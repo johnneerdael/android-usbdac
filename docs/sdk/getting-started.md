@@ -2,6 +2,8 @@
 
 This page takes an app from nothing to audio on a USB DAC. The code is from the sample app in `android/sample`, which does all of it in a few hundred lines.
 
+The quickest way is to let the library choose the output. Add the library (step 1) and the manifest (step 2), then follow [the quick path](#the-quick-path-let-the-library-choose): one `OutputSelector`, one call, and the app has a ready `PcmOutput` with the reason for it and the guarantee that applies. Steps 3 to 10 do the same thing by hand, with every decision in the app's hands: finding the DAC, asking for permission, negotiating, opening the stream. They are what the selector does for you, and the way to go when an app needs control the selector does not give.
+
 ## 1. Add the library
 
 The AAR is published to GitHub Packages as `dev.usbdac:usbdac`. GitHub Packages requires a login even for public packages: create a personal access token with the `read:packages` scope and give it to Gradle, for example in `~/.gradle/gradle.properties` (`gpr.user`, `gpr.token`) or as the environment variables `GITHUB_ACTOR` and `GITHUB_TOKEN`.
@@ -62,6 +64,32 @@ USB permission is asked at run time, per device. If you want Android to offer yo
 ```
 
 Nothing else is needed. In particular the library does not need `RECORD_AUDIO` or a foreground service by itself; a player that continues in the background needs the usual media foreground service of its own.
+
+## The quick path: let the library choose
+
+`OutputSelector` detects what the device offers and returns one ready `PcmOutput`: direct USB when a DAC is attached and the app may take it, Android's bit-perfect mixer on Android 14 and later, an exclusive AAudio stream on a player with an internal DAC, or the standard output otherwise. [Automatic output](automatic-output.md) gives the exact order and what each result guarantees.
+
+```kotlin
+fun automaticPolicy(takeOverDac: Boolean, allowConversion: Boolean, allowFixedVolume: Boolean): OutputPolicy =
+    OutputPolicy(
+        allowDirectUsb = takeOverDac,
+        allowConversion = allowConversion,
+        dacConfig = DacConfig(requireHardwareVolume = !allowFixedVolume),
+    )
+```
+
+```kotlin
+fun openAutomatic(selector: OutputSelector, request: StreamRequest): SelectedOutput {
+    val output = selector.open(request)
+    // output.decision says what was chosen and why, output.format is what to write, and for the
+    // direct output output.volume is the DAC's hardware volume.
+    return output
+}
+```
+
+`open` blocks (it looks at the DAC and the route before it decides), so call it off the main thread. What comes back is a `PcmOutput` like the others: the write loop, the transport calls and the position arithmetic of steps 6 and 7 work on it unchanged. `output.format` says what to write and `output.decision` says why this output was chosen. For the direct output `output.volume` is the DAC's hardware volume, and `output.session` is its `DacSession`, so step 8 works as written. If the app lacks USB permission for an attached DAC the selector does not ask; `decision.needsUsbPermission` names it, and the app asks and selects again ([permission](automatic-output.md#permission)).
+
+The selector never moves a playing stream. At a track boundary the app looks again when `selector.changes` has fired or the next track's format differs ([when to look again](automatic-output.md#when-to-look-again)).
 
 ## 3. Find the DAC, ask for permission, open it
 
@@ -271,11 +299,11 @@ class Transport(private val output: PcmOutput, private val format: StreamFormat,
 
 ### Other outputs
 
-Everything above is written against `PcmOutput`, so the same writer, transport and position code runs on the other two outputs: `AndroidManagedOutput` (an `AudioTrack`) and `AAudioExclusiveOutput` (an exclusive AAudio stream, the route for a player with an internal DAC). They need no `DacSession`: open one, write the PCM in the encoding of the request, and control it as above. The sample's output spinner switches between the three; [transports](transports.md) says what differs.
+Everything above is written against `PcmOutput`, so the same writer, transport and position code runs on the other two outputs: `AndroidManagedOutput` (an `AudioTrack`) and `AAudioExclusiveOutput` (an exclusive AAudio stream, the route for a player with an internal DAC). They need no `DacSession`: open one, write the PCM in the encoding of the request, and control it as above. [Automatic output](automatic-output.md) chooses between them and the direct stream for you. The sample's output spinner starts on Automatic and has the others as a manual override; [transports](transports.md) says what differs.
 
 ## 8. Volume
 
-A direct stream is not touched by Android's volume. Use the DAC's hardware volume, `session.volume`, which is `null` when the DAC has none (or its start-up attenuation could not be verified). Its setters return at once and are safe on every slider event: writes are queued, a burst collapses to its last value, and the last value is always applied.
+A direct stream is not touched by Android's volume. Use the DAC's hardware volume, `session.volume` (with automatic output, `output.volume` or `output.session.volume`), which is `null` when the DAC has none (or its start-up attenuation could not be verified). Its setters return at once and are safe on every slider event: writes are queued, a burst collapses to its last value, and the last value is always applied.
 
 ```kotlin
         volumeBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {

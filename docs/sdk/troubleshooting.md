@@ -111,6 +111,18 @@ Work down the list.
 
 The `usbdac` log (`UsbDac.setLogLevel`) also covers this output.
 
+## Automatic output
+
+`OutputSelector.select` and `open` say why the output they chose is not a better one in `decision.alternativesRejected` (see [automatic output](automatic-output.md#reading-the-decision)); read it first. Then:
+
+- **The direct output is never chosen.** Look for its rejection. `POLICY`: `allowDirectUsb` is off. `PERMISSION_MISSING`: ask with `UsbDac.requestPermission` (the decision's `needsUsbPermission` names the DAC) and select again. `ROUTE_UNSUITABLE`: audio is routed to Bluetooth or a cast device. `IMPLICIT_FEEDBACK`, `NO_HARDWARE_VOLUME`, `BUSY` and `FAILED` carry the `DacErrorCode` in `error`: the same codes as above.
+- **The exclusive AAudio output is never chosen.** `EXCLUSIVE_NOT_GRANTED` means the platform granted only a shared stream on that route; `NOT_AS_REQUESTED` means the hardware runs another rate or format; `PLATFORM_TOO_OLD` means 24-bit or 32-bit integer samples on a release before Android 12. Whether a device grants exclusive mode is the platform's decision, not the library's.
+- **`INVALID_STATE` from `select` or `open`.** An output this selector opened is still open. Close it first: the DAC and an exclusive stream can only be held once.
+- **`UNSUPPORTED` listing every output.** No output can carry the request, typically DSD with no DAC, or 24-bit PCM on a release before Android 12. Read the list.
+- **A forced output fails.** With `OutputPolicy.force` the typed error of that output is thrown and nothing else is tried; it is the same code the rejection would have had.
+- **`select` takes a long time or the DAC glitches.** With a DAC attached it opens a session and negotiates, which programs the clock, and gives the DAC back afterwards. Do not call it while another app is playing to the DAC, and call it off the main thread.
+- **The decision lists the wrong route before Android 13.** Android cannot say where media goes before release 13, so the library guesses from the connected outputs. Select again after the route settles, or force an output.
+
 ## Build and packaging
 
 - `UnsatisfiedLinkError` for `usbdac`: the AAR has no library for the device's ABI. The AAR carries arm64-v8a, armeabi-v7a, x86_64 and x86; check `abiFilters` in your app and that you did not build the AAR with `-Pusbdac.abis` restricted.

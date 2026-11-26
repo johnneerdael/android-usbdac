@@ -20,6 +20,26 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
+        <CheckBox
+            android:id="@+id/takeOverBox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="Let this app take over the DAC (direct USB; other apps lose it while this plays)" />
+
+        <CheckBox
+            android:id="@+id/convertBox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Convert what the DAC cannot run (not bit-perfect)" />
+
+        <TextView
+            android:id="@+id/decisionText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp" />
+
         <Spinner
             android:id="@+id/deviceSpinner"
             android:layout_width="match_parent"

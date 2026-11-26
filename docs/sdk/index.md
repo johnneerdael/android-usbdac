@@ -2,7 +2,7 @@
 
 usbdac gives any Android app bit-perfect playback to a USB DAC, with the DAC's own volume control, DSD, and an indicator that tells the truth about whether the sound is untouched. It started from the USB driver of the Flick music player and has been reworked well beyond it; [what usbdac improves](improvements.md) lists every change, each with a plain-language explanation.
 
-usbdac plays audio from an Android app to a USB DAC. It comes as an Android library (an AAR, package `dev.usbdac`) with three ways to get audio out:
+usbdac plays audio from an Android app to a USB DAC. It comes as an Android library (an AAR, package `dev.usbdac`) with three ways to get audio out, and a selector that picks one for the app (see [automatic output](automatic-output.md)):
 
 - **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with the DAC's feedback endpoint, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
 - **Android-managed.** An `AudioTrack` at the source's own rate and bit depth, through Android's audio stack, behind the same `PcmOutput` interface. On Android 14 and later the library asks the platform for its bit-perfect mixer behavior for a USB device. This is the route for apps that must not take the DAC away from the rest of the system.
@@ -29,6 +29,8 @@ This is a 0.1 pre-release.
 
 Choose **direct USB** when bit-perfect output, DSD or the DAC's hardware volume matters and the app can own the DAC while it plays. Choose **AAudio exclusive** for a device with an internal DAC when bypassing the app mixer matters. Choose **managed** for a DAC that other apps must keep using, or as the fallback when a DAC cannot be driven directly or the platform refuses an exclusive stream. An app can offer all three through the shared `PcmOutput` interface; [transports](transports.md) has the details.
 
+Most apps do not need to choose. `OutputSelector` looks at the attached DAC, the USB permission, where Android sends the sound and what the platform grants, and returns one ready `PcmOutput` with the reason and the guarantee that applies. It tries direct USB, then Android's bit-perfect mixer, then an exclusive AAudio stream, then the standard output; [automatic output](automatic-output.md) gives the exact order and what each guarantee means.
+
 ## What is in the SDK
 
 | Type | What it is for |
@@ -37,6 +39,7 @@ Choose **direct USB** when bit-perfect output, DSD or the DAC's hardware volume 
 | `DacSession` | An open DAC: capabilities, negotiation, `DacStream`, `DacVolume`, state and events |
 | `DacStream` | The direct output: `write`, `play`, `pause`, `flush`, `drain`, position, latency, statistics, bit-perfect state |
 | `DacVolume` | The hardware volume: level in dB or on a 0..1 curve, steps, mute, hand-back |
+| `OutputSelector`, `OutputPolicy`, `OutputDecision`, `SelectedOutput` | Automatic output: looks at the device, chooses one of the outputs below, and returns it ready with the reason, the guarantee and the alternatives it rejected. `changes` says when to look again |
 | `PcmOutput` | The interface `DacStream`, `AndroidManagedOutput` and `AAudioExclusiveOutput` share |
 | `AndroidManagedOutput` | The managed transport |
 | `AAudioExclusiveOutput` | The AAudio exclusive transport: `AAudioConfig` options, the `AAudioGrant` the platform gave, `AAudioEvent`s |
@@ -57,11 +60,12 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 
 Start with [what usbdac improves](improvements.md) for the overview of every change from the driver it started from, in technical and in plain terms. Then:
 
-1. [Getting started](getting-started.md): the dependency, the manifest, permission, open, negotiate, the write loop, pause and seek.
-2. [Controls and configuration](controls.md): every option and control, with its default, its effect and its effect on bit-perfect output.
-3. [Bit-perfect output](bit-perfect.md): what the flag means, when it turns false, DSD, MQA.
-4. [Transports](transports.md): direct USB against the Android-managed output.
-5. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
-6. [Troubleshooting](troubleshooting.md): error codes and a checklist for "nothing plays".
+1. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
+2. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
+3. [Controls and configuration](controls.md): every option and control, with its default, its effect and its effect on bit-perfect output.
+4. [Bit-perfect output](bit-perfect.md): what the flag means, when it turns false, DSD, MQA.
+5. [Transports](transports.md): direct USB, the Android-managed output and exclusive AAudio, side by side.
+6. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
+7. [Troubleshooting](troubleshooting.md): error codes and a checklist for "nothing plays".
 
 The sample app in `android/sample` is the worked example for all of it. The code in this guide is taken from it, except where a block says it is not.

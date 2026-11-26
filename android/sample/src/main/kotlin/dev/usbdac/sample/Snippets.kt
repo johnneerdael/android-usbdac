@@ -13,22 +13,103 @@ import dev.usbdac.ConversionPlan
 import dev.usbdac.ConvertingOutput
 import dev.usbdac.PcmConverter
 import dev.usbdac.RatePolicy
+import dev.usbdac.DacConfig
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
+import dev.usbdac.OutputChange
+import dev.usbdac.OutputDecision
+import dev.usbdac.OutputPolicy
+import dev.usbdac.OutputSelector
 import dev.usbdac.PcmOutput
+import dev.usbdac.SelectedOutput
 import dev.usbdac.StreamFormat
 import dev.usbdac.StreamRequest
 import dev.usbdac.controls.DacIdleRelease
 import dev.usbdac.controls.DacVolumeProvider
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import java.nio.ByteBuffer
 
 // The code samples of docs/sdk that are not part of the activity. They live here so the build
 // compiles them; the guide quotes them. Nothing calls them.
+
+// region auto-policy
+/**
+ * What a player offers its listener for automatic output: one switch for taking over the DAC (while
+ * it plays, other apps lose it), one for converting what the DAC cannot run, and the fixed-volume
+ * permission a DAC without a hardware volume needs.
+ */
+fun automaticPolicy(takeOverDac: Boolean, allowConversion: Boolean, allowFixedVolume: Boolean): OutputPolicy =
+    OutputPolicy(
+        allowDirectUsb = takeOverDac,
+        allowConversion = allowConversion,
+        dacConfig = DacConfig(requireHardwareVolume = !allowFixedVolume),
+    )
+// endregion
+
+// region auto-open
+/**
+ * Chooses the best output for [request] and opens it. It blocks, because it has to look at the DAC and the
+ * route first: call it off the main thread. The result is a [PcmOutput]; closing it closes everything the
+ * selector opened for it, the DAC session included.
+ */
+fun openAutomatic(selector: OutputSelector, request: StreamRequest): SelectedOutput {
+    val output = selector.open(request)
+    // output.decision says what was chosen and why, output.format is what to write, and for the
+    // direct output output.volume is the DAC's hardware volume.
+    return output
+}
+// endregion
+
+// region auto-track-boundary
+/** Whether what [output] takes is the format [request] has. */
+fun sameFormat(output: SelectedOutput, request: StreamRequest): Boolean =
+    output.format.sampleRate == request.sampleRate &&
+        output.format.channels == request.channels &&
+        output.format.validBits == request.bitDepth
+
+/**
+ * At a track boundary: keep writing to the output in use when nothing changed and the next track has the
+ * same format; otherwise close it and open again, which chooses afresh. The old output goes first, because
+ * the DAC and an exclusive stream can only be held once. Call it off the main thread.
+ */
+fun outputForNextTrack(selector: OutputSelector, current: SelectedOutput?, next: StreamRequest, changed: Boolean): SelectedOutput {
+    if (current != null && !changed && sameFormat(current, next)) return current
+    current?.close()
+    return selector.open(next)
+}
+// endregion
+
+// region auto-decision
+/** What was chosen, who vouches for it, why, and why the better outputs were passed over. */
+fun describeDecision(decision: OutputDecision): String = buildString {
+    appendLine("${decision.kind} (${decision.guarantee})")
+    appendLine(decision.reason)
+    decision.conversion?.let { appendLine("Conversion: ${it.description}") }
+    // The selector never asks by itself; the app does, then selects again.
+    decision.needsUsbPermission?.let { appendLine("${it.productName} needs USB permission to be used directly.") }
+    decision.alternativesRejected.forEach { appendLine("Not ${it.kind}: ${it.why}") }
+}.trimEnd()
+// endregion
+
+// region auto-changes
+/**
+ * Calls [onChange] when the best output may have changed: a DAC attached, detached or allowed, or an
+ * output route that came or went. One plug raises several, so they are debounced. Nothing is switched
+ * here; the player looks again at the next track boundary.
+ */
+@OptIn(FlowPreview::class)
+fun reselectOnChange(scope: CoroutineScope, selector: OutputSelector, onChange: (OutputChange) -> Unit): Job =
+    selector.changes
+        .debounce(500)
+        .onEach(onChange)
+        .launchIn(scope)
+// endregion
 
 // region system-volume
 /** Makes the system volume panel and the hardware volume keys drive the DAC, also in the background. */

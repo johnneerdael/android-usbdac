@@ -22,6 +22,7 @@ GUIDE_PAGES = [
     ("index", "Overview"),
     ("improvements", "What usbdac improves"),
     ("getting-started", "Getting started"),
+    ("automatic-output", "Automatic output"),
     ("controls", "Controls and configuration"),
     ("bit-perfect", "Bit-perfect output"),
     ("transports", "Transports"),

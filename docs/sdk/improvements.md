@@ -121,6 +121,12 @@ The original driver was woven into one app's audio engine. usbdac stands alone: 
 
 **In plain terms:** a developer adds one dependency and writes a few dozen lines, instead of writing a USB audio driver.
 
+### The right output is chosen, and explained
+
+An app no longer has to work out which of the outputs suits the situation. `OutputSelector` looks at the attached DAC, the USB permission, where Android sends media, the Android version and what the platform grants, and returns one ready output in a fixed order: direct USB, then Android's bit-perfect mixer, then an exclusive AAudio stream, then the standard output. It says which guarantee applies (verified by the library, requested from the platform, an exclusive stream the platform granted, or none) and lists every better output it passed over with a typed reason. It never asks for a permission or switches a stream that is playing; it reports changes so the app can look again at the next track boundary.
+
+**In plain terms:** the app asks for "the best way to play this" and is told what it got and why, so a phone with a DAC dongle, a music player with a built-in DAC and a phone on Bluetooth all work from one piece of code, and the "bit-perfect" claim on screen matches what is really happening. One setting still has to be the listener's: whether the app may take the DAC away from other apps.
+
 ### Three ways out, one way to use them
 
 Direct USB, an Android-managed output (which asks Android 14 and later for its own bit-perfect mode), and an AAudio exclusive output for players with a built-in DAC all share one interface. The last two never claim to be verified bit-perfect, because an app cannot see past Android's audio system; they report what they asked for and what they were given.

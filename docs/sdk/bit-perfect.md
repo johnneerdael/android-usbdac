@@ -95,6 +95,19 @@ The direct path never converts. If the app converts before writing (a rate the D
 
 So `RatePolicy.NEAREST_SUPPORTED` plus a `ConversionPlan` lets an app play a rate the DAC refuses, and the library says plainly that this is not bit-perfect: the DAC's stream can be `Verified` (the bytes reach it unmodified) while the *audio* is not the source's, which is why `ConvertingOutput` reports the plan, not the transport. The description is a sentence such as "Lossy conversion, not bit-perfect: resampled from 44100 Hz to 48000 Hz (windowed-sinc polyphase, high quality, stopband about 110 dB); quantised to 24-bit in a 4-byte slot with TPDF dither (full scale saturates)." The measured quality of the resampler (passband flat to 0.00004 dB, stopband 109 dB or better, nothing aliased into the output with `HIGH`) is in [the native API document](native-api.html#14-conversion-helpers): a good resampler is still a resampler. MQA signalling in the low bits does not survive any lossy step, and DoP and native DSD are never converted (`UNSUPPORTED`).
 
+## The guarantee the selector reports
+
+`OutputSelector` states, before anything plays, who vouches for the samples on the output it chose (`OutputDecision.guarantee`). It maps onto the states of this page, and the output's `bitPerfect` is still what is true while playing:
+
+| `Guarantee` | Output | Its `bitPerfect` while playing |
+|---|---|---|
+| `VERIFIED_BY_LIBRARY` | Direct USB, exact or with a bit-exact widening | `Verified`, or `NotVerified` with the blocker |
+| `REQUESTED_FROM_PLATFORM` | Android's bit-perfect mixer on a USB DAC | `RequestedViaPlatform` |
+| `EXCLUSIVE_GRANTED_UNVERIFIABLE` | Exclusive AAudio, as requested | `NotVerified(null, reason)` |
+| `NONE` | Standard output, shared AAudio, direct USB behind a conversion that changes the audio, direct USB paced without feedback | `Unverifiable` or `NotVerified` |
+
+See [automatic output](automatic-output.md#what-each-guarantee-means).
+
 ## The states at a glance
 
 | `BitPerfectState` | From | `isVerified` | What it says |

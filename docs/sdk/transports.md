@@ -12,6 +12,8 @@ PcmOutput  write, writableBytes, play, pause, flush, drain, isDrained,
 
 A player written against `PcmOutput` runs on any of them. What differs is who owns the DAC, who does the volume, and what can be promised about the samples.
 
+An app does not have to pick: [`OutputSelector`](automatic-output.md) detects the situation and returns one of these ready, as `ANDROID_BIT_PERFECT` (the managed output with the Android 14 mixer request), `ANDROID_STANDARD` (the managed output without it), `AAUDIO_EXCLUSIVE` or `DIRECT_USB`. This page is what the outputs are, whichever way they are opened.
+
 ## Direct USB: `DacStream`
 
 The library opens the USB device, claims the audio interfaces away from Android's USB audio driver, programs the DAC's clock, and sends isochronous USB transfers itself. Android's mixer, resampler, volume and effects are not in the path.
@@ -140,3 +142,5 @@ Not a transport, but a wrapper that goes in front of one: `ConvertingOutput(targ
 | The DAC refuses the source's rate or depth and the app accepts that conversion is not bit-perfect | Any of them, behind a `ConvertingOutput` |
 
 An app can offer all three and pick at run time: direct while a `DacSession` opens, AAudio exclusive or managed otherwise. Close the `DacSession` first when you switch from direct to managed or AAudio: while the session is open Android has no audio route to the DAC.
+
+Or leave the choice to the library. `OutputSelector` applies this table in a fixed order (direct USB, Android's bit-perfect mixer, exclusive AAudio, standard), skips what the device or the listener rules out, and reports the guarantee that applies and why the better outputs were passed over. The one thing it cannot decide for the app is whether the app may take the DAC away from other apps: that is `OutputPolicy.allowDirectUsb`, and a player should offer it to the listener. See [automatic output](automatic-output.md).

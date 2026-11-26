@@ -20,12 +20,16 @@ import dev.usbdac.DacErrorCode
 import dev.usbdac.DacException
 import dev.usbdac.DacSession
 import dev.usbdac.DacState
+import dev.usbdac.OutputChange
+import dev.usbdac.OutputSelector
+import dev.usbdac.SelectedOutput
 import dev.usbdac.ConvertingOutput
 import dev.usbdac.DacStream
 import dev.usbdac.PcmOutput
 import dev.usbdac.StreamFormat
 import dev.usbdac.StreamRequest
 import dev.usbdac.StreamState
+import dev.usbdac.WriteFormat
 import dev.usbdac.UsbDac
 import dev.usbdac.controls.DacVolumeKeys
 import kotlinx.coroutines.CoroutineScope
@@ -44,9 +48,11 @@ import java.util.concurrent.Executors
  * drive its hardware volume. Everything blocking (open, negotiate, close) runs on [io]; the UI is
  * updated from flows on the main thread.
  *
- * The sine can also go through the Android-managed output or an AAudio exclusive stream (the route
- * of a player with an internal DAC), which need no DAC session, or through the direct stream behind a
- * converter (a rate the DAC refuses): pick the output first.
+ * "Automatic" (the default) lets [OutputSelector] look at the device and choose: it shows what it
+ * chose, the guarantee that applies and why the better outputs were passed over. The other entries of the
+ * output spinner are the manual override: the Android-managed output or an AAudio exclusive stream (the
+ * route of a player with an internal DAC), which need no DAC session, or the direct stream, also behind a
+ * converter (a rate the DAC refuses). Pick the output first.
  */
 class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -57,13 +63,18 @@ class MainActivity : Activity() {
     private var session: DacSession? = null
     private var stream: DacStream? = null
     private var player: SinePlayer? = null
-    private var outputKind = OutputKind.DIRECT_USB
-    private var other: PcmOutput? = null // the managed or AAudio output, while one is playing
+    private var outputChoice = OutputChoice.AUTOMATIC
+    private var automatic: OutputSelector? = null
+    private var waitingForPermission: DacDeviceInfo? = null // a DAC the selector would use directly if it were allowed
+    private var other: PcmOutput? = null // the output of the automatic, managed or AAudio choice, while one is playing
     private var otherPaused = false
     private var streamJobs = mutableListOf<Job>()
     private val events = ArrayDeque<String>()
 
     private lateinit var outputSpinner: Spinner
+    private lateinit var takeOverBox: CheckBox
+    private lateinit var convertBox: CheckBox
+    private lateinit var decisionText: TextView
     private lateinit var deviceSpinner: Spinner
     private lateinit var formatSpinner: Spinner
     private lateinit var capabilitiesText: TextView
@@ -79,6 +90,9 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         outputSpinner = findViewById(R.id.outputSpinner)
+        takeOverBox = findViewById(R.id.takeOverBox)
+        convertBox = findViewById(R.id.convertBox)
+        decisionText = findViewById(R.id.decisionText)
         deviceSpinner = findViewById(R.id.deviceSpinner)
         formatSpinner = findViewById(R.id.formatSpinner)
         capabilitiesText = findViewById(R.id.capabilitiesText)
@@ -90,8 +104,9 @@ class MainActivity : Activity() {
         statusText = findViewById(R.id.statusText)
         eventsText = findViewById(R.id.eventsText)
 
-        click(R.id.refreshButton) { refreshDevices() }
-        click(R.id.openButton) { openSelectedDevice() }
+        click(R.id.refreshButton) { refreshDevices(); refreshDecision() }
+        // In Automatic mode Open asks for the USB permission the selector is waiting for; otherwise it opens a DAC by hand.
+        click(R.id.openButton) { if (outputChoice == OutputChoice.AUTOMATIC) askForUsbPermission() else openSelectedDevice() }
         click(R.id.closeButton) { closeSession() }
         click(R.id.playButton) { play() }
         click(R.id.pauseButton) { togglePause() }
@@ -101,15 +116,23 @@ class MainActivity : Activity() {
         }
         click(R.id.stopButton) { stopStream() }
 
-        // The outputs behind the same PcmOutput interface. The two direct ones need a DAC session.
-        outputSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, OutputKind.entries.map { it.label })
+        // Automatic lets the selector choose; the rest are the outputs behind the same PcmOutput
+        // interface, chosen by hand. The two direct ones need a DAC session of their own.
+        outputSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, OutputChoice.entries.map { it.label })
         outputSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                outputKind = OutputKind.entries[position]
+                outputChoice = OutputChoice.entries[position]
                 showFormats()
+                refreshDecision()
             }
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
+        formatSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = refreshDecision()
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+        takeOverBox.setOnCheckedChangeListener { _, _ -> refreshDecision() }
+        convertBox.setOnCheckedChangeListener { _, _ -> refreshDecision() }
 
         // The volume slider writes the DAC's hardware volume. setFraction() returns at once and
         // collapses a burst of moves into the last one, so it is safe to call on every change.
@@ -122,10 +145,12 @@ class MainActivity : Activity() {
         })
         muteBox.setOnCheckedChangeListener { box, checked -> if (box.isPressed) session?.volume?.setMute(checked) }
         // Allowing a fixed volume is part of the session's configuration, so changing it reopens the DAC.
-        fixedVolumeBox.setOnCheckedChangeListener { box, _ -> if (box.isPressed) reopen() }
+        fixedVolumeBox.setOnCheckedChangeListener { box, _ -> if (box.isPressed) { reopen(); refreshDecision() } }
 
         // Plugging and unplugging: refresh the list.
         UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
+        // A DAC or an output route came or went: look again if nothing plays, else wait for the next track.
+        reselectOnChange(scope, selector(), ::onOutputChange)
         refreshDevices()
         scope.launch { statusLoop() }
     }
@@ -160,6 +185,14 @@ class MainActivity : Activity() {
         UsbDac.requestPermission(this, dac) { granted ->
             if (!granted) return@requestPermission log("USB permission denied")
             openDevice(dac)
+        }
+    }
+
+    /** The selector never asks for USB permission by itself: the app does, then selects again. */
+    private fun askForUsbPermission() {
+        val dac = waitingForPermission ?: return log("no DAC is waiting for USB permission")
+        UsbDac.requestPermission(this, dac) { granted ->
+            if (granted) refreshDecision() else log("USB permission denied")
         }
     }
 
@@ -233,7 +266,7 @@ class MainActivity : Activity() {
     // ---- playback ----
 
     private fun play() {
-        if (outputKind != OutputKind.DIRECT_USB) return playOther()
+        if (outputChoice != OutputChoice.DIRECT_USB) return playOther()
         val open = session ?: return log("open a DAC first")
         if (stream != null) return
         val (rate, bits) = formats.getOrNull(formatSpinner.selectedItemPosition) ?: return
@@ -289,7 +322,7 @@ class MainActivity : Activity() {
     // ---- the managed and AAudio outputs ----
 
     /** The (rate, bit depth) pairs offered for the selected output: the DAC's own, or a fixed list. */
-    private fun currentFormats(): List<Pair<Int, Int>> = if (outputKind == OutputKind.DIRECT_USB) formats else OTHER_FORMATS
+    private fun currentFormats(): List<Pair<Int, Int>> = if (outputChoice == OutputChoice.DIRECT_USB) formats else OTHER_FORMATS
 
     private fun showFormats() {
         formatSpinner.adapter = ArrayAdapter(
@@ -302,18 +335,24 @@ class MainActivity : Activity() {
     private fun playOther() {
         if (other != null) return
         val (rate, bits) = currentFormats().getOrNull(formatSpinner.selectedItemPosition) ?: return
-        val kind = outputKind
+        val kind = outputChoice
         val open = session
-        if (kind == OutputKind.DIRECT_USB_CONVERTED && open == null) return log("open a DAC first")
+        if (kind == OutputChoice.DIRECT_USB_CONVERTED && open == null) return log("open a DAC first")
+        val chooser = selector()
         io.execute {
             try {
                 // All of them are PcmOutputs: the same writer and the same controls drive either.
                 val output = when (kind) {
-                    OutputKind.AAUDIO_EXCLUSIVE -> openAAudio(this, rate, bits)
-                    OutputKind.DIRECT_USB_CONVERTED -> openConverting(requireNotNull(open), StreamRequest.pcm(rate, channels = 2, bitDepth = bits))
+                    OutputChoice.AUTOMATIC -> chooser.open(StreamRequest.pcm(rate, channels = 2, bitDepth = bits))
+                    OutputChoice.AAUDIO_EXCLUSIVE -> openAAudio(this, rate, bits)
+                    OutputChoice.DIRECT_USB_CONVERTED -> openConverting(requireNotNull(open), StreamRequest.pcm(rate, channels = 2, bitDepth = bits))
                     else -> openManaged(this, rate, bits)
                 }
-                val sine = SinePlayer(output, rate, 2, bits / 8, bits) { runOnUiThread { log("writer stopped: ${it.message}") } }
+                // What to write is the layout of the output: the DAC's wire layout for a direct stream.
+                val layout = (output as? SelectedOutput)?.format ?: WriteFormat(rate, 2, bits / 8, bits, rate)
+                val sine = SinePlayer(output, layout.sampleRate, layout.channels, layout.subslotBytes, layout.validBits) {
+                    runOnUiThread { log("writer stopped: ${it.message}") }
+                }
                 runOnUiThread {
                     other = output
                     otherPaused = false
@@ -322,12 +361,58 @@ class MainActivity : Activity() {
                     if (output is AAudioExclusiveOutput) {
                         streamJobs += watchRoute(scope, output) { detail -> log("route lost: $detail"); stopOther() }
                     }
+                    if (output is SelectedOutput) {
+                        decisionText.text = describeDecision(output.decision)
+                        // A direct output brings its DAC session: the volume controls work as for a session opened by hand.
+                        output.session?.let { onOpened(it) }
+                    }
                     sine.start()
                 }
             } catch (error: DacException) {
                 runOnUiThread { log("play failed: ${error.message}") }
             }
         }
+    }
+
+    /** The selector for what the two boxes say; the same one is kept while they do not change. */
+    private fun selector(): OutputSelector {
+        val policy = automaticPolicy(takeOverBox.isChecked, convertBox.isChecked, fixedVolumeBox.isChecked)
+        return automatic?.takeIf { it.policy == policy } ?: OutputSelector(this, policy).also { automatic = it }
+    }
+
+    /**
+     * In Automatic mode, shows what the selector would choose now and why. `select` opens the DAC or an
+     * AAudio stream to look and closes it again, so it runs on [io] and only while nothing plays.
+     */
+    private fun refreshDecision() {
+        if (outputChoice != OutputChoice.AUTOMATIC) {
+            decisionText.text = ""
+            return
+        }
+        if (other != null || stream != null) return
+        val (rate, bits) = currentFormats().getOrNull(formatSpinner.selectedItemPosition) ?: return
+        val chooser = selector()
+        io.execute {
+            val decision = try {
+                chooser.select(StreamRequest.pcm(rate, channels = 2, bitDepth = bits))
+            } catch (error: DacException) {
+                if (error.code == DacErrorCode.INVALID_STATE) return@execute // an output of this selector is opening
+                runOnUiThread { if (other == null) decisionText.text = "No output can play this: ${error.detail}" }
+                return@execute
+            }
+            runOnUiThread {
+                if (other != null) return@runOnUiThread
+                waitingForPermission = decision.needsUsbPermission
+                decisionText.text = describeDecision(decision) +
+                    if (decision.needsUsbPermission != null) "\nTap Open to ask for the USB permission." else ""
+            }
+        }
+    }
+
+    private fun onOutputChange(change: OutputChange) {
+        log("output change: ${change::class.simpleName}")
+        // The selector never switches a playing stream: look again when idle, else at the next track boundary.
+        if (other == null && stream == null) refreshDecision() else log("re-select at the next track boundary")
     }
 
     private fun toggleOther(output: PcmOutput) {
@@ -346,6 +431,8 @@ class MainActivity : Activity() {
             writer?.stop()
             runCatching { closing.close() }
         }
+        // The output closed its DAC session too; clear what the volume controls were showing.
+        if (closing is SelectedOutput && closing.session != null) closeSession()
     }
 
     private fun describeOther(output: PcmOutput): String = buildString {
@@ -356,6 +443,13 @@ class MainActivity : Activity() {
             append(describeGrant(output.grant))
         }
         if (output is ConvertingOutput) append(output.plan.description)
+        if (output is SelectedOutput) {
+            appendLine("writing ${output.format}")
+            output.stream?.let { stream ->
+                val stats = runCatching { stream.stats() }.getOrNull()
+                if (stats != null) append("buffer ${stats.bufferMs}/${stats.bufferTargetMs} ms   underruns ${stats.underruns}   lost ${stats.lostFrames}")
+            }
+        }
     }
 
     // ---- status ----
@@ -425,8 +519,9 @@ class MainActivity : Activity() {
     }
 }
 
-/** Where the sample sends its tone: the three outputs the SDK has, all behind [PcmOutput], and the direct one behind a converter. */
-private enum class OutputKind(val label: String) {
+/** Where the sample sends its tone: the selector's own choice, or one of the outputs by hand. The manual ones are all behind [PcmOutput]. */
+private enum class OutputChoice(val label: String) {
+    AUTOMATIC("Automatic (the library chooses)"),
     DIRECT_USB("Direct USB (needs a DAC session)"),
     ANDROID_MANAGED("Android-managed (AudioTrack)"),
     AAUDIO_EXCLUSIVE("AAudio exclusive (internal DAC)"),
