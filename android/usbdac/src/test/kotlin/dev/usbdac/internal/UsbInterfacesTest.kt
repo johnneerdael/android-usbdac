@@ -30,6 +30,55 @@ class UsbInterfacesTest {
     }
 
     @Test
+    fun pioneerControllersRequireIdleAndBidirectionalActiveAlternates() {
+        val idle = InterfaceInfo(0, 0, 0xff, 0, false)
+        val active = InterfaceInfo(0, 1, 0xff, 0, true, true)
+        for (product in listOf(0x0023, 0x000d, 0x001e, 0x0029, 0x000e)) {
+            assertTrue(isVendorPcmCandidate(0x2b73, product))
+            assertFalse(isVendorPcmCandidate(0x2b74, product))
+            fun plan(values: List<InterfaceInfo>, ids: List<Int> = listOf(0)) =
+                planVendorPcmClaims(values, 0x2b73, product, ids)
+            assertEquals(listOf(0), plan(listOf(idle, active, control(2)))!!.allIds)
+            assertEquals(listOf(0), plan(listOf(idle, active, active.copy(alternateSetting = 2)))!!.allIds)
+            assertNull(plan(listOf(idle, idle, active)))
+            assertNull(plan(listOf(idle, active, active)))
+            assertNull(plan(listOf(active)))
+            assertNull(plan(listOf(idle)))
+            assertNull(plan(listOf(idle.copy(hasIsochronousIn = true), active)))
+            assertNull(plan(listOf(idle, active.copy(hasIsochronousIn = false))))
+            assertNull(plan(listOf(idle, active.copy(hasIsochronousOut = false))))
+            assertNull(plan(listOf(idle.copy(interfaceClass = 1), active)))
+            assertNull(plan(listOf(idle, active.copy(interfaceClass = 1))))
+            assertNull(plan(listOf(idle, active), listOf(0, 0)))
+            assertNull(plan(listOf(idle, active), listOf(1)))
+        }
+        assertFalse(isVendorPcmCandidate(0x2b73, 0x000f))
+        assertFalse(isVendorPcmCaptureCandidate(0x2b73, 0x000f))
+    }
+
+    @Test
+    fun pioneerRbTimingInputIsNotCaptureButStandardAudioFallbackRemainsAvailable() {
+        val vendorInterfaces = listOf(
+            InterfaceInfo(0, 0, 0xff, 0, false),
+            InterfaceInfo(0, 1, 0xff, 0, true, true),
+        )
+        for (product in listOf(0x0017, 0x001b, 0x0023, 0x000d, 0x001e, 0x0029)) {
+            assertTrue(isVendorPcmCaptureCandidate(0x2b73, product))
+            assertTrue(hasConfigurationCapture(vendorInterfaces, 0x2b73, product))
+        }
+        assertFalse(isVendorPcmCaptureCandidate(0x2b73, 0x000e))
+        assertFalse(hasConfigurationCapture(vendorInterfaces, 0x2b73, 0x000e))
+        val standardAudio = listOf(control(0), streamingOut(1),
+            streamingInOnly(2).copy(hasIsochronousIn = true))
+        assertNull(planVendorPcmClaims(standardAudio, 0x2b73, 0x000e))
+        assertTrue(hasConfigurationCapture(standardAudio, 0x2b73, 0x000e))
+        assertEquals(listOf(0, 1), planClaims(standardAudio)!!.allIds)
+        assertEquals(listOf(0, 2), planCaptureClaims(standardAudio, listOf(0), listOf(2))!!.allIds)
+        val separateAudioFunction = standardAudio.map { it.copy(id = it.id + 2) }
+        assertFalse(hasConfigurationCapture(vendorInterfaces + separateAudioFunction, 0x2b73, 0x000e))
+    }
+
+    @Test
     fun rolandDiscoveryAndClaimsRequireBothExactDirectionalInterfaces() {
         val outputIdle = InterfaceInfo(0, 0, 0xff, 0, false)
         val output = InterfaceInfo(0, 1, 0xff, 2, true)

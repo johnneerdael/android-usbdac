@@ -784,3 +784,43 @@ The AAR SHA-256 is
 `4bccece983076c7b17acc33e2e3c9ba1f6cb727b25ccf94317ef98ffde72e1e2`.
 Live playback, standalone capture, duplex, and alternate hand-back remain
 to be verified on both models.
+
+### Fixed-rate Pioneer DJ controllers
+
+The pinned ALSA device table gives these controllers a 44.1 kHz vendor
+PCM profile on interface 0, alternate 1. Channel counts are USB wire
+counts.
+
+| Device | USB ID | PCM | OUT channels and endpoint | IN channels and endpoint |
+| --- | --- | --- | --- | --- |
+| DDJ-SX3 | `2b73:0023` | Signed 32-bit LE | 12, `0x05` | 10, `0x86` |
+| DDJ-RR | `2b73:000d` | Packed signed 24-bit LE | 6, `0x01` | 4, `0x82` |
+| DDJ-SR2 | `2b73:001e` | Packed signed 24-bit LE | 4, `0x01` | 6, `0x82` |
+| DDJ-800 | `2b73:0029` | Packed signed 24-bit LE | 6, `0x01` | 6, `0x82` |
+| DDJ-RB | `2b73:000e` | Packed signed 24-bit LE | 4, `0x01` | 2 timing channels, `0x82` |
+
+The driver verifies the idle alternate, both asynchronous isochronous
+endpoints and their matching service cadence before using the vendor
+profile. Android claims interface 0 after native proof. A standard USB
+Audio configuration uses the class parser. [ALSA DDJ-SX3](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L2749-L2796),
+[ALSA DDJ-RB/RR/SR2](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L2880-L3026),
+[ALSA DDJ-800](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L3086-L3133)
+
+Start playback with silence and use validated IN packet lengths for
+implicit feedback. Share the IN transfers with a duplex reader where
+the profile carries real audio. The DDJ-RB's two dummy IN channels
+provide pacing only, so its vendor profile exposes playback and rejects
+capture and duplex. [ALSA Pioneer timing](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L200-L235)
+
+For each controller, verify the exact alternate, channel count and
+sample layout on hardware. Play across several fractional packet cycles
+and verify implicit lock and release. Verify capture-only and duplex
+channel order on the four audio-capable models, and confirm the DDJ-RB
+rejects both requests while normal playback continues to use its IN
+timing.
+
+Rust workspace tests, the Android arm64 NDK check, Kotlin unit tests,
+the AAR and sample builds, and the SDK snippet check passed. Both JNI
+preflight methods are present on all four ABIs. The AAR SHA-256 is
+`cf030282b9c4697b764e3a87e9711696cbef8f3d37156f4c96f497ffe67a9123`.
+Physical acceptance on the five Pioneer controllers remains pending.

@@ -357,10 +357,17 @@ pub(super) fn owned_capture_candidates(
 ) -> Result<Vec<CaptureEndpoint>, String> {
     let speed = resolve_device_speed(&claimed.handle.device());
     if let Some(profile) = vendor_pcm::discover(&claimed.handle, config, speed)? {
-        return if rate == profile.rate {
-            Ok(vec![vendor_capture_endpoint(config.number(), profile)?])
-        } else { Ok(vec![]) };
+        return vendor_capture_candidates(config.number(), profile, rate);
     }
+    class_capture_candidates(claimed, config, rate, planned_clock)
+}
+
+fn class_capture_candidates(
+    claimed: &ClaimedHandle,
+    config: &ConfigDescriptor,
+    rate: u32,
+    planned_clock: bool,
+) -> Result<Vec<CaptureEndpoint>, String> {
     let raw = read_active_configuration_bytes(&claimed.handle, config)
         .ok_or("cannot read active capture configuration")?;
     let speed = resolve_device_speed(&claimed.handle.device());
@@ -376,7 +383,23 @@ pub(super) fn owned_capture_candidates(
     Ok(candidates)
 }
 
+/// A proven timing-only IN pipe must never fall through to class capture.
+pub(super) fn require_vendor_capture_pcm(profile: &vendor_pcm::VendorPcm) -> Result<(), String> {
+    if !profile.input_carries_pcm {
+        return Err("capture is unsupported: vendor IN stream carries playback timing only".into());
+    }
+    Ok(())
+}
+
+fn vendor_capture_candidates(configuration: u8, profile: vendor_pcm::VendorPcm, rate: u32) -> Result<Vec<CaptureEndpoint>, String> {
+    if require_vendor_capture_pcm(&profile).is_err() || rate != profile.rate {
+        return Ok(vec![]);
+    }
+    Ok(vec![vendor_capture_endpoint(configuration, profile)?])
+}
+
 fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm) -> Result<CaptureEndpoint, String> {
+    require_vendor_capture_pcm(&profile)?;
     let format = CaptureFormat::pcm(profile.rate, profile.input.subslot_bytes * 8, profile.input.subslot_bytes,
         ChannelMap::uac2(u16::from(profile.input.channels), 0).map_err(|e| format!("vendor channel map: {e:?}"))?)
         .map_err(|e| format!("vendor capture format: {e:?}"))?;
@@ -406,6 +429,7 @@ pub(super) fn verify_vendor_capture_alternate(claimed: &ClaimedHandle, candidate
 /// Rediscover the exact fixed duplex profile without sending class clock or power requests.
 pub(super) fn verify_vendor_capture(claimed: &ClaimedHandle, candidate: &CaptureEndpoint) -> Result<(), Error> {
     let expected = candidate.vendor_pcm.as_ref().ok_or_else(|| Error::InvalidState("missing vendor capture profile".into()))?;
+    require_vendor_capture_pcm(expected).map_err(|reason| Error::Unsupported { reason, offered: vec![] })?;
     for interface in expected.claimed_interfaces() {
         claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
     }
@@ -466,6 +490,7 @@ pub(super) fn validate_capture_registration(
         return Err("capture configuration changed since host claim handoff".into());
     }
     if let Some(profile) = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))? {
+        require_vendor_capture_pcm(&profile)?;
         let identity = claimed.handle.device().device_descriptor().map_err(|e| e.to_string())?;
         if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
             return Err("capture host and actual USB identities differ".into());
@@ -538,6 +563,7 @@ pub(crate) fn capture_claim_preflight(
         .active_config_descriptor()
         .map_err(|e| e.to_string())?;
     if let Some(profile) = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))? {
+        require_vendor_capture_pcm(&profile)?;
         return Ok((config.number(), vec![], vec![profile.input_interface_number]));
     }
     let raw = read_active_configuration_bytes(&claimed.handle, &config)
@@ -1016,8 +1042,14 @@ pub(crate) fn open_capture(
     let config = usb
         .active_config_descriptor()
         .map_err(|e| Error::Claim(e.to_string()))?;
-    let mut candidates = owned_capture_candidates(owner.claimed(), &config, request.sample_rate, false)
+    let vendor_profile = vendor_pcm::discover(&owner.claimed().handle, &config, resolve_device_speed(&usb))
         .map_err(Error::Claim)?;
+    let mut candidates = if let Some(profile) = vendor_profile {
+        require_vendor_capture_pcm(&profile).map_err(|reason| Error::Unsupported { reason, offered: vec![] })?;
+        vendor_capture_candidates(config.number(), profile, request.sample_rate)
+    } else {
+        class_capture_candidates(owner.claimed(), &config, request.sample_rate, false)
+    }.map_err(Error::Claim)?;
     candidates.retain(|candidate| {
         candidate.format.satisfies(request)
             && device.claimed_interfaces.contains(&candidate.interface)
@@ -1032,7 +1064,7 @@ pub(crate) fn open_capture(
         )
     });
     let current = candidates.into_iter().next();
-    let endpoint = if current.as_ref().is_some_and(|candidate| candidate.protocol != 0x30) {
+    let endpoint = if vendor_profile.is_some() || current.as_ref().is_some_and(|candidate| candidate.protocol != 0x30) {
         current
     } else {
         adc3::select_standalone_adc3_capture(owner.claimed(), &config, request)
@@ -1573,7 +1605,7 @@ mod tests {
             };
             let profile = vendor_pcm::VendorPcm {
                 interface_number: 0, alt_setting: 1, input_interface_number: 0, input_alt_setting: 1,
-                requires_output_for_capture: false, rate: 48_000, speed: Speed::High,
+                requires_output_for_capture: false, input_carries_pcm: true, rate: 48_000, speed: Speed::High,
                 output: vendor_pcm::VendorEndpoint { address: 1, ..endpoint }, input: endpoint,
             };
             let capture = vendor_capture_endpoint(1, profile).unwrap();
@@ -1595,10 +1627,27 @@ mod tests {
         let output = vendor_pcm::VendorEndpoint { address: 0x05, interval: 1, service_us: 125,
             max_packet_bytes: 7 * 4 * 4, channels: 4, subslot_bytes: 4 };
         vendor_pcm::VendorPcm { interface_number: 0, alt_setting: 1,
-            input_interface_number: 1, input_alt_setting: 1, requires_output_for_capture: true,
+            input_interface_number: 1, input_alt_setting: 1, requires_output_for_capture: true, input_carries_pcm: true,
             rate: 44_100, speed: Speed::High, output,
             input: vendor_pcm::VendorEndpoint { address: 0x85, ..output } }
     }
+    #[test]
+    fn timing_only_vendor_input_is_never_a_capture_candidate() {
+        let mut profile = roland_capture_profile();
+        profile.input_carries_pcm = false;
+        assert!(require_vendor_capture_pcm(&profile).unwrap_err().contains("capture is unsupported"));
+        assert!(vendor_capture_candidates(1, profile, profile.rate).unwrap().is_empty());
+        assert!(vendor_capture_endpoint(1, profile).is_err());
+    }
+
+    #[test]
+    fn ordinary_vendor_input_remains_capture_pcm_at_its_fixed_rate() {
+        let profile = roland_capture_profile();
+        assert!(require_vendor_capture_pcm(&profile).is_ok());
+        assert_eq!(vendor_capture_candidates(1, profile, profile.rate).unwrap().len(), 1);
+        assert!(vendor_capture_candidates(1, profile, 48_000).unwrap().is_empty());
+    }
+
     #[test]
     fn roland_capture_requires_exact_pair_and_preserves_separate_input_format() {
         let profile = roland_capture_profile();

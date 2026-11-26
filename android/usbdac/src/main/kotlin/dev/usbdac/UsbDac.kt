@@ -20,10 +20,11 @@ import org.json.JSONObject
 import dev.usbdac.internal.allInterfaces
 import dev.usbdac.internal.deviceInfoJson
 import dev.usbdac.internal.hasPlayback
-import dev.usbdac.internal.hasCapture
 import dev.usbdac.internal.planCaptureClaims
 import dev.usbdac.internal.planVendorPcmClaims
 import dev.usbdac.internal.isVendorPcmCandidate
+import dev.usbdac.internal.isVendorPcmCaptureCandidate
+import dev.usbdac.internal.hasConfigurationCapture
 import dev.usbdac.internal.planClaims
 import dev.usbdac.internal.toInfo
 import dev.usbdac.internal.toNativeJson
@@ -52,7 +53,7 @@ public data class DacDeviceInfo(
         val configuration = device.getConfiguration(index)
         val interfaces = configuration.interfaces().map { it.toInfo() }
         val vendorPcm = isVendorPcmCandidate(device.vendorId, device.productId) && planVendorPcmClaims(interfaces, device.vendorId, device.productId) != null
-        DacUsbConfiguration(configuration.id, configuration.name, vendorPcm || hasPlayback(interfaces), vendorPcm || hasCapture(interfaces))
+        DacUsbConfiguration(configuration.id, configuration.name, vendorPcm || hasPlayback(interfaces), hasConfigurationCapture(interfaces, device.vendorId, device.productId))
     }
 }
 
@@ -110,7 +111,10 @@ public object UsbDac {
 
     /** Describe an input-capable device; exact PCM support is checked after USB permission. */
     public fun describeCapture(device: UsbDevice): DacDeviceInfo? {
-        if (!isVendorPcmCandidate(device.vendorId, device.productId) && !hasCapture(device.allInterfaces().map { it.toInfo() })) return null
+        if (!isVendorPcmCaptureCandidate(device.vendorId, device.productId) &&
+            !(0 until device.configurationCount).any { index ->
+                hasConfigurationCapture(device.getConfiguration(index).interfaces().map { it.toInfo() }, device.vendorId, device.productId)
+            }) return null
         return DacDeviceInfo(device, device.vendorId, device.productId,
             device.productName?.takeIf { it.isNotBlank() } ?: "USB audio input",
             device.manufacturerName?.takeIf { it.isNotBlank() }, device.deviceName)
@@ -241,6 +245,9 @@ public object UsbDac {
                 device.deviceName, ids, configurationId = configuration,
             )
             val vendorPlan = vendorPcmClaimPlan(fd, device, opened, active.id, interfaces)
+            if (vendorPlan != null && !isVendorPcmCaptureCandidate(device.vendorId, device.productId)) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "${device.productName} has no vendor PCM capture stream")
+            }
             val preflight = if (vendorPlan == null) nativeCall { JSONObject(Native.dacCapturePreflight(fd, infoJson(emptyList(), active.id))) }
                 else JSONObject().put("configuration_id", active.id)
             val configuration = preflight.getInt("configuration_id")
@@ -354,6 +361,9 @@ public object UsbDac {
             val activeConfiguration = selected.selected
             val interfaces = activeConfiguration.interfaces()
             val vendorPlan = vendorPcmClaimPlan(fd, device, connection, activeConfiguration.id, interfaces)
+            if (duplex && vendorPlan != null && !isVendorPcmCaptureCandidate(device.vendorId, device.productId)) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "${device.productName} has no vendor PCM capture stream")
+            }
             val playbackPlan = vendorPlan ?: planClaims(interfaces.map { it.toInfo() })
                 ?: throw DacException(
                     DacErrorCode.UNSUPPORTED,

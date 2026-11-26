@@ -588,6 +588,7 @@ pub(super) fn inspect_duplex_capabilities(device: &UsbDevice, expected: Option<u
     let claimed = wrap_android_usb_handle(device)?;
     let descriptor = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
     if let Some(profile) = vendor_pcm::discover(&claimed.handle, &descriptor, resolve_device_speed(&claimed.handle.device()))? {
+        capture_stream::require_vendor_capture_pcm(&profile)?;
         if !controls.is_empty() || inputs != [profile.input_interface_number] || !profile.claims_match(&device.claimed_interfaces) {
             return Err("vendor PCM duplex requires its exact proven streaming interface claims".into());
         }

@@ -38,8 +38,15 @@ internal data class ClaimPlan(val controlIds: List<Int>, val streamingIds: List<
 internal fun isVendorPcmCandidate(vendorId: Int, productId: Int): Boolean =
     vendorPcmInterfaceIds(vendorId, productId) != null
 
+/** DDJ-RB's vendor IN endpoint carries timing data, not recorded PCM. */
+internal fun isVendorPcmCaptureCandidate(vendorId: Int, productId: Int): Boolean =
+    isVendorPcmCandidate(vendorId, productId) && !(vendorId == 0x2b73 && productId == 0x000e)
+
+private fun isPioneerController(vendorId: Int, productId: Int): Boolean =
+    vendorId == 0x2b73 && productId in listOf(0x0023, 0x000d, 0x001e, 0x0029, 0x000e)
+
 private fun vendorPcmInterfaceIds(vendorId: Int, productId: Int): List<Int>? = when {
-    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b) -> listOf(0)
+    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b) || isPioneerController(vendorId, productId) -> listOf(0)
     vendorId == 0x0582 && productId in listOf(0x0120, 0x012f) -> listOf(0, 1)
     else -> null
 }
@@ -54,7 +61,8 @@ internal fun planVendorPcmClaims(
     val expected = vendorPcmInterfaceIds(vendorId, productId) ?: return null
     if (interfaceIds.distinct().size != interfaceIds.size || interfaceIds.sorted() != expected) return null
     for (id in expected) {
-        val alternates = interfaces.filter { it.id == id && (vendorId != 0x0582 || it.alternateSetting in 0..1) }
+        val requiredAlternatesOnly = vendorId == 0x0582 || isPioneerController(vendorId, productId)
+        val alternates = interfaces.filter { it.id == id && (!requiredAlternatesOnly || it.alternateSetting in 0..1) }
         if (alternates.size != 2 || alternates.any { it.interfaceClass != 0xff }) return null
         if (alternates.none { it.alternateSetting == 0 && !it.hasIsochronousIn && !it.hasIsochronousOut }) return null
         val output = vendorId != 0x0582 || id == 0
@@ -73,6 +81,14 @@ internal fun hasPlayback(interfaces: List<InterfaceInfo>): Boolean =
 
 internal fun hasCapture(interfaces: List<InterfaceInfo>): Boolean =
     interfaces.any { it.isAudioStreaming && it.hasIsochronousIn }
+
+/** Match native vendor precedence while retaining discovery of standard Audio configurations. */
+internal fun hasConfigurationCapture(interfaces: List<InterfaceInfo>, vendorId: Int, productId: Int): Boolean =
+    if (planVendorPcmClaims(interfaces, vendorId, productId) != null) {
+        isVendorPcmCaptureCandidate(vendorId, productId)
+    } else {
+        hasCapture(interfaces)
+    }
 
 /** Validate the native descriptor ownership proof against Android's active interface inventory. */
 internal fun planCaptureClaims(interfaces: List<InterfaceInfo>, controls: List<Int>, inputs: List<Int>): ClaimPlan? {
