@@ -21,10 +21,17 @@ Silence inserted while paused, flushed or underrun is zeros (or the DSD idle pat
 | 1 | The stream is open and its output thread is running | `NO_STREAM` |
 | 2 | No frame queued to the DAC was lost on the bus since the stream started. The first lost frame clears the flag for the life of the stream | `LOST_FRAMES` |
 | 3 | The format on the wire is the one requested: no `RatePolicy.NEAREST_SUPPORTED` rate change | `FORMAT_CHANGED` |
-| 4 | The DAC's sampling frequency was verified: its read-back equals the requested rate. A DAC whose quirk is `SkipClockValidation` is trusted on its acknowledgement | `CLOCK_UNVERIFIED` |
-| 5 | Software gain is exactly 1.0 | `SOFTWARE_GAIN` |
-| 6 | The endpoint is paced by the DAC's own feedback, or follows the host's timing. An asynchronous endpoint streamed without feedback (`allowUnsynchronizedAsync`) is never bit-perfect | `UNSYNCHRONIZED_ASYNC` |
-| 7 | The wire payload audit passes | `PAYLOAD_UNVERIFIED` |
+| 4 | Live feedback has locked when the route uses explicit or implicit feedback | `FEEDBACK_UNLOCKED` |
+| 5 | The DAC's sampling frequency was verified: its read-back equals the requested rate. A DAC whose quirk is `SkipClockValidation` is trusted on its acknowledgement | `CLOCK_UNVERIFIED` |
+| 6 | Software gain is exactly 1.0 | `SOFTWARE_GAIN` |
+| 7 | The route has valid pacing. An asynchronous endpoint using the nominal-timing opt-in cannot be verified | `UNSYNCHRONIZED_ASYNC` |
+| 8 | The wire payload audit passes | `PAYLOAD_UNVERIFIED` |
+
+On a feedback-paced route, use `format.pacing` to identify the selected source
+and `stats().feedbackLocked` to check its live state. The clock readback and
+feedback lock answer different questions. A successful rate readback says
+what rate the DAC is set to. Feedback shows that the host can follow it while
+streaming. [Feedback diagnostics](controls.md#diagnostics-the-clock-and-the-pacing)
 
 The payload audit looks at what is actually in the packets. For PCM it needs real audio: channel 0 must vary within a transfer, with a grace of 1.5 s so digital silence or a fade does not flip the flag. For DoP the markers must alternate and agree across channels. For native DSD the data must not be all zero. A new stream, or one that has only been fed silence, can therefore report `NotVerified` with `PAYLOAD_UNVERIFIED` until real audio has passed.
 

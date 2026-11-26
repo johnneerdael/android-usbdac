@@ -2,8 +2,11 @@
 //!
 //! `usbdac-core` drives a USB Audio Class 1.0/2.0 DAC through usbfs, without the
 //! platform audio stack: PCM at the DAC's native depth, DSD over PCM (DoP) and
-//! native DSD, isochronous transfers paced by the DAC's explicit feedback
-//! endpoint, loss accounting, and the DAC's own hardware volume.
+//! native DSD, feedback-paced isochronous transfers, loss accounting, and the
+//! DAC's own hardware volume. Asynchronous streams can follow explicit rate
+//! reports or frame counts from a compatible UAC2 input stream. Use
+//! [`StreamFormat::pacing`] for the selected mechanism and
+//! [`DacStream::stats`] for live lock and feedback counters.
 //!
 //! The library never resamples, dithers or scales samples unless the host
 //! explicitly enables software gain, and it reports honestly whether the audio

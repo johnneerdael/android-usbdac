@@ -17,7 +17,13 @@ The parts of each decision are the question, what the three drivers do, what usb
 | BitChord | The same: auto-detach and `libusb_claim_interface` in the C++ worker | `usb_transport.cpp` (`Session`) |
 | usbdac | The Kotlin SDK claims, as Flick does: `claimInterface(interface, force = true)` for every AudioControl interface and every playback AudioStreaming interface of the active configuration, all or none, control first. The Rust core is told which interfaces are claimed (`DeviceInfo::with_claimed_interfaces`) and refuses a control request on an interface that is not. `DacSession.close()` resets streaming interfaces to alternate setting 0 and releases them, which asks Android to rebind its driver | `android/usbdac/.../internal/UsbInterfaces.kt` (`planClaims`, `ClaimedInterfaces`), `transport/usbfs.rs` |
 
-**What usbdac does.** The library's Rust core stays free of Android: it takes a file descriptor and a list of claimed interfaces and checks that the list covers what it uses. Everything Android-specific (permission, claim, release) is in the Kotlin layer, which does it in the order that was found to work on hardware. A host that uses the Rust crate directly has to do the same, and the README says so.
+**What usbdac does.** Kotlin obtains USB permission and claims the required
+control and playback interfaces first. When feedback is enabled, the SDK
+preflights eligible implicit IN sources and tries to claim the additional
+interfaces. An unavailable optional claim leaves other viable routes
+available. The Rust core uses the actual claim list. The SDK releases its
+claims on session close. A raw Android host using the Rust crate directly
+manages these steps itself. [Native integration](native-api.html#2-lifecycle)
 
 **Evidence.**
 

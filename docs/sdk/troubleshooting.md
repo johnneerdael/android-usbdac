@@ -33,6 +33,27 @@ By default `negotiate` or `openStream` refuses such an alternate setting with `I
 
 `DacConfig(allowUnsynchronizedAsync = true)` streams it anyway, at the nominal rate, host-paced. Expect the drift to end in clicks or dropouts after some time, and the stream is never bit-perfect (blocker `UNSYNCHRONIZED_ASYNC`). Use the managed output (`AndroidManagedOutput`) for such a DAC if it works there.
 
+## Feedback lock and dropouts {#feedback-lock-and-dropouts}
+
+If a direct stream has opened but loses feedback, record `format.pacing`,
+`stats().feedbackLocked`, `feedbackAgeMs` and the `usbdac` log. Include the
+DAC's USB IDs, the requested format, and whether the issue occurs at startup
+or after playback begins.
+
+- **Explicit.** A successful empty poll increments `feedbackEmpty` and
+  leaves the last valid report timestamp alone. A burst of rejected reports
+  shows up in `feedbackRejected`. If the source goes stale, the driver emits
+  `FeedbackStale` and holds the last valid rate during the recovery window.
+  If valid timing fails to return by the deadline, it emits `StreamFailed`
+  with `TRANSFER`.
+- **Implicit.** `format.pacing` identifies the IN interface, alternate setting
+  and endpoint. Include `implicitFifoDepth`, `implicitWaits` and
+  `implicitInvalidPackets` to distinguish a timing-source gap from a writer
+  underrun. A transport failure can end the stream with `TRANSFER`.
+
+In both modes, `FEEDBACK_UNLOCKED` can appear while the driver acquires or
+reacquires timing. See [all feedback counters](controls.md#diagnostics-the-clock-and-the-pacing).
+
 ## Wrong pitch, or no sound at one sample rate
 
 On a DAC with more than one clock (a Clock Selector choosing between an internal oscillator and another source, or Clock Multipliers in front of a source), the sampling frequency is programmed on one Clock Source. If it goes to the wrong one, the DAC plays at the wrong pitch, or is silent at one rate while others work. Look at `clock.path` and `clock.resolution` of the `StreamFormat` that `negotiate` returned:
@@ -78,7 +99,7 @@ Work down the list.
    - Is the stream `PAUSED`, `DRAINED` or `FAILED`? `stream.state` says. After `drain()` writes fail until `flush()`.
    - Does `write` return 0 forever? `writableBytes` is 0 while the ring is full (the DAC is not taking audio) or after `drain()`. Check `stats().transferQueueDepth` and `completedTransfers`.
 5. **Noise or static.** The bytes are in the wrong layout. Match `StreamFormat.subslotBytes` and `validBits`: 24-bit in a 4-byte slot is the sample shifted left by 8; samples are little-endian and interleaved. For native DSD the byte order (`dsdBigEndian`, `DsdBigEndian`), the bit order (`DsdBitReverse`; DSF is least significant bit first and must be reversed) and the slot size (`dsdSubslot`) are DAC-specific. For DoP, write the DSD bits as the layout says and leave the marker byte alone.
-6. **Clicks and dropouts.** `DacEvent.Underrun` means the writer did not keep the ring filled: raise `bufferTargetMs`, make sure the writer thread is not starved (do not render on the main thread, avoid long garbage collections in it), and write when `writableBytes` says there is room. If the ring is full and the stream still underruns, the output thread itself is late: raise `busQueueMs` (16 ms by default) a few milliseconds at a time. The packets in flight never exceed 255, so a very deep queue at a short service interval is capped. `DacEvent.LostFrames` and `stats().urbTimeouts` mean the USB transport lost audio: cable, hub or port. `DacEvent.FeedbackStale` means the feedback source stopped providing usable timing. Check `format.pacing` and `stats()` to see the selected source, lock and last report age. For implicit feedback, the FIFO and IN packet counters distinguish a capture gap from a playback underrun. For explicit feedback, a short gap holds the last good rate with the bit-perfect verdict cleared. A persistent outage gives `StreamFailed` with `TRANSFER`. Successful empty polls have their own counter.
+6. **Clicks and dropouts.** `DacEvent.Underrun` means the writer did not keep the ring filled: raise `bufferTargetMs`, make sure the writer thread is not starved (do not render on the main thread, avoid long garbage collections in it), and write when `writableBytes` says there is room. If the ring is full and the stream still underruns, the output thread itself is late: raise `busQueueMs` (16 ms by default) a few milliseconds at a time. The packets in flight never exceed 255, so a very deep queue at a short service interval is capped. `DacEvent.LostFrames` and `stats().urbTimeouts` mean the USB transport lost audio: cable, hub or port. `DacEvent.FeedbackStale` means the feedback source stopped providing usable timing. Use the [feedback diagnostics above](#feedback-lock-and-dropouts) to identify the source and collect the counters.
    A click or a short re-lock of a DoP or native DSD DAC at a seek or a track change is the gap a flush makes when it cancels the transfers on the bus: set `DacConfig(cancelInFlightOnFlush = false)` and the queue plays out instead (up to `busQueueMs` of the old audio is then heard after the seek).
 7. **The flag says not bit-perfect.** `stream.bitPerfect.value` carries the blocker and a sentence. See [bit-perfect output](bit-perfect.md#the-verified-flag).
 8. **The volume keys do nothing.** `session.volume` is `null` (the DAC has no volume control), or `dispatchKeyEvent` does not call `DacVolumeKeys.handle`, or the screen is off and no `DacVolumeProvider` is attached to a `MediaSession`.

@@ -34,7 +34,7 @@ The parts of each decision are the question, what the three drivers do, what usb
 
 **The question.** In asynchronous mode the DAC runs its own clock, so the DAC knows how many samples it needs per millisecond and the host has to ask. The DAC reports that on a feedback endpoint. How does the driver read the report, how much does it trust it, and what does it do when the reports stop?
 
-**In plain terms.** At 44.1 kHz, a 125 microsecond packet should carry 5.5125 samples, which is not a whole number. The driver sends 5 samples in some packets and 6 in others so that the long-run average is exact. The DAC's clock is never exactly at nominal, so the DAC sends back a small number saying "I currently want this many per packet", and the driver adjusts the mix of packet sizes to match.
+**In plain terms.** At 44.1 kHz, a 125 microsecond packet averages 5.5125 frames. The driver alternates between whole packet sizes, typically 5 and 6 frames. The DAC reports the rate of its own clock, and the driver adjusts the mix of packet sizes to stay in step.
 
 | | What it does | Where |
 |---|---|---|
@@ -42,21 +42,48 @@ The parts of each decision are the question, what the three drivers do, what usb
 | Mornye | One feedback transfer of one packet, resubmitted each time it completes. Each report within 2 % of nominal replaces the previous one directly, with no averaging. 10.14 in three bytes only on a full-speed link, 16.16 in four bytes. **Two seconds without a valid report ends the stream** ("USB feedback stopped or invalid") | `usb_audio/descriptors.rs` (`PacketClock`), `transport.rs` (`run`) |
 | BitChord | The same | `usb_stream.h` (`PacketClock`), `usb_transport.cpp` (`run`) |
 | Linux `snd-usb-audio` | Applies each report directly and range-checks it (rejects values outside `freqn - freqn/8 .. freqmax`); detects whether the device uses 10.14 or 16.16 | `sound/usb/endpoint.c` (`snd_usb_handle_sync_urb`) |
-| usbdac | The same transfer shape as Flick, with the window limited to the bus queue (`min(16 ms, bus_queue_ms)`) so that a report is never older than the audio queued for the DAC. Reports within 2 % of nominal are accepted and smoothed with the same 0.8 / 0.2 average. A report is decoded by its length (3 bytes as 10.14, 4 bytes or more as 16.16) with the timebase set by the link speed: samples per microframe on a high-speed link, per frame on full speed. 500 ms of silence from the endpoint sets `feedback_stale` and sends `FeedbackStale` once; the last value stays in use and the stream continues | `transport/iso.rs` (`FeedbackTransferSlot`, `pump_feedback_transfer`, `decode_feedback_report`), `iso_packet_scheduler.rs` |
+| usbdac 0.1.1 | A persistent asynchronous transfer polls the explicit endpoint. Uses the newest valid report in each batch, checks the 2% nominal-rate band and the largest required OUT packet, then applies the 0.8 / 0.2 average. A short gap holds the last valid rate. Stale timing clears lock and a persistent outage ends the stream | `transport/iso.rs` (`FeedbackTransferSlot`, `ExplicitFeedbackHealth`), `transport/output.rs`, `iso_packet_scheduler.rs` |
 
-**What usbdac does.** The packet scheduler accumulates a fractional remainder so the count over any long stretch is exact. `StreamFormat.pacing` says `ExplicitFeedback(endpoint)` for such a stream, and `StreamStats` carries the number of reports, rejected reports, timeouts and the rate the last report implies.
+**What usbdac does.** The driver scans each poll batch and uses the newest report
+that passes validation. A successful empty poll increments `feedback_empty`.
+Empty, malformed and rejected reports leave the last valid rate and timestamp
+in place. The decoder accepts exactly three bytes as 10.14 or four as 16.16,
+interprets the value per full-speed frame or high-speed microframe, and scales
+it to the OUT service interval. The capacity check rounds the required frame
+count up, since some packets carry that larger size. A device that reports in
+OUT service intervals can use a trace-backed
+[`ExplicitFeedbackPerServiceInterval` quirk](controls.md#quirks).
+
+`StreamFormat.pacing` identifies `ExplicitFeedback(endpoint)`. Live lock is
+separate. Before the first valid report the stream primes at the nominal rate
+with verification withheld. After a valid report, the stale threshold is the
+larger of 500 ms or three report intervals. The terminal deadline is the larger
+of 1 s or six report intervals. The driver estimates the interval from the
+endpoint's polling cadence and, where present, its valid UAC1 `bRefresh`.
+At stale, it emits `FeedbackStale` and clears bit-perfect verification. A timely
+valid report can restore lock. When the deadline expires the app gets a
+`TRANSFER` failure. [Feedback diagnostics](controls.md#diagnostics-the-clock-and-the-pacing)
 
 **Evidence.**
 
-- **44.1 kHz cannot be represented exactly.** 44.1 samples per microframe is not a multiple of 1/65536 or of 1/16384, so a DAC that reports it rounds. The decoded rate is off by 0.049 Hz in 16.16 and 0.195 Hz in 10.14, both within half of the last bit (0.061 Hz and 0.244 Hz). That is a property of the format. Flick's two tests for this (`feedback_uses_usb_speed_timebase_not_feedback_poll_interval`, `feedback_q10_14_uses_high_speed_timebase`) asserted 0.01 Hz, which no DAC can meet, and fail when the Android-only code is compiled for a host; Flick's pull requests #414 and #415 both note that the two fail on `versionF`. usbdac's tests assert the half-bit bound and that a value the format holds exactly decodes exactly.
+- **Fixed-point rounding at 352.8 kHz.** The rate is 44.1 frames per high-speed
+  microframe. Rounded to the nearest representable value, it is off by 0.049 Hz
+  in 16.16 and 0.195 Hz in 10.14. Both errors are within half a bit of precision
+  (0.061 Hz and 0.244 Hz respectively). usbdac's tests use that bound. Flick's
+  pull requests #414 and #415 record that the earlier 0.01 Hz assertions fail
+  on `versionF`. [Feedback arithmetic](evidence.md#computed-numbers)
 - **The formats are in the specifications.** USB 2.0 section 5.12.4.2 says a full-speed endpoint reports an unsigned 10.10 value left-justified in three bytes, so it reads as 10.14, and a high-speed endpoint reports an unsigned 12.13 value in four bytes with the binary point between the second and third byte, so it reads as 16.16. Only 10 and 13 fractional bits are required; the lower 4 and 3 bits are optional extra precision, so a DAC may report coarser values than the decoder can hold (13 fractional bits is a step of about 0.98 Hz at 8000 microframes a second). UAC 1.0 section 3.7.2.2 gives the 10.14 format for the same three bytes, and the Linux driver says in a comment that full-speed devices use 10.14 and high-speed devices 16.16.
 - **A deep queue delays the correction.** Mornye's revert `580a9bbfe` (2026-11-19, quoted under [decision 1](decisions-stream.md#queue-geometry)) is the one record of what happens when feedback takes effect late: a DAC that steers its own buffer swung past the accepted band and the stream paused. It says the mechanism was "read from the code, not measured". usbdac's 16 ms bus queue and its poll window follow from the same reasoning.
-- **Stale feedback is not fatal here.** Mornye's own revert message reports a tester who had frequent pauses from the two-second rule. usbdac only warns and keeps the last value.
-- Tests: `iso_packet_scheduler_tests.rs` accumulates an exact second at 44.1, 48, 88.2, 96, 176.4, 192 and 352.8 kHz and checks that feedback tracks small clock skew and that outliers are rejected and recovered from.
+- **Recovery has a deadline.** Mornye's revert message reports frequent pauses
+  from its two-second rule. usbdac 0.1.1 tests initial lock, empty polls,
+  recovery before the deadline and failure after it. The release also has
+  tests for malformed reports, USB timebase conversion and packet capacity.
+  [Evidence and status](evidence.md#hardware-status)
 
-**The honest gap.** Mornye, BitChord and the Linux kernel apply each feedback report as it arrives. usbdac, like Flick, averages: a new report moves the value by one fifth. The averaging also means it takes about five reports for a real change in the DAC's clock to be mostly followed. Which is better has not been measured on a DAC. Averaging rejects a single noisy report and lags a real change; applying directly follows a change at once and passes a noisy report through. The 2 % band, the 500 ms stale rule and the 16 ms poll window are all choices that have not been tuned against a measurement of feedback jitter. If a DAC drifts into underruns or overruns with `ExplicitFeedback` pacing, this is the first place to look, and `StreamStats` has the counters to look with.
-
-**Trade-off.** A fixed pacing rule is simpler and cannot be wrong about a DAC's clock; feedback is required for DACs whose clock is not locked to USB, which are most asynchronous DACs. A DAC that sends bad feedback is bounded by the 2 % band rather than trusted.
+**Trade-off.** Smoothing reduces the effect of a noisy report and delays the
+response to a real rate change. The release has automated coverage for the
+validation and recovery rules. There is no hardware measurement here comparing
+smoothing with applying reports directly.
 
 **References.** [UAC 1.0 and USB 2.0 feedback format](references.md#ref-uac1), [USB 2.0 §5.12.4.2](references.md#ref-usb2), [Linux `endpoint.c`](references.md#ref-linux-endpoint), [Mornye commits](references.md#ref-mornye-commits).
 
@@ -64,7 +91,11 @@ The parts of each decision are the question, what the three drivers do, what usb
 
 **The question.** Some asynchronous DACs have no feedback endpoint. Instead they expect the host to derive the pacing from the DAC's own recording stream ("implicit feedback"), which is common on USB interfaces that also record. What does the driver do?
 
-**In plain terms.** Without feedback, the host sends at the nominal rate and the DAC consumes at its own. The two clocks differ by a few hundred parts per million, so the DAC's small buffer slowly fills or empties, and eventually it clicks or drops out. At 200 ppm, a 16 ms cushion lasts about 80 seconds (an illustration of the arithmetic, not a measurement).
+**In plain terms.** For a compatible device that uses its own clock for both
+directions, the frame counts in its IN packets tell the host how many frames
+to send back. That lets playback follow the device's actual clock. With nominal
+timing alone, a 200 ppm difference would use up a 16 ms cushion in about
+80 seconds. This is an illustration of clock drift.
 
 | | What it does | Where |
 |---|---|---|
@@ -72,12 +103,26 @@ The parts of each decision are the question, what the three drivers do, what usb
 | Mornye | Refuses: "Implicit feedback is not supported"; the README says implicit feedback, ambiguous clocks and multiple configurations "fail closed" | `usb_audio/transport.rs` (`Session::configure`) |
 | BitChord | Refuses, with the comment "Implicit feedback means following the DAC's capture stream: not supported" | `usb/UsbDescriptors.kt` (the endpoint plan) |
 | Linux `snd-usb-audio` | Implements it: pairs an asynchronous playback endpoint with an adjacent capture endpoint (or a UAC 2.0 implicit-feedback data endpoint) and copies the packet sizes it receives | `sound/usb/implicit.c`, `endpoint.c` |
-| usbdac at the comparison baseline | Refuses with `Error::ImplicitFeedbackUnsupported` at `negotiate` and `open_stream`, and shows `AltSetting.pacing = null` for alternate settings it would not stream. `DacConfig.allowUnsynchronizedAsync` streams them at the nominal rate; the stream is then never bit-perfect (blocker `UNSYNCHRONIZED_ASYNC`) and `StreamFormat.pacing` says `Unsynchronized`. The output selector records the refusal as `IMPLICIT_FEEDBACK` and moves on to the next output | `crates/usbdac-core/src/endpoint.rs`, `config.rs`, `capabilities.rs` |
+| usbdac 0.1.1 | Resolves a compatible UAC2 IN source in the same audio function, then uses its packet frame counts. If the request has no usable feedback route, negotiation can choose another suitable alternate setting or return `ImplicitFeedbackUnsupported` | `transport/scan.rs`, `transport/implicit.rs`, `transport/output.rs` |
 
-**What usbdac does now.** Version 0.1.1 follows compatible UAC2 IN packet counts for implicit feedback. When the driver cannot establish a compatible clock and service interval, the typed refusal lets the app select another output. The nominal-timing option remains available.
+**What usbdac does.** A usable pair shares a resolved clock source, effective
+wire rate and service interval. The driver requires an unambiguous match with
+enough packet capacity. It starts the IN stream first, converts each IN
+packet's length to whole frames, and schedules the same frame count in the
+corresponding OUT packet using the playback frame size. The app still supplies
+the playback samples. Android's SDK claims eligible IN interfaces as needed
+and releases them when the session closes. `Pacing.ImplicitFeedback` identifies
+the interface, alternate setting and endpoint. Check `feedbackLocked` for the
+live state.
 
-**Evidence.** Two of the three drivers refuse for the same reason. Flick's own log line says what the unpaced stream will do. The Linux driver's implementation shows what doing it properly involves: reading the capture stream's packet sizes and following them, which needs a second isochronous endpoint to be claimed and read. No DAC that needs implicit feedback has been tried with usbdac, and the refusal is covered by host tests and the output selector's tests.
+**Evidence.** Host tests cover source pairing, whole-frame packet sizing,
+ordered consumption of frame counts and Kotlin diagnostics. Hardware coverage
+for implicit feedback is still pending. [Evidence and status](evidence.md#hardware-status)
 
-**Trade-off.** Refusing means a few DACs cannot be played directly, and the app has to offer something else. Allowing them gives playback that works until the clocks drift apart. usbdac chose the refusal because a stream that clicks every minute and still says "bit-perfect" would be wrong, and `allowUnsynchronizedAsync` exists for a host that wants to try anyway.
+**Trade-off.** Implicit pacing requires an IN stream that stays usable while
+playback runs. If no compatible source is available, `OutputSelector` can try
+another route. `allowUnsynchronizedAsync` is a separate opt-in for otherwise
+valid routes using nominal timing. It carries the `UNSYNCHRONIZED_ASYNC`
+blocker for the entire stream.
 
 **References.** [Linux implicit feedback](references.md#ref-linux-implicit), [UAC 2.0 and USB 2.0 synchronisation types](references.md#ref-usb2), [Mornye README](references.md#ref-mornye-commits).
