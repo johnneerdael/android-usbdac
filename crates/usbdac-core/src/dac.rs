@@ -29,6 +29,7 @@ pub(crate) struct DacShared {
     pub(crate) config: DacConfig,
     closed: AtomicBool,
     pub(crate) stream: Mutex<Option<Weak<StreamInner>>>,
+    last_feedback_stream: Mutex<Option<(StreamFormat, Arc<transport::RuntimeStats>)>>,
 }
 
 impl DacShared {
@@ -162,6 +163,7 @@ impl Dac {
                 config,
                 closed: AtomicBool::new(false),
                 stream: Mutex::new(None),
+                last_feedback_stream: Mutex::new(None),
             }),
         })
     }
@@ -169,6 +171,14 @@ impl Dac {
     /// The identity the host gave at open.
     pub fn info(&self) -> &DeviceInfo {
         &self.shared.info
+    }
+
+    /// Export the last stream's opt-in support capture, even after the stream
+    /// has closed. A new successfully opened stream replaces it.
+    pub fn feedback_trace(&self) -> Option<crate::FeedbackTrace> {
+        let (format, stats) = self.shared.last_feedback_stream.lock().clone()?;
+        let explicit = *stats.explicit_feedback_diagnostics.lock();
+        Some(stats.feedback_trace.as_ref()?.snapshot(format, explicit))
     }
 
     /// What the DAC offers, from the descriptors scanned at open.
@@ -226,6 +236,10 @@ impl Dac {
             }
         };
         let inner = StreamInner::new(Arc::clone(&self.shared), handle, format.clone());
+        if inner.shared.stats.feedback_trace.is_some() {
+            *self.shared.last_feedback_stream.lock() =
+                Some((format.clone(), Arc::clone(&inner.shared.stats)));
+        }
         *slot = Some(Arc::downgrade(&inner));
         drop(slot);
         inner.start_events();
@@ -351,6 +365,7 @@ mod tests {
                 config,
                 closed: AtomicBool::new(false),
                 stream: Mutex::new(None),
+                last_feedback_stream: Mutex::new(None),
             }),
         }
     }
@@ -536,6 +551,7 @@ mod tests {
             config: DacConfig::default(),
             closed: AtomicBool::new(false),
             stream: Mutex::new(None),
+            last_feedback_stream: Mutex::new(None),
         });
         let volume = VolumeControl::new(shared.clone());
 

@@ -50,9 +50,13 @@ Empty, malformed and rejected reports leave the last valid rate and timestamp
 in place. The decoder accepts exactly three bytes as 10.14 or four as 16.16,
 interprets the value per full-speed frame or high-speed microframe, and scales
 it to the OUT service interval. The capacity check rounds the required frame
-count up, since some packets carry that larger size. A device that reports in
-OUT service intervals can use a trace-backed
-[`ExplicitFeedbackPerServiceInterval` quirk](controls.md#quirks).
+count up, since some packets carry that larger size. UAC2 does not advertise
+alternate feedback units. For four-byte high-speed reports outside the
+standard rate window, the driver can test OUT service interval units against
+an independent clock readback. Three matching transfer completions are
+required. It keeps the selected timebase for the stream. A trace-backed
+[`ExplicitFeedbackPerServiceInterval` quirk](controls.md#quirks) can force the
+alternate units when clock readback is unavailable.
 
 `StreamFormat.pacing` identifies `ExplicitFeedback(endpoint)`. Live lock is
 separate. Before the first valid report the stream primes at the nominal rate

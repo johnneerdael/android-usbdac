@@ -72,6 +72,7 @@ public class DacSession private constructor(
         Thread(task, "usbdac-volume").apply { isDaemon = true }
     }
     private val closed = AtomicBoolean(false)
+    @Volatile private var closedFeedbackTrace: String? = null
     private var stream: DacStream? = null
 
     /** State of the session. */
@@ -131,6 +132,22 @@ public class DacSession private constructor(
     }
 
     /**
+     * Export the most recent stream's USB feedback support report as JSON.
+     * Available after the stream fails or closes. Closing an opted-in session
+     * retains a final copy on this session object.
+     * Returns null until an opted-in stream has opened. PCM, DSD, and capture
+     * audio are excluded. Export on demand from the app's support UI.
+     */
+    public fun feedbackTraceJson(): String? {
+        if (!config.captureFeedbackTrace) return null
+        if (closed.get()) return closedFeedbackTrace
+        return readFeedbackTrace()
+    }
+
+    private fun readFeedbackTrace(): String? =
+        nativeCall { Native.dacFeedbackTrace(dac).takeUnless { it == "null" } }
+
+    /**
      * Opens a stream in [format], the one [negotiate] returned. Switches the alternate setting,
      * re-verifies the clock and starts the output thread (100 ms or more). A new stream plays by
      * itself once the ring holds [DacConfig.startThresholdMs] of audio.
@@ -181,6 +198,11 @@ public class DacSession private constructor(
         var failure: DacException? = null
         try {
             runCatching { synchronized(this) { stream }?.close() }.onFailure { logWarning("closing the stream failed", it) }
+            if (config.captureFeedbackTrace) {
+                runCatching { readFeedbackTrace() }
+                    .onSuccess { closedFeedbackTrace = it }
+                    .onFailure { logWarning("exporting the feedback trace failed", it) }
+            }
             if (handBack == HandBack.RESTORE_ORIGINAL && mutableState.value != DacState.LOST) {
                 runCatching { volume?.handBack() }.onFailure { logWarning("restoring the volume failed", it) }
             }

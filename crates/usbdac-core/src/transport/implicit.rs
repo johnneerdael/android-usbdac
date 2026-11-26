@@ -90,11 +90,11 @@ impl ImplicitFeedback {
             startup_budget: Duration::from_micros(500_000.max(4 * geometry.transfer_us())),
             last_valid: Instant::now(), out_of_order_seen: vec![false; geometry.transfer_slots] })
     }
-    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), String> {
+    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stats: &RuntimeStats, stop: &AtomicBool) -> Result<(), String> {
         self.started = Instant::now(); self.last_valid = self.started;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if usb_stop_requested(stop) { break; }
-            slot.submit_capture(handle, self.source.address, self.source.max_packet_bytes)?;
+            slot.submit_capture(handle, self.source.address, self.source.max_packet_bytes, stats.feedback_trace.as_deref())?;
             self.order.push_back(index);
         }
         Ok(())
@@ -110,7 +110,12 @@ impl ImplicitFeedback {
         }
         while let Some(&index) = self.order.front() {
             if usb_stop_requested(stop) { break; }
-            let Some((status, _, _)) = self.slots[index].take_completion() else { break; };
+            let Some((status, completed_at, actual_bytes)) = self.slots[index].take_completion() else { break; };
+            if let Some(trace) = &stats.feedback_trace {
+                trace.record_at(completed_at, crate::FeedbackTraceEvent::Completion {
+                    slot: Some(index), status, actual_bytes,
+                });
+            }
             self.order.pop_front(); self.out_of_order_seen[index] = false;
             stats.implicit_in_transfers.fetch_add(1, Ordering::Relaxed);
             let result = if status == LIBUSB_TRANSFER_COMPLETED {
@@ -119,6 +124,14 @@ impl ImplicitFeedback {
                     self.slots[index].mark_completed();
                     return Err("implicit capture packet descriptor count changed".into());
                 } else { unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), self.scratch.len()) } };
+                if let Some(trace) = &stats.feedback_trace {
+                    for (index, descriptor) in descriptors.iter().enumerate() {
+                        trace.record(crate::FeedbackTraceEvent::ImplicitPacket {
+                            index, status: descriptor.status, requested_bytes: descriptor.length as usize,
+                            actual_bytes: descriptor.actual_length as usize,
+                        });
+                    }
+                }
                 capture_pattern(descriptors.iter().map(|p| (p.status, p.actual_length as usize, p.length as usize)),
                     self.source.bytes_per_frame, self.out_stride, self.max_out, &mut self.scratch)
             } else {
@@ -146,7 +159,12 @@ impl ImplicitFeedback {
                     if self.window_us >= 100_000 {
                         let valid = rate_window_valid(self.window_frames, self.window_us, self.rate);
                         self.bad_windows = if valid { 0 } else { self.bad_windows + 1 };
-                        stats.feedback_locked.store(valid, Ordering::Release);
+                        let previous = stats.feedback_locked.swap(valid, Ordering::AcqRel);
+                        if previous != valid {
+                            if let Some(trace) = &stats.feedback_trace {
+                                trace.record(crate::FeedbackTraceEvent::Lock { locked: valid, stale: false });
+                            }
+                        }
                         stats.feedback_rate_milli_hz.store(self.window_frames * 1_000_000_000 / self.window_us, Ordering::Relaxed);
                         self.window_frames = 0; self.window_us = 0;
                         if self.bad_windows >= 2 { return Err("implicit feedback rate outside negotiated window".into()); }
@@ -164,7 +182,7 @@ impl ImplicitFeedback {
                 }
             }
             if !usb_stop_requested(stop) {
-                self.slots[index].submit_capture(handle, self.source.address, self.source.max_packet_bytes)?;
+                self.slots[index].submit_capture(handle, self.source.address, self.source.max_packet_bytes, stats.feedback_trace.as_deref())?;
                 self.order.push_back(index);
             }
         }

@@ -54,6 +54,26 @@ or after playback begins.
 In both modes, `FEEDBACK_UNLOCKED` can appear while the driver acquires or
 reacquires timing. See [all feedback counters](controls.md#diagnostics-the-clock-and-the-pacing).
 
+### Collect a feedback support report
+
+Offer a support toggle that opens a new USB session with
+`DacConfig(captureFeedbackTrace = true)`. If you use `OutputSelector`, pass
+that configuration through `OutputPolicy.dacConfig`. Ask the listener to
+reproduce once and export `DacSession.feedbackTraceJson()`. The report stays
+available after the stream fails or closes. A closed session object retains
+its final report.
+The sample app has **Capture USB feedback for support** and **Copy feedback
+report** controls.
+
+The export includes the selected format and clock route, USB IDs and claims,
+endpoint geometry, submission errors, libusb transfer and packet statuses,
+and timestamped packet lengths. Explicit reports include up to eight raw
+bytes per observation, the decoded rate, the selected timebase and any rejection reason. Implicit
+feedback records packet metadata only. The capture retains the beginning
+and the most recent observations, and counts discarded entries. It stays
+in memory until the app exports it. Explicit feedback failures also carry a
+short summary. Include the Android version and DAC firmware when sending a report.
+
 ## Wrong pitch, or no sound at one sample rate
 
 On a DAC with more than one clock (a Clock Selector choosing between an internal oscillator and another source, or Clock Multipliers in front of a source), the sampling frequency is programmed on one Clock Source. If it goes to the wrong one, the DAC plays at the wrong pitch, or is silent at one rate while others work. Look at `clock.path` and `clock.resolution` of the `StreamFormat` that `negotiate` returned:

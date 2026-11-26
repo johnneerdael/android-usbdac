@@ -25,6 +25,21 @@ usbdac has been run on **one phone and one DAC**: a OnePlus 15 (CPH2747, Android
 
 **Reporting a problem.** Set the native log level (`UsbDac.setLogLevel`) and send the logcat of the tag `usbdac`, with the Android version, the phone, the DAC, and the source format. [Troubleshooting](troubleshooting.md) has the error codes.
 
+### AP80 Pro-X feedback units
+
+On a OnePlus 15, the Hidizs AP80 Pro-X (`c502:0072`) opened UAC2 interface 1,
+alternate setting 2, at 44.1 kHz with 16-bit stereo PCM. The clock readback
+matched. Playback used endpoint `0x01` at a 250 µs service interval. The
+four-byte feedback endpoint `0x81` was polled every 1 ms.
+
+The failing capture recorded 62 successful feedback transfers and zero
+accepted reports before the deadline. One observed report was
+`46 09 0b 00`, or about 11.0362 frames in 16.16 format. Per high-speed USB
+microframe that means about 88,289.8 Hz. Per OUT service interval it means
+about 44,144.9 Hz. The latter fits both the confirmed clock's rate window and
+the OUT packet capacity. The captured bytes are a regression vector for
+[startup timebase detection](decisions-clock.md#feedback).
+
 ## The geometry sweep {#the-geometry-sweep}
 
 From Flick pull request #400. A test-only Flick build (not part of that pull request or of usbdac) read the transfer geometry from a system property so each shape could be run from adb without a rebuild. OnePlus 15 (CPH2747, Android 16) and iBasso DC04U, 24-bit at 44.1 kHz, 10 to 20 seconds per run, and the shapes marked "x2" or "x3" were repeated with the same result. Shapes are written packets per transfer x transfers in flight.

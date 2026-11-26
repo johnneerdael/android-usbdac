@@ -190,4 +190,9 @@ public data class DacConfig @JvmOverloads constructor(
      * `false`. Default `true`.
      */
     val requireHardwareVolume: Boolean = true,
+    /**
+     * Capture a bounded report of USB feedback timing and raw explicit reports.
+     * Enable before opening a support session and export it with [DacSession.feedbackTraceJson].
+     */
+    val captureFeedbackTrace: Boolean = false,
 )

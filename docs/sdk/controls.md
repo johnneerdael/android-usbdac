@@ -38,6 +38,7 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 | `dsdSubslot` | `Int?` | `null` | Slot size (1, 2 or 4) for native DSD alternate settings. `null`: the device's quirk, else the descriptor | None |
 | `allowUnsynchronizedAsync` | `Boolean` | `false` | Permit an otherwise valid asynchronous route without usable feedback to play at the nominal rate. The host and DAC clocks can drift apart | Never bit-perfect while in use (blocker `UNSYNCHRONIZED_ASYNC`) |
 | `disableFeedback` | `Boolean` | `false` | Disable explicit and implicit feedback for this session. An asynchronous route still needs the nominal-timing opt-in | The same blocker applies if the route uses nominal asynchronous timing |
+| `captureFeedbackTrace` | `Boolean` | `false` | Retain a bounded USB feedback support report for the most recent stream. Export it with `DacSession.feedbackTraceJson()` | None |
 
 ### Quirks
 

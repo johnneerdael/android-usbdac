@@ -150,6 +150,18 @@
             android:layout_height="wrap_content"
             android:text="Allow a fixed volume (a DAC without a hardware volume plays at its own level)" />
 
+        <CheckBox
+            android:id="@+id/feedbackTraceBox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Capture USB feedback for support" />
+
+        <Button
+            android:id="@+id/copyFeedbackTraceButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Copy feedback report" />
+
         <TextView
             android:id="@+id/statusText"
             android:layout_width="match_parent"

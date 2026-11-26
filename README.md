@@ -9,6 +9,7 @@ the stream is bit-perfect, with the reason when verification fails.
 UAC2 devices and handles intermittent explicit feedback with a bounded recovery
 window. Read [how USB pacing works](docs/sdk/decisions-clock.md#feedback) or check
 your stream's [pacing and feedback lock](docs/sdk/controls.md#diagnostics-the-clock-and-the-pacing).
+For support sessions, see [collecting a USB feedback report](docs/sdk/troubleshooting.md#collect-a-feedback-support-report).
 
 | Integrating with | Start here |
 |---|---|
