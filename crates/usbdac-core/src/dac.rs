@@ -259,4 +259,75 @@ mod tests {
         let error = Dac::open(-1, DeviceInfo::new(1, 2, "x"), config).unwrap_err();
         assert!(matches!(error, Error::InvalidArgument(_)));
     }
+
+    #[test]
+    fn the_volume_handle_works_without_a_stream_and_reports_changes() {
+        use crate::events::DacEvent;
+        use crate::transport::fake_dac::Registered;
+        use crate::volume::VolumeControl;
+
+        struct Seen(Mutex<Vec<DacEvent>>);
+        impl DacListener for Seen {
+            fn on_event(&self, event: DacEvent) {
+                self.0.lock().push(event);
+            }
+        }
+
+        // Holds the process-wide test lock for the whole test.
+        let fake = Registered::new(false, true);
+        let events = EventHub::start();
+        let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+        events.set_dac_listener(Some(seen.clone()));
+        let shared = Arc::new(DacShared {
+            events: events.clone(),
+            info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
+            config: DacConfig::default(),
+            closed: AtomicBool::new(false),
+            stream: Mutex::new(None),
+        });
+        let volume = VolumeControl::new(shared.clone());
+
+        let range = volume.range().unwrap();
+        assert_eq!((range.min_db, range.max_db, range.res_db), (-80.0, 0.0, 1.0));
+        let initial = volume.get().unwrap();
+        assert_eq!(initial.db, -64.0);
+        assert_eq!(initial.muted, Some(false));
+
+        let set = volume.set_db(-30.0).unwrap();
+        assert_eq!(set.db, -30.0);
+        assert_eq!(fake.raw(), vec![-30 * 256, -30 * 256]);
+        let up = volume.step(1, 0).unwrap();
+        assert!(up.db > -30.0, "{up:?}");
+        let half = volume.set_fraction(0.5).unwrap();
+        assert!((half.fraction - 0.5).abs() < 0.01, "{half:?}");
+        assert_eq!(volume.set_mute(true).unwrap().muted, Some(true));
+        assert_eq!(volume.original_db(), None, "nothing was recorded by the fake");
+
+        // An unreachable DAC fails the call; the handle stays usable.
+        fake.dac.lock().unwrap().unreachable = true;
+        assert!(volume.get().is_err());
+        fake.dac.lock().unwrap().unreachable = false;
+
+        for _ in 0..200 {
+            if seen.0.lock().len() >= 4 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        events.shutdown();
+        let changes: Vec<f64> = seen
+            .0
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                DacEvent::VolumeChanged(state) => Some(state.db),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.len(), 4, "set_db, step, set_fraction, set_mute: {changes:?}");
+        assert_eq!(changes[0], -30.0);
+
+        shared.closed.store(true, Ordering::Release);
+        assert!(matches!(volume.get(), Err(Error::InvalidState(_))));
+    }
 }

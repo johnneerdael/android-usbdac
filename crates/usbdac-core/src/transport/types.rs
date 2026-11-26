@@ -71,6 +71,10 @@ pub(super) struct SessionState {
     pub(super) usb_stream_stable: bool,
     pub(super) bit_perfect_verified: bool,
     pub(super) software_volume_active: bool,
+    /// The open stream runs an asynchronous endpoint that has no explicit
+    /// feedback endpoint (`DacConfig::allow_unsynchronized_async`): host-paced
+    /// at the nominal rate, never bit-perfect.
+    pub(super) unsynchronized_async: bool,
     pub(super) hardware_volume_control: Option<HardwareVolumeControl>,
     pub(super) hardware_volume_generation: u64,
     pub(super) hardware_volume_error: Option<String>,
@@ -172,3 +176,63 @@ pub(super) struct StreamingInterfaceFormat {
     pub(super) sample_rate_ranges: Vec<SamplingFrequencySubrange>,
 }
 
+
+/// Why no alternate setting could be selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelectError {
+    /// Nothing carries the requested format.
+    NoMatch(String),
+    /// The only alternate settings that carry it are asynchronous endpoints with
+    /// no explicit feedback endpoint, which would need implicit feedback, and
+    /// `allow_unsynchronized_async` is off.
+    ImplicitFeedback(String),
+}
+
+impl SelectError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::NoMatch(message) | Self::ImplicitFeedback(message) => message,
+        }
+    }
+
+    pub(crate) fn into_error(self, offered: Vec<crate::capabilities::AltSetting>) -> crate::Error {
+        match self {
+            Self::NoMatch(reason) => crate::Error::Unsupported { reason, offered },
+            Self::ImplicitFeedback(_) => crate::Error::ImplicitFeedbackUnsupported,
+        }
+    }
+}
+
+/// What to do with an isochronous OUT endpoint, by how it is synchronised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointAdmission {
+    Admit,
+    /// Declares a feedback endpoint that could not be resolved: malformed, never
+    /// streamed.
+    SkipMalformed,
+    /// Asynchronous with no explicit feedback endpoint (it would need implicit
+    /// feedback) and the configuration does not allow streaming it at the
+    /// nominal rate.
+    RefuseUnsynchronized,
+}
+
+/// The admission rule for an OUT endpoint. Only an asynchronous endpoint needs a
+/// feedback endpoint to be paced correctly: adaptive and synchronous endpoints
+/// follow the host's packet timing.
+pub(crate) fn admit_endpoint(
+    sync_type: SyncType,
+    synch_address: u8,
+    feedback_resolved: bool,
+    allow_unsynchronized_async: bool,
+) -> EndpointAdmission {
+    if feedback_resolved {
+        return EndpointAdmission::Admit;
+    }
+    if synch_address != 0 {
+        return EndpointAdmission::SkipMalformed;
+    }
+    if sync_type == SyncType::Asynchronous && !allow_unsynchronized_async {
+        return EndpointAdmission::RefuseUnsynchronized;
+    }
+    EndpointAdmission::Admit
+}

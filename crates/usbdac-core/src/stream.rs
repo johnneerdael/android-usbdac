@@ -8,12 +8,67 @@ use crate::dac::DacShared;
 use crate::error::{Error, Result};
 use crate::events::StreamState;
 use crate::format::StreamFormat;
-use crate::transport::session::bit_perfect_now;
+use crate::transport::session::{bit_perfect_now, current_bit_perfect_blocker};
 use crate::transport::shared::StreamShared;
 use crate::transport::StreamHandle;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// What stands in the way of [`DacStream::is_bit_perfect`], most significant
+/// first. `None` from [`DacStream::bit_perfect_blocker`] means nothing does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BitPerfectBlocker {
+    /// The stream is closed or not running.
+    NoStream,
+    /// At least one frame queued to the DAC was never taken (latched for the
+    /// life of the stream).
+    LostFrames,
+    /// The DAC runs another rate or format than the one requested
+    /// (`RatePolicy::NearestSupported`).
+    FormatChanged,
+    /// The DAC did not confirm its sampling frequency.
+    ClockUnverified,
+    /// Software gain other than 1.0 is applied.
+    SoftwareGain,
+    /// An asynchronous endpoint without a feedback endpoint, streamed at the
+    /// nominal rate because `DacConfig::allow_unsynchronized_async` is on.
+    UnsynchronizedAsync,
+    /// The wire payload audit has not seen real audio (yet), or lost it.
+    PayloadUnverified,
+}
+
+impl BitPerfectBlocker {
+    /// Stable identifier: `no_stream`, `lost_frames`, `format_changed`,
+    /// `clock_unverified`, `software_gain`, `unsynchronized_async`,
+    /// `payload_unverified`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NoStream => "no_stream",
+            Self::LostFrames => "lost_frames",
+            Self::FormatChanged => "format_changed",
+            Self::ClockUnverified => "clock_unverified",
+            Self::SoftwareGain => "software_gain",
+            Self::UnsynchronizedAsync => "unsynchronized_async",
+            Self::PayloadUnverified => "payload_unverified",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::NoStream => "stream inactive",
+            Self::LostFrames => "audio lost on the USB transport",
+            Self::FormatChanged => "requested/effective format mismatch",
+            Self::ClockUnverified => "clock verification reset",
+            Self::SoftwareGain => "software gain active",
+            Self::UnsynchronizedAsync => {
+                "asynchronous endpoint without feedback, host-paced at the nominal rate"
+            }
+            Self::PayloadUnverified => "wire payload audit failed",
+        }
+    }
+}
 
 /// Counters of a stream. Frames are in the unit
 /// [`StreamFormat::counter_rate_hz`] gives the rate of.
@@ -22,6 +77,8 @@ use std::sync::Arc;
 pub struct StreamStats {
     pub state: StreamState,
     pub bit_perfect: bool,
+    /// Why `bit_perfect` is false, if it is.
+    pub bit_perfect_blocker: Option<BitPerfectBlocker>,
     pub software_gain: f32,
     /// Runs of padding because the ring ran dry (counted per transfer).
     pub underruns: u64,
@@ -300,6 +357,15 @@ impl DacStream {
         !self.inner.is_closed() && self.shared().note_bit_perfect()
     }
 
+    /// Why [`is_bit_perfect`](Self::is_bit_perfect) is false: `None` when it is
+    /// true, otherwise the first condition that fails.
+    pub fn bit_perfect_blocker(&self) -> Option<BitPerfectBlocker> {
+        if self.inner.is_closed() {
+            return Some(BitPerfectBlocker::NoStream);
+        }
+        current_bit_perfect_blocker()
+    }
+
     /// Scales PCM samples by `gain` (0.0 to 16.0) as each transfer is prepared,
     /// so it takes effect within the bus latency rather than the ring depth.
     /// Rounds to nearest and saturates; no dither. Any value other than 1.0
@@ -324,6 +390,7 @@ impl DacStream {
         StreamStats {
             state: shared.current_state(),
             bit_perfect: !self.inner.is_closed() && bit_perfect_now(),
+            bit_perfect_blocker: self.bit_perfect_blocker(),
             software_gain: stats.software_gain(),
             underruns: stats.underrun_count.load(Relaxed),
             lost_frames: stats.lost_frames.load(Relaxed),

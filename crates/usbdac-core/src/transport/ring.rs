@@ -1,4 +1,5 @@
 use super::*;
+use crate::ring_target::{live_processing, RingTargets};
 
 /// Counters and control flags shared between the API, the output thread and
 /// the ring. Everything is an atomic: no lock is held while reading them.
@@ -78,6 +79,9 @@ pub(crate) struct RuntimeStats {
     pub(crate) published_state: AtomicU32,
     /// The last value published through `BitPerfectChanged`.
     pub(crate) published_bit_perfect: AtomicBool,
+    /// The stream carries a DSD bitstream (DoP or native): never processed, so
+    /// never "live", whatever the gain value says.
+    pub(crate) raw_bitstream: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -168,6 +172,7 @@ impl RuntimeStats {
             closed: AtomicBool::new(false),
             published_state: AtomicU32::new(u32::MAX),
             published_bit_perfect: AtomicBool::new(false),
+            raw_bitstream: AtomicBool::new(false),
         }
     }
 
@@ -179,14 +184,13 @@ impl RuntimeStats {
         f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
     }
 
-    /// The ring depth the host is asked to keep: the shallow processing depth
-    /// while software gain is on, the normal target otherwise.
+    /// The ring depth the host is asked to keep right now: the shallow
+    /// processing depth while software gain is applied to PCM, the deep target
+    /// otherwise (see `ring_target`).
     pub(crate) fn active_target_samples(&self) -> usize {
-        if self.software_gain() != 1.0 {
-            self.processing_target_samples.min(self.buffer_target_samples)
-        } else {
-            self.buffer_target_samples
-        }
+        RingTargets::new(self.buffer_target_samples, self.processing_target_samples).select(
+            live_processing(self.raw_bitstream.load(Ordering::Relaxed), self.software_gain()),
+        )
     }
 
     /// Music frames the DAC has taken since the stream started or the ring was

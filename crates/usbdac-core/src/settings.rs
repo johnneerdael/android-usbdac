@@ -52,6 +52,10 @@ impl Settings {
         self.has(Quirk::IgnoreInvalidSampleRate)
     }
 
+    pub(crate) fn allow_unsynchronized_async(&self) -> bool {
+        self.config.allow_unsynchronized_async
+    }
+
     pub(crate) fn require_verified_rate(&self) -> bool {
         self.config.require_verified_rate || self.has(Quirk::RequireVerifiedRate)
     }

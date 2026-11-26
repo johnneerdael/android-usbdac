@@ -64,6 +64,14 @@ impl UsbDevice {
             return Err(std::io::Error::other("AudioControl interface is not claimed"));
         }
         let length = u16::try_from(data.len()).map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        {
+            if let Some(result) =
+                super::fake_dac::dispatch(self.fd, request_type, request, value, index, data)
+            {
+                return result;
+            }
+        }
         let transfer = UsbfsControlTransfer {
             request_type,
             request,

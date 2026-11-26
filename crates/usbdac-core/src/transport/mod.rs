@@ -15,6 +15,7 @@
 use crate::clock_resolution::{audio_control_descriptors_from_config, ClockGraph};
 use crate::error::Error;
 use crate::events::EventSink;
+use crate::stream::BitPerfectBlocker;
 use crate::descriptors::{
     AudioControlParser, DescriptorIter, FeatureUnit, InputTerminal, OutputTerminal,
 };
@@ -143,6 +144,8 @@ mod stream_open;
 mod types;
 mod usbfs;
 pub(crate) mod volume_hw;
+#[cfg(test)]
+pub(crate) mod fake_dac;
 #[cfg(test)]
 mod tests;
 

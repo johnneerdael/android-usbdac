@@ -146,10 +146,12 @@ pub(super) fn select_stream_candidate(
     handle: &DeviceHandle<Context>,
     playback_format: PlaybackFormat,
     speed: Speed,
-) -> Result<IsoStreamCandidate, String> {
-    let config_descriptor = device
-        .active_config_descriptor()
-        .map_err(|error| format!("Failed to read active USB config descriptor: {}", error))?;
+) -> Result<IsoStreamCandidate, SelectError> {
+    let config_descriptor = device.active_config_descriptor().map_err(|error| {
+        SelectError::NoMatch(format!("Failed to read active USB config descriptor: {}", error))
+    })?;
+    let mut refused_unsynchronized = false;
+    let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
     let dsd_subslot_override = settings().dsd_subslot_override();
@@ -296,15 +298,33 @@ pub(super) fn select_stream_candidate(
                     compatibility_penalty,
                 );
 
-                if endpoint.synch_address() != 0 && feedback_endpoint.is_none() {
-                    dev_eprintln!(
-                        "[USB] Skipping async endpoint=0x{:02x} on interface {} alt {} because feedback endpoint 0x{:02x} was not found",
-                        endpoint.address(),
-                        descriptor.interface_number(),
-                        descriptor.setting_number(),
-                        endpoint.synch_address(),
-                    );
-                    continue;
+                match admit_endpoint(
+                    endpoint.sync_type(),
+                    endpoint.synch_address(),
+                    feedback_endpoint.is_some(),
+                    allow_unsynchronized_async,
+                ) {
+                    EndpointAdmission::Admit => {}
+                    EndpointAdmission::SkipMalformed => {
+                        dev_eprintln!(
+                            "[USB] Skipping async endpoint=0x{:02x} on interface {} alt {} because feedback endpoint 0x{:02x} was not found",
+                            endpoint.address(),
+                            descriptor.interface_number(),
+                            descriptor.setting_number(),
+                            endpoint.synch_address(),
+                        );
+                        continue;
+                    }
+                    EndpointAdmission::RefuseUnsynchronized => {
+                        log_warn!(
+                            "[USB] Refusing asynchronous endpoint=0x{:02x} on interface {} alt {}: it has no explicit feedback endpoint, which would need implicit feedback",
+                            endpoint.address(),
+                            descriptor.interface_number(),
+                            descriptor.setting_number(),
+                        );
+                        refused_unsynchronized = true;
+                        continue;
+                    }
                 }
 
                 if max_packet_bytes < required_max_packet_bytes {
@@ -368,10 +388,16 @@ pub(super) fn select_stream_candidate(
         format!("{} Hz", playback_format.sample_rate)
     };
     candidates.into_iter().next().ok_or_else(|| {
-        format!(
+        if refused_unsynchronized {
+            return SelectError::ImplicitFeedback(format!(
+                "The only isochronous OUT endpoints that can carry {} / {}-bit / {} ch are asynchronous without an explicit feedback endpoint (implicit feedback is not supported)",
+                label_rate, playback_format.bit_depth, playback_format.channels
+            ));
+        }
+        SelectError::NoMatch(format!(
             "No isochronous OUT endpoint can carry {} / {}-bit / {} ch",
             label_rate, playback_format.bit_depth, playback_format.channels
-        )
+        ))
     })
 }
 

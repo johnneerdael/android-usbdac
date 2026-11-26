@@ -34,12 +34,9 @@ pub(super) fn negotiate_playback_format(
         ) {
             Ok(c) => c,
             Err(error) => {
-                set_last_error(Some(error.clone()));
-                set_direct_mode_refusal_reason(Some(error.clone()));
-                return Err(Error::Unsupported {
-                    reason: error,
-                    offered: offered_alt_settings(),
-                });
+                set_last_error(Some(error.message().to_string()));
+                set_direct_mode_refusal_reason(Some(error.message().to_string()));
+                return Err(error.into_error(offered_alt_settings()));
             }
         };
 

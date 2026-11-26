@@ -94,7 +94,8 @@ dac.close(self) -> Result<()>                      // also on drop
 - `open_stream` switches the alternate setting, re-verifies the clock and
   starts the output thread (100 ms or more). Errors include
   `ClockUnverified` (see `DacConfig::require_verified_rate`), `Unsupported`,
-  `Claim`, and `InvalidState` if a stream is already open. Only one stream at a
+  `ImplicitFeedbackUnsupported` (see "Asynchronous endpoints without feedback"
+  below), `Claim`, and `InvalidState` if a stream is already open. Only one stream at a
   time.
 - `close` stops the stream, hands the volume back as `DacConfig::hand_back`
   says, releases the session and joins the threads. After it returns another
@@ -109,13 +110,14 @@ dac.close(self) -> Result<()>                      // also on drop
 | `buffer_target_ms` | 250 | Depth `writable_bytes()` fills the ring to. |
 | `buffer_capacity_ms` | 500 | Hard capacity; `write` never accepts more. |
 | `start_threshold_ms` | 100 | Audio the ring must hold before the stream starts or resumes after `flush()`. Never above the target. |
-| `processing_buffer_target_ms` | 100 | Recommended depth while software gain is not 1.0. |
+| `processing_buffer_target_ms` | 100 | Recommended depth while software gain is not 1.0 on PCM (DoP and native DSD always keep the deep target). Nothing is flushed when the depth changes: see `writable_bytes`. |
 | `require_verified_rate` | `true` | Refuse to stream unless the DAC confirms the sampling frequency. Off: a DAC with a broken readback streams, and the stream is never bit-perfect. |
 | `clock_settle_delay_ms` | `None` | Wait after programming the clock. `None`: the device quirk, else 20 ms. |
 | `dsd_big_endian` | `None` | Native DSD byte order on the wire. `None`: the device quirk, else little-endian. |
 | `dsd_subslot` | `None` | Subslot size (1, 2, 4) for native DSD alternate settings. `None`: the device quirk, else the descriptor. |
 | `padded_24bit` | `None` | Prefer the 4-byte subslot for 24-bit PCM. `None`: the device quirk, else off. |
 | `quirks` | empty | `QuirkOverride { vendor_id, product_id, name_contains, quirks: Vec<Quirk> }`, added to the built-in table. |
+| `allow_unsynchronized_async` | `false` | Stream an asynchronous endpoint that has no explicit feedback endpoint at the nominal rate instead of refusing it (see below). |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
 
@@ -186,6 +188,7 @@ stream.played_frames() -> u64
 stream.latency_frames() -> u64
 stream.stats() -> StreamStats
 stream.is_bit_perfect() -> bool
+stream.bit_perfect_blocker() -> Option<BitPerfectBlocker>   // why not, if not
 stream.set_software_gain(f32) -> Result<()>
 stream.software_gain() -> f32
 ```
@@ -198,7 +201,10 @@ stream.software_gain() -> f32
 - `writable_bytes()` is the room up to the target depth (the shallower
   `processing_buffer_target_ms` while software gain is on), a whole number of
   frames, and 0 after `drain()`. It is the number a pull loop should write; it is
-  not a hard limit.
+  not a hard limit. When the target drops (software gain turned on), a ring that
+  is already deeper than the new target is not flushed: `writable_bytes()` is 0
+  until the output has drained it below the target, so the change is heard after
+  at most the old depth. When the target rises, the room reappears at once.
 - A new stream plays by itself once the ring holds `start_threshold_ms` of
   audio. `play()` is only needed after `pause()`.
 - `pause()` sends wire-correct silence (zero for PCM, the idle pattern for DSD,
@@ -246,6 +252,7 @@ Frame counters are in `counter_rate_hz()` units.
 | `PlatformUnsupported` | `platform_unsupported` | Not Linux or Android. |
 | `Claim(String)` | `claim` | Bad descriptor, interfaces not claimed as required, libusb could not take the descriptor. |
 | `Unsupported { reason, offered }` | `unsupported` | No alternate setting carries the request; `offered` lists what the DAC has. |
+| `ImplicitFeedbackUnsupported` | `implicit_feedback_unsupported` | The only endpoint that can carry the request is asynchronous with no explicit feedback endpoint. See below. |
 | `ClockUnverified { requested_hz, reported_hz }` | `clock_unverified` | The DAC did not confirm the rate and `require_verified_rate` is on, or it reported a different rate. |
 | `DeviceLost` | `device_lost` | Unplugged or stopped answering. |
 | `Transfer(String)` | `transfer` | An isochronous transfer or the stream machinery failed. |
@@ -254,6 +261,26 @@ Frame counters are in `counter_rate_hz()` units.
 | `InvalidArgument(String)` | `invalid_argument` | Out of range or malformed argument. |
 
 `Display` is `"<code>: <message>"`.
+
+### Asynchronous endpoints without feedback
+
+An asynchronous OUT endpoint runs on the DAC's own clock and tells the host the
+true rate through an explicit feedback endpoint. One that has no feedback
+endpoint would need *implicit* feedback (rate information carried by an
+associated IN data endpoint), which this library does not do. Left alone, the
+host's packet timing and the DAC's clock drift apart until the DAC under- or
+overruns.
+
+By default `negotiate` and `open_stream` therefore refuse such an alternate
+setting with `Error::ImplicitFeedbackUnsupported` when it is the only way to
+carry the request (a DAC that also offers a synchronised alternate setting for
+the same format uses that one). With `DacConfig::allow_unsynchronized_async` the
+stream runs at the nominal rate, host-paced; the format reports `sync_type ==
+Asynchronous` and `explicit_feedback == false`, the log says so, and
+`is_bit_perfect()` is false with `bit_perfect_blocker() ==
+Some(UnsynchronizedAsync)` for the whole stream. An endpoint that declares a
+feedback endpoint the library cannot resolve is malformed and is never streamed,
+whatever the setting.
 
 ### Descriptor parsing
 
@@ -371,12 +398,22 @@ else). A panic in a listener is caught and logged.
 3. the DAC's sampling frequency was verified (readback equal to the requested
    rate; a device whose quirk is `SkipClockValidation` is trusted on its SET_CUR);
 4. software gain is exactly 1.0;
-5. no frame was lost on the bus since the stream started (the first lost frame
+5. the endpoint is paced by the DAC's own feedback or follows the host's timing
+   (an asynchronous endpoint streamed without feedback because of
+   `allow_unsynchronized_async` is never bit-perfect);
+6. no frame was lost on the bus since the stream started (the first lost frame
    clears the flag for the life of the stream);
-6. the wire payload audit passes. For PCM the audit needs real audio: channel 0
+7. the wire payload audit passes. For PCM the audit needs real audio: channel 0
    must vary within a transfer, with a 1.5 s grace so digital silence or a
    fade does not flip the flag. For DoP the markers must alternate and agree
    across channels. For native DSD the data must not be all zero.
+
+`bit_perfect_blocker()` returns the first condition that fails, as a
+`BitPerfectBlocker`: `NoStream`, `LostFrames`, `FormatChanged`,
+`ClockUnverified`, `SoftwareGain`, `UnsynchronizedAsync`, `PayloadUnverified`
+(codes `no_stream`, `lost_frames`, `format_changed`, `clock_unverified`,
+`software_gain`, `unsynchronized_async`, `payload_unverified`), and `None` when
+the stream is bit-perfect. `StreamStats::bit_perfect_blocker` carries the same.
 
 What it does not cover: the claim is about the transport. If the host writes
 processed samples (EQ, volume applied in software, resampling), the library
@@ -394,7 +431,11 @@ means volume must be the DAC's hardware control, not software gain.
 
 `dac.volume()` returns a `VolumeControl` when the DAC's Feature Unit has a
 writable volume (UAC 1.0 or 2.0, master control or all channels). It works with
-or without a stream, as long as the `Dac` is open. The control is found through
+or without a stream, as long as the `Dac` is open: closing a stream, or a stream
+that failed, leaves the control, its ranges and the cached level and mute in
+place, and a write that is in flight is not failed by the stream stopping. The
+route changes only when a later stream plays through another Feature Unit (the
+cached level is then read again) or when the `Dac` closes. The control is found through
 the first PCM playback terminal at open and looked up again if a stream plays
 through another terminal.
 
@@ -553,7 +594,7 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 
 Every failure is a `java.lang.IllegalStateException` whose message is
 `usbdac:<code>: <message>`, with `<code>` one of `busy`, `platform_unsupported`,
-`claim`, `unsupported`, `clock_unverified`, `device_lost`, `transfer`,
+`claim`, `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
 `control`, `invalid_state`, `invalid_argument` (section 3). Malformed JSON and
 bad handles are `invalid_argument`. A Rust panic is converted to a
 `RuntimeException`.
@@ -570,7 +611,7 @@ bad handles are `invalid_argument`. A Rust panic is converted to a
 | 3 | BitPerfectChanged | 1 or 0 | 0 | null |
 | 4 | VolumeChanged | muted: 1, 0, or -1 unknown | level in dB | the volume state JSON |
 | 5 | FeedbackStale | 0 | 0 | null |
-| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument | 0 | `usbdac:<code>: <message>` |
+| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported | 0 | `usbdac:<code>: <message>` |
 | 7 | DeviceLost | 0 | 0 | null |
 
 Unknown future events arrive with `type` -1 and a debug string in `message`.
@@ -596,7 +637,7 @@ ignored.
 { "buffer_target_ms": 250, "buffer_capacity_ms": 500, "start_threshold_ms": 100,
   "processing_buffer_target_ms": 100, "require_verified_rate": true,
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
-  "padded_24bit": true, "realtime_priority": true,
+  "padded_24bit": true, "allow_unsynchronized_async": false, "realtime_priority": true,
   "hand_back": "restore_original",
   "quirks": [ { "vendor_id": 1, "product_id": 2, "name_contains": "Foo",
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
@@ -651,7 +692,8 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
 ```
 
 **Stream statistics** (`streamStats`): all `StreamStats` fields of section 3 as
-numbers (`state` is the state code; `bit_perfect` boolean; `software_gain`,
+numbers (`state` is the state code; `bit_perfect` boolean; `bit_perfect_blocker` a
+code string or `null`; `software_gain`,
 `latency_ms`, `effective_rate_hz`, `feedback_rate_hz` floating point; the
 `feedback_age_ms` and `feedback_rate_hz` entries are `null` before the first
 feedback report).

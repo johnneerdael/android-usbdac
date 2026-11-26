@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 use usbdac_core::{
-    Dac, DacConfig, DacEvent, DacListener, DacStream, DeviceInfo, Encoding, Error, HandBack,
+    BitPerfectBlocker, Dac, DacConfig, DacEvent, DacListener, DacStream, DeviceInfo, Encoding, Error,
+    HandBack,
     Quirk, QuirkOverride, RatePolicy, StreamFormat, StreamRequest, StreamState, VolumeControl,
 };
 
@@ -47,6 +48,7 @@ fn errors_have_stable_codes_and_a_readable_message() {
             },
             "clock_unverified",
         ),
+        (Error::ImplicitFeedbackUnsupported, "implicit_feedback_unsupported"),
         (Error::DeviceLost, "device_lost"),
         (Error::Transfer("x".into()), "transfer"),
         (Error::Control("x".into()), "control"),
@@ -80,6 +82,7 @@ fn a_config_is_built_from_the_defaults_with_struct_update_syntax() {
     };
     assert!(config.validate().is_ok());
     assert_eq!(config.buffer_capacity_ms, 500);
+    assert!(!config.allow_unsynchronized_async, "implicit feedback is refused by default");
 }
 
 #[test]
@@ -127,4 +130,32 @@ fn opening_without_usbfs_fails_cleanly_and_leaves_the_slot_free() {
     // fails the same way instead of reporting Busy.
     let second = Dac::open(-1, info, DacConfig::default()).unwrap_err();
     assert_eq!(first, second);
+}
+
+#[test]
+fn the_bit_perfect_blockers_have_stable_codes() {
+    let codes: Vec<&str> = [
+        BitPerfectBlocker::NoStream,
+        BitPerfectBlocker::LostFrames,
+        BitPerfectBlocker::FormatChanged,
+        BitPerfectBlocker::ClockUnverified,
+        BitPerfectBlocker::SoftwareGain,
+        BitPerfectBlocker::UnsynchronizedAsync,
+        BitPerfectBlocker::PayloadUnverified,
+    ]
+    .iter()
+    .map(|blocker| blocker.code())
+    .collect();
+    assert_eq!(
+        codes,
+        [
+            "no_stream",
+            "lost_frames",
+            "format_changed",
+            "clock_unverified",
+            "software_gain",
+            "unsynchronized_async",
+            "payload_unverified"
+        ]
+    );
 }

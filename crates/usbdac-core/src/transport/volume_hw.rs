@@ -634,7 +634,7 @@ pub(crate) fn write_mute(muted: bool) -> Result<VolumeState, String> {
 
 /// Installs `control` as the route volume calls use, unless it is the route
 /// already installed (then nothing changes, in-flight writes stay valid).
-fn install_volume_control(control: Option<HardwareVolumeControl>) {
+pub(super) fn install_volume_control(control: Option<HardwareVolumeControl>) {
     let mut guard = SESSION_STATE.lock();
     let Some(state) = guard.as_mut() else {
         return;

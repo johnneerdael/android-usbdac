@@ -36,7 +36,11 @@ meant to sit on top of the JNI layer; it is not part of this repository yet.
   asynchronously and steer the packet sizes.
 - Reporting: played frames and latency counted on completed transfers, lost
   frames (timed-out and short transfers) latched, an audit of the wire payload,
-  and `is_bit_perfect()` combining them with the clock verification.
+  and `is_bit_perfect()` combining them with the clock verification, with
+  `bit_perfect_blocker()` saying what stands in the way.
+- Pacing: asynchronous endpoints without an explicit feedback endpoint (implicit
+  feedback) are refused with `Error::ImplicitFeedbackUnsupported` unless
+  `DacConfig::allow_unsynchronized_async` streams them at the nominal rate.
 - Volume: the Feature Unit's volume and mute, with read-back verification, a dB
   and a 0..1 view, the level the DAC had before, and a hand-back on close.
 - Events through one library thread: state changes, underruns, lost frames,

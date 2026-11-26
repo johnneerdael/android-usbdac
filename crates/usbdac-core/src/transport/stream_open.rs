@@ -97,17 +97,14 @@ pub(super) fn start_stream_inner(
         match select_stream_candidate(&device, &claimed_handle.handle, playback_format, speed) {
             Ok(candidate) => candidate,
             Err(error) => {
-                set_last_error(Some(error.clone()));
-                set_direct_mode_refusal_reason(Some(error.clone()));
+                set_last_error(Some(error.message().to_string()));
+                set_direct_mode_refusal_reason(Some(error.message().to_string()));
                 set_engine_state(
                     EngineState::Error,
-                    Some(error.clone()),
+                    Some(error.message().to_string()),
                 );
                 cleanup_claimed_handle(claimed_handle, None, lock_requested);
-                return Err(Error::Unsupported {
-                    reason: error,
-                    offered: offered_alt_settings(),
-                });
+                return Err(error.into_error(offered_alt_settings()));
             }
         };
     if playback_format.dsd_transport == DsdTransportMode::Native {
@@ -944,6 +941,14 @@ pub(super) fn start_stream_inner(
 
     set_last_error(None);
     set_direct_mode_refusal_reason(None);
+    let unsynchronized_async =
+        candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none();
+    if unsynchronized_async {
+        log_warn!(
+            "[USB] Streaming an asynchronous endpoint without a feedback endpoint at the nominal rate (allow_unsynchronized_async); the stream is not bit-perfect"
+        );
+    }
+    set_unsynchronized_async(unsynchronized_async);
     set_stream_active(true);
     set_engine_state(EngineState::UsbReady, None);
     set_software_volume_active(false);

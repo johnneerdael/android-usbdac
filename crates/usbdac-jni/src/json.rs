@@ -132,6 +132,7 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
     json!({
         "state": stats.state.code(),
         "bit_perfect": stats.bit_perfect,
+        "bit_perfect_blocker": stats.bit_perfect_blocker.map(|blocker| blocker.code()),
         "software_gain": stats.software_gain,
         "underruns": stats.underruns,
         "lost_frames": stats.lost_frames,
@@ -190,6 +191,7 @@ pub fn error_code(error: &Error) -> i64 {
         Error::Control(_) => 8,
         Error::InvalidState(_) => 9,
         Error::InvalidArgument(_) => 10,
+        Error::ImplicitFeedbackUnsupported => 11,
         _ => 0,
     }
 }
@@ -397,6 +399,9 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
         config.dsd_subslot = Some(narrow(subslot, "dsd_subslot")?);
     }
     config.padded_24bit = boolean(map, "padded_24bit")?;
+    if let Some(value) = boolean(map, "allow_unsynchronized_async")? {
+        config.allow_unsynchronized_async = value;
+    }
     if let Some(value) = boolean(map, "realtime_priority")? {
         config.realtime_priority = value;
     }
@@ -479,7 +484,7 @@ mod tests {
         assert_eq!(info.device_name.as_deref(), Some("/dev/bus/usb/001/004"));
 
         let config = parse_config(Some(
-            r#"{"buffer_target_ms":200,"require_verified_rate":false,"hand_back":"keep",
+            r#"{"buffer_target_ms":200,"require_verified_rate":false,"hand_back":"keep", "allow_unsynchronized_async":true,
                 "dsd_big_endian":true,
                 "quirks":[{"vendor_id":1,"product_id":2,"name_contains":"X",
                            "quirks":["skip_clock_validation",{"settle_delay_ms":80},{"dsd_subslot_size":2}]}]}"#,
@@ -489,6 +494,7 @@ mod tests {
         assert_eq!(config.buffer_target_ms, 200);
         assert!(!config.require_verified_rate);
         assert_eq!(config.hand_back, HandBack::Keep);
+        assert!(config.allow_unsynchronized_async);
         assert_eq!(config.dsd_big_endian, Some(true));
         assert_eq!(config.quirks.len(), 1);
         assert_eq!(

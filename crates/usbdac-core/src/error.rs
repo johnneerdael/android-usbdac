@@ -24,6 +24,13 @@ pub enum Error {
         reason: String,
         offered: Vec<AltSetting>,
     },
+    /// The only way to stream the request is an asynchronous endpoint that has
+    /// no explicit feedback endpoint, which would need implicit feedback (an
+    /// associated IN data endpoint). That is not supported: without feedback the
+    /// DAC's clock and the host's packet timing drift apart. Set
+    /// [`DacConfig::allow_unsynchronized_async`](crate::DacConfig::allow_unsynchronized_async)
+    /// to stream it at the nominal rate anyway (never bit-perfect).
+    ImplicitFeedbackUnsupported,
     /// The DAC would not confirm the sampling frequency, and the
     /// configuration requires a verified rate
     /// ([`DacConfig::require_verified_rate`](crate::DacConfig::require_verified_rate)).
@@ -46,7 +53,7 @@ pub enum Error {
 
 impl Error {
     /// Stable identifier: `busy`, `platform_unsupported`, `claim`,
-    /// `unsupported`, `clock_unverified`, `device_lost`, `transfer`,
+    /// `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
     /// `control`, `invalid_state`, `invalid_argument`.
     pub fn code(&self) -> &'static str {
         match self {
@@ -54,6 +61,7 @@ impl Error {
             Self::PlatformUnsupported => "platform_unsupported",
             Self::Claim(_) => "claim",
             Self::Unsupported { .. } => "unsupported",
+            Self::ImplicitFeedbackUnsupported => "implicit_feedback_unsupported",
             Self::ClockUnverified { .. } => "clock_unverified",
             Self::DeviceLost => "device_lost",
             Self::Transfer(_) => "transfer",
@@ -78,6 +86,7 @@ impl Error {
             Self::Unsupported { reason, offered } => {
                 format!("{reason} ({} alternate setting(s) offered)", offered.len())
             }
+            Self::ImplicitFeedbackUnsupported => "the DAC's asynchronous endpoint has no explicit feedback endpoint and would need implicit feedback, which is not supported (DacConfig::allow_unsynchronized_async streams it at the nominal rate, never bit-perfect)".to_string(),
             Self::ClockUnverified {
                 requested_hz,
                 reported_hz,

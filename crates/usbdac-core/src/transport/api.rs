@@ -129,10 +129,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     let speed = resolve_device_speed(&usb_device);
     let candidate = select_stream_candidate(&usb_device, &handle.handle, effective, speed);
     cleanup_claimed_handle(handle, None, lock_requested);
-    let candidate = candidate.map_err(|reason| Error::Unsupported {
-        reason,
-        offered: offered_alt_settings(),
-    })?;
+    let candidate = candidate.map_err(|error| error.into_error(offered_alt_settings()))?;
 
     let native = effective.dsd_transport == DsdTransportMode::Native;
     Ok(StreamFormat {

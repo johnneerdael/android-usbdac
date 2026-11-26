@@ -160,34 +160,10 @@ pub(super) fn log_bit_perfect_transition(verified: bool, state: &SessionState) {
 }
 
 pub(super) fn bit_perfect_release_reason(state: &SessionState) -> &'static str {
-    if !state.stream_active {
-        return "stream inactive";
+    match bit_perfect_blocker(state) {
+        Some(blocker) => blocker.description(),
+        None => "wire payload audit failed",
     }
-    if !state.clock_verification_passed {
-        return "clock verification reset";
-    }
-    if state.software_volume_active {
-        return "software gain active";
-    }
-    let format_mismatch = state
-        .requested_playback_format
-        .zip(state.playback_format)
-        .is_some_and(|(requested, effective)| {
-            requested.sample_rate != effective.sample_rate
-                || requested.bit_depth != effective.bit_depth
-                || requested.channels != effective.channels
-        });
-    if format_mismatch {
-        return "requested/effective format mismatch";
-    }
-    if state
-        .runtime_stats
-        .as_ref()
-        .is_some_and(|stats| stats.transport_loss_latched())
-    {
-        return "audio lost on the USB transport";
-    }
-    "wire payload audit failed"
 }
 
 /// The bit-perfect verdict for the open stream, logging the transition. False
@@ -275,6 +251,7 @@ pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
         usb_stream_stable: false,
         bit_perfect_verified: false,
         software_volume_active: false,
+        unsynchronized_async: false,
         hardware_volume_control: None,
         hardware_volume_generation: HARDWARE_VOLUME_GENERATION.fetch_add(1, Ordering::Relaxed),
         hardware_volume_error: None,
@@ -337,6 +314,12 @@ pub(super) fn set_direct_mode_refusal_reason(reason: Option<String>) {
 pub(super) fn set_usb_stream_stable(stable: bool) {
     if let Some(state) = SESSION_STATE.lock().as_mut() {
         state.usb_stream_stable = stable;
+    }
+}
+
+pub(super) fn set_unsynchronized_async(active: bool) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.unsynchronized_async = active;
     }
 }
 
@@ -433,9 +416,11 @@ pub(super) fn set_clock_verification(
     }
 }
 
-pub(super) fn direct_path_is_bit_perfect(state: &SessionState) -> bool {
+/// What stands in the way of a bit-perfect claim, if anything. The order is the
+/// order of precedence of the reported reason.
+pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBlocker> {
     if !state.stream_active {
-        return false;
+        return Some(BitPerfectBlocker::NoStream);
     }
 
     // Audio that was queued but never reached the DAC cannot be re-sent, so a
@@ -446,32 +431,51 @@ pub(super) fn direct_path_is_bit_perfect(state: &SessionState) -> bool {
         .as_ref()
         .is_some_and(|stats| stats.transport_loss_latched())
     {
-        return false;
+        return Some(BitPerfectBlocker::LostFrames);
     }
 
-    let Some(requested) = state.requested_playback_format else {
-        return false;
-    };
-    let Some(effective) = state.playback_format else {
-        return false;
+    let (Some(requested), Some(effective)) = (state.requested_playback_format, state.playback_format)
+    else {
+        return Some(BitPerfectBlocker::NoStream);
     };
 
     // Bit-perfect requires: the format the host asked for (no rate change), a
-    // verified clock, no software gain, no lost audio (checked above), and a
-    // live wire payload that passed the audit (the PCM payload audit, or for
-    // DSD the DoP-marker / native-byte audit).
+    // verified clock, no software gain, an endpoint the DAC paces through its own
+    // feedback, no lost audio (checked above), and a live wire payload that
+    // passed the audit (the PCM payload audit, or for DSD the DoP-marker /
+    // native-byte audit).
+    if requested.sample_rate != effective.sample_rate
+        || requested.bit_depth != effective.bit_depth
+        || requested.channels != effective.channels
+    {
+        return Some(BitPerfectBlocker::FormatChanged);
+    }
+    if !state.clock_verification_passed {
+        return Some(BitPerfectBlocker::ClockUnverified);
+    }
     if state.software_volume_active {
-        return false;
+        return Some(BitPerfectBlocker::SoftwareGain);
+    }
+    if state.unsynchronized_async {
+        return Some(BitPerfectBlocker::UnsynchronizedAsync);
     }
     let payload_ok = match effective.dsd_transport {
         DsdTransportMode::DoP | DsdTransportMode::Native => usb_dsd_payload_verified(),
         DsdTransportMode::None => usb_pcm_payload_verified(),
     };
-    requested.sample_rate == effective.sample_rate
-        && requested.bit_depth == effective.bit_depth
-        && requested.channels == effective.channels
-        && state.clock_verification_passed
-        && payload_ok
+    (!payload_ok).then_some(BitPerfectBlocker::PayloadUnverified)
+}
+
+pub(super) fn direct_path_is_bit_perfect(state: &SessionState) -> bool {
+    bit_perfect_blocker(state).is_none()
+}
+
+/// The blocker for the open stream; `NoStream` when none is open.
+pub(crate) fn current_bit_perfect_blocker() -> Option<BitPerfectBlocker> {
+    match SESSION_STATE.lock().as_ref() {
+        Some(state) => bit_perfect_blocker(state),
+        None => Some(BitPerfectBlocker::NoStream),
+    }
 }
 
 pub(super) fn set_effective_playback_format(mut playback_format: PlaybackFormat) {
@@ -505,8 +509,40 @@ pub(super) fn set_dac_mode(mode: DacMode) {
 }
 
 pub(super) fn set_stream_active(active: bool) {
+    // Read before the state lock is taken: the two are never held together.
+    let idle_lock_held = IDLE_LOCK.lock().is_some();
     if let Some(state) = SESSION_STATE.lock().as_mut() {
-        state.stream_active = active;
+        state.set_stream_active(active, idle_lock_held);
+    }
+}
+
+impl SessionState {
+    /// Records the stream starting or stopping.
+    ///
+    /// The DAC's volume control belongs to its AudioControl interface, not to the
+    /// isochronous stream: its requests are synchronous control transfers on the
+    /// registered device. While the idle lock keeps the DAC claimed after the
+    /// stream stops (a track change, a stream closed and not yet reopened), the
+    /// control, its ranges and the cached level and mute therefore stay valid,
+    /// and so does a write that was in flight. The generation is not bumped
+    /// either: the route has not changed, and the next stream's discovery bumps
+    /// it when it finds a different control.
+    ///
+    /// Without the idle lock nothing keeps the platform's USB audio driver off
+    /// the DAC once the stream has stopped, so the control and what was read
+    /// through it are dropped, and writes in flight against it fail as a changed
+    /// route.
+    pub(super) fn set_stream_active(&mut self, active: bool, idle_lock_held: bool) {
+        self.stream_active = active;
+        if !active {
+            self.unsynchronized_async = false;
+        }
+        if !active && !idle_lock_held {
+            self.hardware_volume_control = None;
+            self.hardware_volume_state = None;
+            self.hardware_volume_generation =
+                HARDWARE_VOLUME_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -607,6 +643,7 @@ pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionSta
         usb_stream_stable: false,
         bit_perfect_verified: false,
         software_volume_active: false,
+        unsynchronized_async: false,
         hardware_volume_control: None,
         hardware_volume_generation: 0,
         hardware_volume_error: None,

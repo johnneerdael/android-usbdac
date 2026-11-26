@@ -70,6 +70,14 @@ pub struct DacConfig {
     pub padded_24bit: Option<bool>,
     /// Quirks added to the built-in table for this session.
     pub quirks: Vec<QuirkOverride>,
+    /// Allow streaming an asynchronous endpoint that has no explicit feedback
+    /// endpoint (it would need implicit feedback, which is not supported). By
+    /// default `negotiate` and `open_stream` refuse it with
+    /// [`Error::ImplicitFeedbackUnsupported`]. Allowed, it streams at the nominal
+    /// rate, host-paced, and any drift between the DAC's clock and the host's
+    /// timing ends in underruns or overruns on the DAC; the stream is never
+    /// bit-perfect (`DacStream::bit_perfect_blocker` says why). Default `false`.
+    pub allow_unsynchronized_async: bool,
     /// Ask for `SCHED_FIFO` (nice -16 as a fallback) on the output thread.
     /// Android only; ignored elsewhere. Default `true`.
     pub realtime_priority: bool,
@@ -90,6 +98,7 @@ impl Default for DacConfig {
             dsd_subslot: None,
             padded_24bit: None,
             quirks: Vec::new(),
+            allow_unsynchronized_async: false,
             realtime_priority: true,
             hand_back: HandBack::default(),
         }
@@ -136,6 +145,7 @@ mod tests {
         assert_eq!(config.processing_buffer_target_ms, 100);
         assert!(config.require_verified_rate);
         assert!(config.realtime_priority);
+        assert!(!config.allow_unsynchronized_async);
         assert_eq!(config.hand_back, HandBack::RestoreOriginal);
         config.validate().unwrap();
     }

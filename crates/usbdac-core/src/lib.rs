@@ -47,6 +47,7 @@ mod output_position;
 mod payload_audit_latch;
 mod priority;
 mod quirk;
+mod ring_target;
 mod settings;
 mod stream;
 mod transport;
@@ -65,7 +66,7 @@ pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use quirk::Quirk;
-pub use stream::{DacStream, StreamStats};
+pub use stream::{BitPerfectBlocker, DacStream, StreamStats};
 pub use volume::{VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS};
 
 /// Compiles the README's example as a doctest so it cannot rot.

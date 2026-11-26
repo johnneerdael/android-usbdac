@@ -1,6 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::events::{DacEvent, EventSink, StreamState};
+use crate::ring_target::needs_refill;
 
 /// Everything the host-facing stream handle, the output thread and the event
 /// bridge share: the ring, the counters and the lifecycle flags.
@@ -21,6 +22,10 @@ impl StreamShared {
         playback_format: PlaybackFormat,
         subslot_size: u8,
     ) -> Self {
+        stats.raw_bitstream.store(
+            playback_format.dsd_transport != DsdTransportMode::None,
+            Ordering::Relaxed,
+        );
         Self {
             ring,
             channels: stats.channels,
@@ -113,13 +118,17 @@ impl StreamShared {
             return 0;
         }
         let queued = self.stats.buffered_samples.load(Ordering::Acquire);
-        let room = self
+        let target = self
             .stats
             .active_target_samples()
-            .min(self.stats.buffer_capacity_samples)
-            .saturating_sub(queued);
+            .min(self.stats.buffer_capacity_samples);
+        // Above the target (the target just dropped) nothing is wanted until the
+        // output has drained the ring below it; nothing is flushed.
+        if !needs_refill(queued, target) {
+            return 0;
+        }
         let bytes_per_sample = if self.native_dsd() { 1 } else { self.subslot_bytes };
-        room * bytes_per_sample / self.wire_frame_bytes() * self.wire_frame_bytes()
+        (target - queued) * bytes_per_sample / self.wire_frame_bytes() * self.wire_frame_bytes()
     }
 
     pub(crate) fn set_paused(&self, paused: bool) {

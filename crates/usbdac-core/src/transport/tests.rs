@@ -1090,6 +1090,59 @@ mod push_stream_tests {
     }
 
     #[test]
+    fn a_gain_change_moves_the_target_without_flushing_the_ring() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        let _session = TestSession::install_streaming(Arc::clone(&rig.shared.stats));
+        let stats = Arc::clone(&rig.shared.stats);
+        let deep = stats.buffer_target_samples;
+        let live = stats.processing_target_samples;
+
+        // Fill to the deep target at unity gain: nothing more is wanted.
+        let chunk = vec![5u8; rig.shared.writable_bytes()];
+        rig.shared.write_bytes(&chunk).unwrap();
+        assert_eq!(stats.buffered_samples.load(Ordering::Relaxed), deep);
+        assert_eq!(rig.shared.writable_bytes(), 0);
+        let epoch = stats.flush_epoch.load(Ordering::Relaxed);
+
+        // Gain on: the shallow target applies. The ring is above it, so nothing
+        // is wanted, and nothing is dropped: it simply drains.
+        rig.shared.set_software_gain(0.5).unwrap();
+        assert_eq!(rig.shared.writable_bytes(), 0);
+        assert_eq!(stats.buffered_samples.load(Ordering::Relaxed), deep);
+        assert_eq!(stats.flush_epoch.load(Ordering::Relaxed), epoch, "no flush");
+
+        // The output drains the ring (prepare pops it) down to the shallow
+        // target; only below it does the host get room again.
+        while stats.buffered_samples.load(Ordering::Relaxed) > live {
+            assert_eq!(rig.shared.writable_bytes(), 0);
+            rig.prepare();
+        }
+        assert_eq!(rig.shared.writable_bytes(), 0);
+        rig.prepare();
+        let queued = stats.buffered_samples.load(Ordering::Relaxed);
+        assert!(queued < live);
+        assert_eq!(rig.shared.writable_bytes(), (live - queued) * 2 / 4 * 4);
+
+        // Gain off again: the deep target applies and the room grows to it.
+        rig.shared.set_software_gain(1.0).unwrap();
+        assert_eq!(rig.shared.writable_bytes(), (deep - queued) * 2 / 4 * 4);
+        assert_eq!(stats.flush_epoch.load(Ordering::Relaxed), epoch);
+    }
+
+    #[test]
+    fn a_dsd_bitstream_always_keeps_the_deep_target() {
+        let dop = Rig::new(3, 24, 2, DsdTransportMode::DoP);
+        let native = Rig::new(4, 1, 2, DsdTransportMode::Native);
+        for rig in [&dop, &native] {
+            let stats = &rig.shared.stats;
+            // Even a gain value that could only come from a bug is not "live".
+            stats.gain_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+            assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
+        }
+    }
+
+    #[test]
     fn writable_bytes_fills_to_the_target_and_shrinks_with_software_gain() {
         let _globals = lock_globals();
         let rig = Rig::pcm(2, 16);
@@ -1398,5 +1451,317 @@ mod push_stream_tests {
             .count();
         assert_eq!(underruns, 2, "{events:?}");
         rig.hub.shutdown();
+    }
+}
+
+/// The DAC's volume control, level and mute are the registration's, not the
+/// stream's: they stay usable while the idle lock holds a DAC whose stream has
+/// closed, and they go with the registration.
+#[cfg(test)]
+mod hardware_volume_without_a_stream_tests {
+    use super::fake_dac::{control, device, state, Registered, ORIGINAL_RAW};
+    use super::*;
+
+    #[test]
+    fn a_stopped_stream_keeps_the_control_while_the_idle_lock_holds_the_dac() {
+        let mut stopped = state(true, Some(control()));
+        let (generation, level) = (stopped.hardware_volume_generation, stopped.hardware_volume_state);
+
+        stopped.set_stream_active(false, true);
+
+        assert!(!stopped.stream_active);
+        assert!(stopped.hardware_volume_control.is_some());
+        assert_eq!(stopped.hardware_volume_state, level);
+        assert_eq!(stopped.hardware_volume_generation, generation);
+    }
+
+    #[test]
+    fn a_stopped_stream_without_the_idle_lock_drops_the_control() {
+        let mut stopped = state(true, Some(control()));
+        let generation = stopped.hardware_volume_generation;
+
+        stopped.set_stream_active(false, false);
+
+        assert!(!stopped.stream_active);
+        assert!(stopped.hardware_volume_control.is_none());
+        assert_eq!(stopped.hardware_volume_state, None);
+        assert_ne!(stopped.hardware_volume_generation, generation);
+    }
+
+    #[test]
+    fn a_starting_stream_changes_nothing() {
+        let mut starting = state(false, Some(control()));
+        let generation = starting.hardware_volume_generation;
+
+        starting.set_stream_active(true, false);
+
+        assert!(starting.stream_active);
+        assert!(starting.hardware_volume_control.is_some());
+        assert_eq!(starting.hardware_volume_generation, generation);
+    }
+
+    #[test]
+    fn level_mute_and_readback_work_with_the_stream_stopped() {
+        let dac = Registered::new(true, true);
+        dac.stop_stream_holding_the_dac();
+        let generation = dac.generation();
+        assert!(has_hardware_volume());
+
+        let written = write_volume_fraction(0.5).unwrap();
+        let wrote = quantize_volume(0.5, &control().ranges);
+        assert_eq!(dac.raw(), vec![wrote, wrote]);
+        assert_eq!(written.db, f64::from(wrote) / 256.0);
+        assert_eq!(cached_volume_state(), Some(written));
+
+        let muted = write_mute(true).unwrap();
+        assert!(dac.dac.lock().unwrap().muted);
+        assert_eq!(muted.muted, Some(true));
+        assert_eq!(cached_volume_state().unwrap().muted, Some(true));
+        assert_eq!(cached_volume_state().unwrap().db, written.db);
+
+        // A knob turned on the DAC is seen by the readback.
+        dac.dac.lock().unwrap().volume = [ORIGINAL_RAW; 3];
+        let seen = read_volume_state().unwrap();
+        assert_eq!(seen.db, f64::from(ORIGINAL_RAW) / 256.0);
+        assert_eq!(cached_volume_state(), Some(seen));
+
+        // None of it was a change of route.
+        assert_eq!(dac.generation(), generation);
+        assert!(!SESSION_STATE.lock().as_ref().unwrap().stream_active);
+    }
+
+    #[test]
+    fn db_and_step_writes_work_with_the_stream_stopped_and_are_verified() {
+        let dac = Registered::new(true, true);
+        dac.stop_stream_holding_the_dac();
+
+        let state = write_volume_db(-30.4).unwrap();
+        assert_eq!(state.db, -30.0, "snapped to the DAC's 1 dB steps");
+        assert_eq!(dac.raw(), vec![-30 * 256, -30 * 256]);
+        let up = step_volume(1, 16).unwrap();
+        assert!(up.db > -30.0);
+        let down = step_volume(-1, 16).unwrap();
+        assert!(down.db < up.db);
+        // Reading is a step of zero.
+        assert_eq!(step_volume(0, 16).unwrap(), down);
+    }
+
+    #[test]
+    fn a_dac_that_cannot_be_reached_fails_the_write_without_losing_the_control() {
+        let dac = Registered::new(true, true);
+        dac.stop_stream_holding_the_dac();
+        dac.dac.lock().unwrap().unreachable = true;
+
+        assert!(write_volume_fraction(0.5).is_err());
+        assert!(read_volume_state().is_err());
+
+        // The error is the DAC's; the control is still the registration's.
+        assert!(has_hardware_volume());
+        dac.dac.lock().unwrap().unreachable = false;
+        write_volume_fraction(0.5).unwrap();
+    }
+
+    #[test]
+    fn a_write_in_flight_is_not_failed_by_the_stream_stopping() {
+        let dac = Registered::new(true, true);
+        let (arrived_tx, arrived) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        dac.dac.lock().unwrap().hold_next_volume_write = Some((arrived_tx, release_rx));
+
+        let write = thread::spawn(|| write_volume_fraction(0.25));
+        arrived.recv_timeout(Duration::from_secs(5)).expect("the write reached the DAC");
+        let generation = dac.generation();
+        dac.stop_stream_holding_the_dac();
+        assert_eq!(dac.generation(), generation, "a stopped stream is not a new route");
+        release.send(()).unwrap();
+
+        let state = write.join().unwrap().unwrap();
+        let wrote = quantize_volume(0.25, &control().ranges);
+        assert_eq!(dac.raw(), vec![wrote, wrote]);
+        assert_eq!(cached_volume_state(), Some(state));
+    }
+
+    #[test]
+    fn the_stream_that_follows_keeps_the_same_route_and_replaces_a_different_one() {
+        let dac = Registered::new(true, true);
+        dac.stop_stream_holding_the_dac();
+        let generation = dac.generation();
+        let level = cached_volume_state();
+
+        // Discovery at the next stream start finds the same Feature Unit: the
+        // route is the same route, so a write that is in flight stays valid.
+        install_volume_control(Some(control()));
+        assert_eq!(dac.generation(), generation);
+        assert_eq!(cached_volume_state(), level);
+        assert!(has_hardware_volume());
+
+        // A stream on another terminal finds another unit: a new route, read again.
+        let mut other = control();
+        other.feature_unit_id += 1;
+        install_volume_control(Some(other));
+        assert_ne!(dac.generation(), generation);
+        assert_eq!(cached_volume_state(), None, "read again, not carried over");
+        assert!(has_hardware_volume());
+    }
+
+    #[test]
+    fn clearing_the_registration_ends_the_control() {
+        let dac = Registered::new(true, true);
+        dac.stop_stream_holding_the_dac();
+
+        clear_session_state();
+
+        assert!(!has_hardware_volume());
+        assert!(write_volume_fraction(0.5).is_err());
+        assert!(write_mute(true).is_err());
+        assert!(read_volume_state().is_err());
+        assert!(dac.dac.lock().unwrap().volume_writes.is_empty());
+    }
+
+    #[test]
+    fn the_original_level_is_handed_back_after_the_stream_closed() {
+        let dac = Registered::new(true, true);
+        // Found with the first stream, before the library wrote anything.
+        dac.dac.lock().unwrap().volume = [ORIGINAL_RAW; 3];
+        {
+            let _hold = HARDWARE_VOLUME_MUTEX.lock();
+            note_original_hardware_volume(&device(), &control());
+        }
+        write_volume_fraction(0.2).unwrap();
+        assert_ne!(dac.raw(), vec![ORIGINAL_RAW; 2]);
+        dac.stop_stream_holding_the_dac();
+        assert_eq!(original_volume_db(), Some(-20.0));
+
+        // The host hands the DAC to another driver: close with the restore action.
+        assert!(set_original_volume_action(ORIGINAL_VOLUME_RESTORE));
+        clear_session_state();
+
+        assert_eq!(dac.raw(), vec![ORIGINAL_RAW; 2]);
+        assert!(SESSION_STATE.lock().is_none());
+    }
+
+    #[test]
+    fn hand_back_restores_the_original_with_the_stream_stopped_and_ends_the_record() {
+        let dac = Registered::new(true, true);
+        dac.dac.lock().unwrap().volume = [ORIGINAL_RAW; 3];
+        {
+            let _hold = HARDWARE_VOLUME_MUTEX.lock();
+            note_original_hardware_volume(&device(), &control());
+        }
+        write_volume_fraction(0.9).unwrap();
+        dac.stop_stream_holding_the_dac();
+
+        assert_eq!(hand_back_original_volume(), Ok(true));
+        assert_eq!(dac.raw(), vec![ORIGINAL_RAW; 2]);
+        assert_eq!(original_volume_db(), None, "the record ends once handed back");
+        assert_eq!(hand_back_original_volume(), Ok(false));
+    }
+}
+
+/// Asynchronous endpoints without an explicit feedback endpoint need implicit
+/// feedback, which is not supported: they are refused unless the configuration
+/// allows streaming them at the nominal rate, and then never bit-perfect.
+#[cfg(test)]
+mod unsynchronized_async_tests {
+    use super::fake_dac::{control, state};
+    use super::*;
+    use crate::capabilities::AltSetting;
+
+    #[test]
+    fn an_async_endpoint_with_feedback_is_admitted() {
+        for allow in [false, true] {
+            assert_eq!(
+                admit_endpoint(SyncType::Asynchronous, 0x81, true, allow),
+                EndpointAdmission::Admit
+            );
+        }
+    }
+
+    #[test]
+    fn an_async_endpoint_without_feedback_is_refused_unless_allowed() {
+        assert_eq!(
+            admit_endpoint(SyncType::Asynchronous, 0, false, false),
+            EndpointAdmission::RefuseUnsynchronized
+        );
+        assert_eq!(
+            admit_endpoint(SyncType::Asynchronous, 0, false, true),
+            EndpointAdmission::Admit
+        );
+    }
+
+    #[test]
+    fn a_declared_but_unresolvable_feedback_endpoint_is_never_streamed() {
+        for allow in [false, true] {
+            assert_eq!(
+                admit_endpoint(SyncType::Asynchronous, 0x81, false, allow),
+                EndpointAdmission::SkipMalformed
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_and_synchronous_endpoints_need_no_feedback() {
+        for sync in [SyncType::Adaptive, SyncType::Synchronous, SyncType::NoSync] {
+            for allow in [false, true] {
+                assert_eq!(admit_endpoint(sync, 0, false, allow), EndpointAdmission::Admit);
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_its_own_error_and_a_plain_mismatch_stays_unsupported() {
+        let refusal = SelectError::ImplicitFeedback("async, no feedback".into());
+        assert_eq!(
+            refusal.into_error(Vec::<AltSetting>::new()),
+            crate::Error::ImplicitFeedbackUnsupported
+        );
+        let mismatch = SelectError::NoMatch("no 7.1".into());
+        assert!(matches!(
+            mismatch.into_error(Vec::new()),
+            crate::Error::Unsupported { ref reason, .. } if reason == "no 7.1"
+        ));
+    }
+
+    #[test]
+    fn a_nominal_rate_async_stream_is_never_bit_perfect_and_says_why() {
+        let _globals = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        USB_PCM_PAYLOAD_LATCH.lock().reset();
+        USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
+        let mut stream = state(true, Some(control()));
+        assert_eq!(bit_perfect_blocker(&stream), None);
+        assert!(direct_path_is_bit_perfect(&stream));
+
+        stream.unsynchronized_async = true;
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::UnsynchronizedAsync)
+        );
+        assert!(!direct_path_is_bit_perfect(&stream));
+        assert!(bit_perfect_release_reason(&stream).contains("asynchronous endpoint without feedback"));
+
+        // The flag belongs to the stream: it ends with it.
+        stream.set_stream_active(false, true);
+        assert!(!stream.unsynchronized_async);
+    }
+
+    #[test]
+    fn the_blockers_are_reported_in_order_of_precedence() {
+        let _globals = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        USB_PCM_PAYLOAD_LATCH.lock().reset();
+        let mut stream = state(true, None);
+        // Nothing audited yet.
+        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::PayloadUnverified));
+        USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
+        assert_eq!(bit_perfect_blocker(&stream), None);
+
+        stream.software_volume_active = true;
+        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::SoftwareGain));
+        stream.clock_verification_passed = false;
+        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::ClockUnverified));
+        stream.requested_playback_format.as_mut().unwrap().sample_rate = 96_000;
+        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::FormatChanged));
+        stream.stream_active = false;
+        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::NoStream));
+        assert_eq!(BitPerfectBlocker::UnsynchronizedAsync.code(), "unsynchronized_async");
     }
 }
