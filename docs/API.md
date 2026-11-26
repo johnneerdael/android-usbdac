@@ -486,8 +486,11 @@ For four-byte high-speed reports, the driver first tests the USB microframe
 interpretation. If it is outside the nominal-rate tolerance and post-alt
 `GET_CUR` independently confirmed the clock, the driver can test the OUT
 service interval. Three separate completions must support that interpretation
-and fit the OUT packet capacity. The selected timebase is kept for the
-stream. The feedback poll interval defines when to read a report.
+and fit the OUT packet capacity. The driver remembers learned units for the
+same USB route while the DAC session stays open. A later stream still checks
+its clock and validates a fresh report. A valid standard report takes
+precedence, and feedback lock starts fresh on every stream. The feedback
+poll interval defines when to read a report.
 
 `Quirk::ExplicitFeedbackPerServiceInterval` can force the alternate units
 when a trace establishes them and clock readback is unavailable. Scope the
@@ -519,7 +522,8 @@ out, 3 cancelled, 4 stall, 5 no device and 6 overflow. The summary's status
 array uses index 7 for unknown or unreported values. Submit entries contain
 the return code from `libusb_submit_transfer`. `explicit` is null for other
 pacing modes. The `timebase` event and summary identify the selected units
-and whether the driver inferred them. Before a captured stream opens, `dacFeedbackTrace` returns JSON
+and whether the driver inferred them. The summary's `reused_timebase` field
+indicates reuse from the open DAC session. Before a captured stream opens, `dacFeedbackTrace` returns JSON
 `null`.
 
 ### Descriptor parsing

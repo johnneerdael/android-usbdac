@@ -65,7 +65,8 @@ reproduce once and export `DacSession.feedbackTraceJson()`. The report stays
 available after the stream fails or closes. A closed session object retains
 its final report.
 The sample app has **Capture USB feedback for support** and **Copy feedback
-report** controls.
+report** controls. It keeps the most recent captured report available after
+Stop or USB disconnect.
 
 The export includes the selected format and clock route, USB IDs and claims,
 endpoint geometry, submission errors, libusb transfer and packet statuses,

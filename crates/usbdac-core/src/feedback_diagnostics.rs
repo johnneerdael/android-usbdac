@@ -131,6 +131,8 @@ pub struct ExplicitFeedbackDiagnostics {
     pub post_alt_readback_hz: Option<u32>,
     pub timebase: Option<&'static str>,
     pub inferred_timebase: bool,
+    /// The current stream validated units already learned on this DAC session.
+    pub reused_timebase: bool,
     pub successful_submissions: u64,
     pub submit_failures: u64,
     /// libusb submission error code, separate from completion status.
@@ -332,7 +334,7 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
                 "feedback ep=0x{:02x} {} {} if={} alt={} bInterval={} refresh={} poll={}us ",
                 "request={}B x{} descriptor={}B timeout={}ms out=0x{:02x} {}us ",
                 "capacity={}B stride={}B nominal={}Hz clock_readback={:?} ",
-                "timebase={:?} inferred={} per_service_quirk={} ",
+                "timebase={:?} inferred={} reused={} per_service_quirk={} ",
                 "submits={} submit_failures={} last_submit_error={:?} ",
                 "transfer_statuses={:?} packet_statuses={:?} accepted={}"
             ),
@@ -356,6 +358,7 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
             self.post_alt_readback_hz,
             self.timebase,
             self.inferred_timebase,
+            self.reused_timebase,
             self.per_service_interval_quirk,
             self.successful_submissions,
             self.submit_failures,

@@ -227,6 +227,7 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "post_alt_readback_hz": diag.post_alt_readback_hz,
         "timebase": diag.timebase,
         "inferred_timebase": diag.inferred_timebase,
+        "reused_timebase": diag.reused_timebase,
         "successful_submissions": diag.successful_submissions,
         "submit_failures": diag.submit_failures,
         "last_submit_error": diag.last_submit_error,
