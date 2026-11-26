@@ -128,6 +128,14 @@ jobs:
         working-directory: android
         run: ./gradlew :usbdac:publishReleasePublicationToStagingRepository --console=plain
 
+      - name: Include license and attribution in packages from older tags
+        run: |
+          for notice in LICENSE NOTICE; do
+            if [ ! -e "crates/usbdac-core/$notice" ]; then
+              cp "$notice" crates/usbdac-core/
+            fi
+          done
+
       - name: Check whether the Rust crate version is published
         id: crates
         env:
@@ -152,7 +160,7 @@ jobs:
         if: steps.crates.outputs.published == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
-        run: cargo publish --locked --package usbdac-core
+        run: cargo publish --locked --allow-dirty --package usbdac-core
 
       - name: Publish to GitHub Packages
         if: ${{ github.event_name == 'push' || !inputs.skip_package }}
