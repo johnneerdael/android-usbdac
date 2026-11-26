@@ -4,7 +4,7 @@ How to add bit-perfect USB output to an audio app with usbdac. This page is the 
 
 The [getting started](getting-started.md) page is the tutorial for the first hour: dependency, manifest, a working stream. This guide is for the days after: making it part of a real player.
 
-**Status.** usbdac is a 0.1 pre-release. Its Rust driver has played PCM on one phone and one DAC; the Kotlin SDK, the selector, the managed and AAudio outputs and everything in this guide have been tested without hardware only. Plan your own device testing ([the test plan](integration-app.md#testing-your-integration)), and read [the evidence](evidence.md#hardware-status) before promising anything to listeners.
+**Status.** Direct USB PCM has played on a OnePlus 15 in Flick with an iBasso DC04U and in the SDK sample with a Hidizs AP80 Pro-X. Coverage for the selector, managed and AAudio outputs is automated. Use the [integration test plan](integration-app.md#testing-your-integration) for your own device and app coverage. [Evidence](evidence.md#hardware-status)
 
 ## What you are taking on
 
