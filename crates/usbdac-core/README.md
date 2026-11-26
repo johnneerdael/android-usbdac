@@ -8,11 +8,10 @@ what prevented verification.
 
 ## Add it to your project
 
-Pick a version from [crates.io](https://crates.io/crates/usbdac-core). For the
-0.1 alpha, specify the prerelease version explicitly.
+Find published versions on [crates.io](https://crates.io/crates/usbdac-core).
 
 ```sh
-cargo add usbdac-core@0.1.0-alpha.6
+cargo add usbdac-core@0.1.0
 ```
 
 1. Open the USB device, claim its AudioControl and playback AudioStreaming
@@ -25,9 +24,9 @@ cargo add usbdac-core@0.1.0-alpha.6
 
 Your app supplies the decoded audio. Optional PCM conversion helpers handle
 sample rate, bit depth and mono-to-stereo when your source format needs to change.
-The direct USB stream supports one open DAC per process in 0.1. The alpha has
-played PCM on one phone and DAC combination. Test your target devices and formats
-before relying on it in production.
+The direct USB stream supports one open DAC per process in 0.1. Direct USB
+PCM has played on one phone and DAC combination. Test your target devices
+and formats before relying on it in production.
 
 - [Rust API reference](https://docs.rs/usbdac-core)
 - [Native integration guide and wire layouts](https://johnneerdael.github.io/android-usbdac/native-api.html)

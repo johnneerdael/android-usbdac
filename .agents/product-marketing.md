@@ -34,7 +34,7 @@ Use exact terms such as direct USB, Android-managed, AAudio exclusive,
 hardware volume and bit-perfect verification. Explain terms through API
 behavior and name the relevant method or result. Describe format support and
 measured hardware coverage separately. Direct USB PCM has played through
-Flick on a OnePlus 15 with Android 16 and an iBasso DC04U. The 0.1 alpha has
+Flick on a OnePlus 15 with Android 16 and an iBasso DC04U. The 0.1 release has
 limited hardware coverage across devices, formats and Android routes.
 
 ## Changelog

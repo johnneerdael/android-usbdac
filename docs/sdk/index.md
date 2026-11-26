@@ -19,7 +19,7 @@ opened and what it could verify.
 
 ## Status
 
-This is a 0.1 pre-release.
+This guide covers usbdac 0.1.
 
 - **Automated checks pass.** The driver has several hundred tests that run without a DAC, the Kotlin layer has its own, and every push builds the library and the sample app for four processor types.
 - **Hardware testing has only begun.** The Rust driver has played PCM on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U), inside a build of Flick that runs on this library. Other phones and DACs, DSD and DoP, the Kotlin SDK, the sample app, the Android-managed output and the AAudio output have not been run on hardware yet. Expect to find problems, and report them with the logcat of the tag `usbdac`.
