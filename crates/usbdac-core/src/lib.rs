@@ -7,7 +7,9 @@
 //!
 //! The library never resamples, dithers or scales samples unless the host
 //! explicitly enables software gain, and it reports honestly whether the audio
-//! on the wire is bit-perfect ([`DacStream::is_bit_perfect`]).
+//! on the wire is bit-perfect ([`DacStream::is_bit_perfect`]). (The opt-in
+//! [`convert`] module, which the stream never calls, is for a host that wants
+//! to convert before writing.)
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -30,6 +32,7 @@
 #[macro_use]
 mod macros;
 
+pub mod convert;
 pub mod descriptors;
 
 mod capabilities;

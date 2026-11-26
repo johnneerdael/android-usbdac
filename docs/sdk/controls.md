@@ -237,3 +237,29 @@ A deeper ring costs nothing in responsiveness if you `flush()` on every seek, st
 
 `write`, `writableBytes`, `play`, `pause`, `flush`, `drain`, `isDrained` and `close` behave as in the table of [the stream](#the-stream-dacstream-and-pcmoutput), with these differences: `pause()` plays silence on a stream that stays open, `latencyFrames` counts the ring plus what AAudio holds, and `close()` takes up to about half a second.
 
+## Conversion: `ConversionOptions`
+
+The conversion helpers are opt-in and never touch the direct path by themselves: `ConversionPlan.between(request, format, options)` plans, `PcmConverter.create(plan)` builds the converter, `ConvertingOutput(target, converter)` puts it in front of any `PcmOutput`. Every plan but `NONE` and `BIT_EXACT` changes the audio; "bit-perfect impact" says what the option does to the verdict, which is `NotVerified` with the plan's description for those.
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `narrowing` | `NarrowingMode` | `TPDF_DITHER` | Where bits are dropped (narrowing, floats to integers, the rounding of resampled values): `TRUNCATE` rounds toward negative infinity; `TPDF_DITHER` adds triangular noise of one step before rounding to nearest, so the error is signal-independent noise at half a step RMS (-98 dBFS at 16 bits) | Both are lossy; neither is bit-perfect |
+| `quality` | `ResampleQuality` | `HIGH` | `HIGH`: stopband about 110 dB, no aliasing into the output, passband flat to 91% of the lower Nyquist frequency (20.07 kHz at 44.1 kHz). `FAST`: stopband about 84 dB, passband to 90%, about 2.5 times cheaper. Measured numbers are in [the native API document](native-api.html#14-conversion-helpers) | A rate change is lossy either way |
+| `headroomDb` | `Double` | 0.0 | Gain after resampling, 0 to -60 dB. A resampled signal can exceed its input's peak (a full-scale square wave by 3 dB); integer outputs saturate at full scale, never wrap, and `PcmConverter.clippedSamples` counts them. `-3.5` keeps even that from clipping. At 0 the gain at DC is exactly 1 | Any value other than 0 changes the level; the plan's description says so |
+| `ditherSeed` | `Long?` | `null` | Seed of the dither's generator: the same seed gives the same output. Not negative | None |
+| `sourceLayout` | `PcmLayout?` | `null` | The layout of the source samples when it is not the one `StreamRequest.bitDepth` implies (16: `PCM_16`, 24: `PCM_24_PACKED`, 32: `PCM_32`): `FLOAT_32` or `PCM_24_IN_32` | A float source is converted to integers: lossy |
+
+What the plan can contain, and how each step is classified:
+
+| Step (`ConversionStep.code`) | `kind` | Notes |
+|---|---|---|
+| `widen` | `BIT_EXACT` | More bits; the new low bits are zero; every value is unchanged. 16 to 24 or 32, 24 to 32 |
+| `repack` | `BIT_EXACT` | The same bits in another slot: 24-bit packed in 3 bytes to 24-bit in 4 and back |
+| `mono_to_stereo` | `LOSSLESS` | The sample duplicated. The only channel change there is |
+| `int_to_float` | `LOSSLESS` up to 24 bits, `LOSSY` for 32 | A float holds 24 bits exactly |
+| `narrow` | `LOSSY` | Fewer bits, truncated or dithered |
+| `quantise` | `LOSSY` | A float, or resampled values, rounded to integers; full scale saturates |
+| `resample` | `LOSSY` | The polyphase windowed-sinc converter |
+
+`PcmConverter` (not thread-safe: one thread at a time) has `convert(input, output)` and `finish(output)` on direct buffers, `reset()`, `clippedSamples` and `plan`; `plan.delayFrames` is the audio the resampler holds back and `plan.minOutputBytes` the smallest output buffer `convert` makes progress with. `ConvertingOutput` takes care of both. Its controls are those of [`PcmOutput`](#the-stream-dacstream-and-pcmoutput) with these differences: `write`, `writableBytes`, `playedFrames` and `latencyFrames` are in the **source** format and rate; `flush()` also resets the converter; `drain()` writes the resampler's tail and then drains the target (poll `isDrained`); `close()` closes the target and the converter.
+

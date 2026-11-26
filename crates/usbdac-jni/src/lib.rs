@@ -13,6 +13,7 @@
 //! block.
 
 mod aaudio;
+mod convert;
 mod json;
 mod listener;
 mod registry;

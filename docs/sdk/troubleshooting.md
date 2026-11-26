@@ -71,6 +71,18 @@ Work down the list.
 8. **The volume keys do nothing.** `session.volume` is `null` (the DAC has no volume control), or `dispatchKeyEvent` does not call `DacVolumeKeys.handle`, or the screen is off and no `DacVolumeProvider` is attached to a `MediaSession`.
 9. **After unplugging.** `DacEvent.DeviceLost` and `DacState.LOST`. Close the session, wait for the next `DacHotplugEvent.Attached`, and open again.
 
+## Conversion
+
+`ConversionPlan.between`, `PcmConverter.create` and `ConvertingOutput` fail with typed codes:
+
+- `UNSUPPORTED` with "DoP and native DSD are never converted": a DSD stream cannot go through a converter. Use the direct path as it is.
+- `UNSUPPORTED` with "only mono to stereo is supported": no downmix, no upmix, no channel remapping.
+- `UNSUPPORTED` with "needs a filter of ... taps in ... phases": a rate ratio that does not reduce to small integers (44100 to 47993 Hz) would need a filter larger than the converter builds. Rates between 8000 and 768000 Hz in the 44.1 and 48 kHz families are all fine.
+- `INVALID_ARGUMENT`: a rate or channel count out of range, a negative `ditherSeed`, a `headroomDb` outside -60 to 0, a heap buffer given to `PcmConverter.convert` (use direct buffers).
+- `INVALID_STATE`: `convert` after `finish` without `reset()`, or any call after `close()`.
+- Clipping: `PcmConverter.clippedSamples` counts samples saturated at full scale. A resampled signal can exceed its input's peak; set `ConversionOptions.headroomDb` (`-3.5` covers a full-scale square wave).
+- A `ConvertingOutput` whose `write` takes fewer bytes than you offered is full: the target is not taking audio, and the converted audio waits in the wrapper. Write when `writableBytes` says there is room.
+
 ## AAudio exclusive output
 
 `AAudioExclusiveOutput.open` says why it could not open; the usual ones:

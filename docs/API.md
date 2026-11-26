@@ -21,13 +21,15 @@ Contents
 11. [JSON schemas](#11-json-schemas)
 12. [Limits of v0.1](#12-limits-of-v01)
 13. [AAudio exclusive output](#13-aaudio-exclusive-output)
+14. [Conversion helpers](#14-conversion-helpers)
 
 ## 1. Principles
 
 - **Bit-perfect by default.** The library never resamples, dithers or scales
   samples. The only operation that changes sample values is software gain, and
   only when the host asks for it (`set_software_gain` with a value other than
-  1.0). It is refused for DoP and native DSD.
+  1.0). It is refused for DoP and native DSD. (The opt-in conversion helpers of
+  section 14 are a separate module that the direct path never calls.)
 - **Push model.** The library owns a ring buffer and one USB output thread. The
   host writes audio from its own thread. There is no render thread and no
   callback into the host on the audio path.
@@ -91,7 +93,8 @@ dac.close(self) -> Result<()>                      // also on drop
   `InvalidState` while a stream is open. With `RatePolicy::Exact` a rate the DAC
   cannot run is `Unsupported { offered }`. With `NearestSupported` the returned
   format carries the rate the DAC will run (`rate_differs_from_request()`), and
-  the host must resample. Nothing is resampled by the library.
+  the host must resample. Nothing is resampled by the library on this path; the
+  host that wants it done can use the conversion helpers of section 14.
 - `open_stream` switches the alternate setting, re-verifies the clock and
   starts the output thread (100 ms or more). Errors include
   `ClockUnverified` (see `DacConfig::require_verified_rate`), `Unsupported`,
@@ -935,3 +938,232 @@ close for up to about half a second while the stream stops).
 Nothing in this section has run on a device: the logic is covered by host tests
 with a simulated device and the Kotlin layer by JVM tests with a fake native
 layer, and the AAudio calls themselves have never opened a stream.
+
+## 14. Conversion helpers
+
+The direct USB path never converts anything. For a host that has audio in one
+format and a DAC that runs another (a rate refused under
+`RatePolicy::NearestSupported`, a depth the DAC lacks), `usbdac_core::convert`
+plans, classifies and runs the conversion. It is pure Rust with no platform code,
+it is opt-in, and **everything but the first two kinds below is not bit-perfect.**
+It is exposed to Kotlin as `ConversionPlan`, `PcmConverter` and `ConvertingOutput`
+through `dev.usbdac.internal.ConvertNative`.
+
+### 14.1 Planning
+
+```rust
+ConversionPlan::between(&StreamRequest, &StreamFormat, &ConvertOptions) -> Result<ConversionPlan, ConvertError>
+ConversionPlan::pcm(source: PcmFormat, target: PcmFormat, &ConvertOptions) -> Result<ConversionPlan, ConvertError>
+plan.kind() -> ConversionKind          // None | BitExact | Lossless | Lossy
+plan.description() -> &str             // a sentence for a status line
+plan.steps() -> &[Step]
+plan.preserves_bit_perfect() -> bool   // kind <= BitExact
+PcmFormat { sample_rate, channels, sample: SampleFormat }
+SampleFormat::{ Int { bits, slot_bytes }, Float32 }     // I16, I24, I24_IN_32, I32 constants
+```
+
+`between` takes the request the host made (its source samples are in the layout of
+the request's `bit_depth`: 16, packed 24 or 32, unless
+`ConvertOptions::source_sample` says float or 24-in-4) and the format `negotiate`
+returned (its layout is `valid_bits` left-justified in `subslot_bytes`, section 4).
+DoP and native DSD are refused (`Unsupported`): a rate or depth change would
+destroy them. The minimal chain is chosen, in the order the converter runs it:
+resample, then the sample step, then mono to stereo.
+
+| `ConversionKind` | Steps in it | Bit-perfect |
+|---|---|---|
+| `None` | no step: the formats are the same, the bytes are copied | stays so |
+| `BitExact` | `Widen` (more bits, the new low bits are zero, every value is unchanged) and `Repack` (the same bits in another slot: 24-bit packed to 24-bit in 4 bytes and back) | stays so: the stream is verified as it was |
+| `Lossless` | `MonoToStereo` (the sample duplicated); `IntToFloat` of up to 24 bits (a float holds them exactly) | no: the audio is not identical |
+| `Lossy` | `Narrow` (fewer bits), `Quantise` (a float, or resampled values, rounded to integers), `IntToFloat` of 32 bits (rounded to 24 significant bits), `Resample` | no |
+
+The plan's kind is the largest of its steps'. Anything else than mono to stereo
+is `Unsupported` for channels (no downmix, no upmix); rates are 8000 to 768000 Hz.
+
+`ConvertOptions` (all with defaults): `narrowing` is `TpdfDither` (the default) or
+`Truncate`; `quality` is `High` (default) or `Fast`; `headroom_db` (0 to -60,
+default 0); `dither_seed`; `source_sample`.
+
+### 14.2 Running
+
+```rust
+let mut converter = Converter::new(&plan)?;
+converter.process(input: &[u8], output: &mut [u8]) -> Result<Processed { consumed, produced }, ConvertError>
+converter.finish(output: &mut [u8]) -> Result<usize, ConvertError>     // the resampler's tail; call until 0
+converter.reset()                                                      // a new stream, or a seek
+converter.delay_frames() -> usize          // source frames held back (0 unless resampling)
+converter.min_output_bytes() -> usize      // the output size process makes progress with
+converter.clipped_samples() -> u64
+```
+
+`process` takes whole source frames from the front of `input` and writes whole
+target frames to `output`, as many as fit in either; the caller keeps what was not
+consumed. The output buffer must hold at least `min_output_bytes()` (the frames one
+source frame turns into). `finish` flushes the filter by feeding it silence, so the
+total output for `N` input frames is exactly `ceil(N * L / M)` frames (14.4); after
+it `process` fails `InvalidState` until `reset`. Chunking changes nothing: the
+output is bit-identical whatever the chunk sizes (tested).
+
+Everything the converter needs is allocated in `Converter::new`: `process`,
+`finish` and `reset` do not allocate (tested with a counting allocator, for every
+kind of plan). Integer-to-integer plans run on an integer engine without floating
+point, so a `BitExact` plan is exact by construction; the others decode to `f64`,
+which holds every integer layout exactly.
+
+### 14.3 Narrowing, dither and clipping
+
+Where bits are dropped (an integer narrowing, a float to integers, the rounding of
+resampled values) `Truncate` rounds toward negative infinity, and `TpdfDither`
+adds triangular-PDF noise of one step peak before rounding to nearest: the error
+becomes signal-independent, zero-mean, at half a step RMS (-98 dBFS at 16 bits,
+tested), at most 1.5 steps. The generator is a xorshift64*, seeded by
+`dither_seed`: the same seed gives the same output, and `reset` rewinds it.
+
+Integer outputs **saturate at full scale and never wrap**, and `clipped_samples()`
+counts the saturations. A non-finite float input sample is replaced by silence.
+Whether a resampled signal clips depends on the signal: a band-limited
+reconstruction can exceed its input's peak. Measured: a full-scale 1 kHz square
+wave resampled from 44.1 to 48 kHz peaks at 1.41 (+3.0 dB), and clips; a
+full-scale sine does not (the passband ripple is 0.00004 dB, less than one 16-bit
+step at full scale: tested for 100 Hz to 19 kHz at 16 bits with truncation). The
+strategy is therefore: unity gain by default (DC gain exactly 1, so a resampled stream is as loud as the
+source), saturation with a count, and `headroom_db` for material that can
+overshoot (`-3.5` keeps the square wave above from clipping, tested). The
+headroom applies after resampling only.
+
+### 14.4 The resampler
+
+A polyphase windowed-sinc converter for any rational ratio, written from the textbook
+design (the module documentation of `convert/resample.rs` has the derivation).
+For rates `fi` and `fo` with `g = gcd`, `L = fo / g` and `M = fi / g`: output `n`
+sits at input time `n * M / L`, and is the dot product of `T` input samples with
+the coefficients of phase `(n * M) mod L`, a Kaiser-windowed sinc evaluated at
+the exact fractional position, each phase normalised to sum to 1. Streaming with
+per-channel history; chunks of any size.
+
+- **Alignment and latency.** The filter is zero-phase: output frame `n` is aligned
+  with source time `n * M / L` exactly, so a position needs no correction:
+  `source_position = played_target_frames * fi / fo`. What the converter holds back is
+  `T/2` source frames (`delay_frames()`, 1.8 ms at 44.1 kHz for `High`), the
+  algorithmic latency, which `ConvertingOutput.latencyFrames` adds. `finish` pads with
+  `T/2` zeros, which makes the total output `ceil(N * L / M)`.
+- **Design targets.** `High`: passband to 91% of the lower Nyquist frequency
+  (20.07 kHz at 44.1 kHz), stopband from the Nyquist frequency itself (so nothing
+  aliases into the output), designed for 110 dB. `Fast`: passband to 90%, stopband
+  from 110% of the Nyquist frequency (content between them aliases into the top
+  10% of the band), designed for 84 dB, about 2.5 times cheaper (2.9 times fewer taps).
+- **Limits.** Rates 8000 to 768000 Hz; a ratio is refused (`Unsupported`) if it needs
+  more than 4.5 million coefficients (for the standard 44.1 and 48 kHz families
+  up to 768 kHz the most is 410 000: 44.1 to 768 kHz is 2560 phases of 160 taps,
+  768 to 44.1 kHz 147 phases of 2752 taps). A ratio that does not reduce to small
+  integers (44.1 to 47.993 kHz would be 47993 phases) is refused.
+
+**Measured quality** (`cargo test -p usbdac-core quality -- --nocapture` prints it;
+tones through the converter, least-squares sine fits, all in `f64`). Passband
+ripple is the peak-to-peak gain over 13 tones from 150 Hz to the passband edge;
+"spur" is everything in the output except the tone (images, aliases, harmonics
+and numerical noise), relative to the tone, the worst of those 13; stopband is
+the weakest attenuation over 11 tones from just above the stopband edge to the
+input's Nyquist frequency, where the whole output is alias (downsampling only).
+
+| Pair | `High` ripple | `High` spur | `High` stopband | `Fast` ripple | `Fast` spur | `Fast` stopband |
+|---|---|---|---|---|---|---|
+| 44.1 to 48 kHz | 0.000011 dB | -120.7 dB | (up) | 0.00084 dB | -83.9 dB | (up) |
+| 48 to 44.1 kHz | 0.000026 dB | -126.5 dB | 110.0 dB | 0.00045 dB | -94.0 dB | none above Nyquist |
+| 44.1 to 96 kHz | 0.000011 dB | -120.7 dB | (up) | 0.00084 dB | -83.8 dB | (up) |
+| 96 to 44.1 kHz | 0.000036 dB | -137.8 dB | 112.5 dB | 0.00076 dB | -105.2 dB | 84.0 dB |
+| 96 to 48 kHz | 0.000012 dB | -246.5 dB | 109.2 dB | 0.00085 dB | -246.1 dB | 83.8 dB |
+| 88.2 to 48 kHz | 0.000020 dB | -141.9 dB | 109.9 dB | 0.00082 dB | -104.7 dB | 84.4 dB |
+| 192 to 44.1 kHz | 0.000036 dB | -144.1 dB | 112.5 dB | 0.00028 dB | -117.5 dB | 96.4 dB |
+| 44.1 to 192 kHz | 0.000011 dB | -120.8 dB | (up) | 0.00084 dB | -83.8 dB | (up) |
+| 384 to 48 kHz | 0.000037 dB | -247.6 dB | 112.3 dB | 0.00045 dB | -247.7 dB | 97.2 dB |
+| 768 to 44.1 kHz | 0.000030 dB | -156.4 dB | 112.5 dB | not run | | |
+| 44.1 to 768 kHz | 0.000007 dB | -120.8 dB | (up) | not run | | |
+
+The tests assert stopband above 105 dB, spur below -110 dB and ripple below
+0.0002 dB for `High`; stopband above 80 dB, spur below -80 dB and ripple below
+0.002 dB for `Fast`. The gain at DC is 1 to within 1e-13 in every phase. An
+impulse comes back at the same instant, symmetric. A 1 kHz tone at -6 dBFS from
+44.1 kHz 16-bit to 48 kHz 24-bit comes out with its peak within 0.001 of 0.5 and
+everything else below -90 dB (the 16-bit input's own rounding noise is about
+-92 dB relative to that tone).
+
+**Cost** (`cargo run --release -p usbdac-core --example convert_bench`, Apple
+silicon, one core, stereo 24-bit): `High` converts 44.1 to 48 kHz at 385 times
+real time (0.26% of a core), 96 to 44.1 kHz at 220 times, 44.1 to 192 kHz at 91 times,
+44.1 to 768 kHz at 22 times and 768 to 44.1 kHz at 29 times (3.5% of a core). `Fast` is
+2.3 to 2.6 times faster. Building a converter takes 0.7 ms (44.1 to 48 kHz), 2.7 ms
+(44.1 to 192 kHz) and about 10 ms for the two extremes. Integer re-layouts run at
+thousands of times real time; narrowing 32 to 16 bits with dither at 1550 times. A phone core
+is several times slower than that machine; nothing here has run on one.
+
+### 14.5 JNI contract
+
+The object `dev.usbdac.internal.ConvertNative`, exported as
+`Java_dev_usbdac_internal_ConvertNative_<name>`; handles are opaque ids; failures
+are `IllegalStateException("usbdac:<code>: <message>")` with the codes
+`unsupported`, `invalid_argument` and `invalid_state`.
+
+```kotlin
+internal object ConvertNative {
+    init { System.loadLibrary("usbdac") }
+
+    @JvmStatic external fun convertPlan(requestJson: String): String
+    @JvmStatic external fun convertCreate(requestJson: String): Long
+    @JvmStatic external fun convertClose(handle: Long)
+    @JvmStatic external fun convertProcess(handle: Long, input: ByteBuffer, inOffset: Int, inCount: Int,
+                                           output: ByteBuffer, outOffset: Int, outCapacity: Int): Long
+    @JvmStatic external fun convertFinish(handle: Long, output: ByteBuffer, outOffset: Int, outCapacity: Int): Int
+    @JvmStatic external fun convertReset(handle: Long)
+    @JvmStatic external fun convertClipped(handle: Long): Long
+}
+```
+
+`convertProcess` takes two **direct** buffers, which must not overlap, reads `inCount`
+bytes from `inOffset` and writes at most `outCapacity` bytes at `outOffset`, moves
+neither position, and returns `(consumed shl 32) or produced` in bytes.
+`convertFinish` returns the bytes written. `convertCreate` synthesises the filter
+(a few milliseconds for a resampling plan): call it off the main thread.
+`convertPlan` does no audio work.
+
+**Request** (`convertPlan`, `convertCreate`):
+
+```json
+{ "source": { "sample_rate": 44100, "channels": 2, "sample": { "kind": "int", "bits": 16, "slot_bytes": 2 } },
+  "target": { "sample_rate": 48000, "channels": 2, "sample": { "kind": "int", "bits": 24, "slot_bytes": 4 } },
+  "options": { "narrowing": "tpdf", "quality": "high", "headroom_db": 0.0, "dither_seed": null } }
+```
+
+`sample` is `{ "kind": "int", "bits", "slot_bytes" }` (8 to 32 bits in a slot of
+1 to 4 bytes that holds them) or `{ "kind": "float" }`. `options` and each key in
+it are optional; `narrowing` is `tpdf` or `truncate`, `quality` is `high` or `fast`.
+
+**Plan** (`convertPlan`):
+
+```json
+{ "kind": "lossy", "description": "Lossy conversion, not bit-perfect: resampled from 44100 Hz to 48000 Hz (windowed-sinc polyphase, high quality, stopband about 110 dB); quantised to 24-bit in a 4-byte slot with TPDF dither (full scale saturates).",
+  "preserves_bit_perfect": false, "resamples": true,
+  "steps": [ { "code": "resample", "kind": "lossy", "description": "..." }, { "code": "quantise", "kind": "lossy", "description": "..." } ],
+  "source": { "sample_rate": 44100, "channels": 2, "sample": {}, "bytes_per_frame": 4 },
+  "target": { "sample_rate": 48000, "channels": 2, "sample": {}, "bytes_per_frame": 8 },
+  "source_frame_bytes": 4, "target_frame_bytes": 8, "delay_frames": 80, "min_output_bytes": 16,
+  "filter": { "l": 160, "m": 147, "taps": 160, "passband_hz": 20065.5, "stopband_hz": 22050.0, "design_attenuation_db": 110.0 } }
+```
+
+`kind` is `none`, `bit_exact`, `lossless` or `lossy`; `step.code` is `resample`,
+`widen`, `repack`, `narrow`, `int_to_float`, `quantise` or `mono_to_stereo`;
+`filter` is `null` unless the plan resamples.
+
+### 14.6 The Kotlin side
+
+`ConversionPlan.between(request, format, options)` calls `convertPlan`;
+`PcmConverter.create(plan)` calls `convertCreate`; `PcmConverter.convert` and
+`finish` wrap `convertProcess` and `convertFinish` and move the buffers' positions.
+`ConvertingOutput(target, converter)` is a `PcmOutput` that converts on the way in
+and reports everything in source units: `playedFrames = target.playedFrames * fi / fo`,
+`latencyFrames = (target latency + converted frames the target has not taken) * fi / fo + delay_frames`,
+`writableBytes` in source bytes. Converted audio the target cannot take is held (one
+chunk) and delivered first on the next call; `drain()` writes the resampler's tail
+before it drains the target; `flush()` resets the converter. Its
+`bitPerfect` is the target's for `None` and `BitExact` plans and
+`NotVerified(null, plan.description)` otherwise.

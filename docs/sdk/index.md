@@ -39,6 +39,7 @@ Choose **direct USB** when bit-perfect output, DSD or the DAC's hardware volume 
 | `PcmOutput` | The interface `DacStream`, `AndroidManagedOutput` and `AAudioExclusiveOutput` share |
 | `AndroidManagedOutput` | The managed transport |
 | `AAudioExclusiveOutput` | The AAudio exclusive transport: `AAudioConfig` options, the `AAudioGrant` the platform gave, `AAudioEvent`s |
+| `ConversionPlan`, `PcmConverter`, `ConvertingOutput` | Opt-in conversion in front of any output: a rate the DAC refuses, a depth it lacks, mono to stereo. Classified `NONE`, `BIT_EXACT`, `LOSSLESS` or `LOSSY`; not bit-perfect unless the first two |
 | `DacConfig` | Every tunable of a session: buffer depths, clock policy, DSD options, quirks, hand-back |
 | `dev.usbdac.controls` | `DacVolumeKeys` (volume keys), `DacVolumeProvider` (system volume panel), `DacIdleRelease` (close the stream after a long pause) |
 
@@ -48,7 +49,7 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 
 - Android 8.0 (API 26) or later. The library is built with Kotlin 2.4 at language level 2.2, and its only dependency is `kotlinx-coroutines-core`.
 - Direct USB needs USB host support on the device and a DAC that implements the USB Audio Class 1.0 or 2.0 (not 3.0). Playback only.
-- `libusbdac.so` is built for arm64-v8a, armeabi-v7a, x86_64 and x86 (about 1.2 MB for arm64-v8a). The arm64-v8a build links only against the system's `liblog`, `libdl` and `libc`, and its segments are aligned for 16 KB pages.
+- `libusbdac.so` is built for arm64-v8a, armeabi-v7a, x86_64 and x86 (about 1.9 MB uncompressed for arm64-v8a). The arm64-v8a build links only against the system's `liblog`, `libdl`, `libm` and `libc` (AAudio is opened at run time with `dlopen`, so there is no link-time dependency on `libaaudio`), and its segments are aligned for 16 KB pages.
 - One open `DacSession` per process in this version.
 
 ## The guide

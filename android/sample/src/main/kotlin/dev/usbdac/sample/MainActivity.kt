@@ -18,6 +18,7 @@ import dev.usbdac.DacDeviceInfo
 import dev.usbdac.DacException
 import dev.usbdac.DacSession
 import dev.usbdac.DacState
+import dev.usbdac.ConvertingOutput
 import dev.usbdac.DacStream
 import dev.usbdac.PcmOutput
 import dev.usbdac.StreamRequest
@@ -41,7 +42,8 @@ import java.util.concurrent.Executors
  * updated from flows on the main thread.
  *
  * The sine can also go through the Android-managed output or an AAudio exclusive stream (the route
- * of a player with an internal DAC): pick the output first. Those need no DAC session.
+ * of a player with an internal DAC), which need no DAC session, or through the direct stream behind a
+ * converter (a rate the DAC refuses): pick the output first.
  */
 class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -92,7 +94,7 @@ class MainActivity : Activity() {
         }
         click(R.id.stopButton) { stopStream() }
 
-        // Three outputs behind the same PcmOutput interface. Only the direct one needs a DAC session.
+        // The outputs behind the same PcmOutput interface. The two direct ones need a DAC session.
         outputSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, OutputKind.entries.map { it.label })
         outputSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
@@ -258,10 +260,16 @@ class MainActivity : Activity() {
         if (other != null) return
         val (rate, bits) = currentFormats().getOrNull(formatSpinner.selectedItemPosition) ?: return
         val kind = outputKind
+        val open = session
+        if (kind == OutputKind.DIRECT_USB_CONVERTED && open == null) return log("open a DAC first")
         io.execute {
             try {
-                // Both are PcmOutputs: the same writer and the same controls drive either.
-                val output = if (kind == OutputKind.AAUDIO_EXCLUSIVE) openAAudio(this, rate, bits) else openManaged(this, rate, bits)
+                // All of them are PcmOutputs: the same writer and the same controls drive either.
+                val output = when (kind) {
+                    OutputKind.AAUDIO_EXCLUSIVE -> openAAudio(this, rate, bits)
+                    OutputKind.DIRECT_USB_CONVERTED -> openConverting(requireNotNull(open), StreamRequest.pcm(rate, channels = 2, bitDepth = bits))
+                    else -> openManaged(this, rate, bits)
+                }
                 val sine = SinePlayer(output, rate, 2, bits / 8, bits) { runOnUiThread { log("writer stopped: ${it.message}") } }
                 runOnUiThread {
                     other = output
@@ -304,6 +312,7 @@ class MainActivity : Activity() {
             appendLine("state ${output.state.value}   xruns ${output.xrunCount}   underruns ${output.underrunCount}")
             append(describeGrant(output.grant))
         }
+        if (output is ConvertingOutput) append(output.plan.description)
     }
 
     // ---- status ----
@@ -356,12 +365,13 @@ class MainActivity : Activity() {
     }
 }
 
-/** Where the sample sends its tone: the three outputs the SDK has, all behind [PcmOutput]. */
+/** Where the sample sends its tone: the three outputs the SDK has, all behind [PcmOutput], and the direct one behind a converter. */
 private enum class OutputKind(val label: String) {
     DIRECT_USB("Direct USB (needs a DAC session)"),
     ANDROID_MANAGED("Android-managed (AudioTrack)"),
     AAUDIO_EXCLUSIVE("AAudio exclusive (internal DAC)"),
+    DIRECT_USB_CONVERTED("Direct USB with conversion (not bit-perfect)"),
 }
 
-/** The formats offered to the two outputs that do not read them from a DAC. 24-bit and 32-bit need Android 12. */
+/** The formats offered to the outputs that do not read them from a DAC (the source formats). 24-bit and 32-bit need Android 12 for the platform outputs. */
 private val OTHER_FORMATS = listOf(44_100 to 16, 48_000 to 16, 96_000 to 24, 192_000 to 24, 96_000 to 32)

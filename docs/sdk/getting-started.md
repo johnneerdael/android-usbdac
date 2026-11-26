@@ -125,6 +125,21 @@ Every failure is a `DacException` with a typed `code` (see [troubleshooting](tro
 
 `StreamRequest.pcm(rate, channels, bitDepth)` asks for exactly that. By default a rate the DAC cannot run fails with `UNSUPPORTED`; the library never resamples. With `RatePolicy.NEAREST_SUPPORTED` the returned `StreamFormat` carries the rate the DAC will run (`rateDiffersFromRequest`), and you have to resample. `StreamRequest.dop(...)` and `StreamRequest.dsdNative(...)` ask for DSD; see [bit-perfect output](bit-perfect.md).
 
+### When the DAC refuses what you have
+
+`RatePolicy.EXACT` fails with `UNSUPPORTED` for a rate the DAC cannot run, and the library never resamples. If the app must play it anyway, it can ask for the nearest rate and convert before writing. The conversion is opt-in, it sits in front of the stream, and **it is not bit-perfect**:
+
+```kotlin
+fun openConverting(session: DacSession, source: StreamRequest, wireBitDepth: Int = source.bitDepth): ConvertingOutput {
+    val wire = source.copy(bitDepth = wireBitDepth, ratePolicy = RatePolicy.NEAREST_SUPPORTED)
+    val format = session.negotiate(wire)
+    val plan = ConversionPlan.between(source, format, ConversionOptions())
+    return ConvertingOutput(session.openStream(format), PcmConverter.create(plan))
+}
+```
+
+`negotiate` with `RatePolicy.NEAREST_SUPPORTED` returns the rate the DAC runs (`StreamFormat.rateDiffersFromRequest`). `ConversionPlan.between(source, format)` works out the smallest chain from what the host has to what the DAC runs, and says how much damage it does (`plan.kind`, `plan.description`): a changed rate is `LOSSY`, and so are fewer bits; mono to stereo is `LOSSLESS` but not identical; widening to more bits (the new low bits are zero) and moving a sample between slot sizes are `BIT_EXACT` and keep the stream bit-perfect. The `ConvertingOutput` is a `PcmOutput`: write the **source** format to it, and its `playedFrames`, `latencyFrames` and `writableBytes` are in source units, so the position arithmetic below is unchanged. Its `bitPerfect` is `NotVerified` with the plan's description whenever the plan is not `NONE` or `BIT_EXACT`. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) and [controls](controls.md#conversion-conversionoptions) have the details; DoP and native DSD are never converted. Build the plan and the converter off the main thread (negotiating takes 100 ms or more, and a resampler synthesises its filter).
+
 ## 6. Write audio
 
 `write` takes bytes in the **wire layout** of the stream's `StreamFormat`: whole frames of `bytesPerFrame` bytes, channels interleaved, little-endian, each sample left-justified in a slot of `subslotBytes` bytes. The layouts are tabled in [the native API document](native-api.html#4-sample-layouts); in short, 16-bit PCM is `i16`, 24-bit in a 3-byte slot is packed, and 24-bit in a 4-byte slot is the sample shifted left by 8.

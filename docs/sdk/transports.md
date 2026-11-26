@@ -121,6 +121,10 @@ AAudio's own buffer is a few milliseconds deep, which a writer thread that sleep
 
 **Not verified on hardware.** The logic is covered by host tests with a simulated device and by JVM tests with a fake native layer. The AAudio calls themselves have never opened a stream.
 
+## Converting in front of any output: `ConvertingOutput`
+
+Not a transport, but a wrapper that goes in front of one: `ConvertingOutput(target, converter)` is a `PcmOutput` that converts what it is given (a new sample rate, more or fewer bits, mono to stereo) before it reaches `target`, which can be any of the three. It is how an app plays a source the DAC does not run as it is. It is opt-in, the direct USB path never converts by itself, and **a plan that is not `NONE` or `BIT_EXACT` is not bit-perfect**. See [getting started](getting-started.md#when-the-dac-refuses-what-you-have) for the flow with `RatePolicy.NEAREST_SUPPORTED`, [bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) for what it reports and [controls](controls.md#conversion-conversionoptions) for the options.
+
 ## Choosing
 
 | If | Use |
@@ -133,5 +137,6 @@ AAudio's own buffer is a few milliseconds deep, which a writer thread that sleep
 | The DAC's hardware volume should be the only volume | Direct |
 | Android 14 or later, a USB DAC, PCM, and a platform guarantee is enough | Either; managed is simpler |
 | The DAC cannot be driven directly (it fails `CLAIM`, or is not a USB Audio Class device) | Managed |
+| The DAC refuses the source's rate or depth and the app accepts that conversion is not bit-perfect | Any of them, behind a `ConvertingOutput` |
 
 An app can offer all three and pick at run time: direct while a `DacSession` opens, AAudio exclusive or managed otherwise. Close the `DacSession` first when you switch from direct to managed or AAudio: while the session is open Android has no audio route to the DAC.

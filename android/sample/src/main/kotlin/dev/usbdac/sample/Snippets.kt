@@ -8,6 +8,11 @@ import dev.usbdac.AAudioEvent
 import dev.usbdac.AAudioExclusiveOutput
 import dev.usbdac.AAudioGrant
 import dev.usbdac.AndroidManagedOutput
+import dev.usbdac.ConversionOptions
+import dev.usbdac.ConversionPlan
+import dev.usbdac.ConvertingOutput
+import dev.usbdac.PcmConverter
+import dev.usbdac.RatePolicy
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
@@ -99,6 +104,22 @@ fun watchRoute(scope: CoroutineScope, output: AAudioExclusiveOutput, onLost: (St
     output.events
         .onEach { event -> if (event is AAudioEvent.Disconnected) onLost(event.detail) }
         .launchIn(scope)
+// endregion
+
+// region conversion
+/**
+ * Plays what the DAC refuses: ask for the nearest rate it runs, plan the conversion from what the host
+ * has ([source]) to what the DAC runs, and put a converter in front of the stream. Pass
+ * [wireBitDepth] to ask the DAC for another depth than the source's (it must have it). **This is not
+ * bit-perfect** unless the plan is only a widening: `bitPerfect` on the result says what was done.
+ * Call it off the main thread: negotiating and building a resampler take a moment.
+ */
+fun openConverting(session: DacSession, source: StreamRequest, wireBitDepth: Int = source.bitDepth): ConvertingOutput {
+    val wire = source.copy(bitDepth = wireBitDepth, ratePolicy = RatePolicy.NEAREST_SUPPORTED)
+    val format = session.negotiate(wire)
+    val plan = ConversionPlan.between(source, format, ConversionOptions())
+    return ConvertingOutput(session.openStream(format), PcmConverter.create(plan))
+}
 // endregion
 
 // region transport-mapping
