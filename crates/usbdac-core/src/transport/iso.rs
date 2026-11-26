@@ -391,6 +391,43 @@ impl FeedbackCompatibility {
     }
 }
 
+// Physical AP80 Pro-X c502:0072 revision ffff trace: Q16.16 is in
+// frames per 250-us DATA service, for both ordinary PCM and RAW_DATA DSD.
+// Scope this unit correction to the exact observed configuration and formats;
+// rate plausibility, packet capacity and feedback deadlines remain independent.
+pub(super) fn ap80_feedback_per_service(
+    vendor: u16, product: u16, revision: rusb::Version, configuration: u8,
+    candidate: &IsoStreamCandidate,
+) -> bool {
+    if (vendor, product) != (0xc502, 0x0072)
+        || revision != rusb::Version::from_bcd(0xffff) || configuration != 1
+        || candidate.usb_speed != Speed::High || candidate.is_uac1
+        || candidate.interface_number != 1 || candidate.endpoint_address != 0x01
+        || candidate.endpoint_interval != 2 || candidate.service_interval_us != 250
+        || candidate.max_packet_bytes != 1024 || candidate.sync_type != SyncType::Asynchronous
+        || candidate.usage_type != UsageType::Data || candidate.channels != 2
+        || candidate.refresh != 0 || candidate.synch_address != 0
+        || candidate.implicit_feedback.is_some() { return false; }
+    let Some(endpoint) = candidate.feedback_endpoint else { return false; };
+    if endpoint.address != 0x81 || endpoint.transfer_type != TransferType::Isochronous
+        || endpoint.interval != 4 || endpoint.service_interval_us != 1000
+        || endpoint.max_packet_bytes != 4 || endpoint.refresh != 0 { return false; }
+    match candidate.alt_setting {
+        1..=3 => {
+            let (width, bits) = match candidate.alt_setting { 1 => (3, 24), 2 => (2, 16), _ => (4, 32) };
+            candidate.format_tag == FORMAT_TAG_PCM && candidate.uac2_formats == Some(1)
+                && candidate.native_dsd.is_none()
+                && (candidate.subslot_size, candidate.bit_resolution) == (width, bits)
+        }
+        4 => candidate.format_tag == FORMAT_TAG_DSD && candidate.uac2_formats == Some(0x8000_0000)
+            && candidate.subslot_size == 4 && candidate.bit_resolution == 1
+            && candidate.native_dsd.is_some_and(|profile|
+                profile.signature() == (4, true, false)
+                    && profile.origin == NativeDsdOrigin::DeviceCompatibility),
+        _ => false,
+    }
+}
+
 // Linux endpoint.c Tenor 8802 rule: correct only values strictly outside the
 // nominal half-sample window, before applying this transport's tighter guards.
 fn correct_tenor_feedback(raw: u32, nominal: u32) -> Option<u32> {
@@ -940,6 +977,123 @@ mod explicit_feedback_tests {
     fn feedback_pipe() -> FeedbackEndpoint {
         FeedbackEndpoint { refresh: 0, address: 0x81, transfer_type: TransferType::Isochronous,
             interval: 1, service_interval_us: 125, max_packet_bytes: 4 }
+    }
+
+    fn ap80_candidate(alt: u8) -> IsoStreamCandidate {
+        let (subslot_size, bit_resolution) = match alt { 1 => (3, 24), 2 => (2, 16), 3 => (4, 32), _ => (4, 1) };
+        IsoStreamCandidate {
+            interface_number: 1, alt_setting: alt, endpoint_address: 1, endpoint_interval: 2,
+            service_interval_us: 250, usb_speed: Speed::High, max_packet_bytes: 1024,
+            sync_type: SyncType::Asynchronous, usage_type: UsageType::Data,
+            format_tag: if alt == 4 { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM },
+            uac2_formats: Some(if alt == 4 { 0x8000_0000 } else { 1 }),
+            native_dsd: (alt == 4).then_some(NativeDsdProfile { word_bytes: 4, big_endian: true,
+                bit_reverse: false, origin: NativeDsdOrigin::DeviceCompatibility }),
+            channels: 2, subslot_size, bit_resolution,
+            sample_rates: vec![32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000],
+            refresh: 0, synch_address: 0, feedback_endpoint: Some(FeedbackEndpoint {
+                refresh: 0, address: 0x81, transfer_type: TransferType::Isochronous,
+                interval: 4, service_interval_us: 1000, max_packet_bytes: 4,
+            }), implicit_feedback: None, terminal_link: Some(2), is_uac1: false,
+        }
+    }
+
+    fn ap80_rule(candidate: &IsoStreamCandidate) -> bool {
+        ap80_feedback_per_service(0xc502, 0x0072, rusb::Version::from_bcd(0xffff), 1, candidate)
+    }
+
+    #[test]
+    fn ap80_physical_feedback_vectors_use_data_service_units() {
+        // Captured native DSD64/128/256 and ordinary 16-bit PCM44.1 reports.
+        for (alt, nominal_rate, raw, expected_rate) in [
+            (4, 88_200, [0xa2, 0x10, 0x16, 0x00], 88_259.8876953125),
+            (4, 176_400, [0x2e, 0x1d, 0x2c, 0x00], 176_455.9326171875),
+            (4, 352_800, [0x0a, 0x37, 0x58, 0x00], 352_859.9853515625),
+            (2, 44_100, [0x16, 0x09, 0x0b, 0x00], 44_141.9677734375),
+        ] {
+            let candidate = ap80_candidate(alt);
+            let per_service = ap80_rule(&candidate);
+            assert!(per_service);
+            let stride = usize::from(candidate.channels) * usize::from(candidate.subslot_size);
+            let scheduler = IsoPacketScheduler::new(nominal_rate, stride, 250);
+            let max_frames = candidate.max_packet_bytes / stride;
+            let mut counters = FeedbackCounters::default();
+            let selected = select_feedback_report(&raw, [(LIBUSB_TRANSFER_COMPLETED, 4, 4)],
+                &scheduler, 250, Speed::High, max_frames, per_service, &mut counters).unwrap();
+            assert!((selected.1 - expected_rate).abs() < 0.000001);
+            assert!((selected.0 - expected_rate / 4000.0).abs() < 0.000001);
+            assert_eq!(counters.rejected, 0);
+            // Ordinary UAC2 HS feedback still means frames per 125 us.
+            let normal = decode_feedback_report(&raw, 250, Speed::High).unwrap();
+            assert_eq!((normal.0, normal.1), (selected.0 * 2.0, selected.1 * 2.0));
+            assert!(select_feedback_report(&raw, [(LIBUSB_TRANSFER_COMPLETED, 4, 4)],
+                &scheduler, 250, Speed::High, max_frames, false, &mut FeedbackCounters::default()).is_none());
+            // The rule does not relax capacity validation.
+            assert!(select_feedback_report(&raw, [(LIBUSB_TRANSFER_COMPLETED, 4, 4)],
+                &scheduler, 250, Speed::High, 1, per_service, &mut FeedbackCounters::default()).is_none());
+        }
+        let legacy = [0, 0, 12];
+        assert_eq!(decode_feedback_report_with_scale(&legacy, 250, Speed::High, true),
+            decode_feedback_report(&legacy, 250, Speed::High));
+    }
+
+    #[test]
+    fn ap80_feedback_units_require_exact_identity_revision_link_and_format() {
+        for alt in 1..=4 {
+            let candidate = ap80_candidate(alt);
+            assert!(ap80_rule(&candidate));
+            for (vendor, product, revision, config) in [
+                (0xc503, 0x0072, 0xffff, 1), (0xc502, 0x0073, 0xffff, 1),
+                (0xc502, 0x0072, 0x0100, 1), (0xc502, 0x0072, 0xffff, 2),
+            ] {
+                assert!(!ap80_feedback_per_service(vendor, product, rusb::Version::from_bcd(revision), config, &candidate));
+            }
+            for mutation in 0..29 {
+                let mut candidate = ap80_candidate(alt);
+                match mutation {
+                    0 => candidate.usb_speed = Speed::Full,
+                    1 => candidate.usb_speed = Speed::Super,
+                    2 => candidate.interface_number = 2,
+                    3 => candidate.alt_setting = 5,
+                    4 => candidate.endpoint_address = 2,
+                    5 => candidate.endpoint_interval = 1,
+                    6 => candidate.service_interval_us = 125,
+                    7 => candidate.max_packet_bytes = 1023,
+                    8 => candidate.sync_type = SyncType::Adaptive,
+                    9 => candidate.usage_type = UsageType::FeedbackData,
+                    10 => candidate.channels = 1,
+                    11 => candidate.is_uac1 = true,
+                    12 => candidate.refresh = 1,
+                    13 => candidate.synch_address = 0x81,
+                    14 => candidate.feedback_endpoint = None,
+                    15 => candidate.feedback_endpoint.as_mut().unwrap().address = 0x82,
+                    16 => candidate.feedback_endpoint.as_mut().unwrap().transfer_type = TransferType::Interrupt,
+                    17 => candidate.feedback_endpoint.as_mut().unwrap().interval = 3,
+                    18 => candidate.feedback_endpoint.as_mut().unwrap().service_interval_us = 500,
+                    19 => candidate.feedback_endpoint.as_mut().unwrap().max_packet_bytes = 3,
+                    20 => candidate.feedback_endpoint.as_mut().unwrap().refresh = 1,
+                    21 => candidate.subslot_size = 1,
+                    22 => candidate.bit_resolution = 8,
+                    23 => candidate.format_tag = FORMAT_TAG_IEEE_FLOAT,
+                    24 => candidate.uac2_formats = None,
+                    25 => candidate.uac2_formats = Some(if alt == 4 { 0x8000_0001 } else { 3 }),
+                    26 => candidate.native_dsd = if alt == 4 { None } else { ap80_candidate(4).native_dsd },
+                    27 => candidate.implicit_feedback = Some(ImplicitFeedbackSource {
+                        interface_number: 1, alt_setting: alt, address: 0x82, bytes_per_frame: 8,
+                        service_interval_us: 250, max_packet_bytes: 1024,
+                    }),
+                    _ => candidate.alt_setting = if alt == 1 { 2 } else { 1 },
+                }
+                assert!(!ap80_rule(&candidate), "alt {alt}, mutation {mutation}");
+            }
+        }
+        for mutation in 0..4 {
+            let mut candidate = ap80_candidate(4);
+            let profile = candidate.native_dsd.as_mut().unwrap();
+            match mutation { 0 => profile.word_bytes = 2, 1 => profile.big_endian = false,
+                2 => profile.bit_reverse = true, _ => profile.origin = NativeDsdOrigin::HostPolicy }
+            assert!(!ap80_rule(&candidate));
+        }
     }
 
     fn compatible_report(report: &[u8], service_us: u32, max_frames: usize, per_service: bool,

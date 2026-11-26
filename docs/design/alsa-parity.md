@@ -718,7 +718,57 @@ lists USB DAC decoding for DSD64, DSD128 and DSD256.
 Descriptor SHA-256 is
 `a767fe00fe6a2ae3e4e442362bbcb030fa69b7a4db5c350a9ad8f6342891d33b`.
 The player was detached when the archive was read. Native DSD sample
-delivery, live clock rate and PCM hand-back still need a physical run.
+delivery and its clock were subsequently checked on a connected player.
+
+### Hidizs AP80 Pro-X explicit feedback timebase
+
+On an Android USB host, the AP80 Pro-X opened native DSD on alternate 4
+at 88.2 kHz wire rate and completed audio transfers. The ordinary
+125 µs decode rejected every feedback report, so the stream retired at
+the startup deadline with feedback unlocked.
+
+A bounded diagnostic captured 12 successful four-byte reports in each
+mode. The player reports Q16.16 frames per 250 µs data service interval.
+The values below are the first report from each mode.
+
+| Mode | Nominal wire rate | Raw bytes | Rate at 125 µs | Rate at 250 µs |
+| --- | --- | --- | --- | --- |
+| DSD64 | 88,200 Hz | `a2 10 16 00` | 176,519.775 Hz | 88,259.888 Hz |
+| DSD128 | 176,400 Hz | `2e 1d 2c 00` | 352,911.865 Hz | 176,455.933 Hz |
+| DSD256 | 352,800 Hz | `0a 37 58 00` | 705,719.971 Hz | 352,859.985 Hz |
+| 16-bit PCM | 44,100 Hz | `16 09 0b 00` | 88,283.936 Hz | 44,141.968 Hz |
+
+All four alternates report the same endpoint geometry. Bind the
+timebase to `c502:0072` with `bcdDevice=0xffff`, configuration 1, UAC2
+interface 1, the PCM and RAW_DATA alternates, and the exact high-speed
+OUT and feedback pipe. Continue to check the decoded rate and the
+fractional packet ceiling. Maintain the normal startup and stale-report
+deadlines. The live 361-byte descriptor has SHA-256
+`65839151d497e59fe99b76a27855f84ce22d237cd198f522c035da14d3f21a0f`.
+[USB 2.0 §5.12.4.2](https://www.usb.org/document-library/usb-20-specification),
+[ALSA feedback unit correction](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L1824-L1898)
+
+The production Android AAR passed one bounded session on the OnePlus
+host with the attached AP80 Pro-X. The session played balanced native
+DSD data through alternate 4, then switched to PCM at 44.1 kHz on
+alternates 2, 1 and 3. Each leg had live feedback lock, zero rejected
+reports, zero underruns and zero lost frames. The session closed
+successfully with the existing device volume preserved.
+
+| Mode | Last feedback | Completed media frames | Transport verdict |
+| --- | --- | --- | --- |
+| DSD64 | 88,255.981 Hz | 528,760 | Bit-perfect |
+| DSD128 | 176,459.960 Hz | 1,054,444 | Bit-perfect |
+| DSD256 | 352,855.957 Hz | 2,108,612 | Bit-perfect |
+| 16-bit PCM | 44,144.897 Hz | 57,286 | Feedback locked |
+| 24-bit PCM | 44,141.967 Hz | 57,203 | Feedback locked |
+| 32-bit PCM | 44,141.967 Hz | 57,291 | Feedback locked |
+
+DSD counters count one byte per channel. The PCM legs used silence and
+reported `PAYLOAD_UNVERIFIED`. The probe checked USB transport and PCM
+hand-back. Rust workspace tests, Android arm64 NDK and the four-ABI
+AAR and sample builds passed. The AAR SHA-256 is
+`3693c3ea6b7de6b523902060f433cc0ad22ded4d4fb057084d683f92ad095e8f`.
 
 ### Fixed-rate Pioneer USB mixers
 

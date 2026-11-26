@@ -38,7 +38,7 @@ and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-t
 This guide covers usbdac 0.1.1.
 
 - **Automated checks pass.** Rust and Kotlin tests cover the feedback changes without a DAC. CI builds the library and sample app for four processor types. [Evidence and status](evidence.md) records hardware coverage.
-- **Hardware testing has only begun.** The Rust driver has played PCM on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U), inside a build of Flick that runs on this library. Other phones and DACs, DSD and DoP, the Kotlin SDK, the sample app, the Android-managed output and the AAudio output have not been run on hardware yet. Expect to find problems, and report them with the logcat of the tag `usbdac`.
+- **Hardware testing is still limited.** The Rust driver has played PCM on a OnePlus 15 running Android 16 with an iBasso DC04U, inside a build of Flick. The Kotlin SDK passed native DSD64, DSD128 and DSD256 transport and PCM hand-back on the Hidizs AP80 Pro-X. Further device coverage, DoP, the sample app, Android-managed output and AAudio output still need hardware validation. Report issues with logcat output for the `usbdac` tag. [AP80 Pro-X evidence](../design/alsa-parity.md#hidizs-ap80-pro-x-explicit-feedback-timebase)
 
 ## Which transport to use
 

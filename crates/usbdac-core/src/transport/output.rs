@@ -558,9 +558,19 @@ pub(super) fn run_usb_output_loop(
     let feedback_endpoint = candidate.feedback_endpoint;
     let mut feedback_slot = None;
     let mut feedback_start_error = None;
+    let mut feedback_per_service = settings().has(crate::Quirk::ExplicitFeedbackPerServiceInterval);
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
-            let compatibility = handle.device().device_descriptor().map(|descriptor| {
+            let device = handle.device();
+            let compatibility = device.device_descriptor().map(|descriptor| {
+                if (descriptor.vendor_id(), descriptor.product_id()) == (0xc502, 0x0072)
+                    && descriptor.device_version() == rusb::Version::from_bcd(0xffff) {
+                    let configuration = device.active_config_descriptor().map(|config| config.number()).unwrap_or(0);
+                    feedback_per_service |= ap80_feedback_per_service(
+                        descriptor.vendor_id(), descriptor.product_id(), descriptor.device_version(),
+                        configuration, &candidate,
+                    );
+                }
                 FeedbackCompatibility::for_device(
                     descriptor.vendor_id(),
                     descriptor.product_id(),
@@ -603,7 +613,6 @@ pub(super) fn run_usb_output_loop(
     let mut underrun_count = 0u64;
     let mut feedback_counters = FeedbackCounters::default();
     let mut feedback_stale_warned = false;
-    let feedback_per_service = settings().has(crate::Quirk::ExplicitFeedbackPerServiceInterval);
     let feedback_health = feedback_endpoint.filter(|_| candidate.sync_type == SyncType::Asynchronous).map(|endpoint| ExplicitFeedbackHealth::new(
         endpoint.service_interval_us, candidate.is_uac1.then_some(endpoint.refresh)));
     let mut min_active_slots = transfer_slot_count;
