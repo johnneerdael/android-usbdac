@@ -459,6 +459,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "android_logger",
  "jni",
+ "libc",
  "log",
  "once_cell",
  "parking_lot",

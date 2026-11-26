@@ -11,7 +11,7 @@ Every failure is a `DacException`. `error.code` is a `DacErrorCode`, `error.deta
 | `BUSY` | `UsbDac.open` | A `DacSession` is already open in this process (one per process in this version). Close it first. A session that was not closed holds the DAC until the process dies |
 | `PLATFORM_UNSUPPORTED` | native | Direct output needs Linux usbfs: Android or Linux. Not an Android problem; you are on another host |
 | `CLAIM` | `UsbDac.open` | The audio interfaces could not be taken from Android's USB audio driver, or are not the set the library expected. See [Android keeps the DAC](#android-keeps-the-dac) |
-| `UNSUPPORTED` | `UsbDac.open`, `negotiate`, `openStream`, `AndroidManagedOutput.open` | At open: the device has no AudioControl interface together with a playback AudioStreaming interface. Later: no alternate setting carries the request (rate, depth, channels, DSD), or a managed request the platform cannot make. The message lists how many alternate settings the DAC offers; read `session.capabilities.altSettings`. With `RatePolicy.EXACT` a rate the DAC cannot run ends here |
+| `UNSUPPORTED` | `UsbDac.open`, `negotiate`, `openStream`, `AndroidManagedOutput.open`, `AAudioExclusiveOutput.open` | At open: the device has no AudioControl interface together with a playback AudioStreaming interface. Later: no alternate setting carries the request (rate, depth, channels, DSD), or a managed request the platform cannot make. The message lists how many alternate settings the DAC offers; read `session.capabilities.altSettings`. With `RatePolicy.EXACT` a rate the DAC cannot run ends here |
 | `IMPLICIT_FEEDBACK_UNSUPPORTED` | `negotiate`, `openStream` | See [asynchronous endpoints without feedback](#asynchronous-endpoints-without-feedback) |
 | `CLOCK_UNVERIFIED` | `openStream` | The DAC did not confirm the sampling frequency it was told (or reported another), and `DacConfig.requireVerifiedRate` is on. The message gives the requested and reported rate. Some DACs have a broken readback: `DacQuirk.SkipClockValidation` (with `IgnoreInvalidSampleRate`) trusts them, or turn `requireVerifiedRate` off and accept that the stream is then never verified |
 | `DEVICE_LOST` | any call | The DAC was unplugged or stopped answering. `DacState.LOST` and `DacEvent.DeviceLost` follow; close the session |
@@ -19,6 +19,7 @@ Every failure is a `DacException`. `error.code` is a `DacErrorCode`, `error.deta
 | `CONTROL` | volume, clock | A class control request failed (volume, mute, clock). A DAC without a volume control throws this for volume calls; `session.volume` is `null` for it |
 | `INVALID_STATE` | many | The call is not valid now: a second stream, `negotiate` while a stream is open, `write` after `drain()` or after the stream closed or failed, any call on a closed session |
 | `INVALID_ARGUMENT` | many | A value out of range or inconsistent: buffer depths, a DSD slot size other than 1, 2 or 4, a malformed request |
+| `EXCLUSIVE_UNAVAILABLE` | `AAudioExclusiveOutput.open` | `AAudioConfig.requireExclusive` is on and the platform granted only a shared AAudio stream. The message carries the grant's reason. Exclusive mode depends on the device and the route; open with `requireExclusive = false` to accept a shared stream, or fall back to `AndroidManagedOutput` |
 | `PERMISSION_DENIED` | `UsbDac.open` | The app has no USB permission for the device. See [permission](#permission) |
 | `OPEN_FAILED` | `UsbDac.open`, `AndroidManagedOutput.open` | Android refused to open the device or gave no file descriptor, or the `AudioTrack` could not be created |
 | `UNKNOWN` | any | A code this version of the SDK does not know, from a newer native library |
@@ -70,8 +71,23 @@ Work down the list.
 8. **The volume keys do nothing.** `session.volume` is `null` (the DAC has no volume control), or `dispatchKeyEvent` does not call `DacVolumeKeys.handle`, or the screen is off and no `DacVolumeProvider` is attached to a `MediaSession`.
 9. **After unplugging.** `DacEvent.DeviceLost` and `DacState.LOST`. Close the session, wait for the next `DacHotplugEvent.Attached`, and open again.
 
+## AAudio exclusive output
+
+`AAudioExclusiveOutput.open` says why it could not open; the usual ones:
+
+- `UNSUPPORTED` with "need Android 12 (API 31)": packed 24-bit and 32-bit integer samples are not in AAudio before Android 12. Use 16-bit, 32-bit float (`AAudioConfig(floatSamples = true)`) or another output.
+- `UNSUPPORTED` with "did not open the stream as requested": the platform opened the stream at another rate, channel count or format than the one you write. The message says which. The output never converts, so it refuses; the route may only run one rate (read `AudioDeviceInfo.sampleRates` of the device).
+- `UNSUPPORTED` with "AAudio is not available": `libaaudio.so` could not be opened.
+- `BUSY`: another app holds the device exclusively.
+- `EXCLUSIVE_UNAVAILABLE`: see the table above.
+- `DEVICE_LOST` from `write`, `AAudioEvent.Disconnected` and `state == FAILED`: the route went away. Close the output and open another.
+- Clicks: `AAudioEvent.Underrun` (the ring ran dry: raise `bufferTargetMs`, check the writer thread) against `AAudioEvent.Xrun` (the device-side buffer ran dry: raise `deviceBufferBursts`, or check that `performanceMode` is `LOW_LATENCY`).
+- Silence: the writer must write at least `startThresholdMs` of audio before playback starts, as for a direct stream; check `state` and `writableBytes`.
+
+The `usbdac` log (`UsbDac.setLogLevel`) also covers this output.
+
 ## Build and packaging
 
 - `UnsatisfiedLinkError` for `usbdac`: the AAR has no library for the device's ABI. The AAR carries arm64-v8a, armeabi-v7a, x86_64 and x86; check `abiFilters` in your app and that you did not build the AAR with `-Pusbdac.abis` restricted.
-- `UnsatisfiedLinkError` for a `dev.usbdac.internal.Native` method, or a crash on the first event, with R8 enabled: the library ships consumer rules that keep `Native` and `NativeListener`. If your build replaces or ignores consumer rules, keep them.
+- `UnsatisfiedLinkError` for a `dev.usbdac.internal.Native` or `AAudioNative` method, or a crash on the first event, with R8 enabled: the library ships consumer rules that keep `Native`, `AAudioNative` and `NativeListener`. If your build replaces or ignores consumer rules, keep them.
 - A heap `ByteBuffer` passed to `write` works but is copied on every call; use a direct buffer in a real player.

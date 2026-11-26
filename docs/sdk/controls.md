@@ -206,3 +206,34 @@ Call `idle.onPaused()` when playback pauses and `idle.onResumed()` when it resum
 | `UsbDac.nativeVersion` | The native library's version string; loads `libusbdac.so` |
 
 The managed transport's controls are in [transports](transports.md).
+
+## The AAudio output: `AAudioConfig`
+
+Pass an `AAudioConfig` to `AAudioExclusiveOutput.open(context, request, device, config)`. The request supplies the rate, the channel count and (with `floatSamples`) the sample layout; nothing is converted. "Bit-perfect impact" says whether the option can change what `bitPerfect` reports: the AAudio output is never `Verified`, so the question is whether it changes the reason.
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `requireExclusive` | `Boolean` | `true` | Fail `open` with `EXCLUSIVE_UNAVAILABLE` when the platform grants only a shared stream (AAudio falls back to shared on its own when exclusive is not available). Off, the output opens and `grant.sharingMode` is `SHARED` | On: a stream that opens is exclusive. Off: a shared stream reports that the system mixer is in the path |
+| `floatSamples` | `Boolean` | `false` | With `bitDepth` 32, carry 32-bit float instead of 32-bit integers. Any other depth with it on fails `INVALID_ARGUMENT` | None; the bytes are not converted either way |
+| `performanceMode` | `AAudioPerformanceMode` | `LOW_LATENCY` | How the platform schedules the stream: `NONE`, `POWER_SAVING` or `LOW_LATENCY`. Exclusive (memory-mapped) streams are normally granted only in `LOW_LATENCY` | An exclusive stream is unlikely in the other modes |
+| `bufferTargetMs` | `Int` | 250 | The depth `writableBytes` fills the output's ring to. Between `startThresholdMs` and `bufferCapacityMs` | None |
+| `bufferCapacityMs` | `Int` | 500 | The ring's capacity: `write` never accepts more. At most 10000, and the ring must fit in 64 MiB | None |
+| `startThresholdMs` | `Int` | 100 | Audio the ring must hold before playback starts, and before it resumes after a flush or an underrun. At least 1 | None |
+| `deviceBufferBursts` | `Int?` | `null` | The device-side buffer in bursts of `grant.framesPerBurst` frames; `null` is the platform's default (usually 2). A larger buffer rides out scheduling hiccups at the price of latency | None |
+
+A deeper ring costs nothing in responsiveness if you `flush()` on every seek, stop and track change, exactly as for a direct stream.
+
+### Reading the output
+
+| Member | Type | What it is |
+|---|---|---|
+| `grant` | `AAudioGrant` | What the platform granted, read back after opening: `sharingMode`, `sampleRate`, `channels`, `format`, `framesPerBurst`, `bufferCapacityFrames`, `bufferSizeFrames`, `deviceId`, `performanceMode`, `usesMmap`, `hardware` (Android 14+), `asRequested`, `verdict`, `reason` |
+| `bitPerfect` | `StateFlow<BitPerfectState>` | `NotVerified(null, grant.reason)`, never `Verified`. After a disconnect the reason says the route failed and keeps what was known before |
+| `state` | `StateFlow<StreamState>` | `BUFFERING`, `PLAYING`, `PAUSED`, `DRAINING`, `DRAINED`, `CLOSED`, `FAILED`. Refreshed by every call you make and by the platform's error callback |
+| `events` | `SharedFlow<AAudioEvent>` | `Disconnected`, `Failed`, `Underrun`, `Xrun`, `StateChanged`. A buffer of 64; a collector that cannot keep up misses the oldest |
+| `xrunCount` | `Int` | AAudio's count of device-side underruns since the stream opened |
+| `underrunCount` | `Long` | How often the output's own ring ran dry because the host wrote too slowly |
+| `playedFrames`, `latencyFrames` | `Long` | At the stream's rate; see [transports](transports.md#what-aaudio-guarantees) |
+
+`write`, `writableBytes`, `play`, `pause`, `flush`, `drain`, `isDrained` and `close` behave as in the table of [the stream](#the-stream-dacstream-and-pcmoutput), with these differences: `pause()` plays silence on a stream that stays open, `latencyFrames` counts the ring plus what AAudio holds, and `close()` takes up to about half a second.
+

@@ -195,10 +195,13 @@ The buffer is deep (250 ms by default) so that a stall upstream does not become 
 | Position | `startTime + playedFrames / counterRateHz`, with `startTime` set at each flush |
 | Volume | `DacSession.volume` (hardware). Software gain only if you accept losing bit-perfect output |
 
-`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once; audio already on the bus (tens of milliseconds) still plays. `pause()` sends silence so the DAC stays locked. The sample's buttons:
+`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once; audio already on the bus (tens of milliseconds) still plays. `pause()` sends silence so the DAC stays locked. The sample's buttons (the same calls drive the other two outputs, which the sample reaches through `other`):
 
 ```kotlin
-        click(R.id.flushButton) { stream?.flush() }
+        click(R.id.flushButton) {
+            stream?.flush()
+            other?.flush()
+        }
 ```
 
 ```kotlin
@@ -239,6 +242,10 @@ class Transport(private val output: PcmOutput, private val format: StreamFormat,
     fun endOfAudio() = output.drain()
 }
 ```
+
+### Other outputs
+
+Everything above is written against `PcmOutput`, so the same writer, transport and position code runs on the other two outputs: `AndroidManagedOutput` (an `AudioTrack`) and `AAudioExclusiveOutput` (an exclusive AAudio stream, the route for a player with an internal DAC). They need no `DacSession`: open one, write the PCM in the encoding of the request, and control it as above. The sample's output spinner switches between the three; [transports](transports.md) says what differs.
 
 ## 8. Volume
 

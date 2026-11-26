@@ -70,6 +70,18 @@ Nothing in this library decodes MQA, and it does not offer unfolding in software
 
 Neither state is `isVerified`. See [transports](transports.md).
 
+## The AAudio output
+
+`AAudioExclusiveOutput` asks the platform for an exclusive AAudio stream at the source's own rate, channel count and format, and writes your bytes into it unchanged. It reads back what the platform granted, and its `bitPerfect` is **always** `NotVerified(blocker = null, reason)`: an app cannot see what the audio HAL and the device do with the samples, so the library never claims `Verified`. The reason is as precise as the grant allows:
+
+| `grant.verdict` | The reason says |
+|---|---|
+| `exclusive` | Exclusive mode was granted at the requested rate, format and channel count: the app mixer is bypassed, but the device's audio HAL is not verifiable from an app. On Android 14 and later it adds that the hardware reports the same rate, format and channel count |
+| `shared` | The platform granted shared mode, not exclusive: the audio goes through the system mixer, which can resample, mix it with other sounds and apply volume and effects. With `requireExclusive` on (the default) the open fails instead |
+| `hardware_rate`, `hardware_format`, `hardware_channels` | (Android 14 and later) The hardware runs another rate, format or channel count than the stream: AAudio converts before the device |
+
+A stream that would play the bytes wrongly (another rate, channel count or format than the one you write) is not reported but refused: `open` fails with `UNSUPPORTED`. Nothing is dithered, scaled or resampled by the library on this path, and a decoder that outputs float and converts to integers has already changed the samples before they reach `write`, as for every output. See [transports](transports.md#aaudio-exclusive-aaudioexclusiveoutput).
+
 ## The states at a glance
 
 | `BitPerfectState` | From | `isVerified` | What it says |
@@ -78,3 +90,4 @@ Neither state is `isVerified`. See [transports](transports.md).
 | `NotVerified(blocker, reason)` | `DacStream` | `false` | The first failing condition, with a sentence for a status line |
 | `RequestedViaPlatform(detail)` | `AndroidManagedOutput` | `false` | The platform accepted a bit-perfect request |
 | `Unverifiable(reason)` | `AndroidManagedOutput` | `false` | Nothing can be said |
+| `NotVerified(null, reason)` | `AAudioExclusiveOutput` | `false` | The grant's exact reason: exclusive but not verifiable, shared, or converted before the hardware |

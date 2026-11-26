@@ -20,6 +20,7 @@ Contents
 10. [JNI contract](#10-jni-contract)
 11. [JSON schemas](#11-json-schemas)
 12. [Limits of v0.1](#12-limits-of-v01)
+13. [AAudio exclusive output](#13-aaudio-exclusive-output)
 
 ## 1. Principles
 
@@ -715,3 +716,222 @@ feedback report).
 - Not run on hardware as a standalone library. The transport is the code that
   ran in Flick; the layers around it (handle API, push ring, events, JNI) have
   only been exercised by host tests.
+- The AAudio output (section 13) is not part of the Rust API of `usbdac-core`; it
+  lives in the JNI crate, is Android only, and has never opened a stream on a
+  device.
+
+## 13. AAudio exclusive output
+
+A second output next to the USB transport, for a device whose DAC is internal (a
+digital audio player). It is not a USB feature and has nothing to do with
+`Dac`: the JNI crate asks Android for an exclusive-mode AAudio stream at the
+source's own rate, channel count and sample format, and feeds it the bytes the
+host writes, unchanged. It is the object `dev.usbdac.internal.AAudioNative`,
+separate from `Native`; the Kotlin class on top is `AAudioExclusiveOutput`.
+
+**What it promises.** No conversion, resampling, dithering or scaling: the
+bytes written are the bytes AAudio is handed, and the stream is requested with
+`AAUDIO_SHARING_MODE_EXCLUSIVE`, the exact rate and channel count and the
+requested format, direction output, usage media, content type music. **What it
+cannot promise.** An app cannot see past AAudio, so the output is never
+reported bit-perfect-verified. Section 13.4 lists the reasons it reports.
+
+### 13.1 Lifecycle and functions
+
+```
+aaudioOpen(requestJson, listener, apiLevel) -> handle    open the stream (not started)
+aaudioGrant(handle) -> json                              what the platform granted, and the verdict
+  (the host decides: refuse a shared stream, or go on)
+aaudioStart(handle)                                      request the start; the stream plays silence
+aaudioWrite / WritableBytes / Play / Pause / Flush / Drain / IsDrained
+aaudioState / PlayedFrames / LatencyFrames / Xruns / Underruns
+aaudioClose(handle)                                      stop and release
+```
+
+```kotlin
+package dev.usbdac.internal
+
+internal object AAudioNative {
+    init { System.loadLibrary("usbdac") }
+
+    @JvmStatic external fun aaudioOpen(requestJson: String, listener: Any, apiLevel: Int): Long
+    @JvmStatic external fun aaudioGrant(handle: Long): String
+    @JvmStatic external fun aaudioStart(handle: Long)
+    @JvmStatic external fun aaudioClose(handle: Long)
+    @JvmStatic external fun aaudioWrite(handle: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
+    @JvmStatic external fun aaudioWritableBytes(handle: Long): Int
+    @JvmStatic external fun aaudioPlay(handle: Long)
+    @JvmStatic external fun aaudioPause(handle: Long)
+    @JvmStatic external fun aaudioFlush(handle: Long)
+    @JvmStatic external fun aaudioDrain(handle: Long)
+    @JvmStatic external fun aaudioIsDrained(handle: Long): Boolean
+    @JvmStatic external fun aaudioState(handle: Long): Int
+    @JvmStatic external fun aaudioPlayedFrames(handle: Long): Long
+    @JvmStatic external fun aaudioLatencyFrames(handle: Long): Long
+    @JvmStatic external fun aaudioXruns(handle: Long): Int
+    @JvmStatic external fun aaudioUnderruns(handle: Long): Long
+}
+```
+
+The exported symbols are `Java_dev_usbdac_internal_AAudioNative_<name>`. Handles
+are opaque ids from the same counter as every other handle. `listener` is any
+object with `onEvent(type: Int, a: Long, b: Double, message: String?)` (the
+`NativeListener` interface); the library keeps a global reference until the
+output is closed. `apiLevel` is `Build.VERSION.SDK_INT`. Failures are
+`IllegalStateException("usbdac:<code>: <message>")` as in section 10.
+
+### 13.2 Request
+
+```json
+{ "sample_rate": 96000, "channels": 2, "format": "i24", "device_id": 7,
+  "performance_mode": "low_latency", "buffer_target_ms": 250,
+  "buffer_capacity_ms": 500, "start_threshold_ms": 100, "device_buffer_bursts": null }
+```
+
+`sample_rate` (8000 to 768000), `channels` (1 to 8) and `format` are required.
+`format` is `i16` (signed 16-bit), `i24` (signed 24-bit packed in 3 bytes),
+`i32` (signed 32-bit) or `float` (32-bit IEEE); all little-endian and
+interleaved. `device_id` is `AudioDeviceInfo.getId()`, 0 for the platform's
+choice. `performance_mode` is `none`, `power_saving` or `low_latency` (the
+default). The buffer keys default as shown; `buffer_target_ms` must be at most
+`buffer_capacity_ms` and at least `start_threshold_ms`, and the ring must fit in
+64 MiB. `device_buffer_bursts` (null: the platform's default) sizes the device
+buffer in bursts. A request that fails these checks is `invalid_argument`.
+
+The format needs an Android release: `i16` and `float` need API 26 (AAudio
+itself), `i24` and `i32` need API 31. Below that the open fails with
+`unsupported` and a message naming both API levels. Nothing is converted to make
+a request fit.
+
+### 13.3 Grant
+
+```json
+{ "sharing": "exclusive", "sample_rate": 96000, "channels": 2,
+  "format": "i24", "format_raw": 3,
+  "frames_per_burst": 96, "buffer_capacity_frames": 960, "buffer_size_frames": 192,
+  "device_id": 7, "performance_mode": "low_latency", "mmap": true,
+  "hardware": null,
+  "as_requested": true, "verdict": "exclusive",
+  "reason": "Exclusive mode was granted at the requested rate, format and channel count: the app mixer is bypassed, but the device's audio HAL is not verifiable from an app." }
+```
+
+Everything but the last three keys is read back from the stream after it opened.
+`mmap` (the memory-mapped path exclusive streams use) is `null` below Android 9.
+`hardware` is `{ "sample_rate", "channels", "format", "format_raw" }` on Android
+14 (API 34) and later, where AAudio reports what the device itself runs at, and
+`null` before. `format` is `null` for a format this library does not carry.
+
+### 13.4 The verdict
+
+`as_requested` is true when the stream is exclusive and nothing below differs.
+`verdict` names the most serious difference, and `reason` is the sentence the
+Kotlin side puts in `NotVerified`. The differences, in the order they are
+reported:
+
+| `verdict` | Meaning | `aaudioOpen` |
+|---|---|---|
+| `exclusive` | exclusive, at the requested rate, format and channel count, and (on API 34+) the hardware agrees | succeeds |
+| `shared` | the platform granted a shared stream: the system mixer is in the path | succeeds; the host may refuse |
+| `rate_changed` | the stream runs at another rate than requested | fails `unsupported` |
+| `format_changed` | the stream's format is another than requested | fails `unsupported` |
+| `channels_changed` | the stream has another channel count | fails `unsupported` |
+| `hardware_rate`, `hardware_format`, `hardware_channels` | (API 34+) the hardware runs another rate, format or channel count than the stream, so AAudio converts before the device | succeeds |
+
+A stream whose rate, format or channel count differs from the one the ring holds
+would play the bytes at the wrong speed or as noise, so it is never started: the
+open fails and the stream is closed. A shared stream and a conversion before the
+hardware are playable and are reported instead. With several differences the
+`reason` lists them all, separated by `;`.
+
+The output is **never** verified. Even when `verdict` is `exclusive`, what the
+audio HAL and the device do with the samples (volume, effects, resampling in
+firmware) cannot be seen from an app.
+
+### 13.5 Playing
+
+The stream is opened with a data callback. AAudio's own buffer is a few
+milliseconds deep, which no host loop that sleeps for a few milliseconds can
+keep full, so the output puts a ring of `buffer_capacity_ms` in front of it and
+the callback (on AAudio's real-time thread, without locks or allocation) copies
+from the ring. The host sees the same push model as the USB stream:
+
+- `aaudioWrite` takes whole frames, never blocks, and returns the bytes taken
+  (a short count means the ring is full). It reads `count` bytes from `offset` of
+  a direct buffer and does not move the buffer's position. After `aaudioDrain`
+  (until `aaudioFlush`) it fails `invalid_state`; after a disconnect
+  `device_lost`.
+- `aaudioWritableBytes` is the room up to `buffer_target_ms`, a whole number of
+  frames, and 0 after drain or failure.
+- Nothing plays until the ring holds `start_threshold_ms`; the stream then runs
+  and the state goes from buffering to playing. The device is fed silence until
+  then, while paused, and after an underrun. An underrun (the ring ran dry
+  while playing) is counted by `aaudioUnderruns` and playback waits for the start
+  threshold again instead of stuttering.
+- `aaudioPause` plays silence and keeps the ring and the stream open
+  (and exclusive); `aaudioPlay` continues where the ring was. A long pause holds
+  the device: close the output instead.
+- `aaudioFlush` drops the ring (the callback applies it within one burst),
+  resets `aaudioPlayedFrames` to 0 at once, and re-arms the start threshold. Audio
+  the device already holds still plays and is not counted. It also clears a drain.
+- `aaudioDrain` declares the end of the audio: the ring plays out, a tail
+  shorter than the start threshold included, and the padded end is not an
+  underrun. `aaudioIsDrained` is true when everything written since the last
+  flush has been presented by the device.
+- `aaudioState` is 0 buffering, 1 playing, 2 paused, 3 draining, 4 drained,
+  5 closed, 6 failed, as for a stream.
+
+**Position.** `aaudioPlayedFrames` is the number of music frames the device has
+presented since the start or the last flush, in the stream's rate. The device is
+fed silence as well as music, so the count of music frames among the frames
+AAudio has presented is kept separately: the callback counts the music and the
+silence it hands over, and the position is `min(music, presented - silence handed
+over before the last music frame)`. `presented` is `AAudioStream_getTimestamp`
+extrapolated to now while the stream runs (never past `AAudioStream_getFramesRead`;
+an implausible timestamp is ignored), else the frames read. The result lags the
+audible position by at most the device's own buffer, never leads it, is
+monotonic between flushes, and does not move while paused. `aaudioLatencyFrames`
+is the ring plus the music the device holds.
+
+`aaudioXruns` is AAudio's own count of device-side underruns
+(`AAudioStream_getXRunCount`); `aaudioUnderruns` counts the ring running dry.
+
+### 13.6 Events and errors
+
+`onEvent(type, a, b, message)` from AAudio's error-callback thread:
+
+| `type` | Event | `a` | `message` |
+|---|---|---|---|
+| 0 | the route was disconnected (device unplugged, routing changed) | the AAudio error code (`-899`) | text |
+| 1 | another AAudio error | the AAudio error code | text |
+
+Both mark the output failed (state 6, writes `device_lost`) before the event is
+sent. The library never closes the stream from the callback; the host closes it.
+No event is delivered after `aaudioClose` returns.
+
+AAudio result codes map to the library's codes: `DISCONNECTED` is `device_lost`;
+`ILLEGAL_ARGUMENT`, `OUT_OF_RANGE`, `NULL` are `invalid_argument`;
+`INVALID_STATE`, `INVALID_HANDLE` are `invalid_state`; `UNIMPLEMENTED`,
+`INVALID_FORMAT`, `INVALID_RATE` are `unsupported`; `UNAVAILABLE`,
+`NO_FREE_HANDLES` (another app holds the device) are `busy`; everything else is
+`transfer`. Off Android `aaudioOpen` fails with `platform_unsupported`. The Kotlin layer adds one code of its own,
+`exclusive_unavailable`, when `requireExclusive` is on and the grant is shared.
+
+### 13.7 Loading
+
+`libaaudio.so` is opened with `dlopen` on the first `aaudioOpen` and every
+function is resolved with `dlsym`. The library therefore has no link-time
+dependency on AAudio and loads on every Android release the SDK supports; the
+functions that exist only on newer releases (usage and content type, API 28; the
+MMAP query, API 28; the hardware format, API 34) are optional, and without them
+the grant simply lacks that information. If `libaaudio.so` cannot be opened the
+open fails with `unsupported`.
+
+### 13.8 Threading
+
+As for a stream (section 6): `aaudioWrite` and the getters never block and are
+safe from any thread, with one writer; `aaudioOpen` and `aaudioClose` block (the
+close for up to about half a second while the stream stops).
+
+Nothing in this section has run on a device: the logic is covered by host tests
+with a simulated device and the Kotlin layer by JVM tests with a fake native
+layer, and the AAudio calls themselves have never opened a stream.

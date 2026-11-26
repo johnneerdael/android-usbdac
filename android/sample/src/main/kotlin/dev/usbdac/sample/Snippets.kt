@@ -3,6 +3,10 @@ package dev.usbdac.sample
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.session.MediaSession
+import dev.usbdac.AAudioConfig
+import dev.usbdac.AAudioEvent
+import dev.usbdac.AAudioExclusiveOutput
+import dev.usbdac.AAudioGrant
 import dev.usbdac.AndroidManagedOutput
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
@@ -13,6 +17,9 @@ import dev.usbdac.StreamRequest
 import dev.usbdac.controls.DacIdleRelease
 import dev.usbdac.controls.DacVolumeProvider
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import java.nio.ByteBuffer
 
 // The code samples of docs/sdk that are not part of the activity. They live here so the build
@@ -59,6 +66,39 @@ fun openManaged(context: Context, sampleRate: Int, bitDepth: Int): PcmOutput {
     val usbRoute = AndroidManagedOutput.usbOutputDevices(context).firstOrNull() // null: the default route
     return AndroidManagedOutput.open(context, StreamRequest.pcm(sampleRate, channels = 2, bitDepth = bitDepth), usbRoute)
 }
+// endregion
+
+// region aaudio-output
+/**
+ * The AAudio exclusive output: a stream that bypasses the app mixer, for a device with an internal
+ * DAC (a digital audio player). It plays PCM in the encoding the request names, nothing converted.
+ * With the default `requireExclusive = true`, the call throws if the platform grants only a shared stream.
+ */
+fun openAAudio(context: Context, sampleRate: Int, bitDepth: Int): AAudioExclusiveOutput =
+    AAudioExclusiveOutput.open(
+        context,
+        StreamRequest.pcm(sampleRate, channels = 2, bitDepth = bitDepth),
+        device = null, // the platform's default route; or one of AAudioExclusiveOutput.outputDevices(context)
+        config = AAudioConfig(requireExclusive = true),
+    )
+// endregion
+
+// region aaudio-grant
+/** What the platform granted, and what can and cannot be said about it. */
+fun describeGrant(grant: AAudioGrant): String = buildString {
+    appendLine("${grant.sharingMode} at ${grant.sampleRate} Hz, ${grant.channels} channels, ${grant.format}")
+    appendLine("burst ${grant.framesPerBurst} frames, buffer ${grant.bufferSizeFrames}/${grant.bufferCapacityFrames} frames")
+    appendLine("device ${grant.deviceId}, MMAP ${grant.usesMmap}, hardware ${grant.hardware ?: "not reported"}")
+    append(grant.reason)
+}
+// endregion
+
+// region aaudio-events
+/** Reacts to the route going away: stop writing and close; the output cannot be revived. */
+fun watchRoute(scope: CoroutineScope, output: AAudioExclusiveOutput, onLost: (String) -> Unit): Job =
+    output.events
+        .onEach { event -> if (event is AAudioEvent.Disconnected) onLost(event.detail) }
+        .launchIn(scope)
 // endregion
 
 // region transport-mapping

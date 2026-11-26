@@ -26,6 +26,11 @@ docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
 An Android library (AAR) with the Kotlin side of `dev.usbdac.internal.Native` is
 meant to sit on top of the JNI layer; it is not part of this repository yet.
 
+The JNI crate also carries a second, non-USB output: an AAudio exclusive-mode
+stream for devices with an internal DAC (`dev.usbdac.internal.AAudioNative`,
+[docs/API.md](docs/API.md) section 13). It loads `libaaudio.so` at run time, so
+`libusbdac.so` has no link-time dependency on it.
+
 ## What it does
 
 - Formats: PCM 16/24/32-bit in the subslot size the DAC advertises, DoP
