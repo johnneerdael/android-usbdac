@@ -141,7 +141,7 @@ public class DacStream internal constructor(
     /** The stream's counters. Takes a short lock and touches session state; poll it a few times a second, not per buffer. */
     public fun stats(): DacStreamStats {
         checkOpen()
-        return parseStats(nativeCall { Native.streamStats(handle) })
+        return nativeCall { parseStats(Native.streamStats(handle)) }
     }
 
     /**

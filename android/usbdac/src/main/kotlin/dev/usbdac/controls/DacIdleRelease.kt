@@ -22,7 +22,7 @@ import kotlin.coroutines.CoroutineContext
  * A paused direct stream keeps the USB output thread running and sends silence so the DAC stays
  * locked. After a long pause that is wasted power. This class closes the stream after
  * [timeoutMs] of continuous pause and, when playback resumes, calls your [reopen] lambda to
- * open a new one. The [DacSession] stays open, so the DAC volume keeps working while the
+ * open a new one. The [dev.usbdac.DacSession] stays open, so the DAC volume keeps working while the
  * stream is released. Reopening costs 100 ms or more (negotiate and open); the first audio after
  * a long pause is delayed by that.
  *

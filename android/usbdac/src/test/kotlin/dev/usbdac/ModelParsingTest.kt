@@ -111,6 +111,29 @@ class ModelParsingTest {
     }
 
     @Test
+    fun statsAndCapabilitiesToleratePartialDocuments() {
+        val stats = parseStats("""{ "state": 2, "bit_perfect": true }""")
+        assertEquals(StreamState.PAUSED, stats.state)
+        assertTrue(stats.bitPerfect)
+        assertEquals(0L, stats.underruns)
+        assertNull(stats.feedbackAgeMs)
+        val capabilities = parseCapabilities("""{ "uac_version": "v2" }""")
+        assertEquals(UacVersion.V2, capabilities.uacVersion)
+        assertTrue(capabilities.altSettings.isEmpty())
+        assertFalse(capabilities.supportsPcm)
+    }
+
+    @Test
+    fun anUnreadableNegotiatedFormatIsADacExceptionNotAJsonException() {
+        try {
+            nativeCall { parseStreamFormat("""{ "format_id": 1 }""") }
+            org.junit.Assert.fail("a format without its fields must not parse")
+        } catch (error: DacException) {
+            assertEquals(DacErrorCode.UNKNOWN, error.code)
+        }
+    }
+
+    @Test
     fun volumeDocumentsParse() {
         assertEquals(VolumeRange(-127.0, 0.0, 1.0), parseVolumeRange(Fixtures.VOLUME_RANGE))
         assertEquals(VolumeState(-40.0, 0.5, false), parseVolumeState(Fixtures.VOLUME_STATE))

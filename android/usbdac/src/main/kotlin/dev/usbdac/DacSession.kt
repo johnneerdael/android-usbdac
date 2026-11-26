@@ -96,7 +96,7 @@ public class DacSession private constructor(
 
     init {
         nativeCall { Native.dacSetListener(dac, deviceListener) }
-        val range = nativeCall { Native.volumeRange(dac) }?.let(::parseVolumeRange)
+        val range = nativeCall { Native.volumeRange(dac)?.let(::parseVolumeRange) }
         volume = range?.let {
             val backend = NativeVolumeBackend(dac)
             DacVolume(
@@ -119,7 +119,7 @@ public class DacSession private constructor(
      */
     public fun negotiate(request: StreamRequest): StreamFormat {
         checkOpen()
-        return parseStreamFormat(nativeCall { Native.dacNegotiate(dac, request.toJson()) })
+        return nativeCall { parseStreamFormat(Native.dacNegotiate(dac, request.toJson())) }
     }
 
     /**
@@ -169,7 +169,7 @@ public class DacSession private constructor(
         if (!closed.compareAndSet(false, true)) return
         var failure: DacException? = null
         try {
-            runCatching { stream?.close() }.onFailure { logWarning("closing the stream failed", it) }
+            runCatching { synchronized(this) { stream }?.close() }.onFailure { logWarning("closing the stream failed", it) }
             if (handBack == HandBack.RESTORE_ORIGINAL && mutableState.value != DacState.LOST) {
                 runCatching { volume?.handBack() }.onFailure { logWarning("restoring the volume failed", it) }
             }
@@ -204,7 +204,7 @@ public class DacSession private constructor(
             claims: ClaimedInterfaces,
             onClosed: () -> Unit,
         ): DacSession {
-            val capabilities = parseCapabilities(nativeCall { Native.dacCapabilities(dac) })
+            val capabilities = nativeCall { parseCapabilities(Native.dacCapabilities(dac)) }
             return DacSession(dac, device, config, capabilities, connection, claims, onClosed)
         }
     }

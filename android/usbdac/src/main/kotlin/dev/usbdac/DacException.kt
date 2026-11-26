@@ -95,10 +95,16 @@ internal fun parseNativeError(message: String?, cause: Throwable? = null): DacEx
     return DacException(code, rest.substring(separator + 1).trim(), cause)
 }
 
-/** Runs a native call and rethrows its `usbdac:` failures as [DacException]. */
+/**
+ * Runs a native call, and the parsing of its result, and rethrows its `usbdac:` failures as
+ * [DacException]. A response that cannot be read is a [DacErrorCode.UNKNOWN] failure too, so the
+ * caller only ever sees one kind of exception.
+ */
 internal inline fun <T> nativeCall(block: () -> T): T =
     try {
         block()
     } catch (error: IllegalStateException) {
         throw parseNativeError(error.message, error) ?: error
+    } catch (error: org.json.JSONException) {
+        throw DacException(DacErrorCode.UNKNOWN, "unreadable response from the native library: ${error.message}", error)
     }

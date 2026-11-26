@@ -12,6 +12,9 @@ version = providers.gradleProperty("VERSION_NAME").get()
 
 val ndkVersionPin = "28.2.13676358"
 
+// Set in GitHub Actions; absent on a developer machine.
+val githubRepository: String? = System.getenv("GITHUB_REPOSITORY")
+
 android {
     namespace = "dev.usbdac"
     compileSdk = 36
@@ -69,6 +72,10 @@ val abis = providers.gradleProperty("usbdac.abis")
     .map { list -> list.split(',').map { it.trim() }.filter { it.isNotEmpty() } }
     .orElse(listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86"))
 
+// -Pusbdac.skipNative=true leaves the native build out, for jobs that only need the Kotlin side
+// (the documentation build). An AAR built that way has no libusbdac.so: never publish one.
+val skipNative = providers.gradleProperty("usbdac.skipNative").map { it.toBoolean() }.orElse(false)
+
 val repoRoot = rootProject.projectDir.parentFile
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 val ndkDirectory = androidComponents.sdkComponents.ndkDirectory
@@ -78,6 +85,7 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
     description = "Builds libusbdac.so for the selected ABIs with cargo-ndk into src/main/jniLibs."
 
     workingDir = repoRoot
+    onlyIf { !skipNative.get() }
 
     inputs.property("abis", abis)
     inputs.property("ndkVersion", ndkVersionPin)
@@ -109,13 +117,17 @@ dokka {
     moduleName.set("usbdac")
     dokkaSourceSets.configureEach {
         includes.from("Module.md")
+        if (githubRepository != null) {
+            sourceLink {
+                localDirectory.set(layout.projectDirectory.dir("src/main/kotlin"))
+                remoteUrl("https://github.com/$githubRepository/blob/main/android/usbdac/src/main/kotlin")
+                remoteLineSuffix.set("#L")
+            }
+        }
     }
 }
 
 // ---- publishing ---------------------------------------------------------------
-
-// Set in GitHub Actions; absent on a developer machine.
-val githubRepository: String? = System.getenv("GITHUB_REPOSITORY")
 
 publishing {
     publications {
@@ -148,6 +160,11 @@ publishing {
         }
     }
     repositories {
+        // A local copy of exactly what GitHub Packages receives; the release workflow attaches these files.
+        maven {
+            name = "Staging"
+            url = uri(rootProject.layout.buildDirectory.dir("staging"))
+        }
         maven {
             name = "GitHubPackages"
             url = uri("https://maven.pkg.github.com/${githubRepository ?: "OWNER/usbdac"}")

@@ -19,6 +19,10 @@ import org.json.JSONObject
 
 // Parsing of the JSON the native library returns; the schemas are in docs/API.md section 11.
 // Keys are snake_case, `null` stands for "none", enums are lower-case strings.
+//
+// What the host acts on (the negotiated format, the volume) is read strictly: a missing key throws,
+// and `nativeCall` turns that into a DacException. Capabilities and statistics are descriptive, so a key
+// a newer or older native library lacks reads as its zero value instead of failing the call.
 
 private fun JSONObject.intOrNull(key: String): Int? = if (isNull(key)) null else getInt(key)
 private fun JSONObject.longOrNull(key: String): Long? = if (isNull(key)) null else getLong(key)
@@ -105,14 +109,14 @@ internal fun parseCapabilities(json: String): DacCapabilities {
         pcmSampleRates = value.optJSONArray("pcm_sample_rates").ints(),
         pcmBitDepths = value.optJSONArray("pcm_bit_depths").ints(),
         channelCounts = value.optJSONArray("channel_counts").ints(),
-        supportsPcm = value.getBoolean("supports_pcm"),
-        supportsDop = value.getBoolean("supports_dop"),
+        supportsPcm = value.optBoolean("supports_pcm"),
+        supportsDop = value.optBoolean("supports_dop"),
         dopMaxDsdBitRate = value.intOrNull("dop_max_dsd_bit_rate"),
-        supportsNativeDsd = value.getBoolean("supports_native_dsd"),
+        supportsNativeDsd = value.optBoolean("supports_native_dsd"),
         nativeDsdBitRates = value.optJSONArray("native_dsd_bit_rates").ints(),
-        hasExplicitFeedback = value.getBoolean("has_explicit_feedback"),
+        hasExplicitFeedback = value.optBoolean("has_explicit_feedback"),
         volume = value.objectOrNull("volume")?.let(::parseVolumeRange),
-        hasMute = value.getBoolean("has_mute"),
+        hasMute = value.optBoolean("has_mute"),
     )
 }
 
@@ -146,38 +150,38 @@ internal fun parseStreamFormat(json: String): StreamFormat {
 internal fun parseStats(json: String): DacStreamStats {
     val v = JSONObject(json)
     return DacStreamStats(
-        state = StreamState.fromCode(v.getInt("state")),
-        bitPerfect = v.getBoolean("bit_perfect"),
+        state = StreamState.fromCode(v.optInt("state", -1)),
+        bitPerfect = v.optBoolean("bit_perfect"),
         bitPerfectBlocker = BitPerfectBlocker.fromWireName(v.stringOrNull("bit_perfect_blocker")),
-        softwareGain = v.getDouble("software_gain").toFloat(),
-        underruns = v.getLong("underruns"),
-        lostFrames = v.getLong("lost_frames"),
-        shortPackets = v.getLong("short_packets"),
-        zeroPackets = v.getLong("zero_packets"),
-        urbTimeouts = v.getLong("urb_timeouts"),
-        completedTransfers = v.getLong("completed_transfers"),
-        framesWritten = v.getLong("frames_written"),
-        framesCompleted = v.getLong("frames_completed"),
-        playedFrames = v.getLong("played_frames"),
-        latencyFrames = v.getLong("latency_frames"),
-        latencyMs = v.getDouble("latency_ms"),
-        queuedFrames = v.getLong("queued_frames"),
-        bufferMs = v.getLong("buffer_ms"),
-        bufferTargetMs = v.getLong("buffer_target_ms"),
-        bufferCapacityMs = v.getLong("buffer_capacity_ms"),
-        transferQueueDepth = v.getInt("transfer_queue_depth"),
-        lastTurnaroundUs = v.getLong("last_turnaround_us"),
-        maxTurnaroundUs = v.getLong("max_turnaround_us"),
-        lastSubmitGapUs = v.getLong("last_submit_gap_us"),
-        maxSubmitGapUs = v.getLong("max_submit_gap_us"),
-        effectiveRateHz = v.getDouble("effective_rate_hz"),
-        feedbackActive = v.getBoolean("feedback_active"),
-        feedbackReports = v.getLong("feedback_reports"),
-        feedbackTimeouts = v.getLong("feedback_timeouts"),
-        feedbackErrors = v.getLong("feedback_errors"),
-        feedbackRejected = v.getLong("feedback_rejected"),
+        softwareGain = v.optDouble("software_gain", 0.0).toFloat(),
+        underruns = v.optLong("underruns"),
+        lostFrames = v.optLong("lost_frames"),
+        shortPackets = v.optLong("short_packets"),
+        zeroPackets = v.optLong("zero_packets"),
+        urbTimeouts = v.optLong("urb_timeouts"),
+        completedTransfers = v.optLong("completed_transfers"),
+        framesWritten = v.optLong("frames_written"),
+        framesCompleted = v.optLong("frames_completed"),
+        playedFrames = v.optLong("played_frames"),
+        latencyFrames = v.optLong("latency_frames"),
+        latencyMs = v.optDouble("latency_ms", 0.0),
+        queuedFrames = v.optLong("queued_frames"),
+        bufferMs = v.optLong("buffer_ms"),
+        bufferTargetMs = v.optLong("buffer_target_ms"),
+        bufferCapacityMs = v.optLong("buffer_capacity_ms"),
+        transferQueueDepth = v.optInt("transfer_queue_depth"),
+        lastTurnaroundUs = v.optLong("last_turnaround_us"),
+        maxTurnaroundUs = v.optLong("max_turnaround_us"),
+        lastSubmitGapUs = v.optLong("last_submit_gap_us"),
+        maxSubmitGapUs = v.optLong("max_submit_gap_us"),
+        effectiveRateHz = v.optDouble("effective_rate_hz", 0.0),
+        feedbackActive = v.optBoolean("feedback_active"),
+        feedbackReports = v.optLong("feedback_reports"),
+        feedbackTimeouts = v.optLong("feedback_timeouts"),
+        feedbackErrors = v.optLong("feedback_errors"),
+        feedbackRejected = v.optLong("feedback_rejected"),
         feedbackAgeMs = v.longOrNull("feedback_age_ms"),
         feedbackRateHz = v.doubleOrNull("feedback_rate_hz"),
-        feedbackStale = v.getBoolean("feedback_stale"),
+        feedbackStale = v.optBoolean("feedback_stale"),
     )
 }

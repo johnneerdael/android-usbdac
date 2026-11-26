@@ -16,7 +16,7 @@ internal interface NativeListener {
  * `Java_dev_usbdac_internal_Native_<name>`; the contract is in `docs/API.md` (section 10).
  *
  * Handles are opaque ids. A failure is an [IllegalStateException] whose message starts
- * with `usbdac:<code>:`; [nativeCall] turns it into a `DacException`.
+ * with `usbdac:<code>:`; `nativeCall` turns it into a `DacException`.
  */
 internal object Native {
     init {

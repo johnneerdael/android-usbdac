@@ -18,6 +18,7 @@ import dev.usbdac.DacSession
 import dev.usbdac.DacState
 import dev.usbdac.DacStream
 import dev.usbdac.StreamRequest
+import dev.usbdac.StreamState
 import dev.usbdac.UsbDac
 import dev.usbdac.controls.DacVolumeKeys
 import kotlinx.coroutines.CoroutineScope
@@ -201,7 +202,7 @@ class MainActivity : Activity() {
     private fun togglePause() {
         val current = stream ?: return
         // Keep the writer running: it fills the ring to its target and idles on writableBytes == 0.
-        if (current.state.value == dev.usbdac.StreamState.PAUSED) current.play() else current.pause()
+        if (current.state.value == StreamState.PAUSED) current.play() else current.pause()
     }
 
     private fun stopStream() {

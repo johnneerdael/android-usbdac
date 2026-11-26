@@ -17,10 +17,16 @@ public enum class HandBack {
 
 /** A workaround for a DAC that deviates from the USB Audio Class. */
 public sealed interface DacQuirk {
-    /** Do not read back the sampling frequency; trust the DAC's acknowledgement. Never bit-perfect-verified. */
+    /**
+     * The DAC's clock readback is unreliable (it returns 0 or fails). Trust the acknowledgement of the
+     * set request for PCM and skip the verification.
+     */
     public data object SkipClockValidation : DacQuirk
 
-    /** Ignore a "sample rate invalid" flag the DAC raises while it is locking. */
+    /**
+     * The DAC reports a rate that differs from the one just set (some report 0 Hz) but plays correctly:
+     * do not refuse over the mismatch. PCM only.
+     */
     public data object IgnoreInvalidSampleRate : DacQuirk
 
     /** Refuse to stream unless the rate is verified, even if [DacConfig.requireVerifiedRate] is off. */
@@ -29,16 +35,16 @@ public sealed interface DacQuirk {
     /** Prefer the 4-byte subslot for 24-bit PCM. */
     public data object PreferPadded24BitTransport : DacQuirk
 
-    /** Send native DSD in big-endian word order. */
+    /** Native DSD words go on the wire most-significant byte first. */
     public data object DsdBigEndian : DacQuirk
 
-    /** Reverse the bits of every native DSD byte. */
+    /** Reverse the bit order within each native DSD byte. */
     public data object DsdBitReverse : DacQuirk
 
     /** Wait this long after programming the clock. */
     public data class SettleDelayMs(val milliseconds: Long) : DacQuirk
 
-    /** Subslot size (1, 2 or 4) for native DSD alternate settings. */
+    /** Override the subslot size (1, 2 or 4 bytes) of native DSD alternate settings whose descriptors are wrong or ambiguous. */
     public data class DsdSubslotSize(val bytes: Int) : DacQuirk
 }
 
@@ -103,7 +109,8 @@ public data class DacConfig @JvmOverloads constructor(
 
     /**
      * Stream an asynchronous endpoint that has no explicit feedback endpoint. Default `false`:
-     * [UsbDac.open] succeeds but [DacSession.negotiate] fails with [DacErrorCode.IMPLICIT_FEEDBACK_UNSUPPORTED].
+     * [UsbDac.open] succeeds but [DacSession.negotiate] (or [DacSession.openStream]) fails with
+     * [DacErrorCode.IMPLICIT_FEEDBACK_UNSUPPORTED] when that endpoint is the only way to carry the request.
      * On, the stream runs host-paced at the nominal rate; drift between the DAC's clock and the host's
      * timing ends in underruns or overruns at the DAC, and the stream is never bit-perfect.
      */
