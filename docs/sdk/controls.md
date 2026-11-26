@@ -136,6 +136,21 @@ A `ClockChoice` has `controlInterface` (the AudioControl interface the clock req
 | `Unsynchronized` | Asynchronous without usable feedback (streamed only with `allowUnsynchronizedAsync`), or one that declares no synchronisation | The host sends at the nominal rate and nothing comes back. For the asynchronous case this is the `UNSYNCHRONIZED_ASYNC` blocker: never bit-perfect |
 | `Unknown` | | A value this SDK version does not know, or a native library that predates the field |
 
+Use `format.pacing` for the selected route and `stream.stats()` for its live
+feedback state. The `explicitFeedback` flag describes dedicated rate
+reports. Check `pacing` to identify an implicit route.
+
+| Field | How to use it |
+|---|---|
+| `feedbackLocked`, `feedbackActive` | Whether live explicit or implicit timing has locked. A route that requires feedback has `FEEDBACK_UNLOCKED` while lock is missing |
+| `feedbackAgeMs`, `feedbackRateHz` | Age of the last valid report or IN pattern, and the latest rate estimate when available |
+| `feedbackEmpty`, `feedbackRejected` | Empty polls or IN patterns, and rejected feedback. An empty explicit poll leaves the rate and last report timestamp in place |
+| `feedbackStale` | The timing source has gone stale. For explicit feedback, the last good rate is held only during the bounded recovery window |
+| `implicitFifoDepth`, `implicitWaits`, `implicitInvalidPackets` | Whether IN patterns are ready for each playback transfer, how often playback waits for them, and whether IN packets failed validation |
+
+See [feedback troubleshooting](troubleshooting.md#feedback-lock-and-dropouts)
+for what to collect if lock drops during playback.
+
 `ClockChoice.description` and `Pacing.description` are one-line texts for a status line. The sample shows both next to the stream's statistics:
 
 ```kotlin

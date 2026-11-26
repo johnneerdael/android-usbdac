@@ -118,7 +118,7 @@ pub struct StreamStats {
     pub max_submit_gap_us: u64,
     /// Rate the DAC has actually consumed frames at since the start.
     pub effective_rate_hz: f64,
-    /// The DAC has an explicit feedback endpoint that is being polled.
+    /// Live feedback is locked. Equivalent to `feedback_locked` in 0.1.1.
     pub feedback_active: bool,
     pub feedback_reports: u64,
     pub feedback_timeouts: u64,
@@ -129,7 +129,9 @@ pub struct StreamStats {
     /// The sample rate the last feedback report implies.
     pub feedback_rate_hz: Option<f64>,
     pub feedback_stale: bool,
+    /// The selected explicit or implicit source has established usable timing.
     pub feedback_locked: bool,
+    /// Empty explicit polls or empty implicit IN patterns.
     pub feedback_empty: u64,
     pub implicit_fifo_depth: u32,
     pub implicit_fifo_high_water: u32,

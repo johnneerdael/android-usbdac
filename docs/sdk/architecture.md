@@ -37,11 +37,11 @@ The core talks to the DAC through usbfs, so it works on Android and Linux. On an
 |---|---|---|
 | Public handles | `dac.rs`, `stream.rs`, `volume.rs`, `format.rs`, `capabilities.rs`, `config.rs`, `error.rs`, `events.rs` | `Dac`, `DacStream`, `VolumeControl`; the request and format types; what the DAC offers; every setting with a default and a validation; typed errors with stable codes; events |
 | Descriptors | `descriptors/` | Parse the USB configuration and the Audio Class descriptors (UAC 1.0 and 2.0) into plain types |
-| Topology | `clock_resolution.rs`, `endpoint.rs`, `transport/scan.rs` | Walk the clock graph from a terminal to its source; choose the explicit feedback endpoint; build `Capabilities` from the descriptors |
+| Topology | `clock_resolution.rs`, `endpoint.rs`, `transport/scan.rs` | Walk the clock graph and resolve an explicit feedback endpoint or a compatible UAC2 IN source. Build `Capabilities` from the descriptors |
 | Negotiation | `transport/negotiate.rs`, `transport/clock.rs`, `transport/api.rs` | Program the sampling frequency on the right entity, read it back, and settle the format the DAC will run |
 | Stream setup | `transport/stream_open.rs`, `transport/session.rs`, `transport/shared.rs` | Switch the alternate setting, verify the clock again, start the output thread; the process-wide session and what the host handle, the thread and the events share |
 | The ring | `transport/ring.rs`, `ring_target.rs` | The PCM ring buffer, the counters, the recommended depth and when it changes |
-| The output thread | `transport/output.rs`, `transport/iso.rs`, `transport/encode.rs` | Build each transfer, submit it, handle completions, poll the feedback endpoint, encode samples to the wire layout, audit the payload |
+| The output thread | `transport/output.rs`, `transport/iso.rs`, `transport/implicit.rs`, `transport/encode.rs` | Submit transfers, handle completions, validate explicit reports or consume IN frame-count patterns, and encode and audit the playback payload |
 | Packet arithmetic | `iso_packet_scheduler.rs`, `iso_packet_validation.rs` | How many frames go in each packet (exact over a long time, following feedback); which completed packet sizes are legal |
 | Accounting | `iso_transport_loss.rs`, `output_position.rs`, `payload_audit_latch.rs`, `flush_cancel.rs` | Lost audio, played music frames and latency, the grace on the payload audit, which transfers a flush cancels |
 | Volume | `volume_control.rs`, `transport/volume_hw.rs`, `transport/usbfs.rs` | Find the Feature Unit, quantise levels, attenuate at open, write and read back, hand back; control transfers on the descriptor |
@@ -55,11 +55,11 @@ The code that decides things is kept separate from the code that touches libusb,
 
 1. **The app writes.** `DacStream::write(bytes)` takes whole frames in the stream's wire layout (the layout is in the [native API document](native-api.html#4-sample-layouts)) and copies them into the ring. It never blocks: it takes as many frames as fit and returns the count. `writable_bytes()` says how much the app should write to bring the ring to its target depth, which is deeper while nothing is applied live (see [decision 2](decisions-stream.md#ring-depth)).
 2. **The stream primes.** A new stream, or one that was flushed, sends wire silence until the ring holds `start_threshold_ms` (100 ms by default), so a flush never looks like an underrun.
-3. **The output thread builds a transfer.** For each free slot (eight by default) the thread asks the `IsoPacketScheduler` for the byte count of every packet in the transfer: 16 packets of 5 or 6 frames each at 44.1 kHz and 125 us, with the fractional remainder carried so the long-run count is exact, adjusted by the DAC's feedback if it has a feedback endpoint. It then pops that many bytes from the ring (`pop_music_into_or_pad`): music while the ring has it, padding after that, held silence while paused or refilling. If software gain is on, PCM samples are scaled here, at the last moment, which is why a gain change is heard within the bus queue. The samples are encoded to the wire layout, and DoP markers or native DSD words are put in place.
+3. **The output thread builds a transfer.** For each free slot (eight by default), it gets the packet sizes from the fractional scheduler or consumes the next validated implicit IN pattern. The scheduler uses the newest valid explicit rate when the route provides one. At 44.1 kHz and a 125 us interval, the packets normally carry five or six frames. The thread then pops that many bytes from the ring (`pop_music_into_or_pad`). It uses music when available, padding when data runs short and held silence while paused or refilling. Software gain, wire encoding and audit use the same playback path for either feedback mode.
 4. **The transfer is submitted.** `libusb_submit_transfer` hands the host controller a batch of packets. With the defaults, about 16 ms of audio is queued on the bus at any moment ([decision 1](decisions-stream.md#queue-geometry)).
 5. **A transfer completes.** The thread waits in `handle_events` for at most 50 ms. A completed transfer has a status for the transfer and one for each packet. A `COMPLETED` transfer is validated against the legal packet sizes; a timed-out one is accounted for packet by packet ([decision 3](decisions-stream.md#loss-handling)); any other status ends the stream.
 6. **The accounting is updated.** The loss tracker records what the DAC did not take. `played_music_frames` grows by the music frames it did take, in the flush epoch the transfer was filled in. The payload audit sees the encoded bytes. The bit-perfect flag and the stream state are re-evaluated, and a change goes out as an event.
-7. **The slot is refilled** with the next transfer, and the cycle repeats. The feedback endpoint has one persistent transfer that is re-armed from the same loop.
+7. **The slot is refilled** with the next transfer, and the cycle repeats. The same worker re-arms a persistent transfer for the explicit endpoint or the IN transfer pool for implicit feedback. Implicit IN primes before OUT starts. See [clock and pacing](decisions-clock.md#feedback).
 
 Everything on this path except the ring lock is in one thread, so there is one reaper for libusb's completions. Control transfers for volume do not use libusb at all: they are synchronous `USBDEVFS_CONTROL` ioctls on the same descriptor, which do not reap transfers ([decision 10](decisions-volume.md#volume-writes)).
 
@@ -98,7 +98,8 @@ Two other pieces of state matter to an app. `BitPerfectState` is `Verified` or `
 | What counts as lost audio, and the bounds | `iso_transport_loss.rs`, `transport/output.rs` |
 | Pause, flush and position | `transport/ring.rs`, `flush_cancel.rs`, `output_position.rs` |
 | Which clock is programmed | `clock_resolution.rs`, `transport/clock.rs` |
-| Feedback decoding and smoothing | `transport/iso.rs`, `iso_packet_scheduler.rs` |
+| Explicit report validation, lock and scheduling | `transport/iso.rs`, `iso_packet_scheduler.rs` |
+| Implicit source pairing and IN frame patterns | `transport/scan.rs`, `transport/implicit.rs` |
 | The volume curve and start-up attenuation | `volume_control.rs`, `volume.rs`, `config.rs` |
 | What turns the bit-perfect flag off | `stream.rs` (`BitPerfectBlocker`), `transport/session.rs`, `transport/encode.rs` |
 | Which output the selector picks | `android/usbdac/.../OutputSelector.kt` |

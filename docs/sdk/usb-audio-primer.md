@@ -22,7 +22,14 @@ Software does not send packets one at a time. It builds a **transfer**, a batch 
 
 A DAC has its own oscillator. In **asynchronous** mode, which many hi-fi DACs use, that oscillator is the reference, and the phone has to follow it. The DAC tells the host how many samples it needs per (micro)frame on a second, small endpoint, the **feedback endpoint**. The value is a fixed-point number: 10.14 (ten integer bits, fourteen fractional) on a full-speed link and 16.16 on a high-speed one, according to the USB 2.0 specification. The host reads it and adjusts how many samples go into the following packets ([decision 7](decisions-clock.md#feedback)).
 
-The other modes avoid that. In **synchronous** mode the DAC derives its clock from the bus, and in **adaptive** mode it follows the host's packet sizes. Some asynchronous DACs have no feedback endpoint at all and expect the host to infer the rate from the DAC's recording stream: **implicit feedback**, which the Linux kernel implements and usbdac does not ([decision 8](decisions-clock.md#implicit-feedback)).
+Some asynchronous devices communicate timing through the number of frames in
+each packet of an IN audio stream. This is **implicit feedback**. usbdac 0.1.1
+can use it when a UAC2 input stream shares the playback clock, wire rate and
+USB service interval. The driver uses packet lengths for timing. Apps continue
+to supply the playback samples. [Implicit feedback](decisions-clock.md#implicit-feedback)
+
+In **synchronous** mode the DAC derives its clock from the bus. In **adaptive**
+mode it follows the host's packet sizes.
 
 ## Describing the DAC: descriptors, alternate settings, entities
 

@@ -58,19 +58,26 @@ Dac::open(fd, DeviceInfo, DacConfig)          scan descriptors, find volume, low
   `- dac.close()                              (or drop) hand the volume back, release
 ```
 
-On Android the host does the permission and claim work:
+The Kotlin SDK handles USB permission and claims through `UsbDac`. A raw
+Android host using Rust directly does the following:
 
 1. `UsbManager.requestPermission` and `openDevice` give a `UsbDeviceConnection`.
 2. Claim the AudioControl interface(s) and the playback AudioStreaming
    interface(s) with `claimInterface(iface, true)`.
-3. Pass `connection.fileDescriptor` and the claimed interface numbers to
-   `Dac::open`. The library duplicates the descriptor; the host keeps its
+3. With feedback enabled, call `Dac::feedback_preflight(fd, &info)` with the
+   base claims. It returns the active configuration ID and candidate IN
+   interface numbers. Try the additional claims and record their results in
+   `DeviceInfo.claimed_interfaces`, `configuration_id` and
+   `unavailable_feedback_interfaces`.
+4. Pass `connection.fileDescriptor` and the resulting `DeviceInfo` to
+   `Dac::open`. The library duplicates the descriptor. The host keeps its
    connection open until the `Dac` is closed or dropped, then releases the
    interfaces.
 
-`DeviceInfo.claimed_interfaces` must equal the set of AudioControl and
-playback AudioStreaming interfaces of the active configuration. A mismatch is
-`Error::Claim`: the library does not guess which interfaces it may touch.
+`DeviceInfo.claimed_interfaces` holds the actual successful claims for the
+active configuration. It includes the required control and playback interfaces
+and any successfully claimed optional IN sources. An unavailable optional
+claim leaves other viable playback routes available.
 
 ## 3. Rust API
 
@@ -177,7 +184,8 @@ until the ring holds the start threshold again.
   flush while paused, or while the stream is still priming, or with only held
   silence queued, leaves the bus alone, and `pause()` itself never cancels: the
   DAC stays locked on silence.
-- The feedback transfer is an IN transfer without audio; it is left running.
+- Explicit feedback polls and implicit IN timing transfers stay active across
+  a playback flush.
 - A DAC may notice the short gap in the isochronous stream a cancel makes. DoP
   and native DSD DACs re-detect the stream and can click or re-lock; if a DAC
   does, set `cancel_in_flight_on_flush = false`: the queue then plays out, as
@@ -209,13 +217,15 @@ rides out a later output thread; a shallower one makes a pause and a stop
 sound sooner. Stability ("stable" in the log) is judged over about 256 ms of
 completed transfers for every geometry, and a stream is stopped after about
 6 ms of consecutive lossy transfers (never fewer than three), whatever their
-size. The feedback endpoint is polled over at most the bus queue (16 ms at
-most), so a report is never older than what is queued. The log line
+size. For an isochronous explicit endpoint, the polling batch targets a window
+of `min(16 ms, bus_queue_ms)`, rounded down to whole intervals and clamped to
+one to 32 packets. The log line
 `[USB] Isochronous queue:` states the resulting geometry.
 
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,
 `RequireVerifiedRate`, `SettleDelayMs(u64)`, `PreferPadded24BitTransport`,
-`DsdSubslotSize(u8)`, `DsdBigEndian`, `DsdBitReverse`. Config fields set
+`DsdSubslotSize(u8)`, `DsdBigEndian`, `DsdBitReverse`,
+`ExplicitFeedbackPerServiceInterval`. Config fields set
 explicitly win over quirks. The built-in table has two entries (MOONDROP Dawn
 Pro; Fosi Audio DS2), both verified in the project this was extracted from.
 
@@ -280,7 +290,9 @@ describe what the library already does; reading them changes nothing.
 StreamFormat { ..., pacing: Pacing, clock: Option<ClockChoice> }
 AltSetting   { ..., pacing: Option<Pacing> }
 
-Pacing::{ ExplicitFeedback { endpoint: u8 }, Adaptive, Synchronous, Unsynchronized }
+Pacing::{ ExplicitFeedback { endpoint: u8 },
+          ImplicitFeedback { interface_number: u8, alt_setting: u8, endpoint: u8 },
+          Adaptive, Synchronous, Unsynchronized }
 ClockChoice { control_interface: u8, source_id: u8, path: Vec<ClockHop>, resolution: ClockResolution }
 ClockHop { id: u8, kind: ClockHopKind }
 ClockHopKind::{ Terminal, Selector { selected_pin: u8, pin_count: u8 }, Multiplier, Source }
@@ -410,10 +422,10 @@ now), `buffer_capacity_ms`, `transfer_queue_depth`,
 `clock_verified` (the DAC confirmed the sampling frequency, or the device quirk
 trusts its `SET_CUR`), `payload_verified` (the wire payload audit passes) and
 `payload_constant_for_ms` (how long the payload has been failing the audit, while
-it does). `feedback_locked` and `feedback_active` report live feedback,
-including explicit and implicit pacing. A successful empty explicit poll
-increments `feedback_empty` and leaves the last accepted rate and its age
-unchanged. Frame counters are in `counter_rate_hz()` units, except implicit
+it does). `feedback_locked` and `feedback_active` report live lock for either
+feedback mode. A successful empty explicit poll increments `feedback_empty`
+and leaves the last accepted rate and timestamp unchanged. Report age keeps
+increasing. Frame counters are in `counter_rate_hz()` units, except implicit
 `implicit_measured_frames` and `implicit_scheduled_frames`, which count USB
 wire frames. Implicit timing stats also report FIFO depth and high-water mark,
 waits, empty OUT queue events, overruns, IN completions, out-of-order
@@ -441,17 +453,18 @@ completions and invalid IN packets.
 ### Asynchronous endpoints without feedback
 
 An asynchronous OUT endpoint runs on the DAC's own clock. Explicit feedback
-reports that rate on a dedicated IN endpoint. Implicit feedback uses whole-frame
-counts from an associated audio IN endpoint with a compatible clock, wire rate
-and service interval. Implicit source selection preserves the playback samples. On Android, any capture-only interface held for feedback is returned
-when the DAC session closes.
+reports that rate on a dedicated IN endpoint. For UAC2 implicit feedback, the
+driver uses whole-frame counts from an associated IN audio endpoint with the
+same resolved clock source, wire rate and service interval. It primes the IN
+transfer queue before submitting playback. IN samples are unavailable to apps.
+On Android, the SDK returns capture-only claims when the session closes.
 
 By default `negotiate` and `open_stream` refuse an asynchronous route without
 usable feedback with `Error::ImplicitFeedbackUnsupported` when it is the only way to
 carry the request (a DAC that also offers a synchronised alternate setting for
 the same format uses that one). With `DacConfig::allow_unsynchronized_async` the
-stream runs at the nominal rate, host-paced; the format reports `sync_type ==
-Asynchronous` and `explicit_feedback == false`, the log says so, and
+stream runs at the nominal rate, host-paced. The format reports
+`sync_type == Asynchronous` and `pacing == Pacing::Unsynchronized`, and
 `is_bit_perfect()` is false with `bit_perfect_blocker() ==
 Some(UnsynchronizedAsync)` for the whole stream. An endpoint that declares a
 feedback endpoint the library cannot resolve is malformed and is never streamed,
@@ -462,7 +475,11 @@ whatever the setting.
 Full-speed feedback uses frames per USB frame and high-speed feedback uses
 frames per USB microframe. The driver scales the rate to the OUT service
 interval and checks that the largest packet needed by fractional scheduling fits
-the endpoint. It uses the newest valid report in each batch.
+the endpoint. It uses the newest valid report in each batch. Empty or rejected
+reports do not extend the feedback deadline. A stale explicit source clears
+live lock and emits `FeedbackStale`. Playback can hold the last valid rate
+until a timely report restores lock or the stream fails with `Error::Transfer`.
+[Timing thresholds](https://johnneerdael.github.io/android-usbdac/decisions-clock.html#feedback)
 
 With evidence that a high-speed device sends four-byte feedback in frames per
 OUT service interval, add `Quirk::ExplicitFeedbackPerServiceInterval` through a
@@ -581,26 +598,25 @@ else). A panic in a listener is caught and logged.
 
 `DacStream::is_bit_perfect()` is true only while all of these hold:
 
-1. the stream is open and its output thread is running;
-2. the format on the wire is the one requested (no `NearestSupported` rate
-   change);
-3. the DAC's sampling frequency was verified (readback equal to the requested
-   rate; a device whose quirk is `SkipClockValidation` is trusted on its SET_CUR);
-4. software gain is exactly 1.0;
-5. the endpoint is paced by the DAC's own feedback or follows the host's timing
-   (an asynchronous endpoint streamed without feedback because of
-   `allow_unsynchronized_async` is never bit-perfect);
-6. no frame was lost on the bus since the stream started (the first lost frame
-   clears the flag for the life of the stream);
-7. the wire payload audit passes. For PCM the audit needs real audio: channel 0
+1. The stream is open and its output thread is running.
+2. No frame was lost on the bus since the stream started. The first lost frame
+   clears the flag for the life of the stream.
+3. The format on the wire matches the request.
+4. Live feedback has locked when the stream uses explicit or implicit feedback.
+5. The DAC's sampling frequency was verified by readback or trusted through
+   its `SkipClockValidation` quirk.
+6. Software gain is exactly 1.0.
+7. The endpoint uses valid pacing. An asynchronous route opened with the
+   nominal-timing opt-in remains unverified.
+8. The wire payload audit passes. For PCM the audit needs real audio. Channel 0
    must vary within a transfer, with a 1.5 s grace so digital silence or a
    fade does not flip the flag. For DoP the markers must alternate and agree
    across channels. For native DSD the data must not be all zero.
 
 `bit_perfect_blocker()` returns the first condition that fails, as a
-`BitPerfectBlocker`: `NoStream`, `LostFrames`, `FormatChanged`,
+`BitPerfectBlocker`: `NoStream`, `LostFrames`, `FormatChanged`, `FeedbackUnlocked`,
 `ClockUnverified`, `SoftwareGain`, `UnsynchronizedAsync`, `PayloadUnverified`
-(codes `no_stream`, `lost_frames`, `format_changed`, `clock_unverified`,
+(codes `no_stream`, `lost_frames`, `format_changed`, `feedback_unlocked`, `clock_unverified`,
 `software_gain`, `unsynchronized_async`, `payload_unverified`), and `None` when
 the stream is bit-perfect. `StreamStats::bit_perfect_blocker` carries the same.
 
@@ -792,6 +808,7 @@ object Native {
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)            // 0 off .. 5 trace; logcat tag "usbdac"
 
+    @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacCapabilities(dac: Long): String
@@ -831,6 +848,9 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 - `dacNegotiate` returns the negotiated format as JSON including a `format_id`;
   pass that id to `streamOpen`. Formats are kept per DAC (the latest 16) until
   the DAC is closed.
+- `dacFeedbackPreflight` returns the active configuration ID and candidate
+  implicit feedback interfaces without starting audio. The Kotlin SDK uses
+  the result before `dacOpen`.
 - `streamWrite` takes a **direct** `ByteBuffer` (`ByteBuffer.allocateDirect`),
   reads `count` bytes from `offset` (the buffer's position and limit are
   ignored and not moved) and returns the bytes taken, as in section 3.
@@ -883,10 +903,12 @@ ignored.
 ```json
 { "vendor_id": 12230, "product_id": 61546, "product_name": "MOONDROP Dawn Pro",
   "manufacturer_name": "MOONDROP", "device_name": "/dev/bus/usb/001/004",
-  "claimed_interfaces": [0, 1, 2] }
+  "claimed_interfaces": [0, 1, 2], "configuration_id": 1,
+  "unavailable_feedback_interfaces": [] }
 ```
 
 `vendor_id` and `product_id` are required; the rest is optional.
+The preflight response is `{ "configuration_id": 1, "interfaces": [2] }`.
 
 **Config** (`dacOpen`, nullable; every key optional, defaults as in section 3):
 
@@ -894,7 +916,8 @@ ignored.
 { "buffer_target_ms": 250, "buffer_capacity_ms": 500, "start_threshold_ms": 100,
   "processing_buffer_target_ms": 100, "require_verified_rate": true,
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
-  "padded_24bit": true, "allow_unsynchronized_async": false, "realtime_priority": true,
+  "padded_24bit": true, "allow_unsynchronized_async": false, "disable_feedback": false,
+  "realtime_priority": true,
   "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
   "cancel_in_flight_on_flush": true,
   "startup_volume": "attenuate", "startup_volume_max_db": -40.0, "require_hardware_volume": true,
@@ -906,7 +929,8 @@ ignored.
 (default; `startup_volume_max_db` is its ceiling, -40.0 when absent) or `keep`
 (which ignores the ceiling); a `startup_volume_max_db` alone means `attenuate`. Flag quirks:
 `skip_clock_validation`, `ignore_invalid_sample_rate`, `require_verified_rate`,
-`prefer_padded_24bit_transport`, `dsd_big_endian`, `dsd_bit_reverse`; valued
+`prefer_padded_24bit_transport`, `dsd_big_endian`, `dsd_bit_reverse`,
+`explicit_feedback_per_service_interval`; valued
 quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}`.
 
 **Stream request** (`dacNegotiate`):
@@ -937,7 +961,7 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
       "rate_ranges": [ { "min_hz": 44100, "max_hz": 44100, "step_hz": 0 } ],
       "sample_rates": [44100], "sync_type": "asynchronous", "feedback_endpoint": 129,
       "max_packet_bytes": 1024, "service_interval_us": 125, "uac_version": "v2",
-      "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 } } ] }
+      "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129, "implicit_feedback": null } } ] }
 ```
 
 `uac_version`: `v1`, `v2`, `unknown`. `link_speed`: `low`, `full`, `high`,
@@ -954,7 +978,7 @@ this configuration. It is an additive key: documents from earlier versions lack 
   "counter_rate_hz": 44100, "interface_number": 1, "alt_setting": 1,
   "endpoint_address": 1, "sync_type": "asynchronous", "explicit_feedback": true,
   "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false,
-  "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 },
+  "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129, "implicit_feedback": null },
   "clock": { "control_interface": 0, "source_id": 5, "resolution": "resolved",
              "path": [ { "id": 1, "kind": "terminal", "selected_pin": null, "pin_count": null },
                        { "id": 9, "kind": "selector", "selected_pin": 2, "pin_count": 2 },
@@ -962,10 +986,17 @@ this configuration. It is an additive key: documents from earlier versions lack 
 ```
 
 `pacing` and `clock` are additive keys (documents from earlier versions lack
-them). A **pacing object** is `{ "mode": ..., "feedback_endpoint": ... }` with `mode`
-one of `explicit_feedback`, `adaptive`, `synchronous`, `unsynchronized`;
-`feedback_endpoint` is the feedback endpoint's address for `explicit_feedback` and
-`null` for the others. `clock` is `null` when the device describes no clock
+them). Pacing modes are `explicit_feedback`, `implicit_feedback`, `adaptive`,
+`synchronous`, and `unsynchronized`. `feedback_endpoint` gives the endpoint
+address for explicit feedback. `implicit_feedback` gives the IN source tuple
+for implicit feedback and is `null` in the other modes.
+
+```json
+{ "mode": "implicit_feedback", "feedback_endpoint": null,
+  "implicit_feedback": { "interface_number": 2, "alt_setting": 3, "endpoint": 130 } }
+```
+
+`clock` is `null` when the device describes no clock
 entities; otherwise `resolution` is `resolved` or `fallback_first_source`, `path`
 lists the hops in the order followed (terminal first, Clock Source last, whose `id`
 equals `source_id`), and a hop's `kind` is `terminal`, `selector`, `multiplier` or
@@ -973,12 +1004,12 @@ equals `source_id`), and a hop's `kind` is `terminal`, `selector`, `multiplier` 
 `null` for the others. A reader should treat an unknown `mode`, `resolution` or
 `kind` as "unknown", not as an error.
 
-**Stream statistics** (`streamStats`): all `StreamStats` fields of section 3 as
-numbers (`state` is the state code; `bit_perfect` boolean; `bit_perfect_blocker` a
-code string or `null`; `software_gain`,
-`latency_ms`, `effective_rate_hz`, `feedback_rate_hz` floating point; the
-`feedback_age_ms` and `feedback_rate_hz` entries are `null` before the first
-feedback report).
+**Stream statistics** (`streamStats`) includes the `StreamStats` fields in
+section 3. `state` is a numeric code. `bit_perfect`, `feedback_active`,
+`feedback_locked` and `feedback_stale` are booleans. `bit_perfect_blocker` is a
+code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
+`feedback_rate_hz` are floating-point numbers. `feedback_age_ms` and
+`feedback_rate_hz` are `null` until an age or rate estimate is available.
 
 **Volume range**: `{ "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 }`.
 **Start-up report** (`volumeStartup`):

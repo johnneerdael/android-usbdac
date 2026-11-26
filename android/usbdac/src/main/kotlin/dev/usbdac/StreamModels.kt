@@ -99,7 +99,7 @@ public class StreamFormat internal constructor(
     public val altSetting: Int,
     public val endpointAddress: Int,
     public val syncType: SyncType,
-    /** The DAC's feedback endpoint is polled to pace the packets. */
+    /** Whether playback uses explicit rate reports. See [pacing] for implicit feedback. */
     public val explicitFeedback: Boolean,
     public val linkSpeed: LinkSpeed,
     public val serviceIntervalUs: Int,
@@ -190,7 +190,9 @@ public data class DacStreamStats(
     /** The sample rate the last feedback report implies; `null` before the first one. */
     val feedbackRateHz: Double?,
     val feedbackStale: Boolean,
+    /** Live explicit or implicit feedback has locked. See [StreamFormat.pacing] for the source. */
     val feedbackLocked: Boolean = false,
+    /** Empty explicit polls or empty implicit IN patterns. Neither supplies a rate update. */
     val feedbackEmpty: Long = 0,
     val implicitFifoDepth: Int = 0,
     val implicitFifoHighWater: Int = 0,
