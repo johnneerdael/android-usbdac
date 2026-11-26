@@ -1,0 +1,14 @@
+[package]
+name = "usbdac-jni"
+description = "JNI bindings for usbdac-core (libusbdac.so)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "usbdac"
+crate-type = ["cdylib"]
+
+[dependencies]
+usbdac-core = { path = "../usbdac-core", features = ["serde"] }
