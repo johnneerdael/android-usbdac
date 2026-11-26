@@ -691,6 +691,16 @@ fn active_descriptors(device: &UsbDevice) -> Result<(u8, Vec<u8>), RoutingSessio
                 "routing requires the idle USB owner".into(),
             ))
         })?;
+    let identity = idle
+        .handle
+        .device()
+        .device_descriptor()
+        .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+    if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
+        return Err(RoutingSessionError::Drift(
+            "routing device identity changed".into(),
+        ));
+    }
     let number = idle
         .handle
         .active_configuration()
@@ -1149,6 +1159,208 @@ fn inventory_with_clusters(
     Ok(inventory)
 }
 
+/// Descriptor-only scope proof shared by no-wake discovery and explicit wake.
+fn adc3_routing_scope(
+    descriptors: &[&[u8]],
+) -> Result<
+    (
+        Vec<crate::descriptors::uac3::PowerDomain>,
+        std::collections::BTreeSet<u8>,
+    ),
+    RoutingSessionError,
+> {
+    let mut domains = BTreeMap::new();
+    let mut members = std::collections::BTreeSet::new();
+    for bytes in descriptors {
+        if bytes.get(2) != Some(&0x10) {
+            continue;
+        }
+        let domain = crate::descriptors::uac3::parse_power_domain(bytes)
+            .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?;
+        if domains.insert(domain.id, domain.clone()).is_some()
+            || domain.entities.iter().any(|e| !members.insert(*e))
+        {
+            return Err(RoutingSessionError::UnsupportedTopology(
+                "ADC3 routing power domains overlap or repeat".into(),
+            ));
+        }
+    }
+    let mut nodes = BTreeMap::new();
+    for bytes in descriptors.iter().filter(|b| b.len() >= 4 && b[2] != 1) {
+        if nodes.insert(bytes[3], *bytes).is_some() {
+            return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
+        }
+    }
+    let mut affected = std::collections::BTreeSet::new();
+    let mut pending: Vec<_> = nodes
+        .values()
+        .filter(|b| matches!(b[2], 5 | 6))
+        .map(|b| b[3])
+        .collect();
+    while let Some(id) = pending.pop() {
+        if !affected.insert(id) {
+            continue;
+        }
+        let bytes = nodes.get(&id).ok_or_else(|| {
+            RoutingSessionError::UnsupportedTopology("unresolved ADC3 routing source".into())
+        })?;
+        match bytes[2] {
+            5 | 6 => {
+                let pins = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ))?);
+                pending.extend(bytes.get(5..5 + pins).ok_or(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ))?);
+            }
+            7 => pending.push(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                InvalidRoute::MalformedDescriptor,
+            ))?),
+            _ => {}
+        }
+    }
+    Ok((
+        domains
+            .into_values()
+            .filter(|d| d.entities.iter().any(|e| affected.contains(e)))
+            .collect(),
+        affected,
+    ))
+}
+
+/// Require every interface in the affected full ADC3 function to be claimed
+/// and every AS interface to be idle before the first power write.
+fn routing_power_interfaces(
+    raw: &[u8],
+    claims: &[u8],
+    control: u8,
+) -> Result<Vec<u8>, RoutingSessionError> {
+    let descriptors = framed(raw)?;
+    if descriptors.iter().any(|b| b[1] == 11 && b.len() != 8) {
+        return Err(RoutingSessionError::Invalid(
+            InvalidRoute::MalformedDescriptor,
+        ));
+    }
+    let owners: Vec<_> = descriptors
+        .iter()
+        .filter(|b| {
+            b[1] == 11
+                && b.len() == 8
+                && u16::from(control) >= u16::from(b[2])
+                && u16::from(control) < u16::from(b[2]) + u16::from(b[3])
+        })
+        .collect();
+    let fail = || {
+        RoutingSessionError::UnsupportedTopology(
+            "powered ADC3 routing requires one fully claimed full Audio function".into(),
+        )
+    };
+    if owners.len() != 1 {
+        return Err(fail());
+    }
+    let owner = owners[0];
+    if owner[2] != control
+        || owner[3] == 0
+        || owner[4..7] != [1, 0, 0x30]
+        || u16::from(owner[2]) + u16::from(owner[3]) > 256
+    {
+        return Err(fail());
+    }
+    let mut streams = Vec::new();
+    for interface in u16::from(owner[2])..u16::from(owner[2]) + u16::from(owner[3]) {
+        let interface = interface as u8;
+        if descriptors
+            .iter()
+            .filter(|b| {
+                b[1] == 11
+                    && b.len() == 8
+                    && u16::from(interface) >= u16::from(b[2])
+                    && u16::from(interface) < u16::from(b[2]) + u16::from(b[3])
+            })
+            .count()
+            != 1
+        {
+            return Err(fail());
+        }
+        let alts: Vec<_> = descriptors
+            .iter()
+            .filter(|b| b[1] == 4 && b.len() == 9 && b[2] == interface && b[3] == 0)
+            .collect();
+        if !claims.contains(&interface)
+            || alts.len() != 1
+            || alts[0][5] != 1
+            || alts[0][7] != 0x30
+            || alts[0][6] != if interface == control { 1 } else { 2 }
+        {
+            return Err(fail());
+        }
+        if interface != control {
+            streams.push(interface);
+        }
+    }
+    Ok(streams)
+}
+
+// Keep panic unwinding subject to the same no-external-drift-overwrite rule.
+struct RoutingPowerLease(super::adc3::Adc3PowerLease);
+impl Drop for RoutingPowerLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.restore_checked() {
+            log_warn!("[USB] ADC3 routing power hand-back: {error}");
+        }
+    }
+}
+
+fn with_routing_power<T>(
+    device: &UsbDevice,
+    raw: &[u8],
+    powered: bool,
+    operation: impl FnOnce() -> Result<T, RoutingSessionError>,
+) -> Result<T, RoutingSessionError> {
+    if !powered {
+        return operation();
+    }
+    let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(device.fd));
+    let lease = &guard.0;
+    let result = (|| {
+        let mut scopes = Vec::new();
+        for (interface, (protocol, descriptors)) in
+            routing_interfaces(raw, &device.claimed_interfaces)?
+        {
+            if protocol != 0x30 {
+                continue;
+            }
+            let (domains, _) = adc3_routing_scope(&descriptors)?;
+            if domains.is_empty() {
+                continue;
+            }
+            let streams = routing_power_interfaces(raw, &device.claimed_interfaces, interface)?;
+            for stream in streams {
+                lease
+                    .verify_idle(stream)
+                    .map_err(|e| RoutingSessionError::Session(Error::Control(e)))?;
+            }
+            scopes.push((interface, domains));
+        }
+        // Complete every scope/claim/idle proof before waking any domain.
+        for (interface, domains) in scopes {
+            for domain in domains {
+                lease
+                    .acquire(interface, &domain)
+                    .map_err(|e| RoutingSessionError::Session(Error::Control(e)))?;
+            }
+        }
+        operation()
+    })();
+    match lease.restore_checked() {
+        Ok(()) => result,
+        Err(error) => Err(RoutingSessionError::Session(Error::Control(format!(
+            "powered routing power hand-back: {error}; operation failure: {:?}",
+            result.as_ref().err()
+        )))),
+    }
+}
+
 /// Query only already claimed AC functions. Sleeping/unknown domains are a
 /// typed refusal: capability discovery never changes a device's power state.
 fn routing_clusters(
@@ -1168,61 +1380,9 @@ fn routing_clusters(
         if protocol != 0x30 {
             continue;
         }
-        let mut domains = BTreeMap::new();
-        let mut members = std::collections::BTreeSet::new();
-        for bytes in &descriptors {
-            if bytes.get(2) != Some(&0x10) {
-                continue;
-            }
-            let domain = crate::descriptors::uac3::parse_power_domain(bytes)
-                .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?;
-            if domains.insert(domain.id, domain.clone()).is_some()
-                || domain.entities.iter().any(|e| !members.insert(*e))
-            {
-                return Err(RoutingSessionError::UnsupportedTopology(
-                    "ADC3 routing power domains overlap or repeat".into(),
-                ));
-            }
-        }
-        let nodes: BTreeMap<_, _> = descriptors
-            .iter()
-            .filter(|b| b.len() >= 4 && b[2] != 1)
-            .map(|b| (b[3], *b))
-            .collect();
-        let mut affected = std::collections::BTreeSet::new();
-        let mut pending: Vec<_> = nodes
-            .values()
-            .filter(|b| matches!(b[2], 5 | 6))
-            .map(|b| b[3])
-            .collect();
-        while let Some(id) = pending.pop() {
-            if !affected.insert(id) {
-                continue;
-            }
-            let bytes = nodes.get(&id).ok_or_else(|| {
-                RoutingSessionError::UnsupportedTopology("unresolved ADC3 routing source".into())
-            })?;
-            match bytes[2] {
-                5 | 6 => {
-                    let pins = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
-                        InvalidRoute::MalformedDescriptor,
-                    ))?);
-                    pending.extend(bytes.get(5..5 + pins).ok_or(RoutingSessionError::Invalid(
-                        InvalidRoute::MalformedDescriptor,
-                    ))?);
-                }
-                7 => pending.push(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
-                    InvalidRoute::MalformedDescriptor,
-                ))?),
-                _ => {}
-            }
-        }
+        let (domains, affected) = adc3_routing_scope(&descriptors)?;
         // Prove D0 only for domains containing exposed units or their sources.
-        for id in domains
-            .values()
-            .filter(|d| d.entities.iter().any(|e| affected.contains(e)))
-            .map(|d| d.id)
-        {
+        for id in domains.iter().map(|d| d.id) {
             let mut state = [0xff];
             let n = idle
                 .handle
@@ -1274,7 +1434,7 @@ fn routing_clusters(
     Ok(clusters)
 }
 
-fn verify_snapshot(
+fn verify_descriptor_identity(
     snapshot: &RoutingSnapshot,
     device: &UsbDevice,
 ) -> Result<(), RoutingSessionError> {
@@ -1289,7 +1449,14 @@ fn verify_snapshot(
             "configuration or descriptors changed; rediscover routing".into(),
         ));
     }
-    if routing_clusters(device, &descriptors)? != snapshot.hc_clusters {
+    Ok(())
+}
+fn verify_snapshot(
+    snapshot: &RoutingSnapshot,
+    device: &UsbDevice,
+) -> Result<(), RoutingSessionError> {
+    verify_descriptor_identity(snapshot, device)?;
+    if routing_clusters(device, &snapshot.descriptors)? != snapshot.hc_clusters {
         return Err(RoutingSessionError::Drift(
             "ADC3 HC Clusters changed; rediscover routing".into(),
         ));
@@ -1324,38 +1491,43 @@ fn verify_values<I: RoutingIo<Error = String>>(
 }
 
 pub(crate) fn discover() -> Result<RoutingSnapshot, RoutingSessionError> {
+    discover_with_power(false)
+}
+pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, RoutingSessionError> {
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
-    let hc_clusters = routing_clusters(&device, &descriptors)?;
-    let inventory =
-        inventory_with_clusters(&descriptors, &device.claimed_interfaces, &hc_clusters)?;
-    let mut selectors = Vec::new();
-    let mut io = UsbRoutingIo {
-        device: &device,
-        descriptors: &descriptors,
-    };
-    for unit in inventory.units() {
-        if let RoutingUnit::Selector(selector) = unit {
-            if selector.access() != Access::Absent {
-                let key = ControlKey::Selector(selector.entity());
-                let value = inventory
-                    .control(key)
-                    .map_err(RoutingSessionError::Invalid)?
-                    .read_current(&mut io)
-                    .map_err(RoutingSessionError::Control)?;
-                selectors.push(RouteChange { key, value });
+    with_routing_power(&device, &descriptors, powered, || {
+        let hc_clusters = routing_clusters(&device, &descriptors)?;
+        let inventory =
+            inventory_with_clusters(&descriptors, &device.claimed_interfaces, &hc_clusters)?;
+        let mut selectors = Vec::new();
+        let mut io = UsbRoutingIo {
+            device: &device,
+            descriptors: &descriptors,
+        };
+        for unit in inventory.units() {
+            if let RoutingUnit::Selector(selector) = unit {
+                if selector.access() != Access::Absent {
+                    let key = ControlKey::Selector(selector.entity());
+                    let value = inventory
+                        .control(key)
+                        .map_err(RoutingSessionError::Invalid)?
+                        .read_current(&mut io)
+                        .map_err(RoutingSessionError::Control)?;
+                    selectors.push(RouteChange { key, value });
+                }
             }
         }
-    }
-    Ok(RoutingSnapshot {
-        device,
-        configuration,
-        descriptors,
-        inventory,
-        selectors,
-        hc_clusters,
+        Ok(RoutingSnapshot {
+            device: device.clone(),
+            configuration,
+            descriptors: descriptors.clone(),
+            inventory,
+            selectors,
+            hc_clusters,
+        })
     })
 }
 
@@ -1363,19 +1535,29 @@ pub(crate) fn read(
     snapshot: &RoutingSnapshot,
     key: ControlKey,
 ) -> Result<RouteValue, RoutingSessionError> {
+    read_with_power(snapshot, key, false)
+}
+pub(crate) fn read_with_power(
+    snapshot: &RoutingSnapshot,
+    key: ControlKey,
+    powered: bool,
+) -> Result<RouteValue, RoutingSessionError> {
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
-    verify_snapshot(snapshot, &device)?;
-    snapshot
-        .inventory
-        .control(key)
-        .map_err(RoutingSessionError::Invalid)?
-        .read_current(&mut UsbRoutingIo {
-            device: &device,
-            descriptors: &snapshot.descriptors,
-        })
-        .map_err(RoutingSessionError::Control)
+    verify_descriptor_identity(snapshot, &device)?;
+    with_routing_power(&device, &snapshot.descriptors, powered, || {
+        verify_snapshot(snapshot, &device)?;
+        snapshot
+            .inventory
+            .control(key)
+            .map_err(RoutingSessionError::Invalid)?
+            .read_current(&mut UsbRoutingIo {
+                device: &device,
+                descriptors: &snapshot.descriptors,
+            })
+            .map_err(RoutingSessionError::Control)
+    })
 }
 
 #[derive(Debug)]
@@ -1383,6 +1565,7 @@ struct RecordedRouting {
     snapshot: RoutingSnapshot,
     // Original and last library-written value for each edited control.
     values: BTreeMap<ControlKey, (RouteValue, RouteValue)>,
+    powered: bool,
 }
 static ORIGINAL_ROUTING: Mutex<Option<RecordedRouting>> = Mutex::new(None);
 
@@ -1390,80 +1573,92 @@ pub(crate) fn apply(
     snapshot: &RoutingSnapshot,
     edits: &[RouteEdit],
 ) -> Result<RouteReport, RoutingSessionError> {
+    apply_with_power(snapshot, edits, false)
+}
+pub(crate) fn apply_with_power(
+    snapshot: &RoutingSnapshot,
+    edits: &[RouteEdit],
+    powered: bool,
+) -> Result<RouteReport, RoutingSessionError> {
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
-    verify_snapshot(snapshot, &device)?;
-    if edits.len() > MAX_ROUTE_CHANGES {
-        return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
-    }
-    let mut originals = ORIGINAL_ROUTING.lock();
-    if originals.as_ref().is_some_and(|prior| {
-        prior.snapshot.configuration != snapshot.configuration
-            || prior.snapshot.descriptors != snapshot.descriptors
-    }) {
-        return Err(RoutingSessionError::Drift(
-            "configuration changed since the first routing edit".into(),
-        ));
-    }
-    if originals
-        .as_ref()
-        .is_some_and(|prior| !Arc::ptr_eq(&prior.snapshot.device._fd_owner, &device._fd_owner))
-    {
-        return Err(RoutingSessionError::Drift(
-            "routing restoration record belongs to another attachment".into(),
-        ));
-    }
-    let old_count = originals.as_ref().map_or(0, |prior| prior.values.len());
-    if old_count + edits.len() > MAX_RECORDED_ROUTES {
-        return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
-    }
-    let expected = edits
-        .iter()
-        .map(|e| RouteChange {
-            key: e.key,
-            value: e.expected,
-        })
-        .collect::<Vec<_>>();
-    let changes = edits
-        .iter()
-        .map(|e| RouteChange {
-            key: e.key,
-            value: e.value,
-        })
-        .collect::<Vec<_>>();
-    let mut io = UsbRoutingIo {
-        device: &device,
-        descriptors: &snapshot.descriptors,
-    };
-    verify_values(&snapshot.inventory, &mut io, &expected)?;
-    let report = match routing::apply_routes(&snapshot.inventory, &mut io, &changes) {
-        Ok(report) => report,
-        Err(failure) => {
-            if !failure.rollback_failures.is_empty() {
-                invalidate_route_caches();
-            }
-            return Err(RoutingSessionError::Transaction(failure));
+    verify_descriptor_identity(snapshot, &device)?;
+    with_routing_power(&device, &snapshot.descriptors, powered, || {
+        verify_snapshot(snapshot, &device)?;
+        if edits.len() > MAX_ROUTE_CHANGES {
+            return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
         }
-    };
-    if !report.changed.is_empty() {
-        let recorded = originals.get_or_insert_with(|| RecordedRouting {
-            snapshot: snapshot.clone(),
-            values: BTreeMap::new(),
-        });
-        for edit in edits {
-            if report.changed.contains(&edit.key) {
-                recorded
-                    .values
-                    .entry(edit.key)
-                    .and_modify(|record| record.1 = edit.value)
-                    .or_insert((edit.expected, edit.value));
-            }
+        let mut originals = ORIGINAL_ROUTING.lock();
+        if originals.as_ref().is_some_and(|prior| {
+            prior.snapshot.configuration != snapshot.configuration
+                || prior.snapshot.descriptors != snapshot.descriptors
+        }) {
+            return Err(RoutingSessionError::Drift(
+                "configuration changed since the first routing edit".into(),
+            ));
         }
-        // A later open must repeat route/clock and configured volume admission.
-        invalidate_route_caches();
-    }
-    Ok(report)
+        if originals
+            .as_ref()
+            .is_some_and(|prior| !Arc::ptr_eq(&prior.snapshot.device._fd_owner, &device._fd_owner))
+        {
+            return Err(RoutingSessionError::Drift(
+                "routing restoration record belongs to another attachment".into(),
+            ));
+        }
+        let old_count = originals.as_ref().map_or(0, |prior| prior.values.len());
+        if old_count + edits.len() > MAX_RECORDED_ROUTES {
+            return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
+        }
+        let expected = edits
+            .iter()
+            .map(|e| RouteChange {
+                key: e.key,
+                value: e.expected,
+            })
+            .collect::<Vec<_>>();
+        let changes = edits
+            .iter()
+            .map(|e| RouteChange {
+                key: e.key,
+                value: e.value,
+            })
+            .collect::<Vec<_>>();
+        let mut io = UsbRoutingIo {
+            device: &device,
+            descriptors: &snapshot.descriptors,
+        };
+        verify_values(&snapshot.inventory, &mut io, &expected)?;
+        let report = match routing::apply_routes(&snapshot.inventory, &mut io, &changes) {
+            Ok(report) => report,
+            Err(failure) => {
+                if !failure.rollback_failures.is_empty() {
+                    invalidate_route_caches();
+                }
+                return Err(RoutingSessionError::Transaction(failure));
+            }
+        };
+        if !report.changed.is_empty() {
+            let recorded = originals.get_or_insert_with(|| RecordedRouting {
+                snapshot: snapshot.clone(),
+                values: BTreeMap::new(),
+                powered,
+            });
+            recorded.powered |= powered;
+            for edit in edits {
+                if report.changed.contains(&edit.key) {
+                    recorded
+                        .values
+                        .entry(edit.key)
+                        .and_modify(|record| record.1 = edit.value)
+                        .or_insert((edit.expected, edit.value));
+                }
+            }
+            // A later open must repeat route/clock and configured volume admission.
+            invalidate_route_caches();
+        }
+        Ok(report)
+    })
 }
 
 fn invalidate_route_caches() {
@@ -1508,39 +1703,41 @@ pub(super) fn finish_routing_hand_back() {
                 "configuration changed before routing hand-back".into(),
             ));
         }
-        let mut expected = record.snapshot.selectors.clone();
-        for item in &mut expected {
-            if let Some((_, last)) = record.values.get(&item.key) {
-                item.value = *last;
+        with_routing_power(&device, &raw, record.powered, || {
+            let mut expected = record.snapshot.selectors.clone();
+            for item in &mut expected {
+                if let Some((_, last)) = record.values.get(&item.key) {
+                    item.value = *last;
+                }
             }
-        }
-        if routing_clusters(&device, &raw)? != record.snapshot.hc_clusters {
-            return Err(RoutingSessionError::Drift(
-                "ADC3 HC Clusters changed before routing hand-back".into(),
-            ));
-        }
-        let mut io = UsbRoutingIo {
-            device: &device,
-            descriptors: &record.snapshot.descriptors,
-        };
-        verify_values(&record.snapshot.inventory, &mut io, &expected)?;
-        let current = record
-            .values
-            .iter()
-            .map(|(&key, &(_, value))| RouteChange { key, value })
-            .collect::<Vec<_>>();
-        verify_values(&record.snapshot.inventory, &mut io, &current)?;
-        let changes = record
-            .values
-            .iter()
-            .map(|(&key, &(value, _))| RouteChange { key, value })
-            .collect::<Vec<_>>();
-        // Every bounded group retains the same readback and rollback contract.
-        for batch in changes.chunks(MAX_ROUTE_CHANGES) {
-            routing::apply_routes(&record.snapshot.inventory, &mut io, batch)
-                .map_err(RoutingSessionError::Transaction)?;
-        }
-        Ok(())
+            if routing_clusters(&device, &raw)? != record.snapshot.hc_clusters {
+                return Err(RoutingSessionError::Drift(
+                    "ADC3 HC Clusters changed before routing hand-back".into(),
+                ));
+            }
+            let mut io = UsbRoutingIo {
+                device: &device,
+                descriptors: &record.snapshot.descriptors,
+            };
+            verify_values(&record.snapshot.inventory, &mut io, &expected)?;
+            let current = record
+                .values
+                .iter()
+                .map(|(&key, &(_, value))| RouteChange { key, value })
+                .collect::<Vec<_>>();
+            verify_values(&record.snapshot.inventory, &mut io, &current)?;
+            let changes = record
+                .values
+                .iter()
+                .map(|(&key, &(value, _))| RouteChange { key, value })
+                .collect::<Vec<_>>();
+            // Every bounded group retains the same readback and rollback contract.
+            for batch in changes.chunks(MAX_ROUTE_CHANGES) {
+                routing::apply_routes(&record.snapshot.inventory, &mut io, batch)
+                    .map_err(RoutingSessionError::Transaction)?;
+            }
+            Ok(())
+        })
     };
     if let Err(error) = restore() {
         log_warn!("[USB] Original routing not restored: {error}");
@@ -1583,6 +1780,44 @@ mod tests {
 
     fn selector() -> Vec<u8> {
         vec![9, 0x24, 5, 7, 2, 1, 2, 3, 0]
+    }
+
+    #[test]
+    fn powered_scope_requires_complete_claims_unique_iad_and_full_protocol() {
+        let mut raw = vec![9, 2, 0, 0, 3, 1, 0, 0x80, 50];
+        raw.extend([8, 11, 3, 3, 1, 0, 0x30, 0]);
+        raw.extend([9, 4, 3, 0, 0, 1, 1, 0x30, 0]);
+        raw.extend([9, 4, 4, 0, 0, 1, 2, 0x30, 0]);
+        raw.extend([9, 4, 5, 0, 0, 1, 2, 0x30, 0]);
+        assert_eq!(
+            routing_power_interfaces(&raw, &[3, 4, 5], 3).unwrap(),
+            vec![4, 5]
+        );
+        assert!(routing_power_interfaces(&raw, &[3, 4], 3).is_err());
+        assert!(routing_power_interfaces(&raw, &[3, 4, 5], 4).is_err());
+        let mut badd = raw.clone();
+        badd[15] = 0x20;
+        assert!(routing_power_interfaces(&badd, &[3, 4, 5], 3).is_err());
+        raw.extend([8, 11, 4, 2, 1, 0, 0x30, 0]);
+        assert!(routing_power_interfaces(&raw, &[3, 4, 5], 3).is_err());
+    }
+
+    #[test]
+    fn powered_scope_selects_only_routing_dependencies_and_rejects_ambiguity() {
+        let terminal = [4, 0x24, 2, 1];
+        let unrelated = [4, 0x24, 2, 2];
+        let selector = [9, 0x24, 6, 7, 1, 1, 0, 0, 0];
+        let domain = [12, 0x24, 0x10, 9, 0, 0, 0, 0, 1, 1, 0, 0];
+        let other = [12, 0x24, 0x10, 10, 0, 0, 0, 0, 1, 2, 0, 0];
+        let descriptors: Vec<&[u8]> = vec![&terminal, &unrelated, &selector, &domain, &other];
+        let (domains, entities) = adc3_routing_scope(&descriptors).unwrap();
+        assert_eq!(domains.iter().map(|d| d.id).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(entities.into_iter().collect::<Vec<_>>(), vec![1, 7]);
+        let mut duplicate = descriptors.clone();
+        duplicate.push(&terminal);
+        assert!(adc3_routing_scope(&duplicate).is_err());
+        let missing: Vec<&[u8]> = vec![&selector, &domain];
+        assert!(adc3_routing_scope(&missing).is_err());
     }
 
     #[test]

@@ -10,13 +10,20 @@
 use std::time::{Duration, Instant};
 
 const HEADER: usize = 16;
-pub(crate) const MAX_PAYLOAD: usize = 260;
+// Largest admitted bank: 77 words plus the four-byte SET_MUX header.
+pub(crate) const MAX_PAYLOAD: usize = 312;
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_NOTIFICATIONS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateModel {
     Scarlett18i20Gen2,
+    Scarlett6i6Gen2,
+    Scarlett18i8Gen2,
+    Scarlett4i4Gen3,
+    Scarlett8i6Gen3,
+    Scarlett18i8Gen3,
+    Scarlett18i20Gen3,
     VocasterOne,
     VocasterTwo,
     ScarlettSoloGen4,
@@ -29,6 +36,12 @@ impl CandidateModel {
         if vendor != 0x1235 { return None; }
         match product {
             0x8201 => Some(Self::Scarlett18i20Gen2),
+            0x8203 => Some(Self::Scarlett6i6Gen2),
+            0x8204 => Some(Self::Scarlett18i8Gen2),
+            0x8212 => Some(Self::Scarlett4i4Gen3),
+            0x8213 => Some(Self::Scarlett8i6Gen3),
+            0x8214 => Some(Self::Scarlett18i8Gen3),
+            0x8215 => Some(Self::Scarlett18i20Gen3),
             0x8216 => Some(Self::VocasterOne),
             0x8217 => Some(Self::VocasterTwo),
             0x8218 => Some(Self::ScarlettSoloGen4),
@@ -40,6 +53,12 @@ impl CandidateModel {
     pub fn key(self) -> &'static str {
         match self {
             Self::Scarlett18i20Gen2 => "scarlett_18i20_gen2",
+            Self::Scarlett6i6Gen2 => "scarlett_6i6_gen2",
+            Self::Scarlett18i8Gen2 => "scarlett_18i8_gen2",
+            Self::Scarlett4i4Gen3 => "scarlett_4i4_gen3",
+            Self::Scarlett8i6Gen3 => "scarlett_8i6_gen3",
+            Self::Scarlett18i8Gen3 => "scarlett_18i8_gen3",
+            Self::Scarlett18i20Gen3 => "scarlett_18i20_gen3",
             Self::VocasterOne => "vocaster_one", Self::VocasterTwo => "vocaster_two",
             Self::ScarlettSoloGen4 => "scarlett_solo_gen4",
             Self::Scarlett2i2Gen4 => "scarlett_2i2_gen4",
@@ -49,6 +68,12 @@ impl CandidateModel {
     pub fn name(self) -> &'static str {
         match self {
             Self::Scarlett18i20Gen2 => "Scarlett 18i20 Gen 2",
+            Self::Scarlett6i6Gen2 => "Scarlett 6i6 Gen 2",
+            Self::Scarlett18i8Gen2 => "Scarlett 18i8 Gen 2",
+            Self::Scarlett4i4Gen3 => "Scarlett 4i4 Gen 3",
+            Self::Scarlett8i6Gen3 => "Scarlett 8i6 Gen 3",
+            Self::Scarlett18i8Gen3 => "Scarlett 18i8 Gen 3",
+            Self::Scarlett18i20Gen3 => "Scarlett 18i20 Gen 3",
             Self::VocasterOne => "Vocaster One", Self::VocasterTwo => "Vocaster Two",
             Self::ScarlettSoloGen4 => "Scarlett Solo Gen 4",
             Self::Scarlett2i2Gen4 => "Scarlett 2i2 Gen 4",
@@ -57,7 +82,16 @@ impl CandidateModel {
     }
     pub fn validate_firmware(self, firmware: u32) -> Result<ReadModel, ProtocolError> {
         let admitted = match self {
+            // Preserve the original captured-only profile. Other legacy models
+            // publish no minimum in the pinned driver: require a nonzero
+            // handshake plus complete live mux-zero and mixer proof below.
             Self::Scarlett18i20Gen2 => firmware == 1083,
+            Self::Scarlett6i6Gen2 => firmware != 0,
+            Self::Scarlett18i8Gen2 => firmware != 0,
+            Self::Scarlett4i4Gen3 => firmware != 0,
+            Self::Scarlett8i6Gen3 => firmware != 0,
+            Self::Scarlett18i8Gen3 => firmware != 0,
+            Self::Scarlett18i20Gen3 => firmware != 0,
             Self::VocasterOne | Self::VocasterTwo => firmware >= 1769,
             Self::ScarlettSoloGen4 | Self::Scarlett2i2Gen4 => firmware >= 2115,
             Self::Scarlett4i4Gen4 => firmware >= 2089,
@@ -67,7 +101,8 @@ impl CandidateModel {
     }
 }
 
-/// A model whose firmware passed its exact capture or source-backed minimum.
+/// A model whose firmware passed its exact capture, published minimum, or
+/// nonzero legacy handshake guard. Legacy guard alone proves no geometry.
 /// New profiles also require live protocol proof before a ReadSession is returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadModel {
@@ -106,7 +141,7 @@ impl ReadModel {
     // Gen4/Vocaster DSP endpoints share MIX IDs but have no mixer controls.
     fn dsp_count(self) -> u8 {
         match self.candidate {
-            CandidateModel::Scarlett18i20Gen2 => 0,
+            CandidateModel::Scarlett18i20Gen2 | CandidateModel::Scarlett6i6Gen2 | CandidateModel::Scarlett18i8Gen2 | CandidateModel::Scarlett4i4Gen3 | CandidateModel::Scarlett8i6Gen3 | CandidateModel::Scarlett18i8Gen3 | CandidateModel::Scarlett18i20Gen3 => 0,
             CandidateModel::VocasterOne => 1,
             _ => 2,
         }
@@ -120,6 +155,14 @@ impl ReadModel {
     fn bank_widths(self) -> [u16; 3] {
         match self.candidate {
             CandidateModel::Scarlett18i20Gen2 => [64, 56, 46],
+            CandidateModel::Scarlett6i6Gen2 => [38, 38, 38],
+            CandidateModel::Scarlett18i8Gen2 => [52, 48, 40],
+            CandidateModel::Scarlett4i4Gen3 => [34, 34, 34],
+            // ALSA s8i6_gen3_info: 8 PCM + 4 analogue + 2 S/PDIF +
+            // 2 PCM + 8 mix + 18 padding = 42 words in each bank.
+            CandidateModel::Scarlett8i6Gen3 => [42, 42, 42],
+            CandidateModel::Scarlett18i8Gen3 => [60, 56, 50],
+            CandidateModel::Scarlett18i20Gen3 => [77, 73, 46],
             CandidateModel::VocasterOne => [23, 0, 0],
             CandidateModel::VocasterTwo => [34, 0, 0],
             CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4 => [12; 3],
@@ -134,6 +177,36 @@ impl ReadModel {
             (CandidateModel::Scarlett18i20Gen2, PortKind::Adat) => [8, 8],
             (CandidateModel::Scarlett18i20Gen2, PortKind::Mix) => [10, 18],
             (CandidateModel::Scarlett18i20Gen2, PortKind::Pcm) => [20, 18],
+            (CandidateModel::Scarlett6i6Gen2, PortKind::Analogue) => [4, 4],
+            (CandidateModel::Scarlett6i6Gen2, PortKind::Spdif) => [2, 2],
+            (CandidateModel::Scarlett6i6Gen2, PortKind::Adat) => [0, 0],
+            (CandidateModel::Scarlett6i6Gen2, PortKind::Mix) => [10, 18],
+            (CandidateModel::Scarlett6i6Gen2, PortKind::Pcm) => [6, 6],
+            (CandidateModel::Scarlett18i8Gen2, PortKind::Analogue) => [8, 6],
+            (CandidateModel::Scarlett18i8Gen2, PortKind::Spdif) => [2, 2],
+            (CandidateModel::Scarlett18i8Gen2, PortKind::Adat) => [8, 0],
+            (CandidateModel::Scarlett18i8Gen2, PortKind::Mix) => [10, 18],
+            (CandidateModel::Scarlett18i8Gen2, PortKind::Pcm) => [8, 18],
+            (CandidateModel::Scarlett4i4Gen3, PortKind::Analogue) => [4, 4],
+            (CandidateModel::Scarlett4i4Gen3, PortKind::Spdif) => [0, 0],
+            (CandidateModel::Scarlett4i4Gen3, PortKind::Adat) => [0, 0],
+            (CandidateModel::Scarlett4i4Gen3, PortKind::Mix) => [6, 8],
+            (CandidateModel::Scarlett4i4Gen3, PortKind::Pcm) => [4, 6],
+            (CandidateModel::Scarlett8i6Gen3, PortKind::Analogue) => [6, 4],
+            (CandidateModel::Scarlett8i6Gen3, PortKind::Spdif) => [2, 2],
+            (CandidateModel::Scarlett8i6Gen3, PortKind::Adat) => [0, 0],
+            (CandidateModel::Scarlett8i6Gen3, PortKind::Mix) => [8, 8],
+            (CandidateModel::Scarlett8i6Gen3, PortKind::Pcm) => [6, 10],
+            (CandidateModel::Scarlett18i8Gen3, PortKind::Analogue) => [8, 8],
+            (CandidateModel::Scarlett18i8Gen3, PortKind::Spdif) => [2, 2],
+            (CandidateModel::Scarlett18i8Gen3, PortKind::Adat) => [8, 0],
+            (CandidateModel::Scarlett18i8Gen3, PortKind::Mix) => [10, 20],
+            (CandidateModel::Scarlett18i8Gen3, PortKind::Pcm) => [8, 20],
+            (CandidateModel::Scarlett18i20Gen3, PortKind::Analogue) => [9, 10],
+            (CandidateModel::Scarlett18i20Gen3, PortKind::Spdif) => [2, 2],
+            (CandidateModel::Scarlett18i20Gen3, PortKind::Adat) => [8, 8],
+            (CandidateModel::Scarlett18i20Gen3, PortKind::Mix) => [12, 25],
+            (CandidateModel::Scarlett18i20Gen3, PortKind::Pcm) => [20, 20],
             (CandidateModel::VocasterOne, PortKind::Analogue) => [2, 4],
             (CandidateModel::VocasterOne, PortKind::Mix) => [9, 9],
             (CandidateModel::VocasterOne, PortKind::Pcm) => [4, 10],
@@ -498,7 +571,7 @@ fn exact<E>(actual: usize, expected: usize) -> Result<(), ReadError<E>> {
 }
 
 /// Stateful, bounded protocol. Transfer/protocol failures poison normal calls;
-/// only failed mixer transactions may reinitialize to attempt exact restoration.
+/// failed write restoration and optional bank probes may reinitialize independently.
 pub struct ReadSession<I> {
     io: I,
     model: ReadModel,
@@ -522,11 +595,17 @@ impl<I: ReadIo> ReadSession<I> {
             .validate_firmware(firmware)
             .map_err(ReadError::Protocol)?;
         let mut session = Self { io, model, sequence: 2, poisoned: false };
-        // A firmware minimum alone never authorizes the new profile. Require
-        // observed envelope, lengths, every port, mixer row and bank geometry.
+        // Firmware admission alone never authorizes a new profile. Require
+        // observed envelope, lengths, every mux-zero port and mixer row.
         if candidate != CandidateModel::Scarlett18i20Gen2 {
             session.read_all()?;
-            session.read_mux_banks()?;
+            // Legacy firmwares may not implement MUX_INFO. Bank proof is an
+            // independent explicit operation, never a prerequisite for mix.
+            if matches!(candidate, CandidateModel::VocasterOne | CandidateModel::VocasterTwo
+                | CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4
+                | CandidateModel::Scarlett4i4Gen4) {
+                session.read_mux_banks()?;
+            }
         }
         Ok(session)
     }
@@ -724,6 +803,15 @@ impl<I: ReadIo> ReadSession<I> {
     /// Probe the complete bank contract against the exact model geometry.
     /// Missing banks are never synthesized from another model or selector zero.
     pub fn read_mux_banks(&mut self) -> Result<MuxSnapshot, ReadError<I::Error>> {
+        let result = self.probe_mux_banks();
+        // A rejected optional bank probe must not strand independently verified
+        // legacy mixer controls. Reinitialize only the poisoned stream; keep
+        // the original error and leave the session poisoned if recovery fails.
+        if result.is_err() && self.poisoned { let _ = self.recover(); }
+        result
+    }
+
+    fn probe_mux_banks(&mut self) -> Result<MuxSnapshot, ReadError<I::Error>> {
         let info = self.request(Command::MuxInfo, &[], 12)?;
         let widths: Vec<_> = info[..6].chunks_exact(2)
             .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
@@ -838,15 +926,30 @@ fn bank_destinations_for(model: ReadModel, bank: u8) -> Result<Vec<u16>, Protoco
     if bank > 2 || model.bank_widths()[usize::from(bank)] == 0 {
         return Err(ProtocolError::InvalidMuxBank(bank));
     }
-    if model.candidate != Scarlett18i20Gen2 {
-        let groups: &[(u16, u16, u16)] = match model.candidate {
-            VocasterOne => &[(0x300,8,1),(0x600,5,5),(0x300,6,2),(0x600,0,5),(0x300,0,6),(0x080,0,4)],
-            VocasterTwo => &[(0x300,12,2),(0x600,6,8),(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
-            ScarlettSoloGen4 | Scarlett2i2Gen4 => &[(0x300,4,2),(0x300,2,2),(0x600,0,4),(0x300,0,2),(0x080,0,2)],
-            Scarlett4i4Gen4 => &[(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
-            Scarlett18i20Gen2 => unreachable!(),
-        };
-        return Ok(groups.iter().flat_map(|&(base, first, count)| (first..first+count).map(move |channel| base+channel)).collect());
+    let groups: Vec<(u16, u16, u16)> = match model.candidate {
+        Scarlett6i6Gen2 => vec![(0x600,0,6),(0x080,0,4),(0x180,0,2),(0x300,0,18),(0,0,8)],
+        Scarlett18i8Gen2 => vec![(0x600,0,[18,14,10][bank as usize]),(0x080,0,6),(0x180,0,2),(0x300,0,18),(0,0,if bank==2 {4} else {8})],
+        Scarlett4i4Gen3 => vec![(0x600,0,6),(0x080,0,4),(0x300,0,8),(0,0,16)],
+        Scarlett8i6Gen3 => vec![(0x600,0,8),(0x080,0,4),(0x180,0,2),(0x600,8,2),(0x300,0,8),(0,0,18)],
+        Scarlett18i8Gen3 => {
+            let mut groups=vec![(0x600,0,10)];
+            if bank<2 { groups.push((0x600,12,if bank==0 {8} else {4})); }
+            groups.extend([(0x080,0,2),(0x080,6,2),(0x080,2,4),(0x180,0,2)]);
+            if bank<2 { groups.push((0x600,10,2)); }
+            groups.extend([(0x300,0,20),(0,0,10)]);
+            groups
+        }
+        Scarlett18i20Gen3 if bank==2 => vec![(0x600,0,10),(0x080,0,10),(0x180,0,2),(0,0,24)],
+        Scarlett18i20Gen3 => vec![(0x600,0,8),(0x600,10,if bank==0 {10} else {8}),(0x080,0,10),(0x180,0,2),(0x200,0,8),(0x600,8,2),(0x300,0,25),(0,0,if bank==0 {12} else {10})],
+        VocasterOne => vec![(0x300,8,1),(0x600,5,5),(0x300,6,2),(0x600,0,5),(0x300,0,6),(0x080,0,4)],
+        VocasterTwo => vec![(0x300,12,2),(0x600,6,8),(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
+        ScarlettSoloGen4 | Scarlett2i2Gen4 => vec![(0x300,4,2),(0x300,2,2),(0x600,0,4),(0x300,0,2),(0x080,0,2)],
+        Scarlett4i4Gen4 => vec![(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
+        Scarlett18i20Gen2 => Vec::new(),
+    };
+    if !groups.is_empty() {
+        return Ok(groups.iter().flat_map(|&(base, first, count)|
+            (first..first+count).map(move |channel| if base==0 {0} else {base+channel})).collect());
     }
     let (pcm, adat, padding) = match bank {
         0 => (18, 8, 8), 1 => (14, 4, 8), 2 => (10, 0, 6),
@@ -965,8 +1068,8 @@ mod tests {
         );
         for (vendor, product) in [
             (0x1234, 0x8201),
-            (0x1235, 0x8203),
-            (0x1235, 0x8215),
+            (0x1235, 0x8202),
+            (0x1235, 0x8210),
             (0x1235, 0x821b),
         ] {
             assert_eq!(CandidateModel::recognize(vendor, product), None);
@@ -1419,6 +1522,7 @@ mod tests {
                         part.copy_from_slice(&width.to_le_bytes());
                     }
                     if self.corrupt == 1 { bytes[HEADER] ^= 1; }
+                    if self.corrupt == 5 { bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); }
                 }
                 0x3001 => {
                     let bank = self.base.last[HEADER+3];
@@ -1465,6 +1569,59 @@ mod tests {
                 } else { assert!(result.is_err(), "{candidate:?} accepted corrupt proof {corrupt}"); }
             }
         }
+    }
+
+    #[test]
+    fn legacy_profiles_require_nonzero_firmware_and_full_read_proof() {
+        for (product, inputs, outputs, destinations, widths) in [
+            (0x8203,18,10,30,[38,38,38]),
+            (0x8204,18,10,44,[52,48,40]),
+            (0x8212,8,6,18,[34,34,34]),
+            (0x8213,8,8,24,[42,42,42]),
+            (0x8214,20,10,50,[60,56,50]),
+            (0x8215,25,12,65,[77,73,46]),
+        ] {
+            let candidate=CandidateModel::recognize(0x1235,product).unwrap();
+            assert!(candidate.validate_firmware(0).is_err());
+            // No invented firmware floor: published geometry plus live proof.
+            for firmware in [1,1083,4096] {
+                let model=candidate.validate_firmware(firmware).unwrap();
+                assert_eq!((model.mixer_inputs(),model.mixer_outputs(),model.mux_destinations()),(inputs,outputs,destinations));
+                assert_eq!(model.bank_widths(),widths);
+                for corrupt in [0,2,3,4] {
+                    let io=ProfileIo {base:MockIo {firmware,..MockIo::default()},model,corrupt};
+                    let result=ReadSession::initialize(io,candidate);
+                    if corrupt==0 {
+                        let mut session=result.unwrap();
+                        let snapshot=session.read_mux_banks().unwrap();
+                        assert_eq!(snapshot.banks.len(),3);
+                        for bank in snapshot.banks {
+                            assert_eq!(bank.words.len(),usize::from(widths[bank.bank as usize]));
+                            validate_bank(model,&bank).unwrap();
+                        }
+                        assert_eq!(session.io.base.writes,0);
+                    } else { assert!(result.is_err(),"{candidate:?} accepted corrupt live proof {corrupt}"); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_legacy_bank_probe_recovers_independent_mixer_reads() {
+        let candidate=CandidateModel::Scarlett18i20Gen3;
+        let model=candidate.validate_firmware(1).unwrap();
+        let io=ProfileIo {base:MockIo {firmware:1,..MockIo::default()},model,corrupt:5};
+        let mut session=ReadSession::initialize(io,candidate).unwrap();
+        assert!(matches!(session.read_mux_banks(),Err(ReadError::Protocol(ProtocolError::DeviceStatus(1)))));
+        assert!(!session.poisoned);
+        let read=session.read_all().unwrap();
+        assert_eq!(read.mixes.len(),12);
+        assert_eq!(read.mixes[11].coefficients.len(),25);
+        assert_eq!(session.io.base.writes,0);
+        session.io.base.short_send=true;
+        assert!(session.read_mux_banks().is_err());
+        assert!(session.poisoned);
+        assert!(matches!(session.read_mix(1),Err(ReadError::Protocol(ProtocolError::SessionPoisoned))));
     }
 
     struct BankIo {

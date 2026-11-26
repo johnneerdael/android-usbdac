@@ -429,3 +429,57 @@ complete live mixer/mux geometry before exposing vendor operations.
 Rust workspace tests, Android target and four-ABI builds, Kotlin
 tests, the sample build and the SDK snippet check passed. No physical
 acceptance was performed. The connected Android host was offline.
+
+### Reference integration surface
+
+- Use `UsbDac.openDuplex` to claim playback and input together. After
+  negotiating output, `DacSession.openDuplex` opens a pair with an
+  exact PCM capture request. The returned playback and capture share
+  retirement. Playback and capture formats expose channel order
+  and carry no implicit speaker remapping.
+- Use `UsbDac.openCapture` when the application requires input only.
+  Sample-rate, width and channel-map requests are exact. Capture
+  stats distinguish device packet loss, a full reader queue and
+  reader-lock contention. These are different causes of missing input.
+- Supply an explicit advertised configuration ID when the device's
+  active USB configuration is unsuitable. The native stream owner
+  retires before configuration restoration. The original open
+  signatures continue to use the active configuration.
+- Standard routing discovery returns a session-bound snapshot.
+  Reads and expected-value edits verify it against the current
+  active topology. Vendor opt-in additionally proves the model,
+  firmware and complete relevant readback shape. Scarlett mux edits
+  require native-observed bank snapshots, and separate failure
+  details indicate which rollback operations could be confirmed.
+- Playback Designs DoP-only alternates appear as DoP. Negotiating
+  PCM or native DSD still requires the corresponding independent
+  capability. Exact manufacturer and firmware rules narrow only
+  the device behavior they actually describe.
+
+## Eighth validation checkpoint
+
+Standalone full-ADC3 capture can select a verified alternate clock
+after the current route fails. It uses its own retained plan, preserves
+the pending playback negotiation, and restores prior rates, selectors
+and domains after retirement. Opt-in powered ADC3 routing uses a
+scoped lease after proving function claims and idle interfaces.
+Discovery, reads, transactions and hand-back restore the checked
+prior power state while preserving external drift.
+
+The Scarlett vendor adapter now includes source-backed legacy
+Scarlett 6i6/18i8 Gen 2 and 4i4/8i6/18i8/18i20 Gen 3 profiles.
+Read and mixer admission require live model-specific proof.
+Bank editing remains conditional on complete proven bank geometry.
+The integration test caught and the source confirmed a 42-word
+bank size on 8i6 Gen 3. That value is verified in model tests.
+
+Rust workspace tests, the Android target check, Kotlin tests, the
+four-ABI AAR and sample build passed. Kotlin native methods and
+corresponding JNI exports for duplex, powered routing and Scarlett
+mux were checked in the AAR. Its SHA-256 is
+`f01b73ae1e2edcd3560d4d86c3ea31fff65e0009a7180ebdd0ab53909296dd1e`.
+
+The Android phone came online with the iBasso DC04U (`0661:0883`)
+attached. Its audio service reported an active media track. No
+test sample was installed, no DAC claim was taken, and no physical
+acceptance session was started while the phone was in use.

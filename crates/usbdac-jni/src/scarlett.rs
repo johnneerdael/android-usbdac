@@ -47,9 +47,9 @@ fn failure(v: usbdac_core::routing::RoutingSessionError) -> Value {
 fn byte(v:&Value, key:&str)->Outcome<u8> { v[key].as_u64().and_then(|n|u8::try_from(n).ok()).ok_or_else(||Failure::Bad(format!("Scarlett {key} must be a byte"))) }
 fn parse_edit(v: &Value) -> Outcome<MixRowEdit> {
     let expected=&v["expected"];
-    let coefficients=expected["coefficients"].as_array().filter(|a|!a.is_empty() && a.len()<=18).ok_or_else(||Failure::Bad("Scarlett expected row must contain 1 to 18 raw coefficients; native model validation requires the exact width".into()))?
+    let coefficients=expected["coefficients"].as_array().filter(|a|!a.is_empty() && a.len()<=25).ok_or_else(||Failure::Bad("Scarlett expected row must contain 1 to 25 raw coefficients; native model validation requires the exact width".into()))?
         .iter().map(|n|n.as_u64().and_then(|n|u16::try_from(n).ok()).ok_or_else(||Failure::Bad("Scarlett coefficients must be unsigned 16-bit".into()))).collect::<Outcome<Vec<_>>>()?;
-    let gains=v["gains"].as_array().filter(|a|!a.is_empty() && a.len()<=18).ok_or_else(||Failure::Bad("Scarlett requires 1 to 18 gain edits".into()))?
+    let gains=v["gains"].as_array().filter(|a|!a.is_empty() && a.len()<=25).ok_or_else(||Failure::Bad("Scarlett requires 1 to 25 gain edits".into()))?
         .iter().map(|g| {let gain=g["half_db"].as_i64().and_then(|n|i16::try_from(n).ok()).and_then(|n|MixGain::from_half_db(n).ok()).ok_or_else(||Failure::Bad("Scarlett gain must be -160 to 24 half-dB".into()))?;Ok(MixGainEdit{input:byte(g,"input")?,gain})}).collect::<Outcome<Vec<_>>>()?;
     Ok(MixRowEdit{expected:MixReadback{output:byte(expected,"output")?,coefficients},gains})
 }
@@ -168,6 +168,14 @@ mod tests {
         assert_eq!(parse_edit(&v).unwrap().expected.coefficients[0],65535);
         v["gains"][0]["half_db"]=json!(25);assert!(parse_edit(&v).is_err());
         v["gains"][0]["half_db"]=json!(0);v["expected"]["coefficients"][0]=json!(-1);assert!(parse_edit(&v).is_err());
+    }
+    #[test] fn legacy_maximum_row_is_bounded_before_exact_native_validation() {
+        let mut v=json!({"expected":{"output":12,"coefficients":vec![65535;25]},"gains":[{"input":25,"half_db":0}]});
+        let edit=parse_edit(&v).unwrap();
+        assert_eq!(edit.expected.coefficients.len(),25);
+        assert_eq!(edit.gains[0].input,25);
+        v["expected"]["coefficients"]=json!(vec![0;26]);
+        assert!(parse_edit(&v).is_err());
     }
     #[test] fn mix_failure_preserves_actual_and_rollback() {
         let v=failure(usbdac_core::routing::RoutingSessionError::ScarlettMix(MixWriteError{failure:MixFailure::Verification{actual:MixReadback{output:2,coefficients:vec![65535;18]}},rollback:Some(MixFailure::Read(ReadError::Io("restore".into())))}));

@@ -363,31 +363,37 @@ pub(super) fn owned_capture_candidates(
         capture_candidates(&raw, config.number(), speed, rate)?
     };
     for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)? {
-        let format = CaptureFormat::pcm(
-            rate,
-            candidate.bit_resolution,
-            candidate.subslot_size,
-            adc3::capture_channel_map(&route)?,
-        )
-        .map_err(|e| format!("ADC3 capture format: {e:?}"))?;
-        candidates.push(CaptureEndpoint {
-            configuration: config.number(),
-            interface: candidate.interface_number,
-            alternate: candidate.alt_setting,
-            address: candidate.endpoint_address,
-            service_us: candidate.service_interval_us,
-            packet_bytes: candidate.max_packet_bytes,
-            format,
-            protocol: 0x30,
-            terminal: candidate.terminal_link.unwrap_or(0),
-            control: route.control,
-            control_descriptors: vec![],
-            sampling_control: false,
-            fixed_rate: route.clock.is_none(),
-            adc3_route: Some(route),
-        });
+        candidates.push(adc3_capture_endpoint(config.number(), rate, candidate, route)?);
     }
     Ok(candidates)
+}
+
+fn adc3_capture_endpoint(
+    configuration: u8, rate: u32, candidate: IsoStreamCandidate, route: adc3::Adc3Route,
+) -> Result<CaptureEndpoint, String> {
+    let format = CaptureFormat::pcm(
+        rate,
+        candidate.bit_resolution,
+        candidate.subslot_size,
+        adc3::capture_channel_map(&route)?,
+    )
+    .map_err(|e| format!("ADC3 capture format: {e:?}"))?;
+    Ok(CaptureEndpoint {
+        configuration,
+        interface: candidate.interface_number,
+        alternate: candidate.alt_setting,
+        address: candidate.endpoint_address,
+        service_us: candidate.service_interval_us,
+        packet_bytes: candidate.max_packet_bytes,
+        format,
+        protocol: 0x30,
+        terminal: candidate.terminal_link.unwrap_or(0),
+        control: route.control,
+        control_descriptors: vec![],
+        sampling_control: false,
+        fixed_rate: route.clock.is_none(),
+        adc3_route: Some(route),
+    })
 }
 
 /// Explicit capture registration has its own narrow claim policy. Playback's
@@ -891,7 +897,15 @@ pub(crate) fn open_capture(
             candidate.address,
         )
     });
-    let endpoint = candidates.into_iter().next().ok_or_else(|| Error::Unsupported {
+    let current = candidates.into_iter().next();
+    let endpoint = if current.as_ref().is_some_and(|candidate| candidate.protocol != 0x30) {
+        current
+    } else {
+        adc3::select_standalone_adc3_capture(owner.claimed(), &config, request)
+            .map_err(Error::Control)?
+            .map(|(candidate, route)| adc3_capture_endpoint(config.number(), request.sample_rate, candidate, route))
+            .transpose().map_err(Error::Control)?
+    }.ok_or_else(|| Error::Unsupported {
         reason: "no claimed standard PCM IN alternate matches the exact capture rate, width and channel map".into(), offered: vec![] })?;
     let buffer = Arc::new(Mutex::new(
         CaptureBuffer::new(endpoint.format.clone(), capacity_frames)

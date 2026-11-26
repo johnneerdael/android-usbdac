@@ -43,24 +43,30 @@ public class RoutingException(public val kind: RoutingErrorKind, message: String
 public class DacRouting internal constructor(private val dac: Long, private val checkOpen: () -> Unit) {
     public val scarlett: ScarlettRouting = ScarlettRouting(dac, checkOpen)
 
-    public fun discover(): RoutingSnapshot {
+    /** Explicit opt-in wakes affected full ADC3 domains temporarily; default never wakes. */
+    @JvmOverloads
+    public fun discover(powered: Boolean = false): RoutingSnapshot {
         checkOpen()
-        val value = response { Native.routingDiscover(dac) }
+        val value = response { if (powered) Native.routingDiscoverPowered(dac) else Native.routingDiscover(dac) }
         val controls = value.getJSONArray("controls").objects().map {
             RouteControl(parseKey(it.getJSONObject("key")), RouteAccess.valueOf(it.getString("access").uppercase()),
                 it.getJSONArray("sources").let { array -> (0 until array.length()).map(array::getInt) })
         }
         return RoutingSnapshot(this, value.getLong("snapshot_id"), value.getInt("configuration_id"), controls)
     }
-    public fun read(snapshot: RoutingSnapshot, key: RouteKey): RouteValue {
+    /** Reacquire a scoped ADC3 lease when explicitly requested; snapshots hold no power. */
+    @JvmOverloads
+    public fun read(snapshot: RoutingSnapshot, key: RouteKey, powered: Boolean = false): RouteValue {
         check(snapshot)
-        return parseValue(response { Native.routingRead(dac, snapshot.handle, key.json().toString()) })
+        return parseValue(response { if (powered) Native.routingReadPowered(dac, snapshot.handle, key.json().toString()) else Native.routingRead(dac, snapshot.handle, key.json().toString()) })
     }
-    public fun apply(snapshot: RoutingSnapshot, edits: List<RouteEdit>): RoutingReport {
+    /** Preserve verified routing/rollback semantics while temporarily waking ADC3 domains. */
+    @JvmOverloads
+    public fun apply(snapshot: RoutingSnapshot, edits: List<RouteEdit>, powered: Boolean = false): RoutingReport {
         check(snapshot)
         require(edits.size <= 32) { "at most 32 route edits" }
         val json = JSONArray(edits.map { JSONObject().put("key", it.key.json()).put("expected", it.expected.json()).put("value", it.value.json()) })
-        val result = response { Native.routingApply(dac, snapshot.handle, json.toString()) }
+        val result = response { if (powered) Native.routingApplyPowered(dac, snapshot.handle, json.toString()) else Native.routingApply(dac, snapshot.handle, json.toString()) }
         return RoutingReport(result.getJSONArray("changed").objects().map(::parseKey), result.getJSONArray("unchanged").objects().map(::parseKey))
     }
     private fun check(snapshot: RoutingSnapshot) {

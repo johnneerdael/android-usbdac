@@ -120,6 +120,42 @@ pub fn routing_apply<'l>(mut env: EnvUnowned<'l>, _class:JObject<'l>, dac:i64, s
         java_string(env,&result)
     })
 }
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn routing_discover_powered<'l>(mut env: EnvUnowned<'l>, _class:JObject<'l>, dac:i64) -> JString<'l> {
+    run(&mut env, |env| {
+        let entry = registry::dac(dac)?;
+        let result = match entry.dac.routing_discover_powered() {
+            Ok(snapshot) => { let description = snapshot.clone(); let id = entry.remember_routing(snapshot)?; success(snapshot_json(&description,id)) },
+            Err(e) => failure(e),
+        };
+        java_string(env,&result)
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn routing_read_powered<'l>(mut env: EnvUnowned<'l>, _class:JObject<'l>, dac:i64, snapshot:i64, key:JString<'l>) -> JString<'l> {
+    run(&mut env, |env| {
+        let key = serde_json::from_str::<Value>(&string_of(env,&key)?).map_err(|e| Failure::Bad(e.to_string()))?;
+        let key = parse_key(&key)?;
+        let entry = registry::dac(dac)?;
+        let snapshot = entry.routing(snapshot)?;
+        let result = match entry.dac.routing_read_powered(&snapshot,key) {Ok(v)=>success(value_json(v)),Err(e)=>failure(e)};
+        java_string(env,&result)
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn routing_apply_powered<'l>(mut env: EnvUnowned<'l>, _class:JObject<'l>, dac:i64, snapshot:i64, edits:JString<'l>) -> JString<'l> {
+    run(&mut env, |env| {
+        let edits = serde_json::from_str::<Value>(&string_of(env,&edits)?).map_err(|e| Failure::Bad(e.to_string()))?;
+        let edits = edits.as_array().filter(|v| v.len()<=usbdac_core::routing::MAX_ROUTE_CHANGES).ok_or_else(||Failure::Bad("routing edits must be an array of at most 32 changes".into()))?;
+        let edits = edits.iter().map(|e|Ok(RouteEdit{key:parse_key(&e["key"])?,expected:parse_value(&e["expected"])?,value:parse_value(&e["value"])?})).collect::<Outcome<Vec<_>>>()?;
+        let entry = registry::dac(dac)?;
+        let snapshot = entry.routing(snapshot)?;
+        let result = match entry.dac.routing_apply_powered(&snapshot,&edits) {
+            Ok(v)=>success(json!({"changed":v.changed.into_iter().map(key_json).collect::<Vec<_>>(),"unchanged":v.unchanged.into_iter().map(key_json).collect::<Vec<_>>()})),Err(e)=>failure(e)
+        };
+        java_string(env,&result)
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

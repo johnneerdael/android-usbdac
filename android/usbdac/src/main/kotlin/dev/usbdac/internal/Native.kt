@@ -45,6 +45,9 @@ internal object Native {
     @JvmStatic external fun scarlettMuxRead(dac: Long): String
     @JvmStatic external fun scarlettMuxApply(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun scarlettMixApply(dac: Long, editJson: String): String
+    @JvmStatic external fun routingDiscoverPowered(dac: Long): String
+    @JvmStatic external fun routingReadPowered(dac: Long, snapshot: Long, keyJson: String): String
+    @JvmStatic external fun routingApplyPowered(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun routingDiscover(dac: Long): String
     @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
     @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String

@@ -932,7 +932,7 @@ pub(super) fn adc3_capture_route_for_endpoint(
         true,
         plan,
     )
-    .map(|(_, route)| route)
+    .map(|(_, mut route)| { route.clock_context = expected.clock_context.clone(); route })
 }
 
 // Resolve the input against the intended pins before any shared selector is
@@ -1010,6 +1010,65 @@ pub(super) fn adc3_capture_candidates(
         }
     }
     Ok(result)
+}
+
+/// Standalone capture keeps its transaction on the owning lease; never consult
+/// or replace playback's pending NEGOTIATED plan. Try every exact current route
+/// before considering bounded writable selector alternatives.
+pub(super) fn select_standalone_adc3_capture(
+    claimed: &ClaimedHandle, config: &ConfigDescriptor, request: &crate::capture::CaptureRequest,
+) -> Result<Option<(IsoStreamCandidate, Adc3Route)>, String> {
+    let speed = resolve_device_speed(&claimed.handle.device());
+    let matches = |candidate: &IsoStreamCandidate, route: &Adc3Route| {
+        let Ok(map) = capture_channel_map(route) else { return false; };
+        let Ok(format) = crate::capture::CaptureFormat::pcm(request.sample_rate,
+            candidate.bit_resolution, candidate.subslot_size, map) else { return false; };
+        format.satisfies(request) && adc3_candidate_matches(&claimed.handle, candidate, route,
+            PlaybackFormat { sample_rate: request.sample_rate, channels: request.channels,
+                bit_depth: request.valid_bits, is_dop: false,
+                dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 })
+    };
+    let alts: Vec<_> = config.interfaces().flat_map(|i| i.descriptors()).filter(|alt|
+        alt.class_code() == 1 && alt.sub_class_code() == 2 && alt.protocol_code() == 0x30
+        && alt.setting_number() != 0 && claimed.claimed_interfaces.contains(&alt.interface_number())
+        && alt.endpoint_descriptors().any(|ep| ep.direction() == Direction::In
+            && ep.transfer_type() == TransferType::Isochronous && ep.usage_type() == UsageType::Data)).collect();
+    for alt in &alts {
+        prepare_adc3_alternate_power(claimed, config, alt, true)?;
+        let Ok(pair) = adc3_alternate(config, &claimed.handle, alt, speed, true) else { continue; };
+        if !matches(&pair.0, &pair.1) { continue; }
+        claimed.set_alternate_setting(alt.interface_number(), 0)?;
+        let frequency = if let Some(clock) = &pair.1.clock {
+            let mut bytes = [0; 4];
+            read_exact(&claimed.handle, pair.1.control, clock.id, 1, 1, &mut bytes)?;
+            let original = u32::from_le_bytes(bytes);
+            if original == 0 { continue; }
+            Some(FrequencySnapshot { source: clock.id, original, target: request.sample_rate })
+        } else { None };
+        if configure_adc3(&claimed.handle, &pair.1, request.sample_rate).is_ok() { return Ok(Some(pair)); }
+        if let Some(frequency) = frequency {
+            if let Err(error) = restore_adc3_frequency(&mut Adc3LeaseClockIo {
+                lease: &claimed.adc3_power, control: pair.1.control }, frequency) {
+                claimed.adc3_power.disarm();
+                return Err(format!("ADC3 capture current frequency restoration uncertain: {error}"));
+            }
+        }
+        // A changed current selector is external drift, not permission to retry
+        // with a newly observed original pin snapshot.
+        if adc3_alternate(config, &claimed.handle, alt, speed, true)?.1 != pair.1 {
+            return Err("ADC3 capture current route drifted; renegotiate".into());
+        }
+    }
+    for alt in &alts {
+        for pair in adc3_directional_alternative_routes(claimed, config, alt, speed, true, &matches)? {
+            match apply_adc3_clock_plan(claimed, &pair.1, request.sample_rate) {
+                Ok(()) => return Ok(Some(pair)),
+                Err(error) if claimed.adc3_power.clock.lock().is_some() => return Err(error),
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(super) fn capture_channel_map(route: &Adc3Route) -> Result<crate::capture::ChannelMap, String> {
@@ -1150,7 +1209,7 @@ impl Adc3PowerLease {
         }
         Ok(())
     }
-    fn acquire(&self, ac: u8, d: &wire::PowerDomain) -> Result<(), String> {
+    pub(super) fn acquire(&self, ac: u8, d: &wire::PowerDomain) -> Result<(), String> {
         acquire_domain(&mut PowerUsb(self), &mut self.pending.lock(), ac, d)
     }
     pub(super) fn restore(&self) -> Result<(), String> {
@@ -1168,6 +1227,12 @@ impl Adc3PowerLease {
         }
         let pending = std::mem::take(&mut *self.pending.lock());
         restore_domains(&mut PowerUsb(self), pending)
+    }
+    /// End a scoped routing wake without overwriting an external power change.
+    /// Taking the snapshot first also prevents Drop from retrying drifted writes.
+    pub(super) fn restore_checked(&self) -> Result<(), String> {
+        let pending = std::mem::take(&mut *self.pending.lock());
+        restore_domains_checked(&mut PowerUsb(self), pending)
     }
     pub(super) fn verify_idle(&self, interface: u8) -> Result<(), String> {
         let mut alternate = [0xffu8];
@@ -1333,6 +1398,25 @@ fn restore_domains(io: &mut impl PowerIo, pending: Vec<(u8, u8, u8)>) -> Result<
     }
     error.map_or(Ok(()), Err)
 }
+fn restore_domains_checked(io: &mut impl PowerIo, pending: Vec<(u8, u8, u8)>) -> Result<(), String> {
+    let mut error = None;
+    for (ac, id, previous) in pending.into_iter().rev() {
+        let result: Result<(), String> = (|| {
+            let current = io.read(ac, id)?;
+            if current == previous { return Ok(()); }
+            if current != 0 { return Err("ADC3 power drifted; preserving external change".into()); }
+            if previous != 0 {
+                io.write(ac, id, previous)?;
+                if io.read(ac, id)? != previous {
+                    return Err("ADC3 power restore verification failed".into());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result { error = Some(e); }
+    }
+    error.map_or(Ok(()), Err)
+}
 impl Drop for Adc3PowerLease {
     fn drop(&mut self) {
         if let Err(e) = self.restore() {
@@ -1486,6 +1570,14 @@ fn adc3_plans(handle: &DeviceHandle<Context>, control: u8, terminal: u8, extra: 
 fn adc3_alternative_routes(
     claimed: &ClaimedHandle, config: &ConfigDescriptor, alt: &rusb::InterfaceDescriptor, speed: Speed, requested: PlaybackFormat,
 ) -> Result<Vec<(IsoStreamCandidate, Adc3Route)>, String> {
+    adc3_directional_alternative_routes(claimed, config, alt, speed, false, |candidate, route| {
+        adc3_candidate_matches(&claimed.handle, candidate, route, requested)
+    })
+}
+fn adc3_directional_alternative_routes(
+    claimed: &ClaimedHandle, config: &ConfigDescriptor, alt: &rusb::InterfaceDescriptor,
+    speed: Speed, capture: bool, matches: impl Fn(&IsoStreamCandidate, &Adc3Route) -> bool,
+) -> Result<Vec<(IsoStreamCandidate, Adc3Route)>, String> {
     let (iad, profile, extra) = owning_function(config, &claimed.handle, alt.interface_number())?;
     if profile != wire::FunctionProfile::Full { return Ok(Vec::new()); }
     let headers: Vec<_> = DescriptorIter::new(alt.extra()).filter(|d| d.get(1) == Some(&0x24) && d.get(2) == Some(&1)).collect();
@@ -1496,7 +1588,7 @@ fn adc3_alternative_routes(
         claimed.set_alternate_setting(interface, 0)?;
         claimed.adc3_power.verify_idle(interface)?;
     }
-    let domains = domains(profile, &extra, false)?;
+    let domains = domains(profile, &extra, capture)?;
     let checkpoint = claimed.adc3_power.pending.lock().len();
     let result = (|| {
         for domain in &domains { claimed.adc3_power.acquire(iad.b_first_interface, domain)?; }
@@ -1514,8 +1606,8 @@ fn adc3_alternative_routes(
             for domain in domains.iter().filter(|d| d.entities.iter().any(|id| plan.path.contains(id))) {
                 claimed.adc3_power.acquire(iad.b_first_interface, domain)?;
             }
-            if let Ok(mut pair) = adc3_alternate_plan(config, &claimed.handle, alt, speed, false, Some(&plan)) {
-                if adc3_candidate_matches(&claimed.handle, &pair.0, &pair.1, requested) {
+            if let Ok(mut pair) = adc3_alternate_plan(config, &claimed.handle, alt, speed, capture, Some(&plan)) {
+                if matches(&pair.0, &pair.1) {
                     if let Ok(context) = adc3_clock_context(claimed, config, iad.b_first_interface,
                         iad.b_interface_count, iad.b_first_interface, &extra, &plan) {
                         pair.1.clock_context = Some(context);
@@ -1987,6 +2079,33 @@ mod tests {
         }
     }
     #[test]
+    fn scoped_power_handback_preserves_external_drift_and_restores_other_domains() {
+        let mut io = PowerMock::default();
+        io.states.insert((4, 10), 2); // Another owner changed our D0 state.
+        io.states.insert((4, 11), 0);
+        assert!(restore_domains_checked(&mut io, vec![(4, 11, 2), (4, 10, 1)]).is_err());
+        assert_eq!(io.states[&(4, 10)], 2);
+        assert_eq!(io.states[&(4, 11)], 2);
+        assert!(!io.events.iter().any(|e| e.starts_with("write:4:10:")));
+    }
+    #[test]
+    fn capture_alternative_graph_uses_output_terminal_clock_and_writable_pins() {
+        let mut bytes = vec![19, 0x24, 3, 6, 1, 1, 0, 4, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&[13, 0x24, 0x0c, 10, 2, 20, 21, 3, 0, 0, 0, 0, 0]);
+        for id in [20, 21] {
+            bytes.extend_from_slice(&[12, 0x24, 0x0b, id, 1, 7, 0, 0, 0, 0, 0, 0]);
+        }
+        let plans = ClockGraph::parse_adc3(&bytes).unwrap().enumerate_plans(6, |_| Ok(1)).unwrap();
+        assert_eq!(plans.iter().map(|p| p.source_id).collect::<Vec<_>>(), vec![20, 21]);
+        assert_eq!(plans[1].selectors[0].original, 1);
+        assert_eq!(plans[1].selectors[0].target, 2);
+        let descriptors: Vec<_> = DescriptorIter::new(&bytes).collect();
+        assert_eq!(linked_terminal_clock(&descriptors, 6, true).unwrap(), 10);
+        assert!(linked_terminal_clock(&descriptors, 6, false).is_err());
+        bytes[19 + 7] = 1; // Read-only selector keeps only the selected source.
+        assert_eq!(ClockGraph::parse_adc3(&bytes).unwrap().enumerate_plans(6, |_| Ok(1)).unwrap().len(), 1);
+    }
+    #[test]
     fn shared_domains_wake_once_and_restore_after_last_lease_in_reverse_order() {
         let mut io = PowerMock::default();
         io.states.insert((4, 10), 1);
@@ -2090,6 +2209,16 @@ mod tests {
                 group: 0
             }]
         );
+        let map = capture_channel_map(&route).unwrap();
+        let format = crate::capture::CaptureFormat::pcm(96_000, 16, 2, map.clone()).unwrap();
+        let mut exact = crate::capture::CaptureRequest { sample_rate: 96_000,
+            channels: 1, valid_bits: 16, channel_map: Some(map) };
+        assert!(format.satisfies(&exact));
+        exact.sample_rate = 48_000;
+        assert!(!format.satisfies(&exact));
+        exact.sample_rate = 96_000;
+        exact.channel_map = Some(crate::capture::ChannelMap::uac2(1, 4).unwrap());
+        assert!(!format.satisfies(&exact));
         let mut topology = route.clone();
         topology.cluster.as_mut().unwrap().channels = vec![
             wire::Channel::Information {

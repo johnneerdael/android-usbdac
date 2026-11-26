@@ -72,6 +72,31 @@ impl Dac {
         routing_hw::discover()
     }
 
+    /// Explicitly wake affected full ADC3 routing domains on entirely claimed
+    /// idle functions. Restore checked original power after discovery, including
+    /// failures. The snapshot does not retain a power lease.
+    pub fn routing_discover_powered(&self) -> Result<RoutingSnapshot, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::discover_with_power(true)
+    }
+
+    /// Revalidate the snapshot and acquire a fresh scoped ADC3 routing lease.
+    /// Preserve external power drift instead of overwriting it on hand-back.
+    pub fn routing_read_powered(&self, snapshot: &RoutingSnapshot, key: ControlKey)
+        -> Result<RouteValue, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::read_with_power(snapshot, key, true)
+    }
+
+    /// Apply the ordinary verified routing transaction with explicit scoped
+    /// ADC3 wake. Restore original power after success or failure. Configured
+    /// route hand-back reacquires power only for these opted-in edits.
+    pub fn routing_apply_powered(&self, snapshot: &RoutingSnapshot, edits: &[RouteEdit])
+        -> Result<RouteReport, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::apply_with_power(snapshot, edits, true)
+    }
+
     /// Read a descriptor-backed control after checking the attachment,
     /// configuration, descriptors and discovered selector pins for drift.
     pub fn routing_read(
