@@ -126,7 +126,7 @@ DSD playback has not been run on a DAC. The rules are in [bit-perfect output](bi
 |---|---|
 | `Underrun` | The writer was late. Count it, log it, and look at the decoder's read-ahead. Playback continues with silence in the gap, and the bit-perfect flag does not change |
 | `LostFrames(frames)` | A sliver of audio never reached the DAC. The flag is now `NotVerified(LOST_FRAMES)` for the rest of the stream. Show it. Optionally treat the first one as a reason to log a diagnostic |
-| `FeedbackStale` | The DAC stopped answering its feedback endpoint. Playback continues on the last value. Log it with `stats()` |
+| `FeedbackStale` | The stream lost usable feedback timing. Log `format.pacing` and `stats()`, and update the bit-perfect indicator. Explicit feedback can recover during a short hold of the last rate. Handle `StreamFailed` if timing fails to recover or the feedback transport fails |
 | `StreamFailed` | The stream is `FAILED`. Stop the writer, close the output, and decide ([failures](integration-app.md#failures-and-fallback)) |
 | `DeviceLost` | The DAC is gone. Pause, say so, and do not continue on another output unless the listener asked for that |
 | `BitPerfectChanged`, `StateChanged`, `VolumeChanged` | Update the display ([the signal path](integration-app.md#the-signal-path-display)) |

@@ -11,6 +11,12 @@ opened and what it could verify.
 - Add `usbdac-core` with Cargo for Rust apps on Android or Linux that manage
   USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
 
+**New in 0.1.1.** Direct USB can follow supported UAC2 implicit feedback
+routes. Explicit feedback now ignores invalid reports within a poll batch,
+checks packet capacity, and reports loss of lock before a persistent outage
+ends playback. See [what changed](improvements.md#usb-playback-follows-the-dacs-clock)
+and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-the-pacing).
+
 ## Where to start
 
 | If you want to ... | Read |
@@ -29,9 +35,9 @@ opened and what it could verify.
 
 ## Status
 
-This guide covers usbdac 0.1.
+This guide covers usbdac 0.1.1.
 
-- **Automated checks pass.** The Rust crates have 487 tests (counted for `v0.1.0-alpha.6`) and the Kotlin layer has 237, none of which needs a DAC, and every push builds the library and the sample app for four processor types. [Evidence and status](evidence.md) says what they cover and what they cannot.
+- **Automated checks pass.** Rust and Kotlin tests cover the feedback changes without a DAC. CI builds the library and sample app for four processor types. [Evidence and status](evidence.md) records hardware coverage.
 - **Hardware testing has only begun.** The Rust driver has played PCM on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U), inside a build of Flick that runs on this library. Other phones and DACs, DSD and DoP, the Kotlin SDK, the sample app, the Android-managed output and the AAudio output have not been run on hardware yet. Expect to find problems, and report them with the logcat of the tag `usbdac`.
 
 ## Which transport to use

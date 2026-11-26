@@ -20,7 +20,13 @@ The library opens the USB device, claims the audio interfaces away from Android'
 
 - **Exclusive.** While a `DacSession` is open the DAC belongs to your app. System sounds, notifications and other apps cannot use it (they fall back to the phone's speaker or another route), and the system volume does not reach it. `DacSession.close()` hands the DAC back to Android and asks it to take its USB audio driver back.
 - **Verified.** The library knows the format on the wire, whether the DAC confirmed its clock, whether any frame was lost, and what is in the packets. It reports `BitPerfectState.Verified` or the reason it is not.
-- **Feedback.** A dedicated endpoint can report the playback rate. On compatible UAC2 devices, the driver can use packet lengths from a shared-clock IN stream instead. The session holds the required capture-only interface until close and uses only its packet metadata.
+- **Feedback.** A dedicated endpoint can report the playback rate. Version
+  0.1.1 validates each report and bounds recovery if reports stop. For
+  compatible UAC2 implicit feedback, packet frame counts from an IN stream
+  on the same clock and service interval pace playback. The SDK handles
+  eligible IN interface claims and releases them on session close. Inspect
+  `format.pacing` and `stats().feedbackLocked`.
+  [Clock and pacing](decisions-clock.md#feedback)
 - **Hardware volume.** Volume is the DAC's own volume control (`DacVolume`), which scales the audio in the DAC and leaves the stream bit-perfect.
 - **DSD.** DoP and native DSD, when the DAC offers them.
 - **Costs.** A permission dialog per device. `UsbDac.open`, `negotiate` and `openStream` take 100 ms or more each. One session per process. It depends on the DAC following the USB Audio Class; a DAC with quirks may need an entry in `DacConfig.quirks`. A foreground service is the app's business if it plays in the background.

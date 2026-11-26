@@ -34,11 +34,28 @@ usbdac keeps a quarter of a second of audio ready (the original kept a tenth). T
 
 **In plain terms:** if the phone is briefly busy, or a file is slow to read, there is more music in hand before you would hear a gap. The next section explains why this larger reserve does not make the controls feel slow.
 
-### DACs it cannot pace properly are refused, not played badly
+### USB playback follows the DAC's clock {#usb-playback-follows-the-dacs-clock}
 
-A DAC and a phone each keep their own time. A dedicated return channel can report the DAC's rate through explicit feedback. Compatible recording interfaces provide implicit feedback through the number of frames in each IN packet. The driver validates the IN and OUT clock and cadence before using the source. If no feedback route is usable, the app can use Android's own output or opt into nominal pacing.
+**Explicit feedback.** Version 0.1.1 uses the newest valid rate report in each
+poll batch. A later empty or malformed packet leaves the valid report usable.
+The driver checks that the largest packet the rate calls for fits the
+playback endpoint. If valid reports stop, it can briefly hold the last good
+rate. Stale feedback clears bit-perfect verification and a persistent outage
+ends the stream with a transfer error.
 
-**In plain terms:** rather than play such a device with a click every few minutes as the two clocks drift apart, usbdac says "I can't drive this one properly" and lets the app fall back.
+**Implicit feedback.** On compatible UAC2 devices, the driver checks that an IN
+stream shares the playback clock, wire rate and service interval. It starts
+that stream first and uses its USB packet frame counts to schedule output.
+The playback sample path stays the same. When an asynchronous route has no
+usable source, the app can fall back to Android output. Nominal timing is an
+opt-in and gives up bit-perfect verification.
+
+**In plain terms.** Your app can play directly on compatible USB audio
+interfaces that convey timing through their input stream. On a DAC with a
+dedicated feedback endpoint, an invalid report no longer hides an earlier good
+one in the same batch. Your app can see when timing goes stale and handle
+playback failure if the device stops sending valid timing.
+See [clock and pacing](decisions-clock.md#feedback).
 
 ## Controls that respond at once
 

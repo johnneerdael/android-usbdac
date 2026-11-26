@@ -14,7 +14,8 @@ usbdac has been run on **one phone and one DAC**: a OnePlus 15 (CPH2747, Android
 | Full-speed (1 ms interval) DACs | Not tested | Flick PR #400 |
 | DSD and DoP, native and over PCM | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
 | Clock selectors and multipliers, range check | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
-| Implicit-feedback refusal | Host tests only. No such DAC tried | [decision 8](decisions-clock.md#implicit-feedback) |
+| Explicit feedback changes in 0.1.1 | Host tests for report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
+| UAC2 implicit feedback in 0.1.1 | Host tests for source pairing, packet sizing and ordering, and Android claim planning and diagnostics. Hardware validation pending | [decision 8](decisions-clock.md#implicit-feedback) |
 | Hardware volume, start-up attenuation, hand-back, volume keys, system panel, idle release | Host tests only | [decisions 9 to 12](decisions-volume.md) |
 | The Kotlin SDK and the sample app | Not run on a phone. CI builds them for four ABIs | [index](index.md#status) |
 | Android-managed output (Android 14 bit-perfect mixer request) | Host tests only | [transports](transports.md) |
@@ -110,7 +111,7 @@ Where a figure is arithmetic and not a measurement, it is worked out here so tha
 
 | Figure | Arithmetic |
 |---|---|
-| Feedback representability at 44.1 kHz, 16.16 | `round(44.1 x 65536) / 65536 - 44.1 = 6.1e-6` samples per microframe, times 8000 microframes a second = **0.049 Hz**. Half of the last bit is 0.5 x 8000 / 65536 = 0.061 Hz |
+| Feedback representability at 352.8 kHz, 16.16 | `round(44.1 x 65536) / 65536 - 44.1 = 6.1e-6` frames per microframe, times 8000 microframes a second = **0.049 Hz**. Half of the last bit is 0.5 x 8000 / 65536 = 0.061 Hz |
 | The same in 10.14 | `round(44.1 x 16384) / 16384 - 44.1 = -2.4e-5`, times 8000 = **0.195 Hz**. Half of the last bit is 0.244 Hz |
 | Flick's two feedback tests | They assert `abs(rate - 352800) < 0.01`, which 0.049 Hz and 0.195 Hz exceed; the pull requests #414 and #415 report the same two tests failing on `versionF` when compiled for a host |
 | Ring memory | 500 ms of 384 kHz stereo at 4 bytes a sample (`Vec<i32>`) = 0.5 x 384000 x 2 x 4 = 1.54 MB |

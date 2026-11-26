@@ -5,6 +5,11 @@ DoP or native DSD to the DAC through USB, bypassing Android's mixer on the
 direct path. Your app can control the DAC's hardware volume and show whether
 the stream is bit-perfect, with the reason when verification fails.
 
+**USB feedback in 0.1.1.** Direct USB supports implicit feedback on compatible
+UAC2 devices and handles intermittent explicit feedback with a bounded recovery
+window. Read [how USB pacing works](docs/sdk/decisions-clock.md#feedback) or check
+your stream's [pacing and feedback lock](docs/sdk/controls.md#diagnostics-the-clock-and-the-pacing).
+
 | Integrating with | Start here |
 |---|---|
 | Kotlin on Android 8.0+ | Add `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
@@ -30,6 +35,7 @@ technically, and in plain terms. In short:
 | Area | What usbdac adds | In plain terms |
 |---|---|---|
 | Clock handling | Follows clock selectors and multipliers to the clock in use | No wrong pitch or silence on DACs with more than one clock |
+| USB feedback | Uses the newest valid explicit rate report and supports compatible UAC2 implicit feedback | Playback can follow the device clock through a dedicated rate endpoint or a matching input stream |
 | Transfer queue | Always 16 ms on the bus, never 256 packets | Avoids a stall seen on real hardware; controls feel equally quick on every DAC |
 | Fault handling | Recovers from timed-out transfers and counts lost audio exactly | A brief USB hiccup no longer stops the music |
 | Buffering | 250 ms reserve that shrinks while software volume is active | More protection against gaps without slower controls |
@@ -49,8 +55,9 @@ and BitChord, behave with the same DACs. No code from either was used.
 
 **Status: 0.1.** Direct USB has played
 on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U) through a build
-of Flick that runs on this library. Other phones and DACs, DSD, the Kotlin SDK
-and the two Android-managed outputs are not yet confirmed on hardware.
+of Flick that runs on this library. The 0.1.1 feedback changes have automated
+coverage. See [hardware status](docs/sdk/evidence.md#hardware-status) for the
+device and format coverage.
 
 ## Layout
 
@@ -82,11 +89,15 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   frames (timed-out and short transfers) latched, an audit of the wire payload,
   and `is_bit_perfect()` combining them with the clock verification, with
   `bit_perfect_blocker()` saying what stands in the way.
-- Pacing: implicit feedback uses a compatible IN stream on the same clock and
-  service interval. Only that stream’s packet lengths feed the playback scheduler.
-  An asynchronous route without usable feedback is refused unless
-  `DacConfig::allow_unsynchronized_async` permits nominal timing. See the
-  [engineering handover](docs/design/usb-audio-feedback-handover.md).
+- Pacing: explicit feedback uses the newest valid report in each poll batch
+  and checks that the resulting packet fits. A short report gap can recover
+  while playback holds the last good rate. Stale feedback clears the
+  bit-perfect verdict, and a persistent outage ends the stream. Implicit
+  feedback uses frame counts from a compatible UAC2 IN stream that shares the
+  playback clock, rate and service interval. An otherwise valid asynchronous
+  route without usable feedback requires
+  `DacConfig::allow_unsynchronized_async` to play at the nominal rate.
+  See [clock and pacing](docs/sdk/decisions-clock.md#feedback).
 - Volume: the Feature Unit's volume and mute, with read-back verification, a dB
   and a 0..1 view, the level the DAC had before, and a hand-back on close. The
   volume is lowered to at most -40 dB when the DAC opens (never raising a
