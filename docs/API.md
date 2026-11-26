@@ -120,8 +120,38 @@ dac.close(self) -> Result<()>                      // also on drop
 | `allow_unsynchronized_async` | `false` | Stream an asynchronous endpoint that has no explicit feedback endpoint at the nominal rate instead of refusing it (see below). |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
+| `cancel_in_flight_on_flush` | `true` | `flush()` also cancels the transfers already on the bus (see `flush()`). Off: they play out. |
 | `bus_queue_ms` | 16 | Audio kept queued on the USB bus, 4 to 64. One rule for every service interval and encoding (see "The bus queue"). |
 | `transfers_in_flight` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `bus_queue_ms / transfers_in_flight` of audio. |
+
+#### Flush and the bus
+
+A flush empties the ring, but the transfers already submitted would still play:
+up to `bus_queue_ms` of the old position after a seek or a track change. With
+`cancel_in_flight_on_flush` (default) the output thread notices the flush
+within about one transfer, cancels every transfer on the bus that was filled
+before it, waits until libusb has handed each one back (the buffers stay alive
+until then; if one never returns within a second the stream fails with a
+`transfer` error naming how many), and refills the slots with wire-correct
+silence (zeros for PCM, the idle pattern for DSD, DoP markers alternating)
+until the ring holds the start threshold again.
+
+- Cancelled transfers are not lost frames, not underruns, do not latch
+  bit-perfect false and are not counted in `played_frames()` or
+  `frames_completed`; `completed_transfers` does not count them either.
+- A transfer that had already finished when the cancel reached the controller
+  is accounted as played normally (and, being from before the flush, not as
+  music of the new position).
+- Transfers filled after the flush are never cancelled.
+- Nothing is cancelled unless the bus carries music of the old position. A
+  flush while paused, or while the stream is still priming, or with only held
+  silence queued, leaves the bus alone, and `pause()` itself never cancels: the
+  DAC stays locked on silence.
+- The feedback transfer is an IN transfer without audio; it is left running.
+- A DAC may notice the short gap in the isochronous stream a cancel makes. DoP
+  and native DSD DACs re-detect the stream and can click or re-lock; if a DAC
+  does, set `cancel_in_flight_on_flush = false`: the queue then plays out, as
+  it did before.
 
 #### The bus queue
 
@@ -247,8 +277,9 @@ stream.software_gain() -> f32
   `play()` continues exactly where the ring was.
 - `flush()` drops everything in the ring, resets `played_frames()` to 0
   immediately, clears a pending `drain()`, and holds silence until the ring has
-  the start threshold again. Audio already queued on the bus still plays (it is
-  not counted). Use it for seeks and for switching tracks.
+  the start threshold again. It returns at once; the output thread then cancels
+  the transfers already on the bus (see "Flush and the bus" below). Use it for
+  seeks and for switching tracks.
 - `drain()` declares the end of the audio. The ring plays out, including a tail
   shorter than the start threshold, and the padded end is not an underrun.
   `is_drained()` becomes true when everything written has completed on the bus;
@@ -535,7 +566,7 @@ How the transport controls map:
 |---|---|
 | Pause | `stream.pause()`. Keep the writer running; it fills to the target and idles on `writable_bytes() == 0`. |
 | Resume | `stream.play()` |
-| Seek | Under the same lock the writer uses: reposition the decoder, discard the chunk rendered for the old position, `stream.flush()`, remember the new start time. |
+| Seek | Under the same lock the writer uses: reposition the decoder, discard the chunk rendered for the old position, `stream.flush()`, remember the new start time. The old position stops within a transfer or two: the bus is cancelled too. |
 | Stop / next user-chosen track | `stream.flush()`, then write the new audio. |
 | Gapless next track | Keep writing; no `drain()` and no `flush()`. |
 | End of the last track | `stream.drain()`, then wait for `is_drained()` or the `Drained` state. |
@@ -672,6 +703,7 @@ ignored.
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
   "padded_24bit": true, "allow_unsynchronized_async": false, "realtime_priority": true,
   "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
+  "cancel_in_flight_on_flush": true,
   "quirks": [ { "vendor_id": 1, "product_id": 2, "name_contains": "Foo",
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
 ```

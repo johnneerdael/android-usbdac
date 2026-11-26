@@ -255,6 +255,106 @@ pub(super) fn drain_feedback_transfer_slot(context: &Context, slot: &mut Option<
     }
 }
 
+/// Cancels the transfers the flush left on the bus and waits until libusb has
+/// handed every one back. Returns how many were cancelled (0 when the bus holds
+/// nothing of the old position, see `flush_cancel_targets`).
+///
+/// The cancelled slots are only flagged here: their completions are taken by
+/// the output loop, which recognises them (`classify_completion`), skips loss
+/// and played accounting, and refills the slot. The buffers stay alive until
+/// then. The feedback transfer is not touched: it is an IN transfer that
+/// carries no audio, so there is nothing of the old position in it, and its
+/// reports are as good after a flush as before.
+pub(super) fn cancel_stale_transfers_for_flush(
+    context: &Context,
+    slots: &mut [IsoTransferSlot],
+    current_epoch: u64,
+) -> Result<usize, String> {
+    let targets = flush_cancel_targets(
+        current_epoch,
+        slots
+            .iter()
+            .map(|slot| (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)),
+    );
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    for &index in &targets {
+        slots[index].cancel_for_flush();
+    }
+    let slots_ref: &[IsoTransferSlot] = slots;
+    wait_for_acknowledgements(
+        || {
+            targets
+                .iter()
+                .filter(|&&index| !slots_ref[index].completion_ready())
+                .count()
+        },
+        || {
+            context
+                .handle_events(Some(Duration::from_millis(10)))
+                .map_err(|error| format!("libusb_handle_events failed: {}", error))
+        },
+        FLUSH_CANCEL_TIMEOUT,
+    )?;
+    Ok(targets.len())
+}
+
+/// Fills `slot` from the ring and submits it, as the output loop does for every
+/// completed slot. `Ok(false)`: the scheduler had nothing to send.
+pub(super) fn submit_next_transfer(
+    slot: &mut IsoTransferSlot,
+    handle: &DeviceHandle<Context>,
+    scheduler: &mut IsoPacketScheduler,
+    pcm_buffer: &Arc<Mutex<PcmRing>>,
+    runtime_stats: &RuntimeStats,
+    candidate: &IsoStreamCandidate,
+    slot_bytes: usize,
+    channels: usize,
+    bytes_per_frame: usize,
+    playback_format: PlaybackFormat,
+    dsd_big_endian: bool,
+    dsd_bit_reverse: bool,
+    logged_transfer_preview: &mut bool,
+    logged_usb_encode_format: &mut bool,
+    underrun_count: &mut u64,
+    shared: &StreamShared,
+    was_underrun: &mut bool,
+) -> Result<bool, String> {
+    let payload = match prepare_iso_transfer_payload(
+        scheduler,
+        pcm_buffer,
+        runtime_stats,
+        candidate,
+        slot_bytes,
+        channels,
+        bytes_per_frame,
+        playback_format.dsd_transport,
+        dsd_big_endian,
+        dsd_bit_reverse,
+    ) {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            return Err(format!("USB direct transfer preparation failed: {}", error));
+        }
+    };
+    record_prepared_iso_transfer(
+        &payload,
+        playback_format,
+        candidate,
+        runtime_stats,
+        bytes_per_frame,
+        logged_transfer_preview,
+        logged_usb_encode_format,
+        underrun_count,
+    );
+    note_underrun_edge(shared, was_underrun, payload.underrun);
+    slot.submit(handle, candidate.endpoint_address, payload)
+        .map_err(|error| format!("USB direct transfer failed: {}", error))?;
+    Ok(true)
+}
+
 pub(super) fn record_prepared_iso_transfer(
     payload: &IsoTransferPayload,
     playback_format: PlaybackFormat,
@@ -461,6 +561,8 @@ pub(super) fn run_usb_output_loop(
     let mut feedback_counters = FeedbackCounters::default();
     let mut feedback_stale_warned = false;
     let mut min_active_slots = transfer_slot_count;
+    // The flush epoch the bus was last checked against (see the cancel below).
+    let mut handled_flush_epoch = runtime_stats.flush_epoch.load(Ordering::Acquire);
     let acceptance = PacketAcceptance::new(
         playback_format.sample_rate,
         candidate.service_interval_us,
@@ -650,6 +752,33 @@ pub(super) fn run_usb_output_loop(
             break;
         }
 
+        // A flush since the last look: cut what is still queued of the old
+        // position. Only transfers filled before the flush are touched; their
+        // completions come back below as `CancelledByFlush`.
+        let flush_epoch = runtime_stats.flush_epoch.load(Ordering::Acquire);
+        if flush_epoch != handled_flush_epoch {
+            handled_flush_epoch = flush_epoch;
+            if bus_config.cancel_in_flight_on_flush {
+                let started = Instant::now();
+                match cancel_stale_transfers_for_flush(&context, &mut slots, flush_epoch) {
+                    Ok(0) => {}
+                    Ok(asked) => {
+                        log_info!(
+                            "[USB] flush: {} in-flight transfer(s) cancelled and handed back in {} us \
+                             (cancelled so far: {})",
+                            asked,
+                            started.elapsed().as_micros(),
+                            runtime_stats.flush_cancelled_transfers.load(Ordering::Relaxed),
+                        );
+                    }
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+
         if let Some(feedback_slot) = feedback_slot.as_mut() {
             pump_feedback_transfer(
                 &handle,
@@ -667,6 +796,51 @@ pub(super) fn run_usb_output_loop(
             let Some((status, completed_at, _actual_length)) = slot.take_completion() else {
                 continue;
             };
+
+            // Cancelled because the stream was flushed: the audio was never
+            // played, so it is neither lost nor an underrun nor counted as
+            // played, and it must not touch the loss or stability bounds. The
+            // slot is free again; refill it (wire silence until the ring has
+            // refilled) like any other.
+            if classify_completion(status, slot.cancelled_for_flush) == Completion::CancelledByFlush {
+                runtime_stats
+                    .flush_cancelled_transfers
+                    .fetch_add(1, Ordering::Relaxed);
+                slot.mark_completed();
+                active_slots = active_slots.saturating_sub(1);
+                if !usb_stop_requested(&stop) {
+                    match submit_next_transfer(
+                        slot,
+                        &handle,
+                        &mut scheduler,
+                        &pcm_buffer,
+                        &runtime_stats,
+                        &candidate,
+                        slot_bytes,
+                        channels,
+                        bytes_per_frame,
+                        playback_format,
+                        dsd_big_endian,
+                        dsd_bit_reverse,
+                        &mut logged_transfer_preview,
+                        &mut logged_usb_encode_format,
+                        &mut underrun_count,
+                        &shared,
+                        &mut was_underrun,
+                    ) {
+                        Ok(true) => active_slots = active_slots.saturating_add(1),
+                        Ok(false) => {}
+                        Err(error) => {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                runtime_stats
+                    .transfer_queue_depth
+                    .store(active_slots, Ordering::Relaxed);
+                continue;
+            }
 
             active_slots = active_slots.saturating_sub(1);
             min_active_slots = min_active_slots.min(active_slots);
@@ -850,7 +1024,9 @@ pub(super) fn run_usb_output_loop(
 
             let mut submit_gap_us = 0u64;
             if !usb_stop_requested(&stop) {
-                match prepare_iso_transfer_payload(
+                match submit_next_transfer(
+                    slot,
+                    &handle,
                     &mut scheduler,
                     &pcm_buffer,
                     &runtime_stats,
@@ -858,30 +1034,16 @@ pub(super) fn run_usb_output_loop(
                     slot_bytes,
                     channels,
                     bytes_per_frame,
-                    playback_format.dsd_transport,
+                    playback_format,
                     dsd_big_endian,
                     dsd_bit_reverse,
+                    &mut logged_transfer_preview,
+                    &mut logged_usb_encode_format,
+                    &mut underrun_count,
+                    &shared,
+                    &mut was_underrun,
                 ) {
-                    Ok(Some(payload)) => {
-                        record_prepared_iso_transfer(
-                            &payload,
-                            playback_format,
-                            &candidate,
-                            &runtime_stats,
-                            bytes_per_frame,
-                            &mut logged_transfer_preview,
-                            &mut logged_usb_encode_format,
-                            &mut underrun_count,
-                        );
-                        note_underrun_edge(&shared, &mut was_underrun, payload.underrun);
-
-                        if let Err(error) =
-                            slot.submit(&handle, candidate.endpoint_address, payload)
-                        {
-                            fatal_error =
-                                Some(format!("USB direct transfer failed: {}", error));
-                            break;
-                        }
+                    Ok(true) => {
                         submit_gap_us = completed_at
                             .elapsed()
                             .as_micros()
@@ -892,12 +1054,9 @@ pub(super) fn run_usb_output_loop(
                             .transfer_queue_depth
                             .store(active_slots, Ordering::Relaxed);
                     }
-                    Ok(None) => {}
+                    Ok(false) => {}
                     Err(error) => {
-                        fatal_error = Some(format!(
-                            "USB direct transfer preparation failed: {}",
-                            error
-                        ));
+                        fatal_error = Some(error);
                         break;
                     }
                 }

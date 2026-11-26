@@ -44,6 +44,9 @@ pub(crate) struct RuntimeStats {
     /// Music frames of the current flush epoch submitted and not yet completed.
     pub(crate) inflight_music_frames: AtomicU64,
     pub(crate) completed_transfers: AtomicU64,
+    /// Transfers cancelled on the bus by `flush()` (`cancel_in_flight_on_flush`).
+    /// Not completions: they are neither lost nor played.
+    pub(crate) flush_cancelled_transfers: AtomicU64,
     pub(crate) last_transfer_turnaround_us: AtomicU64,
     pub(crate) max_transfer_turnaround_us: AtomicU64,
     pub(crate) last_submit_gap_us: AtomicU64,
@@ -150,6 +153,7 @@ impl RuntimeStats {
             played_epoch: AtomicU64::new(0),
             inflight_music_frames: AtomicU64::new(0),
             completed_transfers: AtomicU64::new(0),
+            flush_cancelled_transfers: AtomicU64::new(0),
             last_transfer_turnaround_us: AtomicU64::new(0),
             max_transfer_turnaround_us: AtomicU64::new(0),
             last_submit_gap_us: AtomicU64::new(0),

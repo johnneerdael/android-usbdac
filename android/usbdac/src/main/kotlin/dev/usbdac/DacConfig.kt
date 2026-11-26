@@ -135,4 +135,14 @@ public data class DacConfig @JvmOverloads constructor(
 
     /** How many isochronous transfers are in flight at once. 2 to 16, default 8. See [busQueueMs]. */
     val transfersInFlight: Int = 8,
+
+    /**
+     * Cancel the transfers already on the bus when [PcmOutput.flush] is called, so the audio of the
+     * old position is not heard after a seek or a track change. The output thread cancels them,
+     * waits until every one is handed back, and resumes with wire-correct silence until the ring has
+     * refilled. Cancelled transfers are not lost audio, not underruns, do not clear the bit-perfect
+     * flag and are not counted in [PcmOutput.playedFrames]. `pause` never cancels. `false` lets the
+     * queue ([busQueueMs]) play out, as before. Default `true`.
+     */
+    val cancelInFlightOnFlush: Boolean = true,
 )

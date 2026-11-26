@@ -28,6 +28,14 @@ impl IsoTransferCompletion {
         self.actual_length.store(0, Ordering::Release);
     }
 
+    /// libusb has handed the transfer back and nobody has taken the result yet.
+    pub(super) fn is_published(&self) -> bool {
+        match self.status.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+
     pub(super) fn take(&self) -> Option<(i32, Instant, usize)> {
         let status = match self.status.lock() {
             Ok(mut guard) => guard.take()?,
@@ -70,6 +78,10 @@ pub(super) struct IsoTransferSlot {
     pub(super) queued_epoch: u64,
     pub(super) submitted_at: Option<Instant>,
     pub(super) in_flight: bool,
+    /// The flush asked libusb to cancel this transfer. Cleared when it comes
+    /// back, whatever its status: a transfer that finished first is still
+    /// accounted as played.
+    pub(super) cancelled_for_flush: bool,
 }
 
 pub(super) struct IsoTransferPayload {
@@ -120,6 +132,7 @@ impl IsoTransferSlot {
             queued_epoch: 0,
             submitted_at: None,
             in_flight: false,
+            cancelled_for_flush: false,
         })
     }
 
@@ -243,6 +256,7 @@ impl IsoTransferSlot {
         self.queued_music_frames = 0;
         self.submitted_at = None;
         self.in_flight = false;
+        self.cancelled_for_flush = false;
     }
 
     pub(super) fn cancel(&mut self) {
@@ -251,6 +265,23 @@ impl IsoTransferSlot {
         }
 
         let _ = unsafe { libusb_cancel_transfer(self.transfer.as_ptr()) };
+    }
+
+    /// Cancels the transfer because the stream was flushed. The buffer stays
+    /// owned by the slot until libusb hands the transfer back (see
+    /// [`completion_ready`](Self::completion_ready)). A transfer that already
+    /// finished cannot be cancelled and comes back with its own status.
+    pub(super) fn cancel_for_flush(&mut self) {
+        if !self.in_flight {
+            return;
+        }
+        self.cancelled_for_flush = true;
+        self.cancel();
+    }
+
+    /// libusb has handed this transfer back: its result is waiting to be taken.
+    pub(super) fn completion_ready(&self) -> bool {
+        unsafe { &(*self.user_data).completion }.is_published()
     }
 }
 

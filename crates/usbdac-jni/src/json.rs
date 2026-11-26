@@ -411,6 +411,9 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     if let Some(count) = uint(map, "transfers_in_flight")? {
         config.transfers_in_flight = narrow(count, "transfers_in_flight")?;
     }
+    if let Some(value) = boolean(map, "cancel_in_flight_on_flush")? {
+        config.cancel_in_flight_on_flush = value;
+    }
     match text(map, "hand_back")?.as_deref() {
         None => {}
         Some("restore_original") => config.hand_back = HandBack::RestoreOriginal,
@@ -503,6 +506,7 @@ mod tests {
         assert!(config.allow_unsynchronized_async);
         assert_eq!(config.dsd_big_endian, Some(true));
         assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (16, 8), "unset: the defaults");
+        assert!(config.cancel_in_flight_on_flush, "unset: on");
         assert_eq!(config.quirks.len(), 1);
         assert_eq!(
             config.quirks[0].quirks,
@@ -524,6 +528,14 @@ mod tests {
         // Out-of-range values decode; the core's validation names them at open.
         let out_of_range = parse_config(Some(r#"{"bus_queue_ms":3}"#)).ok().unwrap();
         assert!(matches!(out_of_range.validate(), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn the_flush_cancel_key_decodes_and_defaults_on() {
+        assert!(parse_config(Some("{}")).ok().unwrap().cancel_in_flight_on_flush);
+        let off = parse_config(Some(r#"{"cancel_in_flight_on_flush":false}"#)).ok().unwrap();
+        assert!(!off.cancel_in_flight_on_flush);
+        assert!(parse_config(Some(r#"{"cancel_in_flight_on_flush":"no"}"#)).is_err());
     }
 
     #[test]

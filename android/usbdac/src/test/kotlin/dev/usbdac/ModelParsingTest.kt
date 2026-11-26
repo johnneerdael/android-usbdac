@@ -174,6 +174,7 @@ class ModelParsingTest {
         assertFalse(json.getBoolean("allow_unsynchronized_async"))
         assertEquals(16, json.getInt("bus_queue_ms"))
         assertEquals(8, json.getInt("transfers_in_flight"))
+        assertTrue(json.getBoolean("cancel_in_flight_on_flush"))
         // Unset options are left out, so the native side applies the device quirk.
         for (key in listOf("clock_settle_delay_ms", "dsd_big_endian", "dsd_subslot", "padded_24bit")) {
             assertFalse(key, json.has(key))
@@ -204,6 +205,7 @@ class ModelParsingTest {
             realtimePriority = false,
             busQueueMs = 32,
             transfersInFlight = 4,
+            cancelInFlightOnFlush = false,
             quirks = listOf(
                 QuirkOverride(
                     vendorId = 1,
@@ -232,6 +234,7 @@ class ModelParsingTest {
         assertFalse(json.getBoolean("realtime_priority"))
         assertEquals(32, json.getInt("bus_queue_ms"))
         assertEquals(4, json.getInt("transfers_in_flight"))
+        assertFalse(json.getBoolean("cancel_in_flight_on_flush"))
 
         val entry = json.getJSONArray("quirks").getJSONObject(0)
         assertEquals(1, entry.getInt("vendor_id"))

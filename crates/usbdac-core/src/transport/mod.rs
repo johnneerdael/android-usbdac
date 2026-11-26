@@ -15,6 +15,10 @@
 use crate::clock_resolution::{audio_control_descriptors_from_config, ClockGraph};
 use crate::error::Error;
 use crate::events::EventSink;
+use crate::flush_cancel::{
+    classify_completion, flush_cancel_targets, wait_for_acknowledgements, Completion,
+    FLUSH_CANCEL_TIMEOUT,
+};
 use crate::stream::BitPerfectBlocker;
 use crate::descriptors::{
     AudioControlParser, DescriptorIter, FeatureUnit, InputTerminal, OutputTerminal,

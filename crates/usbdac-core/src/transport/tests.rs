@@ -970,10 +970,17 @@ mod push_stream_tests {
         /// The oldest transfer completes; the DAC took all but `lost` frames.
         fn complete_oldest(&mut self, lost: u64) {
             let payload = self.in_flight.remove(0);
+            self.account(&payload, lost);
+            self.publish_inflight();
+        }
+
+        /// What the loop does for a transfer that really played.
+        fn account(&mut self, payload: &IsoTransferPayload, lost: u64) {
             let stats = &self.shared.stats;
             stats
                 .consumer_frames
                 .fetch_add(payload.frame_count as u64 - lost, Ordering::Relaxed);
+            stats.completed_transfers.fetch_add(1, Ordering::Relaxed);
             account_completed_transfer(
                 stats,
                 &mut self.played,
@@ -982,7 +989,42 @@ mod push_stream_tests {
                 payload.music_frames as u64,
                 lost,
             );
+        }
+
+        /// What the output loop does when it sees the flush epoch move: cancels
+        /// the transfers filled before the flush (`flush_cancel_targets`), and
+        /// then takes each one back as libusb returns it. `status_of` is what
+        /// libusb reports for the transfer at that index of the bus. Returns
+        /// (cancelled, raced): the transfers dropped as `CancelledByFlush` and
+        /// the ones that had already finished and were accounted as played.
+        fn cancel_for_flush(&mut self, status_of: impl Fn(usize) -> i32) -> (usize, usize) {
+            let epoch = self.shared.stats.flush_epoch.load(Ordering::Acquire);
+            let targets = flush_cancel_targets(
+                epoch,
+                self.in_flight
+                    .iter()
+                    .map(|payload| (true, payload.epoch, payload.music_frames)),
+            );
+            let (mut cancelled, mut raced) = (0, 0);
+            for (offset, &index) in targets.iter().enumerate() {
+                let payload = self.in_flight.remove(index - offset);
+                match classify_completion(status_of(index), true) {
+                    Completion::CancelledByFlush => {
+                        cancelled += 1;
+                        self.shared
+                            .stats
+                            .flush_cancelled_transfers
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Completion::Played => {
+                        raced += 1;
+                        self.account(&payload, 0);
+                    }
+                    Completion::UnexpectedCancel => unreachable!("the flush asked for it"),
+                }
+            }
             self.publish_inflight();
+            (cancelled, raced)
         }
     }
 
@@ -1270,6 +1312,264 @@ mod push_stream_tests {
         rig.submit();
         rig.complete_oldest(0);
         assert_eq!(rig.shared.stats.played_frames(), 96);
+    }
+
+    use libusb1_sys::constants::{LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED};
+
+    fn loss_and_underruns(stats: &RuntimeStats) -> (u64, u64, u64, bool) {
+        (
+            stats.lost_frames.load(Ordering::Relaxed),
+            stats.underrun_count.load(Ordering::Relaxed),
+            stats.data_urb_timeouts.load(Ordering::Relaxed),
+            stats.transport_loss_latched(),
+        )
+    }
+
+    #[test]
+    fn a_flush_cancels_the_music_on_the_bus_and_none_of_it_is_counted() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        let _session = TestSession::install_streaming(Arc::clone(&rig.shared.stats));
+        USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
+        assert!(rig.shared.note_bit_perfect());
+        rig.shared.write_bytes(&noise(96 * 4 * 12, 21)).unwrap();
+
+        // Eight transfers of music on the bus; two have played.
+        for _ in 0..8 {
+            rig.submit();
+        }
+        rig.complete_oldest(0);
+        rig.complete_oldest(0);
+        let stats = Arc::clone(&rig.shared.stats);
+        assert_eq!(stats.played_frames(), 192);
+        let consumed = stats.consumer_frames.load(Ordering::Relaxed);
+        let completed = stats.completed_transfers.load(Ordering::Relaxed);
+        assert_eq!(rig.in_flight.len(), 6);
+
+        // The seek: the ring is dropped at once, then the output thread cancels
+        // what is on the bus and libusb hands every transfer back as cancelled.
+        rig.shared.flush();
+        assert_eq!(stats.played_frames(), 0);
+        let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+        assert_eq!((cancelled, raced), (6, 0));
+        assert!(rig.in_flight.is_empty(), "nothing of the old position stays on the bus");
+
+        // Nothing was lost, nothing underran, nothing counted as taken or played.
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+        assert_eq!(stats.consumer_frames.load(Ordering::Relaxed), consumed);
+        assert_eq!(stats.completed_transfers.load(Ordering::Relaxed), completed);
+        assert_eq!(stats.played_frames(), 0);
+        assert_eq!(stats.inflight_music_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.flush_cancelled_transfers.load(Ordering::Relaxed), 6);
+        assert_eq!(stats.output_latency_frames(), 0, "the ring is empty and so is the bus");
+
+        // The slots are refilled with wire silence while the ring refills: held,
+        // not an underrun, and the audit and the verdict are untouched.
+        for _ in 0..8 {
+            let payload = rig.prepare();
+            assert!(payload.held && !payload.underrun, "held silence after a flush");
+            assert!(payload.transfer_buffer.iter().all(|byte| *byte == 0));
+            assert_eq!(payload.music_frames, 0);
+            rig.in_flight.push(payload);
+        }
+        for _ in 0..8 {
+            rig.complete_oldest(0);
+        }
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+        assert!(rig.shared.note_bit_perfect(), "cancelled transfers do not clear bit-perfect");
+
+        // The refill hold ends at the start threshold, and from then on the
+        // new position counts from zero.
+        rig.shared
+            .write_bytes(&noise(stats.start_threshold_samples * 2, 22))
+            .unwrap();
+        rig.submit();
+        rig.complete_oldest(0);
+        assert_eq!(stats.played_frames(), 96);
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+        assert!(rig.shared.note_bit_perfect());
+        rig.hub.shutdown();
+    }
+
+    #[test]
+    fn a_transfer_that_finished_before_the_cancel_arrived_is_accounted_as_old_audio() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        rig.shared.write_bytes(&noise(96 * 4 * 12, 23)).unwrap();
+        for _ in 0..8 {
+            rig.submit();
+        }
+        let stats = Arc::clone(&rig.shared.stats);
+        let consumed = stats.consumer_frames.load(Ordering::Relaxed);
+        rig.shared.flush();
+
+        // The cancel reaches the controller too late for the first two: they
+        // complete (libusb reports COMPLETED for a flagged transfer), the other
+        // six come back cancelled.
+        let (cancelled, raced) = rig.cancel_for_flush(|index| {
+            if index < 2 { LIBUSB_TRANSFER_COMPLETED } else { LIBUSB_TRANSFER_CANCELLED }
+        });
+        assert_eq!((cancelled, raced), (6, 2));
+        // The two that played took the DAC's time: counted as taken (they were),
+        // not as lost, and not as played in the new position.
+        assert_eq!(stats.consumer_frames.load(Ordering::Relaxed), consumed + 192);
+        assert_eq!(stats.played_frames(), 0, "audio of the old position is not played audio");
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+        assert!(rig.in_flight.is_empty());
+    }
+
+    #[test]
+    fn a_flush_while_paused_leaves_the_bus_alone() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        rig.shared.write_bytes(&noise(96 * 4 * 12, 24)).unwrap();
+        rig.shared.set_paused(true);
+        for _ in 0..8 {
+            let payload = rig.prepare();
+            assert!(payload.held, "paused: wire silence");
+            rig.in_flight.push(payload);
+        }
+        let queued_before = rig.shared.stats.buffered_samples.load(Ordering::Relaxed);
+        assert!(queued_before > 0, "the ring still holds the paused audio");
+
+        // pause() never cancels, and a flush while paused finds no music on the
+        // bus to cut: the DAC stays locked on the silence it is already playing.
+        rig.shared.flush();
+        let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+        assert_eq!((cancelled, raced), (0, 0));
+        assert_eq!(rig.in_flight.len(), 8);
+        assert_eq!(rig.shared.stats.flush_cancelled_transfers.load(Ordering::Relaxed), 0);
+
+        // The flush emptied the ring and the stream stays paused; the next
+        // transfers are still silence, and the accounting is untouched.
+        assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(rig.shared.current_state(), crate::events::StreamState::Paused);
+        for _ in 0..8 {
+            rig.complete_oldest(0);
+        }
+        assert_eq!(rig.shared.stats.played_frames(), 0);
+        assert_eq!(loss_and_underruns(&rig.shared.stats), (0, 0, 0, false));
+    }
+
+    #[test]
+    fn a_flush_with_music_queued_before_a_pause_cuts_only_what_was_music() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        rig.shared.write_bytes(&noise(96 * 4 * 12, 25)).unwrap();
+        // Two transfers of music, then the pause puts silence behind them.
+        rig.submit();
+        rig.submit();
+        rig.shared.set_paused(true);
+        for _ in 0..6 {
+            rig.submit();
+        }
+        rig.shared.flush();
+        let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+        // Music is on the bus, so the old queue goes with it, silence included
+        // (it would otherwise play after a hole).
+        assert_eq!((cancelled, raced), (8, 0));
+        assert!(rig.in_flight.is_empty());
+        assert_eq!(loss_and_underruns(&rig.shared.stats), (0, 0, 0, false));
+    }
+
+    #[test]
+    fn a_flush_during_priming_has_nothing_to_cancel_and_the_stream_still_starts() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        let stats = Arc::clone(&rig.shared.stats);
+        // Priming: audio is arriving, nothing has been submitted, and a flush
+        // drops it.
+        rig.shared.write_bytes(&noise(96 * 4 * 3, 26)).unwrap();
+        rig.shared.flush();
+        let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+        assert_eq!((cancelled, raced), (0, 0));
+        assert_eq!(stats.flush_epoch.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.buffered_samples.load(Ordering::Relaxed), 0);
+
+        // The priming wait goes on until the threshold, then the first
+        // transfers carry the new audio: the epoch is the new one and nothing
+        // was cut.
+        let fresh = noise(stats.start_threshold_samples * 2 + 96 * 4 * 4, 27);
+        rig.shared.write_bytes(&fresh).unwrap();
+        let first = rig.prepare();
+        assert!(!first.held, "the threshold is met, the music flows");
+        assert_eq!(first.epoch, 1);
+        assert_eq!(first.music_frames, 96);
+        rig.in_flight.push(first);
+        rig.complete_oldest(0);
+        assert_eq!(stats.played_frames(), 96);
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+    }
+
+    #[test]
+    fn transfers_filled_after_the_flush_are_never_cancelled() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        let stats = Arc::clone(&rig.shared.stats);
+        rig.shared.write_bytes(&noise(96 * 4 * 4, 28)).unwrap();
+        rig.submit();
+        rig.submit();
+        rig.shared.flush();
+
+        // The new audio is written and two transfers of it are queued before the
+        // output thread gets to look at the flush.
+        rig.shared
+            .write_bytes(&noise(stats.start_threshold_samples * 2 + 96 * 4 * 4, 29))
+            .unwrap();
+        rig.submit();
+        rig.submit();
+        assert_eq!(rig.in_flight.iter().map(|p| p.epoch).collect::<Vec<_>>(), [0, 0, 1, 1]);
+
+        let (cancelled, _) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+        assert_eq!(cancelled, 2, "only the old position's transfers");
+        assert_eq!(rig.in_flight.len(), 2);
+        rig.complete_oldest(0);
+        rig.complete_oldest(0);
+        assert_eq!(stats.played_frames(), 192, "the new audio plays, from zero");
+    }
+
+    #[test]
+    fn a_second_flush_cancels_again_and_the_counters_add_up() {
+        let _globals = lock_globals();
+        let mut rig = Rig::pcm(2, 16);
+        let stats = Arc::clone(&rig.shared.stats);
+        let refill = stats.start_threshold_samples * 2 + 96 * 4 * 8;
+        for seed in 30..32 {
+            rig.shared.write_bytes(&noise(refill, seed)).unwrap();
+            for _ in 0..4 {
+                rig.submit();
+            }
+            rig.shared.flush();
+            let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
+            assert_eq!((cancelled, raced), (4, 0));
+        }
+        assert_eq!(stats.flush_cancelled_transfers.load(Ordering::Relaxed), 8);
+        assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
+    }
+
+    #[test]
+    fn a_slot_remembers_the_cancellation_until_the_transfer_comes_back() {
+        let mut slot = IsoTransferSlot::new(0, 16, 1024).unwrap();
+        // Not on the bus: nothing to cancel, nothing flagged.
+        slot.cancel_for_flush();
+        assert!(!slot.cancelled_for_flush);
+
+        slot.in_flight = true;
+        slot.cancelled_for_flush = true;
+        assert!(!slot.completion_ready(), "libusb has not handed it back yet");
+        unsafe { &(*slot.user_data).completion }
+            .status
+            .lock()
+            .unwrap()
+            .replace(LIBUSB_TRANSFER_CANCELLED);
+        assert!(slot.completion_ready());
+        assert_eq!(slot.take_completion().map(|(status, _, _)| status), Some(LIBUSB_TRANSFER_CANCELLED));
+        assert!(!slot.completion_ready(), "taken");
+
+        // The slot is reused: the flag does not leak into the next transfer.
+        slot.mark_completed();
+        assert!(!slot.cancelled_for_flush);
+        assert!(!slot.in_flight);
     }
 
     #[test]

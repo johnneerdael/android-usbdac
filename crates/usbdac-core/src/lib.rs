@@ -40,6 +40,7 @@ mod endpoint;
 mod error;
 mod events;
 mod format;
+mod flush_cancel;
 mod iso_packet_scheduler;
 mod iso_packet_validation;
 mod iso_transport_loss;

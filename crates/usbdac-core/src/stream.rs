@@ -302,9 +302,18 @@ impl DacStream {
 
     /// Drops everything queued in the ring and resets
     /// [`played_frames`](Self::played_frames) to 0. The stream holds wire
-    /// silence until the ring holds the start threshold again. Audio already
-    /// submitted to the bus still plays (it is not counted as played). Also
-    /// clears [`drain`](Self::drain), so the stream can be reused.
+    /// silence until the ring holds the start threshold again. Also clears
+    /// [`drain`](Self::drain), so the stream can be reused.
+    ///
+    /// Returns at once. With
+    /// [`DacConfig::cancel_in_flight_on_flush`](crate::DacConfig::cancel_in_flight_on_flush)
+    /// (the default) the output thread then cancels the transfers already on
+    /// the bus, within about one transfer (2 ms), waits for every one to be
+    /// handed back and refills the slots with silence; those transfers are not
+    /// lost audio, not underruns and not counted as played. Off, or when only
+    /// silence is queued (a flush while paused), the queue plays out
+    /// ([`DacConfig::bus_queue_ms`](crate::DacConfig::bus_queue_ms), 16 ms by
+    /// default) and is not counted as played.
     pub fn flush(&self) -> Result<()> {
         self.ensure_open()?;
         self.shared().flush();

@@ -53,6 +53,7 @@ internal fun DacConfig.toNativeJson(): String =
         .put("hand_back", "keep")
         .put("bus_queue_ms", busQueueMs)
         .put("transfers_in_flight", transfersInFlight)
+        .put("cancel_in_flight_on_flush", cancelInFlightOnFlush)
         .put("quirks", JSONArray(quirks.map(::overrideJson)))
         .toString()
 

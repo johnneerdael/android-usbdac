@@ -95,6 +95,15 @@ pub struct DacConfig {
     /// How many isochronous transfers are in flight at once. 2 to 16,
     /// default 8. See [`bus_queue_ms`](Self::bus_queue_ms).
     pub transfers_in_flight: u32,
+    /// Cancel the transfers already on the bus when the stream is flushed, so
+    /// the audio of the old position is not heard after a seek or a track
+    /// change. The output thread cancels them, waits for the host controller to
+    /// hand every one back, and resumes with wire-correct silence until the
+    /// ring has refilled. Cancelled transfers are not lost audio, not
+    /// underruns, do not clear bit-perfect, and their music is not counted as
+    /// played. `pause` never cancels. `false` lets the queue play out (up to
+    /// `bus_queue_ms`). Default `true`.
+    pub cancel_in_flight_on_flush: bool,
 }
 
 impl Default for DacConfig {
@@ -115,6 +124,7 @@ impl Default for DacConfig {
             hand_back: HandBack::default(),
             bus_queue_ms: DEFAULT_BUS_QUEUE_MS,
             transfers_in_flight: DEFAULT_TRANSFERS_IN_FLIGHT,
+            cancel_in_flight_on_flush: true,
         }
     }
 }
@@ -169,6 +179,7 @@ mod tests {
         assert_eq!(config.hand_back, HandBack::RestoreOriginal);
         assert_eq!(config.bus_queue_ms, 16);
         assert_eq!(config.transfers_in_flight, 8);
+        assert!(config.cancel_in_flight_on_flush);
         config.validate().unwrap();
     }
 

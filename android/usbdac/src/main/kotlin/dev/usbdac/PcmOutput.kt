@@ -46,8 +46,10 @@ public interface PcmOutput : Closeable {
 
     /**
      * Discards everything buffered and resets [playedFrames] to 0. Use it for a seek, a stop, or a
-     * track the user picked; it keeps a deep buffer from costing responsiveness. Audio already on
-     * the bus or in the platform's last buffer may still be heard.
+     * track the user picked; it keeps a deep buffer from costing responsiveness. On the direct USB
+     * output the transfers already on the bus are cancelled too ([DacConfig.cancelInFlightOnFlush],
+     * on by default), so the old position stops within a couple of milliseconds; with it off, or on
+     * the managed output, audio already on the bus or in the platform's last buffer may still be heard.
      */
     public fun flush()
 
