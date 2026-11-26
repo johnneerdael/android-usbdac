@@ -14,7 +14,7 @@ dependencyResolutionManagement {
         google()
         mavenCentral()
         maven {
-            url = uri("https://maven.pkg.github.com/OWNER/usbdac")
+            url = uri("https://maven.pkg.github.com/johnneerdael/android-usbdac")
             credentials {
                 username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_ACTOR")
                 password = providers.gradleProperty("gpr.token").orNull ?: System.getenv("GITHUB_TOKEN")
@@ -28,7 +28,7 @@ In the module's `build.gradle.kts`:
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.0-alpha.1")
+    implementation("dev.usbdac:usbdac:0.1.0-alpha.2")
 }
 ```
 

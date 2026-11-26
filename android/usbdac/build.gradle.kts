@@ -168,7 +168,7 @@ publishing {
         }
         maven {
             name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/${githubRepository ?: "OWNER/usbdac"}")
+            url = uri("https://maven.pkg.github.com/${githubRepository ?: "johnneerdael/android-usbdac"}")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")
