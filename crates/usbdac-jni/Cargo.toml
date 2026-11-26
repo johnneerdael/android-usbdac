@@ -11,4 +11,12 @@ name = "usbdac"
 crate-type = ["cdylib"]
 
 [dependencies]
-usbdac-core = { path = "../usbdac-core", features = ["serde"] }
+usbdac-core = { path = "../usbdac-core" }
+serde_json = "1.0"
+jni = "0.22"
+log = "0.4"
+parking_lot = "0.12"
+once_cell = "1.19"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
