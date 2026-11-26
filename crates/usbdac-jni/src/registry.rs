@@ -20,6 +20,23 @@ pub fn next_id() -> u64 {
 /// Negotiated formats kept per DAC, so `streamOpen` can take a `format_id`.
 const FORMATS_KEPT: usize = 16;
 
+/// Each DAC owns a distinct table; tokens share the global handle namespace.
+#[derive(Default)]
+struct Gen1Snapshots(Vec<(u64, usbdac_core::scarlett::Gen1Readback)>);
+impl Gen1Snapshots {
+    fn remember(&mut self, snapshot: usbdac_core::scarlett::Gen1Readback) -> u64 {
+        let id=next_id();
+        self.0.push((id,snapshot));
+        if self.0.len()>8 { self.0.remove(0); }
+        id
+    }
+    fn get(&self, id: i64) -> Result<usbdac_core::scarlett::Gen1Readback, Error> {
+        let key=u64::try_from(id).map_err(|_|stale("first-generation snapshot",id))?;
+        self.0.iter().find(|(candidate,_)|*candidate==key).map(|(_,v)|v.clone())
+            .ok_or_else(||stale("first-generation snapshot",id))
+    }
+}
+
 pub struct DacEntry {
     pub dac: Dac,
     formats: Mutex<Vec<(u64, StreamFormat)>>,
@@ -27,6 +44,7 @@ pub struct DacEntry {
     routing: Mutex<Vec<(u64, usbdac_core::routing::RoutingSnapshot)>>,
     scarlett_mux: Mutex<Vec<(u64, usbdac_core::scarlett::MuxSnapshot)>>,
     fcp: Mutex<Vec<(u64, usbdac_core::scarlett::FcpReadback)>>,
+    gen1: Mutex<Gen1Snapshots>,
 }
 
 impl DacEntry {
@@ -38,6 +56,7 @@ impl DacEntry {
             routing: Mutex::new(Vec::new()),
             scarlett_mux: Mutex::new(Vec::new()),
             fcp: Mutex::new(Vec::new()),
+            gen1: Mutex::new(Gen1Snapshots::default()),
         }
     }
 
@@ -101,6 +120,19 @@ impl DacEntry {
         let key = u64::try_from(id).map_err(|_| stale("FCP snapshot", id))?;
         self.fcp.lock().iter().find(|(candidate, _)| *candidate == key)
             .map(|(_, snapshot)| snapshot.clone()).ok_or_else(|| stale("FCP snapshot", id))
+    }
+
+    /// Only explicitly retained first-generation native readback grants an edit token.
+    pub fn remember_gen1(&self, snapshot: usbdac_core::scarlett::Gen1Readback) -> Result<u64, Error> {
+        let dacs = DACS.lock();
+        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
+            return Err(Error::InvalidState("DAC closed during first-generation read".into()));
+        }
+        Ok(self.gen1.lock().remember(snapshot))
+    }
+
+    pub fn gen1(&self, id: i64) -> Result<usbdac_core::scarlett::Gen1Readback, Error> {
+        self.gen1.lock().get(id)
     }
 
     pub fn remember_format(&self, format: StreamFormat) -> u64 {
@@ -265,6 +297,25 @@ pub fn remove_stream(id: i64) -> Result<Arc<DacStream>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gen1_tokens_are_owner_scoped_bounded_and_reject_invalid_handles() {
+        use usbdac_core::scarlett::{Gen1Model,Gen1Readback};
+        let snapshot=Gen1Readback {model:Gen1Model::Forte,controls:vec![],
+            source_offsets:[0,4,6,6,6],matrix_sources:7,output_sources:0};
+        let mut owner=Gen1Snapshots::default();
+        let foreign=Gen1Snapshots::default();
+        let token=owner.remember(snapshot.clone());
+        assert_eq!(owner.get(token as i64).unwrap(),snapshot);
+        assert!(foreign.get(token as i64).is_err());
+        assert!(owner.get(-1).is_err());
+        assert!(owner.get(0).is_err());
+        for _ in 0..8 { owner.remember(snapshot.clone()); }
+        assert!(owner.get(token as i64).is_err());
+        assert_eq!(owner.0.len(),8);
+        let fresh=owner.remember(snapshot.clone());
+        assert_eq!(owner.get(fresh as i64).unwrap(),snapshot);
+    }
 
     #[test]
     fn ids_are_unique_across_kinds_and_stale_ids_are_errors() {

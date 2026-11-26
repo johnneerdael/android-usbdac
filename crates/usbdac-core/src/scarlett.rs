@@ -10,6 +10,9 @@
 use std::time::{Duration, Instant};
 
 mod fcp;
+mod gen1;
+pub use gen1::{apply_gen1, read_gen1, Gen1Control, Gen1Edit, Gen1Failure, Gen1Io, Gen1Key, Gen1Model, Gen1Readback, Gen1Report, Gen1WriteError};
+pub(crate) use gen1::{restore_gen1, same_gen1_layout};
 pub use fcp::{read_fcp, apply_fcp, FcpBank, FcpPort, FcpReadback, FcpRouteEdit, FcpMixEdit, FcpTarget, FcpWriteReport, FcpFailure, FcpWriteError};
 
 const HEADER: usize = 16;

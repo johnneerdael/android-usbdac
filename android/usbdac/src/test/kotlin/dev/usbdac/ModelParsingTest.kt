@@ -18,6 +18,47 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
+    fun gen1ReadbackPreservesModelSignedSourcesRawGainAndTypedEntryPoints() {
+        for (model in Gen1Model.entries) {
+            val v = parseGen1Readback(JSONObject().put("model", model.name.lowercase())
+                .put("source_offsets", org.json.JSONArray(listOf(0, 4, 6, 6, 6)))
+                .put("matrix_sources", 7).put("output_sources", 0)
+                .put("controls", org.json.JSONArray("""[{"key":{"kind":"matrix_input","index":1},"value":-1},
+                    {"key":{"kind":"gain","input":1,"mix":4},"value":-32767}]""")))
+            assertEquals(model, v.model)
+            assertEquals(Gen1Control(Gen1Key.MatrixInput(1), -1), v.controls[0])
+            assertEquals(Gen1Control(Gen1Key.Gain(1, 4), -32767), v.controls[1])
+            assertEquals(listOf(0, 4, 6, 6, 6), v.sourceOffsets)
+        }
+        assertEquals(Gen1Readback::class.java, ScarlettRouting::class.java.getMethod("readGen1").returnType)
+        assertEquals(Gen1Snapshot::class.java, ScarlettRouting::class.java.getMethod("readGen1Snapshot").returnType)
+        assertEquals(Gen1Report::class.java, ScarlettRouting::class.java.getMethod("applyGen1", Gen1Snapshot::class.java, List::class.java).returnType)
+        for (name in listOf("scarlettGen1Read", "scarlettGen1ReadSnapshot")) {
+            assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod(name, Long::class.javaPrimitiveType).returnType)
+        }
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("scarlettGen1Apply",
+            Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, String::class.java).returnType)
+    }
+
+    @Test
+    fun gen1RejectsForeignSnapshotsDuplicateControlsAndInvalidSignedEdits() {
+        val owner = ScarlettRouting(1L) {}
+        val foreign = ScarlettRouting(2L) {}
+        val snapshot = Gen1Snapshot(owner, 99L, Gen1Readback(Gen1Model.FORTE, emptyList(), emptyList(), 7, 0))
+        val edit = Gen1Edit(Gen1Key.MatrixInput(1), -1)
+        assertTrue(runCatching { foreign.applyGen1(snapshot, listOf(edit)) }.exceptionOrNull() is IllegalArgumentException)
+        assertTrue(runCatching { owner.applyGen1(snapshot, listOf(edit, edit)) }.exceptionOrNull() is IllegalArgumentException)
+        for (invalid in listOf<() -> Any>({ Gen1Key.Output(0) }, { Gen1Key.Gain(1, 256) },
+            { Gen1Edit(Gen1Key.Capture(1), -2) }, { Gen1Edit(Gen1Key.Gain(1, 1), 32768) })) {
+            assertTrue(runCatching { invalid() }.exceptionOrNull() is IllegalArgumentException)
+        }
+        val failure = parseGen1Failure(JSONObject("""{"kind":"io","detail":"write failed","key":{"kind":"output","index":2}}"""))
+        assertEquals(Gen1Key.Output(2), failure.key)
+        assertEquals("write failed", failure.detail)
+        assertNull(parseGen1Failure(JSONObject("""{"kind":"drift","key":null}""")).key)
+    }
+
+    @Test
     fun modernFcpModelsHaveDistinctClaimKeysAndTypedSnapshotEntryPoints() {
         for (key in listOf("scarlett_16i16_gen4", "scarlett_18i16_gen4", "scarlett_18i20_gen4", "isa_c8x")) {
             val capability = parseScarlettCapability(JSONObject()

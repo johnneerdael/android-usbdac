@@ -52,10 +52,32 @@ fn fcp_failure(v: &FcpFailure<String>) -> Value {
         FcpFailure::Verification(target) => json!({"kind":"verification","target":fcp_target(target)}),
     }
 }
+fn gen1_key(key: Gen1Key) -> Value {
+    match key {
+        Gen1Key::MatrixInput(index) => json!({"kind":"matrix_input","index":index}),
+        Gen1Key::Output(index) => json!({"kind":"output","index":index}),
+        Gen1Key::Capture(index) => json!({"kind":"capture","index":index}),
+        Gen1Key::Gain { input, mix } => json!({"kind":"gain","input":input,"mix":mix}),
+    }
+}
+fn gen1_readback(v: &Gen1Readback) -> Value {
+    json!({"model":v.model.key(),"controls":v.controls.iter().map(|c|json!({"key":gen1_key(c.key),"value":c.value})).collect::<Vec<_>>(),
+        "source_offsets":v.source_offsets,"matrix_sources":v.matrix_sources,"output_sources":v.output_sources})
+}
+fn gen1_failure(v: &Gen1Failure<String>) -> Value {
+    match v {
+        Gen1Failure::Io { key, error } => json!({"kind":"io","key":gen1_key(*key),"detail":error}),
+        Gen1Failure::Invalid { key } => json!({"kind":"invalid","key":gen1_key(*key)}),
+        Gen1Failure::Drift { key } => json!({"kind":"drift","key":key.map(gen1_key)}),
+        Gen1Failure::Verification { key } => json!({"kind":"verification","key":gen1_key(*key)}),
+    }
+}
 fn failure(v: usbdac_core::routing::RoutingSessionError) -> Value {
     use usbdac_core::routing::RoutingSessionError as E;
     let detail=v.to_string();
     let error=match v {
+        E::Gen1Read(e)=>json!({"kind":"gen1","cause":gen1_failure(&e),"rollback_failures":[],"detail":detail}),
+        E::Gen1(e)=>json!({"kind":"gen1","cause":gen1_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(key,cause)|json!({"key":gen1_key(*key),"cause":gen1_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
         E::Fcp(e)=>json!({"kind":"fcp","cause":fcp_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(target,cause)|json!({"target":fcp_target(target),"cause":fcp_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
         E::Scarlett(e)=>json!({"kind":"read","cause":read_error(&e),"detail":detail}),
         E::ScarlettMux(e)=>json!({"kind":"mux","cause":mux_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(bank,cause)|json!({"bank":bank,"cause":mux_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
@@ -166,6 +188,76 @@ pub fn fcp_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<
 pub fn fcp_read_snapshot<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
     run(&mut env,|env| java_string(env,&fcp_read_value(dac,true)?))
 }
+fn parse_gen1_key(v: &Value) -> Outcome<Gen1Key> {
+    let fields: &[&str] = if v["kind"] == "gain" { &["kind", "input", "mix"] } else { &["kind", "index"] };
+    if !v.as_object().is_some_and(|v|v.len()==fields.len() && v.keys().all(|k|fields.contains(&k.as_str()))) {
+        return Err(Failure::Bad("First-generation control has invalid key fields".into()));
+    }
+    let coordinate = |name| { let value=byte(v,name)?; if value==0 { Err(Failure::Bad("First-generation coordinates are one-based".into())) } else { Ok(value) } };
+    Ok(match v["kind"].as_str() {
+        Some("matrix_input") => Gen1Key::MatrixInput(coordinate("index")?),
+        Some("output") => Gen1Key::Output(coordinate("index")?),
+        Some("capture") => Gen1Key::Capture(coordinate("index")?),
+        Some("gain") => Gen1Key::Gain {input:coordinate("input")?,mix:coordinate("mix")?},
+        _ => return Err(Failure::Bad("Unknown first-generation control kind".into())),
+    })
+}
+fn parse_gen1_edits(v: &Value) -> Outcome<Vec<Gen1Edit>> {
+    let edits=v.as_array().filter(|a|!a.is_empty() && a.len()<=4096)
+        .ok_or_else(||Failure::Bad("First-generation routing requires 1 to 4096 typed edits".into()))?;
+    let mut keys=Vec::new();
+    edits.iter().map(|v| {
+        if !v.as_object().is_some_and(|v|v.len()==2 && v.keys().all(|k|matches!(k.as_str(),"key"|"value"))) {
+            return Err(Failure::Bad("First-generation edits contain only key and value".into()));
+        }
+        let key=parse_gen1_key(&v["key"])?;
+        let value=v["value"].as_i64().and_then(|v|i16::try_from(v).ok())
+            .ok_or_else(||Failure::Bad("First-generation value must be signed 16-bit".into()))?;
+        if !matches!(key,Gen1Key::Gain {..}) && !(-1..=255).contains(&value) {
+            return Err(Failure::Bad("First-generation source must be -1 (Off) to 255".into()));
+        }
+        if keys.contains(&key) { return Err(Failure::Bad("Duplicate first-generation edit key".into())); }
+        keys.push(key);
+        Ok(Gen1Edit {key,value})
+    }).collect()
+}
+fn gen1_read_value(dac: i64, remember: bool) -> Outcome<Value> {
+    let entry=registry::dac(dac)?;
+    Ok(match entry.dac.scarlett_gen1_read() {
+        Ok(v)=>{
+            let mut value=gen1_readback(&v);
+            if remember { value["snapshot_id"]=json!(entry.remember_gen1(v)?); }
+            json!({"value":value})
+        }, Err(e)=>failure(e),
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_gen1_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| java_string(env,&gen1_read_value(dac,false)?))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_gen1_read_snapshot<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| java_string(env,&gen1_read_value(dac,true)?))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_gen1_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,snapshot:i64,edits:JString<'l>)->JString<'l> {
+    run(&mut env,|env| {
+        let input=string_of(env,&edits)?;
+        if input.len()>262144 { return Err(Failure::Bad("First-generation edits exceed 262144 bytes".into())); }
+        let edits=parse_gen1_edits(&serde_json::from_str::<Value>(&input).map_err(|e|Failure::Bad(e.to_string()))?)?;
+        let entry=registry::dac(dac)?;
+        let expected=entry.gen1(snapshot)?;
+        let result=match entry.dac.scarlett_gen1_apply(&expected,&edits) {
+            Ok(report)=>{
+                let original=gen1_readback(&report.original);
+                let mut verified=gen1_readback(&report.verified);
+                verified["snapshot_id"]=json!(entry.remember_gen1(report.verified)?);
+                json!({"value":{"original":original,"verified":verified}})
+            }, Err(e)=>failure(e),
+        };
+        java_string(env,&result)
+    })
+}
 fn word(v: &Value, key: &str) -> Outcome<u16> {
     v[key].as_u64().and_then(|n|u16::try_from(n).ok())
         .ok_or_else(||Failure::Bad(format!("FCP {key} must be unsigned 16-bit")))
@@ -226,6 +318,44 @@ pub fn scarlett_mix_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gen1_edits_keep_signed_values_and_reject_raw_proof_or_invalid_keys() {
+        let mut v=json!([{"key":{"kind":"matrix_input","index":1},"value":-1},
+            {"key":{"kind":"gain","input":18,"mix":8},"value":-32768}]);
+        let edits=parse_gen1_edits(&v).unwrap();
+        assert_eq!(edits[0],Gen1Edit {key:Gen1Key::MatrixInput(1),value:-1});
+        assert_eq!(edits[1].value,-32768);
+        v[0]["key"]["index"]=json!(0); assert!(parse_gen1_edits(&v).is_err());
+        v[0]["key"]["index"]=json!(1);
+        v[0]["expected"]=json!({"controls":[]}); assert!(parse_gen1_edits(&v).is_err());
+        v[0].as_object_mut().unwrap().remove("expected");
+        v[0]["value"]=json!(-2); assert!(parse_gen1_edits(&v).is_err());
+        v[0]["value"]=json!(-1);
+        v[1]["value"]=json!(32768); assert!(parse_gen1_edits(&v).is_err());
+        assert!(parse_gen1_edits(&json!([])).is_err());
+        assert!(parse_gen1_edits(&json!([{"key":{"kind":"output","index":1},"value":0},
+            {"key":{"kind":"output","index":1},"value":1}])).is_err());
+    }
+    #[test]
+    fn gen1_readback_is_stateless_and_failures_preserve_restore_keys() {
+        let readback=Gen1Readback {model:Gen1Model::Forte,
+            controls:vec![Gen1Control {key:Gen1Key::Gain {input:1,mix:1},value:-32767}],
+            source_offsets:[0,4,6,6,6],matrix_sources:7,output_sources:0};
+        let v=gen1_readback(&readback);
+        assert_eq!(v["model"],"forte");
+        assert_eq!(v["controls"][0]["value"],-32767);
+        assert!(v.get("snapshot_id").is_none());
+        let key=Gen1Key::Output(2);
+        let v=failure(usbdac_core::routing::RoutingSessionError::Gen1(Gen1WriteError {
+            failure:Gen1Failure::Io {key,error:"write".into()},
+            rollback:vec![(key,Gen1Failure::Verification {key})],
+        }));
+        assert_eq!(v["error"]["cause"]["detail"],"write");
+        assert_eq!(v["error"]["rollback_failures"][0]["key"]["index"],2);
+        assert_eq!(v["error"]["rollback_failures"][0]["cause"]["kind"],"verification");
+        let v=gen1_failure(&Gen1Failure::Drift {key:None});
+        assert_eq!(v["key"],Value::Null);
+    }
     #[test]
     fn fcp_typed_edits_reject_raw_proof_and_out_of_range_coefficients() {
         let mut v=json!({"routes":[{"bank":2,"destination":65535,"source":0}],"mixes":[{"output":1,"input":255,"coefficient":32613}]});

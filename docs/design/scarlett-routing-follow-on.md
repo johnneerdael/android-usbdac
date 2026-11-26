@@ -223,9 +223,33 @@ other library-owned targets revert and the external change survives.
 ALSA describes the first-generation 6i6, 8i6, 18i6, 18i8, and 18i20
 with model-specific UAC2 control maps. The matrix, output and capture
 muxes use entities `0x32`, `0x33`, and `0x34`. Matrix gains use `0x3c`.
-Model tables define the signed source IDs and the number of inputs and
-outputs. A library adapter can identify the model, prove the owning
-AudioControl interface, and read live selectors and gains before
-exposing edits. Keep device initialization outside discovery. The ALSA
-probe sets the clock to 48 kHz, which would change a user's session
-during a read. [ALSA model tables and controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L954-L1165), [ALSA Gen 1 dispatch and wire selectors](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L1300-L1390)
+The Forte has a separate matrix layout and gain address calculation.
+Its reference exposes matrix input selectors and crosspoint gains.
+Model tables define the signed source IDs, including `-1` for Off,
+and the number of inputs and outputs. Gain edits use whole decibels
+encoded in signed 1/256 dB units. Retain the exact current gain for
+readback and rollback. [ALSA model tables and controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L911-L1165), [ALSA Gen 1 dispatch and wire selectors](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L1300-L1454)
+
+Resolve the exact model and the owning UAC2 AudioControl interface,
+then read live selectors and gains while the session is idle. Keep
+initialization outside routing discovery so reads leave the user's
+clock and routing intact. Use `Dac::scarlett_gen1_read()` in Rust or
+`ScarlettRouting.readGen1()` on Android. For Android edits, request a
+native baseline through `readGen1Snapshot()` and pass it to `applyGen1()`.
+The already claimed AudioControl interface carries these operations.
+See the returned model-specific source offsets and control lists for
+the available pins and crosspoints.
+
+For physical acceptance, compare all returned controls with ALSA on
+the same model. Test one unused route and one muted matrix crosspoint.
+For the Forte, trace the distinct gain selector and matrix index.
+Verify each requested write and the resulting PCM routing, then
+exercise hand-back with an independently changed control.
+
+Rust workspace tests covered model layouts, exact wire addresses,
+stale snapshots, and write and restore acknowledgement loss. The
+Android NDK check, Kotlin tests, sample build and SDK snippet check
+passed. The local AAR exports Gen 1 read, snapshot and apply on all
+four ABIs. Its SHA-256 is
+`e8798e7c9d04d298bfe54c21ef0e5f7d8f400b6b7e4b19e04778b5ca85a3bc5b`.
+Gen 1 and Forte hardware validation is pending.

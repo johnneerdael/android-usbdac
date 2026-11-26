@@ -5,6 +5,23 @@ use crate::routing::{
 use crate::transport::routing_hw;
 
 impl Dac {
+    /// Read source-backed first-generation Focusrite controls using the already
+    /// claimed AudioControl interface while idle. No vendor claim or probe write.
+    /// Hardware behavior remains physically unvalidated.
+    pub fn scarlett_gen1_read(&self) -> Result<crate::scarlett::Gen1Readback, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_gen1_read()
+    }
+
+    /// Apply bounded typed Gen1 controls against a fresh readback on the live DAC.
+    /// Verify each write and restore attempted controls on failure. Configured
+    /// hand-back preserves external edits; no clock, preamp or persistent writes.
+    pub fn scarlett_gen1_apply(&self, expected: &crate::scarlett::Gen1Readback,
+        edits: &[crate::scarlett::Gen1Edit]) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_gen1_apply(expected, edits)
+    }
+
     /// Inspect the exact Scarlett read candidate and required vendor claim,
     /// without initializing its protocol or reading proprietary state.
     pub fn scarlett_routing_capability(

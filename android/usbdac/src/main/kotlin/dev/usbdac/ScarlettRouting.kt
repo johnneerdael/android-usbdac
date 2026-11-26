@@ -62,12 +62,44 @@ public data class FcpRollbackFailure(val target: FcpTarget, val cause: FcpFailur
 public class FcpException(message: String, public val fcpFailure: FcpFailure,
     public val fcpRollbackFailures: List<FcpRollbackFailure>) :
     ScarlettException(ScarlettErrorKind.FCP, message, null, null, null)
+/** First-generation models use the already claimed standard AudioControl interface. */
+public enum class Gen1Model {
+    SCARLETT_6I6_GEN1, SCARLETT_8I6_GEN1, SCARLETT_18I6_GEN1,
+    SCARLETT_18I8_GEN1, SCARLETT_18I20_GEN1, FORTE,
+}
+/** One-based control coordinates; native model admission determines exact geometry. */
+public sealed class Gen1Key {
+    public data class MatrixInput(val index: Int) : Gen1Key() { init { require(index in 1..255) } }
+    public data class Output(val index: Int) : Gen1Key() { init { require(index in 1..255) } }
+    public data class Capture(val index: Int) : Gen1Key() { init { require(index in 1..255) } }
+    public data class Gain(val input: Int, val mix: Int) : Gen1Key() {
+        init { require(input in 1..255); require(mix in 1..255) }
+    }
+}
+/** Exact signed readback; source -1 means Off, gain retains the raw signed wire value. */
+public data class Gen1Control(val key: Gen1Key, val value: Int)
+public data class Gen1Readback(val model: Gen1Model, val controls: List<Gen1Control>,
+    val sourceOffsets: List<Int>, val matrixSources: Int, val outputSources: Int)
+/** Opaque native baseline owned by one session; at most eight are retained. */
+public class Gen1Snapshot internal constructor(internal val owner: ScarlettRouting, internal val handle: Long,
+    public val readback: Gen1Readback)
+/** Source -1 means Off; gain values are signed raw wire units, checked by native model admission. */
+public data class Gen1Edit(val key: Gen1Key, val value: Int) {
+    init { require(if (key is Gen1Key.Gain) value in -32768..32767 else value in -1..255) }
+}
+public data class Gen1Report(val original: Gen1Readback, val verified: Gen1Snapshot)
+public data class Gen1Failure(val kind: ScarlettFailureKind, val detail: String?, val key: Gen1Key?)
+public data class Gen1RollbackFailure(val key: Gen1Key, val cause: Gen1Failure)
+/** Preserves the original failure and every failed verified restoration independently. */
+public class Gen1Exception(message: String, public val gen1Failure: Gen1Failure,
+    public val gen1RollbackFailures: List<Gen1RollbackFailure>) :
+    ScarlettException(ScarlettErrorKind.GEN1, message, null, null, null)
 /** Half-dB units, -160 (-80 dB) through 24 (+12 dB). */
 public data class ScarlettGainEdit(val input: Int, val halfDb: Int) {
     init { require(input in 1..25); require(halfDb in -160..24) }
 }
 public data class ScarlettMixReport(val original: ScarlettMixRow, val verified: ScarlettMixRow)
-public enum class ScarlettErrorKind { READ, MIX, SESSION, DRIFT, UNSUPPORTED, MUX, FCP }
+public enum class ScarlettErrorKind { READ, MIX, SESSION, DRIFT, UNSUPPORTED, MUX, FCP, GEN1 }
 public enum class ScarlettFailureKind { IO, PROTOCOL, INVALID, DRIFT, VERIFICATION }
 public data class ScarlettFailure(val kind: ScarlettFailureKind, val detail: String?, val actual: ScarlettMixRow?)
 /** Original failure and failed verified restoration are reported independently. */
@@ -100,8 +132,9 @@ public class ScarlettMuxException(message: String, public val muxFailure: Scarle
 
 /**
  * Source-backed, physically unvalidated Scarlett controls. Every operation requires an idle
- * session and the explicitly opted-in vendor claim. Rust owns firmware admission and verified
- * transactions; no raw request API exists. Call blocking operations off the main thread.
+ * session and an explicit API call. Later-generation vendor controls require the opted-in vendor
+ * claim; first-generation controls use the exact already claimed AudioControl interface. Rust owns
+ * model admission and verified transactions. Call blocking operations off the main thread.
  */
 public class ScarlettRouting internal constructor(private val dac: Long, private val checkOpen: () -> Unit) {
     public fun capability(): ScarlettCapability? {
@@ -116,6 +149,27 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
                 ScarlettMuxRoute(port(it.getJSONObject("source")), port(it.getJSONObject("destination")))
             }, v.getJSONArray("mixes").objects().map(::row))
     }
+    /** Stateless first-generation readback; preserves retained edit tokens. */
+    public fun readGen1(): Gen1Readback {
+        checkOpen()
+        return parseGen1Readback(response { Native.scarlettGen1Read(dac) })
+    }
+    /** Retain a bounded native-observed baseline for typed first-generation edits. */
+    public fun readGen1Snapshot(): Gen1Snapshot {
+        checkOpen()
+        return gen1Snapshot(response { Native.scarlettGen1ReadSnapshot(dac) })
+    }
+    /** Check fresh native state, apply typed edits, verify and restore on failure. */
+    public fun applyGen1(expected: Gen1Snapshot, edits: List<Gen1Edit>): Gen1Report {
+        checkOpen()
+        require(expected.owner === this) { "First-generation snapshot belongs to another session" }
+        require(edits.size in 1..4096)
+        require(edits.map { it.key }.distinct().size == edits.size)
+        val json = JSONArray(edits.map { JSONObject().put("key", it.key.json()).put("value", it.value) })
+        val v = response { Native.scarlettGen1Apply(dac, expected.handle, json.toString()) }
+        return Gen1Report(parseGen1Readback(v.getJSONObject("original")), gen1Snapshot(v.getJSONObject("verified")))
+    }
+    private fun gen1Snapshot(v: JSONObject): Gen1Snapshot = Gen1Snapshot(this, v.getLong("snapshot_id"), parseGen1Readback(v))
     /** Stateless read of modern firmware-defined FCP routing; preserves retained edit tokens. */
     public fun readFcp(): FcpReadback {
         checkOpen()
@@ -169,6 +223,27 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
         return ScarlettMixReport(row(v.getJSONObject("original")), row(v.getJSONObject("verified")))
     }
 }
+private fun Gen1Key.json(): JSONObject = when (this) {
+    is Gen1Key.MatrixInput -> JSONObject().put("kind", "matrix_input").put("index", index)
+    is Gen1Key.Output -> JSONObject().put("kind", "output").put("index", index)
+    is Gen1Key.Capture -> JSONObject().put("kind", "capture").put("index", index)
+    is Gen1Key.Gain -> JSONObject().put("kind", "gain").put("input", input).put("mix", mix)
+}
+private fun gen1Key(v: JSONObject): Gen1Key = when (v.getString("kind")) {
+    "matrix_input" -> Gen1Key.MatrixInput(v.getInt("index"))
+    "output" -> Gen1Key.Output(v.getInt("index"))
+    "capture" -> Gen1Key.Capture(v.getInt("index"))
+    "gain" -> Gen1Key.Gain(v.getInt("input"), v.getInt("mix"))
+    else -> throw IllegalArgumentException("Unknown first-generation control kind")
+}
+internal fun parseGen1Readback(v: JSONObject): Gen1Readback = Gen1Readback(
+    Gen1Model.valueOf(v.getString("model").uppercase()), v.getJSONArray("controls").objects().map {
+        Gen1Control(gen1Key(it.getJSONObject("key")), it.getInt("value")) },
+    v.getJSONArray("source_offsets").let { a -> (0 until a.length()).map(a::getInt) },
+    v.getInt("matrix_sources"), v.getInt("output_sources"))
+internal fun parseGen1Failure(v: JSONObject): Gen1Failure = Gen1Failure(
+    ScarlettFailureKind.valueOf(v.getString("kind").uppercase()), v.optString("detail").takeIf(String::isNotEmpty),
+    v.optJSONObject("key")?.let(::gen1Key))
 internal fun parseScarlettCapability(v: JSONObject): ScarlettCapability = ScarlettCapability(
     ScarlettModel.valueOf(v.getString("model").uppercase()), v.getString("name"), v.getInt("configuration_id"),
     v.getInt("interface"), v.getInt("notification_endpoint"), v.getBoolean("interface_claimed"))
@@ -207,6 +282,11 @@ internal fun parseFcpFailure(v: JSONObject): FcpFailure = FcpFailure(
 private fun response(call: () -> String): JSONObject = nativeCall {
     val result = JSONObject(call())
     result.optJSONObject("error")?.let { e ->
+        if (e.getString("kind") == "gen1") {
+            throw Gen1Exception(e.getString("detail"), parseGen1Failure(e.getJSONObject("cause")),
+                e.getJSONArray("rollback_failures").objects().map {
+                    Gen1RollbackFailure(gen1Key(it.getJSONObject("key")), parseGen1Failure(it.getJSONObject("cause"))) })
+        }
         if (e.getString("kind") == "fcp") {
             throw FcpException(e.getString("detail"), parseFcpFailure(e.getJSONObject("cause")),
                 e.getJSONArray("rollback_failures").objects().map {

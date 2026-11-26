@@ -42,6 +42,9 @@ internal object Native {
     @JvmStatic external fun scarlettPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun scarlettCapability(dac: Long): String
     @JvmStatic external fun scarlettRead(dac: Long): String
+    @JvmStatic external fun scarlettGen1Read(dac: Long): String
+    @JvmStatic external fun scarlettGen1ReadSnapshot(dac: Long): String
+    @JvmStatic external fun scarlettGen1Apply(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun fcpRead(dac: Long): String
     @JvmStatic external fun fcpReadSnapshot(dac: Long): String
     @JvmStatic external fun fcpApply(dac: Long, snapshot: Long, editsJson: String): String
