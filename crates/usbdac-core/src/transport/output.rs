@@ -441,6 +441,7 @@ pub(super) fn run_usb_output_loop(
     state: SessionState,
     shared: Arc<StreamShared>,
     stop: Arc<AtomicBool>,
+    capture: Option<Arc<duplex::Attachment>>,
 ) {
     let pcm_buffer = Arc::clone(&shared.ring);
     let runtime_stats = Arc::clone(&shared.stats);
@@ -581,6 +582,7 @@ pub(super) fn run_usb_output_loop(
     let mut explicit_flush_deadline: Option<Instant> = None;
     let mut fatal_error: Option<String> = feedback_start_error;
     let mut implicit_feedback_fault = false;
+    let mut capture_failure: Option<Error> = None;
     let mut device_lost = false;
     let mut was_underrun = false;
 
@@ -642,11 +644,22 @@ pub(super) fn run_usb_output_loop(
     }
 
     let stream_started_at = Instant::now();
+    let mut capture_pool = None;
+    if let Some(attachment) = capture.as_ref().filter(|a| !a.shared_implicit) {
+        match duplex::InputPool::new(Arc::clone(attachment)) {
+            Ok(mut pool) => {
+                if let Err(error) = pool.start(&handle, &stop) { fatal_error = Some(error); }
+                capture_pool = Some(pool);
+            }
+            Err(error) => fatal_error = Some(error),
+        }
+    }
     let mut implicit = None;
     if fatal_error.is_none() && !usb_stop_requested(&stop) {
         if let Some(source) = candidate.implicit_feedback {
             match ImplicitFeedback::new(source, geometry, bytes_per_frame, candidate.max_packet_bytes, playback_format.sample_rate) {
                 Ok(mut engine) => {
+                    engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
                     log_info!("[USB] Implicit feedback source interface={} alt={} endpoint=0x{:02x} inStride={} outStride={} service={}us packetCapacity={}",
                         source.interface_number, source.alt_setting, source.address, source.bytes_per_frame, bytes_per_frame,
                         source.service_interval_us, source.max_packet_bytes);
@@ -654,6 +667,11 @@ pub(super) fn run_usb_output_loop(
                     while fatal_error.is_none() && !usb_stop_requested(&stop) && !engine.primed() {
                         if let Err(error) = context.handle_events(Some(Duration::from_micros(u64::from(candidate.service_interval_us).min(1000)))) {
                             implicit_feedback_fault = true; fatal_error = Some(format!("implicit event pump failed: {}", error)); break;
+                        }
+                        if let Some(pool) = capture_pool.as_mut() {
+                            if let Err(error) = pool.pump(&handle, &stop) {
+                                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                            }
                         }
                         if !usb_stop_requested(&stop) {
                             if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
@@ -807,6 +825,11 @@ pub(super) fn run_usb_output_loop(
             }
         }
 
+        if let Some(pool) = capture_pool.as_mut() {
+            if let Err(error) = pool.pump(&handle, &stop) {
+                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            }
+        }
         if let Some(engine) = implicit.as_mut() {
             if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) {
                 device_lost = error.contains("disconnected"); implicit_feedback_fault = true; fatal_error = Some(error); break;
@@ -1248,10 +1271,15 @@ pub(super) fn run_usb_output_loop(
         shared.note_bit_perfect();
     }
 
+    let failure = classify_stream_failure(fatal_error.as_deref(), device_lost,
+        capture_failure.or_else(|| capture.as_ref().and_then(|attachment| attachment.failure())));
+    device_lost = matches!(&failure, Some(Error::DeviceLost));
+    if let Some(attachment) = capture.as_ref() {
+        attachment.finish(failure.clone());
+    }
     if let Some(error) = fatal_error {
         runtime_stats.feedback_locked.store(false, Ordering::Release);
         if feedback_health.is_some() { publish_feedback_counters(&runtime_stats, &feedback_counters); }
-        device_lost |= error.contains("disconnected");
         if explicit_feedback_fault && !device_lost {
             runtime_stats.feedback_stale.store(true, Ordering::Release);
             if !feedback_stale_warned { shared.events.emit_stream(crate::events::DacEvent::FeedbackStale); }
@@ -1262,25 +1290,22 @@ pub(super) fn run_usb_output_loop(
             runtime_stats.feedback_stale.store(true, Ordering::Release);
             runtime_stats.feedback_errors.fetch_add(1, Ordering::Relaxed);
             shared.events.emit_stream(crate::events::DacEvent::FeedbackStale);
-            device_lost |= error.contains("disconnected");
         }
         set_usb_stream_stable(false);
         set_last_error(Some(error.clone()));
         set_engine_state(EngineState::Error, Some(error.clone()));
         log_error!("{}", error);
-        shared.fail(if device_lost {
-            Error::DeviceLost
-        } else {
-            Error::Transfer(error)
-        });
+        shared.fail(failure.expect("fatal output error has a shared failure classification"));
     }
 
     runtime_stats.feedback_locked.store(false, Ordering::Release);
     shared.note_bit_perfect();
     for slot in &mut slots { slot.cancel(); }
+    if let Some(pool) = capture_pool.as_mut() { for slot in &mut pool.slots { slot.cancel(); } }
     if let Some(engine) = implicit.as_mut() { for slot in &mut engine.slots { slot.cancel(); } }
     if let Some(slot) = feedback_slot.as_mut() { slot.cancel(); }
     drain_iso_transfer_slots(&context, &mut slots);
+    if let Some(pool) = capture_pool.as_mut() { drain_iso_transfer_slots(&context, &mut pool.slots); }
     if let Some(engine) = implicit.as_mut() { drain_iso_transfer_slots(&context, &mut engine.slots); }
     drain_feedback_transfer_slot(&context, &mut feedback_slot);
     runtime_stats.feedback_locked.store(false, Ordering::Release);
@@ -1373,3 +1398,27 @@ pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Str
     }
 }
 
+
+/// Classify once before notifying either direction of the shared worker.
+fn classify_stream_failure(message: Option<&str>, device_lost: bool, capture: Option<Error>) -> Option<Error> {
+    if device_lost || message.is_some_and(|message| message.contains("disconnected"))
+        || matches!(&capture, Some(Error::DeviceLost)) {
+        Some(Error::DeviceLost)
+    } else {
+        capture.or_else(|| message.map(|message| Error::Transfer(message.to_owned())))
+    }
+}
+
+#[cfg(test)]
+mod duplex_failure_tests {
+    use super::*;
+    #[test]
+    fn classify_disconnect_before_notifying_playback_and_capture() {
+        let failure = classify_stream_failure(Some("USB DAC disconnected (implicit feedback)"), false, None);
+        assert_eq!(failure, Some(Error::DeviceLost));
+        let typed = Error::Transfer("capture packet geometry changed".into());
+        assert_eq!(classify_stream_failure(Some(&typed.to_string()), false, Some(typed.clone())), Some(typed));
+        assert_eq!(classify_stream_failure(Some("capture completion failed"), false, Some(Error::DeviceLost)), Some(Error::DeviceLost));
+        assert_eq!(classify_stream_failure(None, false, None), None);
+    }
+}

@@ -37,6 +37,9 @@ internal object Native {
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean
+    @JvmStatic external fun routingDiscover(dac: Long): String
+    @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
+    @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)

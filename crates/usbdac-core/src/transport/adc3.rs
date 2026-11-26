@@ -1,4 +1,4 @@
-//! Active-configuration ADC3 playback. No configuration changes or clock guesses.
+//! Active-configuration ADC3 PCM playback and capture. No configuration changes or clock guesses.
 use super::*;
 use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution};
 use crate::descriptors::uac3 as wire;
@@ -19,7 +19,7 @@ pub(super) struct Adc3Route {
     cluster: Option<wire::Cluster>,
     header: Option<wire::AsHeader>,
     pub(super) clock: Option<wire::ClockSource>,
-    choice: Option<ClockChoice>,
+    pub(super) choice: Option<ClockChoice>,
     domains: Vec<wire::PowerDomain>,
 }
 static NEGOTIATED: Lazy<Mutex<Option<Adc3Route>>> = Lazy::new(|| Mutex::new(None));
@@ -36,7 +36,7 @@ pub(super) fn verify_adc3_route(route: &Adc3Route) -> Result<(), String> {
     Ok(())
 }
 
-fn functions(raw: &[u8]) -> Result<Vec<crate::descriptors::Iad>, String> {
+pub(super) fn functions(raw: &[u8]) -> Result<Vec<crate::descriptors::Iad>, String> {
     let mut result = Vec::new();
     let mut at = 0;
     while at < raw.len() {
@@ -230,7 +230,8 @@ fn validate_badd_function(
             if alt.setting_number() == 1 {
                 let feedback =
                     find_feedback_endpoint(alt, ep.synch_address(), ep.sync_type(), speed);
-                if explicit_feedback_ambiguous(alt, ep.synch_address(), ep.sync_type()) {
+                if !capture && explicit_feedback_ambiguous(alt, ep.synch_address(), ep.sync_type())
+                {
                     return Err("BADD explicit feedback is ambiguous".into());
                 }
                 if !capture
@@ -339,27 +340,37 @@ fn cluster(handle: &DeviceHandle<Context>, control: u8, id: u16) -> Result<wire:
         .map_err(|e| format!("ADC3 HC body: {e}"))?;
     wire::parse_cluster(&body[..n], header).map_err(|e| e.to_string())
 }
+fn linked_terminal_clock(descriptors: &[&[u8]], terminal: u8, capture: bool) -> Result<u8, String> {
+    let terminals: Vec<_> = descriptors
+        .iter()
+        .filter(|d| d.get(2) == Some(&if capture { 3 } else { 2 }) && d.get(3) == Some(&terminal))
+        .collect();
+    let [d] = terminals.as_slice() else {
+        return Err("ADC3 linked terminal missing or ambiguous".into());
+    };
+    let (terminal_type, id) = if capture {
+        let term = wire::parse_output_terminal(d).map_err(|e| e.to_string())?;
+        (term.terminal_type, term.clock_id)
+    } else {
+        let term = wire::parse_input_terminal(d).map_err(|e| e.to_string())?;
+        (term.terminal_type, term.clock_id)
+    };
+    if terminal_type != 0x0101 {
+        return Err("ADC3 linked terminal is not USB Streaming".into());
+    }
+    Ok(id)
+}
 fn clock_route(
     handle: &DeviceHandle<Context>,
     control: u8,
     terminal: u8,
     extra: &[u8],
+    capture: bool,
 ) -> Result<(wire::ClockSource, ClockChoice), String> {
     let descriptors: Vec<_> = DescriptorIter::new(extra)
         .filter(|d| d.get(1) == Some(&0x24))
         .collect();
-    let terminals: Vec<_> = descriptors
-        .iter()
-        .filter(|d| d.get(2) == Some(&2) && d.get(3) == Some(&terminal))
-        .collect();
-    let [d] = terminals.as_slice() else {
-        return Err("ADC3 playback terminal missing or ambiguous".into());
-    };
-    let term = wire::parse_input_terminal(d).map_err(|e| e.to_string())?;
-    if term.terminal_type != 0x0101 {
-        return Err("ADC3 playback terminal is not USB Streaming".into());
-    }
-    let mut id = term.clock_id;
+    let mut id = linked_terminal_clock(&descriptors, terminal, capture)?;
     let mut path = vec![ClockHop {
         id: terminal,
         kind: ClockHopKind::Terminal,
@@ -429,13 +440,21 @@ fn clock_route(
     }
     Err("ADC3 clock path too deep".into())
 }
-fn domains(profile: wire::FunctionProfile, extra: &[u8]) -> Result<Vec<wire::PowerDomain>, String> {
+fn domains(
+    profile: wire::FunctionProfile,
+    extra: &[u8],
+    capture: bool,
+) -> Result<Vec<wire::PowerDomain>, String> {
     if matches!(profile, wire::FunctionProfile::Badd(_)) {
         return Ok(vec![wire::PowerDomain {
-            id: 10,
+            id: if capture { 11 } else { 10 },
             recovery_d1: 600,
             recovery_d2: 6000,
-            entities: vec![1, 2, 3],
+            entities: if capture {
+                vec![4, 5, 6]
+            } else {
+                vec![1, 2, 3]
+            },
             string_id: 0,
         }]);
     }
@@ -472,35 +491,56 @@ pub(super) fn adc3_route_for_candidate(
     if alt.protocol_code() != 0x30 {
         return Ok(None);
     }
-    adc3_alternate(&config, handle, &alt, candidate.usb_speed).map(|(_, r)| Some(r))
+    adc3_alternate(&config, handle, &alt, candidate.usb_speed, false).map(|(_, r)| Some(r))
 }
 fn adc3_alternate(
     config: &ConfigDescriptor,
     handle: &DeviceHandle<Context>,
     alt: &rusb::InterfaceDescriptor,
     speed: Speed,
+    capture: bool,
 ) -> Result<(IsoStreamCandidate, Adc3Route), String> {
     let (iad, profile, extra) = owning_function(config, handle, alt.interface_number())?;
     let control = iad.b_first_interface;
     let endpoints: Vec<_> = alt
         .endpoint_descriptors()
         .filter(|e| {
-            e.direction() == Direction::Out
+            e.direction()
+                == (if capture {
+                    Direction::In
+                } else {
+                    Direction::Out
+                })
                 && e.transfer_type() == TransferType::Isochronous
                 && e.usage_type() == UsageType::Data
         })
         .collect();
     let [ep] = endpoints.as_slice() else {
-        return Err("ADC3 playback alternate must have one OUT data endpoint".into());
+        return Err("ADC3 alternate must have one data endpoint in the requested direction".into());
     };
-    if !(1..=16).contains(&ep.interval()) || !matches!(speed, Speed::Full | Speed::High) {
-        return Err("ADC3 playback currently supports known FS/HS service geometry".into());
+    let packet = ep.max_packet_size();
+    let base = packet & 0x7ff;
+    if ep.address() & 0x0f == 0
+        || packet & 0xe000 != 0
+        || base == 0
+        || (speed == Speed::Full && (base > 1023 || packet & 0x1800 != 0))
+        || (speed == Speed::High && (base > 1024 || (packet >> 11) & 3 == 3))
+    {
+        return Err("ADC3 invalid audio endpoint packet geometry".into());
     }
-    if explicit_feedback_ambiguous(alt, ep.synch_address(), ep.sync_type()) {
+    if !(1..=16).contains(&ep.interval()) || !matches!(speed, Speed::Full | Speed::High) {
+        return Err("ADC3 currently supports known FS/HS service geometry".into());
+    }
+    if !capture && explicit_feedback_ambiguous(alt, ep.synch_address(), ep.sync_type()) {
         return Err("ADC3 explicit feedback ambiguous".into());
     }
-    let feedback = find_feedback_endpoint(alt, ep.synch_address(), ep.sync_type(), speed);
-    if ep.sync_type() == SyncType::Asynchronous
+    let feedback = if capture {
+        None
+    } else {
+        find_feedback_endpoint(alt, ep.synch_address(), ep.sync_type(), speed)
+    };
+    if !capture
+        && ep.sync_type() == SyncType::Asynchronous
         && (feedback.is_none() || settings().disable_feedback())
     {
         return Err("ADC3 asynchronous playback requires enabled explicit feedback".into());
@@ -509,7 +549,7 @@ fn adc3_alternate(
         ep.sync_type(),
         SyncType::Asynchronous | SyncType::Synchronous
     ) {
-        return Err("ADC3 playback synchronization unsupported".into());
+        return Err("ADC3 synchronization unsupported".into());
     }
     let mut route = Adc3Route {
         config: config.number(),
@@ -519,7 +559,7 @@ fn adc3_alternate(
         profile,
         interface: alt.interface_number(),
         alt: alt.setting_number(),
-        terminal: 1,
+        terminal: if capture { 6 } else { 1 },
         endpoint: (
             ep.address(),
             ep.interval(),
@@ -532,7 +572,7 @@ fn adc3_alternate(
         header: None,
         clock: None,
         choice: None,
-        domains: domains(profile, &extra)?,
+        domains: domains(profile, &extra, capture)?,
     };
     let (channels, subslot, bits, rates) = match profile {
         wire::FunctionProfile::Badd(profile) => {
@@ -593,7 +633,7 @@ fn adc3_alternate(
             if c.channels.is_empty() {
                 return Err("ADC3 cluster has no channels".into());
             }
-            let (source, choice) = clock_route(handle, control, h.terminal_link, &extra)?;
+            let (source, choice) = clock_route(handle, control, h.terminal_link, &extra, capture)?;
             let ranges = get_sampling_frequency_ranges(handle, control, source.id)?;
             if ranges.is_empty() || ranges.iter().any(|r| r.min == 0 || r.min > r.max) {
                 return Err("ADC3 invalid clock frequency ranges".into());
@@ -667,7 +707,7 @@ pub(super) fn adc3_candidates(
         {
             continue;
         }
-        match adc3_alternate(&config, handle, &alt, speed) {
+        match adc3_alternate(&config, handle, &alt, speed, false) {
             Ok(pair) => {
                 if claimed.contains(&pair.1.control) {
                     result.push(pair);
@@ -684,6 +724,144 @@ pub(super) fn adc3_candidates(
     }
     result
 }
+pub(super) fn adc3_capture_route_for_endpoint(
+    claimed: &ClaimedHandle,
+    config: &ConfigDescriptor,
+    interface: u8,
+    alternate: u8,
+) -> Result<Adc3Route, String> {
+    let alt = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .find(|d| d.interface_number() == interface && d.setting_number() == alternate)
+        .ok_or("ADC3 capture interface disappeared")?;
+    adc3_alternate(
+        config,
+        &claimed.handle,
+        &alt,
+        resolve_device_speed(&claimed.handle.device()),
+        true,
+    )
+    .map(|(_, route)| route)
+}
+
+/// Capture discovery runs under the same exclusive USB owner as playback.
+/// Wake before HC/clock reads; keep successful candidates' domains leased until
+/// the selected stream retires. Failed probes restore their writes immediately.
+pub(super) fn adc3_capture_candidates(
+    claimed: &ClaimedHandle,
+    config: &ConfigDescriptor,
+    speed: Speed,
+    rate: u32,
+) -> Result<Vec<(IsoStreamCandidate, Adc3Route)>, String> {
+    let mut result = Vec::new();
+    for alt in config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .filter(|d| {
+            d.class_code() == 1
+                && d.sub_class_code() == 2
+                && d.protocol_code() == 0x30
+                && d.setting_number() != 0
+                && claimed.claimed_interfaces.contains(&d.interface_number())
+                && d.endpoint_descriptors()
+                    .any(|e| e.direction() == Direction::In && e.usage_type() == UsageType::Data)
+        })
+    {
+        let checkpoint = claimed.adc3_power.pending.lock().len();
+        let attempt: Result<Option<(IsoStreamCandidate, Adc3Route)>, String> = (|| {
+            prepare_adc3_alternate_power(claimed, config, &alt, true)?;
+            let (candidate, route) = adc3_alternate(config, &claimed.handle, &alt, speed, true)?;
+            let supports = if let Some(clock) = &route.clock {
+                sampling_frequency_ranges_support_rate(
+                    &get_sampling_frequency_ranges(&claimed.handle, route.control, clock.id)?,
+                    rate,
+                )
+            } else {
+                rate == 48_000
+            };
+            if supports
+                && candidate.max_packet_bytes
+                    >= required_max_packet_bytes(
+                        rate,
+                        candidate.service_interval_us,
+                        usize::from(candidate.channels) * usize::from(candidate.subslot_size),
+                    )
+            {
+                Ok(Some((candidate, route)))
+            } else {
+                Ok(None)
+            }
+        })();
+        match attempt {
+            Ok(Some(pair)) => result.push(pair),
+            other => {
+                let pending = claimed.adc3_power.pending.lock().split_off(checkpoint);
+                restore_domains(&mut PowerUsb(&claimed.adc3_power), pending)?;
+                if let Err(error) = other {
+                    log::debug!(
+                        "ADC3 capture interface {} alt {} refused: {error}",
+                        alt.interface_number(),
+                        alt.setting_number()
+                    );
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn capture_channel_map(route: &Adc3Route) -> Result<crate::capture::ChannelMap, String> {
+    use crate::capture::{ChannelMap, ChannelPosition};
+    let positions = if let Some(cluster) = &route.cluster {
+        cluster
+            .channels
+            .iter()
+            .map(|channel| match channel {
+                wire::Channel::Information {
+                    purpose,
+                    relationship,
+                    group,
+                } => {
+                    let relationship = match relationship {
+                        wire::ChannelRelationship::Undefined => 0,
+                        wire::ChannelRelationship::Mono => 1,
+                        wire::ChannelRelationship::Left => 2,
+                        wire::ChannelRelationship::Right => 3,
+                        wire::ChannelRelationship::Array => 4,
+                        wire::ChannelRelationship::Pattern(code)
+                        | wire::ChannelRelationship::Unknown(code) => *code,
+                        wire::ChannelRelationship::Spatial(position) => *position as u8,
+                    };
+                    ChannelPosition::Adc3Information {
+                        purpose: *purpose,
+                        relationship,
+                        group: *group,
+                    }
+                }
+                wire::Channel::Ambisonic {
+                    ordering,
+                    acn,
+                    normalization,
+                    group,
+                } => ChannelPosition::Adc3Ambisonic {
+                    ordering: *ordering,
+                    acn: *acn,
+                    normalization: *normalization,
+                    group: *group,
+                },
+            })
+            .collect()
+    } else if route.pcm.0 == 1 {
+        vec![ChannelPosition::FrontCenter]
+    } else if route.pcm.0 == 2 {
+        vec![ChannelPosition::FrontLeft, ChannelPosition::FrontRight]
+    } else {
+        return Err("BADD invalid channel count".into());
+    };
+    ChannelMap::from_positions(positions).map_err(|e| format!("ADC3 channel map: {e:?}"))
+}
+
 pub(super) fn configure_adc3(
     handle: &DeviceHandle<Context>,
     route: &Adc3Route,
@@ -861,6 +1039,7 @@ fn prepare_adc3_alternate_power(
     claimed: &ClaimedHandle,
     config: &ConfigDescriptor,
     alt: &rusb::InterfaceDescriptor,
+    capture: bool,
 ) -> Result<(), String> {
     if alt.protocol_code() != 0x30 {
         return Ok(());
@@ -868,7 +1047,13 @@ fn prepare_adc3_alternate_power(
     let (iad, profile, extra) = owning_function(config, &claimed.handle, alt.interface_number())?;
     claimed.ensure_interface_claimed(iad.b_first_interface)?;
     let terminal = match profile {
-        wire::FunctionProfile::Badd(_) => 1,
+        wire::FunctionProfile::Badd(_) => {
+            if capture {
+                6
+            } else {
+                1
+            }
+        }
         wire::FunctionProfile::Full => {
             let headers: Vec<_> = DescriptorIter::new(alt.extra())
                 .filter(|d| d.get(1) == Some(&0x24) && d.get(2) == Some(&1))
@@ -881,7 +1066,7 @@ fn prepare_adc3_alternate_power(
                 .terminal_link
         }
     };
-    for d in domains(profile, &extra)?
+    for d in domains(profile, &extra, capture)?
         .into_iter()
         .filter(|d| d.entities.contains(&terminal))
     {
@@ -914,7 +1099,8 @@ pub(super) fn select_owned_stream_candidate(
                     && d.setting_number() == candidate.alt_setting
             })
             .ok_or_else(|| SelectError::NoMatch("selected interface disappeared".into()))?;
-        prepare_adc3_alternate_power(claimed, &config, &alt).map_err(SelectError::NoMatch)?;
+        prepare_adc3_alternate_power(claimed, &config, &alt, false)
+            .map_err(SelectError::NoMatch)?;
         return initial;
     }
     if requested.dsd_transport != DsdTransportMode::None {
@@ -936,8 +1122,8 @@ pub(super) fn select_owned_stream_candidate(
     {
         // This bounded candidate probe is necessary only when a stopped domain
         // prevents read-only HC/clock discovery. It never activates an alt.
-        let attempt = prepare_adc3_alternate_power(claimed, &config, &alt)
-            .and_then(|_| adc3_alternate(&config, &claimed.handle, &alt, speed));
+        let attempt = prepare_adc3_alternate_power(claimed, &config, &alt, false)
+            .and_then(|_| adc3_alternate(&config, &claimed.handle, &alt, speed, false));
         match attempt {
             Ok((candidate, route))
                 if adc3_candidate_matches(&claimed.handle, &candidate, &route, requested) =>
@@ -1066,6 +1252,34 @@ mod tests {
         )
         .is_err());
     }
+    #[test]
+    fn badd_capture_has_its_own_terminal_domain_and_recovery_geometry() {
+        let profile = wire::FunctionProfile::Badd(wire::BaddProfile::Microphone);
+        let capture = domains(profile, &[], true).unwrap();
+        let playback = domains(profile, &[], false).unwrap();
+        assert_eq!(capture[0].id, 11);
+        assert_eq!(capture[0].entities, vec![4, 5, 6]);
+        assert_eq!(playback[0].id, 10);
+        assert_eq!(capture[0].recovery_d1_micros(), 30_000);
+        assert_eq!(capture[0].recovery_d2_micros(), 300_000);
+    }
+
+    #[test]
+    fn capture_requires_output_terminal_and_uses_its_clock_field() {
+        let output = [19, 0x24, 3, 6, 1, 1, 0, 4, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let input = [
+            20, 0x24, 2, 1, 1, 1, 0, 8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let descriptors = vec![output.as_slice(), input.as_slice()];
+        assert_eq!(linked_terminal_clock(&descriptors, 6, true).unwrap(), 9);
+        assert_eq!(linked_terminal_clock(&descriptors, 1, false).unwrap(), 8);
+        assert!(linked_terminal_clock(&descriptors, 1, true).is_err());
+        assert!(linked_terminal_clock(&descriptors, 6, false).is_err());
+        let mut malformed = output;
+        malformed[4] = 2;
+        assert!(linked_terminal_clock(&[malformed.as_slice()], 6, true).is_err());
+    }
+
     #[derive(Default)]
     struct PowerMock {
         states: std::collections::HashMap<(u8, u8), u8>,
@@ -1190,6 +1404,46 @@ mod tests {
             }),
             domains: vec![domain(10)],
         };
+        assert_eq!(
+            capture_channel_map(&route).unwrap().positions(),
+            &[crate::capture::ChannelPosition::Adc3Information {
+                purpose: 1,
+                relationship: 1,
+                group: 0
+            }]
+        );
+        let mut topology = route.clone();
+        topology.cluster.as_mut().unwrap().channels = vec![
+            wire::Channel::Information {
+                purpose: 3,
+                relationship: wire::ChannelRelationship::Spatial(
+                    wire::SpatialPosition::HeadphoneRight,
+                ),
+                group: 7,
+            },
+            wire::Channel::Ambisonic {
+                ordering: 1,
+                acn: 4,
+                normalization: 2,
+                group: 8,
+            },
+        ];
+        assert_eq!(
+            capture_channel_map(&topology).unwrap().positions(),
+            &[
+                crate::capture::ChannelPosition::Adc3Information {
+                    purpose: 3,
+                    relationship: 0xbc,
+                    group: 7
+                },
+                crate::capture::ChannelPosition::Adc3Ambisonic {
+                    ordering: 1,
+                    acn: 4,
+                    normalization: 2,
+                    group: 8
+                },
+            ]
+        );
         let mut geometry = route.clone();
         geometry.endpoint.2 += 4;
         assert_ne!(route, geometry);

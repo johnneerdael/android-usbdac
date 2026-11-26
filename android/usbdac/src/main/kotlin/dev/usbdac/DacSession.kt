@@ -1,6 +1,7 @@
 package dev.usbdac
 
 import android.hardware.usb.UsbDeviceConnection
+import dev.usbdac.internal.UsbConfigurationSelection
 import dev.usbdac.internal.ClaimedInterfaces
 import dev.usbdac.internal.Native
 import dev.usbdac.internal.NativeListener
@@ -59,6 +60,7 @@ public class DacSession private constructor(
     public val capabilities: DacCapabilities,
     private val connection: UsbDeviceConnection,
     private val claims: ClaimedInterfaces,
+    private val configurationSelection: UsbConfigurationSelection,
     private val onClosed: () -> Unit,
 ) : Closeable {
 
@@ -73,6 +75,8 @@ public class DacSession private constructor(
     }
     private val closed = AtomicBoolean(false)
     private var stream: DacStream? = null
+
+    public val routing: DacRouting = DacRouting(dac, ::checkOpen)
 
     /** State of the session. */
     public val state: StateFlow<DacState> get() = mutableState
@@ -194,6 +198,10 @@ public class DacSession private constructor(
         } finally {
             fun releaseHostOwnership() {
                 claims.release()
+                runCatching { configurationSelection.restore() }.onFailure {
+                    logWarning("restoring USB configuration failed", it)
+                    if (it is DacException && failure == null) failure = it
+                }
                 runCatching { connection.close() }
                 onClosed()
             }
@@ -225,10 +233,11 @@ public class DacSession private constructor(
             config: DacConfig,
             connection: UsbDeviceConnection,
             claims: ClaimedInterfaces,
+            configurationSelection: UsbConfigurationSelection,
             onClosed: () -> Unit,
         ): DacSession {
             val capabilities = nativeCall { parseCapabilities(Native.dacCapabilities(dac)) }
-            return DacSession(dac, device, config, capabilities, connection, claims, onClosed)
+            return DacSession(dac, device, config, capabilities, connection, claims, configurationSelection, onClosed)
         }
     }
 }

@@ -1,6 +1,7 @@
 package dev.usbdac.internal
 
 import dev.usbdac.CaptureChannel
+import dev.usbdac.CaptureChannelTopology
 import dev.usbdac.CaptureChannelPosition
 import dev.usbdac.CaptureFormat
 import dev.usbdac.CaptureRequest
@@ -24,6 +25,18 @@ internal fun CaptureRequest.toCaptureJson(): String = JSONObject().apply {
             channels.forEach { channel -> put(JSONObject().apply {
                 put("index", channel.index)
                 put("label", channel.position.name.lowercase(Locale.ROOT))
+                val topology = channel.topology
+                when (topology) {
+                    is CaptureChannelTopology.Information -> {
+                        require(channel.position == CaptureChannelPosition.ADC3_INFORMATION)
+                        put("topology", JSONObject().put("type", "adc3Information").put("purpose", topology.purpose).put("relationship", topology.relationship).put("group", topology.group))
+                    }
+                    is CaptureChannelTopology.Ambisonic -> {
+                        require(channel.position == CaptureChannelPosition.ADC3_AMBISONIC)
+                        put("topology", JSONObject().put("type", "adc3Ambisonic").put("ordering", topology.ordering).put("acn", topology.acn).put("normalization", topology.normalization).put("group", topology.group))
+                    }
+                    null -> require(channel.position != CaptureChannelPosition.ADC3_INFORMATION && channel.position != CaptureChannelPosition.ADC3_AMBISONIC)
+                }
             }) }
         })
     }
@@ -40,7 +53,26 @@ internal fun parseCaptureFormat(json: String): CaptureFormat {
     val map = List(entries.length()) { index ->
         val channel = entries.getJSONObject(index)
         if (channel.getInt("index") != index) throw JSONException("capture channel order changed")
-        CaptureChannel(index, enumLabel<CaptureChannelPosition>(channel.getString("label")))
+        val position = enumLabel<CaptureChannelPosition>(channel.getString("label"))
+        val topology = channel.optJSONObject("topology")
+        fun byte(name: String): Int = (topology ?: throw JSONException("missing ADC3 topology")).getInt(name).also {
+            if (it !in 0..255) throw JSONException("ADC3 topology byte out of range")
+        }
+        val identity = when (position) {
+            CaptureChannelPosition.ADC3_INFORMATION -> {
+                if (topology?.getString("type") != "adc3Information") throw JSONException("ADC3 topology type mismatch")
+                CaptureChannelTopology.Information(byte("purpose"), byte("relationship"), byte("group"))
+            }
+            CaptureChannelPosition.ADC3_AMBISONIC -> {
+                if (topology?.getString("type") != "adc3Ambisonic") throw JSONException("ADC3 topology type mismatch")
+                CaptureChannelTopology.Ambisonic(byte("ordering"), byte("acn"), byte("normalization"), byte("group"))
+            }
+            else -> {
+                if (topology != null) throw JSONException("unexpected ADC3 topology")
+                null
+            }
+        }
+        CaptureChannel(index, position, identity)
     }
     val channels = o.getInt("channels")
     val subslot = o.getInt("subslot_bytes")

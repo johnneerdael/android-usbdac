@@ -86,3 +86,47 @@ responses and Android execution have not been validated on a Scarlett device.
 The shared integration gate must run the new tests before reporting them as
 passing. Vendor route writes remain deferred until sample-rate-family state,
 verified rollback and physical acceptance evidence are available.
+
+## Independent mixer writes
+
+The mixer and mux have different recovery properties. GET_MIX returns every
+coefficient for one named output. SET_MIX sends the same output number followed
+by its full coefficient row. That permits a verified transaction for mixer
+gains without touching any sample-rate mux bank. Start with the existing
+18i20 Gen 2 firmware profile. Accept an expected old row and a requested new
+row of the exact model width. Compare a fresh GET_MIX to the expected row,
+preserve untouched coefficients byte for byte, and read back the entire row
+after SET_MIX. Report the original failure and any restoration uncertainty.
+Use the existing sequence, claim and idle-session guards. Expose bounded,
+source-backed gain values and preserve the raw original row for restoration.
+Run mocked transport cases before trying the transaction on an attenuated
+device. [ALSA mixer row operations](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L2844-L2900)
+
+Mux writes remain a separate transaction. Upstream GET_MUX sends request
+selector zero. SET_MUX sends three individually numbered tables with
+different destination widths and padding. A valid selector-zero reply
+establishes the current route representation used by this implementation,
+while per-bank original values and rollback still need evidence. Capture
+each table's observed request and response or document that the firmware
+shares one canonical route graph across all banks. Verify restoration for
+each table after partial failure before enabling mux edits.
+[ALSA mux read and write](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L3051-L3144)
+
+Upstream's minimum firmware checks supply useful evidence for broader
+readback coverage. Vocaster One and Two use minimum 1769, Scarlett Solo and
+2i2 Gen 4 use minimum 2115, and 4i4 Gen 4 uses minimum 2089. Each exact model
+has its own port geometry and capability flags. Verify the startup reply
+and model-specific port/width rules before using an upstream minimum as an
+admission boundary. The presence of a model registration alone supplies no
+evidence for a particular token's bank or route behavior.
+[ALSA device profiles](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L1805-L2052),
+[ALSA firmware checks](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L8489-L8499)
+
+For new mixer gains, use the pinned driver's documented half-dB interval
+from −80 to +12 dB. The wire coefficient is the integer part of
+`8192 × 10^(dB/20)`. Derive it from the formula and retain raw wire values
+in readback and restoration snapshots. Request verification must compare
+the whole row, including unchanged sources. Hand-back can restore a row
+only when the current row still matches the last verified write. Keep
+front-panel or other-controller edits intact.
+[ALSA mixer coefficient scale](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L196-L207)

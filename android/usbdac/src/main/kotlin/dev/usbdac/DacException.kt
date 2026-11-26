@@ -68,6 +68,15 @@ public enum class DacErrorCode(internal val wireName: String?) {
      */
     EXCLUSIVE_UNAVAILABLE("exclusive_unavailable"),
 
+    /** The requested USB configuration ID is absent or ambiguous. */
+    CONFIGURATION_UNAVAILABLE(null),
+
+    /** Android rejected explicit selection or GET_CONFIGURATION did not confirm it. */
+    CONFIGURATION_SELECTION_FAILED(null),
+
+    /** Hand-back could not confirm restoration of the original USB configuration. */
+    CONFIGURATION_RESTORE_FAILED(null),
+
     /** A code this version of the library does not know. */
     UNKNOWN(null);
 

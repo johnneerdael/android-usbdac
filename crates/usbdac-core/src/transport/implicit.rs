@@ -73,6 +73,8 @@ pub(super) struct ImplicitFeedback {
     startup_budget: Duration,
     pub(super) last_valid: Instant,
     out_of_order_seen: Vec<bool>,
+    capture: Option<Arc<duplex::Attachment>>,
+    capture_scratch: Vec<crate::capture::CapturePacket>,
 }
 impl ImplicitFeedback {
     pub(super) fn new(source: ImplicitFeedbackSource, geometry: IsoQueueGeometry, out_stride: usize,
@@ -88,8 +90,11 @@ impl ImplicitFeedback {
             window_frames: 0, window_us: 0, bad_windows: 0, prime_count: 0,
             prime_target: geometry.transfer_slots, running: false, started: Instant::now(),
             startup_budget: Duration::from_micros(500_000.max(4 * geometry.transfer_us())),
-            last_valid: Instant::now(), out_of_order_seen: vec![false; geometry.transfer_slots] })
+            last_valid: Instant::now(), out_of_order_seen: vec![false; geometry.transfer_slots],
+            capture: None, capture_scratch: vec![crate::capture::CapturePacket {
+                requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
     }
+    pub(super) fn attach_capture(&mut self, capture: Option<Arc<duplex::Attachment>>) { self.capture = capture; }
     pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), String> {
         self.started = Instant::now(); self.last_valid = self.started;
         for (index, slot) in self.slots.iter_mut().enumerate() {
@@ -105,6 +110,7 @@ impl ImplicitFeedback {
                 if !self.slots[head].completion_ready() && self.slots[index].completion_ready() && !self.out_of_order_seen[index] {
                     self.out_of_order_seen[index] = true;
                     stats.implicit_out_of_order.fetch_add(1, Ordering::Relaxed);
+                    if let Some(capture) = self.capture.as_ref() { capture.reordered(); }
                 }
             }
         }
@@ -113,6 +119,8 @@ impl ImplicitFeedback {
             let Some((status, _, _)) = self.slots[index].take_completion() else { break; };
             self.order.pop_front(); self.out_of_order_seen[index] = false;
             stats.implicit_in_transfers.fetch_add(1, Ordering::Relaxed);
+            let capture_result = self.capture.as_ref().map(|capture|
+                capture.ingest(&self.slots[index], status, &mut self.capture_scratch)).transpose();
             let result = if status == LIBUSB_TRANSFER_COMPLETED {
                 let transfer = unsafe { self.slots[index].transfer.as_ref() };
                 let descriptors = if transfer.num_iso_packets != self.scratch.len() as i32 {
@@ -160,9 +168,14 @@ impl ImplicitFeedback {
                 Err(error) => {
                     stats.implicit_invalid_packets.fetch_add(1, Ordering::Relaxed);
                     stats.feedback_rejected.fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
+                    return Err(if matches!(&capture_result, Err(Error::DeviceLost)) {
+                        "USB DAC disconnected (duplex implicit capture)".into()
+                    } else { error });
                 }
             }
+            capture_result.map_err(|error| if error == Error::DeviceLost {
+                "USB DAC disconnected (duplex implicit capture)".into()
+            } else { error.to_string() })?;
             if !usb_stop_requested(stop) {
                 self.slots[index].submit_capture(handle, self.source.address, self.source.max_packet_bytes)?;
                 self.order.push_back(index);

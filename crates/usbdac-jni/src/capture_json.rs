@@ -50,7 +50,11 @@ pub fn channel_map(map: &ChannelMap) -> Value {
                     .find(|(_, known)| known == position)
                     .map(|(label, _)| *label)
                     .unwrap_or("unspecified");
-                json!({ "index": index, "label": label })
+                match position {
+                    ChannelPosition::Adc3Information { purpose, relationship, group } => json!({"index":index,"label":"adc3_information","topology":{"type":"adc3Information","purpose":purpose,"relationship":relationship,"group":group}}),
+                    ChannelPosition::Adc3Ambisonic { ordering, acn, normalization, group } => json!({"index":index,"label":"adc3_ambisonic","topology":{"type":"adc3Ambisonic","ordering":ordering,"acn":acn,"normalization":normalization,"group":group}}),
+                    _ => json!({ "index": index, "label": label }),
+                }
             })
             .collect(),
     )
@@ -103,7 +107,18 @@ pub fn parse_request(text: &str) -> Result<CaptureRequest, BadRequest> {
                     .get("label")
                     .and_then(Value::as_str)
                     .ok_or_else(|| BadRequest("channel label is required".into()))?;
-                let position = if label == "unspecified" {
+                if !matches!(label, "adc3_information" | "adc3_ambisonic")
+                    && entry.get("topology").is_some_and(|v| !v.is_null())
+                {
+                    return Err(BadRequest("unexpected ADC3 topology for channel label".into()));
+                }
+                let topology = &entry["topology"];
+                let field = |name: &str| topology[name].as_u64().and_then(|v|u8::try_from(v).ok()).ok_or_else(||BadRequest(format!("ADC3 channel {name} must be a byte")));
+                let position = if label == "adc3_information" && topology["type"] == "adc3Information" {
+                    ChannelPosition::Adc3Information {purpose:field("purpose")?,relationship:field("relationship")?,group:field("group")?}
+                } else if label == "adc3_ambisonic" && topology["type"] == "adc3Ambisonic" {
+                    ChannelPosition::Adc3Ambisonic {ordering:field("ordering")?,acn:field("acn")?,normalization:field("normalization")?,group:field("group")?}
+                } else if label == "unspecified" {
                     ChannelPosition::Unspecified {
                         index: index as u16,
                     }
@@ -164,9 +179,11 @@ mod tests {
         let map = ChannelMap::from_positions(vec![
             ChannelPosition::FrontRight,
             ChannelPosition::Unspecified { index: 1 },
+            ChannelPosition::Adc3Information {purpose:0x91,relationship:0x83,group:7},
+            ChannelPosition::Adc3Ambisonic {ordering:2,acn:3,normalization:1,group:9},
         ])
         .unwrap();
-        let request = json!({ "sample_rate": 48000, "channels": 2, "valid_bits": 24, "channel_map": channel_map(&map) });
+        let request = json!({ "sample_rate": 48000, "channels": 4, "valid_bits": 24, "channel_map": channel_map(&map) });
         assert_eq!(
             parse_request(&request.to_string())
                 .unwrap_or_else(|error| panic!("capture request rejected: {}", error.0))

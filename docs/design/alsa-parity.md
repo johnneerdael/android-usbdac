@@ -109,3 +109,90 @@ Android now has a separate capture-session API with descriptor-only preflight, a
 The Rust Scarlett read adapter admits the source-backed 18i20 Gen 2 model and firmware only, with an explicit claimed vendor interface and validated command replies. The standard UAC2 routing path has verified writes. Scarlett mux and mixer writes, broader Scarlett profile coverage, Android routing access, duplex, ADC3 capture and explicit configuration selection are separate delivery gates.
 
 Ran the Rust suite and Android builds after the integrated reviews. The target phones and audio devices still need physical acceptance for new capture, native mode, clock and hardware-routing paths.
+
+## Physical acceptance matrix
+
+Record the USB VID/PID, `bcdDevice`, active configuration, interface and alternate numbers, endpoint addresses, USB speed, device firmware and the tested commit for each result. Capture descriptor and control metadata separately from audio. A passing Rust or Android build establishes software coverage for its tested inputs. Physical results must establish that the device accepted the remedy and that sound reached the intended port or capture buffer.
+
+| Area | Minimum observable acceptance |
+| --- | --- |
+| Native DSD | Compare known byte patterns at the USB boundary for each width/order family. Play a native track, switch back to PCM, and verify restoration after a failed open and a stop. For an ITF device, confirm alt zero, the mode command and cadence in that order. Use separate Amanero revisions for little- and big-endian evidence. |
+| Automatic clock source | Leave a working current source selected. Disconnect or invalidate a switchable external clock, reopen and record verified fallback to a valid source. Check read-only selector refusal, external selector drift and original selector restoration. |
+| Multichannel duplex | Send distinguishable channel patterns through a physical loopback or known inputs. Verify ordered channel labels, separate counters on independent clock domains, and bounded capture backlog while playback continues. For implicit feedback, confirm one IN transfer pool and reconcile measured frames with scheduled and delivered OUT frames. |
+| ADC3 | Run fixed 48 kHz BADD and full-ADC3 PCM for each integrated direction. Observe the active configuration, correct channel cluster for full ADC3, and domain wake/restore order around start, stop and unplug. Verify a caller-selected configuration and return to the original configuration after close. |
+| Hardware routing | Start attenuated. Route one known source to one intended destination, confirm the physical result and device readback, then restore. On the admitted Scarlett firmware, verify whole-row mixer readback independently from tests that require all mux-bank originals. |
+
+No task-owned test runtime was started during the inspection of the connected
+Android host. Its USB host inventory had no attached test interface. This
+observation does not verify any of the physical cases above.
+
+### Expanding the descriptor-gated native DSD rules
+
+Linux v7.0 supplies two additional sources of built-in coverage. Its
+`QUIRK_FLAG_DSD_RAW` is enabled for exact products and certain USB vendor
+families, and contributes DSD_U32_BE only when the format descriptor advertises
+RAW_DATA. This is evidence for a guarded, read-only layout interpretation.
+Carry the full descriptor mask into the decision, require the matching audio
+protocol, endpoint geometry and U32 word width, and leave PCM capabilities
+derived from their own format bits. Put exact layout/revision rules ahead of
+a vendor RAW_DATA fallback. Never let a family layout supersede a nonmatching
+Amanero revision, the documented Playback Designs DoP-only alternate, or the
+separate ITF native-mode transaction.
+[ALSA RAW_DATA conditional](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L2071-L2080),
+[ALSA vendor quirk flags](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L2439-L2490)
+
+### Clock validity capability follow-through
+
+The UAC2 fallback currently asks every candidate for CLOCK_VALID and rejects
+a failed request. ALSA inspects Clock Source controls first and treats a
+source without readable validity as usable. Keep this distinction in the
+route plan. A source with an advertised readable validity control must
+reply valid. A source with no such control must pass an exact frequency
+readback before commit, and the diagnostic must distinguish unreported
+validity from a valid device response. A reserved control encoding and a
+failed advertised read both remain errors. Exercise a source with no
+validity control, a source explicitly invalid, and the existing route
+restore tests. Apply the same semantics to the future shared ADC3 resolver
+using its 32-bit controls and ADC3 descriptor offsets.
+[ALSA clock-validity check](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L243-L287)
+
+### Duplex claim and SDK handoff
+
+The Rust pair worker can consume a distinct IN endpoint only if it belongs to
+the registered session. The playback registration allowlist currently admits
+the implicit source and specific vendor controls. Add an explicit duplex
+registration entry point that proves capture claim IDs against the existing
+capture preflight for the same configuration. It must retain all base
+playback claims and authorize only capture IN interfaces and their owning
+AudioControl functions. Keep the existing playback registration policy for
+callers who request only playback.
+
+The Android pair entry point should perform one permission check, one config
+transaction and one combined claim plan. Publish the Rust pair atomically in
+JNI after rechecking that the DAC registry entry is still current. Return the
+existing playback and capture handles under one public duplex owner. Closing
+either direction retires the shared worker, and device hand-back waits for
+both handle lifetimes and the callback retirement guard. Avoid claiming every
+IN interface during ordinary playback discovery.
+
+## Fourth validation checkpoint
+
+The Rust duplex worker now shares the implicit capture endpoint when the
+requested wire format and endpoint match, or uses a separate input pool
+on the same event pump when the clocks and claims permit it. Pair
+retirement, capture-rate rollback and propagated device loss use the
+same ownership transaction. The distinct-input path still needs explicit
+duplex registration and Android pair opening.
+
+ADC3 capture supports the active BADD or full-profile PCM configuration
+with verified input-terminal clock topology, scoped power domains and
+ordered HC channel identities. Android can explicitly select an advertised
+USB configuration, verify it and restore the prior configuration after
+retirement. Its standard routing API preserves typed readback, snapshot
+scope and rollback errors. The driver also applies the pinned upstream
+vendor RAW_DATA layout rules when the descriptor actually advertises the
+guarded transport, including the existing exact-revision exceptions.
+
+The Rust workspace, Android cross-target check, Kotlin tests, all four
+native ABIs and sample build passed after review fixes. The built AAR
+retains the original JVM open methods and Kotlin default bridges.

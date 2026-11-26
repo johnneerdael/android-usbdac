@@ -11,6 +11,9 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import dev.usbdac.internal.ClaimedInterfaces
 import dev.usbdac.internal.Native
+import dev.usbdac.internal.UsbConfigurationSelection
+import dev.usbdac.internal.selectConfiguration
+import dev.usbdac.internal.logWarning
 import dev.usbdac.internal.interfaces
 import dev.usbdac.internal.activeConfiguration
 import org.json.JSONObject
@@ -41,7 +44,17 @@ public data class DacDeviceInfo(
     val manufacturerName: String?,
     /** The system's name for the device, such as `/dev/bus/usb/001/004`. Unique while attached. */
     val deviceName: String,
-)
+) {
+    /** Advertised configurations; audio presence does not imply native format support. */
+    public val configurations: List<DacUsbConfiguration> get() = (0 until device.configurationCount).map { index ->
+        val configuration = device.getConfiguration(index)
+        val interfaces = configuration.interfaces().map { it.toInfo() }
+        DacUsbConfiguration(configuration.id, configuration.name, hasPlayback(interfaces), hasCapture(interfaces))
+    }
+}
+
+/** Explicit configuration choices available before opening a USB connection. */
+public data class DacUsbConfiguration(val id: Int, val name: String?, val hasPlayback: Boolean, val hasCapture: Boolean)
 
 /** A change among the attached DACs. See [UsbDac.hotplug]. */
 public sealed interface DacHotplugEvent {
@@ -181,10 +194,16 @@ public object UsbDac {
      * applies microphone privacy and device permission policy. Declare/request RECORD_AUDIO when
      * the app's other microphone APIs or its platform policy require it; this raw USB path adds no
      * blanket microphone permission gate and requests no permissions automatically.
+     * Pass an advertised [configurationId] to select it explicitly before claims; null keeps
+     * the active configuration. Selection and restoration require GET_CONFIGURATION readback.
      * Native descriptor preflight claims only supported PCM IN interfaces and their owning
      * AudioControl interfaces in the active configuration. Call off the main thread.
      */
-    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacCaptureSession {
+    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacCaptureSession =
+        openCapture(context, device, config, configurationId = null)
+
+    /** Select only [configurationId], or keep the active configuration when null. */
+    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacCaptureSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -193,14 +212,18 @@ public object UsbDac {
         if (!sessionOpen.compareAndSet(false, true)) throw DacException(DacErrorCode.BUSY, "another USB audio session is open")
         var connection: android.hardware.usb.UsbDeviceConnection? = null
         var claims: ClaimedInterfaces? = null
+        var selection: UsbConfigurationSelection? = null
         var nativeDac = 0L
+        var nativeRegistrationAttempted = false
         try {
             val opened = manager.openDevice(device.device)
                 ?: throw DacException(DacErrorCode.OPEN_FAILED, "Android could not open ${device.productName}")
             connection = opened
             val fd = opened.fileDescriptor
             if (fd < 0) throw DacException(DacErrorCode.OPEN_FAILED, "Android gave no capture file descriptor")
-            val active = device.device.activeConfiguration(opened)
+            val selected = device.device.selectConfiguration(opened, configurationId)
+            selection = selected
+            val active = selected.selected
             val interfaces = active.interfaces()
             fun infoJson(ids: List<Int>, configuration: Int) = deviceInfoJson(
                 device.vendorId, device.productId, device.productName, device.manufacturerName,
@@ -221,18 +244,25 @@ public object UsbDac {
             if (device.device.activeConfiguration(opened).id != configuration) {
                 throw DacException(DacErrorCode.CLAIM, "active configuration changed while claiming capture")
             }
+            selected.verify()
+            nativeRegistrationAttempted = true
             nativeDac = nativeCall { Native.dacOpenCaptureDevice(fd, infoJson(owned.ids, configuration), config.toNativeJson()) }
-            return DacCaptureSession(nativeDac, device, opened, owned) { sessionOpen.set(false) }
+            return DacCaptureSession(nativeDac, device, opened, owned, selected) { sessionOpen.set(false) }
         } catch (error: Throwable) {
             if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
             val retainedClaims = claims
             val retainedConnection = connection
+            val retainedSelection = selection
             fun release() {
                 retainedClaims?.release()
+                runCatching { retainedSelection?.restore() }.onFailure {
+                    error.addSuppressed(it)
+                    logWarning("restoring USB configuration after open failed", it)
+                }
                 runCatching { retainedConnection?.close() }
                 sessionOpen.set(false)
             }
-            if (nativeDac == 0L || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
+            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
             else Thread({
                 while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
                 release()
@@ -243,7 +273,9 @@ public object UsbDac {
     }
 
     /**
-     * Opens [device] for direct output.
+     * Opens [device] for direct output. An explicit [configurationId] selects only that
+     * advertised configuration and restores the original after native retirement on close.
+     * Null preserves the active configuration and existing claim behavior.
      *
      * This opens the USB connection, takes the audio interfaces away from Android's own USB audio
      * driver, hands the file descriptor to the native library, which scans the descriptors and
@@ -257,7 +289,11 @@ public object UsbDac {
      *   [DacErrorCode.BUSY] if a session is already open, [DacErrorCode.CLAIM] if the interfaces
      *   could not be taken, and the native library's other codes.
      */
-    public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacSession {
+    public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacSession =
+        open(context, device, config, configurationId = null)
+
+    /** Select only [configurationId], or keep the active configuration when null. */
+    public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -268,13 +304,18 @@ public object UsbDac {
         }
         var connection: android.hardware.usb.UsbDeviceConnection? = null
         var claims: ClaimedInterfaces? = null
+        var selection: UsbConfigurationSelection? = null
+        var nativeDac = 0L
+        var nativeRegistrationAttempted = false
         try {
             connection = manager.openDevice(device.device)
                 ?: throw DacException(DacErrorCode.OPEN_FAILED, "Android could not open ${device.productName}")
             val fd = connection.fileDescriptor
             if (fd < 0) throw DacException(DacErrorCode.OPEN_FAILED, "Android gave no file descriptor for ${device.productName}")
 
-            val activeConfiguration = device.device.activeConfiguration(connection)
+            val selected = device.device.selectConfiguration(connection, configurationId)
+            selection = selected
+            val activeConfiguration = selected.selected
             val interfaces = activeConfiguration.interfaces()
             val plan = planClaims(interfaces.map { it.toInfo() })
                 ?: throw DacException(
@@ -294,29 +335,43 @@ public object UsbDac {
                 configurationId = configurationId,
                 unavailableFeedbackInterfaces = unavailable,
             )
-            var configurationId: Int? = activeConfiguration.id
+            var nativeConfigurationId: Int? = activeConfiguration.id
             var unavailable: List<Int> = emptyList()
             if (!config.disableFeedback) {
                 val preflight = JSONObject(nativeCall { Native.dacFeedbackPreflight(fd, infoJson()) })
-                configurationId = preflight.getInt("configuration_id")
-                if (activeConfiguration.id != configurationId || device.device.activeConfiguration(connection).id != configurationId) {
+                nativeConfigurationId = preflight.getInt("configuration_id")
+                if (activeConfiguration.id != nativeConfigurationId || device.device.activeConfiguration(connection).id != nativeConfigurationId) {
                     throw DacException(DacErrorCode.CLAIM, "The active USB configuration changed during feedback preflight.")
                 }
                 val sources = preflight.getJSONArray("interfaces")
                 unavailable = ownedClaims.claimOptional(interfaces, (0 until sources.length()).map(sources::getInt))
             }
-            val dac = nativeCall { Native.dacOpen(fd, infoJson(configurationId, unavailable), config.toNativeJson()) }
-            val session = try {
-                DacSession.create(dac, device, config, connection, claims) { sessionOpen.set(false) }
-            } catch (error: Throwable) {
-                runCatching { Native.dacClose(dac) }
-                throw error
-            }
-            return session
+            selected.verify()
+            nativeRegistrationAttempted = true
+            val dac = nativeCall { Native.dacOpen(fd, infoJson(nativeConfigurationId, unavailable), config.toNativeJson()) }
+            nativeDac = dac
+            return DacSession.create(dac, device, config, connection, ownedClaims, selected) { sessionOpen.set(false) }
         } catch (error: Throwable) {
-            claims?.release()
-            connection?.close()
-            sessionOpen.set(false)
+            if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
+            val retainedClaims = claims
+            val retainedConnection = connection
+            val retainedSelection = selection
+            fun release() {
+                retainedClaims?.release()
+                runCatching { retainedSelection?.restore() }.onFailure {
+                    error.addSuppressed(it)
+                    logWarning("restoring USB configuration after open failed", it)
+                }
+                runCatching { retainedConnection?.close() }
+                sessionOpen.set(false)
+            }
+            // Open can fail after native registration; the native retirement gate is
+            // authoritative even when no public handle was returned.
+            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
+            else Thread({
+                while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
+                release()
+            }, "usbdac-open-retirement").start()
             throw error
         }
     }

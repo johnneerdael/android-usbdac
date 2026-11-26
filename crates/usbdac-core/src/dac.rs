@@ -272,6 +272,33 @@ impl Dac {
         Ok(DacStream::from_inner(inner))
     }
 
+    /// Open playback and PCM capture atomically on one USB worker.
+    ///
+    /// The output must have a current negotiated format. Shared source clocks
+    /// require equal wire rates; distinct proven clock sources retain their own
+    /// rates and position counters. Capture never supplies playback timing unless
+    /// it exactly matches playback's already selected implicit feedback source.
+    /// Closing either stream stops both endpoints and retires their transfers.
+    pub fn open_duplex(&self, format: &StreamFormat, capture: &crate::capture::CaptureRequest,
+        capacity_frames: usize, listener: Arc<dyn DacListener>)
+        -> Result<(DacStream, crate::capture::DacCaptureStream)> {
+        self.shared.ensure_open()?;
+        let mut slot = self.shared.stream.lock();
+        if slot.as_ref().and_then(Weak::upgrade).is_some_and(|stream| !stream.is_closed()) {
+            return Err(Error::Busy);
+        }
+        self.shared.events.set_stream_listener(Some(listener));
+        let (output, input) = match transport::duplex::open(format, capture, capacity_frames, self.shared.events.clone()) {
+            Ok(pair) => pair,
+            Err(error) => { self.shared.events.set_stream_listener(None); return Err(error); }
+        };
+        let inner = StreamInner::new(Arc::clone(&self.shared), output, format.clone());
+        *slot = Some(Arc::downgrade(&inner));
+        drop(slot);
+        inner.start_events();
+        Ok((DacStream::from_inner(inner), crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), input)))
+    }
+
     /// The hardware volume control, if the DAC has a writable one.
     pub fn volume(&self) -> Option<VolumeControl> {
         if self.shared.ensure_open().is_err() || !transport::volume_hw::has_hardware_volume() {

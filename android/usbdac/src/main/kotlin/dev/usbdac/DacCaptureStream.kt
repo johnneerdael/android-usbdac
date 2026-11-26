@@ -14,10 +14,17 @@ public enum class CaptureChannelPosition {
     TOP_BACK_CENTER, TOP_BACK_RIGHT, TOP_FRONT_LEFT_OF_CENTER, TOP_FRONT_RIGHT_OF_CENTER,
     LEFT_LOW_FREQUENCY, RIGHT_LOW_FREQUENCY, TOP_SIDE_LEFT, TOP_SIDE_RIGHT,
     BOTTOM_CENTER, BACK_LEFT_OF_CENTER, BACK_RIGHT_OF_CENTER, UNSPECIFIED,
+    ADC3_INFORMATION, ADC3_AMBISONIC,
 }
 
 /** An unnamed channel still has a stable zero-based [index] on the wire. */
-public data class CaptureChannel(val index: Int, val position: CaptureChannelPosition)
+public data class CaptureChannel(val index: Int, val position: CaptureChannelPosition, val topology: CaptureChannelTopology? = null)
+
+/** Raw ADC3 HC descriptor identity, preserving unknown purpose/relationship semantics. */
+public sealed interface CaptureChannelTopology {
+    public data class Information(val purpose: Int, val relationship: Int, val group: Int) : CaptureChannelTopology
+    public data class Ambisonic(val ordering: Int, val acn: Int, val normalization: Int, val group: Int) : CaptureChannelTopology
+}
 
 /** Exact integer PCM request. Set [channelMap] to a previous format's map to retain identities. */
 public data class CaptureRequest(

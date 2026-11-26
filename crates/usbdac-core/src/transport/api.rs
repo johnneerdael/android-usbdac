@@ -178,7 +178,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
 }
 
 /// Whether the session already holds the negotiation of `format`.
-fn negotiation_matches(format: &StreamFormat) -> bool {
+pub(super) fn negotiation_matches(format: &StreamFormat) -> bool {
     let Ok(requested) = playback_format_from_request(&format.request) else {
         return false;
     };

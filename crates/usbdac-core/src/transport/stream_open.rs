@@ -6,10 +6,11 @@ use super::*;
 pub(super) struct StreamUsbOwner {
     claimed: Option<ClaimedHandle>,
     lock_requested: bool,
+    capture: Option<Arc<duplex::Attachment>>,
 }
 impl StreamUsbOwner {
-    fn new(claimed: ClaimedHandle, lock_requested: bool) -> Self {
-        Self { claimed: Some(claimed), lock_requested }
+    fn new(claimed: ClaimedHandle, lock_requested: bool, capture: Option<Arc<duplex::Attachment>>) -> Self {
+        Self { claimed: Some(claimed), lock_requested, capture }
     }
     pub(super) fn claimed(&self) -> &ClaimedHandle {
         self.claimed.as_ref().expect("live USB stream owner")
@@ -18,7 +19,7 @@ impl StreamUsbOwner {
 impl Drop for StreamUsbOwner {
     fn drop(&mut self) {
         if let Some(claimed) = self.claimed.take() {
-            cleanup_claimed_handle(claimed, None, self.lock_requested);
+            duplex::cleanup_claimed(claimed, self.capture.as_ref(), None, self.lock_requested);
         }
     }
 }
@@ -28,6 +29,7 @@ pub(crate) struct StreamHandle {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) thread: Option<JoinHandle<()>>,
     pub(crate) shared: Arc<StreamShared>,
+    pub(crate) capture: Option<capture_stream::CaptureHandle>,
 }
 
 impl StreamHandle {
@@ -61,6 +63,11 @@ impl Drop for StreamHandle {
 /// Opens the stream for the format the negotiation stored: programs the clock,
 /// switches the alternate setting and starts the output thread.
 pub(crate) fn start_stream(events: EventSink, expected: &crate::StreamFormat) -> Result<StreamHandle, Error> {
+    start_stream_with_capture(events, expected, None)
+}
+
+pub(crate) fn start_stream_with_capture(events: EventSink, expected: &crate::StreamFormat,
+    capture: Option<(&crate::capture::CaptureRequest, usize)>) -> Result<StreamHandle, Error> {
     // Wait briefly for a previous stream's thread to finish its teardown: a
     // stream closed a moment ago may still be releasing the interface.
     for attempt in 0..15 {
@@ -85,15 +92,12 @@ pub(crate) fn start_stream(events: EventSink, expected: &crate::StreamFormat) ->
         }
         Arc::new(SessionGuard::start_locked())
     };
-    start_stream_inner(events, &session, expected)
+    start_stream_inner_with_capture(events, &session, expected, capture)
 }
 
 #[allow(unused_assignments)]
-pub(super) fn start_stream_inner(
-    events: EventSink,
-    session: &Arc<SessionGuard>,
-    expected: &crate::StreamFormat,
-) -> Result<StreamHandle, Error> {
+fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard>,
+    expected: &crate::StreamFormat, capture: Option<(&crate::capture::CaptureRequest, usize)>) -> Result<StreamHandle, Error> {
     let config = settings().config.clone();
     let (state, mut playback_format) = {
         let guard = SESSION_STATE.lock();
@@ -194,6 +198,12 @@ pub(super) fn start_stream_inner(
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState("clock route changed since negotiation".into()));
     }
+    // Select and validate the complete pair while all streaming alternates are idle.
+    let attachment = match capture.map(|(request, capacity)|
+        duplex::prepare(&claimed_handle, &candidate, expected, request, capacity)).transpose() {
+        Ok(value) => value,
+        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(error); }
+    };
     let clock = clock_choice.map(|(clock, _)| clock);
     let clock_detection_msg = match &clock {
         Some(c) => format!(
@@ -227,7 +237,7 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(error.message()));
         set_direct_mode_refusal_reason(Some(error.message()));
         set_engine_state(EngineState::Error, Some(error.message()));
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(error);
     }
     set_clock_status(clock.map(|_| ClockStatus {
@@ -292,16 +302,16 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(error.clone()));
         set_direct_mode_refusal_reason(Some(error.clone()));
         set_engine_state(EngineState::Error, Some(error.clone()));
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Claim(error));
     }
 
     if let Some(source) = candidate.implicit_feedback.filter(|source| source.interface_number != candidate.interface_number) {
         if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
-            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Claim(error));
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Claim(error));
         }
         if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, 0) {
-            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error));
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Transfer(error));
         }
     }
     if let Err(error) = claimed_handle.set_alternate_setting(candidate.interface_number, 0) {
@@ -312,16 +322,16 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(message.clone()));
         set_direct_mode_refusal_reason(Some(message.clone()));
         set_engine_state(EngineState::Error, Some(message.clone()));
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(message));
     }
     thread::sleep(Duration::from_millis(50));
     if let Err(error) = apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport) {
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(error));
     }
     if let Err(error) = verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) {
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::InvalidState(error));
     }
 
@@ -338,7 +348,7 @@ pub(super) fn start_stream_inner(
             set_last_error(Some(error.clone()));
             set_direct_mode_refusal_reason(Some(error.clone()));
             set_engine_state(EngineState::Error, Some(error.clone()));
-            cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Claim(error));
         }
         match state.dac_mode {
@@ -507,7 +517,7 @@ pub(super) fn start_stream_inner(
         }
     } else if let Some(route) = adc3_route.as_ref() {
         if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
-            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error));
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Transfer(error));
         }
         clock_control_attempted = true;
         clock_control_succeeded = true;
@@ -603,18 +613,23 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(message));
     }
 
+    if let Some(capture) = attachment.as_ref() {
+        if let Err(error) = capture.configure(&claimed_handle, &candidate, expected) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
+        }
+    }
     if let Some(source) = candidate.implicit_feedback {
         if source.interface_number != candidate.interface_number {
             if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
-                cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
                 return Err(Error::Claim(error));
             }
             if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, source.alt_setting) {
-                cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
                 return Err(Error::Transfer(format!("implicit feedback alternate activation failed: {}", error)));
             }
         } else if source.alt_setting != candidate.alt_setting {
-            cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Transfer("implicit source alternate conflicts with playback".into()));
         }
     }
@@ -628,14 +643,14 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(msg.clone()));
         set_direct_mode_refusal_reason(Some(msg.clone()));
         set_engine_state(EngineState::Error, Some(msg.clone()));
-        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
     }
     thread::sleep(Duration::from_millis(50));
 
     if let Some(route) = adc3_route.as_ref() {
         if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
-            cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Transfer(error));
         }
     }
@@ -720,8 +735,7 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
         set_engine_state(EngineState::Error, Some(refusal.clone()));
-        cleanup_claimed_handle(
-            claimed_handle,
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -736,8 +750,7 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
         set_engine_state(EngineState::Error, Some(refusal.clone()));
-        cleanup_claimed_handle(
-            claimed_handle,
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -752,8 +765,7 @@ pub(super) fn start_stream_inner(
             "USB direct refused: no valid isochronous OUT endpoint found".to_string();
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
-        cleanup_claimed_handle(
-            claimed_handle,
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -918,8 +930,7 @@ pub(super) fn start_stream_inner(
                 set_last_error(Some(refusal.clone()));
                 set_direct_mode_refusal_reason(Some(refusal.clone()));
                 set_engine_state(EngineState::Error, Some(refusal.clone()));
-                cleanup_claimed_handle(
-                    claimed_handle,
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
                     Some(candidate.interface_number),
                     lock_requested,
                 );
@@ -956,8 +967,7 @@ pub(super) fn start_stream_inner(
                 set_last_error(Some(refusal.clone()));
                 set_direct_mode_refusal_reason(Some(refusal.clone()));
                 set_engine_state(EngineState::Error, Some(refusal.clone()));
-                cleanup_claimed_handle(
-                    claimed_handle,
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
                     Some(candidate.interface_number),
                     lock_requested,
                 );
@@ -978,8 +988,7 @@ pub(super) fn start_stream_inner(
         dev_eprintln!("[USB] {}", refusal);
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
-        cleanup_claimed_handle(
-            claimed_handle,
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -1099,6 +1108,7 @@ pub(super) fn start_stream_inner(
     ));
     let stop = Arc::new(AtomicBool::new(false));
 
+    let reader_attachment = attachment.clone();
     let usb_stop = Arc::clone(&stop);
     let usb_shared = Arc::clone(&shared);
     let backend_product_name = state.device.product_name.clone();
@@ -1110,11 +1120,12 @@ pub(super) fn start_stream_inner(
     // Publish before spawning: the output thread can fail immediately and must
     // not have its error state overwritten by the caller.
     set_engine_state(EngineState::Streaming, None);
-    let stream_usb_owner = StreamUsbOwner::new(claimed_handle, lock_requested);
+    let stream_usb_owner = StreamUsbOwner::new(claimed_handle, lock_requested, attachment.clone());
     let thread_handle = match thread::Builder::new()
         .name("usbdac-output".to_string())
         .spawn(move || {
             // Keep the interfaces alive until the loop and its USB handles are done.
+            let _capture_retirement = attachment.as_ref().map(|capture| capture.retirement_guard());
             let _session = output_session;
             if realtime_priority && crate::priority::raise_audio_priority().is_err() {
                 dev_eprintln!("[AudioSched] Output thread running without SCHED_FIFO");
@@ -1122,7 +1133,7 @@ pub(super) fn start_stream_inner(
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);
@@ -1169,10 +1180,12 @@ pub(super) fn start_stream_inner(
         backend_alt_setting,
         dsd_transport_label,
     );
+    let capture_handle = reader_attachment.as_ref().map(|capture| capture.reader(Arc::clone(&stop)));
     Ok(StreamHandle {
         stop,
         thread: Some(thread_handle),
         shared,
+        capture: capture_handle,
     })
 }
 

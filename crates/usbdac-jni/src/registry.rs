@@ -24,6 +24,7 @@ pub struct DacEntry {
     pub dac: Dac,
     formats: Mutex<Vec<(u64, StreamFormat)>>,
     streams: Mutex<Vec<u64>>,
+    routing: Mutex<Vec<(u64, usbdac_core::routing::RoutingSnapshot)>>,
 }
 
 impl DacEntry {
@@ -32,7 +33,31 @@ impl DacEntry {
             dac,
             formats: Mutex::new(Vec::new()),
             streams: Mutex::new(Vec::new()),
+            routing: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Snapshots never cross DAC owners and disappear with this entry. Bound retained USB
+    /// descriptor memory; callers rediscover when an old snapshot has been evicted.
+    pub fn remember_routing(&self, snapshot: usbdac_core::routing::RoutingSnapshot) -> Result<u64, Error> {
+        // Lock registration through insertion, so close either invalidates this result
+        // or has already removed the owner and rejects insertion.
+        let dacs = DACS.lock();
+        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
+            return Err(Error::InvalidState("DAC closed during routing discovery".into()));
+        }
+        let id = next_id();
+        let mut snapshots = self.routing.lock();
+        snapshots.push((id, snapshot));
+        if snapshots.len() > 8 { snapshots.remove(0); }
+        Ok(id)
+    }
+
+    pub fn routing(&self, id: i64) -> Result<usbdac_core::routing::RoutingSnapshot, Error> {
+        let id = u64::try_from(id).map_err(|_| stale("routing snapshot", id))?;
+        self.routing.lock().iter().find(|(key, _)| *key == id)
+            .map(|(_, snapshot)| snapshot.clone())
+            .ok_or_else(|| stale("routing snapshot", id as i64))
     }
 
     pub fn remember_format(&self, format: StreamFormat) -> u64 {

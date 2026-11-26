@@ -16,6 +16,7 @@ mod aaudio;
 mod convert;
 mod capture;
 mod capture_json;
+mod routing;
 mod json;
 mod listener;
 mod registry;

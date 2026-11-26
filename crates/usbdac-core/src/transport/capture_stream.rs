@@ -13,12 +13,13 @@ pub(crate) struct CaptureEndpoint {
     pub(crate) service_us: u32,
     pub(crate) packet_bytes: usize,
     pub(crate) format: CaptureFormat,
-    protocol: u8,
-    terminal: u8,
-    control: u8,
-    control_descriptors: Vec<u8>,
+    pub(super) protocol: u8,
+    pub(super) terminal: u8,
+    pub(super) control: u8,
+    pub(super) control_descriptors: Vec<u8>,
     sampling_control: bool,
     fixed_rate: bool,
+    pub(super) adc3_route: Option<adc3::Adc3Route>,
 }
 
 #[derive(Clone)]
@@ -81,6 +82,21 @@ fn capture_control<'a, 'raw>(
                     && d.len() == 8 + usize::from(d[7])
                     && d[8..].contains(&streaming.number)
             })
+        } else if streaming.protocol == 0x30 {
+            let Ok(functions) = adc3::functions(raw) else {
+                return false;
+            };
+            let owners: Vec<_> = functions
+                .iter()
+                .filter(|iad| {
+                    u16::from(streaming.number) >= u16::from(iad.b_first_interface)
+                        && u16::from(streaming.number)
+                            < u16::from(iad.b_first_interface) + u16::from(iad.b_interface_count)
+                })
+                .collect();
+            owners.len() == 1
+                && owners[0].b_first_interface == ac.number
+                && crate::descriptors::uac3::function_profile(owners[0], 0x30).is_ok()
         } else {
             audio_functions(raw)
                 .iter()
@@ -246,7 +262,7 @@ fn capture_format(
     }
 }
 
-fn capture_candidates(
+pub(super) fn capture_candidates(
     raw: &[u8],
     configuration: u8,
     speed: Speed,
@@ -323,8 +339,47 @@ fn capture_candidates(
                     .collect(),
                 sampling_control,
                 fixed_rate,
+                adc3_route: None,
             });
         }
+    }
+    Ok(candidates)
+}
+
+/// Resolve active-configuration candidates while the caller owns USB claims.
+pub(super) fn owned_capture_candidates(
+    claimed: &ClaimedHandle,
+    config: &ConfigDescriptor,
+    rate: u32,
+) -> Result<Vec<CaptureEndpoint>, String> {
+    let raw = read_active_configuration_bytes(&claimed.handle, config)
+        .ok_or("cannot read active capture configuration")?;
+    let speed = resolve_device_speed(&claimed.handle.device());
+    let mut candidates = capture_candidates(&raw, config.number(), speed, rate)?;
+    for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate)? {
+        let format = CaptureFormat::pcm(
+            rate,
+            candidate.bit_resolution,
+            candidate.subslot_size,
+            adc3::capture_channel_map(&route)?,
+        )
+        .map_err(|e| format!("ADC3 capture format: {e:?}"))?;
+        candidates.push(CaptureEndpoint {
+            configuration: config.number(),
+            interface: candidate.interface_number,
+            alternate: candidate.alt_setting,
+            address: candidate.endpoint_address,
+            service_us: candidate.service_interval_us,
+            packet_bytes: candidate.max_packet_bytes,
+            format,
+            protocol: 0x30,
+            terminal: candidate.terminal_link.unwrap_or(0),
+            control: route.control,
+            control_descriptors: vec![],
+            sampling_control: false,
+            fixed_rate: route.clock.is_none(),
+            adc3_route: Some(route),
+        });
     }
     Ok(candidates)
 }
@@ -356,7 +411,7 @@ pub(super) fn validate_capture_registration(
     for interface in &interfaces {
         if interface.class != USB_CLASS_AUDIO
             || interface.subclass != USB_SUBCLASS_AUDIOSTREAMING
-            || !matches!(interface.protocol, 0 | 0x20)
+            || !matches!(interface.protocol, 0 | 0x20 | 0x30)
         {
             continue;
         }
@@ -406,7 +461,7 @@ pub(crate) fn capture_claim_preflight(
         if interface.class != USB_CLASS_AUDIO
             || interface.subclass != USB_SUBCLASS_AUDIOSTREAMING
             || interface.alternate == 0
-            || !matches!(interface.protocol, 0 | 0x20)
+            || !matches!(interface.protocol, 0 | 0x20 | 0x30)
         {
             continue;
         }
@@ -424,7 +479,7 @@ pub(crate) fn capture_claim_preflight(
             } else {
                 48_000
             };
-        if capture_format(interface, control, probe_rate).is_none() {
+        if interface.protocol != 0x30 && capture_format(interface, control, probe_rate).is_none() {
             continue;
         }
         if interface.descriptors.iter().any(|ep| {
@@ -466,8 +521,10 @@ impl Drop for CaptureUsbOwner {
     }
 }
 
-fn configure_rate(owner: &CaptureUsbOwner, candidate: &CaptureEndpoint) -> Result<(), Error> {
-    let claimed = owner.claimed();
+pub(super) fn configure_capture_endpoint(
+    claimed: &ClaimedHandle,
+    candidate: &CaptureEndpoint,
+) -> Result<(), Error> {
     claimed
         .ensure_interface_claimed(candidate.control)
         .map_err(Error::Claim)?;
@@ -504,6 +561,40 @@ fn configure_rate(owner: &CaptureUsbOwner, candidate: &CaptureEndpoint) -> Resul
                 requested_hz: rate,
                 reported_hz: None,
             });
+        }
+    } else if let Some(route) = &candidate.adc3_route {
+        let config = claimed
+            .handle
+            .device()
+            .active_config_descriptor()
+            .map_err(|e| Error::Claim(e.to_string()))?;
+        let actual = adc3::adc3_capture_route_for_endpoint(
+            claimed,
+            &config,
+            candidate.interface,
+            candidate.alternate,
+        )
+        .map_err(Error::Control)?;
+        if &actual != route {
+            return Err(Error::InvalidState(
+                "ADC3 capture route changed; negotiate again".into(),
+            ));
+        }
+        adc3::configure_adc3(&claimed.handle, route, rate).map_err(Error::Control)?;
+        claimed
+            .set_alternate_setting(candidate.interface, candidate.alternate)
+            .map_err(Error::Claim)?;
+        let actual = adc3::adc3_capture_route_for_endpoint(
+            claimed,
+            &config,
+            candidate.interface,
+            candidate.alternate,
+        )
+        .map_err(Error::Control)?;
+        if &actual != route {
+            return Err(Error::InvalidState(
+                "ADC3 capture route changed during activation".into(),
+            ));
         }
     } else {
         let config = claimed
@@ -597,8 +688,10 @@ pub(crate) struct CaptureHandle {
     pub(crate) endpoint: CaptureEndpoint,
     pub(crate) buffer: Arc<Mutex<CaptureBuffer>>,
     pub(crate) error: Arc<Mutex<Option<Error>>>,
-    stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) worker: Option<JoinHandle<()>>,
+    pub(crate) paired: bool,
+    pub(crate) retired: Option<Arc<AtomicBool>>,
 }
 impl CaptureHandle {
     pub(crate) fn stop(&mut self) -> Result<(), Error> {
@@ -623,6 +716,16 @@ impl CaptureHandle {
             worker
                 .join()
                 .map_err(|_| Error::Transfer("USB capture worker panicked".into()))?;
+        }
+        if self.paired {
+            let retired = self.retired.as_ref().expect("paired capture retirement signal");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !retired.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !retired.load(Ordering::Acquire) {
+                return Err(Error::Transfer("USB duplex is still retiring; retain host claims and FD".into()));
+            }
         }
         Ok(())
     }
@@ -669,15 +772,8 @@ pub(crate) fn open_capture(
     let config = usb
         .active_config_descriptor()
         .map_err(|e| Error::Claim(e.to_string()))?;
-    let raw = read_active_configuration_bytes(&owner.claimed().handle, &config)
-        .ok_or_else(|| Error::Claim("cannot read active capture configuration".into()))?;
-    let mut candidates = capture_candidates(
-        &raw,
-        config.number(),
-        resolve_device_speed(&usb),
-        request.sample_rate,
-    )
-    .map_err(Error::Claim)?;
+    let mut candidates = owned_capture_candidates(owner.claimed(), &config, request.sample_rate)
+        .map_err(Error::Claim)?;
     candidates.retain(|candidate| {
         candidate.format.satisfies(request)
             && device.claimed_interfaces.contains(&candidate.interface)
@@ -697,7 +793,7 @@ pub(crate) fn open_capture(
         CaptureBuffer::new(endpoint.format.clone(), capacity_frames)
             .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?,
     ));
-    configure_rate(&owner, &endpoint)?;
+    configure_capture_endpoint(owner.claimed(), &endpoint)?;
     let geometry = IsoQueueGeometry::for_stream(
         endpoint.service_us,
         settings().config.bus_queue_ms,
@@ -750,6 +846,8 @@ pub(crate) fn open_capture(
         error,
         stop,
         worker: Some(worker),
+        paired: false,
+        retired: None,
     };
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(handle),
@@ -766,7 +864,7 @@ pub(crate) fn open_capture(
     }
 }
 
-fn ingest_slot(
+pub(super) fn ingest_slot(
     slot: &IsoTransferSlot,
     status: i32,
     buffer: &mut CaptureBuffer,

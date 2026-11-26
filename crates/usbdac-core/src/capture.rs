@@ -35,6 +35,19 @@ pub enum ChannelPosition {
     BottomCenter,
     BackLeftOfCenter,
     BackRightOfCenter,
+    /// ADC3 HC information segment, preserving relationship, purpose and group.
+    Adc3Information {
+        purpose: u8,
+        relationship: u8,
+        group: u8,
+    },
+    /// ADC3 HC ambisonic segment in its declared wire order.
+    Adc3Ambisonic {
+        ordering: u8,
+        acn: u8,
+        normalization: u8,
+        group: u8,
+    },
     /// No descriptor label; retain the zero-based interleaved channel index.
     Unspecified {
         index: u16,

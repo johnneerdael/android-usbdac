@@ -56,10 +56,16 @@ fn builtin_layout(id: UsbIdentity) -> Option<(u8, bool)> {
     }
 }
 
-// Exact DEVICE_FLG(..., QUIRK_FLAG_DSD_RAW) records in the pinned source.
-// Deliberately do not expand vendor-wide entries into speculative product IDs.
+// DEVICE_FLG and VENDOR_FLG RAW_DATA facts from the pinned source. Vendor
+// membership only interprets an actual UAC2 RAW_DATA descriptor; it neither
+// guesses a chipset nor authorizes any vendor control operation.
 fn raw_data_device(id: UsbIdentity) -> bool {
-    matches!((id.vendor, id.product),
+    matches!(id.vendor,
+        0x1511 | 0x152a | 0x18d1 | 0x20b1 | 0x21ed | 0x22d9 | 0x23ba
+        | 0x25ce | 0x2622 | 0x2772 | 0x278b | 0x292b | 0x2972 | 0x2ab6
+        | 0x2afd | 0x2d87 | 0x2fc6 | 0x3336 | 0x3353 | 0x35f4 | 0x3842
+        | 0xc502)
+    || matches!((id.vendor, id.product),
         (0x0661, 0x0883) // iBasso DC04 Ultra
         | (0x154e, 0x300b) // Marantz SA-KI RUBY / SA-12
         | (0x16d0, 0x0ab1) // PureAudio APA DAC
@@ -89,8 +95,14 @@ fn playback_designs_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfac
         origin: NativeDsdOrigin::DeviceCompatibility })
 }
 
-fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat) -> Option<NativeDsdProfile> {
-    if !raw_data_device(id) || !eligible(format)
+fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat,
+                    eligible_alts: usize) -> Option<NativeDsdProfile> {
+    // Exact compatibility rules remain authoritative even when their layout
+    // or firmware does not match. Legacy Playback Designs alt 1 is DoP only.
+    if builtin_layout(id).is_some() || (id.vendor, id.product) == (0x16d0, 0x071a)
+        || (id.vendor == 0x23ba && id.product < 0x0110) || itf::model(id).is_some()
+        || !raw_data_device(id) || !eligible(format)
+        || eligible_alts != 1
         || !format.uac2_formats.is_some_and(|mask| mask & 0x8000_0000 != 0) { return None; }
     Some(NativeDsdProfile { word_bytes: 4, big_endian: true, bit_reverse: false,
         origin: NativeDsdOrigin::DeviceCompatibility })
@@ -229,6 +241,10 @@ fn itf_packet_geometry(raw: u16, speed: Speed) -> bool {
     // allowed here for Android-wrapped descriptors; selection still performs
     // its existing effective-speed and per-service-interval capacity checks.
     matches!(speed, Speed::Full | Speed::High | Speed::Unknown)
+}
+
+fn raw_packet_geometry(raw: u16, speed: Speed) -> bool {
+    itf_packet_geometry(raw, speed) && raw & 0x07ff >= 8
 }
 
 /// Every operation is explicit so ordering and rollback can be proved without
@@ -429,7 +445,7 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
                 && f.bit_resolution <= width * 8)).count();
         playback_designs_profile(id, alt.setting_number(), format, count)
     });
-    if let Some(mut profile) = playback_designs.or_else(|| raw_data_profile(id, format)) {
+    if let Some(mut profile) = playback_designs {
         if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, profile.word_bytes) {
             if !matches!(width, 1 | 2 | 4) { return None; }
             profile.word_bytes = width;
@@ -447,6 +463,31 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
             && parse_android_streaming_interface_format(d).is_some_and(|f| eligible(&f))).count();
         if let Some(mut profile) = compatibility_profile(id, alt.setting_number(), format, count) {
             if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, format.subslot_size) {
+                if !matches!(width, 1 | 2 | 4) { return None; }
+                profile.word_bytes = width;
+                profile.origin = NativeDsdOrigin::HostPolicy;
+            }
+            (profile.big_endian, profile.bit_reverse) = settings.native_dsd_order(id.vendor, id.product, profile.big_endian);
+            return Some(profile);
+        }
+    }
+    // A vendor RAW_DATA rule supplies no interface identity. Require a unique
+    // UAC2 playback layout at this alternate and capacity for a whole stereo
+    // U32 frame. Maximum packet size is a ceiling, not a frame-length promise.
+    let raw_out_count = |d: &rusb::InterfaceDescriptor| d.endpoint_descriptors().filter(|ep|
+        ep.direction() == Direction::Out && ep.transfer_type() == TransferType::Isochronous
+        && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
+        && (1..=16).contains(&ep.interval())
+        && raw_packet_geometry(ep.max_packet_size(), device.speed())).count();
+    if alt.protocol_code() == 0x20 && raw_out_count(alt) == 1 {
+        let count = config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
+            d.class_code() == USB_CLASS_AUDIO && d.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+            && d.protocol_code() == 0x20 && d.setting_number() == alt.setting_number()
+            && raw_out_count(d) == 1
+            && parse_android_streaming_interface_format(d).is_some_and(|f|
+                raw_data_profile(id, &f, 1).is_some())).count();
+        if let Some(mut profile) = raw_data_profile(id, format, count) {
+            if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, profile.word_bytes) {
                 if !matches!(width, 1 | 2 | 4) { return None; }
                 profile.word_bytes = width;
                 profile.origin = NativeDsdOrigin::HostPolicy;
@@ -596,28 +637,90 @@ mod tests {
     #[test]
     fn exact_raw_data_products_require_standard_raw_mask_and_u32_geometry() {
         for (vendor, product) in [(0x0661, 0x0883), (0x154e, 0x300b),
-            (0x16d0, 0x0ab1), (0x16d0, 0xeca1), (0x20b1, 0x2009),
+            (0x20b1, 0x2009),
             (0x21b4, 0x0230), (0x21b4, 0x0232), (0x262a, 0x9302)] {
             let id = UsbIdentity { vendor, product, revision: 0x0100 };
             let mut f = format();
-            assert!(raw_data_profile(id, &f).is_none());
+            assert!(raw_data_profile(id, &f, 1).is_none());
             f.uac2_formats = Some(0x8000_0001);
-            assert_eq!(raw_data_profile(id, &f).unwrap().signature(), (4, true, false));
+            assert_eq!(raw_data_profile(id, &f, 1).unwrap().signature(), (4, true, false));
             // The PCM bit survives; compatibility recognition never changes it.
             assert_eq!(f.format_tag, FORMAT_TAG_PCM);
             assert_eq!(f.uac2_formats, Some(0x8000_0001));
             f.uac2_formats = Some(8);
-            assert!(raw_data_profile(id, &f).is_none());
+            assert!(raw_data_profile(id, &f, 1).is_none());
             f.uac2_formats = Some(0x8000_0000); f.subslot_size = 2;
-            assert!(raw_data_profile(id, &f).is_none());
+            assert!(raw_data_profile(id, &f, 1).is_none());
             f.subslot_size = 4; f.is_uac1 = true;
-            assert!(raw_data_profile(id, &f).is_none());
+            assert!(raw_data_profile(id, &f, 1).is_none());
         }
         let mut raw = format(); raw.uac2_formats = Some(0x8000_0000);
         for (vendor, product) in [(0x0661, 0x0884), (0x154e, 0x300c),
-            (0x20b1, 0xffff), (0x21b4, 0x0231), (0x262a, 0x9303)] {
-            assert!(raw_data_profile(UsbIdentity { vendor, product, revision: 0 }, &raw).is_none());
+            (0x21b4, 0x0231), (0x262a, 0x9303)] {
+            assert!(raw_data_profile(UsbIdentity { vendor, product, revision: 0 }, &raw, 1).is_none());
         }
+    }
+    #[test]
+    fn vendor_raw_rules_require_real_raw_stereo_u32_and_unique_layout() {
+        for vendor in [0x1511, 0x152a, 0x18d1, 0x20b1, 0x21ed, 0x22d9,
+            0x23ba, 0x25ce, 0x2622, 0x2772, 0x278b, 0x292b, 0x2972, 0x2ab6,
+            0x2afd, 0x2d87, 0x2fc6, 0x3336, 0x3353, 0x35f4, 0x3842, 0xc502] {
+            let id = UsbIdentity { vendor, product: 0xffff, revision: 0 };
+            let mut f = format();
+            for mask in [None, Some(1), Some(8), Some(0x0000_8001)] {
+                f.uac2_formats = mask;
+                assert!(raw_data_profile(id, &f, 1).is_none());
+            }
+            f.uac2_formats = Some(0x8000_0001);
+            assert_eq!(raw_data_profile(id, &f, 1).unwrap().signature(), (4, true, false));
+            assert!(raw_data_profile(id, &f, 0).is_none());
+            assert!(raw_data_profile(id, &f, 2).is_none());
+            assert_eq!(uac2_primary_format(f.uac2_formats.unwrap()), FORMAT_TAG_PCM);
+            for width in [1, 2, 3, 8] {
+                f.subslot_size = width;
+                assert!(raw_data_profile(id, &f, 1).is_none());
+            }
+            f.subslot_size = 4;
+            for bits in [0, 33] {
+                f.bit_resolution = bits;
+                assert!(raw_data_profile(id, &f, 1).is_none());
+            }
+            // RAW describes a U32 container, not 32 significant PCM bits.
+            f.bit_resolution = 1;
+            assert!(raw_data_profile(id, &f, 1).is_some());
+            for channels in [0, 1, 4] {
+                f.channels = channels;
+                assert!(raw_data_profile(id, &f, 1).is_none());
+            }
+            f.channels = 2; f.is_uac1 = true;
+            assert!(raw_data_profile(id, &f, 1).is_none());
+        }
+    }
+    #[test]
+    fn raw_packet_capacity_allows_unused_bytes_but_requires_whole_frame_room() {
+        assert!(raw_packet_geometry(9, Speed::High));
+        assert!(raw_packet_geometry(1024 | (2 << 11), Speed::High));
+        assert!(!raw_packet_geometry(7, Speed::High));
+        assert!(!raw_packet_geometry(1025, Speed::High));
+        assert!(!raw_packet_geometry(1024 | (3 << 11), Speed::High));
+        assert!(!raw_packet_geometry(8 | (1 << 11), Speed::Full));
+        assert!(!raw_packet_geometry(8, Speed::Super));
+    }
+    #[test]
+    fn raw_fallback_never_supersedes_firmware_alt_or_mode_rules() {
+        let mut f = format(); f.uac2_formats = Some(0x8000_0001);
+        for (vendor, product, revision) in [(0x16d0, 0x071a, 0x019a),
+            (0x16d0, 0x071a, 0x0199), (0x16d0, 0x0ab1, 0), (0x16d0, 0xeca1, 0),
+            (0x20b1, 0x3089, 0), (0x2622, 0x0061, 0), (0x23ba, 0x010f, 0),
+            (0x0644, 0x8044, 0)] {
+            assert!(raw_data_profile(UsbIdentity { vendor, product, revision }, &f, 1).is_none());
+        }
+        let exact = UsbIdentity { vendor: 0x20b1, product: 0x3089, revision: 0 };
+        assert_eq!(compatibility_profile(exact, 2, &f, 1).unwrap().signature(), (4, true, false));
+        assert!(compatibility_profile(exact, 3, &f, 1).is_none());
+        let legacy = UsbIdentity { vendor: 0x23ba, product: 0x010f, revision: 0 };
+        assert!(playback_designs_profile(legacy, 1, &f, 1).is_none());
+        assert!(raw_data_profile(UsbIdentity { vendor: 0x23bb, product: 0xffff, revision: 0 }, &f, 1).is_none());
     }
     #[test]
     fn playback_designs_native_alts_are_width_specific_bit_reversed_and_not_dop() {

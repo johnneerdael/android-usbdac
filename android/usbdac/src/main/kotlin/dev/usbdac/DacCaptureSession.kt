@@ -1,6 +1,7 @@
 package dev.usbdac
 
 import android.hardware.usb.UsbDeviceConnection
+import dev.usbdac.internal.UsbConfigurationSelection
 import dev.usbdac.internal.ClaimedInterfaces
 import dev.usbdac.internal.Native
 import dev.usbdac.internal.NativeListener
@@ -26,12 +27,16 @@ public class DacCaptureSession internal constructor(
     public val info: DacDeviceInfo,
     private val connection: UsbDeviceConnection,
     private val claims: ClaimedInterfaces,
+    private val configurationSelection: UsbConfigurationSelection,
     private val onClosed: () -> Unit,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
     private val mutableState = MutableStateFlow(DacState.READY)
     private val mutableEvents = MutableSharedFlow<DacEvent>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private var stream: DacCaptureStream? = null
+    public val routing: DacRouting = DacRouting(dac) {
+        if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "capture session is closed")
+    }
     public val state: StateFlow<DacState> get() = mutableState
     public val events: SharedFlow<DacEvent> get() = mutableEvents
 
@@ -84,6 +89,10 @@ public class DacCaptureSession internal constructor(
         } finally {
             fun release() {
                 claims.release()
+                runCatching { configurationSelection.restore() }.onFailure {
+                    logWarning("restoring USB configuration failed", it)
+                    if (failure == null) failure = it
+                }
                 runCatching { connection.close() }
                 onClosed()
             }
