@@ -28,7 +28,7 @@ In the module's `build.gradle.kts`:
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.0-alpha.3")
+    implementation("dev.usbdac:usbdac:0.1.0-alpha.4")
 }
 ```
 
