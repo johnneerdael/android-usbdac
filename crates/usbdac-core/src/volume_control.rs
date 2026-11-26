@@ -516,8 +516,8 @@ mod tests {
 
     #[test]
     fn legacy_fraction_keeps_its_attenuation_on_the_floored_curve() {
-        // lib/core/utils/volume_curve.dart mirrors this to carry a level saved
-        // under the old full-range mapping over: -63.5 dB is 20.625 % now.
+        // A host that persisted a level under the old full-range mapping can carry
+        // it over by attenuation: -63.5 dB is 20.625 % now.
         let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
         let old_raw = |fraction: f64| (-127.0 * 256.0 * (1.0 - fraction)) as i16;
         assert!((normalize_volume(old_raw(0.5), &ranges) - 0.20625).abs() < 1e-12);

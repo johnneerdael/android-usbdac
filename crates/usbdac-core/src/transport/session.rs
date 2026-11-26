@@ -1,0 +1,616 @@
+use super::*;
+
+pub(super) static SESSION_STATE: Lazy<Mutex<Option<SessionState>>> =
+    Lazy::new(|| Mutex::new(None));
+pub(super) static IDLE_LOCK: Lazy<Mutex<Option<IdleLock>>> = Lazy::new(|| Mutex::new(None));
+pub(super) static LIFECYCLE_STATE: Lazy<Mutex<LifecycleState>> =
+    Lazy::new(|| Mutex::new(LifecycleState::default()));
+/// Serializes Feature Unit I/O with other volume calls and final device clear.
+pub(super) static HARDWARE_VOLUME_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(super) static DISCOVERY_DISABLED: Once = Once::new();
+pub(super) static USB_SESSION_CLEAR_PENDING: AtomicBool = AtomicBool::new(false);
+pub(super) static HARDWARE_VOLUME_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The DAC's volume before this library first changed it. Outside SESSION_STATE
+/// so it outlives stream restarts and a `Dac` that is closed with
+/// `HandBack::Keep` and reopened.
+pub(super) static ORIGINAL_HARDWARE_VOLUME: Mutex<OriginalVolumeSlot<HardwareVolumeControl>> =
+    Mutex::new(OriginalVolumeSlot::new());
+/// What the next device clear does with that level; set by `Dac::close` just
+/// before it.
+pub(super) static ORIGINAL_VOLUME_ACTION: AtomicU32 = AtomicU32::new(ORIGINAL_VOLUME_KEEP);
+pub(super) const ORIGINAL_VOLUME_KEEP: u32 = 0;
+pub(super) const ORIGINAL_VOLUME_RESTORE: u32 = 1;
+pub(super) const ORIGINAL_VOLUME_FORGET: u32 = 2;
+
+/// Only one negotiation or output session can use the claimed interfaces.
+/// Serialize ownership transitions with device clear before the host releases them.
+pub(super) static USB_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(super) static USB_SESSION_GATE: Mutex<()> = Mutex::new(());
+
+pub(super) struct SessionGuard;
+
+impl SessionGuard {
+    // Caller holds USB_SESSION_GATE and has checked that no session is active.
+    pub(super) fn start_locked() -> Self {
+        USB_STOP_REQUESTED.store(false, Ordering::SeqCst);
+        USB_SESSION_ACTIVE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _session_gate = USB_SESSION_GATE.lock();
+        USB_SESSION_ACTIVE.store(false, Ordering::SeqCst);
+        complete_pending_clear_locked();
+    }
+}
+
+// Module-level stop signal. `clear_device()` has no handle to the stream's local
+// `stop` flag, so without this the transfer loop would keep running until the
+// stream is closed or the USB fd dies. Set from the deferred-clear path; reset
+// at session start. A second clear during teardown is harmless (idempotent).
+pub(super) static USB_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Combined stop predicate for the render/output loops: bail when either the
+/// backend's local `stop` Arc or the global clear-requested flag is set.
+pub(super) fn usb_stop_requested(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Acquire) || USB_STOP_REQUESTED.load(Ordering::Acquire)
+}
+
+pub(super) fn payload_audit_latch() -> PayloadAuditLatch {
+    PayloadAuditLatch::new(Duration::from_millis(USB_PAYLOAD_FLICKER_GRACE_MS))
+}
+
+pub(super) static USB_DSD_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
+    Lazy::new(|| Mutex::new(payload_audit_latch()));
+
+pub(super) fn usb_dsd_payload_verified() -> bool {
+    USB_DSD_PAYLOAD_LATCH.lock().is_verified()
+}
+
+/// Tests that read or write the process-global session, settings or payload
+/// audit latches take this first, so they cannot observe each other's state.
+#[cfg(test)]
+pub(crate) static PAYLOAD_LATCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+pub(super) static USB_PCM_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
+    Lazy::new(|| Mutex::new(payload_audit_latch()));
+
+pub(super) fn usb_pcm_payload_verified() -> bool {
+    USB_PCM_PAYLOAD_LATCH.lock().is_verified()
+}
+
+/// Diagnostic line for a state transition (not for per-transfer chatter).
+pub(super) fn log_usb_event(message: String) {
+    log_info!("{}", message);
+}
+
+pub(super) fn observe_dsd_payload_audit(ok: bool) {
+    let now = Instant::now();
+    let mut latch = USB_DSD_PAYLOAD_LATCH.lock();
+    if let Some(verified) = latch.observe(ok, now) {
+        let constant_for = latch.constant_for(now);
+        drop(latch);
+        log_payload_audit_transition("DSD", verified, constant_for);
+    }
+}
+
+pub(super) fn observe_pcm_payload_audit(ok: bool) {
+    let now = Instant::now();
+    let mut latch = USB_PCM_PAYLOAD_LATCH.lock();
+    if let Some(verified) = latch.observe(ok, now) {
+        let constant_for = latch.constant_for(now);
+        drop(latch);
+        log_payload_audit_transition("PCM", verified, constant_for);
+    }
+}
+
+pub(super) fn log_payload_audit_transition(transport: &str, verified: bool, constant_for: Option<Duration>) {
+    if verified {
+        log_usb_event(format!(
+            "[USB-{transport}] wire payload verified: real audio flowing, not a stuck/dead pipeline"
+        ));
+    } else {
+        let constant_ms = constant_for.map(|duration| duration.as_millis()).unwrap_or(0);
+        log_usb_event(format!(
+            "[USB-{transport}] wire payload lost: audit failed for {constant_ms}ms (constant/silent transfer)"
+        ));
+    }
+}
+
+pub(super) static LAST_BIT_PERFECT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Transition evidence line for the bit-perfect claim. Both edges are logged
+/// unconditionally so field reports can show mode flapping without Developer
+/// Mode.
+pub(super) fn log_bit_perfect_transition(verified: bool, state: &SessionState) {
+    let prev = LAST_BIT_PERFECT_LOGGED.swap(verified, Ordering::Relaxed);
+    if prev == verified {
+        return;
+    }
+    let Some(effective) = state.playback_format else {
+        return;
+    };
+    let transport = match effective.dsd_transport {
+        DsdTransportMode::DoP => "dop",
+        DsdTransportMode::Native => "dsd-native",
+        DsdTransportMode::None => "pcm",
+    };
+    if verified {
+        log_usb_event(format!(
+            "[USB-BITPERFECT] verified: {} bit/{} Hz {}ch {} direct on \"{}\" — no mixer, no resample, no DSP",
+            effective.bit_depth,
+            effective.sample_rate,
+            effective.channels,
+            transport,
+            state.device.product_name
+        ));
+    } else {
+        log_usb_event(format!(
+            "[USB-BITPERFECT] released: {} bit/{} Hz {}ch {} direct on \"{}\" — {}",
+            effective.bit_depth,
+            effective.sample_rate,
+            effective.channels,
+            transport,
+            state.device.product_name,
+            bit_perfect_release_reason(state)
+        ));
+    }
+}
+
+pub(super) fn bit_perfect_release_reason(state: &SessionState) -> &'static str {
+    if !state.stream_active {
+        return "stream inactive";
+    }
+    if !state.clock_verification_passed {
+        return "clock verification reset";
+    }
+    if state.software_volume_active {
+        return "software gain active";
+    }
+    let format_mismatch = state
+        .requested_playback_format
+        .zip(state.playback_format)
+        .is_some_and(|(requested, effective)| {
+            requested.sample_rate != effective.sample_rate
+                || requested.bit_depth != effective.bit_depth
+                || requested.channels != effective.channels
+        });
+    if format_mismatch {
+        return "requested/effective format mismatch";
+    }
+    if state
+        .runtime_stats
+        .as_ref()
+        .is_some_and(|stats| stats.transport_loss_latched())
+    {
+        return "audio lost on the USB transport";
+    }
+    "wire payload audit failed"
+}
+
+/// The bit-perfect verdict for the open stream, logging the transition. False
+/// when no stream is open.
+pub(crate) fn bit_perfect_now() -> bool {
+    let mut guard = SESSION_STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    let verified = direct_path_is_bit_perfect(state);
+    state.bit_perfect_verified = verified;
+    log_bit_perfect_transition(verified, state);
+    verified
+}
+
+pub(crate) fn is_usb_session_active() -> bool {
+    USB_SESSION_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Whether a DAC is registered (open) in this process.
+pub(crate) fn session_registered() -> bool {
+    SESSION_STATE.lock().is_some()
+}
+
+pub(super) fn clear_session_state() {
+    // Finish any in-progress Feature Unit I/O before the host releases its claims.
+    let _volume_hold = HARDWARE_VOLUME_MUTEX.lock();
+    finish_original_hardware_volume();
+    release_idle_lock();
+    if LIFECYCLE_STATE.lock().engine_state != EngineState::Fallback {
+        set_engine_state(EngineState::Idle, None);
+    }
+    *SESSION_STATE.lock() = None;
+    crate::settings::reset();
+}
+
+// The caller holds USB_SESSION_GATE so the wait API cannot report success while
+// a clear is still dropping the idle handle and its device registration.
+pub(super) fn complete_pending_clear_locked() {
+    if USB_SESSION_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    if !USB_SESSION_CLEAR_PENDING.swap(false, Ordering::SeqCst) {
+        return;
+    }
+
+    dev_eprintln!("USB direct: clearing registration after USB I/O stopped");
+    clear_session_state();
+}
+
+/// Registers the device: checks the host's claims, reads the descriptors and
+/// takes the idle handle. Fails with `Busy` while another DAC is registered or
+/// a previous session is still stopping.
+pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
+    use crate::Error;
+    let _session_gate = USB_SESSION_GATE.lock();
+    complete_pending_clear_locked();
+    if is_usb_session_active() || SESSION_STATE.lock().is_some() {
+        return Err(Error::Busy);
+    }
+    let capability_model = inspect_usb_capabilities(&device).map_err(Error::Claim)?;
+    if capability_model.alt_settings.is_empty() {
+        return Err(Error::Unsupported {
+            reason: "the device has no isochronous OUT audio streaming interface".to_string(),
+            offered: Vec::new(),
+        });
+    }
+    let mut guard = SESSION_STATE.lock();
+    release_idle_lock();
+    set_engine_state(EngineState::Idle, None);
+    *guard = Some(SessionState {
+        device,
+        requested_playback_format: None,
+        playback_format: None,
+        lock_requested: true,
+        stream_active: false,
+        capability_model: Some(capability_model),
+        clock_status: None,
+        clock_control_attempted: false,
+        clock_control_succeeded: false,
+        clock_verification_passed: false,
+        dac_mode: DacMode::FullControl,
+        last_error: None,
+        direct_mode_refusal_reason: None,
+        usb_stream_stable: false,
+        bit_perfect_verified: false,
+        software_volume_active: false,
+        hardware_volume_control: None,
+        hardware_volume_generation: HARDWARE_VOLUME_GENERATION.fetch_add(1, Ordering::Relaxed),
+        hardware_volume_error: None,
+        hardware_volume_state: None,
+        runtime_stats: None,
+    });
+    drop(guard);
+    if let Err(error) = ensure_idle_lock() {
+        *SESSION_STATE.lock() = None;
+        return Err(Error::Claim(error));
+    }
+    Ok(())
+}
+
+/// Stops the session now, or as soon as the output thread has finished, and
+/// drops the registration.
+pub(crate) fn clear_device() {
+    let _session_gate = USB_SESSION_GATE.lock();
+    USB_SESSION_CLEAR_PENDING.store(true, Ordering::SeqCst);
+    if is_usb_session_active() {
+        // Signal the running transfer loop to drain before the host releases
+        // the interfaces and lets the platform driver rebind.
+        USB_STOP_REQUESTED.store(true, Ordering::SeqCst);
+        dev_eprintln!("USB direct: clear requested while a session is active; stopping the transfer loop");
+        return;
+    }
+
+    complete_pending_clear_locked();
+}
+
+/// Waits until the output thread has stopped and the registration is gone.
+pub(crate) fn wait_for_session_stop(timeout: Duration) -> bool {
+    let started_at = Instant::now();
+    loop {
+        if let Some(_session_gate) = USB_SESSION_GATE.try_lock() {
+            if !is_usb_session_active() {
+                complete_pending_clear_locked();
+                return true;
+            }
+        }
+        if started_at.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub(super) fn set_last_error(error: Option<String>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.last_error = error;
+    }
+}
+
+pub(super) fn set_direct_mode_refusal_reason(reason: Option<String>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.direct_mode_refusal_reason = reason;
+    }
+}
+
+pub(super) fn set_usb_stream_stable(stable: bool) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.usb_stream_stable = stable;
+    }
+}
+
+pub(super) fn set_software_volume_active(active: bool) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.software_volume_active = active;
+        state.bit_perfect_verified = direct_path_is_bit_perfect(state);
+    }
+}
+
+pub(super) fn set_hardware_volume_error(error: Option<String>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.hardware_volume_error = error;
+    }
+}
+
+pub(super) fn publish_hardware_volume_snapshot(
+    generation: u64,
+    volume: crate::volume::VolumeState,
+) -> Result<(), String> {
+    let mut guard = SESSION_STATE.lock();
+    let state = guard.as_mut().filter(|state| state.hardware_volume_generation == generation)
+        .ok_or_else(|| "USB volume route changed during control transfer".to_string())?;
+    state.hardware_volume_state = Some(volume);
+    state.hardware_volume_error = None;
+    Ok(())
+}
+
+pub(super) fn set_runtime_stats(runtime_stats: Option<Arc<RuntimeStats>>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.runtime_stats = runtime_stats;
+    }
+}
+
+pub(super) fn set_capability_model(capability_model: Option<CapabilityModel>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.capability_model = capability_model;
+    }
+}
+
+pub(super) fn engine_state_label(state: EngineState) -> &'static str {
+    match state {
+        EngineState::Idle => "idle",
+        EngineState::UsbInit => "usbInit",
+        EngineState::UsbReady => "usbReady",
+        EngineState::Streaming => "streaming",
+        EngineState::Error => "error",
+        EngineState::Fallback => "fallback",
+    }
+}
+
+pub(super) fn set_engine_state(state: EngineState, reason: Option<String>) {
+    let mut lifecycle_state = LIFECYCLE_STATE.lock();
+    let previous = lifecycle_state.engine_state;
+    lifecycle_state.engine_state = state;
+    lifecycle_state.reason = reason;
+    if previous != state {
+        dev_eprintln!(
+            "USB direct engine state: {:?} -> {:?}",
+            previous, state
+        );
+    }
+    dev_eprintln!(
+        "[USB][STATE] {}{}",
+        engine_state_label(state),
+        lifecycle_state
+            .reason
+            .as_ref()
+            .map(|reason| format!(" ({})", reason))
+            .unwrap_or_default()
+    );
+}
+
+pub(super) fn set_clock_status(clock_status: Option<ClockStatus>) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.clock_status = clock_status;
+    }
+}
+
+pub(super) fn set_clock_verification(
+    attempted: bool,
+    succeeded: bool,
+    passed: bool,
+    reported_sample_rate: Option<u32>,
+) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.clock_control_attempted = attempted;
+        state.clock_control_succeeded = succeeded;
+        state.clock_verification_passed = passed;
+        if let Some(clock_status) = state.clock_status.as_mut() {
+            clock_status.reported_sample_rate = reported_sample_rate;
+        }
+        state.bit_perfect_verified = direct_path_is_bit_perfect(state);
+    }
+}
+
+pub(super) fn direct_path_is_bit_perfect(state: &SessionState) -> bool {
+    if !state.stream_active {
+        return false;
+    }
+
+    // Audio that was queued but never reached the DAC cannot be re-sent, so a
+    // stream that lost any can no longer claim bit-perfect output. The latch
+    // lives in the per-stream runtime stats and clears only with a new stream.
+    if state
+        .runtime_stats
+        .as_ref()
+        .is_some_and(|stats| stats.transport_loss_latched())
+    {
+        return false;
+    }
+
+    let Some(requested) = state.requested_playback_format else {
+        return false;
+    };
+    let Some(effective) = state.playback_format else {
+        return false;
+    };
+
+    // Bit-perfect requires: the format the host asked for (no rate change), a
+    // verified clock, no software gain, no lost audio (checked above), and a
+    // live wire payload that passed the audit (the PCM payload audit, or for
+    // DSD the DoP-marker / native-byte audit).
+    if state.software_volume_active {
+        return false;
+    }
+    let payload_ok = match effective.dsd_transport {
+        DsdTransportMode::DoP | DsdTransportMode::Native => usb_dsd_payload_verified(),
+        DsdTransportMode::None => usb_pcm_payload_verified(),
+    };
+    requested.sample_rate == effective.sample_rate
+        && requested.bit_depth == effective.bit_depth
+        && requested.channels == effective.channels
+        && state.clock_verification_passed
+        && payload_ok
+}
+
+pub(super) fn set_effective_playback_format(mut playback_format: PlaybackFormat) {
+    // Never store 0 Hz — buggy DACs (Fosi DS2 / Savitech) report 0 via
+    // GET_CUR even after a successful SET_CUR. If the requested format has
+    // a valid rate, use it instead. This stops the 0 from poisoning every
+    // downstream consumer (validate_android_direct_request, format
+    // selection, stream rate resolution, position calculation).
+    if playback_format.sample_rate == 0 {
+        if let Some(state) = SESSION_STATE.lock().as_ref() {
+            if let Some(req) = state.requested_playback_format {
+                if req.sample_rate > 0 {
+                    dev_eprintln!(
+                        "[USB] set_effective_playback_format: refusing to store 0 Hz, using requested {} Hz instead",
+                        req.sample_rate
+                    );
+                    playback_format.sample_rate = req.sample_rate;
+                }
+            }
+        }
+    }
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.playback_format = Some(playback_format);
+    }
+}
+
+pub(super) fn set_dac_mode(mode: DacMode) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.dac_mode = mode;
+    }
+}
+
+pub(super) fn set_stream_active(active: bool) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.stream_active = active;
+    }
+}
+
+pub(super) fn release_idle_lock() {
+    // The host owns the claims and releases them after the USB session stops.
+    IDLE_LOCK.lock().take();
+}
+
+pub(super) fn ensure_idle_lock() -> Result<(), String> {
+    if IDLE_LOCK.lock().is_some() {
+        return Ok(());
+    }
+
+    let state = SESSION_STATE
+        .lock()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "no DAC is open".to_string())?;
+    let claimed_handle = open_claimed_usb_handle(&state.device).map_err(|error| {
+        set_last_error(Some(error.clone()));
+        set_direct_mode_refusal_reason(Some(error.clone()));
+        set_engine_state(EngineState::Error, Some(error.clone()));
+        error
+    })?;
+
+    dev_eprintln!(
+        "USB direct idle lock using the host's claims for '{}' interfaces {:?}",
+        state.device.product_name, claimed_handle.claimed_interfaces
+    );
+
+    *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());
+    Ok(())
+}
+
+
+/// A registered session without a USB device behind it, for host tests.
+#[cfg(test)]
+pub(crate) struct TestSession;
+
+#[cfg(test)]
+impl TestSession {
+    /// Registers a fake DAC whose state says "streaming, verified clock".
+    pub(crate) fn install() -> Self {
+        *SESSION_STATE.lock() = Some(test_state(None));
+        Self
+    }
+
+    /// Like `install`, with the stream's counters attached.
+    pub(crate) fn install_streaming(stats: Arc<RuntimeStats>) -> Self {
+        *SESSION_STATE.lock() = Some(test_state(Some(stats)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSession {
+    fn drop(&mut self) {
+        *SESSION_STATE.lock() = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pcm_format() -> PlaybackFormat {
+    PlaybackFormat {
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        is_dop: false,
+        dsd_transport: DsdTransportMode::None,
+        dsd_bit_rate: 0,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionState {
+    SessionState {
+        device: UsbDevice {
+            fd: -1,
+            _fd_owner: Arc::new(OwnedUsbFd(-1)),
+            claimed_interfaces: Arc::from(Vec::<u8>::new()),
+            vendor_id: 0,
+            product_id: 0,
+            product_name: "test DAC".to_string(),
+            device_name: None,
+        },
+        requested_playback_format: Some(test_pcm_format()),
+        playback_format: Some(test_pcm_format()),
+        lock_requested: true,
+        stream_active: true,
+        capability_model: None,
+        clock_status: None,
+        clock_control_attempted: true,
+        clock_control_succeeded: true,
+        clock_verification_passed: true,
+        dac_mode: DacMode::FullControl,
+        last_error: None,
+        direct_mode_refusal_reason: None,
+        usb_stream_stable: false,
+        bit_perfect_verified: false,
+        software_volume_active: false,
+        hardware_volume_control: None,
+        hardware_volume_generation: 0,
+        hardware_volume_error: None,
+        hardware_volume_state: None,
+        runtime_stats,
+    }
+}
