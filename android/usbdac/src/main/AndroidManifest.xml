@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Direct USB output needs USB host mode, but the managed (AudioTrack) transport does not,
+         so an app that uses this library is not filtered out of devices without it. -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
+    <!-- Only AndroidManagedOutput uses this: AudioManager.setPreferredMixerAttributes requires it
+         for the bit-perfect request on Android 14 and later. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+</manifest>

@@ -1,0 +1,7 @@
+// Plugin versions live here so both modules use the same ones.
+plugins {
+    id("com.android.library") version "9.1.0" apply false
+    id("com.android.application") version "9.1.0" apply false
+    id("org.jetbrains.kotlin.android") version "2.4.0" apply false
+    id("org.jetbrains.dokka") version "2.3.0" apply false
+}

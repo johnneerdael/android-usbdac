@@ -1,0 +1,85 @@
+package dev.usbdac
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class EventDecodeTest {
+    @Test
+    fun stateChangesDecodeByCode() {
+        assertEquals(DacEvent.StateChanged(StreamState.PAUSED), decodeEvent(0, 2, 0.0, null))
+        assertEquals(DacEvent.StateChanged(StreamState.FAILED), decodeEvent(0, 6, 0.0, null))
+        assertTrue(decodeEvent(0, 99, 0.0, null) is DacEvent.Unknown)
+    }
+
+    @Test
+    fun simpleEventsDecode() {
+        assertEquals(DacEvent.Underrun, decodeEvent(1, 0, 0.0, null))
+        assertEquals(DacEvent.LostFrames(44), decodeEvent(2, 44, 0.0, null))
+        assertEquals(DacEvent.BitPerfectChanged(true), decodeEvent(3, 1, 0.0, null))
+        assertEquals(DacEvent.BitPerfectChanged(false), decodeEvent(3, 0, 0.0, null))
+        assertEquals(DacEvent.FeedbackStale, decodeEvent(5, 0, 0.0, null))
+        assertEquals(DacEvent.DeviceLost, decodeEvent(7, 0, 0.0, null))
+    }
+
+    @Test
+    fun aVolumeEventReadsItsJsonMessage() {
+        val event = decodeEvent(4, 1, -12.5, """{"db":-12.5,"fraction":0.6,"muted":true}""")
+        assertEquals(DacEvent.VolumeChanged(VolumeState(-12.5, 0.6, true)), event)
+    }
+
+    @Test
+    fun aVolumeEventWithoutAMessageFallsBackToTheNumericFields() {
+        val unknownMute = decodeEvent(4, -1, -30.0, null) as DacEvent.VolumeChanged
+        assertEquals(-30.0, unknownMute.state.db, 0.0)
+        assertEquals(null, unknownMute.state.muted)
+        val muted = decodeEvent(4, 1, -30.0, "not json") as DacEvent.VolumeChanged
+        assertEquals(true, muted.state.muted)
+    }
+
+    @Test
+    fun anErrorEventCarriesTheTypedException() {
+        val event = decodeEvent(6, 7, 0.0, "usbdac:transfer: boom") as DacEvent.StreamFailed
+        assertEquals(DacErrorCode.TRANSFER, event.error.code)
+        assertEquals("boom", event.error.detail)
+    }
+
+    @Test
+    fun anErrorEventWithAnUnparsableMessageStillDecodes() {
+        val event = decodeEvent(6, 3, 0.0, null) as DacEvent.StreamFailed
+        assertEquals(DacErrorCode.UNKNOWN, event.error.code)
+    }
+
+    @Test
+    fun anUnknownTypeIsKeptAsUnknown() {
+        val event = decodeEvent(-1, 0, 0.0, "SomethingNew") as DacEvent.Unknown
+        assertEquals("SomethingNew", event.description)
+    }
+
+    @Test
+    fun theDirectStateFollowsTheFlagAndNamesTheBlocker() {
+        assertEquals(BitPerfectState.Verified, directBitPerfectState(true, null))
+        val state = directBitPerfectState(false, BitPerfectBlocker.SOFTWARE_GAIN) as BitPerfectState.NotVerified
+        assertEquals(BitPerfectBlocker.SOFTWARE_GAIN, state.blocker)
+        assertEquals(BitPerfectBlocker.SOFTWARE_GAIN.description, state.reason)
+        val unknown = directBitPerfectState(false, null) as BitPerfectState.NotVerified
+        assertEquals(BitPerfectBlocker.UNKNOWN, unknown.blocker)
+    }
+
+    @Test
+    fun onlyTheLibrarysOwnVerdictIsVerified() {
+        assertTrue(BitPerfectState.Verified.isVerified)
+        assertFalse(BitPerfectState.NotVerified(null, "x").isVerified)
+        assertFalse(BitPerfectState.RequestedViaPlatform("x").isVerified)
+        assertFalse(BitPerfectState.Unverifiable("x").isVerified)
+    }
+
+    @Test
+    fun everyBlockerNameRoundTrips() {
+        for (blocker in BitPerfectBlocker.entries.filter { it != BitPerfectBlocker.UNKNOWN }) {
+            assertEquals(blocker, BitPerfectBlocker.fromWireName(blocker.wireName))
+        }
+        assertEquals(null, BitPerfectBlocker.fromWireName(null))
+    }
+}

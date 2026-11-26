@@ -1,0 +1,7 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+*.iml
+# Native libraries are build output of the buildUsbdacNative task.
+usbdac/src/main/jniLibs/
