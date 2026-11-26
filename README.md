@@ -32,8 +32,9 @@ meant to sit on top of the JNI layer; it is not part of this repository yet.
   (carrier up to what the DAC runs), native DSD (DSD_U8/U16/U32, byte order and
   bit order per device).
 - Output: a ring buffer (250 ms target, 500 ms capacity by default) feeds eight
-  isochronous transfers in flight; explicit feedback endpoints are polled
-  asynchronously and steer the packet sizes.
+  isochronous transfers in flight, 16 ms queued on the bus at every service
+  interval and for every encoding, never 256 packets; explicit feedback
+  endpoints are polled asynchronously and steer the packet sizes.
 - Reporting: played frames and latency counted on completed transfers, lost
   frames (timed-out and short transfers) latched, an audit of the wire payload,
   and `is_bit_perfect()` combining them with the clock verification, with

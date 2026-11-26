@@ -1,30 +1,102 @@
+/// Default time the library keeps queued on the bus
+/// ([`DacConfig::bus_queue_ms`](crate::DacConfig::bus_queue_ms)).
+pub(crate) const DEFAULT_BUS_QUEUE_MS: u32 = 16;
+/// Default number of isochronous transfers in flight
+/// ([`DacConfig::transfers_in_flight`](crate::DacConfig::transfers_in_flight)).
+pub(crate) const DEFAULT_TRANSFERS_IN_FLIGHT: u32 = 8;
+/// Most packets one transfer carries.
+pub(crate) const MAX_PACKETS_PER_TRANSFER: usize = 32;
+/// Packets in flight never reach this count. On the one phone and DAC this was
+/// measured on, 255 or fewer always played and exactly 256 always stalled.
+pub(crate) const PACKET_FLIGHT_LIMIT: usize = 256;
+/// Completed-transfer time after which a stream counts as stable.
+const STABLE_WINDOW_US: u64 = 256_000;
+/// Consecutive lossy transfers are bounded in time as well as in number: at
+/// least this much audio must be lost in a row before the stream is stopped.
+const MAX_CONSECUTIVE_LOSS_US: u64 = 6_000;
+/// ...and never fewer transfers than this.
+const MIN_CONSECUTIVE_LOSSY_URBS: u32 = 3;
+
+/// How the isochronous queue is shaped: the same rule for every service
+/// interval and every encoding, so the time queued on the bus is constant.
+///
+/// A transfer carries `bus_queue_ms / transfers_in_flight` of audio (2 ms by
+/// default), rounded to whole service intervals, at least one packet and at
+/// most [`MAX_PACKETS_PER_TRANSFER`]; `transfers_in_flight` of them are on the
+/// bus (8 by default), so about `bus_queue_ms` is queued (16 ms by default):
+///
+/// | service interval | packets x transfers | queued |
+/// |---|---|---|
+/// | 125 us | 16 x 8 | 16 ms |
+/// | 250 us | 8 x 8 | 16 ms |
+/// | 500 us | 4 x 8 | 16 ms |
+/// | 1000 us | 2 x 8 | 16 ms |
+///
+/// The packets in flight (`packets_per_transfer * transfer_slots`) never reach
+/// [`PACKET_FLIGHT_LIMIT`]: when the configured depth would, the cap wins and
+/// the transfers carry fewer packets (and less is queued).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IsoQueueGeometry {
     pub(crate) packets_per_transfer: usize,
     pub(crate) transfer_slots: usize,
     pub(crate) stable_transfers: usize,
+    pub(crate) service_interval_us: u32,
 }
 
 impl IsoQueueGeometry {
-    pub(crate) fn for_stream(service_interval_us: u32, dsd_on_wire: bool) -> Self {
-        // On a OnePlus 15 + DC04U, 125-us PCM stalled with 256 packets in
-        // flight. Both 8 x 16 and 16 x 8 (packets x slots) worked with 128
-        // packets queued, but 16 x 8 completed half as many URBs per second
-        // and used less CPU. This is a device result, not a controller limit.
-        // Keep the original geometry for other intervals and native DSD/DoP.
-        if service_interval_us == 125 && !dsd_on_wire {
-            return Self {
-                packets_per_transfer: 16,
-                transfer_slots: 8,
-                // Keep the old 256 ms observation window (64 x 32 x 125 us).
-                stable_transfers: 128,
-            };
-        }
+    pub(crate) fn for_stream(
+        service_interval_us: u32,
+        bus_queue_ms: u32,
+        transfers_in_flight: u32,
+    ) -> Self {
+        let interval = u64::from(service_interval_us.max(1));
+        let slots = u64::from(transfers_in_flight.max(1));
+        let transfer_us = u64::from(bus_queue_ms) * 1_000 / slots;
+        // Round to the nearest whole packet.
+        let wanted = (transfer_us + interval / 2) / interval;
+        let flight_cap = (PACKET_FLIGHT_LIMIT as u64 - 1) / slots;
+        let packets = wanted
+            .clamp(1, MAX_PACKETS_PER_TRANSFER as u64)
+            .min(flight_cap.max(1));
+        let completed_us = packets * interval;
         Self {
-            packets_per_transfer: (4_000 / service_interval_us.max(1)).clamp(16, 32) as usize,
-            transfer_slots: 8,
-            stable_transfers: 64,
+            packets_per_transfer: packets as usize,
+            transfer_slots: slots as usize,
+            stable_transfers: STABLE_WINDOW_US.div_ceil(completed_us).max(1) as usize,
+            service_interval_us: interval as u32,
         }
+    }
+
+    /// The geometry the library was tuned with, for a service interval.
+    #[cfg(test)]
+    pub(crate) fn default_for(service_interval_us: u32) -> Self {
+        Self::for_stream(
+            service_interval_us,
+            DEFAULT_BUS_QUEUE_MS,
+            DEFAULT_TRANSFERS_IN_FLIGHT,
+        )
+    }
+
+    /// Packets submitted and not yet completed when every slot is full.
+    pub(crate) fn packets_in_flight(&self) -> usize {
+        self.packets_per_transfer * self.transfer_slots
+    }
+
+    /// Audio one transfer carries, in microseconds.
+    pub(crate) fn transfer_us(&self) -> u64 {
+        self.packets_per_transfer as u64 * u64::from(self.service_interval_us)
+    }
+
+    /// Audio queued on the bus when every slot is full, in microseconds.
+    pub(crate) fn queued_us(&self) -> u64 {
+        self.packets_in_flight() as u64 * u64::from(self.service_interval_us)
+    }
+
+    /// How many lossy transfers in a row stop the stream: the same stretch of
+    /// time whatever the geometry (never fewer than three transfers).
+    pub(crate) fn max_consecutive_lossy_urbs(&self) -> u32 {
+        let by_time = MAX_CONSECUTIVE_LOSS_US.div_ceil(self.transfer_us().max(1)) as u32;
+        by_time.max(MIN_CONSECUTIVE_LOSSY_URBS)
     }
 }
 
@@ -46,7 +118,7 @@ impl IsoPacketScheduler {
             sample_rate,
             bytes_per_frame,
             service_interval_us,
-            IsoQueueGeometry::for_stream(service_interval_us, false),
+            IsoQueueGeometry::default_for(service_interval_us),
         )
     }
 

@@ -1,6 +1,7 @@
 //! Configuration of a [`Dac`](crate::Dac) session.
 
 use crate::error::{Error, Result};
+use crate::iso_packet_scheduler::{DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT};
 use crate::quirk::Quirk;
 
 /// What happens to the DAC's hardware volume when the [`Dac`](crate::Dac) is
@@ -83,6 +84,17 @@ pub struct DacConfig {
     pub realtime_priority: bool,
     /// What to do with the hardware volume level on close.
     pub hand_back: HandBack,
+    /// How much audio, in milliseconds, is kept queued on the USB bus: the
+    /// transfers in flight together carry about this much. The same for every
+    /// service interval and encoding. It is what a pause or a flush still plays
+    /// out, and the headroom against a late output thread. 4 to 64, default 16. A transfer carries
+    /// `bus_queue_ms / transfers_in_flight` of audio (2 ms by default), at most
+    /// 32 packets, and the packets in flight never reach 256 (255 at most):
+    /// when the configured depth would, that cap wins and less is queued.
+    pub bus_queue_ms: u32,
+    /// How many isochronous transfers are in flight at once. 2 to 16,
+    /// default 8. See [`bus_queue_ms`](Self::bus_queue_ms).
+    pub transfers_in_flight: u32,
 }
 
 impl Default for DacConfig {
@@ -101,6 +113,8 @@ impl Default for DacConfig {
             allow_unsynchronized_async: false,
             realtime_priority: true,
             hand_back: HandBack::default(),
+            bus_queue_ms: DEFAULT_BUS_QUEUE_MS,
+            transfers_in_flight: DEFAULT_TRANSFERS_IN_FLIGHT,
         }
     }
 }
@@ -128,6 +142,12 @@ impl DacConfig {
                 return bad("dsd_subslot must be 1, 2 or 4");
             }
         }
+        if !(4..=64).contains(&self.bus_queue_ms) {
+            return bad("bus_queue_ms must be between 4 and 64");
+        }
+        if !(2..=16).contains(&self.transfers_in_flight) {
+            return bad("transfers_in_flight must be between 2 and 16");
+        }
         Ok(())
     }
 }
@@ -147,6 +167,8 @@ mod tests {
         assert!(config.realtime_priority);
         assert!(!config.allow_unsynchronized_async);
         assert_eq!(config.hand_back, HandBack::RestoreOriginal);
+        assert_eq!(config.bus_queue_ms, 16);
+        assert_eq!(config.transfers_in_flight, 8);
         config.validate().unwrap();
     }
 
@@ -161,5 +183,19 @@ mod tests {
         let mut config = DacConfig::default();
         config.buffer_capacity_ms = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_bus_queue_is_validated_at_both_ends_of_its_range() {
+        for (bus_queue_ms, ok) in [(0, false), (3, false), (4, true), (16, true), (64, true), (65, false)] {
+            let config = DacConfig { bus_queue_ms, ..DacConfig::default() };
+            assert_eq!(config.validate().is_ok(), ok, "bus_queue_ms={bus_queue_ms}");
+        }
+        for (transfers_in_flight, ok) in [(0, false), (1, false), (2, true), (8, true), (16, true), (17, false)] {
+            let config = DacConfig { transfers_in_flight, ..DacConfig::default() };
+            assert_eq!(config.validate().is_ok(), ok, "transfers_in_flight={transfers_in_flight}");
+        }
+        let error = DacConfig { bus_queue_ms: 3, ..DacConfig::default() }.validate().unwrap_err();
+        assert!(matches!(&error, Error::InvalidArgument(message) if message.contains("bus_queue_ms")));
     }
 }

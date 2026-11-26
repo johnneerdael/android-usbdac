@@ -51,6 +51,8 @@ internal fun DacConfig.toNativeJson(): String =
         .put("allow_unsynchronized_async", allowUnsynchronizedAsync)
         .put("realtime_priority", realtimePriority)
         .put("hand_back", "keep")
+        .put("bus_queue_ms", busQueueMs)
+        .put("transfers_in_flight", transfersInFlight)
         .put("quirks", JSONArray(quirks.map(::overrideJson)))
         .toString()
 

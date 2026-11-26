@@ -277,10 +277,12 @@ impl Drop for IsoTransferSlot {
 /// Persistent asynchronous feedback IN slot.
 ///
 /// The previous implementation performed a blocking feedback read from the
-/// single output thread. Four queued OUT transfers only cover ~16 ms at
-/// 125 us service intervals, so a 50 ms feedback timeout could drain the
+/// single output thread. The OUT transfers on the bus only cover about 16 ms
+/// (`DacConfig::bus_queue_ms`), so a 50 ms feedback timeout could drain the
 /// entire hardware queue even while the software ring looked full. This slot
 /// is submitted once and re-armed from the same event loop after completion.
+/// It polls over at most the bus queue (and 16 ms), so a report is never older
+/// than what is queued for the DAC.
 pub(super) struct FeedbackTransferSlot {
     pub(super) transfer: std::ptr::NonNull<libusb_transfer>,
     pub(super) user_data: *mut IsoTransferUserData,
@@ -292,10 +294,10 @@ pub(super) struct FeedbackTransferSlot {
 }
 
 impl FeedbackTransferSlot {
-    pub(super) fn new(endpoint: FeedbackEndpoint) -> Result<Self, String> {
+    pub(super) fn new(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> Result<Self, String> {
         let packet_bytes = endpoint.max_packet_bytes.max(4);
         let packet_count = if endpoint.transfer_type == TransferType::Isochronous {
-            let window_packets = (USB_FEEDBACK_POLL_WINDOW_MS * 1_000)
+            let window_packets = (USB_FEEDBACK_POLL_WINDOW_MS.min(bus_queue_ms.max(1)) * 1_000)
                 / endpoint.service_interval_us.max(125);
             window_packets.clamp(1, 32) as usize
         } else {

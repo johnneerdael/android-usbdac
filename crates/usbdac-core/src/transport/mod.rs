@@ -104,18 +104,20 @@ const UAC2_FEATURE_UNIT_MUTE_CONTROL: u16 = 0x0100;
 const UAC2_FEATURE_UNIT_VOLUME_CONTROL: u16 = 0x0200;
 const ISO_TRANSFER_TIMEOUT_MS: u32 = 1000;
 // A lossy data URB (it timed out, or the DAC took fewer bytes than were queued)
-// cannot be re-sent: up to IsoQueueGeometry::transfer_slots later URBs are
-// already queued behind it and re-sending would play out of order. So loss is
-// counted, clears the bit-perfect status at the first lost frame, and is bounded
-// two ways so a broken transport stops the stream instead of playing glitched
-// audio indefinitely.
+// cannot be re-sent: up to `transfers_in_flight` later URBs are already queued
+// behind it and re-sending would play out of order. So loss is counted, clears
+// the bit-perfect status at the first lost frame, and is bounded two ways so a
+// broken transport stops the stream instead of playing glitched audio
+// indefinitely.
 //
-// More than this many lossy URBs in a row means the host or DAC has stopped
+// More than `IsoQueueGeometry::max_consecutive_lossy_urbs` lossy URBs in a row
+// (three of the default 2 ms transfers, and never less than about 6 ms of
+// audio whatever the transfer size) means the host or DAC has stopped
 // consuming, not that one slot was unlucky.
-const USB_MAX_CONSECUTIVE_LOSSY_URBS: u32 = 3;
+//
 // Cumulative budget since stream start, for loss that is sporadic and so never
-// trips the consecutive bound. 100 ms is about 50 high-speed URBs' worth of
-// audio (one 16-packet PCM URB at 125us is 2 ms): dozens of audible dropouts, far
+// trips the consecutive bound. 100 ms is about 50 default URBs' worth of audio
+// (a default transfer carries 2 ms at every service interval): dozens of audible dropouts, far
 // more than a healthy link ever produces, yet short enough that a stream which
 // keeps shedding frames is not left running for hours. The bit-perfect status
 // is already gone after the first lost frame, so this only decides when to stop
@@ -125,6 +127,8 @@ const USB_MAX_LOST_AUDIO_MS: u64 = 100;
 const USB_LOSS_LOG_BURST: u32 = 4;
 const USB_LOSS_LOG_MIN_INTERVAL_MS: u64 = 1_000;
 const USB_FEEDBACK_TIMEOUT_MS: u32 = 50;
+/// Longest window one feedback transfer polls over; shortened to the bus queue
+/// (`DacConfig::bus_queue_ms`) when that is shallower.
 const USB_FEEDBACK_POLL_WINDOW_MS: u32 = 16;
 const USB_FEEDBACK_STALE_WARN_MS: u64 = 500;
 const USB_PAYLOAD_FLICKER_GRACE_MS: u64 = 1500;

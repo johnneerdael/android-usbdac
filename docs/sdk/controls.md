@@ -17,6 +17,15 @@ Pass a `DacConfig` to `UsbDac.open(context, device, config)`. `DacConfig()` is w
 
 A deep ring costs nothing in responsiveness if you `flush()` on every seek, stop and track change: the flush drops the ring at once. A shallow ring lowers memory and latency and makes underruns likelier (an underrun pads the wire with silence and sends `DacEvent.Underrun`).
 
+### The bus queue
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `busQueueMs` | `Int` | 16 | Audio kept queued on the USB bus, 4 to 64: what a `pause()` still plays out and the headroom against a late output thread. The same for every service interval and encoding | None |
+| `transfersInFlight` | `Int` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `busQueueMs / transfersInFlight` of audio (2 ms by default) | None |
+
+The packets in flight never reach 256, and at most 32 go in a transfer. Where the configured depth would break either limit the cap wins and less is queued: `busQueueMs = 64` with eight transfers at a 125 us service interval queues 31 ms, not 64. A DAC with a 1 ms service interval used to queue 128 ms and DSD at 125 us 256 packets (one more than the measured stall point); both now queue 16 ms like every other case. A shorter queue makes a pause or a stop sound sooner and leaves less headroom for a late output thread; leave the defaults unless a DAC underruns (deepen) or a host needs the shortest pause (shorten). See [the bus queue](../API.md#the-bus-queue).
+
 ### Clock and format
 
 | Option | Type | Default | Effect | Bit-perfect impact |
@@ -72,7 +81,7 @@ Build one with `StreamRequest.pcm(rate, channels, bits)`, `StreamRequest.dop(dsd
 | `write(buffer)` | `ByteBuffer -> Int` | Writes whole frames in the wire layout, advances the position by what it took. Never blocks. A direct buffer is read in place; a heap buffer is copied | The bytes written are the bytes on the wire |
 | `writableBytes` | `Int` | Room up to the target depth, a whole number of frames; 0 after `drain()`. A target, not a limit | None |
 | `play()` | | Starts or resumes. A new stream starts itself once `startThresholdMs` is buffered | None |
-| `pause()` | | Sends silence (zeros for PCM, the idle pattern for DSD, DoP markers keep alternating) so the DAC stays locked. Does not consume the ring. Transfers already queued on the bus (16 to 32 ms on a high-speed link, about 130 ms on full speed) still play | None |
+| `pause()` | | Sends silence (zeros for PCM, the idle pattern for DSD, DoP markers keep alternating) so the DAC stays locked. Does not consume the ring. Transfers already queued on the bus (`busQueueMs`, 16 ms by default, at every service interval) still play | None |
 | `flush()` | | Drops the ring, resets `playedFrames` to 0, clears a pending `drain()`, holds silence until the ring has the start threshold again | None |
 | `drain()` | | Declares the end of the audio: the ring plays out, including a tail shorter than the start threshold. Writes then fail until `flush()` | None. The padded end is not an underrun |
 | `isDrained` | `Boolean` | `true` when everything written has completed on the bus | None |

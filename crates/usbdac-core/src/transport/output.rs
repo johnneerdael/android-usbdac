@@ -398,9 +398,13 @@ pub(super) fn run_usb_output_loop(
 
     let channels = candidate.channels as usize;
     let bytes_per_frame = slot_bytes.saturating_mul(channels);
+    // One rule for every service interval and encoding (PCM, DoP, native DSD):
+    // the same time on the bus, never 256 packets in flight.
+    let bus_config = settings().config.clone();
     let geometry = IsoQueueGeometry::for_stream(
         candidate.service_interval_us,
-        playback_format.is_dop || playback_format.dsd_transport == DsdTransportMode::Native,
+        bus_config.bus_queue_ms,
+        bus_config.transfers_in_flight,
     );
     let mut scheduler = IsoPacketScheduler::with_geometry(
         playback_format.sample_rate,
@@ -418,7 +422,7 @@ pub(super) fn run_usb_output_loop(
     let mut feedback_slot = None;
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
-            match FeedbackTransferSlot::new(endpoint) {
+            match FeedbackTransferSlot::new(endpoint, bus_config.bus_queue_ms) {
                 Ok(slot) => feedback_slot = Some(slot),
                 Err(error) => {
                     dev_eprintln!(
@@ -436,11 +440,7 @@ pub(super) fn run_usb_output_loop(
             );
         }
     } else if candidate.sync_type == SyncType::Asynchronous {
-        let packets_per_transfer = scheduler.packets_per_transfer();
-        let bus_cushion_ms = transfer_slot_count
-            .saturating_mul(packets_per_transfer)
-            .saturating_mul(candidate.service_interval_us as usize)
-            / 1000;
+        let bus_cushion_ms = geometry.queued_us() / 1000;
         log_warn!(
             "[USB] Async sink exposes no feedback endpoint; host-paced nominal timing with {} \
              queued transfers (~{}ms bus cushion). Drift beyond that cushion will still drop out.",
@@ -474,7 +474,7 @@ pub(super) fn run_usb_output_loop(
         bytes_per_frame,
     );
     let mut loss_tracker = LossTracker::new(LossLimits {
-        max_consecutive_lossy_urbs: USB_MAX_CONSECUTIVE_LOSSY_URBS,
+        max_consecutive_lossy_urbs: geometry.max_consecutive_lossy_urbs(),
         max_lost_frames: lost_frame_budget(
             runtime_stats.sample_rate,
             USB_MAX_LOST_AUDIO_MS,
@@ -502,11 +502,19 @@ pub(super) fn run_usb_output_loop(
 
     let priming_target = runtime_stats.start_threshold_samples;
     log_info!(
-        "[USB] Isochronous queue: serviceIntervalUs={} packetsPerTransfer={} slots={} stableTransfers={}",
+        "[USB] Isochronous queue: serviceIntervalUs={} packetsPerTransfer={} slots={} stableTransfers={} \
+         packetsInFlight={} transferMs={:.3} busQueueMs={:.3} (configured {}ms in {} transfers) \
+         maxConsecutiveLossyUrbs={}",
         candidate.service_interval_us,
         geometry.packets_per_transfer,
         geometry.transfer_slots,
         geometry.stable_transfers,
+        geometry.packets_in_flight(),
+        geometry.transfer_us() as f64 / 1000.0,
+        geometry.queued_us() as f64 / 1000.0,
+        bus_config.bus_queue_ms,
+        bus_config.transfers_in_flight,
+        geometry.max_consecutive_lossy_urbs(),
     );
     log_info!(
         "[USB] Waiting for stream prime: buffered_samples must reach start_threshold_samples={} before isochronous submit (the ring fills on to its {}-sample target while playing)",

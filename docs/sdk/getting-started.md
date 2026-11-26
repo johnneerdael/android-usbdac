@@ -195,7 +195,7 @@ The buffer is deep (250 ms by default) so that a stall upstream does not become 
 | Position | `startTime + playedFrames / counterRateHz`, with `startTime` set at each flush |
 | Volume | `DacSession.volume` (hardware). Software gain only if you accept losing bit-perfect output |
 
-`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once; audio already on the bus (tens of milliseconds) still plays. `pause()` sends silence so the DAC stays locked. The sample's buttons:
+`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once; audio already on the bus (`busQueueMs`, 16 ms by default) still plays. `pause()` sends silence so the DAC stays locked. The sample's buttons:
 
 ```kotlin
         click(R.id.flushButton) { stream?.flush() }

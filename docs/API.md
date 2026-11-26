@@ -120,6 +120,38 @@ dac.close(self) -> Result<()>                      // also on drop
 | `allow_unsynchronized_async` | `false` | Stream an asynchronous endpoint that has no explicit feedback endpoint at the nominal rate instead of refusing it (see below). |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
+| `bus_queue_ms` | 16 | Audio kept queued on the USB bus, 4 to 64. One rule for every service interval and encoding (see "The bus queue"). |
+| `transfers_in_flight` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `bus_queue_ms / transfers_in_flight` of audio. |
+
+#### The bus queue
+
+The output thread keeps `transfers_in_flight` isochronous transfers submitted
+at all times. A transfer carries `bus_queue_ms / transfers_in_flight` of audio
+(2 ms by default), rounded to whole service intervals, at least one packet and
+at most 32. Time on the bus is therefore the same for every DAC and every
+encoding (PCM, DoP, native DSD), where the service interval used to decide it:
+
+| Service interval | Packets x transfers | Queued on the bus |
+|---|---|---|
+| 125 us | 16 x 8 | 16 ms |
+| 250 us | 8 x 8 | 16 ms |
+| 500 us | 4 x 8 | 16 ms |
+| 1000 us | 2 x 8 | 16 ms |
+
+A DAC with a 1 ms service interval used to queue 128 ms, which made a pause or
+a seek eight times slower to be heard, and DSD at 125 us queued 32 x 8 = 256
+packets. **Packets in flight never reach 256**: on the phone and DAC where this
+was measured, 255 or fewer always played and exactly 256 always stalled. The
+cap is enforced in code, and it wins over the configuration: with
+`bus_queue_ms = 64` and eight transfers at 125 us each transfer would need 32
+packets (256 in all), so it carries 31 and 31 ms is queued. A deeper queue
+rides out a later output thread; a shallower one makes a pause and a stop
+sound sooner. Stability ("stable" in the log) is judged over about 256 ms of
+completed transfers for every geometry, and a stream is stopped after about
+6 ms of consecutive lossy transfers (never fewer than three), whatever their
+size. The feedback endpoint is polled over at most the bus queue (16 ms at
+most), so a report is never older than what is queued. The log line
+`[USB] Isochronous queue:` states the resulting geometry.
 
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,
 `RequireVerifiedRate`, `SettleDelayMs(u64)`, `PreferPadded24BitTransport`,
@@ -209,8 +241,9 @@ stream.software_gain() -> f32
   audio. `play()` is only needed after `pause()`.
 - `pause()` sends wire-correct silence (zero for PCM, the idle pattern for DSD,
   DoP markers keep alternating) so the DAC stays locked, and does not consume
-  the ring. Transfers already queued on the bus (eight of them: 16 to 32 ms on
-  a high-speed link, about 130 ms on a full-speed one) still play out first.
+  the ring. Transfers already queued on the bus (eight of them, about
+  `bus_queue_ms` = 16 ms at every service interval and for every encoding) still
+  play out first.
   `play()` continues exactly where the ring was.
 - `flush()` drops everything in the ring, resets `played_frames()` to 0
   immediately, clears a pending `drain()`, and holds silence until the ring has
@@ -378,8 +411,8 @@ else). A panic in a listener is caught and logged.
   `played_frames`, `latency_frames`, `set_software_gain`, `software_gain`. They
   take short internal locks (the ring lock is held for the length of a copy).
 - Blocking, call them off the UI thread: `Dac::open` (descriptor and clock
-  reads), `negotiate` and `open_stream` (100 ms or more each), `close` (up to about
-  130 ms for the last transfers to finish), every `VolumeControl` call (control
+  reads), `negotiate` and `open_stream` (100 ms or more each), `close` (the last
+  transfers are cancelled and handed back: typically a few milliseconds), every `VolumeControl` call (control
   transfers, 1 s timeout each), `stats()` and `is_bit_perfect()` take one
   short lock but also touch session state.
 - The library starts two threads: `usbdac-output` (the isochronous loop; with
@@ -638,7 +671,7 @@ ignored.
   "processing_buffer_target_ms": 100, "require_verified_rate": true,
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
   "padded_24bit": true, "allow_unsynchronized_async": false, "realtime_priority": true,
-  "hand_back": "restore_original",
+  "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
   "quirks": [ { "vendor_id": 1, "product_id": 2, "name_contains": "Foo",
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
 ```

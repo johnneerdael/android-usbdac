@@ -294,7 +294,7 @@ mod transport_loss_tests {
 
     fn lossy_tracker(lost_frames: u64) -> LossTracker {
         let mut tracker = LossTracker::new(LossLimits {
-            max_consecutive_lossy_urbs: USB_MAX_CONSECUTIVE_LOSSY_URBS,
+            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125).max_consecutive_lossy_urbs(),
             max_lost_frames: u64::MAX,
         });
         tracker.record(
@@ -344,7 +344,7 @@ mod transport_loss_tests {
         let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();
         let mut tracker = LossTracker::new(LossLimits {
-            max_consecutive_lossy_urbs: USB_MAX_CONSECUTIVE_LOSSY_URBS,
+            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125).max_consecutive_lossy_urbs(),
             max_lost_frames: u64::MAX,
         });
         tracker.record(
@@ -378,7 +378,14 @@ mod transport_loss_tests {
     fn the_lost_audio_budget_is_about_a_tenth_of_a_second() {
         let frames = lost_frame_budget(44_100, USB_MAX_LOST_AUDIO_MS);
         assert_eq!(frames, 4_410);
-        assert_eq!(USB_MAX_CONSECUTIVE_LOSSY_URBS, 3);
+        // Three of the default 2 ms transfers, at every service interval.
+        for interval in [125, 250, 500, 1_000] {
+            assert_eq!(
+                IsoQueueGeometry::default_for(interval).max_consecutive_lossy_urbs(),
+                3,
+                "{interval} us"
+            );
+        }
     }
 }
 

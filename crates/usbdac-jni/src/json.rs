@@ -405,6 +405,12 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     if let Some(value) = boolean(map, "realtime_priority")? {
         config.realtime_priority = value;
     }
+    if let Some(ms) = uint(map, "bus_queue_ms")? {
+        config.bus_queue_ms = narrow(ms, "bus_queue_ms")?;
+    }
+    if let Some(count) = uint(map, "transfers_in_flight")? {
+        config.transfers_in_flight = narrow(count, "transfers_in_flight")?;
+    }
     match text(map, "hand_back")?.as_deref() {
         None => {}
         Some("restore_original") => config.hand_back = HandBack::RestoreOriginal,
@@ -496,6 +502,7 @@ mod tests {
         assert_eq!(config.hand_back, HandBack::Keep);
         assert!(config.allow_unsynchronized_async);
         assert_eq!(config.dsd_big_endian, Some(true));
+        assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (16, 8), "unset: the defaults");
         assert_eq!(config.quirks.len(), 1);
         assert_eq!(
             config.quirks[0].quirks,
@@ -504,6 +511,19 @@ mod tests {
         assert_eq!(parse_config(None).ok().unwrap(), DacConfig::default());
         assert!(parse_config(Some(r#"{"hand_back":"sometimes"}"#)).is_err());
         assert!(parse_config(Some(r#"{"quirks":[{"vendor_id":1,"product_id":2,"quirks":["nope"]}]}"#)).is_err());
+    }
+
+    #[test]
+    fn the_bus_queue_keys_decode_and_a_bad_value_is_refused() {
+        let config = parse_config(Some(r#"{"bus_queue_ms":32,"transfers_in_flight":4}"#))
+            .ok()
+            .unwrap();
+        assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (32, 4));
+        config.validate().unwrap();
+        assert!(parse_config(Some(r#"{"bus_queue_ms":-1}"#)).is_err(), "not a non-negative integer");
+        // Out-of-range values decode; the core's validation names them at open.
+        let out_of_range = parse_config(Some(r#"{"bus_queue_ms":3}"#)).ok().unwrap();
+        assert!(matches!(out_of_range.validate(), Err(Error::InvalidArgument(_))));
     }
 
     #[test]

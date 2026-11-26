@@ -121,4 +121,18 @@ public data class DacConfig @JvmOverloads constructor(
 
     /** What [DacSession.close] does with the hardware volume unless told otherwise. Default [HandBack.RESTORE_ORIGINAL]. */
     val handBack: HandBack = HandBack.RESTORE_ORIGINAL,
+
+    /**
+     * How much audio, in milliseconds, is kept queued on the USB bus: the transfers in flight
+     * together carry about this much, at every service interval and for every encoding. It is
+     * what a pause (or a flush with [cancelInFlightOnFlush] off) still plays out, and the headroom
+     * against a late output thread. 4 to 64, default 16. A transfer carries
+     * `busQueueMs / transfersInFlight` of audio (2 ms by default), at most 32 packets, and the
+     * packets in flight never reach 256: when the configured depth would, that cap wins and less
+     * is queued.
+     */
+    val busQueueMs: Int = 16,
+
+    /** How many isochronous transfers are in flight at once. 2 to 16, default 8. See [busQueueMs]. */
+    val transfersInFlight: Int = 8,
 )
