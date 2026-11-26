@@ -12,7 +12,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import dev.usbdac.AltFormat
 import dev.usbdac.DacCapabilities
+import dev.usbdac.DacConfig
 import dev.usbdac.DacDeviceInfo
+import dev.usbdac.DacErrorCode
 import dev.usbdac.DacException
 import dev.usbdac.DacSession
 import dev.usbdac.DacState
@@ -53,8 +55,10 @@ class MainActivity : Activity() {
     private lateinit var formatSpinner: Spinner
     private lateinit var capabilitiesText: TextView
     private lateinit var volumeText: TextView
+    private lateinit var startupText: TextView
     private lateinit var volumeBar: SeekBar
     private lateinit var muteBox: CheckBox
+    private lateinit var fixedVolumeBox: CheckBox
     private lateinit var statusText: TextView
     private lateinit var eventsText: TextView
 
@@ -65,8 +69,10 @@ class MainActivity : Activity() {
         formatSpinner = findViewById(R.id.formatSpinner)
         capabilitiesText = findViewById(R.id.capabilitiesText)
         volumeText = findViewById(R.id.volumeText)
+        startupText = findViewById(R.id.startupText)
         volumeBar = findViewById(R.id.volumeBar)
         muteBox = findViewById(R.id.muteBox)
+        fixedVolumeBox = findViewById(R.id.fixedVolumeBox)
         statusText = findViewById(R.id.statusText)
         eventsText = findViewById(R.id.eventsText)
 
@@ -88,6 +94,8 @@ class MainActivity : Activity() {
             override fun onStopTrackingTouch(bar: SeekBar) = Unit
         })
         muteBox.setOnCheckedChangeListener { box, checked -> if (box.isPressed) session?.volume?.setMute(checked) }
+        // Allowing a fixed volume is part of the session's configuration, so changing it reopens the DAC.
+        fixedVolumeBox.setOnCheckedChangeListener { box, _ -> if (box.isPressed) reopen() }
 
         // Plugging and unplugging: refresh the list.
         UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
@@ -124,16 +132,34 @@ class MainActivity : Activity() {
         if (session != null) return log("a session is already open")
         UsbDac.requestPermission(this, dac) { granted ->
             if (!granted) return@requestPermission log("USB permission denied")
-            // UsbDac.open() blocks while it claims interfaces and scans descriptors.
-            io.execute {
-                try {
-                    val opened = UsbDac.open(this, dac)
-                    runOnUiThread { onOpened(opened) }
-                } catch (error: DacException) {
-                    runOnUiThread { log("open failed: ${error.message}") }
-                }
+            openDevice(dac)
+        }
+    }
+
+    /**
+     * Opens [dac] off the main thread. By default a DAC without a usable hardware volume cannot
+     * stream (it would play at its own level, with no way to bring it down); the user allows that
+     * with the checkbox, and the DAC is opened again.
+     */
+    private fun openDevice(dac: DacDeviceInfo) {
+        val config = DacConfig(requireHardwareVolume = !fixedVolumeBox.isChecked)
+        // UsbDac.open() blocks while it claims interfaces and scans descriptors.
+        io.execute {
+            try {
+                val opened = UsbDac.open(this, dac, config)
+                runOnUiThread { onOpened(opened) }
+            } catch (error: DacException) {
+                runOnUiThread { log("open failed: ${error.message}") }
             }
         }
+    }
+
+    /** Closes the session and opens the same DAC again with the current setting. */
+    private fun reopen() {
+        val dac = session?.info ?: return
+        closeSession()
+        // io runs its tasks in order, so the close has finished before the open starts.
+        openDevice(dac)
     }
 
     private fun onOpened(opened: DacSession) {
@@ -150,6 +176,14 @@ class MainActivity : Activity() {
         opened.state.onEach { if (it == DacState.LOST) { log("the DAC was unplugged"); closeSession() } }.launchIn(scope)
 
         val volume = opened.volume
+        // What the library did to the DAC's level before any stream could start.
+        startupText.text = volume?.startup?.let { startup ->
+            "Start-up: %s dB, lowered to %s dB. A remembered level should stay at or below %.1f dB.".format(
+                startup.originalDb.joinToString(" / "),
+                startup.appliedDb.joinToString(" / "),
+                startup.limitDb,
+            )
+        } ?: "No usable hardware volume: tick \"Allow a fixed volume\" to stream at the DAC's own level."
         volumeBar.isEnabled = volume != null
         muteBox.isEnabled = volume?.hasMute == true
         volume?.state?.onEach { state ->
@@ -168,6 +202,7 @@ class MainActivity : Activity() {
         volumeBar.isEnabled = false
         muteBox.isEnabled = false
         volumeText.text = "DAC volume: none"
+        startupText.text = ""
         // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
         io.execute { runCatching { closing.close() }; runOnUiThread { log("session closed") } }
     }
@@ -194,7 +229,14 @@ class MainActivity : Activity() {
                     sine.start()
                 }
             } catch (error: DacException) {
-                runOnUiThread { log("play failed: ${error.message}") }
+                runOnUiThread {
+                    // The DAC has no usable hardware volume and the session requires one.
+                    if (error.code == DacErrorCode.VOLUME_UNAVAILABLE) {
+                        log("no hardware volume: tick \"Allow a fixed volume\" to play at the DAC's own level")
+                    } else {
+                        log("play failed: ${error.message}")
+                    }
+                }
             }
         }
     }

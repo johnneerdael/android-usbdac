@@ -102,6 +102,9 @@ pub(crate) struct EventHub {
     thread: Mutex<Option<JoinHandle<()>>>,
     dac_listener: Mutex<Option<Arc<dyn DacListener>>>,
     stream_listener: Mutex<Option<Arc<dyn DacListener>>>,
+    /// Device events from before any listener existed (the start-up volume
+    /// change happens inside `Dac::open`), delivered to the first DAC listener.
+    pending_dac_events: Mutex<Vec<DacEvent>>,
     device_lost: AtomicBool,
 }
 
@@ -120,12 +123,29 @@ impl EventHub {
             thread: Mutex::new(thread),
             dac_listener: Mutex::new(None),
             stream_listener: Mutex::new(None),
+            pending_dac_events: Mutex::new(Vec::new()),
             device_lost: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn set_dac_listener(&self, listener: Option<Arc<dyn DacListener>>) {
-        *self.dac_listener.lock() = listener;
+        *self.dac_listener.lock() = listener.clone();
+        if let Some(listener) = listener {
+            let pending = std::mem::take(&mut *self.pending_dac_events.lock());
+            for event in pending {
+                self.send(listener.clone(), event);
+            }
+        }
+    }
+
+    /// An event about the device that happened before a listener could exist:
+    /// kept for the first DAC listener, or sent now if there is one.
+    pub(crate) fn emit_dac_or_hold(&self, event: DacEvent) {
+        if self.dac_listener.lock().is_some() {
+            self.emit_dac(event);
+        } else {
+            self.pending_dac_events.lock().push(event);
+        }
     }
 
     pub(crate) fn set_stream_listener(&self, listener: Option<Arc<dyn DacListener>>) {
@@ -334,6 +354,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(closer.0.lock().is_none(), "the listener ran and shut the hub down");
+        hub.shutdown();
+    }
+
+    #[test]
+    fn an_event_from_before_any_listener_goes_to_the_first_dac_listener_once() {
+        let hub = EventHub::start();
+        let startup = DacEvent::VolumeChanged(VolumeState { db: -40.0, fraction: 0.5, muted: None });
+        hub.emit_dac_or_hold(startup.clone());
+        // Held, not lost, while nobody listens (a stream listener is not a DAC one).
+        let stream = Arc::new(Collector::default());
+        hub.set_stream_listener(Some(stream.clone()));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(stream.0.lock().is_empty());
+
+        let first = Arc::new(Collector::default());
+        hub.set_dac_listener(Some(first.clone()));
+        wait_for(&first, 1);
+        assert_eq!(first.0.lock()[0].1, startup);
+
+        // Delivered once: a later listener does not see it again.
+        let second = Arc::new(Collector::default());
+        hub.set_dac_listener(Some(second.clone()));
+        std::thread::sleep(Duration::from_millis(30));
+        hub.shutdown();
+        assert!(second.0.lock().is_empty());
+        assert_eq!(first.0.lock().len(), 1);
+    }
+
+    #[test]
+    fn an_event_with_a_listener_present_is_sent_at_once() {
+        let hub = EventHub::start();
+        let listener = Arc::new(Collector::default());
+        hub.set_dac_listener(Some(listener.clone()));
+        hub.emit_dac_or_hold(DacEvent::DeviceLost);
+        wait_for(&listener, 1);
         hub.shutdown();
     }
 

@@ -60,6 +60,13 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 | `realtimePriority` | `Boolean` | `true` | Ask for real-time scheduling (`SCHED_FIFO`, priority 2, falling back to nice -16) for the USB output thread | None; it protects against underruns |
 | `handBack` | `HandBack` | `RESTORE_ORIGINAL` | What `DacSession.close()` does with the DAC's hardware volume. See [hand-back](#hand-back) | None |
 
+### Volume protection
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `startupVolume` | `StartupVolume` | `Attenuate(-40.0)` | What `UsbDac.open` does with the DAC's hardware volume before any stream can start: lower every channel to at most `maxDb`, or `Keep` it. See [start-up volume protection](#start-up-volume-protection) | None: the DAC scales the audio |
+| `requireHardwareVolume` | `Boolean` | `true` | `openStream` fails with `VOLUME_UNAVAILABLE` when the DAC has no usable hardware volume, so the app can ask the user to allow fixed-level output and reopen with `false` | None |
+
 ## The request: `StreamRequest`
 
 `session.negotiate(request)` settles the format.
@@ -101,7 +108,7 @@ Build one with `StreamRequest.pcm(rate, channels, bits)`, `StreamRequest.dop(dsd
 
 ## Hardware volume: `DacVolume`
 
-`session.volume` is `null` when the DAC has no writable volume control. It works with or without a stream while the session is open. The system volume has no effect on a direct stream; this is the volume.
+`session.volume` is `null` when the DAC has no usable hardware volume control: it has none, or its start-up attenuation could not be verified. It works with or without a stream while the session is open. The system volume has no effect on a direct stream; this is the volume.
 
 | Control | Type | Effect | Bit-perfect impact |
 |---|---|---|---|
@@ -113,18 +120,41 @@ Build one with `StreamRequest.pcm(rate, channels, bits)`, `StreamRequest.dop(dsd
 | `setMute(muted)` | `Boolean` | Mutes or unmutes. Needs `hasMute`; otherwise the write fails and is reported | None |
 | `hasMute` | `Boolean` | The DAC has a writable mute | None |
 | `refresh()` | `VolumeState` | Reads the level from the DAC (blocking) and updates `state` | None |
+| `startup` | `StartupVolumeReport` | What the library did to the level when the session opened: `originalDb` and `appliedDb` per channel, `limitDb`, `attenuated`, `clampedToMinimum`, `maxDb`. See [start-up volume protection](#start-up-volume-protection) | None |
 | `originalDb` | `Double?` | The level the DAC had before the library first changed it, if every channel agreed | None |
 | `handBack()` | `Boolean` | Writes the original level back (blocking) and forgets it. Pending writes are dropped first | None |
 
 The setters queue their writes on a library thread, one at a time. A burst of absolute values (`setDb`, `setFraction`) collapses to the last one, which is always applied; identical `step` calls merge into a count (at most 32 wait); a mute request replaces a pending one. A write that fails is reported as `DacEvent.VolumeWriteFailed` on `session.events`, because the call that asked has already returned. Writes are verified by reading the level back.
 
+### Start-up volume protection
+
+A DAC keeps the level it had, and many come up at full scale, so the first audio of a session would play at that level. `UsbDac.open` therefore finds the hardware volume control, records the level of each channel, and with the default `StartupVolume.Attenuate(-40.0)` lowers every controlled channel to `min(its level, maxDb)` before it returns, so before any stream can open. It then reads every channel back to verify it.
+
+- A channel is **never raised**. One that is already quieter, or at the DAC's silent value, is left alone.
+- `maxDb` is rounded **down** to a step the DAC supports. If the DAC's minimum is above `maxDb` the channels go to the minimum and `clampedToMinimum` says so.
+- Channels that come out at different levels (one was already below the ceiling) are brought to the quietest, because the control reads and writes one level. Each channel's own original is still what hand-back restores.
+- If a write or the read-back fails, the attenuation is not verified and the control is treated as **unusable**: `session.volume` is `null`, `capabilities.hasHardwareVolume` is false, and `openStream` fails as described below.
+- `StartupVolume.Keep` leaves the level alone (the original is still recorded for hand-back).
+- The level the DAC had is recorded **first**, so [hand-back](#hand-back) with `RESTORE_ORIGINAL` restores the true original, not the attenuated level. If the DAC is opened again in the same process after a session that kept the level, the record is the first one, and `startup.originalDb` still names it.
+- The step runs once per `UsbDac.open`. A level the app sets afterwards is never pulled back, and a stream that opens later does not repeat it.
+
+`DacVolume.startup` is the report. `limitDb` is the quietest original channel: **a host that restores a level it remembered for this DAC should not go above `limitDb` without the user's action**, because that is how loud the DAC itself was when it connected. On connect an app should:
+
+1. read `session.volume?.startup`, and show it if it wants to say that the level was lowered;
+2. restore its remembered per-DAC level, capped by `limitDb` (`min(remembered, limitDb)`), or leave the attenuated level if it remembers none;
+3. let the user raise it from there (`setDb`, `setFraction`, the volume keys).
+
+`DacEvent.VolumeChanged` follows the attenuation, once, to the first collector of `session.events` (an app that attaches later reads `volume.state` and `volume.startup`, which are already current).
+
+**A DAC without a usable hardware volume.** With `requireHardwareVolume = true` (the default) `openStream` fails with `DacErrorCode.VOLUME_UNAVAILABLE`, because the stream would play at the DAC's own level and the app could not bring it down. `UsbDac.open`, `negotiate` and `capabilities` still work, so the app can show what the DAC offers, explain, and let the user allow fixed-level output: close the session and open it again with `DacConfig(requireHardwareVolume = false)`. It is the user's decision, per DAC; the library does not remember it. Set it to `false` up front for an app whose output always goes through its own software gain.
+
 ### Hand-back
 
-The library records the level the DAC had the first time it read the volume. `DacSession.close()` applies the session's `handBack`; `close(handBack)` overrides it for one call.
+The library records the level each channel of the DAC had the first time it read the volume, which is before the start-up attenuation. `DacSession.close()` applies the session's `handBack`; `close(handBack)` overrides it for one call.
 
 | Policy | Effect |
 |---|---|
-| `RESTORE_ORIGINAL` (default) | Writes the original level back after the stream has stopped, verifies it, and forgets it. Use it when the DAC goes back to Android's audio stack |
+| `RESTORE_ORIGINAL` (default) | Writes the original level of every channel back after the stream has stopped, verifies it, and forgets it. That is the level before the start-up attenuation, not the attenuated one. Use it when the DAC goes back to Android's audio stack |
 | `KEEP` | Leaves the DAC at its current level and remembers the original for the next `UsbDac.open` of the same device in this process. Use it when your app takes the DAC straight back |
 
 The restore runs after the stream has stopped, so a level louder than the current one is never heard. If the device is lost, the restore is skipped.

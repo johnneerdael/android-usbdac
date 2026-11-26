@@ -38,6 +38,34 @@ pub struct VolumeState {
     pub muted: Option<bool>,
 }
 
+/// What [`Dac::open`](crate::Dac::open) did with the DAC's level before any
+/// stream could start (see [`StartupVolume`](crate::StartupVolume)).
+///
+/// The lists hold one entry per controlled channel, in channel order (a single
+/// entry for a DAC with one master control).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct StartupVolumeReport {
+    /// The level each channel had before the library first touched it, in dB.
+    /// What [`VolumeControl::hand_back`] restores.
+    pub original_db: Vec<f64>,
+    /// The level each channel has now that the start-up step is done, in dB.
+    /// Equal to `original_db` when nothing needed lowering, and with
+    /// `StartupVolume::Keep`.
+    pub applied_db: Vec<f64>,
+    /// The quietest original channel, in dB. A host that restores a level it
+    /// remembered for this DAC should not go above it without the user's
+    /// action: that was how loud the DAC itself was when it connected.
+    pub limit_db: f64,
+    /// `applied_db` is below `original_db` on some channel.
+    pub attenuated: bool,
+    /// The ceiling was below the DAC's minimum, so the channels went to the
+    /// minimum instead.
+    pub clamped_to_minimum: bool,
+    /// The ceiling that was asked for; `None` for `StartupVolume::Keep`.
+    pub max_db: Option<f64>,
+}
+
 /// Default number of steps for [`VolumeControl::step`].
 pub const DEFAULT_VOLUME_STEPS: u8 = 16;
 
@@ -130,6 +158,27 @@ impl VolumeControl {
         let state = self.finish(transport::volume_hw::write_mute(muted))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
         Ok(state)
+    }
+
+    /// What the library did with the DAC's level when it was opened, before any
+    /// stream could start: the level each channel had, the level it has now and
+    /// the limit a host should not restore above. See [`StartupVolumeReport`].
+    ///
+    /// On connect a host reads this, then restores the level it remembers for
+    /// this DAC capped by `limit_db`, or leaves the attenuated level.
+    pub fn startup(&self) -> StartupVolumeReport {
+        transport::volume_hw::startup_report().unwrap_or_else(|| {
+            // Not reachable through `Dac::volume`: a control is only installed
+            // together with its start-up step.
+            StartupVolumeReport {
+                original_db: Vec::new(),
+                applied_db: Vec::new(),
+                limit_db: 0.0,
+                attenuated: false,
+                clamped_to_minimum: false,
+                max_db: None,
+            }
+        })
     }
 
     /// The level the DAC had before the library first wrote to it, in dB, if

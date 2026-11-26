@@ -101,9 +101,13 @@ impl Dac {
     /// exactly the AudioControl and playback AudioStreaming interfaces the host
     /// has claimed.
     ///
-    /// Opening scans the descriptors, finds the hardware volume control and
-    /// records the DAC's current level. It does not touch the clock or start
-    /// any audio.
+    /// Opening scans the descriptors, finds the hardware volume control, records
+    /// the DAC's current level and, with the default
+    /// [`StartupVolume::Attenuate`](crate::StartupVolume::Attenuate), lowers every
+    /// channel to at most -40 dB and verifies it, so that no stream can start
+    /// at the DAC's own (often full-scale) level. It does not touch the clock or
+    /// start any audio. [`VolumeControl::startup`](crate::VolumeControl::startup)
+    /// says what it did.
     pub fn open(fd: RawFd, info: DeviceInfo, config: DacConfig) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
@@ -115,9 +119,15 @@ impl Dac {
             settings::reset();
             return Err(error);
         }
+        let events = EventHub::start();
+        // The start-up step lowered the level before this handle existed: tell
+        // the first listener, as a change made through the library.
+        if let Some(state) = transport::volume_hw::startup_lowered_volume() {
+            events.emit_dac_or_hold(crate::events::DacEvent::VolumeChanged(state));
+        }
         Ok(Dac {
             shared: Arc::new(DacShared {
-                events: EventHub::start(),
+                events,
                 info,
                 config,
                 closed: AtomicBool::new(false),
@@ -156,6 +166,11 @@ impl Dac {
     /// thread. The stream plays as soon as the ring holds the start threshold
     /// ([`DacConfig::start_threshold_ms`]) of audio. Only one stream can be open
     /// at a time.
+    ///
+    /// Fails with [`Error::VolumeUnavailable`] when the stream's own route has
+    /// no usable hardware volume control and
+    /// [`DacConfig::require_hardware_volume`] is on; nothing is programmed and
+    /// no output thread starts.
     ///
     /// `listener` receives the stream's events; see [`DacListener`].
     pub fn open_stream(

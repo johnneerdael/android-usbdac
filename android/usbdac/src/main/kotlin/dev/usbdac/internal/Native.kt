@@ -56,4 +56,5 @@ internal object Native {
     @JvmStatic external fun volumeSetMute(dac: Long, muted: Boolean): String
     @JvmStatic external fun volumeOriginalDb(dac: Long): Double
     @JvmStatic external fun volumeHandBack(dac: Long): Boolean
+    @JvmStatic external fun volumeStartup(dac: Long): String?
 }

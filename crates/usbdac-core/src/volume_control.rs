@@ -63,6 +63,18 @@ impl RawRange {
         (i32::from(self.min) + index * step) as i16
     }
 
+    /// The highest value of this range's lattice that is at most `target`
+    /// (`None` below the range's minimum).
+    fn floor_on_lattice(self, target: i32) -> Option<i16> {
+        if target < i32::from(self.min) {
+            return None;
+        }
+        let step = i32::from(self.resolution).max(1);
+        let capped = target.min(i32::from(self.max));
+        let index = (capped - i32::from(self.min)) / step;
+        Some((i32::from(self.min) + index * step) as i16)
+    }
+
     /// Nearest supported value to `target` that lies above `floor`, if this
     /// range has one. A `floor` at or below the range minimum does not restrict it.
     fn nearest_above(self, target: f64, floor: i16) -> Option<i16> {
@@ -162,6 +174,55 @@ pub(crate) fn quantize_db(db: f64, ranges: &[RawRange]) -> i16 {
         .unwrap_or(min)
 }
 
+/// The levels the start-up step wants, from the levels the channels have now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupPlan {
+    /// One level per channel, in the order of the input. Never above it.
+    pub(crate) targets: Vec<i16>,
+    /// `max_db` was below the DAC's minimum: the channels go to the minimum.
+    pub(crate) clamped_to_minimum: bool,
+}
+
+/// The highest level the DAC supports that is at most `db`, or None when `db` is
+/// below its minimum.
+pub(crate) fn floor_db(db: f64, ranges: &[RawRange]) -> Option<i16> {
+    let target = (db * 256.0).floor().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i32;
+    ranges.iter().filter_map(|range| range.floor_on_lattice(target)).max()
+}
+
+/// Lowers each channel to `min(its level, max_db)`, where `max_db` is rounded
+/// down to a step the DAC supports (so the result is never louder than asked).
+/// A channel at or below that is left as it is, whatever it is: a quiet level
+/// or the device's silent value is never raised. If `max_db` is below the
+/// DAC's minimum the channels that are louder go to the minimum.
+pub(crate) fn plan_startup_attenuation(
+    channels: &[i16],
+    ranges: &[RawRange],
+    max_db: f64,
+) -> StartupPlan {
+    let (ceiling, clamped_to_minimum) = match floor_db(max_db, ranges) {
+        Some(ceiling) => (ceiling, false),
+        None => (volume_bounds(ranges).0, true),
+    };
+    StartupPlan {
+        targets: channels.iter().map(|&raw| raw.min(ceiling)).collect(),
+        clamped_to_minimum,
+    }
+}
+
+/// The one level the volume control works with. Channels that came out at
+/// different levels (they were apart before, and one of them was already below
+/// the ceiling) are brought down to the quietest, so that the control, which
+/// reads and writes a single level, stays usable. Nothing is raised.
+pub(crate) fn single_level(targets: Vec<i16>) -> Vec<i16> {
+    match targets.iter().min() {
+        Some(&quietest) if common_channel_volume(&targets).is_none() => {
+            vec![quietest; targets.len()]
+        }
+        _ => targets,
+    }
+}
+
 /// The raw value one lattice step above (`direction > 0`) or below
 /// (`direction < 0`) `raw`, staying inside the ranges; `raw` itself at the end
 /// of the range.
@@ -228,50 +289,80 @@ pub(crate) fn step_target_raw(
     target
 }
 
-/// The level a DAC had before this library first changed it during one attachment,
-/// and the control that writes it back. The live volume control is dropped with each
-/// stream, so the record keeps its own copy and survives stream restarts and idle
-/// releases. It ends when the level is handed back or forgotten, or is replaced
-/// by another DAC's.
+/// Whether two controls drive the same Feature Unit the same way.
+pub(crate) trait SameRoute {
+    fn same_route(&self, other: &Self) -> bool;
+}
+
+/// The level every channel of one control had before this library first changed
+/// it during one attachment, and the control that writes it back. The live volume
+/// control is dropped with each stream, so the record keeps its own copy and
+/// survives stream restarts and idle releases. It ends when the level is handed
+/// back or forgotten, or is replaced by another DAC's.
+///
+/// One entry per channel, in the control's channel order: channels that disagreed
+/// when the DAC connected are restored one by one. A DAC whose streams play
+/// through more than one Feature Unit has one entry per unit.
 #[derive(Debug)]
 pub(crate) struct OriginalVolume<C> {
     pub(crate) device: String,
     pub(crate) control: C,
-    pub(crate) raw: i16,
+    pub(crate) channels: Vec<i16>,
+}
+
+impl<C> OriginalVolume<C> {
+    /// The one level every channel had, or None if they disagreed.
+    pub(crate) fn common(&self) -> Option<i16> {
+        common_channel_volume(&self.channels)
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct OriginalVolumeSlot<C>(Option<OriginalVolume<C>>);
+pub(crate) struct OriginalVolumeSlot<C>(Vec<OriginalVolume<C>>);
 
-impl<C> OriginalVolumeSlot<C> {
+impl<C: SameRoute> OriginalVolumeSlot<C> {
     pub(crate) const fn new() -> Self {
-        Self(None)
+        Self(Vec::new())
     }
 
     pub(crate) fn is_recorded(&self, device: &str) -> bool {
-        self.0.as_ref().is_some_and(|original| original.device == device)
+        self.0.iter().any(|original| original.device == device)
     }
 
-    /// Records `raw` as the original of `device` unless one is already recorded
-    /// for it: later readings are this library's own writes. Another DAC's record goes.
-    pub(crate) fn note(&mut self, device: &str, control: C, raw: i16) {
+    /// Whether the level of `control`'s own Feature Unit is recorded for `device`.
+    pub(crate) fn is_route_recorded(&self, device: &str, control: &C) -> bool {
+        self.peek(device, control).is_some()
+    }
+
+    /// Records `channels` as the original of `control` on `device` unless one is
+    /// already recorded for that Feature Unit: later readings are this library's
+    /// own writes. Another DAC's records go.
+    pub(crate) fn note(&mut self, device: &str, control: C, channels: Vec<i16>) {
         if !self.is_recorded(device) {
-            self.0 = Some(OriginalVolume { device: device.to_string(), control, raw });
+            self.0.clear();
+        }
+        if !self.is_route_recorded(device, &control) {
+            self.0.push(OriginalVolume { device: device.to_string(), control, channels });
         }
     }
 
-    /// The record of `device`, without ending it.
-    pub(crate) fn peek(&self, device: &str) -> Option<&OriginalVolume<C>> {
-        self.0.as_ref().filter(|original| original.device == device)
+    /// The record of `control` on `device`, without ending it.
+    pub(crate) fn peek(&self, device: &str, control: &C) -> Option<&OriginalVolume<C>> {
+        self.0
+            .iter()
+            .find(|original| original.device == device && original.control.same_route(control))
     }
 
-    /// The record of `device`, ending it. Another DAC's record is left alone.
-    pub(crate) fn take(&mut self, device: &str) -> Option<OriginalVolume<C>> {
-        if self.is_recorded(device) { self.0.take() } else { None }
+    /// Every record of `device`, ending them. Another DAC's records are left alone.
+    pub(crate) fn take_all(&mut self, device: &str) -> Vec<OriginalVolume<C>> {
+        let (mine, others): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.0).into_iter().partition(|original| original.device == device);
+        self.0 = others;
+        mine
     }
 
     pub(crate) fn forget(&mut self) {
-        self.0 = None;
+        self.0.clear();
     }
 }
 
@@ -588,19 +679,57 @@ mod tests {
         }
     }
 
+    impl SameRoute for &str {
+        fn same_route(&self, other: &Self) -> bool {
+            self == other
+        }
+    }
+
+    impl SameRoute for () {
+        fn same_route(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn the_first_level_of_an_attachment_is_the_original() {
         let mut slot = OriginalVolumeSlot::new();
         assert!(!slot.is_recorded("dac"));
-        slot.note("dac", "control", -12800);
+        slot.note("dac", "control", vec![-12800]);
         // Later readings are the library's own writes (a restart, an idle reopen).
-        slot.note("dac", "other", -6400);
-        let original = slot.take("dac").unwrap();
-        assert_eq!((original.raw, original.control), (-12800, "control"));
+        slot.note("dac", "control", vec![-6400]);
+        let mut taken = slot.take_all("dac");
+        assert_eq!(taken.len(), 1);
+        let original = taken.remove(0);
+        assert_eq!((original.channels, original.control), (vec![-12800], "control"));
         // Handing it back ends the record; the next reading starts a new one.
-        assert!(slot.take("dac").is_none());
-        slot.note("dac", "control", -3000);
-        assert_eq!(slot.take("dac").unwrap().raw, -3000);
+        assert!(slot.take_all("dac").is_empty());
+        slot.note("dac", "control", vec![-3000]);
+        assert_eq!(slot.take_all("dac")[0].channels, vec![-3000]);
+    }
+
+    #[test]
+    fn every_channel_keeps_its_own_original() {
+        let mut slot = OriginalVolumeSlot::new();
+        slot.note("dac", "control", vec![-2560, -12800]);
+        let original = slot.take_all("dac").remove(0);
+        assert_eq!(original.channels, vec![-2560, -12800]);
+        assert_eq!(original.common(), None, "no single level when they disagree");
+        let mut slot = OriginalVolumeSlot::new();
+        slot.note("dac", "control", vec![-2560, -2560]);
+        assert_eq!(slot.take_all("dac")[0].common(), Some(-2560));
+    }
+
+    #[test]
+    fn a_second_feature_unit_of_the_same_dac_has_its_own_record() {
+        let mut slot = OriginalVolumeSlot::new();
+        slot.note("dac", "headphones", vec![-1000]);
+        slot.note("dac", "line", vec![-5000]);
+        // Each unit's first reading is its original; later ones are ours.
+        slot.note("dac", "line", vec![-9000]);
+        assert_eq!(slot.peek("dac", &"headphones").unwrap().channels, vec![-1000]);
+        assert_eq!(slot.peek("dac", &"line").unwrap().channels, vec![-5000]);
+        assert_eq!(slot.take_all("dac").len(), 2);
     }
 
     #[test]
@@ -612,30 +741,30 @@ mod tests {
         assert_eq!(normalize_volume(original, &ranges), 0.0);
         assert_ne!(quantize_volume(0.0, &ranges), original);
         let mut slot = OriginalVolumeSlot::new();
-        slot.note("dac", (), original);
-        assert_eq!(slot.take("dac").unwrap().raw, original);
+        slot.note("dac", (), vec![original]);
+        assert_eq!(slot.take_all("dac")[0].channels, vec![original]);
     }
 
     #[test]
     fn another_dac_neither_takes_nor_keeps_the_record() {
         let mut slot = OriginalVolumeSlot::new();
-        slot.note("first", (), -1000);
-        assert!(slot.take("second").is_none());
+        slot.note("first", (), vec![-1000]);
+        assert!(slot.take_all("second").is_empty());
         assert!(slot.is_recorded("first"));
         // A different DAC's first reading replaces the stale record.
-        slot.note("second", (), -2000);
+        slot.note("second", (), vec![-2000]);
         assert!(!slot.is_recorded("first"));
-        assert_eq!(slot.take("second").unwrap().raw, -2000);
+        assert_eq!(slot.take_all("second")[0].channels, vec![-2000]);
     }
 
     #[test]
     fn forgetting_ends_the_record() {
         let mut slot = OriginalVolumeSlot::new();
-        slot.note("dac", (), -1000);
+        slot.note("dac", (), vec![-1000]);
         slot.forget();
-        assert!(slot.take("dac").is_none());
-        slot.note("dac", (), -500);
-        assert_eq!(slot.take("dac").unwrap().raw, -500);
+        assert!(slot.take_all("dac").is_empty());
+        slot.note("dac", (), vec![-500]);
+        assert_eq!(slot.take_all("dac")[0].channels, vec![-500]);
     }
 
     #[test]
@@ -745,4 +874,88 @@ mod tests {
             assert_eq!(f64::from(raw) / 256.0, db);
         }
     }
+
+    fn stereo_db(db: i32) -> i16 {
+        (db * 256) as i16
+    }
+
+    fn dac_127_to_0() -> [RawRange; 1] {
+        [RawRange { min: -127 * 256, max: 0, resolution: 256 }]
+    }
+
+    #[test]
+    fn the_startup_step_lowers_what_is_louder_and_never_raises_what_is_quieter() {
+        let ranges = dac_127_to_0();
+        let plan = plan_startup_attenuation(&[stereo_db(0), stereo_db(-20)], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-40), stereo_db(-40)]);
+        assert!(!plan.clamped_to_minimum);
+        // Already quieter than the ceiling: left exactly where it is, even off
+        // the lattice and below the slider floor.
+        let plan = plan_startup_attenuation(&[stereo_db(-60), -100 * 256 - 17], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-60), -100 * 256 - 17]);
+        // At the ceiling exactly: unchanged.
+        let plan = plan_startup_attenuation(&[stereo_db(-40)], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-40)]);
+        // No level a plan produces is above the level the channel had.
+        for original in (-127 * 256..=0).step_by(97) {
+            for max_db in [-90.0, -40.0, -12.5, 0.0] {
+                let plan = plan_startup_attenuation(&[original as i16], &ranges, max_db);
+                assert!(plan.targets[0] <= original as i16, "{original} at {max_db}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ceiling_rounds_down_to_a_step_the_dac_supports() {
+        // 3 dB steps from -80 dB: -80, -77, ... -41, -38.
+        let ranges = [RawRange { min: -80 * 256, max: 0, resolution: 3 * 256 }];
+        assert_eq!(floor_db(-40.0, &ranges), Some(stereo_db(-41)), "the quieter neighbour, not -38");
+        assert_eq!(floor_db(-41.0, &ranges), Some(stereo_db(-41)), "on a step: that step");
+        assert_eq!(floor_db(-40.01, &ranges), Some(stereo_db(-41)));
+        let plan = plan_startup_attenuation(&[0, stereo_db(-30)], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-41), stereo_db(-41)]);
+        // A 0.25 dB lattice, and a ceiling between two steps.
+        let fine = [RawRange { min: -127 * 256, max: 0, resolution: 64 }];
+        assert_eq!(floor_db(-40.1, &fine), Some(-10_304), "-40.25 dB, below -40.1");
+        // Several sub-ranges: the highest step at or below the ceiling anywhere.
+        let ranges = [
+            RawRange { min: -80 * 256, max: -50 * 256, resolution: 256 },
+            RawRange { min: -30 * 256, max: 0, resolution: 256 },
+        ];
+        assert_eq!(floor_db(-40.0, &ranges), Some(stereo_db(-50)), "the gap rounds down to the top of the lower range");
+        assert_eq!(floor_db(-29.5, &ranges), Some(stereo_db(-30)));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_dac_minimum_clamps_to_the_minimum_and_says_so() {
+        let ranges = [RawRange { min: -30 * 256, max: 0, resolution: 256 }];
+        assert_eq!(floor_db(-40.0, &ranges), None);
+        let plan = plan_startup_attenuation(&[0, stereo_db(-10), stereo_db(-30)], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-30); 3]);
+        assert!(plan.clamped_to_minimum);
+    }
+
+    #[test]
+    fn a_channel_at_the_silent_value_stays_there() {
+        // UAC's 0x8000 means "silence"; it is below every ceiling.
+        let ranges = dac_127_to_0();
+        let plan = plan_startup_attenuation(&[i16::MIN, 0], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![i16::MIN, stereo_db(-40)]);
+    }
+
+    #[test]
+    fn channels_are_lowered_independently_then_brought_to_one_level() {
+        let ranges = dac_127_to_0();
+        // Left was loud, right already quiet: each is lowered on its own...
+        let plan = plan_startup_attenuation(&[stereo_db(-10), stereo_db(-70)], &ranges, -40.0);
+        assert_eq!(plan.targets, vec![stereo_db(-40), stereo_db(-70)]);
+        // ...and the control, which holds one level, takes the quietest of them.
+        assert_eq!(single_level(plan.targets), vec![stereo_db(-70); 2]);
+        // Agreeing channels are untouched by that step, and nothing is raised.
+        assert_eq!(single_level(vec![stereo_db(-40); 2]), vec![stereo_db(-40); 2]);
+        assert_eq!(single_level(vec![-5]), vec![-5]);
+        assert!(single_level(Vec::new()).is_empty());
+        assert_eq!(single_level(vec![-3, -9, -5]), vec![-9, -9, -9]);
+    }
+
 }

@@ -1,6 +1,11 @@
 use super::*;
 use crate::volume::{raw_to_db, VolumeRange as PublicVolumeRange, VolumeState};
-use crate::volume_control::{quantize_db, step_target_raw, HardwareVolumeSnapshot};
+use crate::config::StartupVolume;
+use crate::volume::StartupVolumeReport;
+use crate::volume_control::{
+    plan_startup_attenuation, quantize_db, single_level, step_target_raw, HardwareVolumeSnapshot,
+    SameRoute,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct AudioControlTopology {
@@ -426,6 +431,12 @@ pub(super) fn refresh_android_usb_hardware_volume_snapshot(
     Err(last_err.unwrap_or_else(|| "GET_CUR failed with no error recorded".to_string()))
 }
 
+impl SameRoute for HardwareVolumeControl {
+    fn same_route(&self, other: &Self) -> bool {
+        HardwareVolumeControl::same_route(self, other)
+    }
+}
+
 impl HardwareVolumeControl {
     /// Whether `other` drives the same Feature Unit the same way.
     pub(super) fn same_route(&self, other: &HardwareVolumeControl) -> bool {
@@ -690,6 +701,14 @@ pub(super) fn refresh_stream_volume_control(
             return;
         }
     };
+    adopt_volume_control(device, control);
+}
+
+/// Installs what discovery found as the route volume calls use, records its
+/// original level and runs the start-up step before anything can play through
+/// it, then caches the level. A control whose start-up step fails is not
+/// offered. Caller holds HARDWARE_VOLUME_MUTEX.
+pub(super) fn adopt_volume_control(device: &UsbDevice, control: Option<HardwareVolumeControl>) {
     install_volume_control(control.clone());
     let Some(control) = control else {
         log_info!("[USB] No hardware volume control discovered");
@@ -708,6 +727,31 @@ pub(super) fn refresh_stream_volume_control(
         control.volume_channels,
         control.mute_channel
     );
+    // The start-up step, once per route and session, before anything can be
+    // played through it. A route that comes back (the stream's terminal is the
+    // one found at open) keeps the level the host has set since.
+    if startup_volume_pending(&control) {
+        match run_startup_volume(device, &control) {
+            Ok(status) => {
+                log_info!(
+                    "[USB] Start-up volume: original {:?} dB, now {:?} dB, limit {:.2} dB{}",
+                    status.report.original_db,
+                    status.report.applied_db,
+                    status.report.limit_db,
+                    if status.report.clamped_to_minimum { " (clamped to the DAC's minimum)" } else { "" },
+                );
+                set_startup_volume(status);
+            }
+            Err(error) => {
+                // Without a verified, safe level the control is not offered:
+                // a stream through it would play at whatever the DAC had.
+                log_error!("[USB] Start-up volume protection failed, the volume control is unusable: {error}");
+                install_volume_control(None);
+                set_hardware_volume_error(Some(format!("start-up volume protection failed: {error}")));
+                return;
+            }
+        }
+    }
     let generation = SESSION_STATE
         .lock()
         .as_ref()
@@ -793,23 +837,22 @@ pub(super) fn read_channel_volumes(
         .collect()
 }
 
-/// Remembers the level a DAC has the first time its volume control is found
-/// during an attachment, which is before this library has written to it. Caller
-/// holds HARDWARE_VOLUME_MUTEX.
+/// Remembers the level every channel of a DAC has the first time its volume
+/// control is found during an attachment, which is before this library has
+/// written to it. Caller holds HARDWARE_VOLUME_MUTEX.
 pub(super) fn note_original_hardware_volume(
     device: &UsbDevice,
     control: &HardwareVolumeControl,
 ) {
     let key = original_volume_device_key(device);
-    if ORIGINAL_HARDWARE_VOLUME.lock().is_recorded(&key) {
+    if ORIGINAL_HARDWARE_VOLUME.lock().is_route_recorded(&key, control) {
         return;
     }
-    match read_channel_volumes(device, control).map(|raw| common_channel_volume(&raw)) {
-        Ok(Some(raw)) => {
-            log_info!("[USB] Original hardware volume of '{}': raw={raw}", device.product_name);
-            ORIGINAL_HARDWARE_VOLUME.lock().note(&key, control.clone(), raw);
+    match read_channel_volumes(device, control) {
+        Ok(channels) => {
+            log_info!("[USB] Original hardware volume of '{}': raw={channels:?}", device.product_name);
+            ORIGINAL_HARDWARE_VOLUME.lock().note(&key, control.clone(), channels);
         }
-        Ok(None) => log_warn!("[USB] Original hardware volume not recorded: channels disagree"),
         Err(error) => log_warn!("[USB] Original hardware volume not recorded: {error}"),
     }
 }
@@ -825,17 +868,23 @@ pub(crate) fn set_original_volume_action(action: u32) -> bool {
     true
 }
 
-/// The recorded original level in dB.
+/// The recorded original level in dB, if every channel of the current control
+/// had the same one.
 pub(crate) fn original_volume_db() -> Option<f64> {
-    let device = SESSION_STATE.lock().as_ref().map(|state| state.device.clone())?;
+    let (device, control) = {
+        let guard = SESSION_STATE.lock();
+        let state = guard.as_ref()?;
+        (state.device.clone(), state.hardware_volume_control.clone()?)
+    };
     ORIGINAL_HARDWARE_VOLUME
         .lock()
-        .peek(&original_volume_device_key(&device))
-        .map(|original| raw_to_db(original.raw))
+        .peek(&original_volume_device_key(&device), &control)
+        .and_then(|original| original.common())
+        .map(raw_to_db)
 }
 
-/// Writes the recorded original level back now and ends the record. `Ok(false)`
-/// when there is none or the DAC already holds it.
+/// Writes the recorded original level of every channel back now and ends the
+/// record. `Ok(false)` when there is none or the DAC already holds it.
 pub(crate) fn hand_back_original_volume() -> Result<bool, String> {
     let _hold = HARDWARE_VOLUME_MUTEX.lock();
     let device = SESSION_STATE
@@ -843,13 +892,21 @@ pub(crate) fn hand_back_original_volume() -> Result<bool, String> {
         .as_ref()
         .map(|state| state.device.clone())
         .ok_or_else(|| "no DAC is open".to_string())?;
-    let Some(original) = ORIGINAL_HARDWARE_VOLUME
+    let originals = ORIGINAL_HARDWARE_VOLUME
         .lock()
-        .take(&original_volume_device_key(&device))
-    else {
-        return Ok(false);
-    };
-    restore_original_hardware_volume(&device, &original.control, original.raw)
+        .take_all(&original_volume_device_key(&device));
+    let mut restored = false;
+    let mut failure = None;
+    for original in originals {
+        match restore_original_hardware_volume(&device, &original.control, &original.channels) {
+            Ok(wrote) => restored |= wrote,
+            Err(error) => failure = failure.or(Some(error)),
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(restored),
+    }
 }
 
 /// Settles the original level as the device is cleared, which is when another
@@ -863,33 +920,32 @@ pub(super) fn finish_original_hardware_volume() {
             let Some(device) = SESSION_STATE.lock().as_ref().map(|state| state.device.clone()) else {
                 return;
             };
-            let Some(original) = ORIGINAL_HARDWARE_VOLUME
+            let originals = ORIGINAL_HARDWARE_VOLUME
                 .lock()
-                .take(&original_volume_device_key(&device))
-            else {
-                return;
-            };
-            match restore_original_hardware_volume(&device, &original.control, original.raw) {
-                Ok(true) => log_info!("[USB] Restored original hardware volume: raw={}", original.raw),
-                Ok(false) => {}
-                Err(error) => log_warn!("[USB] Original hardware volume not restored: {error}"),
+                .take_all(&original_volume_device_key(&device));
+            for original in originals {
+                match restore_original_hardware_volume(&device, &original.control, &original.channels) {
+                    Ok(true) => log_info!("[USB] Restored original hardware volume: raw={:?}", original.channels),
+                    Ok(false) => {}
+                    Err(error) => log_warn!("[USB] Original hardware volume not restored: {error}"),
+                }
             }
         }
         _ => {}
     }
 }
 
-/// Writes `raw`, exactly as the DAC reported it, back to every channel and reads
-/// it back. Ok(false) when it was already there.
+/// Writes each channel's `channels` level, exactly as the DAC reported it, back
+/// and reads them back. Ok(false) when they were already there.
 pub(super) fn restore_original_hardware_volume(
     device: &UsbDevice,
     control: &HardwareVolumeControl,
-    raw: i16,
+    channels: &[i16],
 ) -> Result<bool, String> {
-    if read_channel_volumes(device, control)?.iter().all(|&current| current == raw) {
+    if read_channel_volumes(device, control)? == channels {
         return Ok(false);
     }
-    for &channel in &control.volume_channels {
+    for (&channel, &raw) in control.volume_channels.iter().zip(channels) {
         write_feature_unit_i16_control(
             device,
             control.interface_number,
@@ -899,10 +955,163 @@ pub(super) fn restore_original_hardware_volume(
             raw,
         )?;
     }
-    let readback = common_channel_volume(&read_channel_volumes(device, control)?);
-    if readback != Some(raw) {
-        return Err(format!("read back {readback:?} after writing {raw}"));
+    let readback = read_channel_volumes(device, control)?;
+    if readback != channels {
+        return Err(format!("read back {readback:?} after writing {channels:?}"));
     }
     Ok(true)
 }
 
+/// What the start-up step left behind for one route.
+#[derive(Debug, Clone)]
+pub(super) struct StartupVolumeStatus {
+    pub(super) route: HardwareVolumeControl,
+    pub(super) report: StartupVolumeReport,
+    /// This open wrote to the DAC (an earlier attenuation that a `Keep` hand-back
+    /// left in place is not this open's change).
+    pub(super) lowered: bool,
+}
+
+/// Whether the start-up step has yet to run for `control` in this session.
+pub(super) fn startup_volume_pending(control: &HardwareVolumeControl) -> bool {
+    SESSION_STATE.lock().as_ref().is_some_and(|state| {
+        !state
+            .startup_volume
+            .as_ref()
+            .is_some_and(|status| status.route.same_route(control))
+    })
+}
+
+fn set_startup_volume(status: StartupVolumeStatus) {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.startup_volume = Some(status);
+    }
+}
+
+/// Runs the configured start-up step on `control`: reads every channel, lowers
+/// what is louder than the ceiling and verifies the result by reading it back.
+/// The originals must be recorded first (they are the report's `original_db` and
+/// what hand-back restores). Caller holds HARDWARE_VOLUME_MUTEX.
+pub(super) fn run_startup_volume(
+    device: &UsbDevice,
+    control: &HardwareVolumeControl,
+) -> Result<StartupVolumeStatus, String> {
+    let startup = settings().config.startup_volume;
+    let current = read_channel_volumes(device, control)?;
+    let originals = ORIGINAL_HARDWARE_VOLUME
+        .lock()
+        .peek(&original_volume_device_key(device), control)
+        .map(|original| original.channels.clone())
+        .unwrap_or_else(|| current.clone());
+    apply_startup_volume(
+        startup,
+        &originals,
+        current,
+        &control.ranges,
+        |channel_index, raw| {
+            write_feature_unit_i16_control(
+                device,
+                control.interface_number,
+                control.feature_unit_id,
+                control.volume_channels[channel_index],
+                UAC2_FEATURE_UNIT_VOLUME_CONTROL,
+                raw,
+            )
+        },
+        || read_channel_volumes(device, control),
+    )
+    .map(|(report, lowered)| StartupVolumeStatus { route: control.clone(), report, lowered })
+}
+
+/// The start-up step against any DAC that can write and read a channel. Returns
+/// the report and whether anything was written.
+///
+/// `originals` are the levels before the library first touched the DAC, `current`
+/// the levels now (the same on a first open). Each channel is lowered to
+/// `min(its level, max_db)`; if that leaves channels at different levels, the
+/// louder ones follow the quietest so the control, which holds one level, stays
+/// usable. Only channels that change are written, and every channel is read back
+/// and compared with what was meant: any difference is an error and the caller
+/// treats the control as unusable.
+pub(super) fn apply_startup_volume(
+    startup: StartupVolume,
+    originals: &[i16],
+    current: Vec<i16>,
+    ranges: &[RawRange],
+    mut write: impl FnMut(usize, i16) -> Result<(), String>,
+    mut read_back: impl FnMut() -> Result<Vec<i16>, String>,
+) -> Result<(StartupVolumeReport, bool), String> {
+    let (targets, clamped_to_minimum, max_db) = match startup {
+        StartupVolume::Keep => (current.clone(), false, None),
+        StartupVolume::Attenuate { max_db } => {
+            let plan = plan_startup_attenuation(&current, ranges, max_db);
+            (single_level(plan.targets), plan.clamped_to_minimum, Some(max_db))
+        }
+    };
+    let mut lowered = false;
+    for (index, (&target, &now)) in targets.iter().zip(&current).enumerate() {
+        if target != now {
+            write(index, target)?;
+            lowered = true;
+        }
+    }
+    if lowered {
+        let after = read_back()?;
+        if after != targets {
+            return Err(format!(
+                "the attenuation could not be verified: wrote {targets:?}, the DAC reads {after:?}"
+            ));
+        }
+    }
+    let db = |raws: &[i16]| raws.iter().map(|&raw| raw_to_db(raw)).collect::<Vec<_>>();
+    let original_db = db(originals);
+    let limit_db = original_db
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let report = StartupVolumeReport {
+        attenuated: targets.iter().zip(originals).any(|(&applied, &original)| applied < original),
+        limit_db: if limit_db.is_finite() { limit_db } else { db(&targets).first().copied().unwrap_or(0.0) },
+        original_db,
+        applied_db: db(&targets),
+        clamped_to_minimum,
+        max_db,
+    };
+    Ok((report, lowered))
+}
+
+/// What the start-up step did for the route in use now.
+pub(crate) fn startup_report() -> Option<StartupVolumeReport> {
+    let guard = SESSION_STATE.lock();
+    let state = guard.as_ref()?;
+    let control = state.hardware_volume_control.as_ref()?;
+    state
+        .startup_volume
+        .as_ref()
+        .filter(|status| status.route.same_route(control))
+        .map(|status| status.report.clone())
+}
+
+/// Whether the start-up step lowered the level while this DAC was opened, with
+/// the level it left.
+pub(crate) fn startup_lowered_volume() -> Option<VolumeState> {
+    let guard = SESSION_STATE.lock();
+    let state = guard.as_ref()?;
+    state.startup_volume.as_ref().filter(|status| status.lowered)?;
+    state.hardware_volume_state
+}
+
+/// `Err(VolumeUnavailable)` when a hardware volume control is required and the
+/// DAC has no usable one.
+pub(crate) fn ensure_volume_if_required(required: bool) -> Result<(), crate::Error> {
+    if !required || has_hardware_volume() {
+        return Ok(());
+    }
+    let reason = SESSION_STATE
+        .lock()
+        .as_ref()
+        .and_then(|state| state.hardware_volume_error.clone())
+        .unwrap_or_else(|| "no volume control was found".to_string());
+    log_warn!("[USB] No usable hardware volume and one is required: {reason}");
+    Err(crate::Error::VolumeUnavailable)
+}

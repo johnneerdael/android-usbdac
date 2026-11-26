@@ -256,6 +256,7 @@ pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
         hardware_volume_generation: HARDWARE_VOLUME_GENERATION.fetch_add(1, Ordering::Relaxed),
         hardware_volume_error: None,
         hardware_volume_state: None,
+        startup_volume: None,
         runtime_stats: None,
     });
     drop(guard);
@@ -648,6 +649,7 @@ pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionSta
         hardware_volume_generation: 0,
         hardware_volume_error: None,
         hardware_volume_state: None,
+        startup_volume: None,
         runtime_stats,
     }
 }

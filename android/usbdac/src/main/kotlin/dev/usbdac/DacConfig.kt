@@ -15,6 +15,29 @@ public enum class HandBack {
     KEEP,
 }
 
+/**
+ * What [UsbDac.open] does with the DAC's hardware volume before any stream can start.
+ *
+ * A DAC keeps the level it had, and many default to full scale, so the first audio would play at
+ * that level. The default [Attenuate] lowers it. The level the DAC had is recorded first and
+ * [HandBack.RESTORE_ORIGINAL] restores it. [DacVolume.startup] says what happened.
+ */
+public sealed interface StartupVolume {
+    /**
+     * Lower every controlled channel to `min(its level, maxDb)`, rounded down to a step the DAC
+     * supports, and verify it by reading it back. A channel is never raised: one that is already
+     * quieter, or at the DAC's silent value, is left alone. If [maxDb] is below the DAC's minimum
+     * the channels go to the minimum and [StartupVolumeReport.clampedToMinimum] says so. If the
+     * attenuation cannot be verified the hardware volume is treated as unusable: [DacSession.volume]
+     * is `null` and, with [DacConfig.requireHardwareVolume], streaming fails with
+     * [DacErrorCode.VOLUME_UNAVAILABLE]. [maxDb] must be between -128 and 0.
+     */
+    public data class Attenuate @JvmOverloads constructor(val maxDb: Double = -40.0) : StartupVolume
+
+    /** Leave the DAC's level alone. The first audio plays at whatever the DAC had. */
+    public data object Keep : StartupVolume
+}
+
 /** A workaround for a DAC that deviates from the USB Audio Class. */
 public sealed interface DacQuirk {
     /**
@@ -145,4 +168,21 @@ public data class DacConfig @JvmOverloads constructor(
      * queue ([busQueueMs]) play out, as before. Default `true`.
      */
     val cancelInFlightOnFlush: Boolean = true,
+
+    /**
+     * What [UsbDac.open] does with the DAC's hardware volume before any stream can start. Default
+     * [StartupVolume.Attenuate] at -40 dB: a DAC that comes up at full scale does not play its first
+     * audio there. See [StartupVolume] and [DacVolume.startup].
+     */
+    val startupVolume: StartupVolume = StartupVolume.Attenuate(),
+
+    /**
+     * [DacSession.openStream] fails with [DacErrorCode.VOLUME_UNAVAILABLE] when the DAC has no usable
+     * hardware volume control (none, or its start-up attenuation could not be verified): a stream
+     * would play at the DAC's own level with no way to bring it down. The session itself opens, and
+     * [DacSession.negotiate] and [DacSession.capabilities] work, so the app can show what the DAC
+     * offers, ask the user to allow fixed-level output, and open the session again with this
+     * `false`. Default `true`.
+     */
+    val requireHardwareVolume: Boolean = true,
 )

@@ -43,15 +43,31 @@ class DacVolumeTest {
     private val backend = FakeBackend()
     private val errors = mutableListOf<DacException>()
     private val inline = Executor { it.run() }
+    private val startup = StartupVolumeReport(
+        originalDb = listOf(0.0), appliedDb = listOf(-40.0), limitDb = 0.0,
+        attenuated = true, clampedToMinimum = false, maxDb = -40.0,
+    )
 
     private fun volume(executor: Executor = inline, hasMute: Boolean = true) = DacVolume(
         backend = backend,
         range = VolumeRange(-80.0, 0.0, 1.0),
         hasMute = hasMute,
         initial = VolumeState(-40.0, 0.5, false),
+        startup = startup,
         executor = executor,
         onWriteFailed = { errors += it },
     )
+
+    @Test
+    fun theStartupReportIsWhatTheLibraryDidBeforeAnyStream() {
+        val volume = volume()
+        assertEquals(listOf(0.0), volume.startup.originalDb)
+        assertEquals(listOf(-40.0), volume.startup.appliedDb)
+        assertEquals("a host restoring a remembered level stays at or below this", 0.0, volume.startup.limitDb, 0.0)
+        assertTrue(volume.startup.attenuated)
+        // The state a UI starts from is the attenuated level, not the original.
+        assertEquals(-40.0, volume.state.value.db, 0.0)
+    }
 
     @Test
     fun theStateFollowsWhatTheDacReadsBack() {
@@ -125,7 +141,7 @@ class DacVolumeTest {
         val broken = object : VolumeBackend by backend {
             override fun setFraction(fraction: Double): VolumeState = throw RuntimeException("boom")
         }
-        val failing = DacVolume(broken, VolumeRange(-80.0, 0.0, 1.0), true, VolumeState(-40.0, 0.5, false), inline) { errors += it }
+        val failing = DacVolume(broken, VolumeRange(-80.0, 0.0, 1.0), true, VolumeState(-40.0, 0.5, false), startup, inline) { errors += it }
         failing.setFraction(0.1)
         assertEquals(DacErrorCode.UNKNOWN, errors.single().code)
         assertEquals(0.5, failing.state.value.fraction, 0.0)

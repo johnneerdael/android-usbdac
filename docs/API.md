@@ -40,7 +40,7 @@ Contents
 ## 2. Lifecycle
 
 ```
-Dac::open(fd, DeviceInfo, DacConfig)          scan descriptors, find volume, hold the device
+Dac::open(fd, DeviceInfo, DacConfig)          scan descriptors, find volume, lower it, hold the device
   |- dac.capabilities()                       what the DAC offers
   |- dac.volume()  -> VolumeControl           works with or without a stream
   |- dac.negotiate(&StreamRequest) -> StreamFormat     programs and verifies the clock
@@ -81,8 +81,9 @@ dac.set_listener(Option<Arc<dyn DacListener>>)     // device-level events
 dac.close(self) -> Result<()>                      // also on drop
 ```
 
-- `open` scans the descriptors, finds the hardware volume control and records
-  the DAC's level. It does not touch the clock and starts no audio. Errors:
+- `open` scans the descriptors, finds the hardware volume control, records the
+  DAC's level and lowers it (`DacConfig::startup_volume`, see section 8). It does
+  not touch the clock and starts no audio. Errors:
   `Busy`, `PlatformUnsupported` (not Linux or Android), `Claim`,
   `Unsupported` (no isochronous OUT audio interface), `InvalidArgument` (config).
 - `negotiate` settles the wire format. It programs the DAC's sampling
@@ -95,7 +96,8 @@ dac.close(self) -> Result<()>                      // also on drop
   starts the output thread (100 ms or more). Errors include
   `ClockUnverified` (see `DacConfig::require_verified_rate`), `Unsupported`,
   `ImplicitFeedbackUnsupported` (see "Asynchronous endpoints without feedback"
-  below), `Claim`, and `InvalidState` if a stream is already open. Only one stream at a
+  below), `VolumeUnavailable` (see `DacConfig::require_hardware_volume`),
+  `Claim`, and `InvalidState` if a stream is already open. Only one stream at a
   time.
 - `close` stops the stream, hands the volume back as `DacConfig::hand_back`
   says, releases the session and joins the threads. After it returns another
@@ -120,6 +122,8 @@ dac.close(self) -> Result<()>                      // also on drop
 | `allow_unsynchronized_async` | `false` | Stream an asynchronous endpoint that has no explicit feedback endpoint at the nominal rate instead of refusing it (see below). |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
+| `startup_volume` | `Attenuate { max_db: -40.0 }` | What `open` does with the hardware volume before any stream can start: `Attenuate { max_db }` lowers every channel to `min(its level, max_db)`, `Keep` leaves it. See section 8. |
+| `require_hardware_volume` | `true` | `open_stream` fails with `Error::VolumeUnavailable` when the DAC has no usable hardware volume control. `negotiate` and `capabilities` work either way. |
 | `cancel_in_flight_on_flush` | `true` | `flush()` also cancels the transfers already on the bus (see `flush()`). Off: they play out. |
 | `bus_queue_ms` | 16 | Audio kept queued on the USB bus, 4 to 64. One rule for every service interval and encoding (see "The bus queue"). |
 | `transfers_in_flight` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `bus_queue_ms / transfers_in_flight` of audio. |
@@ -206,6 +210,7 @@ Capabilities {
     native_dsd_bit_rates: Vec<u32>,
     has_explicit_feedback: bool,
     volume: Option<VolumeRange>,
+    has_hardware_volume: bool,        // volume.is_some(): a usable control exists
     has_mute: bool,
 }
 AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat /*Pcm|Dsd|Other*/,
@@ -323,6 +328,7 @@ Frame counters are in `counter_rate_hz()` units.
 | `Control(String)` | `control` | A class control request (clock, volume, mute) failed. |
 | `InvalidState(String)` | `invalid_state` | The call is not valid now (closed, drained, second stream, ...). |
 | `InvalidArgument(String)` | `invalid_argument` | Out of range or malformed argument. |
+| `VolumeUnavailable` | `volume_unavailable` | `open_stream` on a DAC with no usable hardware volume control while `require_hardware_volume` is on. The host asks the user to allow fixed-level output and opens the DAC again with `require_hardware_volume = false`. |
 
 `Display` is `"<code>: <message>"`.
 
@@ -510,6 +516,7 @@ volume.set_db(f64) -> Result<VolumeState>
 volume.set_fraction(f64) -> Result<VolumeState>
 volume.step(direction: i8, steps: u8) -> Result<VolumeState>   // steps == 0 means 16
 volume.set_mute(bool) -> Result<VolumeState>
+volume.startup() -> StartupVolumeReport           // what open did to the level
 volume.original_db() -> Option<f64>
 volume.hand_back() -> Result<bool>
 ```
@@ -528,13 +535,79 @@ volume.hand_back() -> Result<bool>
   fails restores the channels already written. A readback that differs from the
   write is `Error::Control`.
 - `original_db()` is the level the DAC had the first time the library read it
-  (before any write), if all channels agreed. `hand_back()` writes it back and
-  ends the record. With `HandBack::RestoreOriginal` this happens at close; with
+  (before any write, so before the start-up attenuation), if all channels
+  agreed. `hand_back()` writes it back, each channel its own original, and ends
+  the record. With `HandBack::RestoreOriginal` this happens at close; with
   `Keep` the record survives in the process so a later `open` of the same device
   still knows the true original.
 - `VolumeChanged` events are sent for changes made through this library, not
   for a physical knob; call `get()` to poll (it sends the event if the level
   differs from the last one it saw).
+
+### Start-up volume protection
+
+A DAC keeps the level it had, and many default to full scale. `Dac::open`
+therefore protects the first audio. With the default
+`StartupVolume::Attenuate { max_db: -40.0 }`, once the hardware volume control
+is found:
+
+1. each controlled channel's level is read and recorded first, as the original
+   (what `hand_back` and a `RestoreOriginal` close restore);
+2. each channel is lowered to `min(its level, max_db)` and every channel is read
+   back and compared with what was meant, all before `open` returns and so
+   before any stream can be opened;
+3. the result is the `StartupVolumeReport` of `volume.startup()`, and a
+   `VolumeChanged` event follows when something was lowered.
+
+A channel is **never raised**: one already below the ceiling, or at the DAC's
+silent value, is left alone. `max_db` is rounded **down** to a step the DAC
+supports; if the DAC's minimum is above it, the channels go to the minimum and
+`clamped_to_minimum` says so. Channels that end at different levels are brought
+to the quietest, because the control reads and writes one level (a channel's
+own original is still what hand-back restores). `StartupVolume::Keep` leaves
+the level alone. The step runs once per `open` and per volume route: a level the
+host sets afterwards is never pulled back, a stream that opens later does not
+repeat it, and a stream that plays through another Feature Unit gets the same
+protection for that unit, with its own recorded original.
+
+If a write or the read-back fails, the attenuation is not verified: the control
+is treated as **unusable**. `dac.volume()` is `None`,
+`Capabilities::has_hardware_volume` is false, the failure is logged, and what the
+library may have changed stays on record for hand-back.
+
+```rust
+StartupVolumeReport {
+    original_db: Vec<f64>,   // per channel, before the library touched it
+    applied_db: Vec<f64>,    // per channel, now
+    limit_db: f64,           // the quietest original channel
+    attenuated: bool,        // applied is below original on some channel
+    clamped_to_minimum: bool,
+    max_db: Option<f64>,     // the ceiling asked for; None for Keep
+}
+```
+
+`limit_db` is the cap for a host that restores a level it remembered for this
+DAC: it should not go above it without the user's action, because that is how
+loud the DAC itself was when it connected. What a host does on connect:
+
+1. read `volume.startup()` and show it if it wants to say the level was lowered;
+2. restore its remembered per-DAC level capped by `limit_db`
+   (`min(remembered, limit_db)`), or leave the attenuated level if it remembers
+   none;
+3. let the user raise it from there.
+
+`VolumeChanged` (with the attenuated level) goes to the first listener set with
+`Dac::set_listener` when the open lowered something: nothing can listen before
+`open` returns, so it is held until then. A re-open that finds the DAC already
+at the ceiling (after `HandBack::Keep`) lowers nothing and sends nothing.
+
+**Without a usable hardware volume** (none found, or the step above failed),
+`open_stream` fails with `Error::VolumeUnavailable` while
+`DacConfig::require_hardware_volume` is true, once the stream's own route is
+known to have none and before the output thread starts or the stream's clock is
+programmed. `open`, `negotiate` and `capabilities` still work, so the host can
+show what the DAC offers, ask the user whether to allow fixed-level output, and
+open the DAC again with `require_hardware_volume = false`.
 
 ## 9. Driving the stream from a render callback
 
@@ -630,6 +703,7 @@ object Native {
     @JvmStatic external fun volumeSetMute(dac: Long, muted: Boolean): String
     @JvmStatic external fun volumeOriginalDb(dac: Long): Double  // NaN: none recorded
     @JvmStatic external fun volumeHandBack(dac: Long): Boolean
+    @JvmStatic external fun volumeStartup(dac: Long): String?   // null: no hardware volume
 }
 ```
 
@@ -659,7 +733,7 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 Every failure is a `java.lang.IllegalStateException` whose message is
 `usbdac:<code>: <message>`, with `<code>` one of `busy`, `platform_unsupported`,
 `claim`, `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
-`control`, `invalid_state`, `invalid_argument` (section 3). Malformed JSON and
+`control`, `invalid_state`, `invalid_argument`, `volume_unavailable` (section 3). Malformed JSON and
 bad handles are `invalid_argument`. A Rust panic is converted to a
 `RuntimeException`.
 
@@ -675,7 +749,7 @@ bad handles are `invalid_argument`. A Rust panic is converted to a
 | 3 | BitPerfectChanged | 1 or 0 | 0 | null |
 | 4 | VolumeChanged | muted: 1, 0, or -1 unknown | level in dB | the volume state JSON |
 | 5 | FeedbackStale | 0 | 0 | null |
-| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported | 0 | `usbdac:<code>: <message>` |
+| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported, 12 volume_unavailable | 0 | `usbdac:<code>: <message>` |
 | 7 | DeviceLost | 0 | 0 | null |
 
 Unknown future events arrive with `type` -1 and a debug string in `message`.
@@ -704,11 +778,14 @@ ignored.
   "padded_24bit": true, "allow_unsynchronized_async": false, "realtime_priority": true,
   "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
   "cancel_in_flight_on_flush": true,
+  "startup_volume": "attenuate", "startup_volume_max_db": -40.0, "require_hardware_volume": true,
   "quirks": [ { "vendor_id": 1, "product_id": 2, "name_contains": "Foo",
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
 ```
 
-`hand_back` is `restore_original` or `keep`. Flag quirks:
+`hand_back` is `restore_original` or `keep`. `startup_volume` is `attenuate`
+(default; `startup_volume_max_db` is its ceiling, -40.0 when absent) or `keep`
+(which ignores the ceiling); a `startup_volume_max_db` alone means `attenuate`. Flag quirks:
 `skip_clock_validation`, `ignore_invalid_sample_rate`, `require_verified_rate`,
 `prefer_padded_24bit_transport`, `dsd_big_endian`, `dsd_bit_reverse`; valued
 quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}`.
@@ -734,7 +811,8 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
   "supports_pcm": true, "supports_dop": true, "dop_max_dsd_bit_rate": 11289600,
   "supports_native_dsd": false, "native_dsd_bit_rates": [],
   "has_explicit_feedback": true,
-  "volume": { "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 }, "has_mute": true,
+  "volume": { "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 },
+  "has_hardware_volume": true, "has_mute": true,
   "alt_settings": [ { "interface_number": 1, "alt_setting": 1, "endpoint_address": 1,
       "format": "pcm", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
       "rate_ranges": [ { "min_hz": 44100, "max_hz": 44100, "step_hz": 0 } ],
@@ -764,6 +842,10 @@ code string or `null`; `software_gain`,
 feedback report).
 
 **Volume range**: `{ "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 }`.
+**Start-up report** (`volumeStartup`):
+`{ "original_db": [-10.0, -70.0], "applied_db": [-70.0, -70.0], "limit_db": -70.0,
+"attenuated": true, "clamped_to_minimum": false, "max_db": -40.0 }` (`max_db` is
+`null` for `keep`).
 **Volume state**: `{ "db": -40.0, "fraction": 0.5, "muted": false }` (`muted` is
 `null` when the DAC has no readable mute).
 

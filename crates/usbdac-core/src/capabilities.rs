@@ -158,6 +158,10 @@ pub struct Capabilities {
     pub has_explicit_feedback: bool,
     /// The DAC's hardware volume control, if it has a writable one.
     pub volume: Option<VolumeRange>,
+    /// The DAC has a usable hardware volume control (`volume.is_some()`). A
+    /// DAC that has none is refused by `open_stream` unless
+    /// `DacConfig::require_hardware_volume` is off.
+    pub has_hardware_volume: bool,
     pub has_mute: bool,
 }
 

@@ -7,6 +7,7 @@ import dev.usbdac.internal.NativeListener
 import dev.usbdac.internal.NativeVolumeBackend
 import dev.usbdac.internal.logWarning
 import dev.usbdac.internal.parseCapabilities
+import dev.usbdac.internal.parseStartupReport
 import dev.usbdac.internal.parseStreamFormat
 import dev.usbdac.internal.parseVolumeRange
 import dev.usbdac.internal.parseVolumeState
@@ -83,7 +84,13 @@ public class DacSession private constructor(
      */
     public val events: SharedFlow<DacEvent> get() = mutableEvents
 
-    /** The hardware volume, or `null` when the DAC has no writable volume control. */
+    /**
+     * The hardware volume, or `null` when the DAC has no usable volume control: it has none, or the
+     * start-up attenuation ([DacConfig.startupVolume]) could not be verified. With a volume,
+     * [DacVolume.startup] says what the library did to the level when the session opened. Without
+     * one, [openStream] fails with [DacErrorCode.VOLUME_UNAVAILABLE] unless
+     * [DacConfig.requireHardwareVolume] is off.
+     */
     public val volume: DacVolume?
 
     private val deviceListener = object : NativeListener {
@@ -104,6 +111,7 @@ public class DacSession private constructor(
                 range = it,
                 hasMute = capabilities.hasMute,
                 initial = nativeCall { parseVolumeState(Native.volumeGet(dac)) },
+                startup = nativeCall { parseStartupReport(requireNotNull(Native.volumeStartup(dac))) },
                 executor = volumeExecutor,
                 onWriteFailed = { error -> mutableEvents.tryEmit(DacEvent.VolumeWriteFailed(error)) },
             )
@@ -128,7 +136,9 @@ public class DacSession private constructor(
      * itself once the ring holds [DacConfig.startThresholdMs] of audio.
      *
      * @throws DacException [DacErrorCode.INVALID_STATE] if a stream is already open,
-     *   [DacErrorCode.CLOCK_UNVERIFIED] if the DAC does not confirm the rate, and the native codes.
+     *   [DacErrorCode.CLOCK_UNVERIFIED] if the DAC does not confirm the rate,
+     *   [DacErrorCode.VOLUME_UNAVAILABLE] if the DAC has no usable hardware volume and
+     *   [DacConfig.requireHardwareVolume] is on, and the native codes.
      */
     @Synchronized
     public fun openStream(format: StreamFormat): DacStream {

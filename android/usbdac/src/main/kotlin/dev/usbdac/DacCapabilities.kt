@@ -71,5 +71,11 @@ public data class DacCapabilities(
     val hasExplicitFeedback: Boolean,
     /** The hardware volume range; `null` when the DAC has no writable volume control. */
     val volume: VolumeRange?,
+    /**
+     * The DAC has a usable hardware volume control (`volume != null`). Without one,
+     * [DacSession.openStream] fails with [DacErrorCode.VOLUME_UNAVAILABLE] unless
+     * [DacConfig.requireHardwareVolume] is off.
+     */
+    val hasHardwareVolume: Boolean,
     val hasMute: Boolean,
 )

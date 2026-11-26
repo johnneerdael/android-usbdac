@@ -1965,6 +1965,329 @@ mod hardware_volume_without_a_stream_tests {
     }
 }
 
+/// What `Dac::open` does with the DAC's level before any stream can start: the
+/// start-up attenuation, its verification, the original level it must preserve,
+/// and what happens to a DAC whose level cannot be made safe. The fake Feature
+/// Unit answers the control transfers in-process.
+#[cfg(test)]
+mod startup_volume_tests {
+    use super::fake_dac::{control, device, Registered};
+    use super::*;
+    use crate::config::{DacConfig, StartupVolume};
+
+    fn db(db: i32) -> i16 {
+        (db * 256) as i16
+    }
+
+    fn attenuate(max_db: f64) -> DacConfig {
+        DacConfig {
+            startup_volume: StartupVolume::Attenuate { max_db },
+            ..DacConfig::default()
+        }
+    }
+
+    /// What the library does once discovery has found `control`.
+    fn open_with(dac: &Registered, config: DacConfig, control: HardwareVolumeControl) {
+        dac.configure(config);
+        let _hold = HARDWARE_VOLUME_MUTEX.lock();
+        adopt_volume_control(&device(), Some(control));
+    }
+
+    fn report() -> crate::volume::StartupVolumeReport {
+        startup_report().expect("a control with a start-up report")
+    }
+
+    #[test]
+    fn a_loud_dac_comes_up_at_the_ceiling_with_the_original_recorded_first() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+
+        assert_eq!(dac.raw(), vec![db(-40), db(-40)]);
+        let report = report();
+        assert_eq!(report.original_db, vec![0.0, 0.0]);
+        assert_eq!(report.applied_db, vec![-40.0, -40.0]);
+        assert_eq!(report.limit_db, 0.0, "the quietest original channel");
+        assert!(report.attenuated && !report.clamped_to_minimum);
+        assert_eq!(report.max_db, Some(-40.0));
+        // The record holds the pre-attenuation level, not the attenuated one.
+        assert_eq!(original_volume_db(), Some(0.0));
+        // The control works and its cached level is the attenuated one.
+        assert!(has_hardware_volume());
+        assert_eq!(cached_volume_state().unwrap().db, -40.0);
+        assert_eq!(startup_lowered_volume().unwrap().db, -40.0, "the open changed the level");
+    }
+
+    #[test]
+    fn a_channel_is_never_raised() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(-64), db(-64));
+        open_with(&dac, attenuate(-40.0), control());
+
+        assert_eq!(dac.raw(), vec![db(-64), db(-64)]);
+        assert!(dac.dac.lock().unwrap().volume_writes.is_empty(), "nothing was written");
+        let report = report();
+        assert_eq!(report.applied_db, report.original_db);
+        assert_eq!(report.limit_db, -64.0);
+        assert!(!report.attenuated);
+        assert_eq!(startup_lowered_volume(), None, "no change, no event");
+        assert!(has_hardware_volume());
+    }
+
+    #[test]
+    fn the_ceiling_rounds_down_to_a_step_the_dac_supports() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        let mut coarse = control();
+        coarse.ranges = vec![RawRange { min: db(-80), max: 0, resolution: 3 * 256 }];
+        coarse.resolution_raw = 3 * 256;
+        open_with(&dac, attenuate(-40.0), coarse);
+
+        // -80, -77, ... -41, -38: the ceiling is the step below it.
+        assert_eq!(dac.raw(), vec![db(-41), db(-41)]);
+        assert_eq!(report().applied_db, vec![-41.0, -41.0]);
+    }
+
+    #[test]
+    fn a_ceiling_below_the_dacs_minimum_clamps_to_it_and_reports_that() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(-10));
+        let mut shallow = control();
+        shallow.ranges = vec![RawRange { min: db(-30), max: 0, resolution: 256 }];
+        shallow.min_volume_raw = db(-30);
+        open_with(&dac, attenuate(-40.0), shallow);
+
+        assert_eq!(dac.raw(), vec![db(-30), db(-30)]);
+        let report = report();
+        assert!(report.clamped_to_minimum);
+        assert_eq!(report.applied_db, vec![-30.0, -30.0]);
+        assert_eq!(report.max_db, Some(-40.0), "what was asked is still reported");
+    }
+
+    #[test]
+    fn a_channel_already_at_the_silent_value_is_kept() {
+        let dac = Registered::new(false, false);
+        // The left channel sits at the DAC's minimum (silence); the right is loud.
+        dac.set_levels(db(-80), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+
+        let writes = dac.dac.lock().unwrap().volume_writes.clone();
+        assert!(
+            writes.iter().all(|(channel, _)| *channel == 2),
+            "the silent channel is never written: {writes:?}"
+        );
+        // One level for the control: the loud channel follows the silent one.
+        assert_eq!(dac.raw(), vec![db(-80), db(-80)]);
+        let report = report();
+        assert_eq!(report.original_db, vec![-80.0, 0.0]);
+        assert_eq!(report.limit_db, -80.0);
+    }
+
+    #[test]
+    fn channels_are_lowered_independently_and_each_original_is_kept_for_hand_back() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(-10), db(-70));
+        open_with(&dac, attenuate(-40.0), control());
+
+        // Left was loud and comes down; right was already quiet and is not written.
+        let writes = dac.dac.lock().unwrap().volume_writes.clone();
+        assert_eq!(writes, vec![(1, db(-70))], "only the loud channel, and nothing is raised");
+        assert_eq!(dac.raw(), vec![db(-70), db(-70)]);
+        let report = report();
+        assert_eq!(report.original_db, vec![-10.0, -70.0]);
+        assert_eq!(report.applied_db, vec![-70.0, -70.0]);
+        assert_eq!(report.limit_db, -70.0);
+        // Different originals have no single level...
+        assert_eq!(original_volume_db(), None);
+
+        // ...but each one is restored.
+        assert_eq!(hand_back_original_volume(), Ok(true));
+        assert_eq!(dac.raw(), vec![db(-10), db(-70)]);
+    }
+
+    #[test]
+    fn keep_leaves_the_levels_alone() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        let keep = DacConfig { startup_volume: StartupVolume::Keep, ..DacConfig::default() };
+        open_with(&dac, keep, control());
+
+        assert_eq!(dac.raw(), vec![db(0), db(0)]);
+        assert!(dac.dac.lock().unwrap().volume_writes.is_empty());
+        let report = report();
+        assert_eq!(report.applied_db, report.original_db);
+        assert!(!report.attenuated);
+        assert_eq!(report.max_db, None);
+        assert_eq!(report.limit_db, 0.0);
+        assert!(has_hardware_volume(), "the control is there, just not lowered");
+        assert_eq!(startup_lowered_volume(), None);
+    }
+
+    #[test]
+    fn a_dac_that_does_not_take_the_attenuation_is_unusable_and_refused() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        dac.dac.lock().unwrap().ignore_volume_writes = true;
+        open_with(&dac, attenuate(-40.0), control());
+
+        // The read-back still says 0 dB: the attenuation cannot be verified.
+        assert!(!has_hardware_volume(), "no control is offered");
+        assert!(startup_report().is_none());
+        let reason = SESSION_STATE
+            .lock()
+            .as_ref()
+            .and_then(|state| state.hardware_volume_error.clone())
+            .unwrap();
+        assert!(reason.contains("start-up volume protection failed"), "{reason}");
+        assert!(reason.contains("could not be verified"), "{reason}");
+
+        // With a control required, a stream is refused; otherwise it may go ahead.
+        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(ensure_volume_if_required(false), Ok(()));
+        // What the library may have changed is still on record for hand-back.
+        assert!(ORIGINAL_HARDWARE_VOLUME.lock().is_recorded(&original_volume_device_key(&device())));
+    }
+
+    #[test]
+    fn a_dac_that_cannot_be_read_is_unusable_too() {
+        let dac = Registered::new(false, false);
+        dac.dac.lock().unwrap().unreachable = true;
+        open_with(&dac, attenuate(-40.0), control());
+        assert!(!has_hardware_volume());
+        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+    }
+
+    #[test]
+    fn no_control_at_all_is_refused_only_when_one_is_required() {
+        let none = Registered::new(false, false);
+        assert!(!has_hardware_volume());
+        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(ensure_volume_if_required(false), Ok(()));
+        drop(none); // the fake registration is process-wide: one at a time
+        let dac = Registered::new(false, true);
+        assert_eq!(ensure_volume_if_required(true), Ok(()), "a DAC with a control is never refused");
+        drop(dac);
+    }
+
+    #[test]
+    fn a_stream_whose_own_route_has_no_volume_is_refused_even_if_open_found_one() {
+        // Open found a control through the first playback stream; the stream that
+        // is being opened plays through a terminal that has none.
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+        assert_eq!(ensure_volume_if_required(true), Ok(()));
+        {
+            let _hold = HARDWARE_VOLUME_MUTEX.lock();
+            adopt_volume_control(&device(), None);
+        }
+        assert!(!has_hardware_volume());
+        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(ensure_volume_if_required(false), Ok(()), "a fixed level the user allowed");
+    }
+
+    #[test]
+    fn hand_back_restores_the_true_original_and_it_survives_a_reopen() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(-5), db(-5));
+        open_with(&dac, attenuate(-40.0), control());
+        assert_eq!(dac.raw(), vec![db(-40), db(-40)]);
+
+        // The session ends with the level kept (the host takes the DAC straight
+        // back) and a new one opens the same DAC: it is already at the ceiling,
+        // so nothing is written, and the report still names the true original.
+        *SESSION_STATE.lock() = Some(fake_dac::state(false, None));
+        dac.dac.lock().unwrap().volume_writes.clear();
+        open_with(&dac, attenuate(-40.0), control());
+        assert!(dac.dac.lock().unwrap().volume_writes.is_empty());
+        let report = report();
+        assert_eq!(report.original_db, vec![-5.0, -5.0]);
+        assert_eq!(report.applied_db, vec![-40.0, -40.0]);
+        assert!(report.attenuated, "below the level it had before the library touched it");
+        assert_eq!(report.limit_db, -5.0);
+        assert_eq!(startup_lowered_volume(), None, "this open wrote nothing");
+
+        // Closing for the restore action puts the true original back.
+        assert!(set_original_volume_action(ORIGINAL_VOLUME_RESTORE));
+        clear_session_state();
+        assert_eq!(dac.raw(), vec![db(-5), db(-5)]);
+    }
+
+    #[test]
+    fn a_louder_level_left_by_a_kept_session_is_brought_down_again() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(-5), db(-5));
+        open_with(&dac, attenuate(-40.0), control());
+        write_volume_db(-10.0).unwrap();
+
+        *SESSION_STATE.lock() = Some(fake_dac::state(false, None));
+        open_with(&dac, attenuate(-40.0), control());
+        assert_eq!(dac.raw(), vec![db(-40), db(-40)]);
+        assert_eq!(report().original_db, vec![-5.0, -5.0], "still the first original");
+    }
+
+    #[test]
+    fn a_route_that_comes_back_keeps_the_level_the_host_set_since() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+        write_volume_db(-20.0).unwrap();
+        let writes = dac.dac.lock().unwrap().volume_writes.len();
+
+        // The next stream's discovery finds the same Feature Unit: the start-up
+        // step has run for it, so the host's -20 dB is not pulled back to -40.
+        {
+            let _hold = HARDWARE_VOLUME_MUTEX.lock();
+            adopt_volume_control(&device(), Some(control()));
+        }
+        assert_eq!(dac.raw(), vec![db(-20), db(-20)]);
+        assert_eq!(dac.dac.lock().unwrap().volume_writes.len(), writes);
+        assert_eq!(cached_volume_state().unwrap().db, -20.0);
+        // The original is still the first one.
+        assert_eq!(original_volume_db(), Some(0.0));
+    }
+
+    #[test]
+    fn another_feature_unit_is_a_new_route_that_still_needs_its_start_up_step() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+        assert!(!startup_volume_pending(&control()));
+        let mut other = control();
+        other.feature_unit_id += 1;
+        assert!(startup_volume_pending(&other), "its level was never lowered");
+    }
+
+    #[test]
+    fn volume_works_without_a_stream_after_the_start_up_step() {
+        let dac = Registered::new(false, false);
+        dac.set_levels(db(0), db(0));
+        open_with(&dac, attenuate(-40.0), control());
+        assert!(!SESSION_STATE.lock().as_ref().unwrap().stream_active);
+
+        let state = write_volume_fraction(0.5).unwrap();
+        assert!(state.db > -80.0 && state.db < 0.0);
+        assert_eq!(write_mute(true).unwrap().muted, Some(true));
+        assert_eq!(read_volume_state().unwrap().db, state.db);
+        // A level above the ceiling is the host's choice once the DAC is open.
+        assert_eq!(write_volume_db(-3.0).unwrap().db, -3.0);
+    }
+
+    #[test]
+    fn capabilities_say_whether_a_hardware_volume_exists() {
+        let with = Registered::new(false, true);
+        SESSION_STATE.lock().as_mut().unwrap().capability_model = Some(CapabilityModel::default());
+        let capabilities = crate::transport::api::capabilities().unwrap();
+        assert!(capabilities.has_hardware_volume && capabilities.volume.is_some());
+        drop(with);
+
+        let _without = Registered::new(false, false);
+        SESSION_STATE.lock().as_mut().unwrap().capability_model = Some(CapabilityModel::default());
+        let capabilities = crate::transport::api::capabilities().unwrap();
+        assert!(!capabilities.has_hardware_volume && capabilities.volume.is_none());
+    }
+}
+
 /// Asynchronous endpoints without an explicit feedback endpoint need implicit
 /// feedback, which is not supported: they are refused unless the configuration
 /// allows streaming them at the nominal rate, and then never bit-perfect.

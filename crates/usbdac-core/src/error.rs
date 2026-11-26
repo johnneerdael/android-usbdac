@@ -49,12 +49,20 @@ pub enum Error {
     InvalidState(String),
     /// An argument was out of range or malformed.
     InvalidArgument(String),
+    /// The DAC has no usable hardware volume control (none, or its start-up
+    /// attenuation could not be verified) and
+    /// [`DacConfig::require_hardware_volume`](crate::DacConfig::require_hardware_volume)
+    /// is on: a stream would play at the DAC's own level with no way for the
+    /// host to bring it down. Ask the user to allow fixed-level output and open
+    /// the DAC again with `require_hardware_volume` off. `negotiate` and
+    /// `capabilities` still work, so the host can show what the DAC offers.
+    VolumeUnavailable,
 }
 
 impl Error {
     /// Stable identifier: `busy`, `platform_unsupported`, `claim`,
     /// `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
-    /// `control`, `invalid_state`, `invalid_argument`.
+    /// `control`, `invalid_state`, `invalid_argument`, `volume_unavailable`.
     pub fn code(&self) -> &'static str {
         match self {
             Self::Busy => "busy",
@@ -68,6 +76,7 @@ impl Error {
             Self::Control(_) => "control",
             Self::InvalidState(_) => "invalid_state",
             Self::InvalidArgument(_) => "invalid_argument",
+            Self::VolumeUnavailable => "volume_unavailable",
         }
     }
 
@@ -97,6 +106,7 @@ impl Error {
                 None => format!("DAC clock not verified at {requested_hz} Hz (no readback)"),
             },
             Self::DeviceLost => "the USB device was disconnected".to_string(),
+            Self::VolumeUnavailable => "the DAC has no usable hardware volume control, so a stream would play at the DAC's own level; allow fixed-level output (DacConfig::require_hardware_volume = false) to stream anyway".to_string(),
         }
     }
 }

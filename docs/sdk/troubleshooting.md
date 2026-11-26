@@ -18,7 +18,8 @@ Every failure is a `DacException`. `error.code` is a `DacErrorCode`, `error.deta
 | `TRANSFER` | stream, events | An isochronous transfer or the stream machinery failed. The stream goes to `FAILED` and stays open until closed. A cable, hub or port problem is the usual cause |
 | `CONTROL` | volume, clock | A class control request failed (volume, mute, clock). A DAC without a volume control throws this for volume calls; `session.volume` is `null` for it |
 | `INVALID_STATE` | many | The call is not valid now: a second stream, `negotiate` while a stream is open, `write` after `drain()` or after the stream closed or failed, any call on a closed session |
-| `INVALID_ARGUMENT` | many | A value out of range or inconsistent: buffer depths, `busQueueMs` outside 4..64, `transfersInFlight` outside 2..16, a DSD slot size other than 1, 2 or 4, a malformed request |
+| `INVALID_ARGUMENT` | many | A value out of range or inconsistent: buffer depths, `startupVolume` ceiling outside -128..0 dB, `busQueueMs` outside 4..64, `transfersInFlight` outside 2..16, a DSD slot size other than 1, 2 or 4, a malformed request |
+| `VOLUME_UNAVAILABLE` | `openStream` | The DAC has no usable hardware volume control (none, or the start-up attenuation could not be verified) and `DacConfig.requireHardwareVolume` is on: a stream would play at the DAC's own level and nothing could bring it down. `negotiate` and `capabilities` still work. Show the user what the DAC offers, ask whether to allow fixed-level output, and open the session again with `requireHardwareVolume = false`. See [start-up volume protection](controls.md#start-up-volume-protection) |
 | `PERMISSION_DENIED` | `UsbDac.open` | The app has no USB permission for the device. See [permission](#permission) |
 | `OPEN_FAILED` | `UsbDac.open`, `AndroidManagedOutput.open` | Android refused to open the device or gave no file descriptor, or the `AudioTrack` could not be created |
 | `UNKNOWN` | any | A code this version of the SDK does not know, from a newer native library |
@@ -60,7 +61,7 @@ Work down the list.
 2. **Open fails.** Read the code above. `BUSY`, `PERMISSION_DENIED` and `CLAIM` are the usual ones.
 3. **`negotiate` fails.** `UNSUPPORTED`: pick a rate and depth from `capabilities`. `IMPLICIT_FEEDBACK_UNSUPPORTED`, `CLOCK_UNVERIFIED`: see above.
 4. **The stream opens and is silent.** In this order:
-   - Is the DAC's **volume at its minimum, or muted**? Read `session.volume?.state`; the library does not change the volume when it opens, so the DAC plays at whatever level it had. If `session.volume` is `null` the DAC has no hardware volume.
+   - Is the DAC's **volume at its minimum, or muted**? Read `session.volume?.state`. `UsbDac.open` lowers the volume to at most -40 dB (`DacConfig.startupVolume`), so a DAC that was at full scale is quiet until the slider goes up; `session.volume?.startup` says what it had and what it was lowered to. If `session.volume` is `null` the DAC has no usable hardware volume, and `openStream` fails with `VOLUME_UNAVAILABLE` unless `requireHardwareVolume` is off.
    - Is the **writer running**? `stats().framesWritten` must rise. A writer that writes less than `startThresholdMs` of audio leaves the stream in `BUFFERING`, and it never starts. Write at least `startThresholdMs` (100 ms), or call `drain()` for a short clip.
    - Is the stream `PAUSED`, `DRAINED` or `FAILED`? `stream.state` says. After `drain()` writes fail until `flush()`.
    - Does `write` return 0 forever? `writableBytes` is 0 while the ring is full (the DAC is not taking audio) or after `drain()`. Check `stats().transferQueueDepth` and `completedTransfers`.

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use usbdac_core::{
     BitPerfectBlocker, Dac, DacConfig, DacEvent, DacListener, DacStream, DeviceInfo, Encoding, Error,
     HandBack,
-    Quirk, QuirkOverride, RatePolicy, StreamFormat, StreamRequest, StreamState, VolumeControl,
+    Quirk, QuirkOverride, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat,
+    StreamRequest, StreamState, VolumeControl,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -54,6 +55,7 @@ fn errors_have_stable_codes_and_a_readable_message() {
         (Error::Control("x".into()), "control"),
         (Error::InvalidState("x".into()), "invalid_state"),
         (Error::InvalidArgument("x".into()), "invalid_argument"),
+        (Error::VolumeUnavailable, "volume_unavailable"),
     ];
     for (error, code) in cases {
         assert_eq!(error.code(), code);
@@ -83,6 +85,26 @@ fn a_config_is_built_from_the_defaults_with_struct_update_syntax() {
     assert!(config.validate().is_ok());
     assert_eq!(config.buffer_capacity_ms, 500);
     assert!(!config.allow_unsynchronized_async, "implicit feedback is refused by default");
+}
+
+#[test]
+fn the_dac_is_protected_at_open_by_default_and_a_host_can_opt_out() {
+    let config = DacConfig::default();
+    assert_eq!(config.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+    assert!(config.require_hardware_volume);
+
+    let fixed = DacConfig {
+        startup_volume: StartupVolume::Keep,
+        require_hardware_volume: false,
+        ..DacConfig::default()
+    };
+    assert!(fixed.validate().is_ok());
+
+    // The report a host reads on connect is plain data.
+    fn report_of(volume: &VolumeControl) -> StartupVolumeReport {
+        volume.startup()
+    }
+    let _ = report_of;
 }
 
 #[test]

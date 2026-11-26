@@ -156,6 +156,15 @@ pub(super) fn start_stream_inner(
         candidate.channels,
         clock.map(|clock| clock.interface_number),
     );
+    // The stream's own terminal may have no volume control, or one the start-up
+    // step could not make safe: with a control required, nothing is programmed.
+    if let Err(error) = ensure_volume_if_required(config.require_hardware_volume) {
+        set_last_error(Some(error.message()));
+        set_direct_mode_refusal_reason(Some(error.message()));
+        set_engine_state(EngineState::Error, Some(error.message()));
+        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        return Err(error);
+    }
     set_clock_status(clock.map(|_| ClockStatus {
         reported_sample_rate: state
             .clock_status

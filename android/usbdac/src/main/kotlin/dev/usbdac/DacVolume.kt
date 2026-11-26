@@ -19,6 +19,30 @@ import java.util.concurrent.Executor
 public data class VolumeState(val db: Double, val fraction: Double, val muted: Boolean?)
 
 /**
+ * What [UsbDac.open] did with the DAC's level before any stream could start
+ * (see [DacConfig.startupVolume]). The lists hold one entry per controlled channel, in channel
+ * order (a single entry for a DAC with one master control).
+ *
+ * @property originalDb The level each channel had before the library first touched it, in dB:
+ *   what [DacVolume.handBack] restores.
+ * @property appliedDb The level each channel has now that the start-up step is done.
+ * @property limitDb The quietest original channel. An app that restores a level it remembered for
+ *   this DAC should not go above it without the user's action: it is how loud the DAC itself was
+ *   when it connected.
+ * @property attenuated [appliedDb] is below [originalDb] on some channel.
+ * @property clampedToMinimum The ceiling was below the DAC's minimum, so the channels went to the minimum.
+ * @property maxDb The ceiling that was asked for; `null` for [StartupVolume.Keep].
+ */
+public data class StartupVolumeReport(
+    val originalDb: List<Double>,
+    val appliedDb: List<Double>,
+    val limitDb: Double,
+    val attenuated: Boolean,
+    val clampedToMinimum: Boolean,
+    val maxDb: Double?,
+)
+
+/**
  * The DAC's hardware volume (the Feature Unit's volume and mute control).
  *
  * This is the volume to use with direct USB output: it changes the level in the DAC and leaves
@@ -42,6 +66,8 @@ public class DacVolume internal constructor(
     /** The DAC has a writable mute. */
     public val hasMute: Boolean,
     initial: VolumeState,
+    /** What the library did with the DAC's level when it opened, before any stream could start. */
+    public val startup: StartupVolumeReport,
     executor: Executor,
     private val onWriteFailed: (DacException) -> Unit,
 ) {

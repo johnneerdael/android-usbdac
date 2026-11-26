@@ -80,6 +80,8 @@ pub(super) struct SessionState {
     pub(super) hardware_volume_error: Option<String>,
     /// The last level read from or written to the DAC.
     pub(super) hardware_volume_state: Option<crate::volume::VolumeState>,
+    /// What the start-up volume step did, for the route it ran on.
+    pub(super) startup_volume: Option<StartupVolumeStatus>,
     pub(super) runtime_stats: Option<Arc<RuntimeStats>>,
 }
 

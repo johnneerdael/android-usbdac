@@ -12,7 +12,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Plays a 1 kHz sine at about -20 dBFS straight to a USB DAC. Turn the DAC volume down first, and use the slider below to raise it."
+            android:text="Plays a 1 kHz sine at about -20 dBFS straight to a USB DAC. The DAC volume is lowered to at most -40 dB when it opens; use the slider below to raise it."
             android:textStyle="italic" />
 
         <Spinner
@@ -99,6 +99,12 @@
             android:layout_height="wrap_content"
             android:text="DAC volume: none" />
 
+        <TextView
+            android:id="@+id/startupText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="12sp" />
+
         <SeekBar
             android:id="@+id/volumeBar"
             android:layout_width="match_parent"
@@ -112,6 +118,12 @@
             android:layout_height="wrap_content"
             android:enabled="false"
             android:text="Mute" />
+
+        <CheckBox
+            android:id="@+id/fixedVolumeBox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Allow a fixed volume (a DAC without a hardware volume plays at its own level)" />
 
         <TextView
             android:id="@+id/statusText"

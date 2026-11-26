@@ -271,6 +271,7 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
             max_db: crate::volume::raw_to_db(control.max_volume_raw),
             res_db: crate::volume::raw_to_db(control.resolution_raw.max(1)),
         }),
+        has_hardware_volume: control.is_some(),
         has_mute: control.is_some_and(|control| control.mute_channel.is_some()),
     })
 }

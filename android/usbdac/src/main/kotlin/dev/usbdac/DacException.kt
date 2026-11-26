@@ -48,6 +48,14 @@ public enum class DacErrorCode(internal val wireName: String?) {
     /** An argument was out of range or malformed. */
     INVALID_ARGUMENT("invalid_argument"),
 
+    /**
+     * The DAC has no usable hardware volume control (none, or its start-up attenuation could not
+     * be verified) and [DacConfig.requireHardwareVolume] is on, so a stream would play at the
+     * DAC's own level. Ask the user to allow fixed-level output and open the session again with
+     * `requireHardwareVolume = false`.
+     */
+    VOLUME_UNAVAILABLE("volume_unavailable"),
+
     /** The app does not hold USB permission for the device. */
     PERMISSION_DENIED(null),
 

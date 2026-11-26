@@ -82,18 +82,27 @@ UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
         if (session != null) return log("a session is already open")
         UsbDac.requestPermission(this, dac) { granted ->
             if (!granted) return@requestPermission log("USB permission denied")
-            // UsbDac.open() blocks while it claims interfaces and scans descriptors.
-            io.execute {
-                try {
-                    val opened = UsbDac.open(this, dac)
-                    runOnUiThread { onOpened(opened) }
-                } catch (error: DacException) {
-                    runOnUiThread { log("open failed: ${error.message}") }
-                }
+            openDevice(dac)
+        }
+    }
+```
+
+```kotlin
+    private fun openDevice(dac: DacDeviceInfo) {
+        val config = DacConfig(requireHardwareVolume = !fixedVolumeBox.isChecked)
+        // UsbDac.open() blocks while it claims interfaces and scans descriptors.
+        io.execute {
+            try {
+                val opened = UsbDac.open(this, dac, config)
+                runOnUiThread { onOpened(opened) }
+            } catch (error: DacException) {
+                runOnUiThread { log("open failed: ${error.message}") }
             }
         }
     }
 ```
+
+Opening also protects the ears: a DAC keeps the level it had, and many default to full scale, so `UsbDac.open` lowers every channel of the DAC's hardware volume to at most -40 dB (`DacConfig.startupVolume`), never raising one, and verifies it by reading it back. The level the DAC had is recorded first and `close()` restores it. If the DAC has no usable hardware volume, or the attenuation cannot be verified, `session.volume` is `null` and `openStream` fails with `VOLUME_UNAVAILABLE` until the app opens the session again with `DacConfig(requireHardwareVolume = false)`: show what the DAC offers, ask the user to allow a fixed volume, and reopen (the sample does it with a checkbox). See [volume](controls.md#start-up-volume-protection).
 
 Every failure is a `DacException` with a typed `code` (see [troubleshooting](troubleshooting.md)). A `DacSession` keeps the USB connection and the claimed interfaces until you call `close()`. Closing hands the DAC back to Android.
 
@@ -111,7 +120,7 @@ Every failure is a `DacException` with a typed `code` (see [troubleshooting](tro
             .sortedWith(compareBy({ it.second }, { it.first }))
 ```
 
-`capabilities.supportsDop`, `dopMaxDsdBitRate`, `supportsNativeDsd` and `nativeDsdBitRates` say whether and how far DSD works. `capabilities.volume` is `null` when the DAC has no hardware volume.
+`capabilities.supportsDop`, `dopMaxDsdBitRate`, `supportsNativeDsd` and `nativeDsdBitRates` say whether and how far DSD works. `capabilities.volume` is `null` (and `capabilities.hasHardwareVolume` false) when the DAC has no usable hardware volume.
 
 ## 5. Negotiate and open a stream
 
@@ -242,13 +251,25 @@ class Transport(private val output: PcmOutput, private val format: StreamFormat,
 
 ## 8. Volume
 
-A direct stream is not touched by Android's volume. Use the DAC's hardware volume, `session.volume`, which is `null` when the DAC has none. Its setters return at once and are safe on every slider event: writes are queued, a burst collapses to its last value, and the last value is always applied.
+A direct stream is not touched by Android's volume. Use the DAC's hardware volume, `session.volume`, which is `null` when the DAC has none (or its start-up attenuation could not be verified). Its setters return at once and are safe on every slider event: writes are queued, a burst collapses to its last value, and the last value is always applied.
 
 ```kotlin
         volumeBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
                 if (fromUser) session?.volume?.setFraction(progress / 1000.0)
             }
+```
+
+`volume.startup` says what the library did to the level when the session opened: the level each channel had (`originalDb`), the level it has now (`appliedDb`) and `limitDb`, the quietest original channel. A player that remembers a level per DAC restores it on connect, capped by `limitDb`; the sample shows the report:
+
+```kotlin
+        startupText.text = volume?.startup?.let { startup ->
+            "Start-up: %s dB, lowered to %s dB. A remembered level should stay at or below %.1f dB.".format(
+                startup.originalDb.joinToString(" / "),
+                startup.appliedDb.joinToString(" / "),
+                startup.limitDb,
+            )
+        } ?: "No usable hardware volume: tick \"Allow a fixed volume\" to stream at the DAC's own level."
 ```
 
 `volume.state` is a `StateFlow` of the level in dB, the 0..1 position and the mute state. Route the phone's volume keys to the DAC while an activity is in front:

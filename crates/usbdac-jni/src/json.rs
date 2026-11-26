@@ -7,8 +7,8 @@
 use serde_json::{json, Value};
 use usbdac_core::{
     AltFormat, AltSetting, Capabilities, DacConfig, DacEvent, DeviceInfo, Encoding, Error,
-    HandBack, LinkSpeed, Quirk, QuirkOverride, RatePolicy, StreamFormat, StreamRequest,
-    StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
+    HandBack, LinkSpeed, Quirk, QuirkOverride, RatePolicy, StartupVolume, StartupVolumeReport,
+    StreamFormat, StreamRequest, StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
 };
 
 fn uac(version: UacVersion) -> &'static str {
@@ -82,6 +82,17 @@ pub fn volume_state(state: &VolumeState) -> Value {
     })
 }
 
+pub fn startup_report(report: &StartupVolumeReport) -> Value {
+    json!({
+        "original_db": report.original_db,
+        "applied_db": report.applied_db,
+        "limit_db": report.limit_db,
+        "attenuated": report.attenuated,
+        "clamped_to_minimum": report.clamped_to_minimum,
+        "max_db": report.max_db,
+    })
+}
+
 pub fn capabilities(capabilities: &Capabilities) -> Value {
     json!({
         "uac_version": uac(capabilities.uac_version),
@@ -96,6 +107,7 @@ pub fn capabilities(capabilities: &Capabilities) -> Value {
         "native_dsd_bit_rates": capabilities.native_dsd_bit_rates,
         "has_explicit_feedback": capabilities.has_explicit_feedback,
         "volume": capabilities.volume.as_ref().map(volume_range),
+        "has_hardware_volume": capabilities.has_hardware_volume,
         "has_mute": capabilities.has_mute,
         "alt_settings": capabilities.alt_settings.iter().map(alt).collect::<Vec<_>>(),
     })
@@ -192,6 +204,7 @@ pub fn error_code(error: &Error) -> i64 {
         Error::InvalidState(_) => 9,
         Error::InvalidArgument(_) => 10,
         Error::ImplicitFeedbackUnsupported => 11,
+        Error::VolumeUnavailable => 12,
         _ => 0,
     }
 }
@@ -270,6 +283,16 @@ fn text(map: &serde_json::Map<String, Value>, key: &str) -> Decoded<Option<Strin
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(BadRequest(format!("{key} must be a string"))),
+    }
+}
+
+fn number(map: &serde_json::Map<String, Value>, key: &str) -> Decoded<Option<f64>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| BadRequest(format!("{key} must be a number"))),
     }
 }
 
@@ -414,6 +437,24 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     if let Some(value) = boolean(map, "cancel_in_flight_on_flush")? {
         config.cancel_in_flight_on_flush = value;
     }
+    if let Some(value) = boolean(map, "require_hardware_volume")? {
+        config.require_hardware_volume = value;
+    }
+    let max_db = number(map, "startup_volume_max_db")?;
+    match text(map, "startup_volume")?.as_deref() {
+        None => {
+            if let Some(max_db) = max_db {
+                config.startup_volume = StartupVolume::Attenuate { max_db };
+            }
+        }
+        Some("attenuate") => {
+            config.startup_volume = StartupVolume::Attenuate {
+                max_db: max_db.unwrap_or(-40.0),
+            };
+        }
+        Some("keep") => config.startup_volume = StartupVolume::Keep,
+        Some(other) => return Err(BadRequest(format!("unknown startup_volume \"{other}\""))),
+    }
     match text(map, "hand_back")?.as_deref() {
         None => {}
         Some("restore_original") => config.hand_back = HandBack::RestoreOriginal,
@@ -536,6 +577,45 @@ mod tests {
         let off = parse_config(Some(r#"{"cancel_in_flight_on_flush":false}"#)).ok().unwrap();
         assert!(!off.cancel_in_flight_on_flush);
         assert!(parse_config(Some(r#"{"cancel_in_flight_on_flush":"no"}"#)).is_err());
+    }
+
+    #[test]
+    fn the_startup_volume_keys_decode_and_default_to_protection() {
+        let defaults = parse_config(Some("{}")).ok().unwrap();
+        assert_eq!(defaults.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+        assert!(defaults.require_hardware_volume);
+
+        let keep = parse_config(Some(r#"{"startup_volume":"keep","require_hardware_volume":false}"#))
+            .ok()
+            .unwrap();
+        assert_eq!(keep.startup_volume, StartupVolume::Keep);
+        assert!(!keep.require_hardware_volume);
+
+        let ceiling = parse_config(Some(r#"{"startup_volume":"attenuate","startup_volume_max_db":-25.5}"#))
+            .ok()
+            .unwrap();
+        assert_eq!(ceiling.startup_volume, StartupVolume::Attenuate { max_db: -25.5 });
+        // A ceiling alone means attenuate; "keep" ignores it.
+        let alone = parse_config(Some(r#"{"startup_volume_max_db":-30}"#)).ok().unwrap();
+        assert_eq!(alone.startup_volume, StartupVolume::Attenuate { max_db: -30.0 });
+        let ignored = parse_config(Some(r#"{"startup_volume":"keep","startup_volume_max_db":-30}"#))
+            .ok()
+            .unwrap();
+        assert_eq!(ignored.startup_volume, StartupVolume::Keep);
+
+        assert!(parse_config(Some(r#"{"startup_volume":"loud"}"#)).is_err());
+        assert!(parse_config(Some(r#"{"startup_volume_max_db":"quiet"}"#)).is_err());
+        // Out-of-range values decode; validation names them at open.
+        let loud = parse_config(Some(r#"{"startup_volume_max_db":6}"#)).ok().unwrap();
+        assert!(matches!(loud.validate(), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn the_startup_report_and_the_volume_error_encode_as_documented() {
+        let (kind, code, _, message) = event(&DacEvent::Error(Error::VolumeUnavailable));
+        assert_eq!((kind, code), (6, 12));
+        assert!(message.unwrap().starts_with("usbdac:volume_unavailable: "));
+        assert_eq!(error_code(&Error::VolumeUnavailable), 12);
     }
 
     #[test]

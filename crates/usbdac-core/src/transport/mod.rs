@@ -38,7 +38,7 @@ use crate::output_position::{
 use crate::payload_audit_latch::PayloadAuditLatch;
 use crate::settings::settings;
 use crate::volume_control::{
-    common_channel_volume, parse_uac2_volume_ranges, quantize_volume,
+    parse_uac2_volume_ranges, quantize_volume,
     read_hardware_volume_snapshot, volume_bounds, AudioControlProtocol, OriginalVolumeSlot,
     RawRange,
 };

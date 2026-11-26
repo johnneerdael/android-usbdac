@@ -2,6 +2,7 @@ package dev.usbdac
 
 import dev.usbdac.internal.deviceInfoJson
 import dev.usbdac.internal.parseCapabilities
+import dev.usbdac.internal.parseStartupReport
 import dev.usbdac.internal.parseStats
 import dev.usbdac.internal.parseStreamFormat
 import dev.usbdac.internal.parseVolumeRange
@@ -28,6 +29,7 @@ class ModelParsingTest {
         assertFalse(capabilities.supportsNativeDsd)
         assertTrue(capabilities.hasExplicitFeedback)
         assertEquals(VolumeRange(-127.0, 0.0, 1.0), capabilities.volume)
+        assertTrue(capabilities.hasHardwareVolume)
         assertTrue(capabilities.hasMute)
 
         val alt = capabilities.altSettings.single()
@@ -44,6 +46,7 @@ class ModelParsingTest {
     fun nullsInCapabilitiesBecomeNulls() {
         val capabilities = parseCapabilities(Fixtures.CAPABILITIES_NO_VOLUME)
         assertNull(capabilities.volume)
+        assertFalse(capabilities.hasHardwareVolume)
         assertNull(capabilities.dopMaxDsdBitRate)
         assertEquals(UacVersion.V1, capabilities.uacVersion)
         assertEquals(listOf(2_822_400, 5_644_800), capabilities.nativeDsdBitRates)
@@ -175,11 +178,37 @@ class ModelParsingTest {
         assertEquals(16, json.getInt("bus_queue_ms"))
         assertEquals(8, json.getInt("transfers_in_flight"))
         assertTrue(json.getBoolean("cancel_in_flight_on_flush"))
+        // The DAC is protected by default, and a stream needs a volume to bring it down.
+        assertEquals("attenuate", json.getString("startup_volume"))
+        assertEquals(-40.0, json.getDouble("startup_volume_max_db"), 0.0)
+        assertTrue(json.getBoolean("require_hardware_volume"))
         // Unset options are left out, so the native side applies the device quirk.
         for (key in listOf("clock_settle_delay_ms", "dsd_big_endian", "dsd_subslot", "padded_24bit")) {
             assertFalse(key, json.has(key))
         }
         assertEquals(0, json.getJSONArray("quirks").length())
+    }
+
+    @Test
+    fun keepLeavesTheCeilingOutOfTheNativeConfig() {
+        val json = JSONObject(DacConfig(startupVolume = StartupVolume.Keep).toNativeJson())
+        assertEquals("keep", json.getString("startup_volume"))
+        assertFalse(json.has("startup_volume_max_db"))
+    }
+
+    @Test
+    fun aStartupReportParsesFromTheDocumentedSchema() {
+        val report = parseStartupReport(Fixtures.STARTUP)
+        assertEquals(listOf(-10.0, -70.0), report.originalDb)
+        assertEquals(listOf(-70.0, -70.0), report.appliedDb)
+        assertEquals(-70.0, report.limitDb, 0.0)
+        assertTrue(report.attenuated)
+        assertFalse(report.clampedToMinimum)
+        assertEquals(-40.0, report.maxDb)
+
+        val kept = parseStartupReport(Fixtures.STARTUP_KEEP)
+        assertFalse(kept.attenuated)
+        assertNull("Keep has no ceiling", kept.maxDb)
     }
 
     @Test
@@ -206,6 +235,8 @@ class ModelParsingTest {
             busQueueMs = 32,
             transfersInFlight = 4,
             cancelInFlightOnFlush = false,
+            startupVolume = StartupVolume.Attenuate(-25.5),
+            requireHardwareVolume = false,
             quirks = listOf(
                 QuirkOverride(
                     vendorId = 1,
@@ -235,6 +266,9 @@ class ModelParsingTest {
         assertEquals(32, json.getInt("bus_queue_ms"))
         assertEquals(4, json.getInt("transfers_in_flight"))
         assertFalse(json.getBoolean("cancel_in_flight_on_flush"))
+        assertEquals("attenuate", json.getString("startup_volume"))
+        assertEquals(-25.5, json.getDouble("startup_volume_max_db"), 0.0)
+        assertFalse(json.getBoolean("require_hardware_volume"))
 
         val entry = json.getJSONArray("quirks").getJSONObject(0)
         assertEquals(1, entry.getInt("vendor_id"))

@@ -45,7 +45,10 @@ meant to sit on top of the JNI layer; it is not part of this repository yet.
   feedback) are refused with `Error::ImplicitFeedbackUnsupported` unless
   `DacConfig::allow_unsynchronized_async` streams them at the nominal rate.
 - Volume: the Feature Unit's volume and mute, with read-back verification, a dB
-  and a 0..1 view, the level the DAC had before, and a hand-back on close.
+  and a 0..1 view, the level the DAC had before, and a hand-back on close. The
+  volume is lowered to at most -40 dB when the DAC opens (never raising a
+  channel, verified by reading it back), and a DAC without a usable hardware
+  volume refuses to stream unless the host allows a fixed level.
 - Events through one library thread: state changes, underruns, lost frames,
   bit-perfect changes, volume changes, stale feedback, errors, device loss.
 

@@ -61,14 +61,16 @@ mod tests;
 pub use capabilities::{
     AltFormat, AltSetting, Capabilities, DeviceInfo, LinkSpeed, RateRange, SyncKind, UacVersion,
 };
-pub use config::{DacConfig, HandBack, QuirkOverride};
+pub use config::{DacConfig, HandBack, QuirkOverride, StartupVolume};
 pub use dac::Dac;
 pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use quirk::Quirk;
 pub use stream::{BitPerfectBlocker, DacStream, StreamStats};
-pub use volume::{VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS};
+pub use volume::{
+    StartupVolumeReport, VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS,
+};
 
 /// Compiles the README's example as a doctest so it cannot rot.
 #[cfg(doctest)]

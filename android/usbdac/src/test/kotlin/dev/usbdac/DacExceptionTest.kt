@@ -22,6 +22,7 @@ class DacExceptionTest {
             "control" to DacErrorCode.CONTROL,
             "invalid_state" to DacErrorCode.INVALID_STATE,
             "invalid_argument" to DacErrorCode.INVALID_ARGUMENT,
+            "volume_unavailable" to DacErrorCode.VOLUME_UNAVAILABLE,
         )
         for ((wire, code) in expected) {
             val error = parseNativeError("usbdac:$wire: something went wrong")!!

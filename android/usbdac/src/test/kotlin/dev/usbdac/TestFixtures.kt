@@ -24,7 +24,8 @@ internal object Fixtures {
       "supports_pcm": true, "supports_dop": true, "dop_max_dsd_bit_rate": 11289600,
       "supports_native_dsd": false, "native_dsd_bit_rates": [],
       "has_explicit_feedback": true,
-      "volume": { "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 }, "has_mute": true,
+      "volume": { "min_db": -127.0, "max_db": 0.0, "res_db": 1.0 },
+      "has_hardware_volume": true, "has_mute": true,
       "alt_settings": [ { "interface_number": 1, "alt_setting": 1, "endpoint_address": 1,
           "format": "pcm", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
           "rate_ranges": [ { "min_hz": 44100, "max_hz": 44100, "step_hz": 0 } ],
@@ -37,12 +38,23 @@ internal object Fixtures {
       "pcm_sample_rates": [44100], "pcm_bit_depths": [16], "channel_counts": [2],
       "supports_pcm": true, "supports_dop": false, "dop_max_dsd_bit_rate": null,
       "supports_native_dsd": true, "native_dsd_bit_rates": [2822400, 5644800],
-      "has_explicit_feedback": false, "volume": null, "has_mute": false,
+      "has_explicit_feedback": false, "volume": null,
+      "has_hardware_volume": false, "has_mute": false,
       "alt_settings": [ { "interface_number": 1, "alt_setting": 2, "endpoint_address": 2,
           "format": "dsd", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
           "rate_ranges": [], "sample_rates": [88200], "sync_type": "adaptive",
           "feedback_endpoint": null, "max_packet_bytes": 512, "service_interval_us": 1000,
           "uac_version": "v1" } ] }
+    """
+
+    const val STARTUP = """
+    { "original_db": [-10.0, -70.0], "applied_db": [-70.0, -70.0], "limit_db": -70.0,
+      "attenuated": true, "clamped_to_minimum": false, "max_db": -40.0 }
+    """
+
+    const val STARTUP_KEEP = """
+    { "original_db": [0.0], "applied_db": [0.0], "limit_db": 0.0,
+      "attenuated": false, "clamped_to_minimum": false, "max_db": null }
     """
 
     const val FORMAT = """

@@ -479,6 +479,18 @@ pub fn volume_set_mute<'l>(
     })
 }
 
+/// What the library did with the DAC's level when it was opened, as JSON
+/// (`docs/API.md` section 11), or `null` if the DAC has no hardware volume.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn volume_startup<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> JString<'l> {
+    run(&mut env, |env| {
+        match registry::dac(dac)?.dac.volume() {
+            Some(volume) => java_string(env, &json::startup_report(&volume.startup())),
+            None => Ok(JString::null()),
+        }
+    })
+}
+
 /// The recorded original level in dB, or NaN if there is none.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn volume_original_db<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> f64 {

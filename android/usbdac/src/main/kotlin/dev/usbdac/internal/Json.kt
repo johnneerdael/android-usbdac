@@ -12,6 +12,7 @@ import dev.usbdac.StreamFormat
 import dev.usbdac.StreamState
 import dev.usbdac.SyncType
 import dev.usbdac.UacVersion
+import dev.usbdac.StartupVolumeReport
 import dev.usbdac.VolumeRange
 import dev.usbdac.VolumeState
 import org.json.JSONArray
@@ -77,6 +78,20 @@ internal fun parseVolumeState(json: String): VolumeState {
     )
 }
 
+internal fun parseStartupReport(json: String): StartupVolumeReport {
+    val value = JSONObject(json)
+    fun doubles(key: String): List<Double> =
+        value.getJSONArray(key).let { array -> List(array.length()) { array.getDouble(it) } }
+    return StartupVolumeReport(
+        originalDb = doubles("original_db"),
+        appliedDb = doubles("applied_db"),
+        limitDb = value.getDouble("limit_db"),
+        attenuated = value.getBoolean("attenuated"),
+        clampedToMinimum = value.getBoolean("clamped_to_minimum"),
+        maxDb = value.doubleOrNull("max_db"),
+    )
+}
+
 private fun parseAltSetting(json: JSONObject) = AltSetting(
     interfaceNumber = json.getInt("interface_number"),
     altSetting = json.getInt("alt_setting"),
@@ -116,6 +131,7 @@ internal fun parseCapabilities(json: String): DacCapabilities {
         nativeDsdBitRates = value.optJSONArray("native_dsd_bit_rates").ints(),
         hasExplicitFeedback = value.optBoolean("has_explicit_feedback"),
         volume = value.objectOrNull("volume")?.let(::parseVolumeRange),
+        hasHardwareVolume = value.optBoolean("has_hardware_volume", !value.isNull("volume")),
         hasMute = value.optBoolean("has_mute"),
     )
 }

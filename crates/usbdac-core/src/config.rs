@@ -24,6 +24,34 @@ pub enum HandBack {
     Keep,
 }
 
+/// What [`Dac::open`](crate::Dac::open) does with the DAC's hardware volume
+/// before any stream can start.
+///
+/// A DAC keeps the level it had, and many default to full scale. The first
+/// audio would then play at whatever that is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StartupVolume {
+    /// Lower every controlled channel to `min(its level, max_db)` and verify it
+    /// by reading it back. A channel is never raised, and one that is already
+    /// quieter (or at the device's silent value) is left alone. `max_db` is
+    /// rounded down to a step the DAC supports; below the DAC's minimum the
+    /// channels go to the minimum and the report says so. The level each
+    /// channel had is recorded first, so [`HandBack::RestoreOriginal`]
+    /// restores it. If the attenuation cannot be verified the volume control is
+    /// treated as unusable (see
+    /// [`DacConfig::require_hardware_volume`](DacConfig::require_hardware_volume)).
+    Attenuate { max_db: f64 },
+    /// Leave the DAC's level alone.
+    Keep,
+}
+
+impl Default for StartupVolume {
+    /// `Attenuate { max_db: -40.0 }`.
+    fn default() -> Self {
+        Self::Attenuate { max_db: -40.0 }
+    }
+}
+
 /// Extra quirks for one VID/PID, added to the built-in table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuirkOverride {
@@ -104,6 +132,14 @@ pub struct DacConfig {
     /// played. `pause` never cancels. `false` lets the queue play out (up to
     /// `bus_queue_ms`). Default `true`.
     pub cancel_in_flight_on_flush: bool,
+    /// What `Dac::open` does with the DAC's hardware volume before any stream
+    /// can start. Default: lower it to at most -40 dB.
+    pub startup_volume: StartupVolume,
+    /// `open_stream` fails with [`Error::VolumeUnavailable`] when the DAC has no
+    /// usable hardware volume control, so the host can ask the user to allow
+    /// fixed-level output and open the DAC again with this off. `negotiate` and
+    /// `capabilities` work either way. Default `true`.
+    pub require_hardware_volume: bool,
 }
 
 impl Default for DacConfig {
@@ -125,6 +161,8 @@ impl Default for DacConfig {
             bus_queue_ms: DEFAULT_BUS_QUEUE_MS,
             transfers_in_flight: DEFAULT_TRANSFERS_IN_FLIGHT,
             cancel_in_flight_on_flush: true,
+            startup_volume: StartupVolume::default(),
+            require_hardware_volume: true,
         }
     }
 }
@@ -150,6 +188,11 @@ impl DacConfig {
         if let Some(subslot) = self.dsd_subslot {
             if !matches!(subslot, 1 | 2 | 4) {
                 return bad("dsd_subslot must be 1, 2 or 4");
+            }
+        }
+        if let StartupVolume::Attenuate { max_db } = self.startup_volume {
+            if !max_db.is_finite() || !(-128.0..=0.0).contains(&max_db) {
+                return bad("startup_volume max_db must be a level between -128 and 0 dB");
             }
         }
         if !(4..=64).contains(&self.bus_queue_ms) {
@@ -180,6 +223,8 @@ mod tests {
         assert_eq!(config.bus_queue_ms, 16);
         assert_eq!(config.transfers_in_flight, 8);
         assert!(config.cancel_in_flight_on_flush);
+        assert_eq!(config.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+        assert!(config.require_hardware_volume);
         config.validate().unwrap();
     }
 
@@ -194,6 +239,30 @@ mod tests {
         let mut config = DacConfig::default();
         config.buffer_capacity_ms = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_startup_ceiling_must_be_a_level_a_dac_can_have() {
+        for (startup_volume, ok) in [
+            (StartupVolume::Keep, true),
+            (StartupVolume::Attenuate { max_db: -40.0 }, true),
+            (StartupVolume::Attenuate { max_db: 0.0 }, true),
+            (StartupVolume::Attenuate { max_db: -128.0 }, true),
+            (StartupVolume::Attenuate { max_db: 3.0 }, false),
+            (StartupVolume::Attenuate { max_db: -200.0 }, false),
+            (StartupVolume::Attenuate { max_db: f64::NAN }, false),
+            (StartupVolume::Attenuate { max_db: f64::NEG_INFINITY }, false),
+        ] {
+            let config = DacConfig { startup_volume, ..DacConfig::default() };
+            assert_eq!(config.validate().is_ok(), ok, "{startup_volume:?}");
+        }
+        let error = DacConfig {
+            startup_volume: StartupVolume::Attenuate { max_db: 6.0 },
+            ..DacConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(&error, Error::InvalidArgument(message) if message.contains("max_db")));
     }
 
     #[test]

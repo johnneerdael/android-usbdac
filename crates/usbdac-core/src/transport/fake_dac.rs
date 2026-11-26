@@ -22,6 +22,9 @@ pub(crate) struct FakeDac {
     pub reads: usize,
     /// Makes every transfer fail, as an unreachable DAC would.
     pub unreachable: bool,
+    /// Accepts volume writes (and logs them) without taking them: the level
+    /// reads back as it was, as a DAC that ignores SET_CUR does.
+    pub ignore_volume_writes: bool,
     /// Holds the next volume SET_CUR: reports on the sender that it has
     /// arrived, then waits for the receiver before it takes effect.
     pub hold_next_volume_write: Option<(Sender<()>, Receiver<()>)>,
@@ -85,7 +88,9 @@ fn answer(
             }
             let raw = i16::from_le_bytes([data[0], data[1]]);
             let mut dac = dac.lock().unwrap();
-            dac.volume[channel] = raw;
+            if !dac.ignore_volume_writes {
+                dac.volume[channel] = raw;
+            }
             dac.volume_writes.push((channel as u16, raw));
         }
         (MUTE_SELECTOR, true) => {
@@ -173,6 +178,21 @@ impl Registered {
         Self { _serial: serial, dac }
     }
 
+    /// Installs the settings a session opened with `config` would have.
+    pub(crate) fn configure(&self, config: crate::config::DacConfig) {
+        crate::settings::install(crate::settings::Settings::for_device(
+            config,
+            &crate::capabilities::DeviceInfo::new(0x1234, 0x5678, "test DAC"),
+        ));
+    }
+
+    /// Sets the stereo channels' levels (raw) and forgets the writes so far.
+    pub(crate) fn set_levels(&self, left: i16, right: i16) {
+        let mut dac = self.dac.lock().unwrap();
+        dac.volume = [left, left, right];
+        dac.volume_writes.clear();
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         SESSION_STATE.lock().as_ref().unwrap().hardware_volume_generation
     }
@@ -197,6 +217,7 @@ impl Drop for Registered {
 }
 
 fn reset_globals() {
+    crate::settings::reset();
     *SESSION_STATE.lock() = None;
     ORIGINAL_HARDWARE_VOLUME.lock().forget();
     ORIGINAL_VOLUME_ACTION.store(ORIGINAL_VOLUME_KEEP, Ordering::SeqCst);

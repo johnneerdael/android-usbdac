@@ -6,6 +6,7 @@ import dev.usbdac.QuirkOverride
 import dev.usbdac.StreamEncoding
 import dev.usbdac.StreamRequest
 import dev.usbdac.RatePolicy
+import dev.usbdac.StartupVolume
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -54,6 +55,14 @@ internal fun DacConfig.toNativeJson(): String =
         .put("bus_queue_ms", busQueueMs)
         .put("transfers_in_flight", transfersInFlight)
         .put("cancel_in_flight_on_flush", cancelInFlightOnFlush)
+        .put("require_hardware_volume", requireHardwareVolume)
+        .let { json ->
+            when (val startup = startupVolume) {
+                is StartupVolume.Attenuate ->
+                    json.put("startup_volume", "attenuate").put("startup_volume_max_db", startup.maxDb)
+                StartupVolume.Keep -> json.put("startup_volume", "keep")
+            }
+        }
         .put("quirks", JSONArray(quirks.map(::overrideJson)))
         .toString()
 
