@@ -13,7 +13,7 @@ and Linux developers who manage access to the USB device themselves.
 
 | Developer | First milestone | Dependency |
 |---|---|---|
-| Android player developer | Add the library, open a PCM output through `OutputSelector` and feed it decoded samples | Android AAR from GitHub Releases |
+| Android player developer | Add the library, open a PCM output through `OutputSelector` and feed it decoded samples | Gradle coordinate `dev.usbdac:usbdac` or the AAR from GitHub Releases |
 | Rust audio developer | Pass an open USB file descriptor, negotiate a format and feed the stream samples | Cargo crate `usbdac-core` |
 
 ## Positioning

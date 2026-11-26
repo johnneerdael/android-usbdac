@@ -6,8 +6,8 @@ report whether the stream is bit-perfect. For PCM playback across devices,
 `OutputSelector` gives your app a single interface and reports which route it
 opened and what it could verify.
 
-- Add the AAR with Gradle for Android apps. It bundles the native code for all
-  four Android ABIs. [Android quickstart](getting-started.md)
+- Add `dev.usbdac:usbdac` with Gradle for Android apps. The AAR bundles native
+  code for all four Android ABIs. [Android quickstart](getting-started.md)
 - Add `usbdac-core` with Cargo for Rust apps on Android or Linux that manage
   USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
 

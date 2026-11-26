@@ -9,11 +9,49 @@ The quickest way is to let the library choose the output. Add the library (step 
 
 ## 1. Add the library
 
-Download `usbdac-0.1.0-alpha.6.aar` from the
-[alpha.6 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.0-alpha.6)
-and put it in your app module's `libs/` directory. Add the AAR and its
-coroutines dependency to the app module's `build.gradle.kts`. Resolve
-coroutines from Maven Central.
+Add `dev.usbdac:usbdac` from the project's GitHub Packages Maven registry. It
+requires your GitHub username and a classic personal access token with
+`read:packages`, including for public packages. Set `gpr.user` and `gpr.token`
+in `~/.gradle/gradle.properties`, or supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
+in the build environment.
+
+Add the Maven repository in `settings.gradle.kts`.
+
+```gradle
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven {
+            url = uri("https://maven.pkg.github.com/johnneerdael/android-usbdac")
+            credentials {
+                username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_ACTOR")
+                password = providers.gradleProperty("gpr.token").orNull ?: System.getenv("GITHUB_TOKEN")
+            }
+        }
+    }
+}
+```
+
+Add the dependency in your app module's `build.gradle.kts`.
+
+```gradle
+dependencies {
+    implementation("dev.usbdac:usbdac:0.1.0-alpha.6")
+}
+```
+
+For a download without registry credentials, put `usbdac-0.1.0-alpha.6.aar`
+from the [alpha.6 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.0-alpha.6)
+in your app module's `libs/` directory. Use these dependencies in place of
+the registry coordinate.
+
+```gradle
+dependencies {
+    implementation(files("libs/usbdac-0.1.0-alpha.6.aar"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+}
+```
 
 ```gradle
 dependencies {

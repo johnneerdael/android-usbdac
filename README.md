@@ -7,7 +7,7 @@ the stream is bit-perfect, with the reason when verification fails.
 
 | Integrating with | Start here |
 |---|---|
-| Kotlin on Android 8.0+ | Add the AAR to your Gradle app. It bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
+| Kotlin on Android 8.0+ | Add `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
 | Rust on Android or Linux | Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor to the driver. [Rust API reference](https://docs.rs/usbdac-core) |
 
 Use `OutputSelector` when your Android player needs one PCM playback integration
