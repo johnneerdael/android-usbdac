@@ -374,6 +374,17 @@ impl DacStream {
         self.shared().stats.output_latency_frames()
     }
 
+    /// Frames waiting in the ring, in the unit of
+    /// [`StreamFormat::counter_rate_hz`]. Cheaper than [`stats`](Self::stats)
+    /// (`StreamStats::queued_frames`), for a host that wants to know how full the
+    /// ring is on every cycle of its writer loop.
+    pub fn queued_frames(&self) -> u64 {
+        if self.inner.is_closed() {
+            return 0;
+        }
+        self.shared().stats.queued_frames()
+    }
+
     /// Bit-perfect means: no software gain, a verified clock at the requested
     /// rate, no frame lost on the bus, and the wire payload is real audio.
     /// False as soon as any of that stops being true, and for good after a lost
@@ -436,7 +447,6 @@ impl DacStream {
         use std::sync::atomic::Ordering::Relaxed;
         let shared = self.shared();
         let stats = &shared.stats;
-        let channels = stats.channels.max(1) as u64;
         let feedback_last = stats.feedback_last_report_ms.load(Relaxed);
         let elapsed_ms = stats.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let verdicts = if self.inner.is_closed() {
@@ -460,7 +470,7 @@ impl DacStream {
             played_frames: stats.played_frames(),
             latency_frames: stats.output_latency_frames(),
             latency_ms: stats.output_latency_ms(),
-            queued_frames: stats.buffered_samples.load(Relaxed) as u64 / channels,
+            queued_frames: stats.queued_frames(),
             buffer_ms: stats.buffer_fill_ms(),
             buffer_target_ms: stats.buffer_target_ms(),
             active_target_ms: stats.active_target_ms(),

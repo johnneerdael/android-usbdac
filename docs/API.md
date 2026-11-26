@@ -275,6 +275,7 @@ stream.close(self) -> Result<()>            // also on drop
 stream.state() -> StreamState
 stream.played_frames() -> u64
 stream.latency_frames() -> u64
+stream.queued_frames() -> u64               // frames in the ring (cheap)
 stream.stats() -> StreamStats
 stream.is_bit_perfect() -> bool
 stream.bit_perfect_blocker() -> Option<BitPerfectBlocker>   // why not, if not

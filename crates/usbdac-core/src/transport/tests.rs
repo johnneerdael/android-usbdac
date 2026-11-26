@@ -1205,6 +1205,19 @@ mod push_stream_tests {
     }
 
     #[test]
+    fn the_queued_frames_are_the_ring_fill_in_counter_units() {
+        let _globals = lock_globals();
+        let rig = Rig::pcm(2, 16);
+        assert_eq!(rig.shared.stats.queued_frames(), 0);
+        let taken = rig.shared.write_bytes(&vec![9u8; 4_000]).unwrap();
+        assert_eq!(rig.shared.stats.queued_frames(), (taken / 4) as u64);
+        // Native DSD counts DSD bytes per channel.
+        let dsd = Rig::new(4, 1, 2, DsdTransportMode::Native);
+        dsd.shared.write_bytes(&vec![0x69u8; 64]).unwrap();
+        assert_eq!(dsd.shared.stats.queued_frames(), 32, "one DSD byte per channel is one frame");
+    }
+
+    #[test]
     fn host_processing_moves_the_target_without_flushing_the_ring() {
         let _globals = lock_globals();
         let rig = Rig::pcm(2, 16);

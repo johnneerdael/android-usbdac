@@ -205,6 +205,12 @@ impl RuntimeStats {
         )
     }
 
+    /// Frames waiting in the ring, in counter units (one DSD byte per channel
+    /// for native DSD).
+    pub(crate) fn queued_frames(&self) -> u64 {
+        self.buffered_samples.load(Ordering::Relaxed) as u64 / self.channels.max(1) as u64
+    }
+
     /// The depth `active_target_samples` asks for, in milliseconds.
     pub(crate) fn active_target_ms(&self) -> u32 {
         samples_to_millis(self.active_target_samples(), self.sample_rate, self.channels)
