@@ -29,6 +29,14 @@ impl Dac {
         routing_hw::scarlett_read()
     }
 
+    /// Read firmware-defined modern Focusrite FCP pins, mux banks and mix rows.
+    /// Requires idle ownership and an explicit exact-model vendor-interface claim.
+    /// This API does not expose edits or persistent configuration commands.
+    pub fn fcp_routing_read(&self) -> Result<crate::scarlett::FcpReadback, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::fcp_read()
+    }
+
     /// Apply bounded half-dB replacements to one complete Scarlett mixer row.
     /// Requires fresh expected raw coefficients, idle ownership and the explicit
     /// vendor claim. Verifies the whole row and attempts verified restoration

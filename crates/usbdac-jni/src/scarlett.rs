@@ -11,6 +11,15 @@ fn port(v: Port) -> Value {
         PortKind::Off=>"off",PortKind::Analogue=>"analogue",PortKind::Spdif=>"spdif",PortKind::Adat=>"adat",PortKind::Mix=>"mix",PortKind::Pcm=>"pcm"},"channel":channel}) }
 }
 fn row(v: &MixReadback) -> Value { json!({"output":v.output,"coefficients":v.coefficients}) }
+fn fcp_readback(v: &FcpReadback) -> Value {
+    let port = |p: &FcpPort| json!({"pin":p.pin,"name":p.name,"fixed_source":p.fixed_source});
+    json!({"model":v.model.key(),"firmware":v.firmware,
+        "mixer_inputs":v.mixer_inputs,"mixer_outputs":v.mixer_outputs,
+        "sources":v.sources.iter().map(port).collect::<Vec<_>>(),
+        "destinations":v.destinations.iter().map(port).collect::<Vec<_>>(),
+        "banks":v.banks.iter().map(|b|json!({"bank":b.bank,"raw_words":b.raw_words})).collect::<Vec<_>>(),
+        "mixes":v.mixes.iter().map(row).collect::<Vec<_>>()})
+}
 fn read_error(v: &ReadError<String>) -> Value {
     match v { ReadError::Io(detail)=>json!({"kind":"io","detail":detail}),ReadError::Protocol(e)=>json!({"kind":"protocol","detail":format!("{e:?}")}) }
 }
@@ -126,12 +135,39 @@ pub fn scarlett_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JSt
     run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_read(){Ok(v)=>json!({"value":{"model":v.model.candidate().key(),"firmware":v.model.firmware(),"mixer_inputs":v.model.mixer_inputs(),"mixer_outputs":v.model.mixer_outputs(),"mux_zero":v.mux_zero.iter().map(|r|json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>(),"mixes":v.mixes.iter().map(row).collect::<Vec<_>>()}}),Err(e)=>failure(e)};java_string(env,&v)})
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
+pub fn fcp_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| {
+        let entry=registry::dac(dac)?;
+        let result=match entry.dac.fcp_routing_read() {
+            Ok(v)=>json!({"value":fcp_readback(&v)}), Err(e)=>failure(e),
+        };
+        java_string(env,&result)
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
 pub fn scarlett_mix_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,edit:JString<'l>)->JString<'l> {
     run(&mut env,|env| {let input=string_of(env,&edit)?;if input.len()>8192 {return Err(Failure::Bad("Scarlett edit exceeds 8192 bytes".into()));}let edit=parse_edit(&serde_json::from_str::<Value>(&input).map_err(|e|Failure::Bad(e.to_string()))?)?;let e=registry::dac(dac)?;let v=match e.dac.scarlett_mix_apply(&edit){Ok(v)=>json!({"value":{"original":row(&v.original),"verified":row(&v.verified)}}),Err(e)=>failure(e)};java_string(env,&v)})
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fcp_bridge_preserves_firmware_pins_fixed_routes_and_unsigned_banks() {
+        let v=fcp_readback(&FcpReadback {
+            model:CandidateModel::Scarlett16i16Gen4,firmware:0xffff_ffff,
+            mixer_inputs:1,mixer_outputs:1,
+            sources:vec![FcpPort {pin:65535,name:"Mic 1".into(),fixed_source:None}],
+            destinations:vec![FcpPort {pin:40000,name:"Fixed Output".into(),fixed_source:Some(65535)}],
+            banks:vec![FcpBank {bank:2,raw_words:vec![0xffff_ffff,0x8000_0000,0]}],
+            mixes:vec![MixReadback {output:1,coefficients:vec![65535]}],
+        });
+        assert_eq!(v["model"],"scarlett_16i16_gen4");
+        assert_eq!(v["sources"][0]["fixed_source"],Value::Null);
+        assert_eq!(v["destinations"][0]["fixed_source"],65535);
+        assert_eq!(v["destinations"][0]["name"],"Fixed Output");
+        assert_eq!(v["banks"][0]["raw_words"][0],0xffff_ffffu32);
+        assert_eq!(v["mixes"][0]["coefficients"][0],65535);
+    }
     #[test]
     fn mux_edits_accept_only_typed_routes_without_caller_raw_baselines() {
         let mut edit=json!([{"bank":2,"destination":{"kind":"analogue","channel":1},"source":{"kind":"off"}}]);

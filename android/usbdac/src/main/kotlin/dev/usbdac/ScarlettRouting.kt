@@ -12,6 +12,7 @@ public enum class VendorRouting {
     SCARLETT_SOLO_GEN4, SCARLETT_2I2_GEN4, SCARLETT_4I4_GEN4,
     CLARETT_USB_2PRE, CLARETT_USB_4PRE, CLARETT_USB_8PRE,
     CLARETT_PLUS_2PRE, CLARETT_PLUS_4PRE, CLARETT_PLUS_8PRE,
+    SCARLETT_16I16_GEN4, SCARLETT_18I16_GEN4, SCARLETT_18I20_GEN4, ISA_C8X,
 }
 
 public enum class ScarlettModel {
@@ -21,6 +22,7 @@ public enum class ScarlettModel {
     SCARLETT_SOLO_GEN4, SCARLETT_2I2_GEN4, SCARLETT_4I4_GEN4,
     CLARETT_USB_2PRE, CLARETT_USB_4PRE, CLARETT_USB_8PRE,
     CLARETT_PLUS_2PRE, CLARETT_PLUS_4PRE, CLARETT_PLUS_8PRE,
+    SCARLETT_16I16_GEN4, SCARLETT_18I16_GEN4, SCARLETT_18I20_GEN4, ISA_C8X,
 }
 public data class ScarlettCapability(val model: ScarlettModel, val name: String, val configurationId: Int,
     val interfaceId: Int, val notificationEndpoint: Int, val interfaceClaimed: Boolean)
@@ -33,6 +35,14 @@ public data class ScarlettMixRow(val output: Int, val coefficients: List<Int>)
 /** GET_MUX argument zero only; this does not prove all sample-rate banks. */
 public data class ScarlettReadback(val model: ScarlettModel, val firmware: Long, val mixerInputs: Int,
     val mixerOutputs: Int, val muxZero: List<ScarlettMuxRoute>, val mixes: List<ScarlettMixRow>)
+/** Firmware-defined FCP pin; fixedSource is a source pin when routing is fixed. */
+public data class FcpPort(val pin: Int, val name: String, val fixedSource: Int?)
+/** Exact unsigned mux words, including padding, in firmware order. */
+public data class FcpBank(val bank: Int, val rawWords: List<Long>)
+/** Modern Focusrite firmware topology, available through readFcp() only. */
+public data class FcpReadback(val model: ScarlettModel, val firmware: Long, val mixerInputs: Int,
+    val mixerOutputs: Int, val sources: List<FcpPort>, val destinations: List<FcpPort>,
+    val banks: List<FcpBank>, val mixes: List<ScarlettMixRow>)
 /** Half-dB units, -160 (-80 dB) through 24 (+12 dB). */
 public data class ScarlettGainEdit(val input: Int, val halfDb: Int) {
     init { require(input in 1..25); require(halfDb in -160..24) }
@@ -87,6 +97,11 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
                 ScarlettMuxRoute(port(it.getJSONObject("source")), port(it.getJSONObject("destination")))
             }, v.getJSONArray("mixes").objects().map(::row))
     }
+    /** Read modern firmware-defined FCP routing. No FCP editing API is exposed. */
+    public fun readFcp(): FcpReadback {
+        checkOpen()
+        return parseFcpReadback(response { Native.fcpRead(dac) })
+    }
     /** Probe complete bank geometry. Legacy read().muxZero remains independent. */
     public fun readMux(): ScarlettMuxSnapshot {
         checkOpen()
@@ -118,6 +133,16 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
 internal fun parseScarlettCapability(v: JSONObject): ScarlettCapability = ScarlettCapability(
     ScarlettModel.valueOf(v.getString("model").uppercase()), v.getString("name"), v.getInt("configuration_id"),
     v.getInt("interface"), v.getInt("notification_endpoint"), v.getBoolean("interface_claimed"))
+internal fun parseFcpReadback(v: JSONObject): FcpReadback = FcpReadback(
+    ScarlettModel.valueOf(v.getString("model").uppercase()), v.getLong("firmware"),
+    v.getInt("mixer_inputs"), v.getInt("mixer_outputs"),
+    v.getJSONArray("sources").objects().map(::fcpPort),
+    v.getJSONArray("destinations").objects().map(::fcpPort),
+    v.getJSONArray("banks").objects().map { FcpBank(it.getInt("bank"),
+        it.getJSONArray("raw_words").let { a -> (0 until a.length()).map(a::getLong) }) },
+    v.getJSONArray("mixes").objects().map(::row))
+private fun fcpPort(v: JSONObject): FcpPort = FcpPort(v.getInt("pin"), v.getString("name"),
+    if (v.isNull("fixed_source")) null else v.getInt("fixed_source"))
 private fun JSONArray.objects(): List<JSONObject> = (0 until length()).map(::getJSONObject)
 private fun row(v: JSONObject): ScarlettMixRow = ScarlettMixRow(v.getInt("output"), v.getJSONArray("coefficients").let { a -> (0 until a.length()).map(a::getInt) })
 private fun port(v: JSONObject): ScarlettPort = ScarlettPort(ScarlettPortKind.valueOf(v.getString("kind").uppercase()), if (v.has("channel")) v.getInt("channel") else null)

@@ -173,3 +173,18 @@ detect drift before enabling edits.
 [FCP map wire read](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp.c#L930-L979),
 [FCP map decoding](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp-devmap.c#L58-L152),
 [FCP route discovery](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/mux.c#L334-L491)
+
+Use `Dac::fcp_routing_read()` in Rust. In Android, open with the exact
+`VendorRouting` option and call `ScarlettRouting.readFcp()` while idle.
+The readback includes firmware-named pins, fixed sources, per-rate mux
+words and complete mix rows. In each nonzero mux word, bits 0–11 carry
+the destination and bits 12–23 carry the source. Source zero means off.
+A map destination can be inactive in a particular bank. Fixed sources
+are provided by the map. Each bank is read in sequence, so a separate
+controller can change routing during the read.
+
+For physical acceptance, compare all bank widths, occupied destination
+slots, fixed sources and coefficients with ALSA FCP on the same firmware.
+Check both a fully configured device and a device with its vendor
+interface unavailable. Verify loss of USB ownership and detach during
+an in-flight read. The current API exposes routing discovery only.

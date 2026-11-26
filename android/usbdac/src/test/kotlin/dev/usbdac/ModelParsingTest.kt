@@ -18,6 +18,40 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
+    fun modernFcpModelsHaveDistinctClaimKeysAndReadOnlyEntryPoint() {
+        for (key in listOf("scarlett_16i16_gen4", "scarlett_18i16_gen4", "scarlett_18i20_gen4", "isa_c8x")) {
+            val capability = parseScarlettCapability(JSONObject()
+                .put("model", key).put("name", key).put("configuration_id", 1)
+                .put("interface", 4).put("notification_endpoint", 132).put("interface_claimed", false))
+            assertEquals(key, capability.model.name.lowercase())
+            assertEquals(capability.model.name, VendorRouting.valueOf(key.uppercase()).name)
+            assertFalse(capability.interfaceClaimed)
+        }
+        assertEquals(FcpReadback::class.java, ScarlettRouting::class.java.getMethod("readFcp").returnType)
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("fcpRead", Long::class.javaPrimitiveType).returnType)
+        assertFalse(ScarlettRouting::class.java.methods.any { it.name.startsWith("applyFcp") })
+    }
+
+    @Test
+    fun fcpReadbackPreservesFirmwarePinsFixedSourcesNamesMixesAndUnsignedWords() {
+        val readback = parseFcpReadback(JSONObject("""{
+            "model":"isa_c8x","firmware":4294967295,"mixer_inputs":1,"mixer_outputs":1,
+            "sources":[{"pin":65535,"name":"Mic 1","fixed_source":null}],
+            "destinations":[{"pin":40000,"name":"Fixed Output","fixed_source":65535}],
+            "banks":[{"bank":2,"raw_words":[4294967295,2147483648,0]}],
+            "mixes":[{"output":1,"coefficients":[65535]}]
+        }"""))
+        assertEquals(ScarlettModel.ISA_C8X, readback.model)
+        assertEquals(4294967295L, readback.firmware)
+        assertEquals(FcpPort(65535, "Mic 1", null), readback.sources.single())
+        assertEquals(FcpPort(40000, "Fixed Output", 65535), readback.destinations.single())
+        assertEquals(FcpBank(2, listOf(4294967295L, 2147483648L, 0L)), readback.banks.single())
+        assertEquals(ScarlettMixRow(1, listOf(65535)), readback.mixes.single())
+        assertEquals(1, readback.mixerInputs)
+        assertEquals(1, readback.mixerOutputs)
+    }
+
+    @Test
     fun clarettCapabilityKeysPreserveUsbAndPlusIdentityAndOptIn() {
         for ((key, name) in listOf(
             "clarett_usb_2pre" to "Clarett USB 2Pre",

@@ -220,6 +220,7 @@ struct UsbScarlettIo<'a> {
     handle: &'a DeviceHandle<Context>,
     interface: u8,
     endpoint: u8,
+    max_payload: usize,
 }
 
 impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
@@ -253,7 +254,7 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
         Err("Scarlett notification drain exceeded its bounded packet budget".into())
     }
     fn send_request(&mut self, bytes: &[u8]) -> Result<usize, String> {
-        if bytes.len() < 16 || bytes.len() > 16 + crate::scarlett::MAX_PAYLOAD {
+        if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett request refused".into());
         }
         let mut request = bytes.to_vec();
@@ -271,7 +272,7 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
             .map_err(|e| e.to_string())
     }
     fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, String> {
-        if bytes.len() < 16 || bytes.len() > 16 + crate::scarlett::MAX_PAYLOAD {
+        if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett response refused".into());
         }
         self.device
@@ -287,37 +288,9 @@ pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, Routin
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
-    let capability = scarlett_capability(&device, configuration)?.ok_or_else(|| {
-        RoutingSessionError::UnsupportedTopology(
-            "no exact Scarlett read candidate with a proven notification interface".into(),
-        )
+    let readback = with_scarlett(&device, configuration, |session| {
+        session.read_all().map_err(RoutingSessionError::Scarlett)
     })?;
-    if !capability.interface_claimed {
-        return Err(RoutingSessionError::Session(Error::Claim(format!(
-            "Scarlett read requires the host's explicit claim of vendor interface {}",
-            capability.interface
-        ))));
-    }
-    let readback = {
-        let idle = IDLE_LOCK.lock();
-        let idle = idle
-            .as_ref()
-            .filter(|idle| idle.device_fd == device.fd)
-            .ok_or_else(|| {
-                RoutingSessionError::Session(Error::InvalidState(
-                    "Scarlett read lost its idle USB owner".into(),
-                ))
-            })?;
-        let io = UsbScarlettIo {
-            device: &device,
-            handle: &idle.handle,
-            interface: capability.interface,
-            endpoint: capability.notification_endpoint,
-        };
-        let mut session = crate::scarlett::ReadSession::initialize(io, capability.candidate)
-            .map_err(RoutingSessionError::Scarlett)?;
-        session.read_all().map_err(RoutingSessionError::Scarlett)?
-    };
     let (after, raw) = active_descriptors(&device)?;
     if configuration != after || descriptors != raw {
         return Err(RoutingSessionError::Drift(
@@ -345,12 +318,34 @@ fn with_scarlett<T>(
         &mut crate::scarlett::ReadSession<UsbScarlettIo<'_>>,
     ) -> Result<T, RoutingSessionError>,
 ) -> Result<T, RoutingSessionError> {
+    with_scarlett_io(device, configuration, false, |io, candidate| {
+        let mut session = crate::scarlett::ReadSession::initialize(io, candidate)
+            .map_err(RoutingSessionError::Scarlett)?;
+        operation(&mut session)
+    })
+}
+
+/// Share exact identity/claim admission between legacy controls and FCP reads.
+fn with_scarlett_io<T>(
+    device: &UsbDevice,
+    configuration: u8,
+    fcp: bool,
+    operation: impl FnOnce(UsbScarlettIo<'_>, crate::scarlett::CandidateModel) -> Result<T, RoutingSessionError>,
+) -> Result<T, RoutingSessionError> {
     let capability = scarlett_capability(device, configuration)?.ok_or_else(|| {
         RoutingSessionError::UnsupportedTopology("no exact Scarlett candidate".into())
     })?;
+    if capability.candidate.is_fcp() != fcp {
+        let message = if fcp {
+            "firmware-described routing requires a modern FCP interface"
+        } else {
+            "modern FCP routing is available through fcp_routing_read"
+        };
+        return Err(RoutingSessionError::UnsupportedTopology(message.into()));
+    }
     if !capability.interface_claimed {
         return Err(RoutingSessionError::Session(Error::Claim(
-            "Scarlett mixer requires explicit vendor-interface claim".into(),
+            "Focusrite routing requires an explicit vendor-interface claim".into(),
         )));
     }
     let idle = IDLE_LOCK.lock();
@@ -367,10 +362,25 @@ fn with_scarlett<T>(
         handle: &idle.handle,
         interface: capability.interface,
         endpoint: capability.notification_endpoint,
+        max_payload: if fcp { crate::scarlett::FCP_MAX_PAYLOAD } else { crate::scarlett::MAX_PAYLOAD },
     };
-    let mut session = crate::scarlett::ReadSession::initialize(io, capability.candidate)
-        .map_err(RoutingSessionError::Scarlett)?;
-    operation(&mut session)
+    operation(io, capability.candidate)
+}
+
+/// Read only firmware-defined FCP topology on a proven, explicitly claimed idle owner.
+pub(crate) fn fcp_read() -> Result<crate::scarlett::FcpReadback, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let readback = with_scarlett_io(&device, configuration, true, |io, candidate| {
+        crate::scarlett::read_fcp(io, candidate).map_err(RoutingSessionError::Scarlett)
+    })?;
+    let (after, raw) = active_descriptors(&device)?;
+    if configuration != after || descriptors != raw {
+        return Err(RoutingSessionError::Drift("configuration changed during FCP routing read".into()));
+    }
+    Ok(readback)
 }
 
 pub(crate) fn scarlett_mix_apply(

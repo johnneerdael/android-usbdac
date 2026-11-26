@@ -9,7 +9,11 @@
 
 use std::time::{Duration, Instant};
 
+mod fcp;
+pub use fcp::{read_fcp, FcpBank, FcpPort, FcpReadback};
+
 const HEADER: usize = 16;
+pub(crate) const FCP_MAX_PAYLOAD: usize = 1024;
 // Largest admitted bank: 77 words plus the four-byte SET_MUX header.
 pub(crate) const MAX_PAYLOAD: usize = 312;
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -37,6 +41,10 @@ pub enum CandidateModel {
     ScarlettSoloGen4,
     Scarlett2i2Gen4,
     Scarlett4i4Gen4,
+    Scarlett16i16Gen4,
+    Scarlett18i16Gen4,
+    Scarlett18i20Gen4,
+    IsaC8x,
 }
 
 impl CandidateModel {
@@ -61,8 +69,18 @@ impl CandidateModel {
             0x8218 => Some(Self::ScarlettSoloGen4),
             0x8219 => Some(Self::Scarlett2i2Gen4),
             0x821a => Some(Self::Scarlett4i4Gen4),
+            0x821b => Some(Self::Scarlett16i16Gen4),
+            0x821c => Some(Self::Scarlett18i16Gen4),
+            0x821d => Some(Self::Scarlett18i20Gen4),
+            0x821e => Some(Self::IsaC8x),
             _ => None,
         }
+    }
+    pub fn is_fcp(self) -> bool {
+        matches!(
+            self,
+            Self::Scarlett16i16Gen4 | Self::Scarlett18i16Gen4 | Self::Scarlett18i20Gen4 | Self::IsaC8x
+        )
     }
     pub fn key(self) -> &'static str {
         match self {
@@ -83,6 +101,10 @@ impl CandidateModel {
             Self::ScarlettSoloGen4 => "scarlett_solo_gen4",
             Self::Scarlett2i2Gen4 => "scarlett_2i2_gen4",
             Self::Scarlett4i4Gen4 => "scarlett_4i4_gen4",
+            Self::Scarlett16i16Gen4 => "scarlett_16i16_gen4",
+            Self::Scarlett18i16Gen4 => "scarlett_18i16_gen4",
+            Self::Scarlett18i20Gen4 => "scarlett_18i20_gen4",
+            Self::IsaC8x => "isa_c8x",
         }
     }
     pub fn name(self) -> &'static str {
@@ -104,6 +126,10 @@ impl CandidateModel {
             Self::ScarlettSoloGen4 => "Scarlett Solo Gen 4",
             Self::Scarlett2i2Gen4 => "Scarlett 2i2 Gen 4",
             Self::Scarlett4i4Gen4 => "Scarlett 4i4 Gen 4",
+            Self::Scarlett16i16Gen4 => "Scarlett 16i16 Gen 4",
+            Self::Scarlett18i16Gen4 => "Scarlett 18i16 Gen 4",
+            Self::Scarlett18i20Gen4 => "Scarlett 18i20 Gen 4",
+            Self::IsaC8x => "ISA C8X",
         }
     }
     pub fn validate_firmware(self, firmware: u32) -> Result<ReadModel, ProtocolError> {
@@ -123,6 +149,9 @@ impl CandidateModel {
             Self::VocasterOne | Self::VocasterTwo => firmware >= 1769,
             Self::ScarlettSoloGen4 | Self::Scarlett2i2Gen4 => firmware >= 2115,
             Self::Scarlett4i4Gen4 => firmware >= 2089,
+            Self::Scarlett16i16Gen4 | Self::Scarlett18i16Gen4 | Self::Scarlett18i20Gen4 | Self::IsaC8x => {
+                return Err(ProtocolError::UnsupportedProtocol);
+            }
         };
         if !admitted { return Err(ProtocolError::UnsupportedFirmware(firmware)); }
         Ok(ReadModel { candidate: self, firmware })
@@ -172,6 +201,8 @@ impl ReadModel {
             CandidateModel::Scarlett18i20Gen2 | CandidateModel::Scarlett6i6Gen2 | CandidateModel::Scarlett18i8Gen2 | CandidateModel::Scarlett4i4Gen3 | CandidateModel::Scarlett8i6Gen3 | CandidateModel::Scarlett18i8Gen3 | CandidateModel::Scarlett18i20Gen3 => 0,
             CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettUsb8Pre
                 | CandidateModel::ClarettPlus2Pre | CandidateModel::ClarettPlus4Pre | CandidateModel::ClarettPlus8Pre => 0,
+            CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4
+                | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x => 0,
             CandidateModel::VocasterOne => 1,
             _ => 2,
         }
@@ -202,6 +233,7 @@ impl ReadModel {
             CandidateModel::VocasterTwo => [34, 0, 0],
             CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4 => [12; 3],
             CandidateModel::Scarlett4i4Gen4 => [24; 3],
+            CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4 | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x => [0; 3],
         }
     }
     fn count(self, kind: PortKind, source: bool) -> u8 {
@@ -272,6 +304,11 @@ impl ReadModel {
             (CandidateModel::Scarlett4i4Gen4, PortKind::Analogue) => [4, 6],
             (CandidateModel::Scarlett4i4Gen4, PortKind::Mix) => [8, 12],
             (CandidateModel::Scarlett4i4Gen4, PortKind::Pcm) => [6, 6],
+            // FCP models cannot construct a legacy ReadModel; all their
+            // actual counts and pins come from the firmware-described map.
+            (CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4
+                | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x,
+                PortKind::Analogue | PortKind::Mix | PortKind::Pcm) => [0, 0],
             (_, PortKind::Spdif | PortKind::Adat) => [0, 0],
         };
         pair[usize::from(!source)]
@@ -446,6 +483,8 @@ pub struct RoutingReadback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
+    UnsupportedProtocol,
+    InvalidDeviceMap,
     UnsupportedFirmware(u32),
     InvalidMixOutput(u8),
     InvalidMixInput(u8),
@@ -495,6 +534,9 @@ pub trait ReadIo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
+    MixInfo,
+    DevmapInfo,
+    DevmapRead,
     Init,
     Info,
     Mux,
@@ -506,6 +548,9 @@ enum Command {
 impl Command {
     fn code(self) -> u32 {
         match self {
+            Self::MixInfo => 0x2000,
+            Self::DevmapInfo => 0x80000c,
+            Self::DevmapRead => 0x80000d,
             Self::Init => 0,
             Self::Info => 2,
             Self::Mux => 0x3001,
@@ -530,14 +575,19 @@ fn packet(command: Command, sequence: u16, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[cfg(test)]
 fn decode_reply<'a>(
     command: Command,
     sequence: u16,
     size: usize,
     bytes: &'a [u8],
 ) -> Result<&'a [u8], ProtocolError> {
+    decode_reply_mode(command, sequence, size, bytes, false)
+}
+
+fn decode_reply_mode(command: Command, sequence: u16, size: usize, bytes: &[u8], fcp: bool) -> Result<&[u8], ProtocolError> {
     let expected = HEADER + size;
-    if size > MAX_PAYLOAD || bytes.len() != expected {
+    if size > if fcp { FCP_MAX_PAYLOAD } else { MAX_PAYLOAD } || bytes.len() != expected {
         return Err(ProtocolError::InvalidLength {
             expected,
             actual: bytes.len(),
@@ -551,7 +601,7 @@ fn decode_reply<'a>(
     }
     let reply_sequence = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
     if reply_sequence != sequence
-        && !(command.initializing() && sequence == 1 && reply_sequence == 0)
+        && !(!fcp && command.initializing() && sequence == 1 && reply_sequence == 0)
     {
         return Err(ProtocolError::InvalidSequence);
     }
@@ -572,6 +622,12 @@ fn transact<I: ReadIo>(
     payload: &[u8],
     size: usize,
 ) -> Result<Vec<u8>, ReadError<I::Error>> {
+    transact_mode(io, command, sequence, payload, size, false)
+}
+
+fn transact_mode<I: ReadIo>(io: &mut I, command: Command, sequence: u16, payload: &[u8], size: usize, fcp: bool) -> Result<Vec<u8>, ReadError<I::Error>> {
+    let limit = if fcp { FCP_MAX_PAYLOAD } else { MAX_PAYLOAD };
+    if size > limit || payload.len() > limit { return Err(ReadError::Protocol(ProtocolError::InvalidPayloadSize)); }
     let request = packet(command, sequence, payload);
     exact(
         io.send_request(&request).map_err(ReadError::Io)?,
@@ -604,7 +660,7 @@ fn transact<I: ReadIo>(
         io.receive_response(&mut reply).map_err(ReadError::Io)?,
         reply.len(),
     )?;
-    decode_reply(command, sequence, size, &reply)
+    decode_reply_mode(command, sequence, size, &reply, fcp)
         .map_err(ReadError::Protocol)
         .map(Vec::from)
 }
@@ -631,6 +687,7 @@ pub struct ReadSession<I> {
 
 impl<I: ReadIo> ReadSession<I> {
     pub fn initialize(mut io: I, candidate: CandidateModel) -> Result<Self, ReadError<I::Error>> {
+        if candidate.is_fcp() { return Err(ReadError::Protocol(ProtocolError::UnsupportedProtocol)); }
         let mut startup = [0; 24];
         exact(
             io.initial_read(&mut startup).map_err(ReadError::Io)?,
@@ -1016,6 +1073,9 @@ fn bank_destinations_for(model: ReadModel, bank: u8) -> Result<Vec<u16>, Protoco
         ScarlettSoloGen4 | Scarlett2i2Gen4 => vec![(0x300,4,2),(0x300,2,2),(0x600,0,4),(0x300,0,2),(0x080,0,2)],
         Scarlett4i4Gen4 => vec![(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
         Scarlett18i20Gen2 => Vec::new(),
+        Scarlett16i16Gen4 | Scarlett18i16Gen4 | Scarlett18i20Gen4 | IsaC8x => {
+            return Err(ProtocolError::UnsupportedProtocol);
+        }
     };
     if !groups.is_empty() {
         return Ok(groups.iter().flat_map(|&(base, first, count)|
@@ -1140,9 +1200,19 @@ mod tests {
             (0x1234, 0x8201),
             (0x1235, 0x8202),
             (0x1235, 0x8210),
-            (0x1235, 0x821b),
+            (0x1235, 0x821f),
         ] {
             assert_eq!(CandidateModel::recognize(vendor, product), None);
+        }
+        for (product, candidate) in [
+            (0x821b, CandidateModel::Scarlett16i16Gen4),
+            (0x821c, CandidateModel::Scarlett18i16Gen4),
+            (0x821d, CandidateModel::Scarlett18i20Gen4),
+            (0x821e, CandidateModel::IsaC8x),
+        ] {
+            assert_eq!(CandidateModel::recognize(0x1235, product), Some(candidate));
+            assert_eq!(CandidateModel::recognize(0x1234, product), None);
+            assert_eq!(candidate.validate_firmware(2778), Err(ProtocolError::UnsupportedProtocol));
         }
         for firmware in [0, 1082, 1084, u32::MAX] {
             assert_eq!(
