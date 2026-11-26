@@ -697,3 +697,54 @@ factor drift and implicit-clock pairing. The four-ABI local AAR
 SHA-256 is
 `4157a1cc315e45d03a22cb5685c3937951ba1375ec1ed42c58e180f64c2e9580`.
 Physical testing of a UAC2 multiplier path is pending.
+
+### Archived Hidizs AP80 Pro-X evidence
+
+Android's USB host service retained the descriptor from the last
+Hidizs AP80 Pro-X connection. The 361-byte record identifies
+`c502:0072`, `bcdDevice=ffff`, configuration 1, and UAC2 AS interface
+1. Alts 1–3 advertise stereo PCM at 24, 16 and 32 valid bits.
+Alt 4 advertises stereo Type I RAW_DATA (`0x80000000`) in four-byte
+subslots with 32 valid bits. The data OUT endpoint is `0x01` at
+`bInterval=2`; the explicit four-byte IN feedback endpoint is `0x81`
+at `bInterval=4`. The descriptor contains the format and geometry.
+ALSA's `c502` RAW_DATA rule supplies the native DSD layout. Hidizs
+lists USB DAC decoding for DSD64, DSD128 and DSD256.
+[Android USB archive](https://android.googlesource.com/platform/frameworks/base.git/+/master/services/usb/java/com/android/server/usb/UsbHostManager.java),
+[ALSA RAW_DATA interpretation](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2103-L2108),
+[ALSA `c502` family rule](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2641-L2646),
+[Hidizs specifications](https://www.hidizs.net/pages/ap80pro-x-specifications)
+
+Descriptor SHA-256 is
+`a767fe00fe6a2ae3e4e442362bbcb030fa69b7a4db5c350a9ad8f6342891d33b`.
+The player was detached when the archive was read. Native DSD sample
+delivery, live clock rate and PCM hand-back still need a physical run.
+
+### Fixed-rate Pioneer USB mixers
+
+The DJM-250MK2 and DJM-750MK2 have fixed stereo-pair channel arrays
+on one vendor interface. The driver matches exact USB IDs and the
+verified active high-speed configuration. Both use 48 kHz packed
+24-bit PCM on interface 0, alternate 1, with `0x01` OUT and `0x82` IN.
+The two models carry 8 out and 8 in, and 10 out and 12 in respectively.
+Prove endpoint cadence and capacity before claiming the interface.
+Channel order is USB wire order. The physical mixer controls output
+volume, so playback uses the existing fixed-level opt-in policy.
+[ALSA DJM-250MK2](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L2799-L2875),
+[ALSA DJM-750MK2](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L3373-L3421)
+
+Post valid playback silence before arming the capture pipe. Acquire
+implicit feedback within the existing startup window, then schedule
+application frames from validated IN packet lengths. A duplex reader
+shares those same IN transfers. For capture alone, use the exact
+fixed-rate IN endpoint. The ALSA Pioneer capture quirk specifies
+independent capture timing. Retire all transfers before releasing the
+alternate. [ALSA Pioneer timing](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L200-L235)
+
+Rust workspace tests, Android NDK, Android unit tests, sample build
+and SDK snippet checks passed. The AAR exports the vendor preflight
+on all four ABIs. Its SHA-256 is
+`eba6356be9eaa7b6ad0a227604282b30326ef5ed9d07e8c6826b36caeb6a5a8c`.
+Physical acceptance needs each target mixer at its exact channel
+count, with an OUT-start trace, measured feedback, independent capture
+and shared duplex capture.

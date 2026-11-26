@@ -8,6 +8,22 @@ import org.junit.Test
 
 class UsbInterfacesTest {
     @Test
+    fun vendorPcmDiscoveryIsExactAndClaimsOnlyNativeProvenInterface() {
+        assertTrue(isVendorPcmCandidate(0x2b73, 0x0017))
+        assertTrue(isVendorPcmCandidate(0x2b73, 0x001b))
+        assertFalse(isVendorPcmCandidate(0x2b73, 0x0018))
+        assertFalse(isVendorPcmCandidate(0x2b74, 0x0017))
+        val idle = InterfaceInfo(0, 0, 0xff, 0, false)
+        val active = InterfaceInfo(0, 1, 0xff, 0, true, true)
+        assertEquals(listOf(0), planVendorPcmClaims(listOf(idle, active, control(2)), 0)!!.allIds)
+        assertNull(planVendorPcmClaims(listOf(idle, active.copy(hasIsochronousIn = false)), 0))
+        assertNull(planVendorPcmClaims(listOf(idle, active.copy(interfaceClass = 1)), 0))
+        assertNull(planVendorPcmClaims(listOf(idle, active, active.copy(alternateSetting = 2)), 0))
+        assertNull(planVendorPcmClaims(listOf(idle, active), 1))
+        assertNull(planClaims(listOf(idle, active)))
+    }
+
+    @Test
     fun explicitCaptureClaimsUseOnlyPreflightInputsAndTheirControl() {
         val interfaces = listOf(control(0), streamingOut(1), control(4),
             streamingInOnly(5).copy(hasIsochronousIn = true),

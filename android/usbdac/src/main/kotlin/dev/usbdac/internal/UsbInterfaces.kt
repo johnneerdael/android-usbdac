@@ -34,6 +34,19 @@ internal data class ClaimPlan(val controlIds: List<Int>, val streamingIds: List<
     val allIds: List<Int> get() = (controlIds + streamingIds).distinct()
 }
 
+/** Discovery is prospective; the native read-only proof is required before any claim. */
+internal fun isVendorPcmCandidate(vendorId: Int, productId: Int): Boolean =
+    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b)
+
+/** Corroborate the dedicated native-proven bidirectional vendor interface. */
+internal fun planVendorPcmClaims(interfaces: List<InterfaceInfo>, interfaceId: Int): ClaimPlan? {
+    val alternates = interfaces.filter { it.id == interfaceId }
+    if (interfaceId != 0 || alternates.size != 2 || alternates.any { it.interfaceClass != 0xff }) return null
+    if (alternates.none { it.alternateSetting == 0 && !it.hasIsochronousIn && !it.hasIsochronousOut }) return null
+    if (alternates.none { it.alternateSetting == 1 && it.hasIsochronousIn && it.hasIsochronousOut }) return null
+    return ClaimPlan(emptyList(), listOf(interfaceId))
+}
+
 /**
  * Whether the interfaces of a configuration can play audio: an AudioStreaming interface with
  * an alternate setting that has an isochronous OUT endpoint.
@@ -145,7 +158,8 @@ internal class ClaimedInterfaces private constructor(
     fun release() {
         for (usbInterface in claimed.asReversed()) {
             runCatching {
-                if (usbInterface.interfaceSubclass == SUBCLASS_AUDIO_STREAMING && usbInterface.alternateSetting == 0) {
+                if (usbInterface.alternateSetting == 0 &&
+                    (usbInterface.interfaceSubclass == SUBCLASS_AUDIO_STREAMING || usbInterface.interfaceClass == 0xff)) {
                     connection.setInterface(usbInterface)
                 }
             }

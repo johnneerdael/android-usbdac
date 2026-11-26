@@ -5,6 +5,9 @@ use crate::capture::ChannelMap;
 pub(super) fn for_candidate(
     device: &Device<Context>, handle: &DeviceHandle<Context>, candidate: &IsoStreamCandidate,
 ) -> Result<ChannelMap, String> {
+    if vendor_pcm::for_candidate(handle, candidate)?.is_some() {
+        return unnamed(candidate.channels);
+    }
     // RAW_DATA has transport channels, without a PCM speaker assignment.
     if candidate.format_tag == FORMAT_TAG_DSD {
         return unnamed(candidate.channels);

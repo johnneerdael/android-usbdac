@@ -167,6 +167,20 @@ fn init_logging(level: i32) {
 
 // ---- DAC ------------------------------------------------------------------
 
+/// Read-only exact vendor PCM proof before Android detaches its dedicated interface.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_vendor_pcm_preflight<'l>(
+    mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32, device_info_json: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let info = json::parse_device_info(&string_of(env, &device_info_json)?)?;
+        let profile = Dac::vendor_pcm_preflight(fd, &info)?;
+        java_string(env, &serde_json::json!(profile.map(|(configuration, interface)| serde_json::json!({
+            "configuration_id": configuration, "interface_id": interface,
+        }))))
+    })
+}
+
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn dac_feedback_preflight<'l>(
     mut env: EnvUnowned<'l>,

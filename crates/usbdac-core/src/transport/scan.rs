@@ -12,6 +12,9 @@ pub(super) fn preflight_implicit_feedback_interfaces(
     let usb = claimed.handle.device();
     let config = usb.active_config_descriptor().map_err(|e| e.to_string())?;
     validate_android_usb_claims(&claimed, &config)?;
+    if vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&usb))?.is_some() {
+        return Ok((config.number(), Vec::new()));
+    }
     Ok((
         config.number(),
         structural_feedback_interfaces(&config, &claimed.handle, resolve_device_speed(&usb), &claimed.claimed_interfaces),
@@ -582,8 +585,15 @@ pub(super) fn inspect_duplex_capabilities(device: &UsbDevice, expected: Option<u
     if expected.is_some_and(|id| id != configuration) {
         return Err("duplex configuration changed since capture preflight".into());
     }
-    validate_duplex_capture_claims(&device.claimed_interfaces, &controls, &inputs)?;
     let claimed = wrap_android_usb_handle(device)?;
+    let descriptor = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
+    if let Some(profile) = vendor_pcm::discover(&claimed.handle, &descriptor, resolve_device_speed(&claimed.handle.device()))? {
+        if !controls.is_empty() || inputs != [profile.interface_number] || device.claimed_interfaces.as_ref() != [profile.interface_number] {
+            return Err("Pioneer duplex requires its single shared streaming interface".into());
+        }
+    } else {
+        validate_duplex_capture_claims(&device.claimed_interfaces, &controls, &inputs)?;
+    }
     let usb_device = claimed.handle.device();
     let config = usb_device.active_config_descriptor().map_err(|e| e.to_string())?;
     if config.number() != configuration { return Err("duplex configuration changed".into()); }
@@ -618,6 +628,29 @@ pub(super) fn build_usb_capability_model(
         .active_config_descriptor()
         .map_err(|error| format!("Failed to read active USB config descriptor: {}", error))?;
 
+    if let Some(profile) = vendor_pcm::discover(handle, &config_descriptor, speed)? {
+        if claimed_interfaces != [profile.interface_number] {
+            return Err("Pioneer vendor PCM requires exactly its proven interface claim".into());
+        }
+        if settings().disable_feedback() {
+            return Err("Pioneer vendor PCM requires implicit feedback".into());
+        }
+        return Ok(CapabilityModel {
+            supported_sample_rates: vec![profile.rate], link_speed: Some(link_speed_of(profile.speed)),
+            alt_settings: vec![AltSetting {
+                interface_number: profile.interface_number, alt_setting: profile.alt_setting,
+                endpoint_address: profile.output.address, format: AltFormat::Pcm,
+                channels: profile.output.channels, subslot_bytes: profile.output.subslot_bytes, valid_bits: 24,
+                rate_ranges: vec![RateRange { min_hz: profile.rate, max_hz: profile.rate, step_hz: 0 }],
+                sample_rates: vec![profile.rate], sync_type: SyncKind::Asynchronous,
+                feedback_endpoint: None, max_packet_bytes: profile.output.max_packet_bytes,
+                service_interval_us: profile.output.service_us, uac_version: UacVersion::Unknown,
+                endpoint_interval: profile.output.interval, usage: EndpointUsage::Data, refresh: 0, synch_address: 0,
+                pacing: Some(crate::capabilities::Pacing::ImplicitFeedback { interface_number: profile.interface_number,
+                    alt_setting: profile.alt_setting, endpoint: profile.input.address }),
+            }],
+        });
+    }
     let implicit_sources = if settings().disable_feedback() {
         Vec::new()
     } else {
@@ -863,6 +896,20 @@ pub(super) fn select_stream_candidate(
             error
         ))
     })?;
+    if let Some(profile) = vendor_pcm::discover(handle, &config_descriptor, speed).map_err(SelectError::NoMatch)? {
+        if claimed_interfaces != [profile.interface_number] {
+            return Err(SelectError::Claim("Pioneer vendor PCM requires exactly its proven interface claim".into()));
+        }
+        if settings().disable_feedback() {
+            return Err(SelectError::NoMatch("Pioneer vendor PCM requires implicit feedback".into()));
+        }
+        if playback_format.dsd_transport != DsdTransportMode::None || playback_format.is_dop
+            || playback_format.sample_rate != profile.rate || playback_format.bit_depth != 24
+            || playback_format.channels != profile.output.channels {
+            return Err(SelectError::NoMatch("Pioneer vendor PCM requires its exact 48000 Hz packed 24-bit channel format".into()));
+        }
+        return Ok(profile.candidate());
+    }
     let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed);
     let mut refused_unsynchronized = false;
     let mut refused_claim = None;
@@ -1376,6 +1423,14 @@ fn validate_android_usb_claims_with_capture(
     config_descriptor: &ConfigDescriptor,
     capture_inputs: &[u8],
 ) -> Result<(), String> {
+    if let Some(profile) = vendor_pcm::discover(&claimed_handle.handle, config_descriptor,
+        resolve_device_speed(&claimed_handle.handle.device()))? {
+        if claimed_handle.claimed_interfaces.as_ref() != [profile.interface_number]
+            || capture_inputs.iter().any(|id| *id != profile.interface_number) {
+            return Err("Pioneer vendor PCM permits only the exact native-proven interface claim".into());
+        }
+        return Ok(());
+    }
     let mut required = HashSet::new();
     let mut has_control = false;
     let mut has_playback = false;
@@ -1445,7 +1500,7 @@ fn validate_android_usb_claims_with_capture(
 }
 
 /// Reject reserved transaction encodings before deriving an implicit capacity.
-fn valid_implicit_packet_capacity(raw: u16, speed: Speed) -> bool {
+pub(super) fn valid_implicit_packet_capacity(raw: u16, speed: Speed) -> bool {
     if raw & 0xe000 != 0 || raw & 0x07ff == 0 {
         return false;
     }

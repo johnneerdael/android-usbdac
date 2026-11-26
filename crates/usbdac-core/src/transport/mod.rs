@@ -155,6 +155,7 @@ mod playback_map;
 mod ring;
 pub(crate) mod routing_hw;
 mod scan;
+mod vendor_pcm;
 pub(crate) mod session;
 pub(crate) mod shared;
 mod stream_open;

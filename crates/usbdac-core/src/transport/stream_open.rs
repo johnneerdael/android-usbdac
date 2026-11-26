@@ -141,6 +141,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 return Err(error.into_error(offered_alt_settings()));
             }
         };
+    let vendor_profile = match vendor_pcm::for_candidate(&claimed_handle.handle, &candidate) {
+        Ok(profile) => profile,
+        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
+    };
     let channel_map = match playback_map::for_candidate(&device, &claimed_handle.handle, &candidate) {
         Ok(map) => map,
         Err(error) => {
@@ -192,7 +196,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             current.requested_playback_format = Some(requested_playback_format);
         }
     }
-    let adc3_route = match adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) {
+    let adc3_route = match if vendor_profile.is_some() { Ok(None) } else { adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) } {
         Ok(route) => route,
         Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
     };
@@ -201,7 +205,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::InvalidState(error));
         }
     }
-    let clock_choice = if let Some(route) = adc3_route.as_ref() {
+    let clock_choice = if vendor_profile.is_some() { None } else if let Some(route) = adc3_route.as_ref() {
         route.choice.clone().map(|choice| (AudioControlClock {
             interface_number: choice.control_interface, clock_id: choice.source_id,
         }, choice))
@@ -238,7 +242,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         return Err(Error::Transfer(error));
     }
     let clock = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(clock, _)| *clock) };
-    let clock_detection_msg = match (adc3_route.as_ref(), &clock) {
+    let clock_detection_msg = if let Some(profile) = vendor_profile.as_ref() {
+        format!("vendor PCM model-backed nominal {}Hz; live implicit lock required", profile.rate)
+    } else { match (adc3_route.as_ref(), &clock) {
         (Some(route), _) => match route.choice.as_ref() {
             Some(choice) => format!("ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
                 choice.control_interface, choice.source_id, candidate.terminal_link),
@@ -249,7 +255,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             c.interface_number, c.clock_id, candidate.terminal_link,
         ),
         (None, None) => "Clock NOT FOUND: no UAC2 clock entity in any AudioControl descriptor".to_string(),
-    };
+    } };
     dev_eprintln!(
         "[USB] Clock entity for '{}': {}",
         state.device.product_name, clock_detection_msg
@@ -261,14 +267,21 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // The hardware volume control of the terminal this stream feeds. Normally
     // the one found when the DAC was opened; replaced if the stream plays
     // through a different Feature Unit.
-    refresh_stream_volume_control(
-        &state.device,
-        &device,
-        candidate.terminal_link,
-        candidate.interface_number,
-        candidate.channels,
-        adc3_route.as_ref().map(|route| route.control).or_else(|| clock.map(|clock| clock.interface_number)),
-    );
+    if vendor_profile.is_some() {
+        // The source-proven vendor interface has no class volume contract.
+        // Fixed output remains an explicit host opt-in through the normal guard.
+        install_volume_control(None);
+        set_hardware_volume_error(Some("vendor PCM has fixed output without a proven hardware volume control".into()));
+    } else {
+        refresh_stream_volume_control(
+            &state.device,
+            &device,
+            candidate.terminal_link,
+            candidate.interface_number,
+            candidate.channels,
+            adc3_route.as_ref().map(|route| route.control).or_else(|| clock.map(|clock| clock.interface_number)),
+        );
+    }
     // The stream's own terminal may have no volume control, or one the start-up
     // step could not make safe: with a control required, nothing is programmed.
     if let Err(error) = ensure_volume_if_required(config.require_hardware_volume) {
@@ -369,11 +382,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         return Err(Error::Transfer(message));
     }
     thread::sleep(Duration::from_millis(50));
-    if let Err(error) = apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport) {
+    if let Err(error) = if vendor_profile.is_some() { Ok(()) } else { apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport) } {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(error));
     }
-    if let Err(error) = verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) {
+    if let Err(error) = if vendor_profile.is_some() { Ok(()) } else { verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) } {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::InvalidState(error));
     }
@@ -568,6 +581,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         clock_verification_passed = true;
         reported_sample_rate = Some(playback_format.sample_rate);
         set_clock_verification(true, true, true, reported_sample_rate);
+    } else if let Some(profile) = vendor_profile.as_ref() {
+        clock_control_attempted = false;
+        clock_control_succeeded = false;
+        clock_verification_passed = playback_format.dsd_transport == DsdTransportMode::None
+            && playback_format.sample_rate == profile.rate;
+        reported_sample_rate = Some(profile.rate);
+        set_clock_verification(false, false, clock_verification_passed, reported_sample_rate);
     } else if candidate.is_uac1 {
         // UAC1 has no UAC2 clock entity; the sample rate is set endpoint-level
         // via SET_CUR (UAC1_SAM_FREQ_CONTROL 0x0100) on the streaming endpoint.
@@ -683,6 +703,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             return Err(Error::Transfer("implicit source alternate conflicts with playback".into()));
         }
     }
+    if vendor_profile.is_some() {
+        if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
+            .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed before activation".into()) }) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Transfer(error));
+        }
+    }
     if let Err(error) =
         claimed_handle.set_alternate_setting(candidate.interface_number, candidate.alt_setting)
     {
@@ -695,6 +722,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_engine_state(EngineState::Error, Some(msg.clone()));
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
+    }
+    if vendor_profile.is_some() {
+        if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
+            .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed after activation".into()) }) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(Error::Transfer(error));
+        }
     }
     thread::sleep(Duration::from_millis(50));
 

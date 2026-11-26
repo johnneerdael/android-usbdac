@@ -19,6 +19,7 @@ pub(crate) struct CaptureEndpoint {
     pub(super) control_descriptors: Vec<u8>,
     sampling_control: bool,
     fixed_rate: bool,
+    pub(super) vendor_pcm: Option<vendor_pcm::VendorPcm>,
     pub(super) adc3_route: Option<adc3::Adc3Route>,
 }
 
@@ -340,6 +341,7 @@ pub(super) fn capture_candidates(
                 sampling_control,
                 fixed_rate,
                 adc3_route: None,
+                vendor_pcm: None,
             });
         }
     }
@@ -353,6 +355,12 @@ pub(super) fn owned_capture_candidates(
     rate: u32,
     planned_clock: bool,
 ) -> Result<Vec<CaptureEndpoint>, String> {
+    let speed = resolve_device_speed(&claimed.handle.device());
+    if let Some(profile) = vendor_pcm::discover(&claimed.handle, config, speed)? {
+        return if rate == profile.rate {
+            Ok(vec![vendor_capture_endpoint(config.number(), profile)?])
+        } else { Ok(vec![]) };
+    }
     let raw = read_active_configuration_bytes(&claimed.handle, config)
         .ok_or("cannot read active capture configuration")?;
     let speed = resolve_device_speed(&claimed.handle.device());
@@ -366,6 +374,44 @@ pub(super) fn owned_capture_candidates(
         candidates.push(adc3_capture_endpoint(config.number(), rate, candidate, route)?);
     }
     Ok(candidates)
+}
+
+fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm) -> Result<CaptureEndpoint, String> {
+    let format = CaptureFormat::pcm(profile.rate, 24, profile.input.subslot_bytes,
+        ChannelMap::uac2(u16::from(profile.input.channels), 0).map_err(|e| format!("vendor channel map: {e:?}"))?)
+        .map_err(|e| format!("vendor capture format: {e:?}"))?;
+    Ok(CaptureEndpoint {
+        configuration, interface: profile.interface_number, alternate: profile.alt_setting,
+        address: profile.input.address, service_us: profile.input.service_us,
+        packet_bytes: profile.input.max_packet_bytes, format, protocol: 0xff,
+        terminal: 0, control: profile.interface_number, control_descriptors: vec![],
+        sampling_control: false, fixed_rate: true, adc3_route: None, vendor_pcm: Some(profile),
+    })
+}
+
+pub(super) fn verify_vendor_capture_alternate(claimed: &ClaimedHandle, candidate: &CaptureEndpoint, expected: u8) -> Result<(), Error> {
+    let mut alternate = [0u8];
+    let read = claimed.handle.read_control(0x81, 0x0a, 0, u16::from(candidate.interface), &mut alternate, Duration::from_millis(500))
+        .map_err(|e| Error::Control(e.to_string()))?;
+    if read != 1 || alternate[0] != expected {
+        return Err(Error::InvalidState("vendor capture alternate did not verify".into()));
+    }
+    Ok(())
+}
+
+/// Rediscover the exact fixed duplex profile without sending class clock or power requests.
+pub(super) fn verify_vendor_capture(claimed: &ClaimedHandle, candidate: &CaptureEndpoint) -> Result<(), Error> {
+    let expected = candidate.vendor_pcm.as_ref().ok_or_else(|| Error::InvalidState("missing vendor capture profile".into()))?;
+    let config = claimed.handle.device().active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
+    if config.number() != candidate.configuration {
+        return Err(Error::InvalidState("vendor capture configuration changed".into()));
+    }
+    let actual = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))
+        .map_err(Error::Control)?;
+    if actual.as_ref() != Some(expected) {
+        return Err(Error::InvalidState("vendor capture wire profile changed".into()));
+    }
+    Ok(())
 }
 
 fn adc3_capture_endpoint(
@@ -393,6 +439,7 @@ fn adc3_capture_endpoint(
         sampling_control: false,
         fixed_rate: route.clock.is_none(),
         adc3_route: Some(route),
+        vendor_pcm: None,
     })
 }
 
@@ -410,6 +457,16 @@ pub(super) fn validate_capture_registration(
         .map_err(|e| e.to_string())?;
     if expected_configuration.is_some_and(|id| id != config.number()) {
         return Err("capture configuration changed since host claim handoff".into());
+    }
+    if let Some(profile) = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))? {
+        let identity = claimed.handle.device().device_descriptor().map_err(|e| e.to_string())?;
+        if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
+            return Err("capture host and actual USB identities differ".into());
+        }
+        if device.claimed_interfaces.as_ref() != [profile.interface_number] {
+            return Err("vendor capture requires only its dedicated streaming interface".into());
+        }
+        return Ok(());
     }
     let raw = read_active_configuration_bytes(&claimed.handle, &config)
         .ok_or("cannot read active capture configuration")?;
@@ -572,6 +629,17 @@ pub(super) fn configure_capture_endpoint_guarded(
     candidate: &CaptureEndpoint,
     expected_source: Option<(&ClockChoice, u32)>,
 ) -> Result<(), Error> {
+    if candidate.vendor_pcm.is_some() {
+        verify_vendor_capture(claimed, candidate)?;
+        claimed.ensure_interface_claimed(candidate.interface).map_err(Error::Claim)?;
+        claimed.set_alternate_setting(candidate.interface, 0).map_err(Error::Claim)?;
+        verify_vendor_capture(claimed, candidate)?;
+        verify_vendor_capture_alternate(claimed, candidate, 0)?;
+        claimed.set_alternate_setting(candidate.interface, candidate.alternate).map_err(Error::Claim)?;
+        verify_vendor_capture(claimed, candidate)?;
+        verify_vendor_capture_alternate(claimed, candidate, candidate.alternate)?;
+        return Ok(());
+    }
     claimed
         .ensure_interface_claimed(candidate.control)
         .map_err(Error::Claim)?;
@@ -1356,6 +1424,33 @@ mod tests {
         assert!(super::verify_capture_wire_rate(96_000, None).is_err());
     }
     use super::*;
+    #[test]
+    fn vendor_capture_preserves_fixed_packed_pcm_and_unnamed_channel_order() {
+        for channels in [8u16, 12] {
+            let endpoint = vendor_pcm::VendorEndpoint {
+                address: 0x82, interval: 1, service_us: 125,
+                max_packet_bytes: usize::from(channels) * 3 * 7,
+                channels, subslot_bytes: 3,
+            };
+            let profile = vendor_pcm::VendorPcm {
+                interface_number: 0, alt_setting: 1, rate: 48_000, speed: Speed::High,
+                output: vendor_pcm::VendorEndpoint { address: 1, ..endpoint }, input: endpoint,
+            };
+            let capture = vendor_capture_endpoint(1, profile).unwrap();
+            assert_eq!(capture.format.sample_rate(), 48_000);
+            assert_eq!(capture.format.valid_bits(), 24);
+            assert_eq!(capture.format.subslot_bytes(), 3);
+            assert_eq!(capture.format.channels(), channels);
+            assert_eq!(capture.format.bytes_per_frame(), usize::from(channels) * 3);
+            assert!(capture.format.channel_map().positions().iter().enumerate().all(|(index, position)|
+                *position == crate::capture::ChannelPosition::Unspecified { index: index as u16 }));
+            assert_eq!(capture.control, capture.interface);
+            assert!(capture.control_descriptors.is_empty());
+            assert!(!capture.sampling_control);
+            assert!(capture.fixed_rate);
+        }
+    }
+
     use crate::capture::{CaptureState, ChannelPosition};
 
     fn configuration(protocol: u8) -> Vec<u8> {

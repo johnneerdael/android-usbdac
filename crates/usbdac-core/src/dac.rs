@@ -107,6 +107,14 @@ impl std::fmt::Debug for Dac {
 }
 
 impl Dac {
+    /// Read-only proof of a fixed-rate vendor PCM profile. Returns the actual
+    /// active configuration and the sole interface the host may claim.
+    pub fn vendor_pcm_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<(u8, u8)>> {
+        let _guard = OPEN_GUARD.lock();
+        if transport::session::session_registered() { return Err(Error::Busy); }
+        transport::api::vendor_pcm_preflight(fd, info)
+    }
+
     /// Prove the exact optional Scarlett vendor claim from actual USB descriptors.
     /// Requires the host-selected configuration; sends no proprietary requests.
     pub fn scarlett_routing_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>> {

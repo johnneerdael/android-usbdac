@@ -385,6 +385,25 @@ pub(crate) fn open_capture_device(fd: RawFd, info: &crate::DeviceInfo) -> Result
     register_capture_device(device, info.configuration_id)
 }
 
+/// Descriptor-only vendor profile proof before any host claims.
+pub(crate) fn vendor_pcm_preflight(fd: RawFd, info: &crate::DeviceInfo) -> Result<Option<(u8, u8)>, Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
+    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(),
+        info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
+    let wrapped = wrap_android_usb_handle(&device).map_err(Error::Claim)?;
+    let usb = wrapped.handle.device();
+    let identity = usb.device_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
+    if identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id {
+        return Err(Error::Claim("USB identity changed before vendor PCM preflight".into()));
+    }
+    let config = usb.active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
+    if info.configuration_id.is_some_and(|id| id != config.number()) {
+        return Err(Error::Claim("USB configuration changed before vendor PCM preflight".into()));
+    }
+    vendor_pcm::discover(&wrapped.handle, &config, resolve_device_speed(&usb))
+        .map(|profile| profile.map(|p| (config.number(), p.interface_number))).map_err(Error::Claim)
+}
+
 pub(crate) fn capture_preflight_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>), Error> {
     if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
     let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(),

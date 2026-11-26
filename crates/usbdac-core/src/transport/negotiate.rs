@@ -48,6 +48,21 @@ pub(super) fn negotiate_playback_format(
             }
         };
 
+        // A descriptor-proven fixed vendor pair has no AudioControl clock.
+        // This is nominal model evidence; live implicit pacing remains required.
+        if let Some(profile) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
+            .map_err(Error::Transfer)? {
+            if requested_format.dsd_transport != DsdTransportMode::None
+                || requested_format.sample_rate != profile.rate {
+                return Err(Error::Unsupported { reason: "vendor PCM requires its fixed nominal PCM rate".into(), offered: offered_alt_settings() });
+            }
+            set_effective_playback_format(requested_format);
+            set_dac_mode(DacMode::FixedClock);
+            set_clock_status(None);
+            set_clock_verification(false, false, true, Some(profile.rate));
+            return Ok(requested_format);
+        }
+
         // Clock controls and packet pacing use transport words, not source bytes.
         let requested_format = PlaybackFormat {
             sample_rate: native_wire_rate(requested_format, candidate.subslot_size)

@@ -78,6 +78,16 @@ fn input_clock(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint) -> Option<Cl
 
 fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, endpoint: &CaptureEndpoint) -> Result<(), Error> {
+    if let Some(profile) = endpoint.vendor_pcm.as_ref() {
+        capture_stream::verify_vendor_capture(claimed, endpoint)?;
+        let proven = vendor_pcm::for_candidate(&claimed.handle, playback).map_err(Error::Control)?;
+        let exact = proven.as_ref() == Some(profile)
+            && expected.sample_rate == profile.rate && expected.clock.is_none()
+            && endpoint.format.sample_rate() == profile.rate
+            && validate_alternates(playback, endpoint)?;
+        if exact { return Ok(()); }
+        return Err(Error::Unsupported { reason: "duplex must match the exact vendor OUT and shared implicit IN profile".into(), offered: vec![] });
+    }
     let route = adc3_route_for_candidate(&claimed.handle.device(), &claimed.handle, playback).map_err(Error::Control)?;
     if let (Some(output), Some(input)) = (route.as_ref(), endpoint.adc3_route.as_ref()) {
         adc3::validate_adaptive_duplex(playback, output, expected.sample_rate,
@@ -155,6 +165,12 @@ impl Attachment {
     pub(super) fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         expected: &crate::StreamFormat) -> Result<(), Error> {
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
+        if self.endpoint.vendor_pcm.is_some() {
+            // Playback has activated this exact shared alternate; capture only
+            // joins its IN pool and never reprograms or reactivates the interface.
+            capture_stream::verify_vendor_capture_alternate(claimed, &self.endpoint, self.endpoint.alternate)?;
+            return validate_clocks(claimed, playback, expected, &self.endpoint);
+        }
         if self.shared_implicit {
             // Playback owns both programming and activation of this IN source.
             // Its existing clock transaction has already selected the wire rate.

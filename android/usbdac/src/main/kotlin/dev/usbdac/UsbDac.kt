@@ -22,6 +22,8 @@ import dev.usbdac.internal.deviceInfoJson
 import dev.usbdac.internal.hasPlayback
 import dev.usbdac.internal.hasCapture
 import dev.usbdac.internal.planCaptureClaims
+import dev.usbdac.internal.planVendorPcmClaims
+import dev.usbdac.internal.isVendorPcmCandidate
 import dev.usbdac.internal.planClaims
 import dev.usbdac.internal.toInfo
 import dev.usbdac.internal.toNativeJson
@@ -49,7 +51,8 @@ public data class DacDeviceInfo(
     public val configurations: List<DacUsbConfiguration> get() = (0 until device.configurationCount).map { index ->
         val configuration = device.getConfiguration(index)
         val interfaces = configuration.interfaces().map { it.toInfo() }
-        DacUsbConfiguration(configuration.id, configuration.name, hasPlayback(interfaces), hasCapture(interfaces))
+        val vendorPcm = isVendorPcmCandidate(device.vendorId, device.productId) && planVendorPcmClaims(interfaces, 0) != null
+        DacUsbConfiguration(configuration.id, configuration.name, vendorPcm || hasPlayback(interfaces), vendorPcm || hasCapture(interfaces))
     }
 }
 
@@ -107,7 +110,7 @@ public object UsbDac {
 
     /** Describe an input-capable device; exact PCM support is checked after USB permission. */
     public fun describeCapture(device: UsbDevice): DacDeviceInfo? {
-        if (!hasCapture(device.allInterfaces().map { it.toInfo() })) return null
+        if (!isVendorPcmCandidate(device.vendorId, device.productId) && !hasCapture(device.allInterfaces().map { it.toInfo() })) return null
         return DacDeviceInfo(device, device.vendorId, device.productId,
             device.productName?.takeIf { it.isNotBlank() } ?: "USB audio input",
             device.manufacturerName?.takeIf { it.isNotBlank() }, device.deviceName)
@@ -118,7 +121,7 @@ public object UsbDac {
      * `ACTION_USB_DEVICE_ATTACHED` intent carries.
      */
     public fun describe(device: UsbDevice): DacDeviceInfo? {
-        if (!hasPlayback(device.allInterfaces().map { it.toInfo() })) return null
+        if (!isVendorPcmCandidate(device.vendorId, device.productId) && !hasPlayback(device.allInterfaces().map { it.toInfo() })) return null
         return DacDeviceInfo(
             device = device,
             vendorId = device.vendorId,
@@ -237,7 +240,9 @@ public object UsbDac {
                 device.vendorId, device.productId, device.productName, device.manufacturerName,
                 device.deviceName, ids, configurationId = configuration,
             )
-            val preflight = nativeCall { JSONObject(Native.dacCapturePreflight(fd, infoJson(emptyList(), active.id))) }
+            val vendorPlan = vendorPcmClaimPlan(fd, device, opened, active.id, interfaces)
+            val preflight = if (vendorPlan == null) nativeCall { JSONObject(Native.dacCapturePreflight(fd, infoJson(emptyList(), active.id))) }
+                else JSONObject().put("configuration_id", active.id)
             val configuration = preflight.getInt("configuration_id")
             if (configuration != active.id || device.device.activeConfiguration(opened).id != configuration) {
                 throw DacException(DacErrorCode.CLAIM, "active configuration changed during capture preflight")
@@ -245,7 +250,7 @@ public object UsbDac {
             fun ids(key: String): List<Int> = preflight.getJSONArray(key).let { array ->
                 (0 until array.length()).map(array::getInt)
             }
-            val plan = planCaptureClaims(interfaces.map { it.toInfo() }, ids("control_interfaces"), ids("input_interfaces"))
+            val plan = vendorPlan ?: planCaptureClaims(interfaces.map { it.toInfo() }, ids("control_interfaces"), ids("input_interfaces"))
                 ?: throw DacException(DacErrorCode.CLAIM, "capture preflight does not match Android's active interfaces")
             val vendorInterface = vendorRoutingInterface(vendorRouting, fd, device, active.id, interfaces)
             val owned = ClaimedInterfaces.claim(opened, interfaces,
@@ -348,12 +353,13 @@ public object UsbDac {
             selection = selected
             val activeConfiguration = selected.selected
             val interfaces = activeConfiguration.interfaces()
-            val playbackPlan = planClaims(interfaces.map { it.toInfo() })
+            val vendorPlan = vendorPcmClaimPlan(fd, device, connection, activeConfiguration.id, interfaces)
+            val playbackPlan = vendorPlan ?: planClaims(interfaces.map { it.toInfo() })
                 ?: throw DacException(
                     DacErrorCode.UNSUPPORTED,
                     "${device.productName} has no AudioControl interface together with a playback AudioStreaming interface",
                 )
-            val plan = if (duplex) {
+            val plan = if (vendorPlan != null) vendorPlan else if (duplex) {
                 val preflightInfo = deviceInfoJson(device.vendorId, device.productId, device.productName,
                     device.manufacturerName, device.deviceName, emptyList(), configurationId = activeConfiguration.id)
                 val preflight = JSONObject(nativeCall { Native.dacCapturePreflight(fd, preflightInfo) })
@@ -385,7 +391,7 @@ public object UsbDac {
             )
             var nativeConfigurationId: Int? = activeConfiguration.id
             var unavailable: List<Int> = emptyList()
-            if (!duplex && !config.disableFeedback) {
+            if (vendorPlan == null && !duplex && !config.disableFeedback) {
                 val preflight = JSONObject(nativeCall { Native.dacFeedbackPreflight(fd, infoJson()) })
                 nativeConfigurationId = preflight.getInt("configuration_id")
                 if (activeConfiguration.id != nativeConfigurationId || device.device.activeConfiguration(connection).id != nativeConfigurationId) {
@@ -430,6 +436,22 @@ public object UsbDac {
 
     private fun usbManager(context: Context): UsbManager =
         context.getSystemService(Context.USB_SERVICE) as UsbManager
+
+    private fun vendorPcmClaimPlan(fd: Int, device: DacDeviceInfo,
+        connection: android.hardware.usb.UsbDeviceConnection, configuration: Int,
+        interfaces: List<android.hardware.usb.UsbInterface>): dev.usbdac.internal.ClaimPlan? {
+        if (!isVendorPcmCandidate(device.device.vendorId, device.device.productId)) return null
+        val info = deviceInfoJson(device.vendorId, device.productId, device.productName,
+            device.manufacturerName, device.deviceName, emptyList(), configurationId = configuration)
+        val raw = nativeCall { Native.dacVendorPcmPreflight(fd, info) }
+        if (raw == "null") throw DacException(DacErrorCode.UNSUPPORTED, "no exact native-proven vendor PCM profile")
+        val proof = JSONObject(raw)
+        if (proof.getInt("configuration_id") != configuration || device.device.activeConfiguration(connection).id != configuration) {
+            throw DacException(DacErrorCode.CLAIM, "active configuration changed during vendor PCM preflight")
+        }
+        return planVendorPcmClaims(interfaces.map { it.toInfo() }, proof.getInt("interface_id"))
+            ?: throw DacException(DacErrorCode.CLAIM, "vendor PCM proof does not match Android interfaces")
+    }
 
     private fun vendorRoutingInterface(optIn: VendorRouting?, fd: Int, device: DacDeviceInfo,
         configurationId: Int, interfaces: List<android.hardware.usb.UsbInterface>): Int? {
