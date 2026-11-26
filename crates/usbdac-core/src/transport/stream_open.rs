@@ -141,6 +141,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 return Err(error.into_error(offered_alt_settings()));
             }
         };
+    let channel_map = match playback_map::for_candidate(&device, &claimed_handle.handle, &candidate) {
+        Ok(map) => map,
+        Err(error) => {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::Control(error));
+        }
+    };
     let selected_pacing = if let Some(source) = candidate.implicit_feedback {
         crate::capabilities::Pacing::ImplicitFeedback { interface_number: source.interface_number,
             alt_setting: source.alt_setting, endpoint: source.address }
@@ -155,7 +162,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     if expected.interface_number != candidate.interface_number || expected.alt_setting != candidate.alt_setting
         || expected.endpoint_address != candidate.endpoint_address || expected.pacing != selected_pacing
         || expected.sample_rate != selected_rate || expected.subslot_bytes != candidate.subslot_size
-        || expected.channels != candidate.channels || expected.service_interval_us != candidate.service_interval_us
+        || expected.channels != candidate.channels || expected.channel_map != channel_map
+        || expected.service_interval_us != candidate.service_interval_us
         || expected.native_dsd_signature != (if playback_format.dsd_transport == DsdTransportMode::Native {
             candidate.native_dsd.map(|p| p.signature())
         } else { None }) {

@@ -170,6 +170,7 @@ pub fn stream_format(format_id: u64, format: &StreamFormat) -> Value {
     };
     json!({
         "format_id": format_id,
+        "channel_map": crate::capture_json::channel_map(&format.channel_map),
         "encoding": encoding,
         "dsd_bit_rate": dsd_bit_rate,
         "sample_rate": format.sample_rate,

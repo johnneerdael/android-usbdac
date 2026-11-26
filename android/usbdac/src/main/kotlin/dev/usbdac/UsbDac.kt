@@ -293,7 +293,18 @@ public object UsbDac {
         open(context, device, config, configurationId = null)
 
     /** Select only [configurationId], or keep the active configuration when null. */
-    public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacSession {
+    public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacSession =
+        openDevice(context, device, config, configurationId, duplex = false)
+
+    /**
+     * Explicitly claim playback plus native-supported PCM input in one configuration transaction.
+     * USB capture remains subject to Android's permission and microphone privacy policy.
+     * Open audio with [DacSession.openDuplex] after negotiating the output format.
+     */
+    public fun openDuplex(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int? = null): DacSession =
+        openDevice(context, device, config, configurationId, duplex = true)
+
+    private fun openDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, duplex: Boolean): DacSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -317,11 +328,26 @@ public object UsbDac {
             selection = selected
             val activeConfiguration = selected.selected
             val interfaces = activeConfiguration.interfaces()
-            val plan = planClaims(interfaces.map { it.toInfo() })
+            val playbackPlan = planClaims(interfaces.map { it.toInfo() })
                 ?: throw DacException(
                     DacErrorCode.UNSUPPORTED,
                     "${device.productName} has no AudioControl interface together with a playback AudioStreaming interface",
                 )
+            val plan = if (duplex) {
+                val preflightInfo = deviceInfoJson(device.vendorId, device.productId, device.productName,
+                    device.manufacturerName, device.deviceName, emptyList(), configurationId = activeConfiguration.id)
+                val preflight = JSONObject(nativeCall { Native.dacCapturePreflight(fd, preflightInfo) })
+                if (preflight.getInt("configuration_id") != activeConfiguration.id) {
+                    throw DacException(DacErrorCode.CLAIM, "active configuration changed during duplex preflight")
+                }
+                fun ids(key: String): List<Int> = preflight.getJSONArray(key).let { values ->
+                    (0 until values.length()).map(values::getInt)
+                }
+                val capture = planCaptureClaims(interfaces.map { it.toInfo() }, ids("control_interfaces"), ids("input_interfaces"))
+                    ?: throw DacException(DacErrorCode.CLAIM, "duplex capture proof does not match active interfaces")
+                dev.usbdac.internal.ClaimPlan((playbackPlan.controlIds + capture.controlIds).distinct(),
+                    (playbackPlan.streamingIds + capture.streamingIds).distinct())
+            } else playbackPlan
             val ownedClaims = ClaimedInterfaces.claim(connection, interfaces, plan, device.productName)
             claims = ownedClaims
 
@@ -337,7 +363,7 @@ public object UsbDac {
             )
             var nativeConfigurationId: Int? = activeConfiguration.id
             var unavailable: List<Int> = emptyList()
-            if (!config.disableFeedback) {
+            if (!duplex && !config.disableFeedback) {
                 val preflight = JSONObject(nativeCall { Native.dacFeedbackPreflight(fd, infoJson()) })
                 nativeConfigurationId = preflight.getInt("configuration_id")
                 if (activeConfiguration.id != nativeConfigurationId || device.device.activeConfiguration(connection).id != nativeConfigurationId) {
@@ -348,9 +374,12 @@ public object UsbDac {
             }
             selected.verify()
             nativeRegistrationAttempted = true
-            val dac = nativeCall { Native.dacOpen(fd, infoJson(nativeConfigurationId, unavailable), config.toNativeJson()) }
+            val dac = nativeCall {
+                if (duplex) Native.dacOpenDuplexDevice(fd, infoJson(nativeConfigurationId), config.toNativeJson())
+                else Native.dacOpen(fd, infoJson(nativeConfigurationId, unavailable), config.toNativeJson())
+            }
             nativeDac = dac
-            return DacSession.create(dac, device, config, connection, ownedClaims, selected) { sessionOpen.set(false) }
+            return DacSession.create(dac, device, config, connection, ownedClaims, selected, duplexEnabled = duplex) { sessionOpen.set(false) }
         } catch (error: Throwable) {
             if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
             val retainedClaims = claims
@@ -372,6 +401,7 @@ public object UsbDac {
                 while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
                 release()
             }, "usbdac-open-retirement").start()
+            if (error is SecurityException) throw DacException(DacErrorCode.PERMISSION_DENIED, "Android denied USB audio permission", error)
             throw error
         }
     }

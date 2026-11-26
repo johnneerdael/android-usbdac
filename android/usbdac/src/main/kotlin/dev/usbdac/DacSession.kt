@@ -13,6 +13,9 @@ import dev.usbdac.internal.parseStreamFormat
 import dev.usbdac.internal.parseVolumeRange
 import dev.usbdac.internal.parseVolumeState
 import dev.usbdac.internal.toJson
+import dev.usbdac.internal.toCaptureJson
+import dev.usbdac.internal.parseCaptureFormat
+import org.json.JSONObject
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +64,7 @@ public class DacSession private constructor(
     private val connection: UsbDeviceConnection,
     private val claims: ClaimedInterfaces,
     private val configurationSelection: UsbConfigurationSelection,
+    private val duplexEnabled: Boolean,
     private val onClosed: () -> Unit,
 ) : Closeable {
 
@@ -75,6 +79,7 @@ public class DacSession private constructor(
     }
     private val closed = AtomicBoolean(false)
     private var stream: DacStream? = null
+    private var duplex: DacDuplexStream? = null
 
     public val routing: DacRouting = DacRouting(dac, ::checkOpen)
 
@@ -157,9 +162,42 @@ public class DacSession private constructor(
         return opened
     }
 
+    /**
+     * Open both directions atomically on one USB worker after [UsbDac.openDuplex].
+     * Shared clocks require equal rates; proven independent clocks retain their own counters.
+     * Closing either public direction closes the pair. Capture backlog never blocks playback.
+     */
+    @Synchronized
+    public fun openDuplex(format: StreamFormat, request: CaptureRequest, capacityFrames: Int = 48_000): DacDuplexStream {
+        checkOpen()
+        if (!duplexEnabled) throw DacException(DacErrorCode.INVALID_STATE, "open the device with UsbDac.openDuplex first")
+        if (stream != null) throw DacException(DacErrorCode.INVALID_STATE, "a stream is already open")
+        val signals = StreamSignals { event -> mutableEvents.tryEmit(event) }
+        val handles = nativeCall { JSONObject(Native.duplexOpen(dac, format.formatId, request.toCaptureJson(), capacityFrames, signals)) }
+        val playbackHandle = handles.getLong("playback")
+        val captureHandle = handles.getLong("capture")
+        try {
+            val captureFormat = nativeCall { parseCaptureFormat(Native.captureFormat(captureHandle)) }
+            lateinit var pair: DacDuplexStream
+            val output = DacStream(playbackHandle, format, signals) { pair.close() }
+            val input = DacCaptureStream(captureHandle, captureFormat) { pair.close() }
+            pair = DacDuplexStream(output, input) { streamClosed() }
+            signals.seedBitPerfect(nativeCall { Native.streamIsBitPerfect(playbackHandle) })
+            stream = output
+            duplex = pair
+            mutableState.update { if (it == DacState.READY) DacState.STREAMING else it }
+            return pair
+        } catch (error: Throwable) {
+            runCatching { Native.streamClose(playbackHandle) }.onFailure(error::addSuppressed)
+            runCatching { Native.captureClose(captureHandle) }.onFailure(error::addSuppressed)
+            throw error
+        }
+    }
+
     @Synchronized
     private fun streamClosed() {
         stream = null
+        duplex = null
         mutableState.update { if (it == DacState.STREAMING) DacState.READY else it }
     }
 
@@ -184,7 +222,7 @@ public class DacSession private constructor(
         if (!closed.compareAndSet(false, true)) return
         var failure: DacException? = null
         try {
-            runCatching { synchronized(this) { stream }?.close() }.onFailure { logWarning("closing the stream failed", it) }
+            runCatching { synchronized(this) { duplex ?: stream }?.close() }.onFailure { logWarning("closing the stream failed", it) }
             if (handBack == HandBack.RESTORE_ORIGINAL && mutableState.value != DacState.LOST) {
                 runCatching { volume?.handBack() }.onFailure { logWarning("restoring the volume failed", it) }
             }
@@ -234,10 +272,11 @@ public class DacSession private constructor(
             connection: UsbDeviceConnection,
             claims: ClaimedInterfaces,
             configurationSelection: UsbConfigurationSelection,
+            duplexEnabled: Boolean = false,
             onClosed: () -> Unit,
         ): DacSession {
             val capabilities = nativeCall { parseCapabilities(Native.dacCapabilities(dac)) }
-            return DacSession(dac, device, config, capabilities, connection, claims, configurationSelection, onClosed)
+            return DacSession(dac, device, config, capabilities, connection, claims, configurationSelection, duplexEnabled, onClosed)
         }
     }
 }

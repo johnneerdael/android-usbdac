@@ -196,3 +196,58 @@ guarded transport, including the existing exact-revision exceptions.
 The Rust workspace, Android cross-target check, Kotlin tests, all four
 native ABIs and sample build passed after review fixes. The built AAR
 retains the original JVM open methods and Kotlin default bridges.
+
+### Ordered playback channel maps
+
+Capture exposes wire identities today. Extend output formats with the same
+ordered channel model without changing wire ordering. For UAC1, resolve the
+playback AS terminal through its owning AudioControl association, using the
+input terminal's channel mask only when its count matches the selected
+alternate. For UAC2, prefer the AS General channel mask. A zero mask can
+fall back to the matching input terminal of that same function with equal
+channel count, following the upstream comparison. Full ADC3 uses the parsed
+HC cluster and fixed BADD layouts derive from the verified endpoint profile.
+Retain stable unnamed indices when descriptions are unavailable or ambiguous.
+Apply no speaker inference to native RAW_DATA and expose its transport
+channels as unnamed when no source-backed identity exists. Compare maps on
+stream open to catch changed descriptors, and serialize through the same
+Kotlin channel identity decoder as capture.
+[USB-IF UAC2 logical channel order](https://usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[ALSA UAC1/UAC2 terminal and AS channels](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/stream.c#L715-L865)
+
+### Full ADC3 alternate-clock mutation
+
+A full ADC3 clock plan spans selector pins and an owning power lease.
+Discovery may enumerate readable paths without selecting a pin. During
+negotiation, acquire only the required D0 domains, validate and program
+the chosen path, record its original and target pins, and restore the
+original pins before releasing temporary D0. Opening reapplies that exact
+plan while owned and awake, after checking that the original pins still
+match the negotiated snapshot. A running owner restores the pins after
+callbacks retire and the alternate is confirmed zero, before restoring
+power. Any selector readback or rollback uncertainty is a typed failure.
+Existing BADD fixed-rate behavior bypasses this plan. Keep external
+selector changes intact if the snapshot drifted.
+
+## Fifth validation checkpoint
+
+Explicit duplex registration now combines the approved playback and
+capture claim sets on one configuration. Android publishes both JNI
+handles as one pair. Closing either direction retires the common worker,
+and the ordinary playback open methods keep their established claims
+and signatures. Negotiated playback and capture mappings carry ordered
+channel identities, and playback open checks for a changed map.
+
+UAC2 clock selection distinguishes unreported validity from an advertised
+invalid response, with frequency verification for sources lacking a
+validity control. ADC3 exact-rate configuration shares that control
+policy. Alternate ADC3 pin mutation still needs its power-lifecycle
+transaction. Scarlett 18i20 Gen 2 firmware 1083 now has typed
+mixer-row edits with fresh state comparison, whole-row readback,
+rollback and drift-preserving hand-back. Vendor mux-bank edits and
+broader device profiles remain separate implementation work.
+
+Rust and JNI tests, Android cross-target and four-ABI builds, Kotlin
+tests and the sample build passed. Physical clock switching, multichannel
+wire behavior and hardware routing have yet to be verified on target
+devices.

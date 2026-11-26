@@ -46,11 +46,10 @@ private inline fun <reified T : Enum<T>> enumLabel(label: String): T =
     enumValues<T>().firstOrNull { it.name == label.uppercase(Locale.ROOT) }
         ?: throw JSONException("unknown capture label: $label")
 
-internal fun parseCaptureFormat(json: String): CaptureFormat {
-    val o = JSONObject(json)
-    if (o.getString("encoding") != "pcm") throw JSONException("capture is not integer PCM")
+/** Shared ordered identity decoder for capture and playback. */
+internal fun parseChannelMap(o: JSONObject): List<CaptureChannel> {
     val entries = o.getJSONArray("channel_map")
-    val map = List(entries.length()) { index ->
+    return List(entries.length()) { index ->
         val channel = entries.getJSONObject(index)
         if (channel.getInt("index") != index) throw JSONException("capture channel order changed")
         val position = enumLabel<CaptureChannelPosition>(channel.getString("label"))
@@ -74,6 +73,12 @@ internal fun parseCaptureFormat(json: String): CaptureFormat {
         }
         CaptureChannel(index, position, identity)
     }
+}
+
+internal fun parseCaptureFormat(json: String): CaptureFormat {
+    val o = JSONObject(json)
+    if (o.getString("encoding") != "pcm") throw JSONException("capture is not integer PCM")
+    val map = parseChannelMap(o)
     val channels = o.getInt("channels")
     val subslot = o.getInt("subslot_bytes")
     val bits = o.getInt("valid_bits")

@@ -179,7 +179,7 @@ pub(super) fn set_sampling_frequency(
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
     let data = sample_rate.to_le_bytes();
-    itf_timed_write_control(handle,
+    let transferred = itf_timed_write_control(handle,
             request_type,
             UAC2_REQUEST_SET_CUR,
             value,
@@ -188,6 +188,9 @@ pub(super) fn set_sampling_frequency(
             Duration::from_secs(1),
         )
         .map_err(|error| format!("Failed to set sampling frequency: {}", error))?;
+    if transferred != data.len() {
+        return Err(format!("Sampling-frequency SET_CUR transferred {transferred} bytes, expected {}", data.len()));
+    }
     Ok(())
 }
 
@@ -535,6 +538,17 @@ pub(super) fn format_sampling_frequency_ranges(ranges: &[SamplingFrequencySubran
         .join(", ")
 }
 
+fn uac2_source_controls(handle: &DeviceHandle<Context>, interface: u8, source: u8) -> Option<u32> {
+    let config = handle.device().active_config_descriptor().ok()?;
+    let raw = read_active_configuration_bytes(handle, &config)?;
+    let bytes = audio_control_descriptors_from_config(&raw, interface);
+    let mut sources = DescriptorIter::new(&bytes).filter(|d| {
+        d.len() >= 8 && d[1] == 0x24 && d[2] == 0x0a && d[3] == source
+    });
+    let controls = u32::from(sources.next()?[5]);
+    if sources.next().is_some() { None } else { Some(controls) }
+}
+
 pub(super) fn apply_sampling_frequency(
     handle: &DeviceHandle<Context>,
     interface_number: u8,
@@ -550,6 +564,7 @@ pub(super) fn apply_sampling_frequency(
         settle_delay_ms,
     );
 
+    let source_controls = uac2_source_controls(handle, interface_number, clock_id);
     let supported_ranges = get_sampling_frequency_ranges(handle, interface_number, clock_id).ok();
     match &supported_ranges {
         Some(ranges) => {
@@ -643,33 +658,31 @@ pub(super) fn apply_sampling_frequency(
             Ok(reported_sample_rate) => {
                 last_reported_rate = Some(reported_sample_rate);
                 if reported_sample_rate == sample_rate {
-                    // Rate verified — also check clock validity if supported.
-                    let clock_valid = match get_clock_validity(handle, interface_number, clock_id) {
-                        Ok(valid) => {
-                            dev_eprintln!(
-                                "[USB] Clock Validity: clock {} valid={} (after SET_CUR {}Hz)",
-                                clock_id,
-                                valid,
-                                sample_rate,
-                            );
-                            Some(valid)
-                        }
-                        Err(e) => {
-                            dev_eprintln!(
-                                "[USB] Clock Validity: not supported for clock {} ({}); assuming valid",
-                                clock_id, e,
-                            );
-                            None
-                        }
+                    let validity = match source_controls {
+                        Some(controls) => crate::clock_resolution::clock_validity(controls, || {
+                            get_clock_validity(handle, interface_number, clock_id)
+                        }),
+                        // Preserve the malformed-descriptor compatibility path;
+                        // it never authorizes automatic selector changes.
+                        None => match get_clock_validity(handle, interface_number, clock_id) {
+                            Ok(true) => Ok(crate::clock_resolution::ClockValidity::ReportedValid),
+                            Ok(false) => Err("clock source reports invalid".into()),
+                            Err(error) => {
+                                log_warn!("[USB] Clock {}: validity capability unknown in malformed descriptor fallback: {}", clock_id, error);
+                                Ok(crate::clock_resolution::ClockValidity::Unreported)
+                            }
+                        },
                     };
-                    if clock_valid == Some(false) {
-                        dev_eprintln!(
-                            "[USB] Clock {} reports INVALID after SET_CUR {}Hz; retrying",
-                            clock_id,
-                            sample_rate,
-                        );
-                        thread::sleep(Duration::from_millis(settle_delay_ms));
-                        continue;
+                    match validity {
+                        Ok(crate::clock_resolution::ClockValidity::ReportedValid) => {}
+                        Ok(crate::clock_resolution::ClockValidity::Unreported)
+                            if source_controls.is_none() || supported_ranges.is_some() => {
+                            log_info!("[USB] Clock {}: validity unreported; exact {} Hz frequency verified", clock_id, sample_rate);
+                        }
+                        result => {
+                            last_readback_error = Some(format!("clock validity not established: {result:?}"));
+                            continue;
+                        }
                     }
                     dev_eprintln!(
                         "[USB] SET_CUR verified: {} Hz on clock {} interface {} after attempt {}",
@@ -710,12 +723,15 @@ pub(super) fn apply_sampling_frequency(
             clock_ok: false,
             rate_verified: false,
             reported_sample_rate: Some(reported_sample_rate),
-            known_mismatch: true,
+            known_mismatch: reported_sample_rate != sample_rate,
             set_cur_succeeded,
-            message: Some(format!(
-                "Requested {} Hz, DAC reports {} Hz after SET_CUR on clock {} / interface {}",
-                sample_rate, reported_sample_rate, clock_id, interface_number
-            )),
+            message: Some(match last_readback_error {
+                Some(error) if reported_sample_rate == sample_rate => error,
+                _ => format!(
+                    "Requested {} Hz, DAC reports {} Hz after SET_CUR on clock {} / interface {}",
+                    sample_rate, reported_sample_rate, clock_id, interface_number
+                ),
+            }),
         };
     }
 
@@ -904,20 +920,46 @@ pub(super) fn selectable_clock_ranges(
         if sources.len() > 8 {
             break;
         }
-        if get_clock_validity(handle, control, plan.source_id) != Ok(true) {
-            continue;
-        }
-        if let Ok(found) = get_sampling_frequency_ranges(handle, control, plan.source_id) {
+        if let Ok((_, _, found)) = probe_clock_source(handle, control, plan.source_id, plan.source_controls) {
             ranges.extend(found);
         }
     }
     ranges
 }
 
+/// Actual CUR/RANGE evidence is required even when validity is unreported.
+/// This probe never changes the source frequency or selector route.
+fn probe_clock_source(
+    handle: &DeviceHandle<Context>,
+    control: u8,
+    source: u8,
+    controls: u32,
+) -> Result<(crate::clock_resolution::ClockValidity, u32, Vec<SamplingFrequencySubrange>), String> {
+    if !matches!(controls & 3, 1 | 3) {
+        return Err(format!("clock {source} sampling frequency is not readable"));
+    }
+    let validity = crate::clock_resolution::clock_validity(controls, || {
+        get_clock_validity(handle, control, source)
+    })?;
+    let current = get_sampling_frequency(handle, control, source)?;
+    if current == 0 {
+        return Err(format!("clock {source} returned zero frequency"));
+    }
+    let ranges = get_sampling_frequency_ranges(handle, control, source)?;
+    if ranges.is_empty()
+        || ranges.iter().any(|range| range.min == 0 || range.max < range.min || (range.res == 0 && range.min != range.max))
+        || !sampling_frequency_ranges_support_rate(&ranges, current)
+    {
+        return Err(format!("clock {source} current frequency is outside its ranges"));
+    }
+    Ok((validity, current, ranges))
+}
+
 struct UsbClockPlanIo<'a> {
     handle: &'a DeviceHandle<Context>,
     control: u8,
     rate: u32,
+    allow_program: bool,
 }
 impl crate::clock_resolution::ClockPlanIo for UsbClockPlanIo<'_> {
     fn read_pin(&mut self, selector: u8) -> Result<u8, String> {
@@ -943,16 +985,26 @@ impl crate::clock_resolution::ClockPlanIo for UsbClockPlanIo<'_> {
         }
         Ok(())
     }
-    fn validate_source(&mut self, source: u8) -> Result<(), String> {
-        if !get_clock_validity(self.handle, self.control, source)? {
-            return Err(format!("clock source {source} is invalid"));
-        }
-        let ranges = get_sampling_frequency_ranges(self.handle, self.control, source)?;
+    fn validate_source(&mut self, source: u8, controls: u32) -> Result<(), String> {
+        let (validity, current, ranges) = probe_clock_source(self.handle, self.control, source, controls)?;
         if !sampling_frequency_ranges_support_rate(&ranges, self.rate) {
-            return Err(format!(
-                "clock source {source} does not support {} Hz",
-                self.rate
-            ));
+            return Err(format!("clock source {source} does not support {} Hz", self.rate));
+        }
+        if validity == crate::clock_resolution::ClockValidity::Unreported {
+            if current != self.rate {
+                if !self.allow_program || controls & 3 != 3 {
+                    return Err(format!("clock {source} has unreported validity and its rate is not verified at {} Hz", self.rate));
+                }
+                // This is reached only after the complete selector path and
+                // session ownership have been checked. Never infer validity
+                // from an unsupported CLOCK_VALID request.
+                set_sampling_frequency(self.handle, self.control, source, self.rate)?;
+                thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
+            }
+            if get_sampling_frequency(self.handle, self.control, source)? != self.rate {
+                return Err(format!("clock {source} with unreported validity failed exact frequency readback"));
+            }
+            log_info!("[USB] Clock {source}: validity unreported; exact {} Hz frequency verified", self.rate);
         }
         Ok(())
     }
@@ -993,6 +1045,7 @@ pub(super) fn select_requested_clock_route(
         handle: &claimed.handle,
         control,
         rate,
+        allow_program: false,
     };
     let mut sources = HashSet::new();
     for plan in plans.into_iter().take(8) {
@@ -1002,16 +1055,20 @@ pub(super) fn select_requested_clock_route(
         if sources.len() > 8 {
             break;
         }
-        use crate::clock_resolution::ClockPlanIo;
-        if io.validate_source(plan.source_id).is_err() {
+        let Ok((validity, current, ranges)) = probe_clock_source(&claimed.handle, control, plan.source_id, plan.source_controls) else {
+            continue;
+        };
+        if !sampling_frequency_ranges_support_rate(&ranges, rate) {
             continue;
         }
-        if plan.selectors.iter().any(|pin| pin.original != pin.target)
+        let needs_program = validity == crate::clock_resolution::ClockValidity::Unreported && current != rate;
+        if (plan.selectors.iter().any(|pin| pin.original != pin.target) || needs_program)
             && !stop_owned_clock_alternates(claimed, candidate.interface_number)?
         {
             // Never alter a clock shared with an unclaimed sibling interface.
             continue;
         }
+        io.allow_program = true;
         match plan.apply(&mut io) {
             Ok(()) => {
                 let exact = graph
@@ -1059,6 +1116,7 @@ pub(super) fn verify_requested_clock_route(
             handle: &claimed.handle,
             control: selected.control,
             rate,
+            allow_program: false,
         })
         .map_err(|e| format!("negotiated clock route changed or became invalid: {e}"))
 }
@@ -1085,6 +1143,7 @@ pub(super) fn restore_requested_clock_route(claimed: &ClaimedHandle) -> Result<(
             handle: &claimed.handle,
             control: selected.control,
             rate: 0,
+            allow_program: false,
         })
         .map_err(|e| e.to_string())?;
     *slot = None;

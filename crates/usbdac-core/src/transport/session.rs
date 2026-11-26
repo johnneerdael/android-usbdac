@@ -230,7 +230,11 @@ pub(super) fn register_capture_device(device: UsbDevice, configuration: Option<u
     register_device_mode(device, RegistrationMode::Capture { configuration })
 }
 
-enum RegistrationMode { Playback, Capture { configuration: Option<u8> } }
+pub(super) fn register_duplex_device(device: UsbDevice, configuration: Option<u8>) -> Result<(), crate::Error> {
+    register_device_mode(device, RegistrationMode::Duplex { configuration })
+}
+
+enum RegistrationMode { Playback, Capture { configuration: Option<u8> }, Duplex { configuration: Option<u8> } }
 
 fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(), crate::Error> {
     use crate::Error;
@@ -245,6 +249,7 @@ fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(),
             None
         }
         RegistrationMode::Playback => Some(inspect_usb_capabilities(&device).map_err(Error::Claim)?),
+        RegistrationMode::Duplex { configuration } => Some(inspect_duplex_capabilities(&device, configuration).map_err(Error::Claim)?),
     };
     if capability_model.as_ref().is_some_and(|model| model.alt_settings.is_empty()) {
         return Err(Error::Unsupported {

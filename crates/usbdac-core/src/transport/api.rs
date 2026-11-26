@@ -129,15 +129,19 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     let handle = open_claimed_usb_handle(&device).map_err(Error::Claim)?;
     let usb_device = handle.handle.device();
     let speed = resolve_device_speed(&usb_device);
-    let candidate = select_stream_candidate(
-        &usb_device,
-        &handle.handle,
-        effective,
-        speed,
-        &device.claimed_interfaces,
-    );
-    cleanup_claimed_handle(handle, None, lock_requested);
-    let candidate = candidate.map_err(|error| error.into_error(offered_alt_settings()))?;
+    // Keep any selectively woken ADC3 domain owned until its HC map is read.
+    let selected = select_owned_stream_candidate(&handle, effective, speed)
+        .map_err(|error| error.into_error(offered_alt_settings()))
+        .and_then(|candidate| {
+            let map = playback_map::for_candidate(&usb_device, &handle.handle, &candidate)
+                .map_err(Error::Control)?;
+            Ok((candidate, map))
+        });
+    let restored = cleanup_claimed_handle(handle, None, lock_requested);
+    if !restored {
+        return Err(Error::Control("playback descriptor probe could not restore USB ownership/power".into()));
+    }
+    let (candidate, channel_map) = selected?;
 
     let native = effective.dsd_transport == DsdTransportMode::Native;
     Ok(StreamFormat {
@@ -149,6 +153,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
             effective.sample_rate
         },
         channels: candidate.channels,
+        channel_map,
         valid_bits: if native { 1 } else { candidate.bit_resolution },
         subslot_bytes: candidate.subslot_size,
         interface_number: candidate.interface_number,
@@ -211,7 +216,8 @@ pub(crate) fn open_stream(format: &StreamFormat, events: EventSink) -> Result<St
             && again.valid_bits == format.valid_bits
             && again.endpoint_address == format.endpoint_address
             && again.pacing == format.pacing
-            && again.native_dsd_signature == format.native_dsd_signature;
+            && again.native_dsd_signature == format.native_dsd_signature
+            && again.channel_map == format.channel_map;
         if !same {
             return Err(Error::InvalidState(
                 "the DAC no longer offers that format; negotiate again".to_string(),
@@ -344,6 +350,19 @@ pub(crate) fn open_device(fd: RawFd, info: &crate::capabilities::DeviceInfo) -> 
     )
     .map_err(Error::Claim)?;
     register_device(device)?;
+    discover_idle_volume_control();
+    Ok(())
+}
+
+/// Register both directions through the native capture proof, preserving playback startup.
+pub(crate) fn open_duplex_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(), Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
+    if !info.unavailable_feedback_interfaces.is_empty() {
+        return Err(Error::Claim("duplex requires a complete combined claim plan".into()));
+    }
+    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id,
+        info.product_name.clone(), info.device_name.clone(), info.claimed_interfaces.clone()).map_err(Error::Claim)?;
+    super::session::register_duplex_device(device, info.configuration_id)?;
     discover_idle_volume_control();
     Ok(())
 }

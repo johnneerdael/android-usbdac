@@ -99,6 +99,20 @@ static STREAMS: Lazy<Mutex<StreamTable>> = Lazy::new(|| Mutex::new(HashMap::new(
 type CaptureTable = HashMap<u64, (u64, Arc<DacCaptureStream>)>;
 static CAPTURES: Lazy<Mutex<CaptureTable>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Publish both directions under the owner lock. DAC close either collects
+/// the complete pair or makes this fail, dropping and retiring both workers.
+pub fn insert_duplex(dac: &Arc<DacEntry>, playback: DacStream, capture: DacCaptureStream) -> Result<(u64, u64), Error> {
+    let dacs = DACS.lock();
+    let owner = dacs.iter().find(|(_, entry)| Arc::ptr_eq(entry, dac)).map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed while duplex was opening".into()))?;
+    let output = next_id();
+    let input = next_id();
+    STREAMS.lock().insert(output, (owner, Arc::new(playback)));
+    CAPTURES.lock().insert(input, (owner, Arc::new(capture)));
+    dac.add_stream(output);
+    Ok((output, input))
+}
+
 pub fn insert_capture(dac: &Arc<DacEntry>, stream: DacCaptureStream) -> Result<u64, Error> {
     // Keep DAC removal serialized through insertion; a close racing open must
     // either collect this capture or make insertion fail and drop the stream.

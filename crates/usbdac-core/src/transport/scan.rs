@@ -443,6 +443,30 @@ fn discover_candidate_rate_ranges(
     discover_stream_sample_rate_ranges(device, handle, interface, terminal, parsed)
 }
 
+/// Explicit duplex registration admits only capture preflight IN claims in addition
+/// to the unchanged base playback and optional vendor/feedback claims.
+fn validate_duplex_capture_claims(claimed: &[u8], controls: &[u8], inputs: &[u8]) -> Result<(), String> {
+    if inputs.is_empty() || controls.is_empty()
+        || !inputs.iter().chain(controls).all(|id| claimed.contains(id)) {
+        return Err("duplex requires capture IN interfaces and their owning AudioControl claims".into());
+    }
+    Ok(())
+}
+
+pub(super) fn inspect_duplex_capabilities(device: &UsbDevice, expected: Option<u8>) -> Result<CapabilityModel, String> {
+    let (configuration, controls, inputs) = capture_stream::capture_claim_preflight(device)?;
+    if expected.is_some_and(|id| id != configuration) {
+        return Err("duplex configuration changed since capture preflight".into());
+    }
+    validate_duplex_capture_claims(&device.claimed_interfaces, &controls, &inputs)?;
+    let claimed = wrap_android_usb_handle(device)?;
+    let usb_device = claimed.handle.device();
+    let config = usb_device.active_config_descriptor().map_err(|e| e.to_string())?;
+    if config.number() != configuration { return Err("duplex configuration changed".into()); }
+    validate_android_usb_claims_with_capture(&claimed, &config, &inputs)?;
+    build_usb_capability_model(&usb_device, &claimed.handle, resolve_device_speed(&usb_device), &claimed.claimed_interfaces)
+}
+
 pub(super) fn inspect_usb_capabilities(device: &UsbDevice) -> Result<CapabilityModel, String> {
     let claimed_handle = wrap_android_usb_handle(device)?;
     let inspected_device = claimed_handle.handle.device();
@@ -1183,6 +1207,14 @@ pub(super) fn validate_android_usb_claims(
     claimed_handle: &ClaimedHandle,
     config_descriptor: &ConfigDescriptor,
 ) -> Result<(), String> {
+    validate_android_usb_claims_with_capture(claimed_handle, config_descriptor, &[])
+}
+
+fn validate_android_usb_claims_with_capture(
+    claimed_handle: &ClaimedHandle,
+    config_descriptor: &ConfigDescriptor,
+    capture_inputs: &[u8],
+) -> Result<(), String> {
     let mut required = HashSet::new();
     let mut has_control = false;
     let mut has_playback = false;
@@ -1230,6 +1262,7 @@ pub(super) fn validate_android_usb_claims(
     )
     .into_iter()
     .collect();
+    optional.extend(capture_inputs.iter().copied());
     if let Ok(identity) = claimed_handle.handle.device().device_descriptor() {
         optional.extend(routing_hw::scarlett_claim_interface(
             config_descriptor,
@@ -1773,5 +1806,18 @@ mod implicit_discovery_tests {
         assert!(audio_functions(&raw[..7]).is_empty());
         assert!(audio_functions(&[8, 0x0b, 255, 2, 1, 0, 0x20, 0]).is_empty());
         assert!(audio_functions(&[8, 0x0b, 4, 3, 1, 0, 0, 0]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod duplex_claim_tests {
+    use super::validate_duplex_capture_claims;
+
+    #[test]
+    fn duplex_capture_proof_requires_input_and_owning_control() {
+        assert!(validate_duplex_capture_claims(&[0, 1, 2, 3], &[0, 2], &[3]).is_ok());
+        assert!(validate_duplex_capture_claims(&[0, 1, 3], &[0, 2], &[3]).is_err());
+        assert!(validate_duplex_capture_claims(&[0, 1, 2], &[0, 2], &[3]).is_err());
+        assert!(validate_duplex_capture_claims(&[0, 1], &[0], &[]).is_err());
     }
 }

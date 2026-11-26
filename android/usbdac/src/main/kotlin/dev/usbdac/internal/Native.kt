@@ -29,6 +29,8 @@ internal object Native {
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacCapturePreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacOpenCaptureDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
+    @JvmStatic external fun dacOpenDuplexDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
+    @JvmStatic external fun duplexOpen(dac: Long, formatId: Long, requestJson: String, capacityFrames: Int, listener: Any): String
     @JvmStatic external fun captureOpen(dac: Long, requestJson: String, capacityFrames: Int): Long
     @JvmStatic external fun captureFormat(capture: Long): String
     @JvmStatic external fun captureStats(capture: Long): String

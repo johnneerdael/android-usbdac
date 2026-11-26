@@ -130,3 +130,26 @@ the whole row, including unchanged sources. Hand-back can restore a row
 only when the current row still matches the last verified write. Keep
 front-panel or other-controller edits intact.
 [ALSA mixer coefficient scale](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L196-L207)
+
+### Per-bank evidence from the FCP userspace driver
+
+The separate FCP userspace driver supplies a concrete bank-read contract.
+It queries MUX_INFO for the three bank widths, then issues MUX_READ with
+four byte fields for offset, padding, count and bank. MUX_WRITE identifies
+the bank in its two-word header. Its routing code reads each bank and
+tracks a destination's slot separately at each rate. This evidence is
+for the documented FCP device families. The 18i20 Gen 2 firmware already
+admitted to usbdac still needs a successful capability probe or a matching
+trace before treating these reads as its rollback baseline.
+
+A guarded implementation can probe MUX_INFO and each bounded bank read
+before allowing any edit. Validate all reply lengths, port identities,
+destination uniqueness and the model's bank geometry, including padding.
+Preserve exact bank payloads for rollback. For an edit, require the
+current complete snapshot, update only the named destination in the
+requested banks, read those banks back, and restore all affected originals
+after a partial failure. Gate every write on an observed complete
+snapshot. This also permits read-only reporting for firmware that answers
+selector zero and rejects the per-bank probes.
+[FCP information and bank wire operations](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp.c#L349-L469),
+[FCP destination slots by rate](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/mux.c#L447-L491)

@@ -151,6 +151,7 @@ mod negotiate;
 mod native_dsd;
 use native_dsd::*;
 mod output;
+mod playback_map;
 mod ring;
 pub(crate) mod routing_hw;
 mod scan;

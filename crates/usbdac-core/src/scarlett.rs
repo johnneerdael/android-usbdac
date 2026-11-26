@@ -1,11 +1,11 @@
-//! Read-only Scarlett 18i20 Gen 2 protocol primitives, independently implemented
+//! Scarlett 18i20 Gen 2 protocol primitives, independently implemented
 //! from Linux v7.0 `mixer_scarlett2.c` protocol evidence. The initial trace
 //! described there identifies firmware 1083. No other firmware is admitted.
 //!
 //! Model ports and packet decoding are source-backed; physical routing has not
 //! been validated on Scarlett hardware. GET_MUX uses only its documented zero
 //! argument here; its result does not establish all three sample-rate banks.
-//! Coefficients remain unsigned wire values, without a guessed dB conversion.
+//! Original coefficients remain unsigned wire values for exact restoration.
 
 use std::time::{Duration, Instant};
 
@@ -142,6 +142,61 @@ pub struct MixReadback {
     pub coefficients: Vec<u16>,
 }
 
+/// Bounded half-dB gain; -160 means -80 dB, 24 means +12 dB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixGain(i16);
+impl MixGain {
+    pub fn from_half_db(value: i16) -> Result<Self, ProtocolError> {
+        if !(-160..=24).contains(&value) {
+            return Err(ProtocolError::InvalidMixGain(value));
+        }
+        Ok(Self(value))
+    }
+    pub fn half_db(self) -> i16 {
+        self.0
+    }
+    pub fn coefficient(self) -> u16 {
+        (8192.0 * 10.0_f64.powf(f64::from(self.0) / 40.0)).floor() as u16
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MixGainEdit {
+    /// One-based input in the selected output row.
+    pub input: u8,
+    pub gain: MixGain,
+}
+
+/// Expected complete raw row and bounded gain replacements. Untouched values
+/// are carried through exactly, even when they are outside the editable scale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixRowEdit {
+    pub expected: MixReadback,
+    pub gains: Vec<MixGainEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixWriteReport {
+    pub original: MixReadback,
+    pub verified: MixReadback,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MixFailure<E> {
+    Read(ReadError<E>),
+    Invalid(ProtocolError),
+    Drift { actual: MixReadback },
+    Verification { actual: MixReadback },
+}
+
+/// `rollback` is present only when the attempted row could not be restored and
+/// verified. The original failure is always retained, including transport errors.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MixWriteError<E> {
+    pub failure: MixFailure<E>,
+    pub rollback: Option<MixFailure<E>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingReadback {
     pub model: ReadModel,
@@ -154,6 +209,9 @@ pub struct RoutingReadback {
 pub enum ProtocolError {
     UnsupportedFirmware(u32),
     InvalidMixOutput(u8),
+    InvalidMixInput(u8),
+    InvalidMixGain(i16),
+    DuplicateMixInput(u8),
     InvalidLength { expected: usize, actual: usize },
     InvalidCommand,
     InvalidSequence,
@@ -199,6 +257,7 @@ enum Command {
     Info,
     Mux,
     Mix,
+    SetMix,
 }
 impl Command {
     fn code(self) -> u32 {
@@ -207,6 +266,7 @@ impl Command {
             Self::Info => 2,
             Self::Mux => 0x3001,
             Self::Mix => 0x2001,
+            Self::SetMix => 0x2002,
         }
     }
     fn initializing(self) -> bool {
@@ -314,8 +374,8 @@ fn exact<E>(actual: usize, expected: usize) -> Result<(), ReadError<E>> {
     }
 }
 
-/// Stateful, bounded read protocol. Any transfer/protocol failure poisons the
-/// session; there are no automatic retries of commands with uncertain results.
+/// Stateful, bounded protocol. Transfer/protocol failures poison normal calls;
+/// only failed mixer transactions may reinitialize to attempt exact restoration.
 pub struct ReadSession<I> {
     io: I,
     model: ReadModel,
@@ -396,6 +456,141 @@ impl<I: ReadIo> ReadSession<I> {
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect(),
         })
+    }
+
+    fn validate_row(&self, row: &MixReadback) -> Result<(), ProtocolError> {
+        if row.output == 0 || row.output > self.model.mixer_outputs() {
+            return Err(ProtocolError::InvalidMixOutput(row.output));
+        }
+        let expected = usize::from(self.model.mixer_inputs());
+        if row.coefficients.len() != expected {
+            return Err(ProtocolError::InvalidLength {
+                expected,
+                actual: row.coefficients.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn set_mix(&mut self, row: &MixReadback) -> Result<(), ReadError<I::Error>> {
+        let mut payload = u16::from(row.output - 1).to_le_bytes().to_vec();
+        for value in &row.coefficients {
+            payload.extend(value.to_le_bytes());
+        }
+        self.request(Command::SetMix, &payload, 0).map(|_| ())
+    }
+
+    // Recovery must re-establish notification/sequence state rather than reuse a
+    // poisoned request stream after an uncertain write or malformed response.
+    fn recover(&mut self) -> Result<(), ReadError<I::Error>> {
+        let mut startup = [0; 24];
+        exact(
+            self.io.initial_read(&mut startup).map_err(ReadError::Io)?,
+            startup.len(),
+        )?;
+        self.io.prepare_notifications().map_err(ReadError::Io)?;
+        transact(&mut self.io, Command::Init, 1, &[], 0)?;
+        let info = transact(&mut self.io, Command::Info, 1, &[], 84)?;
+        let firmware = u32::from_le_bytes(info[8..12].try_into().unwrap());
+        self.model
+            .candidate
+            .validate_firmware(firmware)
+            .map_err(ReadError::Protocol)?;
+        self.sequence = 2;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    /// Fresh-check, set and verify an entire row. A failed attempted SET always
+    /// triggers bounded restoration, including when the SET response is lost.
+    pub fn apply_mix(
+        &mut self,
+        edit: &MixRowEdit,
+    ) -> Result<MixWriteReport, MixWriteError<I::Error>> {
+        let invalid = |error| MixWriteError {
+            failure: MixFailure::Invalid(error),
+            rollback: None,
+        };
+        self.validate_row(&edit.expected).map_err(invalid)?;
+        let mut target = edit.expected.clone();
+        let mut seen = Vec::new();
+        for gain in &edit.gains {
+            if gain.input == 0 || gain.input > self.model.mixer_inputs() {
+                return Err(invalid(ProtocolError::InvalidMixInput(gain.input)));
+            }
+            if seen.contains(&gain.input) {
+                return Err(invalid(ProtocolError::DuplicateMixInput(gain.input)));
+            }
+            seen.push(gain.input);
+            target.coefficients[usize::from(gain.input - 1)] = gain.gain.coefficient();
+        }
+        self.replace_mix(&edit.expected, &target)
+    }
+
+    pub(crate) fn replace_mix(
+        &mut self,
+        expected: &MixReadback,
+        target: &MixReadback,
+    ) -> Result<MixWriteReport, MixWriteError<I::Error>> {
+        let fail = |failure| MixWriteError {
+            failure,
+            rollback: None,
+        };
+        self.validate_row(expected)
+            .map_err(|e| fail(MixFailure::Invalid(e)))?;
+        self.validate_row(target)
+            .map_err(|e| fail(MixFailure::Invalid(e)))?;
+        if expected.output != target.output {
+            return Err(fail(MixFailure::Invalid(ProtocolError::InvalidMixOutput(
+                target.output,
+            ))));
+        }
+        let actual = self
+            .read_mix(expected.output)
+            .map_err(|e| fail(MixFailure::Read(e)))?;
+        if actual != *expected {
+            return Err(fail(MixFailure::Drift { actual }));
+        }
+        if expected == target {
+            return Ok(MixWriteReport {
+                original: actual.clone(),
+                verified: actual,
+            });
+        }
+        let attempt = self
+            .set_mix(target)
+            .map_err(MixFailure::Read)
+            .and_then(|_| {
+                let actual = self.read_mix(target.output).map_err(MixFailure::Read)?;
+                if actual != *target {
+                    return Err(MixFailure::Verification { actual });
+                }
+                Ok(actual)
+            });
+        match attempt {
+            Ok(verified) => Ok(MixWriteReport {
+                original: expected.clone(),
+                verified,
+            }),
+            Err(failure) => {
+                let rollback = (|| {
+                    if self.poisoned {
+                        self.recover().map_err(MixFailure::Read)?;
+                    }
+                    self.set_mix(expected).map_err(MixFailure::Read)?;
+                    let actual = self.read_mix(expected.output).map_err(MixFailure::Read)?;
+                    if actual != *expected {
+                        return Err(MixFailure::Verification { actual });
+                    }
+                    Ok(())
+                })()
+                .err();
+                if rollback.is_some() {
+                    self.poisoned = true;
+                }
+                Err(MixWriteError { failure, rollback })
+            }
+        }
     }
 
     pub fn read_all(&mut self) -> Result<RoutingReadback, ReadError<I::Error>> {
@@ -599,6 +794,10 @@ mod tests {
         wrong_sequence: bool,
         short_send: bool,
         prepared: bool,
+        row: Vec<u16>,
+        writes: usize,
+        fail_writes: Vec<usize>,
+        corrupt_writes: Vec<usize>,
     }
     impl Default for MockIo {
         fn default() -> Self {
@@ -611,6 +810,10 @@ mod tests {
                 wrong_sequence: false,
                 short_send: false,
                 prepared: false,
+                row: vec![0x1234; 18],
+                writes: 0,
+                fail_writes: Vec::new(),
+                corrupt_writes: Vec::new(),
             }
         }
     }
@@ -627,6 +830,19 @@ mod tests {
             assert!(self.prepared);
             self.sent.push(bytes.to_vec());
             self.last = bytes.to_vec();
+            if u32::from_le_bytes(bytes[..4].try_into().unwrap()) == 0x2002 {
+                self.writes += 1;
+                self.row = bytes[HEADER + 2..]
+                    .chunks_exact(2)
+                    .map(|part| u16::from_le_bytes([part[0], part[1]]))
+                    .collect();
+                if self.corrupt_writes.contains(&self.writes) {
+                    self.row[17] ^= 1;
+                }
+                if self.fail_writes.contains(&self.writes) {
+                    return Err("lost SET response");
+                }
+            }
             Ok(if self.short_send { 0 } else { bytes.len() })
         }
         fn next_notification(
@@ -652,10 +868,11 @@ mod tests {
                 }
                 0x3001 => bytes[HEADER..].copy_from_slice(&mux_bytes()),
                 0x2001 => {
-                    for part in bytes[HEADER..].chunks_exact_mut(2) {
-                        part.copy_from_slice(&0x1234u16.to_le_bytes());
+                    for (part, value) in bytes[HEADER..].chunks_exact_mut(2).zip(&self.row) {
+                        part.copy_from_slice(&value.to_le_bytes());
                     }
                 }
+                0x2002 => {}
                 _ => panic!("unexpected command"),
             }
             if self.wrong_sequence {
@@ -755,5 +972,134 @@ mod tests {
             Err(ReadError::Protocol(ProtocolError::InvalidLength { .. }))
         ));
         assert_eq!(io.notifications, 0);
+    }
+    fn row_edit() -> MixRowEdit {
+        MixRowEdit {
+            expected: MixReadback {
+                output: 2,
+                coefficients: vec![0x1234; 18],
+            },
+            gains: vec![MixGainEdit {
+                input: 3,
+                gain: MixGain::from_half_db(-12).unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn bounded_half_db_formula_and_whole_row_preservation() {
+        assert!(MixGain::from_half_db(-161).is_err());
+        assert!(MixGain::from_half_db(25).is_err());
+        assert_eq!(MixGain::from_half_db(-160).unwrap().coefficient(), 0);
+        assert_eq!(MixGain::from_half_db(0).unwrap().coefficient(), 8192);
+        assert_eq!(MixGain::from_half_db(24).unwrap().coefficient(), 32612);
+        let mut edit = row_edit();
+        edit.expected.coefficients[17] = u16::MAX;
+        let mut session = ReadSession::initialize(
+            MockIo {
+                row: edit.expected.coefficients.clone(),
+                ..MockIo::default()
+            },
+            CandidateModel::Scarlett18i20Gen2,
+        )
+        .unwrap();
+        let report = session.apply_mix(&edit).unwrap();
+        assert_eq!(report.verified.coefficients[17], u16::MAX);
+        assert_eq!(
+            report.verified.coefficients[2],
+            edit.gains[0].gain.coefficient()
+        );
+        let set = session
+            .io
+            .sent
+            .iter()
+            .find(|p| p[..4] == 0x2002u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(set.len(), HEADER + 38);
+        assert_eq!(&set[HEADER..HEADER + 2], &[1, 0]);
+        assert_eq!(session.io.writes, 1);
+    }
+
+    #[test]
+    fn stale_and_invalid_rows_never_write() {
+        let mut session =
+            ReadSession::initialize(MockIo::default(), CandidateModel::Scarlett18i20Gen2).unwrap();
+        let mut edit = row_edit();
+        edit.expected.coefficients[0] ^= 1;
+        assert!(matches!(
+            session.apply_mix(&edit).unwrap_err().failure,
+            MixFailure::Drift { .. }
+        ));
+        edit.expected.coefficients.pop();
+        assert!(matches!(
+            session.apply_mix(&edit).unwrap_err().failure,
+            MixFailure::Invalid(ProtocolError::InvalidLength { .. })
+        ));
+        edit = row_edit();
+        edit.gains.push(edit.gains[0]);
+        assert!(matches!(
+            session.apply_mix(&edit).unwrap_err().failure,
+            MixFailure::Invalid(ProtocolError::DuplicateMixInput(3))
+        ));
+        assert_eq!(session.io.writes, 0);
+    }
+
+    #[test]
+    fn failed_write_and_bad_readback_restore_exact_original() {
+        for io in [
+            MockIo {
+                fail_writes: vec![1],
+                ..MockIo::default()
+            },
+            MockIo {
+                corrupt_writes: vec![1],
+                ..MockIo::default()
+            },
+        ] {
+            let mut session =
+                ReadSession::initialize(io, CandidateModel::Scarlett18i20Gen2).unwrap();
+            let error = session.apply_mix(&row_edit()).unwrap_err();
+            assert!(error.rollback.is_none());
+            assert_eq!(session.io.row, row_edit().expected.coefficients);
+            assert_eq!(session.io.writes, 2);
+        }
+    }
+
+    #[test]
+    fn rollback_uncertainty_retains_original_failure_and_blocks_reuse() {
+        let io = MockIo {
+            fail_writes: vec![1, 2],
+            ..MockIo::default()
+        };
+        let mut session = ReadSession::initialize(io, CandidateModel::Scarlett18i20Gen2).unwrap();
+        let error = session.apply_mix(&row_edit()).unwrap_err();
+        assert_eq!(
+            error.failure,
+            MixFailure::Read(ReadError::Io("lost SET response"))
+        );
+        assert_eq!(
+            error.rollback,
+            Some(MixFailure::Read(ReadError::Io("lost SET response")))
+        );
+        assert_eq!(
+            session.read_mix(2),
+            Err(ReadError::Protocol(ProtocolError::SessionPoisoned))
+        );
+    }
+
+    #[test]
+    fn hand_back_row_check_preserves_external_coefficient_drift() {
+        let mut session =
+            ReadSession::initialize(MockIo::default(), CandidateModel::Scarlett18i20Gen2).unwrap();
+        let report = session.apply_mix(&row_edit()).unwrap();
+        session.io.row[17] ^= 1;
+        assert!(matches!(
+            session
+                .replace_mix(&report.verified, &report.original)
+                .unwrap_err()
+                .failure,
+            MixFailure::Drift { .. }
+        ));
+        assert_eq!(session.io.writes, 1);
     }
 }

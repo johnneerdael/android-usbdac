@@ -72,9 +72,9 @@ public data class CaptureStats(
 )
 
 /**
- * Standalone direct USB PCM input. Read whole interleaved frames in [format]; slow readers lose
+ * Direct USB PCM input. Read whole interleaved frames in [format]; slow readers lose
  * the oldest buffered frames and can inspect [CaptureStats.overrunFrames]. No conversion occurs.
- * Close off the main thread. A session owns at most one stream; simultaneous duplex is not exposed.
+ * Close off the main thread. In a duplex pair, closing this direction also closes playback.
  */
 public class DacCaptureStream internal constructor(
     private val handle: Long,

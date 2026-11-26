@@ -52,6 +52,7 @@ pub enum RoutingSessionError {
     Control(RoutingError<String>),
     Transaction(TransactionError<String>),
     Scarlett(crate::scarlett::ReadError<String>),
+    ScarlettMix(crate::scarlett::MixWriteError<String>),
 }
 
 impl std::fmt::Display for RoutingSessionError {
@@ -269,6 +270,158 @@ pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, Routin
         ));
     }
     Ok(readback)
+}
+
+struct RecordedScarlett {
+    device: UsbDevice,
+    configuration: u8,
+    descriptors: Vec<u8>,
+    rows: BTreeMap<u8, (crate::scarlett::MixReadback, crate::scarlett::MixReadback)>,
+}
+static ORIGINAL_SCARLETT: Mutex<Option<RecordedScarlett>> = Mutex::new(None);
+
+/// The caller owns session/volume serialization. Recheck exact claim and USB
+/// identity for every operation, including configured hand-back.
+fn with_scarlett<T>(
+    device: &UsbDevice,
+    configuration: u8,
+    operation: impl FnOnce(
+        &mut crate::scarlett::ReadSession<UsbScarlettIo<'_>>,
+    ) -> Result<T, RoutingSessionError>,
+) -> Result<T, RoutingSessionError> {
+    let capability = scarlett_capability(device, configuration)?.ok_or_else(|| {
+        RoutingSessionError::UnsupportedTopology("no exact Scarlett candidate".into())
+    })?;
+    if !capability.interface_claimed {
+        return Err(RoutingSessionError::Session(Error::Claim(
+            "Scarlett mixer requires explicit vendor-interface claim".into(),
+        )));
+    }
+    let idle = IDLE_LOCK.lock();
+    let idle = idle
+        .as_ref()
+        .filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState(
+                "Scarlett mixer lost idle USB owner".into(),
+            ))
+        })?;
+    let io = UsbScarlettIo {
+        device,
+        handle: &idle.handle,
+        interface: capability.interface,
+        endpoint: capability.notification_endpoint,
+    };
+    let mut session = crate::scarlett::ReadSession::initialize(io, capability.candidate)
+        .map_err(RoutingSessionError::Scarlett)?;
+    operation(&mut session)
+}
+
+pub(crate) fn scarlett_mix_apply(
+    edit: &crate::scarlett::MixRowEdit,
+) -> Result<crate::scarlett::MixWriteReport, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let mut records = ORIGINAL_SCARLETT.lock();
+    if let Some(record) = records.as_ref() {
+        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+            || record.configuration != configuration
+            || record.descriptors != descriptors
+        {
+            return Err(RoutingSessionError::Drift(
+                "Scarlett attachment/configuration changed since mixer write".into(),
+            ));
+        }
+        if let Some((_, last)) = record.rows.get(&edit.expected.output) {
+            if last != &edit.expected {
+                return Err(RoutingSessionError::Drift(
+                    "Scarlett row differs from last verified library write".into(),
+                ));
+            }
+        }
+    }
+    let report = match with_scarlett(&device, configuration, |session| {
+        session
+            .apply_mix(edit)
+            .map_err(RoutingSessionError::ScarlettMix)
+    }) {
+        Ok(report) => report,
+        Err(error) => {
+            if matches!(&error, RoutingSessionError::ScarlettMix(failure) if failure.rollback.is_some())
+            {
+                invalidate_route_caches();
+            }
+            return Err(error);
+        }
+    };
+    // Record before the post-write descriptor check so a confirmed row is never
+    // forgotten if configuration inspection itself fails after the write.
+    if report.original != report.verified {
+        invalidate_route_caches();
+        let record = records.get_or_insert_with(|| RecordedScarlett {
+            device: device.clone(),
+            configuration,
+            descriptors: descriptors.clone(),
+            rows: BTreeMap::new(),
+        });
+        record
+            .rows
+            .entry(report.original.output)
+            .and_modify(|row| row.1 = report.verified.clone())
+            .or_insert((report.original.clone(), report.verified.clone()));
+    }
+    let (after, raw) = active_descriptors(&device)?;
+    if configuration != after || descriptors != raw {
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during Scarlett mixer write".into(),
+        ));
+    }
+    Ok(report)
+}
+
+fn finish_scarlett_hand_back() {
+    let Some(record) = ORIGINAL_SCARLETT.lock().take() else {
+        return;
+    };
+    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+        return;
+    }
+    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
+        return;
+    };
+    let restore = || -> Result<(), RoutingSessionError> {
+        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner) {
+            return Err(RoutingSessionError::Drift(
+                "Scarlett attachment changed before hand-back".into(),
+            ));
+        }
+        let (number, raw) = active_descriptors(&device)?;
+        if number != record.configuration || raw != record.descriptors {
+            return Err(RoutingSessionError::Drift(
+                "Scarlett configuration changed before hand-back".into(),
+            ));
+        }
+        with_scarlett(&device, number, |session| {
+            for (original, last) in record.rows.values() {
+                // A fresh whole-row equality check prevents overwriting any
+                // external edit, even in an otherwise untouched coefficient.
+                if let Err(error) = session.replace_mix(last, original) {
+                    log_warn!(
+                        "[USB] Scarlett mixer row {} not restored: {:?}",
+                        original.output,
+                        error
+                    );
+                    // A poisoned failed recovery forbids subsequent writes.
+                }
+            }
+            Ok(())
+        })
+    };
+    if let Err(error) = restore() {
+        log_warn!("[USB] Original Scarlett mixer not restored: {error}");
+    }
 }
 
 struct UsbRoutingIo<'a> {
@@ -807,6 +960,7 @@ fn invalidate_route_caches() {
 /// edited controls still contain the last library-written values. A volume-only
 /// close override never changes this policy. Always retire the record on close.
 pub(super) fn finish_routing_hand_back() {
+    finish_scarlett_hand_back();
     let Some(record) = ORIGINAL_ROUTING.lock().take() else {
         return;
     };

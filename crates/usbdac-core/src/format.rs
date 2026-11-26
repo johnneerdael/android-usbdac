@@ -104,6 +104,8 @@ pub struct StreamFormat {
     /// subslot_bytes)`).
     pub sample_rate: u32,
     pub channels: u16,
+    /// Descriptor-backed identities in interleaved USB wire order; unnamed when unavailable.
+    pub channel_map: crate::capture::ChannelMap,
     /// Significant bits of the alternate setting (PCM and DoP carrier). 1 for
     /// native DSD.
     pub valid_bits: u8,

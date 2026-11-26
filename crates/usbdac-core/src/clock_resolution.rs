@@ -133,6 +133,7 @@ pub(crate) struct ClockGraph {
     // Strict selectable topology is separate from the legacy sparse fallback.
     exact_sources: HashSet<u8>,
     selector_controls: HashMap<u8, u8>,
+    source_controls: HashMap<u8, u32>,
     duplicate_ids: HashSet<u8>,
 }
 
@@ -181,6 +182,9 @@ impl ClockGraph {
                     graph.first_source.get_or_insert(descriptor[3]);
                     if length >= 8 && descriptor[3] != 0 {
                         graph.exact_sources.insert(descriptor[3]);
+                        graph
+                            .source_controls
+                            .insert(descriptor[3], u32::from(descriptor[5]));
                     }
                 }
                 UAC2_CLOCK_SELECTOR if length >= 4 => {
@@ -417,6 +421,27 @@ impl ClockGraph {
     }
 }
 
+/// Descriptor-aware clock validity, shared by UAC2 and full ADC3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockValidity {
+    Unreported,
+    ReportedValid,
+}
+
+pub(crate) fn clock_validity(
+    controls: u32,
+    mut read: impl FnMut() -> Result<bool, String>,
+) -> Result<ClockValidity, String> {
+    match (controls >> 2) & 3 {
+        0 => Ok(ClockValidity::Unreported),
+        1 | 3 => match read()? {
+            true => Ok(ClockValidity::ReportedValid),
+            false => Err("clock source reports invalid".into()),
+        },
+        _ => Err("clock validity access is reserved".into()),
+    }
+}
+
 /// One selector's snapshot and requested 1-based pin. Kept even for unchanged
 /// selectors so opening a negotiated plan can reject intervening route changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +454,8 @@ pub(crate) struct ClockPinPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClockPlan {
     pub source_id: u8,
+    /// Descriptor controls at protocol width; absent validity is not a valid response.
+    pub source_controls: u32,
     /// Root-to-source entity IDs, excluding the streaming terminal.
     pub path: Vec<u8>,
     /// Root-to-leaf selector order, including unchanged pins.
@@ -442,7 +469,7 @@ pub(crate) trait ClockPlanIo {
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String>;
     /// Check validity and requested sampling cadence on this exact source.
     /// Called after the whole path is selected, even when no selector changes.
-    fn validate_source(&mut self, source: u8) -> Result<(), String>;
+    fn validate_source(&mut self, source: u8, controls: u32) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,7 +514,7 @@ impl ClockPlan {
             for pin in &self.selectors {
                 verify_pin(io, pin.selector, pin.target)?;
             }
-            io.validate_source(self.source_id)
+            io.validate_source(self.source_id, self.source_controls)
         })();
         match result {
             Ok(()) => Ok(()),
@@ -578,6 +605,7 @@ impl<F: FnMut(u8) -> Result<u8, String>> ClockSearch<'_, F> {
             Some(ClockEntity::Source) if self.graph.exact_sources.contains(&id) => {
                 self.plans.push(ClockPlan {
                     source_id: id,
+                    source_controls: self.graph.source_controls[&id],
                     path: path.clone(),
                     selectors: selectors.clone(),
                 });
@@ -781,6 +809,9 @@ mod selectable_clock_tests {
         writes: Vec<(u8, u8)>,
         checked: Vec<u8>,
         invalid_source: bool,
+        reported_valid: bool,
+        validity_read_fails: bool,
+        validity_reads: usize,
         bad_write: bool,
         fail_restore: bool,
     }
@@ -802,14 +833,43 @@ mod selectable_clock_tests {
             }
             Ok(())
         }
-        fn validate_source(&mut self, id: u8) -> Result<(), String> {
+        fn validate_source(&mut self, id: u8, controls: u32) -> Result<(), String> {
             self.checked.push(id);
+            clock_validity(controls, || {
+                self.validity_reads += 1;
+                if self.validity_read_fails {
+                    Err("advertised read failed".into())
+                } else {
+                    Ok(self.reported_valid)
+                }
+            })?;
             if self.invalid_source {
                 Err("source invalid or unsupported rate".into())
             } else {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn source_validity_uses_descriptor_capability_and_preserves_unreported_state() {
+        assert_eq!(
+            clock_validity(0, || panic!("absent control must not be read")),
+            Ok(ClockValidity::Unreported)
+        );
+        assert_eq!(
+            clock_validity(4, || Ok(true)),
+            Ok(ClockValidity::ReportedValid)
+        );
+        assert!(clock_validity(4, || Ok(false)).is_err());
+        assert!(clock_validity(12, || Err("advertised read failed".into())).is_err());
+        assert!(clock_validity(8, || panic!("reserved must not be read")).is_err());
+        assert_eq!(
+            clock_validity(0xffff_fff3, || panic!("high ADC3 bits must not imply validity")),
+            Ok(ClockValidity::Unreported)
+        );
+        let plans = selector(3).enumerate_plans(1, |_| Ok(1)).unwrap();
+        assert_eq!(plans[0].source_controls, 0);
     }
 
     #[test]
@@ -826,6 +886,7 @@ mod selectable_clock_tests {
         plans[0].apply(&mut io).unwrap();
         assert!(io.writes.is_empty());
         assert_eq!(io.checked, [21]);
+        assert_eq!(io.validity_reads, 0);
     }
 
     #[test]
@@ -859,6 +920,31 @@ mod selectable_clock_tests {
         plan.apply(&mut io).unwrap();
         plan.restore(&mut io).unwrap();
         assert_eq!(io.pins[&10], 1);
+    }
+
+    #[test]
+    fn advertised_validity_failures_restore_the_original_selector() {
+        for read_fails in [false, true] {
+            let mut extra = vec![9, 0x24, 0x0b, 10, 2, 20, 21, 3, 0];
+            let mut sources = SOURCES.to_vec();
+            sources[13] = 7; // source 21: frequency R/W, validity readable.
+            extra.extend_from_slice(&sources);
+            let plan = graph(&extra)
+                .enumerate_plans(1, |_| Ok(1))
+                .unwrap()
+                .remove(1);
+            assert_eq!(plan.source_controls, 7);
+            let mut io = Device {
+                pins: HashMap::from([(10, 1)]),
+                validity_read_fails: read_fails,
+                ..Device::default()
+            };
+            let error = plan.apply(&mut io).unwrap_err();
+            assert!(error.rollback_errors.is_empty());
+            assert_eq!(io.writes, [(10, 2), (10, 1)]);
+            assert_eq!(io.validity_reads, 1);
+            assert_eq!(io.pins[&10], 1);
+        }
     }
 
     #[test]

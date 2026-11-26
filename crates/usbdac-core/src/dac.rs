@@ -179,13 +179,26 @@ impl Dac {
     /// start any audio. [`VolumeControl::startup`](crate::VolumeControl::startup)
     /// says what it did.
     pub fn open(fd: RawFd, info: DeviceInfo, config: DacConfig) -> Result<Dac> {
+        Self::open_playback_device(fd, info, config, false)
+    }
+
+    /// Explicit duplex registration. Claim the base playback interfaces and all
+    /// IN/control interfaces returned by capture_preflight for the same configuration.
+    /// Ordinary playback registration retains its narrower optional-IN policy.
+    pub fn open_duplex_device(fd: RawFd, info: DeviceInfo, config: DacConfig) -> Result<Dac> {
+        Self::open_playback_device(fd, info, config, true)
+    }
+
+    fn open_playback_device(fd: RawFd, info: DeviceInfo, config: DacConfig, duplex: bool) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
         if transport::session::session_registered() {
             return Err(Error::Busy);
         }
         settings::install(Settings::for_device(config.clone(), &info));
-        if let Err(error) = transport::api::open_device(fd, &info) {
+        let registration = if duplex { transport::api::open_duplex_device(fd, &info) }
+            else { transport::api::open_device(fd, &info) };
+        if let Err(error) = registration {
             settings::reset();
             return Err(error);
         }

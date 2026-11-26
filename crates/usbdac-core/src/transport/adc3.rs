@@ -903,16 +903,13 @@ pub(super) fn configure_adc3(
     if u32::from_le_bytes(current) != rate {
         return Err("ADC3 source frequency verification failed".into());
     }
-    match source.controls.access(2) {
-        wire::ControlAccess::ReadOnly | wire::ControlAccess::ReadWrite => {
-            let mut valid = [0];
-            read_exact(handle, route.control, source.id, 2, 1, &mut valid)?;
-            if valid != [1] {
-                return Err("ADC3 clock source invalid".into());
-            }
-        }
-        wire::ControlAccess::Reserved => return Err("ADC3 clock validity access reserved".into()),
-        _ => {}
+    let validity = crate::clock_resolution::clock_validity(source.controls.0, || {
+        let mut valid = [0];
+        read_exact(handle, route.control, source.id, 2, 1, &mut valid)?;
+        Ok(valid == [1])
+    })?;
+    if validity == crate::clock_resolution::ClockValidity::Unreported {
+        log_info!("[USB] ADC3 clock {}: validity unreported; exact {} Hz frequency verified", source.id, rate);
     }
     Ok(())
 }

@@ -116,6 +116,8 @@ public class StreamFormat internal constructor(
      * entities to set (UAC 1.0 sets the rate on the endpoint), or from an older native library.
      */
     public val clock: ClockChoice? = null,
+    /** Descriptor identities in interleaved USB wire order, shared with capture. */
+    public val channelMap: List<CaptureChannel> = List(channels) { CaptureChannel(it, CaptureChannelPosition.UNSPECIFIED) },
 ) {
     override fun toString(): String =
         "StreamFormat($encoding ${sampleRate}Hz ${validBits}bit x$channels, $bytesPerFrame bytes/frame)"

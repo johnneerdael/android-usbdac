@@ -26,4 +26,20 @@ class CaptureChannelIdentityTest {
         val channel = CaptureChannel(0, CaptureChannelPosition.ADC3_INFORMATION)
         assertTrue(runCatching { CaptureRequest(48000, 1, 24, listOf(channel)).toCaptureJson() }.isFailure)
     }
+    @Test fun playbackUsesTheCaptureWireIdentityDecoder() {
+        val channels = listOf(
+            CaptureChannel(0, CaptureChannelPosition.BACK_LEFT),
+            CaptureChannel(1, CaptureChannelPosition.UNSPECIFIED))
+        val value = JSONObject(CaptureRequest(48000, 2, 24, channels).toCaptureJson())
+            .put("format_id", 1).put("subslot_bytes", 3).put("bytes_per_frame", 6)
+            .put("counter_rate_hz", 48000).put("interface_number", 1).put("alt_setting", 1)
+            .put("endpoint_address", 1).put("sync_type", "synchronous").put("explicit_feedback", false)
+            .put("link_speed", "high").put("service_interval_us", 125).put("rate_differs_from_request", false)
+        assertEquals(channels, parseStreamFormat(value.toString()).channelMap)
+        value.getJSONArray("channel_map").getJSONObject(1).put("index", 0)
+        assertTrue(runCatching { parseStreamFormat(value.toString()) }.isFailure)
+        value.remove("channel_map")
+        assertEquals(listOf(CaptureChannel(0, CaptureChannelPosition.UNSPECIFIED),
+            CaptureChannel(1, CaptureChannelPosition.UNSPECIFIED)), parseStreamFormat(value.toString()).channelMap)
+    }
 }

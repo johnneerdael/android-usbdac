@@ -3,6 +3,8 @@ package dev.usbdac.internal
 import dev.usbdac.AltFormat
 import dev.usbdac.AltSetting
 import dev.usbdac.BitPerfectBlocker
+import dev.usbdac.CaptureChannel
+import dev.usbdac.CaptureChannelPosition
 import dev.usbdac.ClockChoice
 import dev.usbdac.ClockHop
 import dev.usbdac.ClockHopKind
@@ -188,6 +190,9 @@ internal fun parseStreamFormat(json: String): StreamFormat {
     val value = JSONObject(json)
     return StreamFormat(
         formatId = value.getLong("format_id"),
+        channelMap = if (value.has("channel_map")) parseChannelMap(value).also {
+            if (it.size != value.getInt("channels")) throw org.json.JSONException("playback channel count changed")
+        } else List(value.getInt("channels")) { CaptureChannel(it, CaptureChannelPosition.UNSPECIFIED) },
         encoding = when (value.stringOrNull("encoding")) {
             "dop" -> StreamEncoding.DOP
             "dsd_native" -> StreamEncoding.DSD_NATIVE

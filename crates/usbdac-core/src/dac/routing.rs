@@ -29,6 +29,22 @@ impl Dac {
         routing_hw::scarlett_read()
     }
 
+    /// Apply bounded half-dB replacements to one complete Scarlett mixer row.
+    /// Requires fresh expected raw coefficients, idle ownership and the explicit
+    /// vendor claim. Verifies the whole row and attempts verified restoration
+    /// after any attempted-write failure. Configured hand-back restores only
+    /// rows still matching the last verified write. Source-backed, physically
+    /// unverified; no mux bank or persistent configuration is written.
+    pub fn scarlett_mix_apply(
+        &self,
+        edit: &crate::scarlett::MixRowEdit,
+    ) -> Result<crate::scarlett::MixWriteReport, RoutingSessionError> {
+        self.shared
+            .ensure_open()
+            .map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_mix_apply(edit)
+    }
+
     /// Discover standard UAC2 selectors and mixer crosspoints on claimed
     /// AudioControl interfaces in the active configuration. No vendor protocol
     /// is inferred. Requires an idle DAC, including no open capture stream.

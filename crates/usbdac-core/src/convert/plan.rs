@@ -397,6 +397,7 @@ mod tests {
             pacing: Pacing::ExplicitFeedback { endpoint: 0x81 },
             clock: None,
             native_dsd_signature: None,
+            channel_map: crate::capture::ChannelMap::uac2(channels, 0).unwrap(),
         }
     }
 
