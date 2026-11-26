@@ -467,6 +467,49 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
     (!payload_ok).then_some(BitPerfectBlocker::PayloadUnverified)
 }
 
+/// What the open stream says besides the bit-perfect verdict, for
+/// `DacStream::stats`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamVerdicts {
+    /// Lossless transfers for long enough, with no underrun and no lost audio.
+    pub(crate) stable: bool,
+    /// The DAC confirmed the sampling frequency (or the device quirk trusts it).
+    pub(crate) clock_verified: bool,
+    /// The wire payload audit passes.
+    pub(crate) payload_verified: bool,
+    /// How long the wire payload has been failing the audit, if it is.
+    pub(crate) payload_constant_for_ms: Option<u64>,
+}
+
+/// The verdicts of the open stream; all false when none is open.
+pub(crate) fn stream_verdicts() -> StreamVerdicts {
+    let Some((stable, clock_verified, dsd)) = SESSION_STATE.lock().as_ref().map(|state| {
+        (
+            state.usb_stream_stable,
+            state.clock_verification_passed,
+            state
+                .playback_format
+                .is_some_and(|format| format.dsd_transport != DsdTransportMode::None),
+        )
+    }) else {
+        return StreamVerdicts::default();
+    };
+    let now = Instant::now();
+    let (payload_verified, constant_for) = if dsd {
+        let latch = USB_DSD_PAYLOAD_LATCH.lock();
+        (latch.is_verified(), latch.constant_for(now))
+    } else {
+        let latch = USB_PCM_PAYLOAD_LATCH.lock();
+        (latch.is_verified(), latch.constant_for(now))
+    };
+    StreamVerdicts {
+        stable,
+        clock_verified,
+        payload_verified,
+        payload_constant_for_ms: constant_for.map(|duration| duration.as_millis() as u64),
+    }
+}
+
 pub(super) fn direct_path_is_bit_perfect(state: &SessionState) -> bool {
     bit_perfect_blocker(state).is_none()
 }

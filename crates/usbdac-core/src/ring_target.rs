@@ -56,6 +56,13 @@ pub(crate) fn live_processing(raw_bitstream: bool, software_gain: f32) -> bool {
     !raw_bitstream && software_gain != 1.0
 }
 
+/// Whether the shallow depth applies: software gain is applied to PCM, or the
+/// host says it processes the audio itself before writing it (EQ, DSP,
+/// crossfade). A bitstream is never live whatever the host says.
+pub(crate) fn live_depth(raw_bitstream: bool, software_gain: f32, host_processing: bool) -> bool {
+    live_processing(raw_bitstream, software_gain) || (!raw_bitstream && host_processing)
+}
+
 /// Whether the host should write more into a ring holding `buffered_samples`
 /// while it is kept at `target_samples`.
 pub(crate) fn needs_refill(buffered_samples: usize, target_samples: usize) -> bool {

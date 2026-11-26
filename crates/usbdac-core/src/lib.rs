@@ -62,9 +62,10 @@ mod volume_control;
 mod tests;
 
 pub use capabilities::{
-    AltFormat, AltSetting, Capabilities, DeviceInfo, LinkSpeed, RateRange, SyncKind, UacVersion,
+    AltFormat, AltSetting, Capabilities, DeviceInfo, EndpointUsage, LinkSpeed, RateRange,
+    SyncKind, UacVersion,
 };
-pub use config::{DacConfig, HandBack, QuirkOverride, StartupVolume};
+pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume};
 pub use dac::Dac;
 pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};

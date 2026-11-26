@@ -79,6 +79,15 @@ mod dsd_bitperfect_tests {
     }
 
     #[test]
+    fn endpoint_usage_bits_map_to_the_public_enum() {
+        use crate::capabilities::EndpointUsage;
+        assert_eq!(endpoint_usage(UsageType::Data), EndpointUsage::Data);
+        assert_eq!(endpoint_usage(UsageType::Feedback), EndpointUsage::Feedback);
+        assert_eq!(endpoint_usage(UsageType::FeedbackData), EndpointUsage::FeedbackData);
+        assert_eq!(endpoint_usage(UsageType::Reserved), EndpointUsage::Reserved);
+    }
+
+    #[test]
     fn an_unknown_device_has_no_dsd_quirk() {
         let info = crate::capabilities::DeviceInfo::new(1, 2, "Mystery DAC");
         let resolved = crate::settings::Settings::for_device(Default::default(), &info);
@@ -669,6 +678,22 @@ mod pcm_ring_hold_tests {
     }
 
     #[test]
+    fn the_host_processing_hint_switches_the_recommended_depth_like_software_gain() {
+        let stats = deep_ring_stats();
+        assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
+        assert_eq!(stats.active_target_ms(), 250);
+        stats.host_processing.store(true, Ordering::Relaxed);
+        assert_eq!(stats.active_target_samples(), stats.processing_target_samples);
+        assert_eq!(stats.active_target_ms(), 100);
+        stats.host_processing.store(false, Ordering::Relaxed);
+        assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
+        // A bitstream is never live.
+        stats.raw_bitstream.store(true, Ordering::Relaxed);
+        stats.host_processing.store(true, Ordering::Relaxed);
+        assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
+    }
+
+    #[test]
     fn a_flush_clears_the_ring_and_starts_a_new_epoch() {
         let stats = deep_ring_stats();
         let ring = Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2));
@@ -1180,6 +1205,72 @@ mod push_stream_tests {
     }
 
     #[test]
+    fn host_processing_moves_the_target_without_flushing_the_ring() {
+        let _globals = lock_globals();
+        let rig = Rig::pcm(2, 16);
+        let stats = Arc::clone(&rig.shared.stats);
+        let deep = stats.buffer_target_samples;
+        let live = stats.processing_target_samples;
+        let chunk = vec![5u8; rig.shared.writable_bytes()];
+        rig.shared.write_bytes(&chunk).unwrap();
+        assert_eq!(stats.buffered_samples.load(Ordering::Relaxed), deep);
+        assert_eq!(rig.shared.writable_bytes(), 0);
+        let epoch = stats.flush_epoch.load(Ordering::Relaxed);
+
+        // The host starts processing: the shallow target applies, the ring is
+        // above it, so nothing is wanted and nothing is dropped.
+        stats.host_processing.store(true, Ordering::Relaxed);
+        assert_eq!(rig.shared.writable_bytes(), 0);
+        assert_eq!(stats.buffered_samples.load(Ordering::Relaxed), deep);
+        assert_eq!(stats.flush_epoch.load(Ordering::Relaxed), epoch, "no flush");
+        assert!(live < deep);
+
+        // The host stops processing: the deep target's room reappears at once.
+        stats.host_processing.store(false, Ordering::Relaxed);
+        stats.buffered_samples.store(live, Ordering::Relaxed);
+        assert_eq!(rig.shared.writable_bytes(), (deep - live) * 2 / 4 * 4);
+    }
+
+    #[test]
+    fn the_stream_verdicts_follow_the_session_and_the_payload_audit() {
+        let _globals = lock_globals();
+        // No session: nothing is true.
+        assert!(!stream_verdicts().stable && !stream_verdicts().clock_verified);
+
+        let rig = Rig::pcm(2, 16);
+        let _session = TestSession::install_streaming(Arc::clone(&rig.shared.stats));
+        {
+            // The test session has a verified clock and no stability yet.
+            let verdicts = stream_verdicts();
+            assert!(verdicts.clock_verified);
+            assert!(!verdicts.stable);
+            assert!(!verdicts.payload_verified, "no audio has been audited");
+        }
+        set_usb_stream_stable(true);
+        assert!(stream_verdicts().stable);
+        set_clock_verification(true, true, false, None);
+        assert!(!stream_verdicts().clock_verified);
+        assert_eq!(
+            current_bit_perfect_blocker(),
+            Some(crate::stream::BitPerfectBlocker::ClockUnverified)
+        );
+
+        // Real audio through the PCM audit verifies the payload.
+        let music: Vec<i32> = (1..=2_000).map(|i| i << 16).collect();
+        let mut samples = vec![0i32; 2_000];
+        let mut ring = PcmRing::new(8_000, 2);
+        assert_eq!(ring.push_samples(&music), 2_000);
+        let pop = ring.pop_music_into_or_pad(&mut samples, 2, DsdTransportMode::None);
+        assert_eq!(pop.music_samples, 2_000);
+        let mut wire = vec![0u8; samples.len() * 2];
+        encode_usb_pcm_slots(&samples, &mut wire, 2, 16, DsdTransportMode::None, 2, false, false)
+            .unwrap();
+        observe_pcm_payload_audit(audit_pcm_payload(&wire, 2, 2));
+        assert!(stream_verdicts().payload_verified);
+        assert_eq!(stream_verdicts().payload_constant_for_ms, None);
+    }
+
+    #[test]
     fn a_dsd_bitstream_always_keeps_the_deep_target() {
         let dop = Rig::new(3, 24, 2, DsdTransportMode::DoP);
         let native = Rig::new(4, 1, 2, DsdTransportMode::Native);
@@ -1187,6 +1278,8 @@ mod push_stream_tests {
             let stats = &rig.shared.stats;
             // Even a gain value that could only come from a bug is not "live".
             stats.gain_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+            assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
+            stats.host_processing.store(true, Ordering::Relaxed);
             assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
         }
     }

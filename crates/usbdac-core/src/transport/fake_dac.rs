@@ -203,6 +203,21 @@ impl Registered {
         SESSION_STATE.lock().as_mut().unwrap().set_stream_active(false, true);
     }
 
+    /// Whether the level the DAC had before the library first changed it is on
+    /// record for the fake device.
+    pub(crate) fn original_recorded(&self) -> bool {
+        ORIGINAL_HARDWARE_VOLUME
+            .lock()
+            .is_recorded(&original_volume_device_key(&device()))
+    }
+
+    /// Records what the fake DAC reads now as the level it had before the
+    /// library touched it, as the discovery of the first stream does.
+    pub(crate) fn record_original(&self) {
+        let _hold = HARDWARE_VOLUME_MUTEX.lock();
+        note_original_hardware_volume(&device(), &control());
+    }
+
     /// The raw level of the stereo channels.
     pub(crate) fn raw(&self) -> Vec<i16> {
         self.dac.lock().unwrap().volume[1..].to_vec()

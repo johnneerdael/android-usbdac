@@ -84,6 +84,19 @@ pub enum SyncKind {
     None,
 }
 
+/// The usage bits of an isochronous endpoint's `bmAttributes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointUsage {
+    /// A data endpoint.
+    Data,
+    /// A feedback endpoint.
+    Feedback,
+    /// An implicit feedback data endpoint (the feedback is carried by an
+    /// associated IN data endpoint).
+    FeedbackData,
+    Reserved,
+}
+
 /// What an alternate setting carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AltFormat {
@@ -128,6 +141,16 @@ pub struct AltSetting {
     pub max_packet_bytes: usize,
     pub service_interval_us: u32,
     pub uac_version: UacVersion,
+    /// The endpoint's `bInterval`.
+    pub endpoint_interval: u8,
+    /// The endpoint's usage bits.
+    pub usage: EndpointUsage,
+    /// The endpoint's `bRefresh`.
+    pub refresh: u8,
+    /// The endpoint's `bSynchAddress`: the feedback endpoint it names, or 0.
+    /// [`feedback_endpoint`](Self::feedback_endpoint) can be set while this is 0
+    /// (a feedback endpoint found by its usage bits).
+    pub synch_address: u8,
 }
 
 /// Summary of what the DAC can do.

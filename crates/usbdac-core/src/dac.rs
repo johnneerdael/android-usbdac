@@ -1,7 +1,7 @@
 //! The DAC handle.
 
 use crate::capabilities::{Capabilities, DeviceInfo};
-use crate::config::{DacConfig, HandBack};
+use crate::config::{CloseVolume, DacConfig, HandBack};
 use crate::error::{Error, Result};
 use crate::events::{DacListener, EventHub, EventSink};
 use crate::format::{StreamFormat, StreamRequest};
@@ -49,19 +49,29 @@ impl DacShared {
             .filter(|stream| !stream.is_closed())
     }
 
-    fn shutdown(&self) -> Result<()> {
+    /// Closes with what the configuration says about the original volume
+    /// (`None`) or with what the host decided at close.
+    fn shutdown(&self, volume: Option<CloseVolume>) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         if let Some(stream) = self.active_stream() {
             let _ = stream.close();
         }
+        // A DAC that has gone cannot be written to, and what was recorded for
+        // it must not survive into a later attachment: forget it, whatever was
+        // asked for.
         let action = if self.events.device_lost() {
             transport::api::ORIGINAL_VOLUME_ACTION_FORGET
         } else {
-            match self.config.hand_back {
-                HandBack::RestoreOriginal => transport::api::ORIGINAL_VOLUME_ACTION_RESTORE,
-                HandBack::Keep => transport::api::ORIGINAL_VOLUME_ACTION_KEEP,
+            match volume {
+                Some(CloseVolume::Restore) => transport::api::ORIGINAL_VOLUME_ACTION_RESTORE,
+                Some(CloseVolume::Keep) => transport::api::ORIGINAL_VOLUME_ACTION_KEEP,
+                Some(CloseVolume::Forget) => transport::api::ORIGINAL_VOLUME_ACTION_FORGET,
+                None => match self.config.hand_back {
+                    HandBack::RestoreOriginal => transport::api::ORIGINAL_VOLUME_ACTION_RESTORE,
+                    HandBack::Keep => transport::api::ORIGINAL_VOLUME_ACTION_KEEP,
+                },
             }
         };
         let stopped = transport::api::close_device(action, CLOSE_TIMEOUT);
@@ -222,13 +232,47 @@ impl Dac {
     /// [`Dac::open`] can succeed. The host may then release its interfaces and
     /// close its connection. Dropping the `Dac` does the same.
     pub fn close(self) -> Result<()> {
-        self.shared.shutdown()
+        self.shared.shutdown(None)
+    }
+
+    /// Like [`close`](Self::close), but the host says what becomes of the level
+    /// the DAC had before the library first changed it, instead of
+    /// [`DacConfig::hand_back`] deciding at open: write it back (another driver
+    /// gets the DAC), keep the record (the host holds on to the DAC or takes it
+    /// straight back) or forget it (the DAC was unplugged).
+    ///
+    /// A DAC the library saw disappear is always forgotten: nothing can be
+    /// written to it and a later attachment must start fresh.
+    pub fn close_with(self, volume: CloseVolume) -> Result<()> {
+        self.shared.shutdown(Some(volume))
+    }
+
+    /// Changes the native DSD overrides of the open DAC ([`DacConfig::dsd_big_endian`]
+    /// and [`DacConfig::dsd_subslot`]), for a host whose user can change them
+    /// while the DAC stays open. `None` goes back to the device quirk.
+    ///
+    /// They are read when a format is negotiated and when a stream is opened: a
+    /// stream that is already open keeps what it started with, and
+    /// [`capabilities`](Self::capabilities) reflects a new subslot size after the
+    /// next [`negotiate`](Self::negotiate). `subslot` must be 1, 2 or 4.
+    pub fn set_dsd_overrides(&self, big_endian: Option<bool>, subslot: Option<u8>) -> Result<()> {
+        self.shared.ensure_open()?;
+        if subslot.is_some_and(|size| !matches!(size, 1 | 2 | 4)) {
+            return Err(Error::InvalidArgument(
+                "dsd_subslot must be 1, 2 or 4".to_string(),
+            ));
+        }
+        settings::update(|config| {
+            config.dsd_big_endian = big_endian;
+            config.dsd_subslot = subslot;
+        });
+        Ok(())
     }
 }
 
 impl Drop for Dac {
     fn drop(&mut self) {
-        if let Err(error) = self.shared.shutdown() {
+        if let Err(error) = self.shared.shutdown(None) {
             log::warn!("closing the DAC: {error}");
         }
     }
@@ -273,6 +317,159 @@ mod tests {
         };
         let error = Dac::open(-1, DeviceInfo::new(1, 2, "x"), config).unwrap_err();
         assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    /// A `Dac` over the fake registered session.
+    fn fake_dac_handle(config: DacConfig) -> Dac {
+        Dac {
+            shared: Arc::new(DacShared {
+                events: EventHub::start(),
+                info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
+                config,
+                closed: AtomicBool::new(false),
+                stream: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// A DAC whose level the library lowered, with the true original on record.
+    fn lowered_with_a_record() -> crate::transport::fake_dac::Registered {
+        use crate::transport::fake_dac::{Registered, ORIGINAL_RAW};
+        let fake = Registered::new(false, true);
+        fake.set_levels(ORIGINAL_RAW, ORIGINAL_RAW);
+        fake.record_original();
+        crate::transport::volume_hw::write_volume_db(-40.0).unwrap();
+        assert_ne!(fake.raw(), vec![ORIGINAL_RAW; 2]);
+        fake
+    }
+
+    #[test]
+    fn close_with_restore_writes_the_original_back_and_ends_the_record() {
+        use crate::transport::fake_dac::ORIGINAL_RAW;
+        let fake = lowered_with_a_record();
+        // The configuration says keep: the host's decision at close wins.
+        let dac = fake_dac_handle(DacConfig {
+            hand_back: HandBack::Keep,
+            ..DacConfig::default()
+        });
+        dac.close_with(CloseVolume::Restore).unwrap();
+        assert_eq!(fake.raw(), vec![ORIGINAL_RAW; 2]);
+        assert!(!fake.original_recorded());
+        assert!(!transport::session::session_registered());
+    }
+
+    #[test]
+    fn close_with_keep_leaves_the_level_and_the_record() {
+        use crate::transport::fake_dac::ORIGINAL_RAW;
+        let fake = lowered_with_a_record();
+        let lowered = fake.raw();
+        // The configuration says restore: again the host's decision wins.
+        let dac = fake_dac_handle(DacConfig::default());
+        dac.close_with(CloseVolume::Keep).unwrap();
+        assert_eq!(fake.raw(), lowered, "the level was not touched");
+        assert_ne!(lowered, vec![ORIGINAL_RAW; 2]);
+        assert!(fake.original_recorded(), "a later open still knows the true original");
+        assert!(!transport::session::session_registered());
+    }
+
+    #[test]
+    fn close_with_forget_ends_the_record_without_writing() {
+        let fake = lowered_with_a_record();
+        let lowered = fake.raw();
+        let writes = fake.dac.lock().unwrap().volume_writes.len();
+        let dac = fake_dac_handle(DacConfig::default());
+        dac.close_with(CloseVolume::Forget).unwrap();
+        assert_eq!(fake.raw(), lowered);
+        assert_eq!(fake.dac.lock().unwrap().volume_writes.len(), writes, "nothing was written");
+        assert!(!fake.original_recorded());
+    }
+
+    #[test]
+    fn a_dac_the_library_saw_disappear_is_forgotten_whatever_close_asked_for() {
+        let fake = lowered_with_a_record();
+        let lowered = fake.raw();
+        let dac = fake_dac_handle(DacConfig::default());
+        dac.shared.events.emit_dac(crate::events::DacEvent::DeviceLost);
+        dac.close_with(CloseVolume::Restore).unwrap();
+        assert_eq!(fake.raw(), lowered, "no write to a DAC that is gone");
+        assert!(!fake.original_recorded());
+    }
+
+    #[test]
+    fn a_plain_close_still_follows_the_configuration() {
+        use crate::transport::fake_dac::ORIGINAL_RAW;
+        let fake = lowered_with_a_record();
+        fake_dac_handle(DacConfig::default()).close().unwrap();
+        assert_eq!(fake.raw(), vec![ORIGINAL_RAW; 2], "the default is to restore");
+        drop(fake);
+
+        let fake = lowered_with_a_record();
+        let lowered = fake.raw();
+        fake_dac_handle(DacConfig {
+            hand_back: HandBack::Keep,
+            ..DacConfig::default()
+        })
+        .close()
+        .unwrap();
+        assert_eq!(fake.raw(), lowered);
+        assert!(fake.original_recorded());
+    }
+
+    #[test]
+    fn dsd_overrides_change_the_settings_of_the_open_dac_and_are_validated() {
+        let fake = crate::transport::fake_dac::Registered::new(false, false);
+        fake.configure(DacConfig::default());
+        let dac = fake_dac_handle(DacConfig::default());
+        assert!(!settings::settings().dsd_big_endian());
+        assert_eq!(settings::settings().dsd_subslot_override(), None);
+
+        dac.set_dsd_overrides(Some(true), Some(2)).unwrap();
+        assert!(settings::settings().dsd_big_endian());
+        assert_eq!(settings::settings().dsd_subslot_override(), Some(2));
+
+        assert!(matches!(
+            dac.set_dsd_overrides(None, Some(3)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(
+            settings::settings().dsd_subslot_override(),
+            Some(2),
+            "a refused call changes nothing"
+        );
+
+        dac.set_dsd_overrides(None, None).unwrap();
+        assert!(!settings::settings().dsd_big_endian());
+        assert_eq!(settings::settings().dsd_subslot_override(), None);
+        dac.close().unwrap();
+        drop(fake);
+    }
+
+    #[test]
+    fn dsd_overrides_keep_the_quirks_resolved_for_the_device() {
+        let fake = crate::transport::fake_dac::Registered::new(false, false);
+        fake.configure(DacConfig {
+            quirks: vec![crate::config::QuirkOverride {
+                vendor_id: 0x1234,
+                product_id: 0x5678,
+                name_contains: None,
+                quirks: vec![
+                    crate::quirk::Quirk::SettleDelayMs(80),
+                    crate::quirk::Quirk::DsdBigEndian,
+                ],
+            }],
+            ..DacConfig::default()
+        });
+        let dac = fake_dac_handle(DacConfig::default());
+        // The quirk gives big-endian; an override of "little-endian" wins over it.
+        assert!(settings::settings().dsd_big_endian());
+        dac.set_dsd_overrides(Some(false), None).unwrap();
+        assert!(!settings::settings().dsd_big_endian());
+        assert_eq!(settings::settings().settle_delay_ms(), 80, "the device quirk is still there");
+        // `None` goes back to the quirk.
+        dac.set_dsd_overrides(None, None).unwrap();
+        assert!(settings::settings().dsd_big_endian());
+        dac.close().unwrap();
+        drop(fake);
     }
 
     #[test]

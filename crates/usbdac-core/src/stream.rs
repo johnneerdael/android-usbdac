@@ -8,7 +8,7 @@ use crate::dac::DacShared;
 use crate::error::{Error, Result};
 use crate::events::StreamState;
 use crate::format::StreamFormat;
-use crate::transport::session::{bit_perfect_now, current_bit_perfect_blocker};
+use crate::transport::session::{bit_perfect_now, current_bit_perfect_blocker, stream_verdicts};
 use crate::transport::shared::StreamShared;
 use crate::transport::StreamHandle;
 use parking_lot::Mutex;
@@ -101,7 +101,11 @@ pub struct StreamStats {
     /// Frames in the ring.
     pub queued_frames: u64,
     pub buffer_ms: u32,
+    /// The deep ring depth (`DacConfig::buffer_target_ms`).
     pub buffer_target_ms: u32,
+    /// The depth `writable_bytes()` asks for now: `buffer_target_ms`, or the
+    /// shallower processing depth while software gain or host processing is on.
+    pub active_target_ms: u32,
     pub buffer_capacity_ms: u32,
     /// Transfers currently submitted to the bus.
     pub transfer_queue_depth: u32,
@@ -122,6 +126,18 @@ pub struct StreamStats {
     /// The sample rate the last feedback report implies.
     pub feedback_rate_hz: Option<f64>,
     pub feedback_stale: bool,
+    /// The transfers have been lossless for long enough (about 256 ms) with no
+    /// underrun and no lost audio. A stream that lost audio is never stable
+    /// again.
+    pub stable: bool,
+    /// The DAC confirmed the sampling frequency (or the device quirk trusts
+    /// its `SET_CUR`). False before the clock is verified and after it is lost.
+    pub clock_verified: bool,
+    /// The wire payload audit passes (see `is_bit_perfect`).
+    pub payload_verified: bool,
+    /// How long, in milliseconds, the wire payload has been failing the audit,
+    /// while it does.
+    pub payload_constant_for_ms: Option<u64>,
 }
 
 pub(crate) struct StreamInner {
@@ -389,6 +405,33 @@ impl DacStream {
         self.shared().stats.software_gain()
     }
 
+    /// Tells the stream that the host processes the audio (EQ, DSP, crossfade,
+    /// pitch) before it writes it. A change the host makes is then heard after
+    /// the ring's fill, so [`writable_bytes`](Self::writable_bytes) asks for the
+    /// shallow `processing_buffer_target_ms` instead of the deep target, as it
+    /// does for software gain. Nothing is flushed when the depth changes (see
+    /// `writable_bytes`).
+    ///
+    /// It is only a hint about buffering. It does not change a sample, and the
+    /// library cannot see what the host did to the audio, so it does not touch
+    /// [`is_bit_perfect`](Self::is_bit_perfect): a host that processes audio is
+    /// responsible for not claiming bit-perfect output. It has no effect for DoP
+    /// and native DSD, which are never processed.
+    pub fn set_host_processing(&self, processing: bool) {
+        self.shared()
+            .stats
+            .host_processing
+            .store(processing, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`set_host_processing`](Self::set_host_processing) is on.
+    pub fn host_processing(&self) -> bool {
+        self.shared()
+            .stats
+            .host_processing
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn stats(&self) -> StreamStats {
         use std::sync::atomic::Ordering::Relaxed;
         let shared = self.shared();
@@ -396,6 +439,11 @@ impl DacStream {
         let channels = stats.channels.max(1) as u64;
         let feedback_last = stats.feedback_last_report_ms.load(Relaxed);
         let elapsed_ms = stats.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let verdicts = if self.inner.is_closed() {
+            Default::default()
+        } else {
+            stream_verdicts()
+        };
         StreamStats {
             state: shared.current_state(),
             bit_perfect: !self.inner.is_closed() && bit_perfect_now(),
@@ -415,6 +463,7 @@ impl DacStream {
             queued_frames: stats.buffered_samples.load(Relaxed) as u64 / channels,
             buffer_ms: stats.buffer_fill_ms(),
             buffer_target_ms: stats.buffer_target_ms(),
+            active_target_ms: stats.active_target_ms(),
             buffer_capacity_ms: stats.buffer_capacity_ms(),
             transfer_queue_depth: stats.transfer_queue_depth.load(Relaxed) as u32,
             last_turnaround_us: stats.last_transfer_turnaround_us.load(Relaxed),
@@ -433,6 +482,10 @@ impl DacStream {
             feedback_rate_hz: (stats.feedback_reports.load(Relaxed) > 0)
                 .then(|| stats.feedback_rate_milli_hz.load(Relaxed) as f64 / 1_000.0),
             feedback_stale: stats.feedback_stale.load(Relaxed),
+            stable: verdicts.stable,
+            clock_verified: verdicts.clock_verified,
+            payload_verified: verdicts.payload_verified,
+            payload_constant_for_ms: verdicts.payload_constant_for_ms,
         }
     }
 }

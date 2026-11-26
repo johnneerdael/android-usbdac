@@ -114,6 +114,15 @@ pub(crate) fn reset() {
     *SETTINGS.write() = Arc::new(Settings::default());
 }
 
+/// Changes the configuration of the installed settings in place, keeping the
+/// quirks resolved for the open device.
+pub(crate) fn update(change: impl FnOnce(&mut DacConfig)) {
+    let mut guard = SETTINGS.write();
+    let mut settings = (**guard).clone();
+    change(&mut settings.config);
+    *guard = Arc::new(settings);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,7 @@
 use super::*;
-use crate::capabilities::{AltFormat, AltSetting, LinkSpeed, RateRange, SyncKind, UacVersion};
+use crate::capabilities::{
+    AltFormat, AltSetting, EndpointUsage, LinkSpeed, RateRange, SyncKind, UacVersion,
+};
 
 pub(super) fn inspect_usb_capabilities(device: &UsbDevice) -> Result<CapabilityModel, String> {
     let claimed_handle = wrap_android_usb_handle(device)?;
@@ -117,6 +119,10 @@ pub(super) fn build_usb_capability_model(
                     } else {
                         UacVersion::V2
                     },
+                    endpoint_interval: endpoint.interval(),
+                    usage: endpoint_usage(endpoint.usage_type()),
+                    refresh: endpoint.refresh(),
+                    synch_address: endpoint.synch_address(),
                 });
             }
         }
@@ -929,6 +935,15 @@ pub(super) fn sync_kind(sync_type: SyncType) -> SyncKind {
         SyncType::Adaptive => SyncKind::Adaptive,
         SyncType::Synchronous => SyncKind::Synchronous,
         SyncType::NoSync => SyncKind::None,
+    }
+}
+
+pub(super) fn endpoint_usage(usage_type: UsageType) -> EndpointUsage {
+    match usage_type {
+        UsageType::Data => EndpointUsage::Data,
+        UsageType::Feedback => EndpointUsage::Feedback,
+        UsageType::FeedbackData => EndpointUsage::FeedbackData,
+        UsageType::Reserved => EndpointUsage::Reserved,
     }
 }
 

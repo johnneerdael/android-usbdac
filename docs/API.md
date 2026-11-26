@@ -82,6 +82,8 @@ dac.open_stream(&StreamFormat, Arc<dyn DacListener>) -> Result<DacStream>
 dac.volume() -> Option<VolumeControl>
 dac.set_listener(Option<Arc<dyn DacListener>>)     // device-level events
 dac.close(self) -> Result<()>                      // also on drop
+dac.close_with(self, CloseVolume) -> Result<()>    // decide the volume hand-back at close
+dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD byte order, subslot
 ```
 
 - `open` scans the descriptors, finds the hardware volume control, records the
@@ -106,6 +108,20 @@ dac.close(self) -> Result<()>                      // also on drop
 - `close` stops the stream, hands the volume back as `DacConfig::hand_back`
   says, releases the session and joins the threads. After it returns another
   `Dac::open` can succeed. Do not call it from inside a `DacListener`.
+- `close_with(CloseVolume)` is `close` for a host that only learns at the end
+  what becomes of the volume: `Restore` writes the DAC's original level back and
+  ends the record (another driver gets the DAC), `Keep` leaves the level and the
+  record (the host holds on to the DAC or takes it straight back, and a later
+  `open` still knows the true original), `Forget` ends the record without
+  touching the DAC (it was unplugged, so a later attachment of the same device
+  starts fresh). It overrides `DacConfig::hand_back` for this call. A DAC the
+  library saw disappear (`DeviceLost`) is forgotten whatever was asked for.
+- `set_dsd_overrides(big_endian, subslot)` changes `DacConfig::dsd_big_endian`
+  and `DacConfig::dsd_subslot` of the open DAC, for a host whose user can change
+  them while the DAC stays open. `None` goes back to the device quirk; a subslot
+  other than 1, 2 or 4 is `InvalidArgument`. They are read at `negotiate` and
+  `open_stream`: an open stream keeps what it started with, and `capabilities()`
+  shows a new subslot size after the next `negotiate`.
 
 ### `DacConfig`
 
@@ -220,7 +236,9 @@ Capabilities {
 AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat /*Pcm|Dsd|Other*/,
              channels, subslot_bytes, valid_bits, rate_ranges: Vec<RateRange>, sample_rates,
              sync_type: SyncKind, feedback_endpoint: Option<u8>, max_packet_bytes,
-             service_interval_us, uac_version }
+             service_interval_us, uac_version,
+             endpoint_interval /* bInterval */, usage: EndpointUsage /*Data|Feedback|FeedbackData|Reserved*/,
+             refresh /* bRefresh */, synch_address /* bSynchAddress, 0 if the feedback endpoint was found by usage */ }
 ```
 
 ### `StreamRequest`, `StreamFormat`
@@ -262,6 +280,8 @@ stream.is_bit_perfect() -> bool
 stream.bit_perfect_blocker() -> Option<BitPerfectBlocker>   // why not, if not
 stream.set_software_gain(f32) -> Result<()>
 stream.software_gain() -> f32
+stream.set_host_processing(bool)            // the host processes the audio: shallow ring
+stream.host_processing() -> bool
 ```
 
 - `write` never blocks. It takes whole wire frames, as many as fit under the
@@ -302,6 +322,13 @@ stream.software_gain() -> f32
   what is on the bus.
 - `write_i32` counts samples and takes multiples of `channels` (of
   `subslot_bytes * channels` for native DSD).
+- `set_host_processing(true)` tells the stream that the host processes the audio
+  (EQ, DSP, crossfade, pitch) before writing it, so a change the host makes is
+  heard after the ring's fill. `writable_bytes()` then asks for the shallow
+  `processing_buffer_target_ms`, as it does for software gain (and, as for gain,
+  nothing is flushed when the target changes). It is only a buffering hint: it
+  changes no sample and, since the library cannot see what the host did to the
+  audio, it does not touch `is_bit_perfect()`. DoP and native DSD ignore it.
 
 `StreamState`: `Buffering`, `Playing`, `Paused`, `Draining`, `Drained`,
 `Closed`, `Failed` (codes 0 to 6).
@@ -310,12 +337,17 @@ stream.software_gain() -> f32
 `lost_frames`, `short_packets`, `zero_packets`, `urb_timeouts`,
 `completed_transfers`, `frames_written`, `frames_completed`, `played_frames`,
 `latency_frames`, `latency_ms`, `queued_frames`, `buffer_ms`,
-`buffer_target_ms`, `buffer_capacity_ms`, `transfer_queue_depth`,
+`buffer_target_ms`, `active_target_ms` (the depth `writable_bytes()` asks for
+now), `buffer_capacity_ms`, `transfer_queue_depth`,
 `last_turnaround_us`, `max_turnaround_us`, `last_submit_gap_us`,
 `max_submit_gap_us`, `effective_rate_hz`, `feedback_active`,
 `feedback_reports`, `feedback_timeouts`, `feedback_errors`,
-`feedback_rejected`, `feedback_age_ms`, `feedback_rate_hz`, `feedback_stale`.
-Frame counters are in `counter_rate_hz()` units.
+`feedback_rejected`, `feedback_age_ms`, `feedback_rate_hz`, `feedback_stale`,
+`stable` (lossless transfers for about 256 ms, no underrun, no lost audio),
+`clock_verified` (the DAC confirmed the sampling frequency, or the device quirk
+trusts its `SET_CUR`), `payload_verified` (the wire payload audit passes) and
+`payload_constant_for_ms` (how long the payload has been failing the audit, while
+it does). Frame counters are in `counter_rate_hz()` units.
 
 ### `Error`
 

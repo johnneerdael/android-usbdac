@@ -1,4 +1,4 @@
-use crate::ring_target::{live_processing, needs_refill, RingTargets};
+use crate::ring_target::{live_depth, live_processing, needs_refill, RingTargets};
 
 // 48 kHz stereo: 96 samples per millisecond.
 const SAMPLES_PER_MS: usize = 96;
@@ -32,6 +32,23 @@ fn only_a_gain_of_exactly_one_is_no_gain() {
     assert!(live_processing(false, 0.0));
     // An unusable gain is not unity either.
     assert!(live_processing(false, f32::NAN));
+}
+
+#[test]
+fn host_processing_keeps_the_shallow_ring_at_unity_gain() {
+    let targets = RingTargets::new(DEEP, LIVE);
+    assert_eq!(targets.select(live_depth(false, 1.0, true)), LIVE);
+    assert_eq!(targets.select(live_depth(false, 1.0, false)), DEEP);
+    // Either reason is enough.
+    assert!(live_depth(false, 0.5, false));
+    assert!(live_depth(false, 0.5, true));
+}
+
+#[test]
+fn a_bitstream_ignores_the_host_processing_hint() {
+    // DoP and native DSD are never processed, whatever the host says.
+    assert!(!live_depth(true, 1.0, true));
+    assert!(!live_depth(true, 0.5, true));
 }
 
 #[test]

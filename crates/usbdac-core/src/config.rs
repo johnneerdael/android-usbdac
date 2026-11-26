@@ -24,6 +24,26 @@ pub enum HandBack {
     Keep,
 }
 
+/// What [`Dac::close_with`](crate::Dac::close_with) does with the level the DAC
+/// had before the library first changed it, decided at close rather than at
+/// open.
+///
+/// [`HandBack`] is fixed in the [`DacConfig`] when the DAC opens. A host that
+/// only learns at the end what happens next (Android's own driver gets the DAC,
+/// the host takes it straight back, the DAC was unplugged) closes with this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseVolume {
+    /// Write the recorded original level back, verify it, and end the record.
+    Restore,
+    /// Leave the DAC at its current level and keep the record, so a later
+    /// [`Dac::open`](crate::Dac::open) of the same device in this process still
+    /// knows the true original level.
+    Keep,
+    /// End the record without touching the DAC: it is gone, so a later
+    /// attachment of the same device starts with a fresh record.
+    Forget,
+}
+
 /// What [`Dac::open`](crate::Dac::open) does with the DAC's hardware volume
 /// before any stream can start.
 ///

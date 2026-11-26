@@ -1,5 +1,5 @@
 use super::*;
-use crate::ring_target::{live_processing, RingTargets};
+use crate::ring_target::{live_depth, RingTargets};
 
 /// Counters and control flags shared between the API, the output thread and
 /// the ring. Everything is an atomic: no lock is held while reading them.
@@ -85,6 +85,9 @@ pub(crate) struct RuntimeStats {
     /// The stream carries a DSD bitstream (DoP or native): never processed, so
     /// never "live", whatever the gain value says.
     pub(crate) raw_bitstream: AtomicBool,
+    /// The host says it processes the audio before writing it, so a change it
+    /// makes is heard after the ring's fill (`DacStream::set_host_processing`).
+    pub(crate) host_processing: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -177,6 +180,7 @@ impl RuntimeStats {
             published_state: AtomicU32::new(u32::MAX),
             published_bit_perfect: AtomicBool::new(false),
             raw_bitstream: AtomicBool::new(false),
+            host_processing: AtomicBool::new(false),
         }
     }
 
@@ -189,12 +193,21 @@ impl RuntimeStats {
     }
 
     /// The ring depth the host is asked to keep right now: the shallow
-    /// processing depth while software gain is applied to PCM, the deep target
-    /// otherwise (see `ring_target`).
+    /// processing depth while software gain is applied to PCM or the host says
+    /// it processes the audio, the deep target otherwise (see `ring_target`).
     pub(crate) fn active_target_samples(&self) -> usize {
         RingTargets::new(self.buffer_target_samples, self.processing_target_samples).select(
-            live_processing(self.raw_bitstream.load(Ordering::Relaxed), self.software_gain()),
+            live_depth(
+                self.raw_bitstream.load(Ordering::Relaxed),
+                self.software_gain(),
+                self.host_processing.load(Ordering::Relaxed),
+            ),
         )
+    }
+
+    /// The depth `active_target_samples` asks for, in milliseconds.
+    pub(crate) fn active_target_ms(&self) -> u32 {
+        samples_to_millis(self.active_target_samples(), self.sample_rate, self.channels)
     }
 
     /// Music frames the DAC has taken since the stream started or the ring was
