@@ -4,7 +4,7 @@ description = "Bit-perfect direct USB DAC output (UAC 1.0/2.0, PCM, DoP, native 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.76"
 
 [dependencies]
 libc = "0.2"

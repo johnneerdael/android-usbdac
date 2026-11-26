@@ -4,7 +4,7 @@ description = "JNI bindings for usbdac-core (libusbdac.so)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 
 [lib]
 name = "usbdac"

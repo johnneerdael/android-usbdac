@@ -6,8 +6,6 @@ members = ["crates/usbdac-core", "crates/usbdac-jni"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://example.invalid/usbdac"
-rust-version = "1.75"
 
 [profile.release]
 opt-level = 3

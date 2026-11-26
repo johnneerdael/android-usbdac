@@ -234,7 +234,7 @@ impl DacStream {
     /// Holds the stream: wire-correct silence goes out (zero for PCM, the
     /// idle pattern for DSD, DoP markers keep alternating) so the DAC stays
     /// locked, and the ring is not consumed. Audio already submitted to the bus
-    /// (a few transfers: roughly 16 ms on a high-speed link, up to ~130 ms on a
+    /// (eight transfers: 16 to 32 ms on a high-speed link, about 130 ms on a
     /// full-speed one) still plays out first; the ring resumes exactly where it
     /// was.
     pub fn pause(&self) -> Result<()> {

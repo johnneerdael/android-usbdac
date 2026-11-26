@@ -67,3 +67,8 @@ pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use quirk::Quirk;
 pub use stream::{DacStream, StreamStats};
 pub use volume::{VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS};
+
+/// Compiles the README's example as a doctest so it cannot rot.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;

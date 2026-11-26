@@ -99,7 +99,7 @@ fn optional_string_of(env: &Env<'_>, text: &JString<'_>) -> Outcome<Option<Strin
 }
 
 fn java_string<'l>(env: &mut Env<'l>, value: &Value) -> Outcome<JString<'l>> {
-    Ok(JString::from_str(env, &value.to_string())?)
+    Ok(JString::from_str(env, value.to_string())?)
 }
 
 fn listener_of(env: &Env<'_>, target: &JObject<'_>) -> Outcome<Option<Arc<dyn DacListener>>> {
@@ -189,10 +189,9 @@ pub fn dac_close<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) {
                 let _ = stream.close();
             }
         }
-        match Arc::try_unwrap(entry) {
-            Ok(entry) => entry.dac.close()?,
-            // Another call still holds the DAC; the last holder closes it.
-            Err(_) => {}
+        // If another call still holds the DAC, the last holder closes it.
+        if let Ok(entry) = Arc::try_unwrap(entry) {
+            entry.dac.close()?;
         }
         Ok(())
     })
@@ -277,10 +276,9 @@ pub fn stream_open<'l>(
 pub fn stream_close<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, stream: i64) {
     run(&mut env, |_env| {
         let stream = registry::remove_stream(stream)?;
-        match Arc::try_unwrap(stream) {
-            Ok(stream) => stream.close()?,
-            // A call is still using it; it closes when that call returns.
-            Err(_) => {}
+        // If a call is still using it, it closes when that call returns.
+        if let Ok(stream) = Arc::try_unwrap(stream) {
+            stream.close()?;
         }
         Ok(())
     })
@@ -310,7 +308,7 @@ pub fn stream_write<'l>(
         let capacity = env
             .get_direct_buffer_capacity(&buffer)
             .map_err(|_| Failure::Bad("the buffer is not a direct ByteBuffer".into()))?;
-        if offset.checked_add(count).map_or(true, |end| end > capacity) {
+        if offset.checked_add(count).is_none_or(|end| end > capacity) {
             return Err(Failure::Bad(format!(
                 "offset {offset} + count {count} exceeds the buffer capacity {capacity}"
             )));

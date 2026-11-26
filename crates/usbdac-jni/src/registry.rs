@@ -66,8 +66,10 @@ impl DacEntry {
 }
 
 static DACS: Lazy<Mutex<HashMap<u64, Arc<DacEntry>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static STREAMS: Lazy<Mutex<HashMap<u64, (u64, Arc<DacStream>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Stream id to (owning DAC id, stream).
+type StreamTable = HashMap<u64, (u64, Arc<DacStream>)>;
+
+static STREAMS: Lazy<Mutex<StreamTable>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn stale(kind: &str, id: i64) -> Error {
     Error::InvalidArgument(format!("{kind} handle {id} is not open"))
