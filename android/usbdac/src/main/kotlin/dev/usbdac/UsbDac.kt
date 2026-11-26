@@ -51,7 +51,7 @@ public data class DacDeviceInfo(
     public val configurations: List<DacUsbConfiguration> get() = (0 until device.configurationCount).map { index ->
         val configuration = device.getConfiguration(index)
         val interfaces = configuration.interfaces().map { it.toInfo() }
-        val vendorPcm = isVendorPcmCandidate(device.vendorId, device.productId) && planVendorPcmClaims(interfaces, 0) != null
+        val vendorPcm = isVendorPcmCandidate(device.vendorId, device.productId) && planVendorPcmClaims(interfaces, device.vendorId, device.productId) != null
         DacUsbConfiguration(configuration.id, configuration.name, vendorPcm || hasPlayback(interfaces), vendorPcm || hasCapture(interfaces))
     }
 }
@@ -443,13 +443,21 @@ public object UsbDac {
         if (!isVendorPcmCandidate(device.device.vendorId, device.device.productId)) return null
         val info = deviceInfoJson(device.vendorId, device.productId, device.productName,
             device.manufacturerName, device.deviceName, emptyList(), configurationId = configuration)
-        val raw = nativeCall { Native.dacVendorPcmPreflight(fd, info) }
-        if (raw == "null") throw DacException(DacErrorCode.UNSUPPORTED, "no exact native-proven vendor PCM profile")
-        val proof = JSONObject(raw)
-        if (proof.getInt("configuration_id") != configuration || device.device.activeConfiguration(connection).id != configuration) {
+        val raw = nativeCall { Native.dacVendorPcmClaimsPreflight(fd, info) }
+        if (device.device.activeConfiguration(connection).id != configuration) {
             throw DacException(DacErrorCode.CLAIM, "active configuration changed during vendor PCM preflight")
         }
-        return planVendorPcmClaims(interfaces.map { it.toInfo() }, proof.getInt("interface_id"))
+        // A positively standard Audio-class configuration uses the established class claim flow.
+        if (raw == "null") return null
+        val proof = JSONObject(raw)
+        if (proof.getInt("configuration_id") != configuration) {
+            throw DacException(DacErrorCode.CLAIM, "active configuration changed during vendor PCM preflight")
+        }
+        val provenInterfaces = proof.getJSONArray("interfaces").let { ids ->
+            (0 until ids.length()).map(ids::getInt)
+        }
+        return planVendorPcmClaims(interfaces.map { it.toInfo() }, device.device.vendorId,
+            device.device.productId, provenInterfaces)
             ?: throw DacException(DacErrorCode.CLAIM, "vendor PCM proof does not match Android interfaces")
     }
 

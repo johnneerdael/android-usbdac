@@ -36,15 +36,32 @@ internal data class ClaimPlan(val controlIds: List<Int>, val streamingIds: List<
 
 /** Discovery is prospective; the native read-only proof is required before any claim. */
 internal fun isVendorPcmCandidate(vendorId: Int, productId: Int): Boolean =
-    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b)
+    vendorPcmInterfaceIds(vendorId, productId) != null
 
-/** Corroborate the dedicated native-proven bidirectional vendor interface. */
-internal fun planVendorPcmClaims(interfaces: List<InterfaceInfo>, interfaceId: Int): ClaimPlan? {
-    val alternates = interfaces.filter { it.id == interfaceId }
-    if (interfaceId != 0 || alternates.size != 2 || alternates.any { it.interfaceClass != 0xff }) return null
-    if (alternates.none { it.alternateSetting == 0 && !it.hasIsochronousIn && !it.hasIsochronousOut }) return null
-    if (alternates.none { it.alternateSetting == 1 && it.hasIsochronousIn && it.hasIsochronousOut }) return null
-    return ClaimPlan(emptyList(), listOf(interfaceId))
+private fun vendorPcmInterfaceIds(vendorId: Int, productId: Int): List<Int>? = when {
+    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b) -> listOf(0)
+    vendorId == 0x0582 && productId in listOf(0x0120, 0x012f) -> listOf(0, 1)
+    else -> null
+}
+
+/** Corroborate the exact native-proven interface set without claiming neighboring MIDI/control interfaces. */
+internal fun planVendorPcmClaims(
+    interfaces: List<InterfaceInfo>,
+    vendorId: Int,
+    productId: Int,
+    interfaceIds: List<Int> = vendorPcmInterfaceIds(vendorId, productId).orEmpty(),
+): ClaimPlan? {
+    val expected = vendorPcmInterfaceIds(vendorId, productId) ?: return null
+    if (interfaceIds.distinct().size != interfaceIds.size || interfaceIds.sorted() != expected) return null
+    for (id in expected) {
+        val alternates = interfaces.filter { it.id == id && (vendorId != 0x0582 || it.alternateSetting in 0..1) }
+        if (alternates.size != 2 || alternates.any { it.interfaceClass != 0xff }) return null
+        if (alternates.none { it.alternateSetting == 0 && !it.hasIsochronousIn && !it.hasIsochronousOut }) return null
+        val output = vendorId != 0x0582 || id == 0
+        val input = vendorId != 0x0582 || id == 1
+        if (alternates.none { it.alternateSetting == 1 && it.hasIsochronousOut == output && it.hasIsochronousIn == input }) return null
+    }
+    return ClaimPlan(emptyList(), expected)
 }
 
 /**

@@ -181,6 +181,20 @@ pub fn dac_vendor_pcm_preflight<'l>(
     })
 }
 
+/// Read-only exact vendor PCM configuration and complete interface ownership proof.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_vendor_pcm_claims_preflight<'l>(
+    mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32, device_info_json: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let info = json::parse_device_info(&string_of(env, &device_info_json)?)?;
+        let profile = Dac::vendor_pcm_claims_preflight(fd, &info)?;
+        java_string(env, &serde_json::json!(profile.map(|(configuration, interfaces)| serde_json::json!({
+            "configuration_id": configuration, "interfaces": interfaces,
+        }))))
+    })
+}
+
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn dac_feedback_preflight<'l>(
     mut env: EnvUnowned<'l>,

@@ -677,7 +677,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(message));
     }
 
-    if let Some(capture) = attachment.as_ref() {
+    if let Some(capture) = attachment.as_ref().filter(|_| vendor_profile.is_none()) {
         if let Err(error) = capture.configure(&claimed_handle, &candidate, expected) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
         }
@@ -723,11 +723,28 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
     }
-    if vendor_profile.is_some() {
+    if vendor_profile.is_some() && attachment.is_none() {
         if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
             .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed after activation".into()) }) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Transfer(error));
+        }
+    }
+    if let Some(profile) = vendor_profile.as_ref() {
+        let verification = (|| {
+            if let Some(capture) = attachment.as_ref() {
+                capture.configure(&claimed_handle, &candidate, expected)?;
+            } else {
+                capture_stream::verify_vendor_interface_alternate(&claimed_handle, profile.interface_number, profile.alt_setting)?;
+                if profile.input_interface_number != profile.interface_number {
+                    capture_stream::verify_vendor_interface_alternate(&claimed_handle, profile.input_interface_number, profile.input_alt_setting)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
         }
     }
     thread::sleep(Duration::from_millis(50));

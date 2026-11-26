@@ -748,3 +748,39 @@ on all four ABIs. Its SHA-256 is
 Physical acceptance needs each target mixer at its exact channel
 count, with an OUT-start trace, measured feedback, independent capture
 and shared duplex capture.
+
+### Fixed-rate Roland multichannel interfaces
+
+The ALSA table gives the OCTO-CAPTURE (`0582:0120`) and QUAD-CAPTURE
+(`0582:012f`) an exact 44.1 kHz signed 32-bit little-endian format.
+The OCTO-CAPTURE has 10 USB playback channels and 12 capture channels.
+The QUAD-CAPTURE has 4 playback channels and 6 capture channels.
+Playback uses interface 0, alternate 1, endpoint `0x05`. Capture uses
+interface 1, alternate 1, endpoint `0x85`. Verify both vendor interfaces,
+their zero-bandwidth alternates and the live endpoint geometry, then
+claim only those two interfaces. The exact profile accepts an asynchronous
+audio IN pipe with either normal or implicit-feedback data usage. A standard
+USB Audio configuration uses the class parser. [ALSA fixed Roland formats](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L1214-L1311),
+[ALSA Roland timing](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L135-L198)
+
+Playback and duplex post valid silence before acquiring timing from IN.
+Duplex capture reads the same IN transfers used for that timing.
+Standalone capture keeps its companion OUT endpoint running at the
+fixed nominal cadence with digital silence. A valid OUT completion
+qualifies the initial capture data. Both transfer pools retire before
+alternate and claim hand-back. [ALSA companion endpoint startup](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/pcm.c#L283-L310),
+[ALSA silent playback packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L279-L318)
+
+Exercise both profiles with exact channel counts. During capture alone,
+check the OUT endpoint's zero-filled frame schedule and the captured
+channel order. During duplex, check acquisition and continued pacing,
+then confirm both alternates return to zero after stop or detach.
+
+Rust workspace tests, the Android arm64 NDK check, Kotlin unit tests,
+the AAR and sample builds, and the SDK snippet check passed. The AAR
+and sample APK package identical native libraries on all four ABIs and
+retain both the single-interface and full-set JNI preflight exports.
+The AAR SHA-256 is
+`4bccece983076c7b17acc33e2e3c9ba1f6cb727b25ccf94317ef98ffde72e1e2`.
+Live playback, standalone capture, duplex, and alternate hand-back remain
+to be verified on both models.

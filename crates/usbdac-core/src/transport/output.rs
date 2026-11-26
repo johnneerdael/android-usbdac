@@ -2,7 +2,7 @@ use super::*;
 
 /// Bootstrap the exact PLAYBACK_FIRST pair without touching application PCM,
 /// playback position, loss accounting, or payload verification.
-fn nominal_pcm_silence(scheduler: &mut IsoPacketScheduler, max_packet: usize,
+pub(super) fn nominal_pcm_silence(scheduler: &mut IsoPacketScheduler, max_packet: usize,
     stride: usize, epoch: u64) -> Result<IsoTransferPayload, String> {
     let packet_sizes = scheduler.next_transfer_packet_bytes();
     if stride == 0 || packet_sizes.is_empty() || packet_sizes.iter().any(|&n| n == 0 || n > max_packet || n % stride != 0) {
@@ -13,8 +13,12 @@ fn nominal_pcm_silence(scheduler: &mut IsoPacketScheduler, max_packet: usize,
         underrun: false, held: true, frame_count: 0, music_frames: 0, epoch })
 }
 
-fn retire_bootstrap(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) -> Result<bool, Error> {
-    let Some((status, _, _)) = slot.take_completion() else { return Ok(false); };
+pub(super) fn retire_bootstrap(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) -> Result<bool, Error> {
+    retire_bootstrap_completion(slot, acceptance).map(|completion| completion.is_some())
+}
+
+pub(super) fn retire_bootstrap_completion(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) -> Result<Option<Instant>, Error> {
+    let Some((status, completed, _)) = slot.take_completion() else { return Ok(None); };
     let result = if status == LIBUSB_TRANSFER_COMPLETED {
         slot.validate_packets(acceptance).map_err(Error::Transfer).and_then(|stats| if stats == CompletionStats::default() {
             Ok(())
@@ -23,7 +27,7 @@ fn retire_bootstrap(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) ->
         Err(Error::DeviceLost)
     } else { Err(Error::Transfer(format!("PLAYBACK_FIRST silence transfer status {status}"))) };
     slot.mark_completed();
-    result.map(|()| true)
+    result.map(|()| Some(completed))
 }
 
 pub(super) fn prepare_iso_transfer_payload(
@@ -258,6 +262,11 @@ pub(super) fn drain_iso_transfer_slots(context: &Context, slots: &mut [IsoTransf
         slot.cancel();
     }
 
+    retire_cancelled_iso_transfer_slots(context, slots);
+}
+
+/// Retire a pool after its complete owner batch has requested cancellation.
+pub(super) fn retire_cancelled_iso_transfer_slots(context: &Context, slots: &mut [IsoTransferSlot]) {
     let mut warned = false;
     while slots.iter().any(|slot| slot.in_flight) {
         if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
@@ -1678,6 +1687,24 @@ mod playback_first_tests {
         assert!(payload.held);
         assert!(!payload.underrun);
         assert_eq!((payload.frame_count, payload.music_frames, payload.epoch), (0, 0, 17));
+    }
+    #[test]
+    fn roland_nominal_silence_preserves_44100_fractional_frame_cadence() {
+        let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
+        for channels in [4, 10] {
+            let stride = channels * 4;
+            let mut scheduler = IsoPacketScheduler::with_geometry(44_100, stride, 125, geometry);
+            // 8000 microframes represent exactly one second, independent of URB boundaries.
+            let mut sizes = Vec::new();
+            for _ in 0..8000 / geometry.packets_per_transfer {
+                let payload = nominal_pcm_silence(&mut scheduler, 7 * stride, stride, 0).unwrap();
+                assert!(payload.transfer_buffer.iter().all(|&byte| byte == 0));
+                assert_eq!((payload.frame_count, payload.music_frames), (0, 0));
+                sizes.extend(payload.packet_sizes);
+            }
+            assert!(sizes.iter().all(|&size| size == 5 * stride || size == 6 * stride));
+            assert_eq!(sizes.iter().sum::<usize>() / stride, 44_100);
+        }
     }
     #[test]
     fn nominal_bootstrap_rejects_capacity_or_frame_mismatch() {

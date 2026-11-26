@@ -166,10 +166,14 @@ impl Attachment {
         expected: &crate::StreamFormat) -> Result<(), Error> {
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
         if self.endpoint.vendor_pcm.is_some() {
-            // Playback has activated this exact shared alternate; capture only
-            // joins its IN pool and never reprograms or reactivates the interface.
+            // Playback has activated both exact alternates; capture joins the
+            // existing implicit IN pool and never opens another companion OUT.
+            let profile = self.endpoint.vendor_pcm.as_ref().expect("vendor profile");
+            if profile.interface_number != self.endpoint.interface {
+                capture_stream::verify_vendor_interface_alternate(claimed, profile.interface_number, profile.alt_setting)?;
+            }
             capture_stream::verify_vendor_capture_alternate(claimed, &self.endpoint, self.endpoint.alternate)?;
-            return validate_clocks(claimed, playback, expected, &self.endpoint);
+            return Ok(());
         }
         if self.shared_implicit {
             // Playback owns both programming and activation of this IN source.
