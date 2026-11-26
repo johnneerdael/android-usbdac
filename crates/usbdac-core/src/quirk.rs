@@ -29,6 +29,10 @@ pub enum Quirk {
     DsdBigEndian,
     /// Reverse the bit order within each native DSD byte.
     DsdBitReverse,
+    /// Decode four-byte high-speed feedback as frames per OUT service interval.
+    /// Opt in only with a device trace proving these units (e.g. Linux UAC2 gadget).
+    /// No built-in device enables this compatibility rule.
+    ExplicitFeedbackPerServiceInterval,
 }
 
 struct BuiltinEntry {

@@ -166,6 +166,17 @@ impl IsoPacketScheduler {
     /// errors and malformed feedback values that would otherwise cause a large
     /// audio discontinuity.
     pub(crate) fn update_feedback_frames_per_packet(&mut self, frames_per_packet: f64) -> bool {
+        if !self.feedback_rate_is_plausible(frames_per_packet) { return false; }
+
+        self.feedback_frames_per_packet = Some(match self.feedback_frames_per_packet {
+            Some(previous) => previous + (frames_per_packet - previous) * 0.2,
+            None => frames_per_packet,
+        });
+        true
+    }
+
+    /// Validate without changing EWMA or fractional phase while scanning a batch.
+    pub(crate) fn feedback_rate_is_plausible(&self, frames_per_packet: f64) -> bool {
         if !frames_per_packet.is_finite() || frames_per_packet <= 0.0 {
             return false;
         }
@@ -175,10 +186,6 @@ impl IsoPacketScheduler {
             return false;
         }
 
-        self.feedback_frames_per_packet = Some(match self.feedback_frames_per_packet {
-            Some(previous) => previous * 0.8 + frames_per_packet * 0.2,
-            None => frames_per_packet,
-        });
         true
     }
 

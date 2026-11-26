@@ -158,6 +158,7 @@ pub(super) struct ImplicitFeedbackSource {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FeedbackEndpoint {
+    pub(super) refresh: u8,
     pub(super) address: u8,
     pub(super) transfer_type: TransferType,
     pub(super) interval: u8,

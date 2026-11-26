@@ -51,6 +51,7 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 | `SettleDelayMs(ms)` | Wait this long after programming the clock | None |
 | `PreferPadded24BitTransport` | The 4-byte slot for 24-bit PCM, as `padded24Bit` | None on the samples |
 | `DsdSubslotSize(bytes)` | Override the slot size of native DSD alternate settings whose descriptors are wrong | None |
+| `ExplicitFeedbackPerServiceInterval` | Interpret four-byte high-speed explicit feedback as frames per OUT service interval for the matched device. Use this only with a trace confirming those units | Live feedback must still lock before the stream is verified |
 | `DsdBigEndian` | Native DSD words go on the wire most-significant byte first | None |
 | `DsdBitReverse` | Reverse the bit order within each native DSD byte, for a DAC that expects the other order | None on the flag |
 

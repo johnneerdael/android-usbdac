@@ -451,7 +451,7 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
     {
         return Some(BitPerfectBlocker::FormatChanged);
     }
-    if state.runtime_stats.as_ref().is_some_and(|stats| stats.implicit_feedback.load(Ordering::Acquire) && !stats.feedback_locked.load(Ordering::Acquire)) {
+    if state.runtime_stats.as_ref().is_some_and(|stats| (stats.implicit_feedback.load(Ordering::Acquire) || stats.feedback_required.load(Ordering::Acquire)) && !stats.feedback_locked.load(Ordering::Acquire)) {
         return Some(BitPerfectBlocker::FeedbackUnlocked);
     }
     if !state.clock_verification_passed {

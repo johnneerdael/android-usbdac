@@ -64,6 +64,9 @@ public sealed interface DacQuirk {
     /** Reverse the bit order within each native DSD byte. */
     public data object DsdBitReverse : DacQuirk
 
+    /** Trace-backed high-speed four-byte feedback reports express frames per OUT service interval. */
+    public data object ExplicitFeedbackPerServiceInterval : DacQuirk
+
     /** Wait this long after programming the clock. */
     public data class SettleDelayMs(val milliseconds: Long) : DacQuirk
 

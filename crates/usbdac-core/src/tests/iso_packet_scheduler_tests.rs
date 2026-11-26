@@ -381,3 +381,23 @@ fn test_scheduler_feedback_rejects_and_recovers_from_outlier() {
         .sum();
     assert!(total_frames > 352_800);
 }
+
+#[test]
+fn explicit_feedback_validation_preserves_phase_and_updates_ewma_once() {
+    let mut scheduler = IsoPacketScheduler::new(48_000, 8, 1000);
+    assert!(scheduler.update_feedback_frames_per_packet(48.25));
+    let first = scheduler.next_transfer_packet_bytes();
+    let first_frames: usize = first.iter().map(|bytes| bytes / 8).sum();
+    // Candidate scans validate without mutating the current rate or phase.
+    for _ in 0..10 { assert!(scheduler.feedback_rate_is_plausible(48.75)); }
+    assert!(scheduler.update_feedback_frames_per_packet(48.75)); // 48.25 * .8 + 48.75 * .2 = 48.35
+    let mut total = first_frames;
+    let mut remaining_packets = 0usize;
+    for _ in 0..100 {
+        let packets = scheduler.next_transfer_packet_bytes();
+        remaining_packets += packets.len();
+        total += packets.iter().map(|bytes| bytes / 8).sum::<usize>();
+    }
+    let integrated = first.len() as f64 * 48.25 + remaining_packets as f64 * 48.35;
+    assert!((total as f64 - integrated).abs() < 1.0);
+}

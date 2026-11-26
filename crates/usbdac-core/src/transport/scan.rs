@@ -1104,10 +1104,14 @@ pub(super) fn find_feedback_endpoint(
     };
 
     let feedback = FeedbackEndpoint {
+        refresh: descriptor.endpoint_descriptors().find(|ep| ep.address() == endpoint.address)
+            .map(|ep| ep.refresh()).unwrap_or(0),
         address: endpoint.address,
         transfer_type: endpoint.transfer_type,
         interval: endpoint.interval,
-        service_interval_us: service_interval_micros(speed, endpoint.interval),
+        service_interval_us: if endpoint.transfer_type == TransferType::Interrupt && speed == Speed::Full {
+            u32::from(endpoint.interval.max(1)) * 1000
+        } else { service_interval_micros(speed, endpoint.interval) },
         max_packet_bytes: effective_iso_packet_bytes(endpoint.max_packet_size, speed),
     };
     let resolution = if feedback_address != 0 && endpoint.address == feedback_address {

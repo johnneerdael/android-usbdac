@@ -410,7 +410,10 @@ now), `buffer_capacity_ms`, `transfer_queue_depth`,
 `clock_verified` (the DAC confirmed the sampling frequency, or the device quirk
 trusts its `SET_CUR`), `payload_verified` (the wire payload audit passes) and
 `payload_constant_for_ms` (how long the payload has been failing the audit, while
-it does). Frame counters are in `counter_rate_hz()` units, except implicit
+it does). `feedback_locked` and `feedback_active` report live feedback,
+including explicit and implicit pacing. A successful empty explicit poll
+increments `feedback_empty` and leaves the last accepted rate and its age
+unchanged. Frame counters are in `counter_rate_hz()` units, except implicit
 `implicit_measured_frames` and `implicit_scheduled_frames`, which count USB
 wire frames. Implicit timing stats also report FIFO depth and high-water mark,
 waits, empty OUT queue events, overruns, IN completions, out-of-order
@@ -453,6 +456,20 @@ Asynchronous` and `explicit_feedback == false`, the log says so, and
 Some(UnsynchronizedAsync)` for the whole stream. An endpoint that declares a
 feedback endpoint the library cannot resolve is malformed and is never streamed,
 whatever the setting.
+
+### Explicit report compatibility
+
+Full-speed feedback uses frames per USB frame and high-speed feedback uses
+frames per USB microframe. The driver scales the rate to the OUT service
+interval and checks that the largest packet needed by fractional scheduling fits
+the endpoint. It uses the newest valid report in each batch.
+
+With evidence that a high-speed device sends four-byte feedback in frames per
+OUT service interval, add `Quirk::ExplicitFeedbackPerServiceInterval` through a
+VID/PID-scoped `QuirkOverride`. Configure the override only for a device whose
+report bytes and OUT interval confirm these units. The [Linux UAC2 gadget
+implementation](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/function/u_audio.c#L100-L147)
+illustrates the alternate units.
 
 ### Descriptor parsing
 
@@ -523,7 +540,7 @@ Closures `Fn(DacEvent) + Send + Sync` are listeners.
 | `LostFrames { frames }` | The DAC did not take queued audio (timed-out or short transfer). It cannot be re-sent. |
 | `BitPerfectChanged(bool)` | `is_bit_perfect()` changed. |
 | `VolumeChanged(VolumeState)` | The hardware volume or mute was changed through this library. |
-| `FeedbackStale` | The explicit feedback endpoint stopped producing valid reports; timing falls back to the last good value or the nominal rate. |
+| `FeedbackStale` | The feedback source stopped supplying usable timing. The bit-perfect verdict clears. Explicit pacing can recover during a bounded hold of the last good rate. Persistent failure ends the stream. |
 | `Error(Error)` | The stream failed. Followed by `StateChanged(Failed)`. |
 | `DeviceLost` | The device is gone. Also delivered as `Error(DeviceLost)` for a stream. |
 

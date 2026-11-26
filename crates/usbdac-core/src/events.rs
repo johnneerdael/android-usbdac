@@ -65,8 +65,9 @@ pub enum DacEvent {
     BitPerfectChanged(bool),
     /// The hardware volume or mute changed through this library.
     VolumeChanged(VolumeState),
-    /// The DAC's feedback endpoint stopped producing valid reports; packet
-    /// timing falls back to the last good value or the nominal rate.
+    /// Feedback pacing lost its live lock. Explicit playback holds its last
+    /// good rate for a bounded grace period, then fails if reports do not recover.
+    /// Emitted once per stale transition after publishing the cleared lock.
     FeedbackStale,
     /// The stream (or a control request) failed.
     Error(Error),

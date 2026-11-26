@@ -1047,6 +1047,8 @@ pub(super) fn start_stream_inner(
         config.processing_buffer_target_ms as usize,
     ));
     runtime_stats.implicit_feedback.store(candidate.implicit_feedback.is_some(), Ordering::Release);
+    runtime_stats.feedback_required.store(candidate.implicit_feedback.is_some()
+        || (candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_some()), Ordering::Release);
     set_runtime_stats(Some(Arc::clone(&runtime_stats)));
     let pcm_buffer = Arc::new(Mutex::new(PcmRing::new(
         runtime_stats.buffer_capacity_samples,

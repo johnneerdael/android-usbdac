@@ -472,6 +472,9 @@ fn parse_quirk(value: &Value) -> Decoded<Quirk> {
             "prefer_padded_24bit_transport" => Ok(Quirk::PreferPadded24BitTransport),
             "dsd_big_endian" => Ok(Quirk::DsdBigEndian),
             "dsd_bit_reverse" => Ok(Quirk::DsdBitReverse),
+            "explicit_feedback_per_service_interval" => {
+                Ok(Quirk::ExplicitFeedbackPerServiceInterval)
+            }
             other => Err(unknown(other)),
         },
         Value::Object(map) if map.len() == 1 => {
@@ -654,7 +657,7 @@ mod tests {
             r#"{"buffer_target_ms":200,"require_verified_rate":false,"hand_back":"keep", "allow_unsynchronized_async":true,
                 "dsd_big_endian":true,
                 "quirks":[{"vendor_id":1,"product_id":2,"name_contains":"X",
-                           "quirks":["skip_clock_validation",{"settle_delay_ms":80},{"dsd_subslot_size":2}]}]}"#,
+                           "quirks":["skip_clock_validation",{"settle_delay_ms":80},{"dsd_subslot_size":2},"explicit_feedback_per_service_interval"]}]}"#,
         ))
         .ok()
         .unwrap();
@@ -671,11 +674,17 @@ mod tests {
         assert!(config.cancel_in_flight_on_flush, "unset: on");
         assert_eq!(config.quirks.len(), 1);
         assert_eq!(
+            (config.quirks[0].vendor_id, config.quirks[0].product_id),
+            (1, 2)
+        );
+        assert_eq!(config.quirks[0].name_contains.as_deref(), Some("X"));
+        assert_eq!(
             config.quirks[0].quirks,
             vec![
                 Quirk::SkipClockValidation,
                 Quirk::SettleDelayMs(80),
-                Quirk::DsdSubslotSize(2)
+                Quirk::DsdSubslotSize(2),
+                Quirk::ExplicitFeedbackPerServiceInterval,
             ]
         );
         assert_eq!(parse_config(None).ok().unwrap(), DacConfig::default());

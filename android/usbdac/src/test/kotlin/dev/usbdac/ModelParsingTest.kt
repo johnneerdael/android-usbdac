@@ -361,6 +361,7 @@ class ModelParsingTest {
                         DacQuirk.SettleDelayMs(80),
                         DacQuirk.DsdSubslotSize(4),
                         DacQuirk.DsdBitReverse,
+                        DacQuirk.ExplicitFeedbackPerServiceInterval,
                     ),
                 ),
             ),
@@ -393,6 +394,7 @@ class ModelParsingTest {
         assertEquals(80, quirks.getJSONObject(1).getInt("settle_delay_ms"))
         assertEquals(4, quirks.getJSONObject(2).getInt("dsd_subslot_size"))
         assertEquals("dsd_bit_reverse", quirks.getString(3))
+        assertEquals("explicit_feedback_per_service_interval", quirks.getString(4))
     }
 
     @Test

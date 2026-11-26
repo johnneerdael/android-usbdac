@@ -317,6 +317,21 @@ mod transport_loss_tests {
     }
 
     #[test]
+    fn explicit_feedback_live_lock_gates_bit_perfect() {
+        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stats = new_stream_stats();
+        let state = streaming_state(Arc::clone(&stats));
+        stats.feedback_required.store(true, Ordering::Release);
+        assert_eq!(bit_perfect_blocker(&state), Some(BitPerfectBlocker::FeedbackUnlocked));
+        stats.feedback_locked.store(true, Ordering::Release);
+        assert_eq!(bit_perfect_blocker(&state), None);
+        stats.feedback_locked.store(false, Ordering::Release);
+        assert_eq!(bit_perfect_blocker(&state), Some(BitPerfectBlocker::FeedbackUnlocked));
+        stats.feedback_required.store(false, Ordering::Release);
+        assert_eq!(bit_perfect_blocker(&state), None);
+    }
+
+    #[test]
     fn lost_frames_clear_the_bit_perfect_claim_until_a_new_stream() {
         let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();

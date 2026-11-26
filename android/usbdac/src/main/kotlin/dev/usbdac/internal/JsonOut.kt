@@ -22,6 +22,7 @@ private fun quirkJson(quirk: DacQuirk): Any = when (quirk) {
     DacQuirk.PreferPadded24BitTransport -> "prefer_padded_24bit_transport"
     DacQuirk.DsdBigEndian -> "dsd_big_endian"
     DacQuirk.DsdBitReverse -> "dsd_bit_reverse"
+    DacQuirk.ExplicitFeedbackPerServiceInterval -> "explicit_feedback_per_service_interval"
     is DacQuirk.SettleDelayMs -> JSONObject().put("settle_delay_ms", quirk.milliseconds)
     is DacQuirk.DsdSubslotSize -> JSONObject().put("dsd_subslot_size", quirk.bytes)
 }

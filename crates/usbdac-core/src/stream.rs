@@ -67,7 +67,7 @@ impl BitPerfectBlocker {
             Self::UnsynchronizedAsync => {
                 "asynchronous endpoint without feedback, host-paced at the nominal rate"
             }
-            Self::FeedbackUnlocked => "implicit feedback has not locked",
+            Self::FeedbackUnlocked => "feedback pacing has not locked",
             Self::PayloadUnverified => "wire payload audit failed",
         }
     }
@@ -497,8 +497,7 @@ impl DacStream {
             last_submit_gap_us: stats.last_submit_gap_us.load(Relaxed),
             max_submit_gap_us: stats.max_submit_gap_us.load(Relaxed),
             effective_rate_hz: stats.effective_consumer_rate_milli_hz.load(Relaxed) as f64 / 1_000.0,
-            feedback_active: if stats.implicit_feedback.load(Relaxed) { stats.feedback_locked.load(Relaxed) } else { self.inner.format.explicit_feedback
-                && matches!(self.inner.format.sync_type, crate::SyncKind::Asynchronous) },
+            feedback_active: stats.feedback_locked.load(Relaxed),
             feedback_reports: stats.feedback_reports.load(Relaxed),
             feedback_timeouts: stats.feedback_timeouts.load(Relaxed),
             feedback_errors: stats.feedback_errors.load(Relaxed),
