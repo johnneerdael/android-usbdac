@@ -503,7 +503,16 @@ pub(super) fn run_usb_output_loop(
     let mut feedback_start_error = None;
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
-            match FeedbackTransferSlot::new(endpoint, bus_config.bus_queue_ms) {
+            let compatibility = handle.device().device_descriptor().map(|descriptor| {
+                FeedbackCompatibility::for_device(
+                    descriptor.vendor_id(),
+                    descriptor.product_id(),
+                    candidate.usb_speed,
+                    endpoint,
+                    playback_format.sample_rate,
+                )
+            }).unwrap_or_default();
+            match FeedbackTransferSlot::new(endpoint, bus_config.bus_queue_ms, compatibility) {
                 Ok(slot) => feedback_slot = Some(slot),
                 Err(error) => {
                     feedback_start_error = Some(format!("explicit feedback allocation failed: {}", error));

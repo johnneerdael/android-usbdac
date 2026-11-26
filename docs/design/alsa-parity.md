@@ -483,3 +483,28 @@ The Android phone came online with the iBasso DC04U (`0661:0883`)
 attached. Its audio service reported an active media track. No
 test sample was installed, no DAC claim was taken, and no physical
 acceptance session was started while the phone was in use.
+
+## Built-in device compatibility
+
+The Focusrite Clarett 2Pre, 4Pre and 8Pre each have separate USB and
+Clarett+ product IDs under VID `1235`. Use their shared per-model mixer
+and mux geometry while keeping the identities separate in Rust and
+Android. Confirm firmware and complete live mixer and selector-zero
+readback before exposing the routing session. Per-rate mux edits still
+require independent readback of all banks, including the smaller
+high-rate bank and its padding. [ALSA Clarett geometry and USB IDs](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c#L2053-L2262)
+
+Resolve explicit-feedback rules from the opened USB device and selected
+feedback pipe. On the TEAC UD-H01 `0644:8038` and T+A DAC 8 `1852:5034`,
+correct the documented deviation in high-speed four-byte reports before
+the normal plausibility and packet-ceiling checks. For Playback Designs
+VID `23ba`, disregard the first four explicit isochronous feedback
+packet opportunities. A discarded report cannot establish or extend
+feedback lock. [ALSA start rules](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L1930-L1956), [ALSA report correction](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L1825-L1864)
+
+The Rust workspace, Android arm64 NDK check, Kotlin unit tests,
+sample build and SDK snippet check passed. The local AAR contains the
+native library for all four ABIs. Its SHA-256 is
+`2385559d2cefebb6d698c49d53e8ab149ede3e216bfd408ac92b75d55c7fb1d3`.
+The Clarett profiles and feedback workarounds still need physical
+verification on the matching devices.

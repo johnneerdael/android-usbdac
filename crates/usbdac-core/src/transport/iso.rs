@@ -347,15 +347,61 @@ impl Drop for IsoTransferSlot {
     }
 }
 
-/// Persistent asynchronous feedback IN slot.
-///
-/// The previous implementation performed a blocking feedback read from the
-/// single output thread. The OUT transfers on the bus only cover about 16 ms
-/// (`DacConfig::bus_queue_ms`), so a 50 ms feedback timeout could drain the
-/// entire hardware queue even while the software ring looked full. This slot
-/// is submitted once and re-armed from the same event loop after completion.
-/// It polls over at most the bus queue (and 16 ms), so a report is never older
-/// than what is queued for the DAC.
+/// Built-in rules are bound to the opened descriptor and selected explicit pipe.
+#[derive(Default, Debug)]
+pub(super) struct FeedbackCompatibility {
+    tenor_nominal_q16: Option<u32>,
+    startup_packets_remaining: u8,
+}
+
+impl FeedbackCompatibility {
+    pub(super) fn for_device(
+        vendor: u16,
+        product: u16,
+        speed: Speed,
+        endpoint: FeedbackEndpoint,
+        sample_rate: u32,
+    ) -> Self {
+        let explicit_isoc_in = endpoint.transfer_type == TransferType::Isochronous
+            && endpoint.address & 0x80 != 0;
+        let tenor = explicit_isoc_in
+            && endpoint.max_packet_bytes == 4
+            && speed == Speed::High
+            && matches!((vendor, product), (0x0644, 0x8038) | (0x1852, 0x5034));
+        // ALSA rounds samples per 125-us microframe to the nearest Q16.16 value.
+        let nominal_q16 = (u64::from(sample_rate) * 1024 + 62) / 125;
+        Self {
+            tenor_nominal_q16: tenor.then_some(nominal_q16).and_then(|nominal| u32::try_from(nominal).ok()),
+            startup_packets_remaining: if explicit_isoc_in && vendor == 0x23ba { 4 } else { 0 },
+        }
+    }
+
+    fn skip_packet(&mut self) -> bool {
+        let skip = self.startup_packets_remaining != 0;
+        self.startup_packets_remaining = self.startup_packets_remaining.saturating_sub(1);
+        skip
+    }
+}
+
+// Linux endpoint.c Tenor 8802 rule: correct only values strictly outside the
+// nominal half-sample window, before applying this transport's tighter guards.
+fn correct_tenor_feedback(raw: u32, nominal: u32) -> Option<u32> {
+    if raw == 0 || raw & 0xf000_0000 != 0 {
+        return None;
+    }
+    let lower = nominal.checked_sub(0x8000)?;
+    let upper = nominal.checked_add(0x8000)?;
+    if raw < lower {
+        raw.checked_add(0xf000)
+    } else if raw > upper {
+        raw.checked_sub(0xf000)
+    } else {
+        Some(raw)
+    }
+}
+
+/// Persistent asynchronous feedback IN slot. The output event loop re-arms
+/// the transfer after each completion, without blocking the OUT queue.
 pub(super) struct FeedbackTransferSlot {
     pub(super) transfer: std::ptr::NonNull<libusb_transfer>,
     pub(super) user_data: *mut IsoTransferUserData,
@@ -367,10 +413,15 @@ pub(super) struct FeedbackTransferSlot {
     retirement_context: Option<Context>,
     pub(super) submit_no_device: bool,
     retry_at: Instant,
+    compatibility: FeedbackCompatibility,
 }
 
 impl FeedbackTransferSlot {
-    pub(super) fn new(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> Result<Self, String> {
+    pub(super) fn new(
+        endpoint: FeedbackEndpoint,
+        bus_queue_ms: u32,
+        compatibility: FeedbackCompatibility,
+    ) -> Result<Self, String> {
         let packet_bytes = endpoint.max_packet_bytes.max(4);
         let packet_count = if endpoint.transfer_type == TransferType::Isochronous {
             let window_packets = (USB_FEEDBACK_POLL_WINDOW_MS.min(bus_queue_ms.max(1)) * 1_000)
@@ -413,6 +464,7 @@ impl FeedbackTransferSlot {
             retirement_context: None,
             submit_no_device: false,
             retry_at: Instant::now(),
+            compatibility,
         })
     }
 
@@ -488,7 +540,7 @@ impl FeedbackTransferSlot {
         completion.take()
     }
 
-    fn newest_valid_report(&self, scheduler: &IsoPacketScheduler, service_us: u32,
+    fn newest_valid_report(&mut self, scheduler: &IsoPacketScheduler, service_us: u32,
         speed: Speed, max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
         actual_length: usize) -> Option<(f64, f64)> {
         let buffer = unsafe { &(*self.user_data).buffer };
@@ -498,13 +550,15 @@ impl FeedbackTransferSlot {
                 counters.errors = counters.errors.saturating_add(1);
                 return None;
             }
-            select_feedback_report(buffer, (0..self.packet_count).map(|index| {
+            select_feedback_report_with_compatibility(buffer, (0..self.packet_count).map(|index| {
                 let packet = unsafe { &*transfer.iso_packet_desc.as_ptr().add(index) };
                 (packet.status, packet.length as usize, packet.actual_length as usize)
-            }), scheduler, service_us, speed, max_frames, per_service, counters)
+            }), scheduler, service_us, speed, max_frames, per_service, counters, &mut self.compatibility)
         } else {
-            select_feedback_report(buffer, [(LIBUSB_TRANSFER_COMPLETED, self.packet_bytes, actual_length)],
-                scheduler, service_us, speed, max_frames, per_service, counters)
+            select_feedback_report_with_compatibility(
+                buffer, [(LIBUSB_TRANSFER_COMPLETED, self.packet_bytes, actual_length)],
+                scheduler, service_us, speed, max_frames, per_service, counters, &mut self.compatibility,
+            )
         }
     }
 
@@ -558,18 +612,30 @@ pub(super) struct FeedbackCounters {
     last_report_len: usize,
 }
 
-/// Scan requested packet spans, never a shortened/concatenated actual-length prefix.
-/// Validate all candidates before selecting one; update the EWMA only once per transfer.
+#[cfg(test)]
 fn select_feedback_report(
     buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
     scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
     max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
+) -> Option<(f64, f64)> {
+    select_feedback_report_with_compatibility(buffer, packets, scheduler, service_us,
+        speed, max_frames, per_service, counters, &mut FeedbackCompatibility::default())
+}
+
+/// Scan the requested packet spans and update the EWMA only once per transfer.
+fn select_feedback_report_with_compatibility(
+    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
+    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
+    compatibility: &mut FeedbackCompatibility,
 ) -> Option<(f64, f64)> {
     let mut offset = 0usize;
     let mut newest = None;
     for (status, requested, actual) in packets {
         let start = offset;
         offset = offset.saturating_add(requested);
+        // A completed URB contributes each bus opportunity, including failed or empty packets.
+        let skip = compatibility.skip_packet();
         if status != LIBUSB_TRANSFER_COMPLETED {
             counters.errors = counters.errors.saturating_add(1);
             continue;
@@ -580,7 +646,18 @@ fn select_feedback_report(
         }
         let report = (actual <= requested && offset <= buffer.len())
             .then(|| buffer.get(start..start.saturating_add(actual))).flatten();
-        let decoded = report.and_then(|bytes| decode_feedback_report_with_scale(bytes, service_us, speed, per_service));
+        let decoded = report.and_then(|bytes| {
+            if let (false, Speed::High, Some(nominal), Ok(raw_bytes)) =
+                (per_service, speed, compatibility.tenor_nominal_q16, bytes.try_into())
+            {
+                let corrected = correct_tenor_feedback(u32::from_le_bytes(raw_bytes), nominal)?;
+                return decode_feedback_report_with_scale(&corrected.to_le_bytes(), service_us, speed, false);
+            }
+            decode_feedback_report_with_scale(bytes, service_us, speed, per_service)
+        });
+        // Discard startup rates before selection: these cannot acquire or renew lock.
+        // Malformed packets still contribute the normal diagnostics.
+        if skip && decoded.is_some() { continue; }
         if let Some((frames, rate)) = decoded.filter(|(frames, _)|
             scheduler.feedback_rate_is_plausible(*frames) && frames.ceil() <= max_frames as f64) {
             newest = Some((frames, rate));
@@ -851,6 +928,122 @@ mod explicit_feedback_tests {
 
     fn q16(frames: f64) -> [u8; 4] { ((frames * 65536.0).round() as u32).to_le_bytes() }
     fn scheduler(service_us: u32) -> IsoPacketScheduler { IsoPacketScheduler::new(48_000, 8, service_us) }
+
+    fn feedback_pipe() -> FeedbackEndpoint {
+        FeedbackEndpoint { refresh: 0, address: 0x81, transfer_type: TransferType::Isochronous,
+            interval: 1, service_interval_us: 125, max_packet_bytes: 4 }
+    }
+
+    fn compatible_report(report: &[u8], service_us: u32, max_frames: usize, per_service: bool,
+        compatibility: &mut FeedbackCompatibility) -> Option<(f64, f64)> {
+        select_feedback_report_with_compatibility(report, [(0, report.len(), report.len())],
+            &scheduler(service_us), service_us, Speed::High, max_frames, per_service,
+            &mut FeedbackCounters::default(), compatibility)
+    }
+
+    #[test]
+    fn tenor_correction_is_exact_identity_pipe_and_bus_scoped() {
+        let pipe = feedback_pipe();
+        for (vendor, product) in [(0x0644, 0x8038), (0x1852, 0x5034)] {
+            let mut compatibility = FeedbackCompatibility::for_device(vendor, product, Speed::High, pipe, 48_000);
+            for raw in [0x60000 - 0xf000, 0x60000, 0x60000 + 0xf000] {
+                assert_eq!(compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility),
+                    Some((6.0, 48_000.0)));
+            }
+        }
+        for (vendor, product) in [(0x0644, 0x8037), (0x0644, 0x8039), (0x1852, 0x5035), (0x1853, 0x5034)] {
+            let mut compatibility = FeedbackCompatibility::for_device(vendor, product, Speed::High, pipe, 48_000);
+            assert!(compatibility.tenor_nominal_q16.is_none());
+            assert!(compatible_report(&q16(6.9375), 125, 7, false, &mut compatibility).is_none());
+        }
+        for speed in [Speed::Full, Speed::Super, Speed::SuperPlus, Speed::Unknown] {
+            assert!(FeedbackCompatibility::for_device(0x0644, 0x8038, speed, pipe, 48_000)
+                .tenor_nominal_q16.is_none());
+        }
+        for disabled_pipe in [FeedbackEndpoint { max_packet_bytes: 3, ..pipe },
+            FeedbackEndpoint { max_packet_bytes: 8, ..pipe },
+            FeedbackEndpoint { address: 1, ..pipe },
+            FeedbackEndpoint { transfer_type: TransferType::Interrupt, ..pipe }] {
+            let compatibility = FeedbackCompatibility::for_device(0x0644, 0x8038, Speed::High, disabled_pipe, 48_000);
+            assert!(compatibility.tenor_nominal_q16.is_none());
+        }
+    }
+
+    #[test]
+    fn tenor_uses_checked_strict_bounds_and_never_bypasses_admission() {
+        assert_eq!(correct_tenor_feedback(0, 0x60000), None);
+        assert_eq!(correct_tenor_feedback(0x58000, 0x60000), Some(0x58000));
+        assert_eq!(correct_tenor_feedback(0x68000, 0x60000), Some(0x68000));
+        assert_eq!(correct_tenor_feedback(0x57fff, 0x60000), Some(0x66fff));
+        assert_eq!(correct_tenor_feedback(0x68001, 0x60000), Some(0x59001));
+        assert_eq!(correct_tenor_feedback(1, 0x7fff), None); // nominal bound underflow
+        assert_eq!(correct_tenor_feedback(u32::MAX, u32::MAX), None); // nominal bound overflow
+        let mut compatibility = FeedbackCompatibility::for_device(0x0644, 0x8038,
+            Speed::High, feedback_pipe(), 48_000);
+        for raw in [0, 1, 0xf0060000, 0x80000] {
+            assert!(compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility).is_none());
+        }
+        // Corrected values still need fractional-ceiling capacity and nominal-rate checks.
+        let report = q16(6.01 + 0.9375);
+        assert!(compatible_report(&report, 1000, 48, false, &mut compatibility).is_none());
+        assert!(compatible_report(&report, 1000, 49, false, &mut compatibility).is_some());
+        assert!(compatible_report(&q16(7.2), 125, 8, false, &mut compatibility).is_none());
+        // The explicit user scale wins and is never followed by the Tenor subtraction.
+        assert_eq!(compatible_report(&q16(48.0), 1000, 49, true, &mut compatibility), Some((48.0, 48_000.0)));
+        // A three-byte report keeps the existing Q10.14 interpretation.
+        assert_eq!(compatible_report(&[0, 0x80, 1], 125, 7, false, &mut compatibility), Some((6.0, 48_000.0)));
+    }
+
+    #[test]
+    fn playback_designs_skips_four_completed_bus_opportunities_across_batches() {
+        let mut compatibility = FeedbackCompatibility::for_device(0x23ba, 0xffff,
+            Speed::High, feedback_pipe(), 48_000);
+        let mut counters = FeedbackCounters::default();
+        let prior_lock = Instant::now();
+        counters.last_report_at = Some(prior_lock);
+        let report = q16(6.0);
+        assert!(select_feedback_report_with_compatibility(&report.repeat(2), [(0, 4, 4); 2],
+            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).is_none());
+        // A transfer-level failure never invokes packet selection (and consumes no skip).
+        assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, false, 0x81).is_none());
+        assert_eq!(compatibility.startup_packets_remaining, 2);
+        assert!(select_feedback_report_with_compatibility(&report.repeat(2),
+            [(LIBUSB_TRANSFER_ERROR, 4, 4), (0, 4, 0)], &scheduler(125), 125, Speed::High,
+            7, false, &mut counters, &mut compatibility).is_none());
+        assert_eq!(counters.errors, 1);
+        assert_eq!(counters.empty_polls, 1);
+        assert_eq!(counters.last_report_at, Some(prior_lock));
+        assert_eq!(counters.reports, 0);
+        let mut bytes = report.to_vec();
+        bytes.extend_from_slice(&q16(6.01));
+        bytes.extend_from_slice(&q16(48.0)); // newest invalid report cannot replace the good one
+        let selected = select_feedback_report_with_compatibility(&bytes, [(0, 4, 4); 3],
+            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).unwrap();
+        assert!((selected.0 - 6.01).abs() < 1.0 / 65536.0);
+        assert_eq!(counters.rejected, 1);
+        let fresh = FeedbackCompatibility::for_device(0x23ba, 1, Speed::Full, feedback_pipe(), 48_000);
+        assert_eq!(fresh.startup_packets_remaining, 4);
+    }
+
+    #[test]
+    fn playback_startup_keeps_malformed_safety_and_non_iso_semantics() {
+        let mut compatibility = FeedbackCompatibility::for_device(0x23ba, 1,
+            Speed::High, feedback_pipe(), 48_000);
+        let mut counters = FeedbackCounters::default();
+        assert!(select_feedback_report_with_compatibility(&[0; 16],
+            [(0, 4, 5), (0, 4, 2), (0, 4, 0), (LIBUSB_TRANSFER_ERROR, 4, 4)],
+            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).is_none());
+        assert_eq!(counters.malformed, 2);
+        assert_eq!(counters.rejected, 2);
+        assert_eq!(counters.empty_polls, 1);
+        assert_eq!(counters.errors, 1);
+        assert_eq!(compatibility.startup_packets_remaining, 0);
+        for (vendor, pipe) in [(0x23bb, feedback_pipe()), (0x23ba,
+            FeedbackEndpoint { transfer_type: TransferType::Interrupt, ..feedback_pipe() })] {
+            let mut compatibility = FeedbackCompatibility::for_device(vendor, 1, Speed::High, pipe, 48_000);
+            assert_eq!(compatible_report(&q16(6.0), 125, 7, false, &mut compatibility), Some((6.0, 48_000.0)));
+        }
+    }
 
     #[test]
     fn newest_fully_valid_poll_wins_at_requested_offsets() {
