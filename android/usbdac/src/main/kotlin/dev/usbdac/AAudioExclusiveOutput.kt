@@ -5,6 +5,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import dev.usbdac.internal.AAudioBackend
+import dev.usbdac.internal.AAudioOffer
 import dev.usbdac.internal.NativeAAudioBackend
 import dev.usbdac.internal.NativeListener
 import dev.usbdac.internal.aaudioRequestJson
@@ -210,6 +211,43 @@ internal class AAudioSignals(private val reasonWhenGranted: () -> String?) : Nat
         const val EVENT_DISCONNECTED = 0
         const val EVENT_FAILED = 1
         const val EVENT_BUFFER = 64
+    }
+}
+
+/**
+ * An AAudio stream that is open and whose grant has been read, but that has not been started: it
+ * plays nothing, and holds the device until [start] turns it into an [AAudioExclusiveOutput] or
+ * [close] releases it. It is how a caller finds out what the platform grants for a request without
+ * making a sound, and then uses the very stream that was granted.
+ */
+internal class AAudioProbe(
+    private val backend: AAudioBackend,
+    private val handle: Long,
+    /** What the platform granted. */
+    override val grant: AAudioGrant,
+    private val frameBytes: Int,
+    private val signals: AAudioSignals,
+    private val nanoTime: () -> Long,
+) : AAudioOffer {
+    private val done = AtomicBoolean(false)
+
+    /** Starts the stream and hands it over: the probe is spent, and closing it does nothing more. */
+    override fun start(): AAudioExclusiveOutput {
+        check(!done.get()) { "the probe is already started or closed" }
+        nativeCall { backend.start(handle) }
+        done.set(true)
+        signals.bitPerfect.value = BitPerfectState.NotVerified(null, grant.reason)
+        return AAudioExclusiveOutput(backend, handle, grant, frameBytes, signals, nanoTime)
+    }
+
+    /** Releases the stream if it was not started. Safe to call again. */
+    override fun close() {
+        if (!done.compareAndSet(false, true)) return
+        try {
+            nativeCall { backend.close(handle) }
+        } finally {
+            signals.state.value = StreamState.CLOSED
+        }
     }
 }
 
@@ -467,6 +505,35 @@ public class AAudioExclusiveOutput internal constructor(
             config: AAudioConfig,
             nanoTime: () -> Long = System::nanoTime,
         ): AAudioExclusiveOutput {
+            val probe = probe(backend, apiLevel, request, deviceId, config, nanoTime)
+            try {
+                if (config.requireExclusive && !probe.grant.isExclusive) {
+                    throw DacException(
+                        DacErrorCode.EXCLUSIVE_UNAVAILABLE,
+                        "the platform granted a shared stream, not an exclusive one. ${probe.grant.reason}",
+                    )
+                }
+                return probe.start()
+            } catch (error: Throwable) {
+                runCatching { probe.close() }
+                throw error
+            }
+        }
+
+        /**
+         * Opens the stream and reads what the platform granted, without starting it: nothing is
+         * played, and the device stays held until the probe is started or closed. The checks that
+         * refuse a stream that would play the bytes wrongly are the platform's and the library's, as
+         * for [open]; whether a shared grant is acceptable is left to the caller.
+         */
+        internal fun probe(
+            backend: AAudioBackend,
+            apiLevel: Int,
+            request: StreamRequest,
+            deviceId: Int,
+            config: AAudioConfig,
+            nanoTime: () -> Long = System::nanoTime,
+        ): AAudioProbe {
             if (request.encoding != StreamEncoding.PCM) {
                 throw DacException(
                     DacErrorCode.UNSUPPORTED,
@@ -482,15 +549,7 @@ public class AAudioExclusiveOutput internal constructor(
             try {
                 val grant = nativeCall { parseAAudioGrant(backend.grant(handle)) }
                 granted = grant
-                if (config.requireExclusive && !grant.isExclusive) {
-                    throw DacException(
-                        DacErrorCode.EXCLUSIVE_UNAVAILABLE,
-                        "the platform granted a shared stream, not an exclusive one. ${grant.reason}",
-                    )
-                }
-                nativeCall { backend.start(handle) }
-                signals.bitPerfect.value = BitPerfectState.NotVerified(null, grant.reason)
-                return AAudioExclusiveOutput(backend, handle, grant, frameBytes, signals, nanoTime)
+                return AAudioProbe(backend, handle, grant, frameBytes, signals, nanoTime)
             } catch (error: Throwable) {
                 runCatching { backend.close(handle) }
                 throw error

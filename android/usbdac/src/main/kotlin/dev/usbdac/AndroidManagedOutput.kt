@@ -1,5 +1,6 @@
 package dev.usbdac
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
@@ -212,13 +213,10 @@ public class AndroidManagedOutput private constructor(
                     "the managed output plays PCM only; the platform mixer would destroy DoP and native DSD",
                 )
             }
-            val encoding = encodingFor(request.bitDepth)
-                ?: throw DacException(
-                    DacErrorCode.UNSUPPORTED,
-                    "${request.bitDepth}-bit PCM is not available through AudioTrack on API ${Build.VERSION.SDK_INT}",
-                )
-            val channelMask = channelMaskFor(request.channels)
-                ?: throw DacException(DacErrorCode.UNSUPPORTED, "${request.channels} channels are not supported")
+            val problem = carryProblem(request, Build.VERSION.SDK_INT)
+            if (problem != null) throw DacException(DacErrorCode.UNSUPPORTED, problem)
+            val encoding = requireNotNull(encodingFor(request.bitDepth, Build.VERSION.SDK_INT))
+            val channelMask = requireNotNull(channelMaskFor(request.channels))
             val format = AudioFormat.Builder()
                 .setEncoding(encoding)
                 .setSampleRate(request.sampleRate)
@@ -266,10 +264,36 @@ public class AndroidManagedOutput private constructor(
             )
         }
 
-        private fun encodingFor(bitDepth: Int): Int? = when (bitDepth) {
+        /**
+         * Why an `AudioTrack` on [apiLevel] cannot carry [request], or `null` if it can. A pure check
+         * of the same tables [open] uses, so a caller can ask without creating a track.
+         */
+        internal fun carryProblem(request: StreamRequest, apiLevel: Int): String? = when {
+            request.encoding != StreamEncoding.PCM ->
+                "the managed output plays PCM only; the platform mixer would destroy DoP and native DSD"
+            encodingFor(request.bitDepth, apiLevel) == null ->
+                "${request.bitDepth}-bit PCM is not available through AudioTrack on API $apiLevel"
+            channelMaskFor(request.channels) == null -> "${request.channels} channels are not supported"
+            else -> null
+        }
+
+        /** The platform format an `AudioTrack` for [request] has, or `null` if [carryProblem] says it cannot be carried. */
+        internal fun audioFormatOf(request: StreamRequest, apiLevel: Int): AudioFormat? {
+            if (carryProblem(request, apiLevel) != null) return null
+            return AudioFormat.Builder()
+                .setEncoding(requireNotNull(encodingFor(request.bitDepth, apiLevel)))
+                .setSampleRate(request.sampleRate)
+                .setChannelMask(requireNotNull(channelMaskFor(request.channels)))
+                .build()
+        }
+
+        // The guard is [apiLevel] (callers pass `Build.VERSION.SDK_INT`, or a level under test), which lint
+        // cannot see; the constants are compile-time and are only chosen on a release that has them.
+        @SuppressLint("InlinedApi")
+        private fun encodingFor(bitDepth: Int, apiLevel: Int): Int? = when (bitDepth) {
             16 -> AudioFormat.ENCODING_PCM_16BIT
-            24 -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) AudioFormat.ENCODING_PCM_24BIT_PACKED else null
-            32 -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) AudioFormat.ENCODING_PCM_32BIT else null
+            24 -> if (apiLevel >= Build.VERSION_CODES.S) AudioFormat.ENCODING_PCM_24BIT_PACKED else null
+            32 -> if (apiLevel >= Build.VERSION_CODES.S) AudioFormat.ENCODING_PCM_32BIT else null
             else -> null
         }
 

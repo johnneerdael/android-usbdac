@@ -485,4 +485,56 @@ class AAudioExclusiveOutputTest {
     fun theNewErrorCodeParsesFromTheNativeName() {
         assertEquals(DacErrorCode.EXCLUSIVE_UNAVAILABLE, DacErrorCode.fromWireName("exclusive_unavailable"))
     }
+
+    // ---- the probe: what the platform grants, without a sound ----
+
+    @Test
+    fun aProbeOpensAndReadsTheGrantButDoesNotStartTheStream() {
+        val backend = FakeAAudioBackend()
+        val probe = AAudioExclusiveOutput.probe(backend, 34, PCM24, 0, AAudioConfig())
+        assertTrue(probe.grant.isExclusive)
+        assertEquals(listOf("open"), backend.calls)
+        probe.close()
+        assertEquals(listOf("open", "close"), backend.calls)
+        probe.close()
+        assertEquals("closing twice releases once", 1, backend.calls.count { it == "close" })
+    }
+
+    @Test
+    fun aProbeThatIsStartedIsTheOutputAndClosingTheProbeAfterwardsDoesNothing() {
+        val backend = FakeAAudioBackend()
+        val probe = AAudioExclusiveOutput.probe(backend, 34, PCM24, 0, AAudioConfig())
+        val output = probe.start()
+        assertEquals(listOf("open", "start"), backend.calls)
+        assertEquals(probe.grant, output.grant)
+        assertTrue(output.bitPerfect.value is BitPerfectState.NotVerified)
+        probe.close()
+        assertEquals("the output owns the stream now", 0, backend.calls.count { it == "close" })
+        output.close()
+        assertEquals(1, backend.calls.count { it == "close" })
+    }
+
+    @Test
+    fun aProbeReportsASharedGrantInsteadOfRefusingIt() {
+        val backend = FakeAAudioBackend(grantJson(sharing = "shared", verdict = "shared", asRequested = false, reason = "shared"))
+        val probe = AAudioExclusiveOutput.probe(backend, 34, PCM24, 0, AAudioConfig())
+        assertFalse(probe.grant.isExclusive)
+        probe.close()
+    }
+
+    @Test
+    fun aProbeRefusesWhatOpenRefusesBeforeAnyNativeCall() {
+        val backend = FakeAAudioBackend()
+        failsWith(DacErrorCode.UNSUPPORTED) { AAudioExclusiveOutput.probe(backend, 34, StreamRequest.dop(2_822_400, 2), 0, AAudioConfig()) }
+        assertTrue(backend.calls.isEmpty())
+    }
+
+    @Test
+    fun aProbeThatFailsToStartCanStillBeClosed() {
+        val backend = FakeAAudioBackend().apply { failStart = IllegalStateException("usbdac:transfer: could not start") }
+        val probe = AAudioExclusiveOutput.probe(backend, 34, PCM24, 0, AAudioConfig())
+        failsWith(DacErrorCode.TRANSFER) { probe.start() }
+        probe.close()
+        assertEquals(1, backend.calls.count { it == "close" })
+    }
 }

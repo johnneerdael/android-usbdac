@@ -30,12 +30,7 @@ internal object BitPerfectMixer {
     ): Pair<BitPerfectState, () -> Unit> {
         val none: () -> Unit = {}
         return try {
-            val wanted = audioManager.getSupportedMixerAttributes(device).firstOrNull {
-                it.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
-                    it.format.encoding == format.encoding &&
-                    it.format.sampleRate == format.sampleRate &&
-                    it.format.channelMask == format.channelMask
-            } ?: return BitPerfectState.Unverifiable(
+            val wanted = find(audioManager, device, format) ?: return BitPerfectState.Unverifiable(
                 "the platform offers no bit-perfect mixer attributes for this format on this device",
             ) to none
             if (!audioManager.setPreferredMixerAttributes(attributes, device, wanted)) {
@@ -56,4 +51,19 @@ internal object BitPerfectMixer {
             BitPerfectState.Unverifiable("the app lacks the MODIFY_AUDIO_SETTINGS permission") to none
         }
     }
+
+    /**
+     * Whether the platform offers the bit-perfect mixer behavior for [device] in exactly [format].
+     * It only asks: nothing is set, so it is safe to call to decide between outputs.
+     */
+    fun supports(audioManager: AudioManager, device: AudioDeviceInfo, format: AudioFormat): Boolean =
+        find(audioManager, device, format) != null
+
+    private fun find(audioManager: AudioManager, device: AudioDeviceInfo, format: AudioFormat): AudioMixerAttributes? =
+        audioManager.getSupportedMixerAttributes(device).firstOrNull {
+            it.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
+                it.format.encoding == format.encoding &&
+                it.format.sampleRate == format.sampleRate &&
+                it.format.channelMask == format.channelMask
+        }
 }
