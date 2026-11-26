@@ -6,9 +6,10 @@
 
 use serde_json::{json, Value};
 use usbdac_core::{
-    AltFormat, AltSetting, Capabilities, DacConfig, DacEvent, DeviceInfo, Encoding, Error,
-    HandBack, LinkSpeed, Quirk, QuirkOverride, RatePolicy, StartupVolume, StartupVolumeReport,
-    StreamFormat, StreamRequest, StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
+    AltFormat, AltSetting, Capabilities, ClockChoice, ClockHop, ClockHopKind, DacConfig, DacEvent,
+    DeviceInfo, Encoding, Error, HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride, RatePolicy,
+    StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest, StreamStats, SyncKind,
+    UacVersion, VolumeRange, VolumeState,
 };
 
 fn uac(version: UacVersion) -> &'static str {
@@ -39,6 +40,41 @@ fn sync(kind: SyncKind) -> &'static str {
     }
 }
 
+/// `{ "mode": "explicit_feedback", "feedback_endpoint": 129 }`; the endpoint is `null`
+/// for every other mode.
+pub fn pacing(pacing: Pacing) -> Value {
+    json!({
+        "mode": pacing.code(),
+        "feedback_endpoint": pacing.feedback_endpoint(),
+    })
+}
+
+fn clock_hop(hop: &ClockHop) -> Value {
+    let (selected_pin, pin_count) = match hop.kind {
+        ClockHopKind::Selector {
+            selected_pin,
+            pin_count,
+        } => (Some(selected_pin), Some(pin_count)),
+        _ => (None, None),
+    };
+    json!({
+        "id": hop.id,
+        "kind": hop.kind.code(),
+        "selected_pin": selected_pin,
+        "pin_count": pin_count,
+    })
+}
+
+/// Which clock the sample rate was set on and how it was reached.
+pub fn clock_choice(choice: &ClockChoice) -> Value {
+    json!({
+        "control_interface": choice.control_interface,
+        "source_id": choice.source_id,
+        "resolution": choice.resolution.code(),
+        "path": choice.path.iter().map(clock_hop).collect::<Vec<_>>(),
+    })
+}
+
 fn alt(alt: &AltSetting) -> Value {
     json!({
         "interface_number": alt.interface_number,
@@ -63,6 +99,7 @@ fn alt(alt: &AltSetting) -> Value {
         "max_packet_bytes": alt.max_packet_bytes,
         "service_interval_us": alt.service_interval_us,
         "uac_version": uac(alt.uac_version),
+        "pacing": alt.pacing.map(pacing),
     })
 }
 
@@ -137,6 +174,8 @@ pub fn stream_format(format_id: u64, format: &StreamFormat) -> Value {
         "link_speed": speed(format.link_speed),
         "service_interval_us": format.service_interval_us,
         "rate_differs_from_request": format.rate_differs_from_request(),
+        "pacing": pacing(format.pacing),
+        "clock": format.clock.as_ref().map(clock_choice),
     })
 }
 
@@ -616,6 +655,64 @@ mod tests {
         assert_eq!((kind, code), (6, 12));
         assert!(message.unwrap().starts_with("usbdac:volume_unavailable: "));
         assert_eq!(error_code(&Error::VolumeUnavailable), 12);
+    }
+
+    #[test]
+    fn pacing_encodes_its_mode_and_only_an_explicit_feedback_endpoint() {
+        assert_eq!(
+            pacing(Pacing::ExplicitFeedback { endpoint: 0x81 }),
+            json!({ "mode": "explicit_feedback", "feedback_endpoint": 129 })
+        );
+        for (value, mode) in [
+            (Pacing::Adaptive, "adaptive"),
+            (Pacing::Synchronous, "synchronous"),
+            (Pacing::Unsynchronized, "unsynchronized"),
+        ] {
+            assert_eq!(pacing(value), json!({ "mode": mode, "feedback_endpoint": null }));
+        }
+    }
+
+    #[test]
+    fn a_clock_choice_encodes_the_path_in_the_order_followed() {
+        use usbdac_core::ClockResolution;
+        let choice = ClockChoice {
+            control_interface: 0,
+            source_id: 5,
+            path: vec![
+                ClockHop { id: 1, kind: ClockHopKind::Terminal },
+                ClockHop {
+                    id: 9,
+                    kind: ClockHopKind::Selector { selected_pin: 2, pin_count: 2 },
+                },
+                ClockHop { id: 8, kind: ClockHopKind::Multiplier },
+                ClockHop { id: 5, kind: ClockHopKind::Source },
+            ],
+            resolution: ClockResolution::Resolved,
+        };
+        assert_eq!(
+            clock_choice(&choice),
+            json!({
+                "control_interface": 0,
+                "source_id": 5,
+                "resolution": "resolved",
+                "path": [
+                    { "id": 1, "kind": "terminal", "selected_pin": null, "pin_count": null },
+                    { "id": 9, "kind": "selector", "selected_pin": 2, "pin_count": 2 },
+                    { "id": 8, "kind": "multiplier", "selected_pin": null, "pin_count": null },
+                    { "id": 5, "kind": "source", "selected_pin": null, "pin_count": null },
+                ],
+            })
+        );
+
+        let fallback = ClockChoice {
+            control_interface: 0,
+            source_id: 4,
+            path: vec![ClockHop { id: 4, kind: ClockHopKind::Source }],
+            resolution: ClockResolution::FallbackFirstSource,
+        };
+        let value = clock_choice(&fallback);
+        assert_eq!(value["resolution"], "fallback_first_source");
+        assert_eq!(value["path"].as_array().unwrap().len(), 1);
     }
 
     #[test]

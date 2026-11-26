@@ -12,7 +12,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
-use crate::clock_resolution::{audio_control_descriptors_from_config, ClockGraph};
+use crate::clock_resolution::{audio_control_descriptors_from_config, ClockChoice, ClockGraph};
 use crate::error::Error;
 use crate::events::EventSink;
 use crate::flush_cancel::{

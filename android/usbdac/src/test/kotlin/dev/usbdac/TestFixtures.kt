@@ -30,7 +30,8 @@ internal object Fixtures {
           "format": "pcm", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
           "rate_ranges": [ { "min_hz": 44100, "max_hz": 44100, "step_hz": 0 } ],
           "sample_rates": [44100], "sync_type": "asynchronous", "feedback_endpoint": 129,
-          "max_packet_bytes": 1024, "service_interval_us": 125, "uac_version": "v2" } ] }
+          "max_packet_bytes": 1024, "service_interval_us": 125, "uac_version": "v2",
+          "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 } } ] }
     """
 
     const val CAPABILITIES_NO_VOLUME = """
@@ -44,7 +45,7 @@ internal object Fixtures {
           "format": "dsd", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
           "rate_ranges": [], "sample_rates": [88200], "sync_type": "adaptive",
           "feedback_endpoint": null, "max_packet_bytes": 512, "service_interval_us": 1000,
-          "uac_version": "v1" } ] }
+          "uac_version": "v1", "pacing": { "mode": "adaptive", "feedback_endpoint": null } } ] }
     """
 
     const val STARTUP = """
@@ -62,7 +63,26 @@ internal object Fixtures {
       "channels": 2, "valid_bits": 16, "subslot_bytes": 2, "bytes_per_frame": 4,
       "counter_rate_hz": 44100, "interface_number": 1, "alt_setting": 1,
       "endpoint_address": 1, "sync_type": "asynchronous", "explicit_feedback": true,
-      "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false }
+      "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false,
+      "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 },
+      "clock": { "control_interface": 0, "source_id": 5, "resolution": "resolved",
+        "path": [
+          { "id": 1, "kind": "terminal", "selected_pin": null, "pin_count": null },
+          { "id": 9, "kind": "selector", "selected_pin": 2, "pin_count": 2 },
+          { "id": 8, "kind": "multiplier", "selected_pin": null, "pin_count": null },
+          { "id": 5, "kind": "source", "selected_pin": null, "pin_count": null } ] } }
+    """
+
+    /** A DAC whose clock topology could not be traced: the first Clock Source was used. */
+    const val FORMAT_CLOCK_FALLBACK = """
+    { "format_id": 8, "encoding": "pcm", "dsd_bit_rate": null, "sample_rate": 96000,
+      "channels": 2, "valid_bits": 24, "subslot_bytes": 3, "bytes_per_frame": 6,
+      "counter_rate_hz": 96000, "interface_number": 1, "alt_setting": 2,
+      "endpoint_address": 1, "sync_type": "adaptive", "explicit_feedback": false,
+      "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false,
+      "pacing": { "mode": "adaptive", "feedback_endpoint": null },
+      "clock": { "control_interface": 0, "source_id": 4, "resolution": "fallback_first_source",
+        "path": [ { "id": 4, "kind": "source", "selected_pin": null, "pin_count": null } ] } }
     """
 
     const val FORMAT_NATIVE_DSD = """
@@ -70,7 +90,8 @@ internal object Fixtures {
       "channels": 2, "valid_bits": 32, "subslot_bytes": 4, "bytes_per_frame": 8,
       "counter_rate_hz": 352800, "interface_number": 1, "alt_setting": 2,
       "endpoint_address": 2, "sync_type": "adaptive", "explicit_feedback": false,
-      "link_speed": "full", "service_interval_us": 1000, "rate_differs_from_request": true }
+      "link_speed": "full", "service_interval_us": 1000, "rate_differs_from_request": true,
+      "pacing": { "mode": "adaptive", "feedback_endpoint": null }, "clock": null }
     """
 
     /** A stream-statistics document with the optional feedback fields still null. */

@@ -23,6 +23,7 @@ import dev.usbdac.DacState
 import dev.usbdac.ConvertingOutput
 import dev.usbdac.DacStream
 import dev.usbdac.PcmOutput
+import dev.usbdac.StreamFormat
 import dev.usbdac.StreamRequest
 import dev.usbdac.StreamState
 import dev.usbdac.UsbDac
@@ -373,9 +374,10 @@ class MainActivity : Activity() {
                         current.latencyFrames * 1000.0 / rate,
                     ) +
                     "buffer ${stats.bufferMs}/${stats.bufferTargetMs} ms   underruns ${stats.underruns}   lost ${stats.lostFrames}\n" +
-                    "effective %.1f Hz   feedback ${if (stats.feedbackActive) "${stats.feedbackReports} reports" else "off"}".format(
+                    "effective %.1f Hz   feedback ${if (stats.feedbackActive) "${stats.feedbackReports} reports" else "off"}\n".format(
                         stats.effectiveRateHz,
-                    )
+                    ) +
+                    describeFormat(current.format)
             }.getOrDefault("")
         }
     }
@@ -398,8 +400,24 @@ class MainActivity : Activity() {
             .distinct()
             .sortedWith(compareBy({ it.second }, { it.first }))
 
+    /**
+     * How the stream is paced and which clock the rate was set on: what to read first when a DAC
+     * plays at the wrong pitch, or not at all at one rate.
+     */
+    private fun describeFormat(format: StreamFormat): String = buildString {
+        appendLine("pacing: ${format.pacing.description}")
+        val clock = format.clock
+        if (clock == null) {
+            append("clock: none (the DAC describes no clock entities)")
+        } else {
+            appendLine("clock: source ${clock.sourceId} on AudioControl interface ${clock.controlInterface}")
+            append("  ${clock.description}")
+        }
+    }
+
     private fun describe(c: DacCapabilities): String = buildString {
         appendLine("UAC ${c.uacVersion}, ${c.linkSpeed} speed, explicit feedback: ${c.hasExplicitFeedback}")
+        appendLine("pacing: ${c.altSettings.mapNotNull { it.pacing }.distinct().joinToString("; ") { it.description }.ifEmpty { "none" }}")
         appendLine("PCM ${c.pcmSampleRates} Hz, ${c.pcmBitDepths}-bit")
         appendLine("DoP: ${c.supportsDop} (max DSD ${c.dopMaxDsdBitRate})   native DSD: ${c.supportsNativeDsd}")
         val range = c.volume

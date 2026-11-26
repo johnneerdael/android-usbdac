@@ -105,6 +105,17 @@ public class StreamFormat internal constructor(
     public val serviceIntervalUs: Int,
     /** `true` when the DAC runs another rate than requested ([RatePolicy.NEAREST_SUPPORTED]). */
     public val rateDiffersFromRequest: Boolean,
+    /**
+     * How the stream is paced on its endpoint: what the library does, named. Consistent with
+     * [syncType] and [explicitFeedback]. [Pacing.Unknown] from a native library that predates it.
+     */
+    public val pacing: Pacing = Pacing.Unknown,
+    /**
+     * The Clock Source the sample rate was set and verified on, and how it was reached from the
+     * stream's terminal, as resolved by [DacSession.negotiate]. `null` when the DAC has no clock
+     * entities to set (UAC 1.0 sets the rate on the endpoint), or from an older native library.
+     */
+    public val clock: ClockChoice? = null,
 ) {
     override fun toString(): String =
         "StreamFormat($encoding ${sampleRate}Hz ${validBits}bit x$channels, $bytesPerFrame bytes/frame)"

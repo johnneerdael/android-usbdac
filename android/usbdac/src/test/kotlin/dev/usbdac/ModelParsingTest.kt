@@ -85,6 +85,105 @@ class ModelParsingTest {
     }
 
     @Test
+    fun aNegotiatedFormatCarriesTheClockPathAndThePacing() {
+        val format = parseStreamFormat(Fixtures.FORMAT)
+        assertEquals(Pacing.ExplicitFeedback(0x81), format.pacing)
+        assertEquals("explicit feedback (endpoint 0x81)", format.pacing.description)
+        val clock = format.clock!!
+        assertEquals(0, clock.controlInterface)
+        assertEquals(5, clock.sourceId)
+        assertEquals(ClockResolution.RESOLVED, clock.resolution)
+        // In the order followed: the terminal, then each clock entity down to the source.
+        assertEquals(
+            listOf(
+                ClockHop(1, ClockHopKind.Terminal),
+                ClockHop(9, ClockHopKind.Selector(selectedPin = 2, pinCount = 2)),
+                ClockHop(8, ClockHopKind.Multiplier),
+                ClockHop(5, ClockHopKind.Source),
+            ),
+            clock.path,
+        )
+        assertEquals(clock.sourceId, clock.path.last().id)
+        assertEquals("terminal 1 > selector 9 (pin 2 of 2) > multiplier 8 > source 5, resolved", clock.description)
+    }
+
+    @Test
+    fun aClockThatFellBackToTheFirstSourceSaysSo() {
+        val format = parseStreamFormat(Fixtures.FORMAT_CLOCK_FALLBACK)
+        assertEquals(Pacing.Adaptive, format.pacing)
+        val clock = format.clock!!
+        assertEquals(ClockResolution.FALLBACK_FIRST_SOURCE, clock.resolution)
+        assertEquals(4, clock.sourceId)
+        assertEquals(listOf(ClockHop(4, ClockHopKind.Source)), clock.path)
+        assertEquals("source 4, fallback to the first source", clock.description)
+    }
+
+    @Test
+    fun aDeviceWithoutClockEntitiesHasNoClock() {
+        val format = parseStreamFormat(Fixtures.FORMAT_NATIVE_DSD)
+        assertNull(format.clock)
+        assertEquals(Pacing.Adaptive, format.pacing)
+    }
+
+    @Test
+    fun everyPacingModeParses() {
+        fun pacingOf(mode: String, endpoint: String = "null"): Pacing = parseStreamFormat(
+            JSONObject(Fixtures.FORMAT)
+                .put("pacing", JSONObject("""{ "mode": "$mode", "feedback_endpoint": $endpoint }"""))
+                .toString(),
+        ).pacing
+        assertEquals(Pacing.ExplicitFeedback(131), pacingOf("explicit_feedback", "131"))
+        assertEquals(Pacing.Adaptive, pacingOf("adaptive"))
+        assertEquals(Pacing.Synchronous, pacingOf("synchronous"))
+        assertEquals(Pacing.Unsynchronized, pacingOf("unsynchronized"))
+        assertEquals(Pacing.Unknown, pacingOf("something_new"))
+    }
+
+    @Test
+    fun aFormatFromABuildWithoutTheDiagnosticsStillParses() {
+        val json = JSONObject(Fixtures.FORMAT).apply { remove("pacing"); remove("clock") }.toString()
+        val format = parseStreamFormat(json)
+        assertEquals(Pacing.Unknown, format.pacing)
+        assertNull(format.clock)
+        assertEquals(44100, format.sampleRate)
+    }
+
+    @Test
+    fun anUnknownClockResolutionOrHopKindIsUnknownNotAnError() {
+        val clock = JSONObject(Fixtures.FORMAT).getJSONObject("clock")
+            .put("resolution", "something_new")
+        clock.getJSONArray("path").getJSONObject(2).put("kind", "something_new")
+        val format = parseStreamFormat(JSONObject(Fixtures.FORMAT).put("clock", clock).toString())
+        assertEquals(ClockResolution.UNKNOWN, format.clock!!.resolution)
+        assertEquals(ClockHopKind.Unknown, format.clock!!.path[2].kind)
+        assertEquals(8, format.clock!!.path[2].id)
+    }
+
+    @Test
+    fun capabilitiesCarryThePacingOfEachAlternateSetting() {
+        assertEquals(
+            Pacing.ExplicitFeedback(0x81),
+            parseCapabilities(Fixtures.CAPABILITIES).altSettings.single().pacing,
+        )
+        assertEquals(Pacing.Adaptive, parseCapabilities(Fixtures.CAPABILITIES_NO_VOLUME).altSettings.single().pacing)
+    }
+
+    @Test
+    fun anAlternateSettingTheLibraryWouldNotStreamHasNoPacing() {
+        // null: refused (an asynchronous endpoint without feedback, with allowUnsynchronizedAsync off).
+        val refused = JSONObject(Fixtures.CAPABILITIES).apply {
+            getJSONArray("alt_settings").getJSONObject(0).put("pacing", JSONObject.NULL)
+        }.toString()
+        assertNull(parseCapabilities(refused).altSettings.single().pacing)
+
+        // The same for a build that does not report it.
+        val absent = JSONObject(Fixtures.CAPABILITIES).apply {
+            getJSONArray("alt_settings").getJSONObject(0).remove("pacing")
+        }.toString()
+        assertNull(parseCapabilities(absent).altSettings.single().pacing)
+    }
+
+    @Test
     fun statsParseIncludingTheNullFeedbackFieldsAndTheBlocker() {
         val stats = parseStats(Fixtures.STATS)
         assertEquals(StreamState.PLAYING, stats.state)

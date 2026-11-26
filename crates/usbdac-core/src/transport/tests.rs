@@ -2501,3 +2501,112 @@ mod unsynchronized_async_tests {
         assert_eq!(BitPerfectBlocker::UnsynchronizedAsync.code(), "unsynchronized_async");
     }
 }
+
+/// The pacing label: what the transport does for an admitted endpoint, and
+/// `None` for the ones it would never stream.
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use crate::capabilities::Pacing;
+
+    const FEEDBACK: u8 = 0x81;
+
+    /// (sync type, bSynchAddress, resolved feedback endpoint, allow unsynchronized async,
+    /// expected pacing).
+    type Row = (SyncType, u8, Option<u8>, bool, Option<Pacing>);
+
+    fn table() -> Vec<Row> {
+        let explicit = Some(Pacing::ExplicitFeedback { endpoint: FEEDBACK });
+        let mut rows: Vec<Row> = Vec::new();
+        for allow in [false, true] {
+            rows.extend([
+                // Asynchronous with its feedback endpoint: polled, whatever the config says.
+                (SyncType::Asynchronous, FEEDBACK, Some(FEEDBACK), allow, explicit),
+                // The feedback endpoint found by its usage bits rather than bSynchAddress.
+                (SyncType::Asynchronous, 0, Some(FEEDBACK), allow, explicit),
+                // A declared feedback endpoint that cannot be resolved is never streamed.
+                (SyncType::Asynchronous, FEEDBACK, None, allow, None),
+                (SyncType::Adaptive, FEEDBACK, None, allow, None),
+                // Adaptive and synchronous follow the host's packet timing.
+                (SyncType::Adaptive, 0, None, allow, Some(Pacing::Adaptive)),
+                (SyncType::Synchronous, 0, None, allow, Some(Pacing::Synchronous)),
+                // The transport only polls feedback for an asynchronous endpoint.
+                (SyncType::Adaptive, FEEDBACK, Some(FEEDBACK), allow, Some(Pacing::Adaptive)),
+                (SyncType::Synchronous, FEEDBACK, Some(FEEDBACK), allow, Some(Pacing::Synchronous)),
+                // No synchronisation declared: nothing comes back, nominal rate.
+                (SyncType::NoSync, 0, None, allow, Some(Pacing::Unsynchronized)),
+            ]);
+        }
+        rows.extend([
+            // Asynchronous without feedback: refused unless the config allows the nominal rate.
+            (SyncType::Asynchronous, 0, None, false, None),
+            (SyncType::Asynchronous, 0, None, true, Some(Pacing::Unsynchronized)),
+        ]);
+        rows
+    }
+
+    #[test]
+    fn each_endpoint_shape_has_the_pacing_the_transport_gives_it() {
+        for (sync, synch_address, feedback, allow, expected) in table() {
+            assert_eq!(
+                endpoint_pacing(sync, synch_address, feedback, allow),
+                expected,
+                "{sync:?} synch=0x{synch_address:02x} feedback={feedback:?} allow={allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_endpoint_has_a_pacing_exactly_when_the_scan_admits_it() {
+        for (sync, synch_address, feedback, allow, _) in table() {
+            let admitted = admit_endpoint(sync, synch_address, feedback.is_some(), allow)
+                == EndpointAdmission::Admit;
+            assert_eq!(
+                endpoint_pacing(sync, synch_address, feedback, allow).is_some(),
+                admitted,
+                "{sync:?} synch=0x{synch_address:02x} feedback={feedback:?} allow={allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_negotiated_label_matches_the_capability_label_of_the_same_endpoint() {
+        // `negotiate` labels the admitted candidate with `admitted_pacing`, the
+        // capability scan with `endpoint_pacing`: the same answer for the same endpoint.
+        for (sync, synch_address, feedback, allow, expected) in table() {
+            if let Some(pacing) = expected {
+                assert_eq!(admitted_pacing(sync, feedback), pacing);
+                assert_eq!(endpoint_pacing(sync, synch_address, feedback, allow), Some(pacing));
+            }
+        }
+    }
+
+    #[test]
+    fn unsynchronized_asynchronous_pacing_is_the_streams_unsynchronized_async_flag() {
+        // stream_open sets `unsynchronized_async` (the UnsynchronizedAsync bit-perfect
+        // blocker) when an asynchronous endpoint has no feedback endpoint.
+        for sync in [
+            SyncType::Asynchronous,
+            SyncType::Adaptive,
+            SyncType::Synchronous,
+            SyncType::NoSync,
+        ] {
+            for feedback in [None, Some(FEEDBACK)] {
+                let flag = sync == SyncType::Asynchronous && feedback.is_none();
+                let labelled = sync == SyncType::Asynchronous
+                    && admitted_pacing(sync, feedback) == Pacing::Unsynchronized;
+                assert_eq!(flag, labelled, "{sync:?} feedback={feedback:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pacing_codes_are_stable() {
+        assert_eq!(Pacing::ExplicitFeedback { endpoint: 0x83 }.code(), "explicit_feedback");
+        assert_eq!(Pacing::ExplicitFeedback { endpoint: 0x83 }.feedback_endpoint(), Some(0x83));
+        assert_eq!(Pacing::Adaptive.code(), "adaptive");
+        assert_eq!(Pacing::Synchronous.code(), "synchronous");
+        assert_eq!(Pacing::Unsynchronized.code(), "unsynchronized");
+        assert_eq!(Pacing::Adaptive.feedback_endpoint(), None);
+    }
+}

@@ -3,9 +3,14 @@ package dev.usbdac.internal
 import dev.usbdac.AltFormat
 import dev.usbdac.AltSetting
 import dev.usbdac.BitPerfectBlocker
+import dev.usbdac.ClockChoice
+import dev.usbdac.ClockHop
+import dev.usbdac.ClockHopKind
+import dev.usbdac.ClockResolution
 import dev.usbdac.DacCapabilities
 import dev.usbdac.DacStreamStats
 import dev.usbdac.LinkSpeed
+import dev.usbdac.Pacing
 import dev.usbdac.RateRange
 import dev.usbdac.StreamEncoding
 import dev.usbdac.StreamFormat
@@ -53,6 +58,44 @@ private fun syncType(name: String?): SyncType = when (name) {
     "adaptive" -> SyncType.ADAPTIVE
     "synchronous" -> SyncType.SYNCHRONOUS
     else -> SyncType.NONE
+}
+
+// The clock and pacing diagnostics describe, they are not acted on: an absent, null or unknown value
+// reads as "not reported" instead of failing the negotiated format.
+
+private fun pacing(json: JSONObject?): Pacing? = json?.let {
+    when (it.stringOrNull("mode")) {
+        "explicit_feedback" -> Pacing.ExplicitFeedback(it.optInt("feedback_endpoint"))
+        "adaptive" -> Pacing.Adaptive
+        "synchronous" -> Pacing.Synchronous
+        "unsynchronized" -> Pacing.Unsynchronized
+        else -> Pacing.Unknown
+    }
+}
+
+private fun clockHop(json: JSONObject) = ClockHop(
+    id = json.optInt("id"),
+    kind = when (json.stringOrNull("kind")) {
+        "terminal" -> ClockHopKind.Terminal
+        "selector" -> ClockHopKind.Selector(json.optInt("selected_pin"), json.optInt("pin_count"))
+        "multiplier" -> ClockHopKind.Multiplier
+        "source" -> ClockHopKind.Source
+        else -> ClockHopKind.Unknown
+    },
+)
+
+private fun clockChoice(json: JSONObject?): ClockChoice? = json?.let {
+    val hops = it.optJSONArray("path")
+    ClockChoice(
+        controlInterface = it.optInt("control_interface"),
+        sourceId = it.optInt("source_id"),
+        path = if (hops == null) emptyList() else List(hops.length()) { index -> clockHop(hops.getJSONObject(index)) },
+        resolution = when (it.stringOrNull("resolution")) {
+            "resolved" -> ClockResolution.RESOLVED
+            "fallback_first_source" -> ClockResolution.FALLBACK_FIRST_SOURCE
+            else -> ClockResolution.UNKNOWN
+        },
+    )
 }
 
 private fun altFormat(name: String?): AltFormat = when (name) {
@@ -112,6 +155,7 @@ private fun parseAltSetting(json: JSONObject) = AltSetting(
     maxPacketBytes = json.getInt("max_packet_bytes"),
     serviceIntervalUs = json.getInt("service_interval_us"),
     uacVersion = uacVersion(json.stringOrNull("uac_version")),
+    pacing = pacing(json.optJSONObject("pacing")),
 )
 
 internal fun parseCapabilities(json: String): DacCapabilities {
@@ -160,6 +204,8 @@ internal fun parseStreamFormat(json: String): StreamFormat {
         linkSpeed = linkSpeed(value.stringOrNull("link_speed")),
         serviceIntervalUs = value.getInt("service_interval_us"),
         rateDiffersFromRequest = value.getBoolean("rate_differs_from_request"),
+        pacing = pacing(value.optJSONObject("pacing")) ?: Pacing.Unknown,
+        clock = clockChoice(value.optJSONObject("clock")),
     )
 }
 

@@ -363,7 +363,7 @@ fn describe(kind: ConversionKind, steps: &[Step], options: &ConvertOptions) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::{LinkSpeed, SyncKind};
+    use crate::capabilities::{LinkSpeed, Pacing, SyncKind};
 
     fn fmt(rate: u32, channels: u16, sample: SampleFormat) -> PcmFormat {
         PcmFormat::new(rate, channels, sample)
@@ -394,6 +394,8 @@ mod tests {
             explicit_feedback: true,
             link_speed: LinkSpeed::High,
             service_interval_us: 125,
+            pacing: Pacing::ExplicitFeedback { endpoint: 0x81 },
+            clock: None,
         }
     }
 

@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Turn on the native library's log first: `UsbDac.setLogLevel(4)` (debug), then `adb logcat -s usbdac`. Include that log in a bug report, together with the DAC's name and USB ids (`DacDeviceInfo.vendorId`, `productId`), `session.capabilities`, the `StreamFormat` and `stream.stats()`.
+Turn on the native library's log first: `UsbDac.setLogLevel(4)` (debug), then `adb logcat -s usbdac`. Include that log in a bug report, together with the DAC's name and USB ids (`DacDeviceInfo.vendorId`, `productId`), `session.capabilities`, the `StreamFormat` (its `clock` and `pacing` in particular, see [diagnostics](controls.md#diagnostics-the-clock-and-the-pacing)) and `stream.stats()`.
 
 ## Error codes
 
@@ -33,6 +33,17 @@ By default `negotiate` or `openStream` refuses such an alternate setting with `I
 
 `DacConfig(allowUnsynchronizedAsync = true)` streams it anyway, at the nominal rate, host-paced. Expect the drift to end in clicks or dropouts after some time, and the stream is never bit-perfect (blocker `UNSYNCHRONIZED_ASYNC`). Use the managed output (`AndroidManagedOutput`) for such a DAC if it works there.
 
+## Wrong pitch, or no sound at one sample rate
+
+On a DAC with more than one clock (a Clock Selector choosing between an internal oscillator and another source, or Clock Multipliers in front of a source), the sampling frequency is programmed on one Clock Source. If it goes to the wrong one, the DAC plays at the wrong pitch, or is silent at one rate while others work. Look at `clock.path` and `clock.resolution` of the `StreamFormat` that `negotiate` returned:
+
+- **`clock.resolution == FALLBACK_FIRST_SOURCE`**: the library could not trace the stream's terminal to its clock (no terminal link, a malformed or looping entity, a selector that would not say which pin is active) and used the first Clock Source in descriptor order. On a multi-clock DAC that may be the wrong one. The `usbdac` log (`UsbDac.setLogLevel(2)` or more) has the reason on a warning line. Report it with the log, the DAC's USB ids and its descriptors (`lsusb -v` or the Android USB host dump).
+- **`clock.resolution == RESOLVED`**: read `clock.path` from the terminal down. Each `Selector` hop shows the pin the DAC reported as active (`selectedPin` of `pinCount`); the library follows what the DAC says and never switches it. If the source at the end is not the one that clocks the playback terminal on that DAC, the selector is on another input than you expect: a clock switch on the DAC, an external clock input, or the DAC's own default. Compare with the DAC's descriptors.
+- **`clock.sourceId` and `clock.controlInterface`** say where the sampling frequency was written and read back. `CLOCK_UNVERIFIED` (see the table above) is the DAC refusing to confirm it on that source.
+- **`clock == null`**: the DAC describes no clock entities (UAC 1.0, whose rate is set on the endpoint). The clock topology is not the cause.
+
+`format.pacing` answers the other half, how packets are paced: `Unsynchronized` on an asynchronous endpoint is the [no-feedback case](#asynchronous-endpoints-without-feedback), the usual cause of clicks that appear after some time. See [diagnostics](controls.md#diagnostics-the-clock-and-the-pacing) for the fields.
+
 ## Permission
 
 USB permission is per device and asked at run time.
@@ -60,7 +71,7 @@ Work down the list.
 
 1. **`attachedDacs` is empty.** The device has no Audio Streaming interface with an isochronous OUT endpoint: it is not a USB audio playback device, the cable carries power only, or the adapter or hub is the problem. A capture-only device is not listed.
 2. **Open fails.** Read the code above. `BUSY`, `PERMISSION_DENIED` and `CLAIM` are the usual ones.
-3. **`negotiate` fails.** `UNSUPPORTED`: pick a rate and depth from `capabilities`. `IMPLICIT_FEEDBACK_UNSUPPORTED`, `CLOCK_UNVERIFIED`: see above.
+3. **`negotiate` fails.** `UNSUPPORTED`: pick a rate and depth from `capabilities`. `IMPLICIT_FEEDBACK_UNSUPPORTED`, `CLOCK_UNVERIFIED`: see above. Silence or a wrong pitch at one rate on a DAC with several clocks: [look at the clock](#wrong-pitch-or-no-sound-at-one-sample-rate).
 4. **The stream opens and is silent.** In this order:
    - Is the DAC's **volume at its minimum, or muted**? Read `session.volume?.state`. `UsbDac.open` lowers the volume to at most -40 dB (`DacConfig.startupVolume`), so a DAC that was at full scale is quiet until the slider goes up; `session.volume?.startup` says what it had and what it was lowered to. If `session.volume` is `null` the DAC has no usable hardware volume, and `openStream` fails with `VOLUME_UNAVAILABLE` unless `requireHardwareVolume` is off.
    - Is the **writer running**? `stats().framesWritten` must rise. A writer that writes less than `startThresholdMs` of audio leaves the stream in `BUFFERING`, and it never starts. Write at least `startThresholdMs` (100 ms), or call `drain()` for a short clip.

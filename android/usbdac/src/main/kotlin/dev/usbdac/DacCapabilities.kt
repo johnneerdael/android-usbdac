@@ -47,6 +47,13 @@ public data class AltSetting(
     val maxPacketBytes: Int,
     val serviceIntervalUs: Int,
     val uacVersion: UacVersion,
+    /**
+     * How a stream on this alternate setting would be paced, as [StreamFormat.pacing] will report
+     * it. `null` when the library would not stream it with this configuration (an asynchronous
+     * endpoint without a feedback endpoint while [DacConfig.allowUnsynchronizedAsync] is off, or
+     * one that declares a feedback endpoint it cannot resolve), or from an older native library.
+     */
+    val pacing: Pacing? = null,
 )
 
 /** The range of the DAC's hardware volume control, in dB. */

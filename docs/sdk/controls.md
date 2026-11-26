@@ -98,13 +98,61 @@ Build one with `StreamRequest.pcm(rate, channels, bits)`, `StreamRequest.dop(dsd
 | `stats()` | `DacStreamStats` | Counters: underruns, lost frames, packets, timeouts, buffer depth, effective rate, feedback state, and `bitPerfectBlocker` | None |
 | `bitPerfect` | `StateFlow<BitPerfectState>` | `Verified` or `NotVerified(blocker, reason)` | It is the verdict |
 | `state` | `StateFlow<StreamState>` | `BUFFERING`, `PLAYING`, `PAUSED`, `DRAINING`, `DRAINED`, `CLOSED`, `FAILED` | None |
-| `format` | `StreamFormat` | What goes on the wire: encoding, rate, channels, bits, slot size, interface, alternate setting, synchronisation, whether feedback is used | None |
+| `format` | `StreamFormat` | What goes on the wire: encoding, rate, channels, bits, slot size, interface, alternate setting, synchronisation, whether feedback is used, and the clock and pacing diagnostics ([below](#diagnostics-the-clock-and-the-pacing)) | None |
 | `setSoftwareGain(gain)` | `Float` (1.0) | Scales the samples in the library. Refused for DoP and native DSD | Any value other than exactly 1.0 stops the stream being bit-perfect (blocker `SOFTWARE_GAIN`). Prefer the DAC's volume |
 | `close()` | | Stops the stream and releases it (about 100 ms). The session and the volume stay | None |
 
 `position = startTime + playedFrames / format.counterRateHz`, with `startTime` set at each flush.
 
 `DacSession.events` carries what happened: `StateChanged`, `Underrun`, `LostFrames`, `BitPerfectChanged`, `VolumeChanged`, `FeedbackStale`, `StreamFailed`, `DeviceLost`, `VolumeWriteFailed`. It is a `SharedFlow` with a buffer of 64; a collector that cannot keep up misses the oldest events. `DacSession.state` is `READY`, `STREAMING`, `LOST` or `CLOSED`.
+
+## Diagnostics: the clock and the pacing
+
+Two read-only facts about a stream, on the `StreamFormat` that `negotiate` returned. They say what the library did; reading them changes nothing, and they cost nothing to read. Start here when a DAC plays at the wrong pitch, is silent at one rate, or clicks.
+
+| Field | Type | What it says |
+|---|---|---|
+| `StreamFormat.clock` | `ClockChoice?` | The Clock Source the sample rate was set and verified on, and how it was reached from the stream's terminal. `null` when the DAC describes no clock entities (UAC 1.0 sets the rate on the endpoint) |
+| `StreamFormat.pacing` | `Pacing` | What keeps the host's packets and the DAC's clock in step on the endpoint the stream uses |
+| `AltSetting.pacing` | `Pacing?` | The same for each alternate setting of `session.capabilities`: what a stream on it would use. `null` when the library would not stream it with this configuration |
+
+A `ClockChoice` has `controlInterface` (the AudioControl interface the clock requests go to), `sourceId` (the Clock Source entity ID) and `path`, a list of `ClockHop`s in the order followed: the stream's terminal first, then each clock entity, ending at the source. A hop's `kind` is `Terminal`, `Selector(selectedPin, pinCount)` (pins are 1-based; a selector with one input is reported as pin 1 of 1 without being asked, and with several, the pin is what the DAC reported), `Multiplier` or `Source`. `resolution` is:
+
+| `ClockResolution` | Meaning |
+|---|---|
+| `RESOLVED` | The terminal was traced to the Clock Source through the descriptors. This is the normal case |
+| `FALLBACK_FIRST_SOURCE` | The topology could not be traced (no terminal link, a malformed or looping entity, a selector that would not say which pin is active), so the first Clock Source in descriptor order was used and `path` is that source alone. On a DAC with more than one clock the rate may then have gone to the wrong one. The `usbdac` log says why at warning level |
+
+`Pacing` names what the library does for the endpoint. It is a label, not a switch; the library adds no mode of its own.
+
+| `Pacing` | The endpoint | Notes |
+|---|---|---|
+| `ExplicitFeedback(endpoint)` | Asynchronous, with a feedback endpoint (`endpoint` is its address) | The feedback endpoint is polled and the packets follow the rate the DAC reports |
+| `Adaptive` | Adaptive | The DAC follows the host's packet timing |
+| `Synchronous` | Synchronous | The DAC and the host share the bus clock |
+| `Unsynchronized` | Asynchronous without a feedback endpoint (streamed only with `allowUnsynchronizedAsync`), or one that declares no synchronisation | The host sends at the nominal rate and nothing comes back. For the asynchronous case this is the `UNSYNCHRONIZED_ASYNC` blocker: never bit-perfect |
+| `Unknown` | | A value this SDK version does not know, or a native library that predates the field |
+
+`ClockChoice.description` and `Pacing.description` are one-line texts for a status line. The sample shows both next to the stream's statistics:
+
+```kotlin
+    /**
+     * How the stream is paced and which clock the rate was set on: what to read first when a DAC
+     * plays at the wrong pitch, or not at all at one rate.
+     */
+    private fun describeFormat(format: StreamFormat): String = buildString {
+        appendLine("pacing: ${format.pacing.description}")
+        val clock = format.clock
+        if (clock == null) {
+            append("clock: none (the DAC describes no clock entities)")
+        } else {
+            appendLine("clock: source ${clock.sourceId} on AudioControl interface ${clock.controlInterface}")
+            append("  ${clock.description}")
+        }
+    }
+```
+
+For a DAC whose Clock Selector has the second of two inputs active, that prints `terminal 1 > selector 9 (pin 2 of 2) > source 5, resolved`. The clock is resolved when the format is negotiated and again when the stream opens, on the same terminal; a DAC whose selector is switched between the two calls (a clock switch on its front panel) can differ from what `negotiate` reported. See [troubleshooting](troubleshooting.md#wrong-pitch-or-no-sound-at-one-sample-rate) for what to do with a wrong clock.
 
 ## Hardware volume: `DacVolume`
 

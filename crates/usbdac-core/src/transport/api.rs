@@ -103,7 +103,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     let _session = SessionGuard::start_locked();
     drop(session_gate);
 
-    let effective = negotiate_playback_format(requested)?;
+    let (effective, clock) = negotiate_playback_format(requested)?;
     let effective = SESSION_STATE
         .lock()
         .as_ref()
@@ -150,6 +150,12 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
         explicit_feedback: candidate.feedback_endpoint.is_some(),
         link_speed: link_speed_of(candidate.usb_speed),
         service_interval_us: candidate.service_interval_us,
+        // The candidate was admitted, so it has a pacing.
+        pacing: admitted_pacing(
+            candidate.sync_type,
+            candidate.feedback_endpoint.map(|feedback| feedback.address),
+        ),
+        clock,
     })
 }
 

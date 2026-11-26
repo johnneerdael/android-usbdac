@@ -238,3 +238,40 @@ pub(crate) fn admit_endpoint(
     }
     EndpointAdmission::Admit
 }
+
+/// How the transport paces an endpoint it admits (see [`admit_endpoint`]).
+/// Only an asynchronous endpoint polls its feedback endpoint (a feedback
+/// endpoint declared next to an adaptive or synchronous one is ignored), and
+/// anything with no feedback to follow runs at the nominal rate. This labels
+/// that; it decides nothing.
+pub(crate) fn admitted_pacing(
+    sync_type: SyncType,
+    feedback_endpoint: Option<u8>,
+) -> crate::capabilities::Pacing {
+    use crate::capabilities::Pacing;
+    match (sync_type, feedback_endpoint) {
+        (SyncType::Asynchronous, Some(endpoint)) => Pacing::ExplicitFeedback { endpoint },
+        (SyncType::Adaptive, _) => Pacing::Adaptive,
+        (SyncType::Synchronous, _) => Pacing::Synchronous,
+        (SyncType::Asynchronous, None) | (SyncType::NoSync, _) => Pacing::Unsynchronized,
+    }
+}
+
+/// The pacing a stream on an endpoint would have, or `None` when
+/// [`admit_endpoint`] would not let it stream with this configuration.
+pub(crate) fn endpoint_pacing(
+    sync_type: SyncType,
+    synch_address: u8,
+    feedback_endpoint: Option<u8>,
+    allow_unsynchronized_async: bool,
+) -> Option<crate::capabilities::Pacing> {
+    match admit_endpoint(
+        sync_type,
+        synch_address,
+        feedback_endpoint.is_some(),
+        allow_unsynchronized_async,
+    ) {
+        EndpointAdmission::Admit => Some(admitted_pacing(sync_type, feedback_endpoint)),
+        EndpointAdmission::SkipMalformed | EndpointAdmission::RefuseUnsynchronized => None,
+    }
+}

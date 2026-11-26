@@ -238,7 +238,8 @@ AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat 
              sync_type: SyncKind, feedback_endpoint: Option<u8>, max_packet_bytes,
              service_interval_us, uac_version,
              endpoint_interval /* bInterval */, usage: EndpointUsage /*Data|Feedback|FeedbackData|Reserved*/,
-             refresh /* bRefresh */, synch_address /* bSynchAddress, 0 if the feedback endpoint was found by usage */ }
+             refresh /* bRefresh */, synch_address /* bSynchAddress, 0 if the feedback endpoint was found by usage */,
+             pacing: Option<Pacing> /* how a stream here would be paced; None if it would not be streamed */ }
 ```
 
 ### `StreamRequest`, `StreamFormat`
@@ -256,11 +257,65 @@ RatePolicy::{ Exact (default), NearestSupported }
 carrier rate, or for native DSD the rate of subslot-sized words, `bit_rate / (8 *
 subslot_bytes)`), `channels`, `valid_bits`, `subslot_bytes`, the interface,
 alternate setting and endpoint, `sync_type`, `explicit_feedback`, `link_speed`,
-`service_interval_us`. Helpers: `bytes_per_frame()` (`subslot_bytes * channels`,
+`service_interval_us`, and two read-only diagnostics, `pacing` and `clock`
+(next section). Helpers: `bytes_per_frame()` (`subslot_bytes * channels`,
 the unit of `write`), `counter_rate_hz()` (the unit of `played_frames` and
 `latency_frames`: the wire frame rate, or `bit_rate / 8` for native DSD),
 `rate_differs_from_request()`. It cannot be built by hand; pass the one
 `negotiate` returned.
+
+### Clock and pacing diagnostics
+
+Two facts about a stream that explain "wrong pitch" and "clicks" reports, exposed
+so a developer can read them instead of reconstructing them from the log. They
+describe what the library already does; reading them changes nothing.
+
+```rust
+StreamFormat { ..., pacing: Pacing, clock: Option<ClockChoice> }
+AltSetting   { ..., pacing: Option<Pacing> }
+
+Pacing::{ ExplicitFeedback { endpoint: u8 }, Adaptive, Synchronous, Unsynchronized }
+ClockChoice { control_interface: u8, source_id: u8, path: Vec<ClockHop>, resolution: ClockResolution }
+ClockHop { id: u8, kind: ClockHopKind }
+ClockHopKind::{ Terminal, Selector { selected_pin: u8, pin_count: u8 }, Multiplier, Source }
+ClockResolution::{ Resolved, FallbackFirstSource }
+```
+
+**`StreamFormat::clock`** is the Clock Source the sample rate was set and verified on,
+as resolved by `negotiate`, and how it was reached. `control_interface` is the
+AudioControl interface the clock requests go to and `source_id` the Clock Source
+entity ID. `path` is the walk in the order followed: the stream's terminal
+(`Terminal`, its terminal ID), then each clock entity (a `Selector` with the 1-based
+pin that is active out of `pin_count`, a `Multiplier`), ending at the `Source`
+(its `id` is `source_id`). A selector with a single input reports pin 1 of 1 and is
+not asked; with several, the pin is what the device reported. `resolution` is
+`Resolved` when the walk succeeded and `FallbackFirstSource` when it could not (no
+terminal link, a malformed or looping entity, a selector that would not report its
+pin), in which case the first Clock Source in descriptor order was used and `path`
+holds that source alone. `None` when the device describes no clock entities (UAC
+1.0 sets the rate on the endpoint). The clock is resolved again when the stream
+opens, on the same terminal; a DAC whose selector is switched between the two calls
+(a front-panel clock switch) can differ from what `negotiate` reported.
+
+**`pacing`** names what the transport does for the chosen endpoint:
+
+| Endpoint | `Pacing` |
+|---|---|
+| Asynchronous, explicit feedback endpoint resolved | `ExplicitFeedback { endpoint }` (the feedback endpoint's address; it is polled) |
+| Adaptive | `Adaptive` (a declared feedback endpoint is ignored) |
+| Synchronous | `Synchronous` (likewise) |
+| Asynchronous, no feedback endpoint, streamed because `allow_unsynchronized_async` is on | `Unsynchronized` (also the `UnsynchronizedAsync` blocker; never bit-perfect) |
+| Declares no synchronisation | `Unsynchronized` (nominal rate; not a bit-perfect blocker today) |
+
+It is a label, not a mode selector: no pacing is added or chosen by it. On
+`StreamFormat` it is what the stream uses; on `AltSetting` it is what a stream on
+that alternate setting would use, and `None` when the library would not stream it
+with this configuration (an asynchronous endpoint without feedback while
+`allow_unsynchronized_async` is off, or a declared feedback endpoint that cannot be
+resolved).
+
+`Pacing`, `ClockResolution` and `ClockHopKind` are `#[non_exhaustive]`; each has a
+`code()` with the stable lower-case identifier the JSON uses.
 
 ### `DacStream`
 
@@ -854,12 +909,15 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
       "format": "pcm", "channels": 2, "subslot_bytes": 4, "valid_bits": 32,
       "rate_ranges": [ { "min_hz": 44100, "max_hz": 44100, "step_hz": 0 } ],
       "sample_rates": [44100], "sync_type": "asynchronous", "feedback_endpoint": 129,
-      "max_packet_bytes": 1024, "service_interval_us": 125, "uac_version": "v2" } ] }
+      "max_packet_bytes": 1024, "service_interval_us": 125, "uac_version": "v2",
+      "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 } } ] }
 ```
 
 `uac_version`: `v1`, `v2`, `unknown`. `link_speed`: `low`, `full`, `high`,
 `super`, `super_plus`, `unknown`. `format`: `pcm`, `dsd`, `other`. `sync_type`:
-`asynchronous`, `adaptive`, `synchronous`, `none`.
+`asynchronous`, `adaptive`, `synchronous`, `none`. An alternate setting's `pacing`
+is a pacing object (below), or `null` when the library would not stream it with
+this configuration. It is an additive key: documents from earlier versions lack it.
 
 **Negotiated format** (`dacNegotiate`):
 
@@ -868,8 +926,25 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
   "channels": 2, "valid_bits": 16, "subslot_bytes": 2, "bytes_per_frame": 4,
   "counter_rate_hz": 44100, "interface_number": 1, "alt_setting": 1,
   "endpoint_address": 1, "sync_type": "asynchronous", "explicit_feedback": true,
-  "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false }
+  "link_speed": "high", "service_interval_us": 125, "rate_differs_from_request": false,
+  "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129 },
+  "clock": { "control_interface": 0, "source_id": 5, "resolution": "resolved",
+             "path": [ { "id": 1, "kind": "terminal", "selected_pin": null, "pin_count": null },
+                       { "id": 9, "kind": "selector", "selected_pin": 2, "pin_count": 2 },
+                       { "id": 5, "kind": "source", "selected_pin": null, "pin_count": null } ] } }
 ```
+
+`pacing` and `clock` are additive keys (documents from earlier versions lack
+them). A **pacing object** is `{ "mode": ..., "feedback_endpoint": ... }` with `mode`
+one of `explicit_feedback`, `adaptive`, `synchronous`, `unsynchronized`;
+`feedback_endpoint` is the feedback endpoint's address for `explicit_feedback` and
+`null` for the others. `clock` is `null` when the device describes no clock
+entities; otherwise `resolution` is `resolved` or `fallback_first_source`, `path`
+lists the hops in the order followed (terminal first, Clock Source last, whose `id`
+equals `source_id`), and a hop's `kind` is `terminal`, `selector`, `multiplier` or
+`source`. `selected_pin` (1-based) and `pin_count` are set for `selector` hops and
+`null` for the others. A reader should treat an unknown `mode`, `resolution` or
+`kind` as "unknown", not as an error.
 
 **Stream statistics** (`streamStats`): all `StreamStats` fields of section 3 as
 numbers (`state` is the state code; `bit_perfect` boolean; `bit_perfect_blocker` a

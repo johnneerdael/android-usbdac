@@ -30,6 +30,89 @@ const UAC2_CLOCK_MULTIPLIER: u8 = 0x0c;
 /// only stops a pathological descriptor from walking for long.
 const MAX_CLOCK_PATH: usize = 16;
 
+/// How the clock the library programs the sample rate on was reached, for
+/// diagnosing a DAC with more than one clock. Read-only: nothing here changes
+/// what the library does.
+///
+/// UAC 2.0 routes a streaming terminal to its clock through Clock Selectors
+/// (several inputs, one active) and Clock Multipliers, ending at a Clock Source
+/// (section 4.7.2). The sampling frequency is set and read back on that source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockChoice {
+    /// Interface number of the AudioControl interface the clock requests go to.
+    pub control_interface: u8,
+    /// Entity ID of the Clock Source the sample rate is set and verified on.
+    pub source_id: u8,
+    /// The entities followed, in order: the streaming terminal, then each clock
+    /// entity down to the Clock Source (the last hop, whose `id` is `source_id`).
+    ///
+    /// For [`ClockResolution::FallbackFirstSource`] nothing was followed, so the
+    /// path is the Clock Source alone.
+    pub path: Vec<ClockHop>,
+    pub resolution: ClockResolution,
+}
+
+/// How [`ClockChoice::source_id`] was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClockResolution {
+    /// The stream's terminal was traced to the Clock Source through the
+    /// descriptors (and, at a Clock Selector with several inputs, the pin the
+    /// device reports as selected).
+    Resolved,
+    /// The topology could not be traced (no terminal link, a malformed or
+    /// looping entity, a selector that would not say which pin is active), so
+    /// the first Clock Source in descriptor order was used. On a DAC with more
+    /// than one clock the rate may then be set on the wrong one.
+    FallbackFirstSource,
+}
+
+impl ClockResolution {
+    /// Stable identifier: `resolved`, `fallback_first_source`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::FallbackFirstSource => "fallback_first_source",
+        }
+    }
+}
+
+/// One entity on the path from a streaming terminal to its Clock Source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockHop {
+    /// The entity ID (the terminal ID for [`ClockHopKind::Terminal`]).
+    pub id: u8,
+    pub kind: ClockHopKind,
+}
+
+/// What a [`ClockHop`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClockHopKind {
+    /// The streaming terminal the path starts at.
+    Terminal,
+    /// A Clock Selector. Pins are 1-based. A selector with one input has
+    /// nothing to choose and is reported as `selected_pin: 1, pin_count: 1`
+    /// without being asked; with several, the pin is what the device reported.
+    Selector { selected_pin: u8, pin_count: u8 },
+    /// A Clock Multiplier (one clock input).
+    Multiplier,
+    /// A Clock Source: the end of the path.
+    Source,
+}
+
+impl ClockHopKind {
+    /// Stable identifier: `terminal`, `selector`, `multiplier`, `source`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Selector { .. } => "selector",
+            Self::Multiplier => "multiplier",
+            Self::Source => "source",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClockEntity {
     Source,
@@ -135,14 +218,23 @@ impl ClockGraph {
         }
 
         let mut path = vec![first];
+        let mut hops = vec![ClockHop {
+            id: terminal_id,
+            kind: ClockHopKind::Terminal,
+        }];
         loop {
             let current = *path.last().expect("path starts non-empty");
             match self.entities.get(&current) {
                 None | Some(ClockEntity::Source) => {
                     let assumed_source = !self.entities.contains_key(&current);
+                    hops.push(ClockHop {
+                        id: current,
+                        kind: ClockHopKind::Source,
+                    });
                     return Ok(ResolvedClock {
                         clock_id: current,
                         path,
+                        hops,
                         assumed_source,
                     });
                 }
@@ -153,12 +245,17 @@ impl ClockGraph {
                     if *input == 0 {
                         return Err(ClockResolveError::MalformedEntity(current));
                     }
+                    hops.push(ClockHop {
+                        id: current,
+                        kind: ClockHopKind::Multiplier,
+                    });
                     path.push(*input);
                 }
                 Some(ClockEntity::Selector(inputs)) => {
-                    let next = match inputs.as_slice() {
+                    let pin_count = u8::try_from(inputs.len()).unwrap_or(u8::MAX);
+                    let (next, pin) = match inputs.as_slice() {
                         [] => return Err(ClockResolveError::SelectorWithoutInputs(current)),
-                        [only] => *only,
+                        [only] => (*only, 1),
                         many => {
                             let pin = selected_pin(current).map_err(|reason| {
                                 ClockResolveError::PinUnavailable {
@@ -173,12 +270,19 @@ impl ClockGraph {
                                     inputs: many.len(),
                                 });
                             }
-                            many[usize::from(pin) - 1]
+                            (many[usize::from(pin) - 1], pin)
                         }
                     };
                     if next == 0 {
                         return Err(ClockResolveError::MalformedEntity(current));
                     }
+                    hops.push(ClockHop {
+                        id: current,
+                        kind: ClockHopKind::Selector {
+                            selected_pin: pin,
+                            pin_count,
+                        },
+                    });
                     path.push(next);
                 }
             }
@@ -192,6 +296,74 @@ impl ClockGraph {
             }
         }
     }
+
+    /// The clock the sample rate is programmed on for the stream whose
+    /// AudioStreaming interface links `terminal_link`, on the AudioControl
+    /// interface `control_interface`.
+    ///
+    /// The terminal is traced to its Clock Source with
+    /// [`resolve_terminal_clock`](Self::resolve_terminal_clock). When that
+    /// fails (or the stream names no terminal) the first Clock Source in
+    /// descriptor order is used instead, and the result says so. `Err` carries
+    /// the reason when there is no clock to choose: the interface describes no
+    /// clock entities, or none is a Clock Source to fall back on.
+    pub(crate) fn select_clock(
+        &self,
+        control_interface: u8,
+        terminal_link: Option<u8>,
+        selected_pin: impl FnMut(u8) -> Result<u8, String>,
+    ) -> Result<ClockSelection, String> {
+        // UAC 1.0 describes no clock entities, and its terminal descriptors must
+        // not be read as if they named one.
+        if !self.has_clock_entities() {
+            return Err("the AudioControl interface describes no clock entities".to_string());
+        }
+        let unresolved = match terminal_link {
+            None => "the stream has no bTerminalLink to trace its clock from".to_string(),
+            Some(terminal) => match self.resolve_terminal_clock(terminal, selected_pin) {
+                Ok(resolved) => {
+                    return Ok(ClockSelection {
+                        choice: ClockChoice {
+                            control_interface,
+                            source_id: resolved.clock_id,
+                            path: resolved.hops,
+                            resolution: ClockResolution::Resolved,
+                        },
+                        assumed_source: resolved.assumed_source,
+                        unresolved: None,
+                    });
+                }
+                Err(error) => error.to_string(),
+            },
+        };
+        match self.first_clock_source() {
+            Some(source_id) => Ok(ClockSelection {
+                choice: ClockChoice {
+                    control_interface,
+                    source_id,
+                    path: vec![ClockHop {
+                        id: source_id,
+                        kind: ClockHopKind::Source,
+                    }],
+                    resolution: ClockResolution::FallbackFirstSource,
+                },
+                assumed_source: false,
+                unresolved: Some(unresolved),
+            }),
+            None => Err(unresolved),
+        }
+    }
+}
+
+/// What [`ClockGraph::select_clock`] chose, with what the transport logs about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockSelection {
+    pub choice: ClockChoice,
+    /// The source has no descriptor of its own and was taken to be one.
+    pub assumed_source: bool,
+    /// Why the topology could not be traced. Set exactly when the choice is
+    /// [`ClockResolution::FallbackFirstSource`].
+    pub unresolved: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +371,8 @@ pub(crate) struct ResolvedClock {
     pub clock_id: u8,
     /// Entity IDs from the terminal's `bCSourceID` to `clock_id`, inclusive.
     pub path: Vec<u8>,
+    /// The same walk with what each entity is, starting at the terminal itself.
+    pub hops: Vec<ClockHop>,
     /// `clock_id` has no descriptor of its own and was taken to be the source.
     pub assumed_source: bool,
 }

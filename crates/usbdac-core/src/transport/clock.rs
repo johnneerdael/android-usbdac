@@ -5,6 +5,16 @@ pub(super) fn find_audio_control_clock(
     handle: &DeviceHandle<Context>,
     terminal_link: Option<u8>,
 ) -> Option<AudioControlClock> {
+    find_audio_control_clock_choice(device, handle, terminal_link).map(|(clock, _)| clock)
+}
+
+/// [`find_audio_control_clock`], with how the clock was reached for
+/// `StreamFormat::clock`.
+pub(super) fn find_audio_control_clock_choice(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    terminal_link: Option<u8>,
+) -> Option<(AudioControlClock, ClockChoice)> {
     let config_descriptor = device.active_config_descriptor().ok()?;
 
     for interface in config_descriptor.interfaces() {
@@ -55,80 +65,59 @@ pub(super) fn find_audio_control_clock(
                 continue;
             }
 
-            if let Some(clock) = resolve_stream_clock(handle, ac_iface, &graph, terminal_link) {
-                return Some(clock);
-            }
-
-            // Last resort: the first Clock Source entity.
-            if let Some(clock_id) = graph.first_clock_source() {
-                log_warn!(
-                    "[USB] Clock topology for bTerminalLink={:?} could not be resolved; using the \
-                     first Clock Source id={} on AC interface {}. On a DAC with more than one clock \
-                     the sample rate may be set on the wrong one.",
+            match graph.select_clock(ac_iface, terminal_link, |selector| {
+                get_clock_selector_pin(handle, ac_iface, selector)
+            }) {
+                Ok(selection) => {
+                    match &selection.unresolved {
+                        None => log_info!(
+                            "[USB] Clock resolved via topology: bTerminalLink={:?} -> clock path {:?} -> \
+                             Clock Source id={} on AC interface {}{}",
+                            terminal_link,
+                            selection
+                                .choice
+                                .path
+                                .iter()
+                                .skip(1)
+                                .map(|hop| hop.id)
+                                .collect::<Vec<_>>(),
+                            selection.choice.source_id,
+                            ac_iface,
+                            if selection.assumed_source {
+                                " (no descriptor for that ID; assumed to be the source)"
+                            } else {
+                                ""
+                            },
+                        ),
+                        // The first Clock Source in descriptor order is the last resort.
+                        Some(reason) => log_warn!(
+                            "[USB] Could not resolve the clock for bTerminalLink={:?} on AC interface {}: \
+                             {}. Using the first Clock Source id={}; on a DAC with more than one clock \
+                             the sample rate may be set on the wrong one.",
+                            terminal_link,
+                            ac_iface,
+                            reason,
+                            selection.choice.source_id,
+                        ),
+                    }
+                    let clock = AudioControlClock {
+                        interface_number: ac_iface,
+                        clock_id: selection.choice.source_id,
+                    };
+                    return Some((clock, selection.choice));
+                }
+                Err(reason) => log_warn!(
+                    "[USB] Could not resolve the clock for bTerminalLink={:?} on AC interface {}: {}",
                     terminal_link,
-                    clock_id,
                     ac_iface,
-                );
-                return Some(AudioControlClock {
-                    interface_number: ac_iface,
-                    clock_id,
-                });
+                    reason,
+                ),
             }
         }
     }
 
     dev_eprintln!("[USB] No AudioControl clock source entity found in any interface descriptor");
     None
-}
-
-/// Walk the terminal's clock chain on one AudioControl interface. `None` means
-/// the caller must fall back; the reason is logged here.
-pub(super) fn resolve_stream_clock(
-    handle: &DeviceHandle<Context>,
-    ac_iface: u8,
-    graph: &ClockGraph,
-    terminal_link: Option<u8>,
-) -> Option<AudioControlClock> {
-    let Some(terminal) = terminal_link else {
-        log_warn!(
-            "[USB] No bTerminalLink for the selected stream; cannot trace its clock on AC interface {}",
-            ac_iface
-        );
-        return None;
-    };
-    let resolved = graph.resolve_terminal_clock(terminal, |selector| {
-        get_clock_selector_pin(handle, ac_iface, selector)
-    });
-    match resolved {
-        Ok(resolved) => {
-            log_info!(
-                "[USB] Clock resolved via topology: bTerminalLink={} -> clock path {:?} -> Clock \
-                 Source id={} on AC interface {}{}",
-                terminal,
-                resolved.path,
-                resolved.clock_id,
-                ac_iface,
-                if resolved.assumed_source {
-                    " (no descriptor for that ID; assumed to be the source)"
-                } else {
-                    ""
-                },
-            );
-            Some(AudioControlClock {
-                interface_number: ac_iface,
-                clock_id: resolved.clock_id,
-            })
-        }
-        Err(error) => {
-            log_warn!(
-                "[USB] Could not resolve the clock for bTerminalLink={} on AC interface {}: {}",
-                terminal,
-                ac_iface,
-                error
-            );
-            None
-        }
-    }
 }
 
 /// CX_CLOCK_SELECTOR_CONTROL GET_CUR: the 1-based input pin a Clock Selector

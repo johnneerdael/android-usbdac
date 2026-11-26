@@ -84,6 +84,49 @@ pub enum SyncKind {
     None,
 }
 
+/// What keeps the host's packets and the DAC's clock in step on an endpoint:
+/// the transport's pacing, named for diagnostics. It only labels what the
+/// transport does for the endpoint; it never selects a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Pacing {
+    /// An asynchronous endpoint whose explicit feedback endpoint (`endpoint`,
+    /// the address) is polled; packet sizes follow the rate the DAC reports.
+    ExplicitFeedback { endpoint: u8 },
+    /// An adaptive endpoint: the DAC follows the host's packet timing.
+    Adaptive,
+    /// A synchronous endpoint: the DAC and the host share the bus clock.
+    Synchronous,
+    /// No rate information comes back from the DAC: the host sends at the
+    /// nominal rate. This is an asynchronous endpoint without a feedback
+    /// endpoint, streamed only because
+    /// [`DacConfig::allow_unsynchronized_async`](crate::DacConfig::allow_unsynchronized_async)
+    /// is on (never bit-perfect), or an endpoint that declares no
+    /// synchronisation at all.
+    Unsynchronized,
+}
+
+impl Pacing {
+    /// Stable identifier: `explicit_feedback`, `adaptive`, `synchronous`,
+    /// `unsynchronized`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ExplicitFeedback { .. } => "explicit_feedback",
+            Self::Adaptive => "adaptive",
+            Self::Synchronous => "synchronous",
+            Self::Unsynchronized => "unsynchronized",
+        }
+    }
+
+    /// The feedback endpoint address, for [`Pacing::ExplicitFeedback`].
+    pub fn feedback_endpoint(self) -> Option<u8> {
+        match self {
+            Self::ExplicitFeedback { endpoint } => Some(endpoint),
+            _ => None,
+        }
+    }
+}
+
 /// The usage bits of an isochronous endpoint's `bmAttributes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointUsage {
@@ -151,6 +194,13 @@ pub struct AltSetting {
     /// [`feedback_endpoint`](Self::feedback_endpoint) can be set while this is 0
     /// (a feedback endpoint found by its usage bits).
     pub synch_address: u8,
+    /// How a stream on this alternate setting would be paced, as
+    /// [`StreamFormat::pacing`](crate::StreamFormat::pacing) will report it.
+    /// `None` when the library would not stream it with the current
+    /// configuration: an asynchronous endpoint without a feedback endpoint
+    /// while [`DacConfig::allow_unsynchronized_async`](crate::DacConfig::allow_unsynchronized_async)
+    /// is off, or one that declares a feedback endpoint that cannot be resolved.
+    pub pacing: Option<Pacing>,
 }
 
 /// Summary of what the DAC can do.

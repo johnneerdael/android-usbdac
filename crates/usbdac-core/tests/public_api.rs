@@ -181,3 +181,38 @@ fn the_bit_perfect_blockers_have_stable_codes() {
         ]
     );
 }
+
+#[test]
+fn the_clock_and_pacing_diagnostics_have_stable_codes_and_are_plain_data() {
+    use usbdac_core::{ClockChoice, ClockHop, ClockHopKind, ClockResolution, Pacing};
+
+    let choice = ClockChoice {
+        control_interface: 0,
+        source_id: 5,
+        path: vec![
+            ClockHop { id: 1, kind: ClockHopKind::Terminal },
+            ClockHop {
+                id: 9,
+                kind: ClockHopKind::Selector { selected_pin: 2, pin_count: 2 },
+            },
+            ClockHop { id: 5, kind: ClockHopKind::Source },
+        ],
+        resolution: ClockResolution::Resolved,
+    };
+    assert_eq!(choice.clone(), choice);
+    assert_eq!(choice.resolution.code(), "resolved");
+    assert_eq!(ClockResolution::FallbackFirstSource.code(), "fallback_first_source");
+    let kinds: Vec<&str> = choice.path.iter().map(|hop| hop.kind.code()).collect();
+    assert_eq!(kinds, ["terminal", "selector", "source"]);
+
+    let codes: Vec<&str> = [
+        Pacing::ExplicitFeedback { endpoint: 0x81 },
+        Pacing::Adaptive,
+        Pacing::Synchronous,
+        Pacing::Unsynchronized,
+    ]
+    .iter()
+    .map(|pacing| pacing.code())
+    .collect();
+    assert_eq!(codes, ["explicit_feedback", "adaptive", "synchronous", "unsynchronized"]);
+}

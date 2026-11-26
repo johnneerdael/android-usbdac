@@ -86,6 +86,13 @@ pub(super) fn build_usb_capability_model(
                 let max_packet_bytes =
                     effective_iso_packet_bytes(endpoint.max_packet_size(), speed);
 
+                let feedback_address = find_feedback_endpoint(
+                    &descriptor,
+                    endpoint.synch_address(),
+                    endpoint.sync_type(),
+                    speed,
+                )
+                .map(|feedback| feedback.address);
                 supported_sample_rates.extend(sample_rates.iter().copied());
                 alt_settings.push(AltSetting {
                     interface_number: descriptor.interface_number(),
@@ -105,13 +112,7 @@ pub(super) fn build_usb_capability_model(
                         .collect(),
                     sample_rates: sample_rates.clone(),
                     sync_type: sync_kind(endpoint.sync_type()),
-                    feedback_endpoint: find_feedback_endpoint(
-                        &descriptor,
-                        endpoint.synch_address(),
-                        endpoint.sync_type(),
-                        speed,
-                    )
-                    .map(|feedback| feedback.address),
+                    feedback_endpoint: feedback_address,
                     max_packet_bytes,
                     service_interval_us,
                     uac_version: if stream_format.is_uac1 {
@@ -123,6 +124,12 @@ pub(super) fn build_usb_capability_model(
                     usage: endpoint_usage(endpoint.usage_type()),
                     refresh: endpoint.refresh(),
                     synch_address: endpoint.synch_address(),
+                    pacing: endpoint_pacing(
+                        endpoint.sync_type(),
+                        endpoint.synch_address(),
+                        feedback_address,
+                        settings().allow_unsynchronized_async(),
+                    ),
                 });
             }
         }

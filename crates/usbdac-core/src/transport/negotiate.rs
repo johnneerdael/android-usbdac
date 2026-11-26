@@ -3,15 +3,18 @@ use super::*;
 /// Programs and verifies the DAC clock for `requested_format` and settles on the
 /// format the DAC will actually run (which differs only when the exact rate is
 /// not available). Runs with the alternate setting at 0 and leaves it there.
+///
+/// Also returns which clock the rate was programmed on and how it was reached
+/// (`None` when the DAC has no clock entities).
 #[allow(unused_assignments)]
 pub(super) fn negotiate_playback_format(
     requested_format: PlaybackFormat,
-) -> Result<PlaybackFormat, crate::Error> {
+) -> Result<(PlaybackFormat, Option<ClockChoice>), crate::Error> {
     use crate::Error;
     let device = {
         let guard = SESSION_STATE.lock();
         let Some(state) = guard.as_ref() else {
-            return Ok(requested_format);
+            return Ok((requested_format, None));
         };
         state.device.clone()
     };
@@ -19,6 +22,7 @@ pub(super) fn negotiate_playback_format(
     let claimed_handle = open_claimed_usb_handle(&device).map_err(Error::Claim)?;
     let lock_requested = current_lock_requested_for_fd(device.fd);
     let mut cleanup_interface: Option<u8> = None;
+    let mut clock_choice: Option<ClockChoice> = None;
     let negotiated = (|| {
         let usb_device = claimed_handle.handle.device();
         let speed = resolve_device_speed(&usb_device);
@@ -42,8 +46,15 @@ pub(super) fn negotiate_playback_format(
 
         // Find clock entity AFTER selecting candidate so we can trace the
         // topology using the candidate's bTerminalLink.
-        let clock =
-            find_audio_control_clock(&usb_device, &claimed_handle.handle, candidate.terminal_link);
+        let clock = find_audio_control_clock_choice(
+            &usb_device,
+            &claimed_handle.handle,
+            candidate.terminal_link,
+        )
+        .map(|(clock, choice)| {
+            clock_choice = Some(choice);
+            clock
+        });
 
         if let Err(error) = claimed_handle.ensure_interface_claimed(candidate.interface_number) {
             set_last_error(Some(error.clone()));
@@ -278,7 +289,7 @@ pub(super) fn negotiate_playback_format(
     })();
 
     cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
-    negotiated
+    negotiated.map(|format| (format, clock_choice))
 }
 
 pub(super) fn choose_adaptive_sample_rate(

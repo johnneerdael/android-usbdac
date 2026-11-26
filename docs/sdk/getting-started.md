@@ -132,6 +132,8 @@ Every failure is a `DacException` with a typed `code` (see [troubleshooting](tro
                 val opened = open.openStream(format)
 ```
 
+The returned `StreamFormat` also says which clock the rate was set on (`format.clock`) and how the stream is paced (`format.pacing`); see [diagnostics](controls.md#diagnostics-the-clock-and-the-pacing).
+
 `StreamRequest.pcm(rate, channels, bitDepth)` asks for exactly that. By default a rate the DAC cannot run fails with `UNSUPPORTED`; the library never resamples. With `RatePolicy.NEAREST_SUPPORTED` the returned `StreamFormat` carries the rate the DAC will run (`rateDiffersFromRequest`), and you have to resample. `StreamRequest.dop(...)` and `StreamRequest.dsdNative(...)` ask for DSD; see [bit-perfect output](bit-perfect.md).
 
 ### When the DAC refuses what you have

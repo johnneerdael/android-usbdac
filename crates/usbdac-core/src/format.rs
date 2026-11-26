@@ -1,6 +1,7 @@
 //! Stream formats: what the host asks for and what goes on the wire.
 
-use crate::capabilities::{LinkSpeed, SyncKind};
+use crate::capabilities::{LinkSpeed, Pacing, SyncKind};
+use crate::clock_resolution::ClockChoice;
 
 /// How the audio is carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,14 @@ pub struct StreamFormat {
     pub explicit_feedback: bool,
     pub link_speed: LinkSpeed,
     pub service_interval_us: u32,
+    /// How the stream is paced on the endpoint: what the transport does, named
+    /// (see [`Pacing`]). Consistent with `sync_type` and `explicit_feedback`.
+    pub pacing: Pacing,
+    /// The Clock Source the sample rate was set and verified on, and how it was
+    /// reached from the stream's terminal (see [`ClockChoice`]), as resolved by
+    /// [`Dac::negotiate`](crate::Dac::negotiate). `None` when the DAC has no
+    /// clock entities to set (UAC 1.0 sets the rate on the endpoint).
+    pub clock: Option<ClockChoice>,
 }
 
 impl StreamFormat {

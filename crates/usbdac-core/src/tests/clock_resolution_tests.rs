@@ -1,5 +1,6 @@
 use crate::clock_resolution::{
-    audio_control_descriptors_from_config, ClockGraph, ClockResolveError, ResolvedClock,
+    audio_control_descriptors_from_config, ClockChoice, ClockGraph, ClockHop, ClockHopKind,
+    ClockResolution, ClockResolveError, ClockSelection, ResolvedClock,
 };
 
 // Descriptor builders. Layouts follow UAC 2.0 sections 4.7.2.1 to 4.7.2.5.
@@ -342,4 +343,241 @@ fn the_raw_fallback_survives_a_truncated_configuration() {
     raw.extend_from_slice(&[30, 0x24, 0x0a]);
     let collected = audio_control_descriptors_from_config(&raw, 0);
     assert_eq!(ClockGraph::parse(&collected).first_clock_source(), Some(4));
+}
+
+// ---- what the library reports about the clock it chose (ClockChoice) ----
+
+/// The AudioControl interface the choice is made on; any number will do.
+const AC: u8 = 0;
+
+fn hop(id: u8, kind: ClockHopKind) -> ClockHop {
+    ClockHop { id, kind }
+}
+
+fn selector_hop(id: u8, selected_pin: u8, pin_count: u8) -> ClockHop {
+    hop(
+        id,
+        ClockHopKind::Selector {
+            selected_pin,
+            pin_count,
+        },
+    )
+}
+
+fn choose(
+    bytes: &[u8],
+    terminal_link: Option<u8>,
+    pin: impl FnMut(u8) -> Result<u8, String>,
+) -> Result<ClockSelection, String> {
+    ClockGraph::parse(bytes).select_clock(AC, terminal_link, pin)
+}
+
+fn resolved(choice: ClockChoice, source_id: u8, path: Vec<ClockHop>) {
+    assert_eq!(choice.control_interface, AC);
+    assert_eq!(choice.source_id, source_id);
+    assert_eq!(choice.resolution, ClockResolution::Resolved);
+    assert_eq!(choice.path, path);
+    // The path ends at the Clock Source the rate is set on.
+    assert_eq!(choice.path.last(), Some(&hop(source_id, ClockHopKind::Source)));
+}
+
+#[test]
+fn the_choice_for_a_terminal_fed_directly_by_a_source_is_terminal_then_source() {
+    let bytes = descriptors(&[input_terminal(1, 4), clock_source(4)]);
+    let selection = choose(&bytes, Some(1), no_request).unwrap();
+    assert_eq!(selection.unresolved, None);
+    resolved(
+        selection.choice,
+        4,
+        vec![hop(1, ClockHopKind::Terminal), hop(4, ClockHopKind::Source)],
+    );
+}
+
+#[test]
+fn the_choice_through_a_single_input_selector_reports_pin_one_of_one_without_asking() {
+    let bytes = descriptors(&[
+        input_terminal(1, 6),
+        clock_source(4),
+        clock_selector(6, &[4]),
+    ]);
+    let selection = choose(&bytes, Some(1), no_request).unwrap();
+    resolved(
+        selection.choice,
+        4,
+        vec![
+            hop(1, ClockHopKind::Terminal),
+            selector_hop(6, 1, 1),
+            hop(4, ClockHopKind::Source),
+        ],
+    );
+}
+
+#[test]
+fn the_choice_through_a_multi_input_selector_on_pin_two_names_the_second_source() {
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_source(4),
+        clock_source(5),
+        clock_selector(9, &[4, 5]),
+    ]);
+    let selection = choose(&bytes, Some(1), |_| Ok(2)).unwrap();
+    resolved(
+        selection.choice,
+        5,
+        vec![
+            hop(1, ClockHopKind::Terminal),
+            selector_hop(9, 2, 2),
+            hop(5, ClockHopKind::Source),
+        ],
+    );
+}
+
+#[test]
+fn the_choice_through_a_multiplier_lists_it_between_terminal_and_source() {
+    let bytes = descriptors(&[
+        input_terminal(1, 7),
+        clock_source(4),
+        clock_multiplier(7, 4),
+    ]);
+    let selection = choose(&bytes, Some(1), no_request).unwrap();
+    resolved(
+        selection.choice,
+        4,
+        vec![
+            hop(1, ClockHopKind::Terminal),
+            hop(7, ClockHopKind::Multiplier),
+            hop(4, ClockHopKind::Source),
+        ],
+    );
+}
+
+#[test]
+fn the_choice_through_a_selector_then_a_multiplier_keeps_the_order_followed() {
+    // terminal -> selector 9 [multiplier 7, multiplier 8]; 8 -> source 5 on pin 2.
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_source(4),
+        clock_source(5),
+        clock_multiplier(7, 4),
+        clock_multiplier(8, 5),
+        clock_selector(9, &[7, 8]),
+    ]);
+    let selection = choose(&bytes, Some(1), |_| Ok(2)).unwrap();
+    resolved(
+        selection.choice,
+        5,
+        vec![
+            hop(1, ClockHopKind::Terminal),
+            selector_hop(9, 2, 2),
+            hop(8, ClockHopKind::Multiplier),
+            hop(5, ClockHopKind::Source),
+        ],
+    );
+}
+
+#[test]
+fn the_choice_for_an_output_terminal_starts_at_that_terminal() {
+    let bytes = descriptors(&[output_terminal(2, 9, 4), clock_source(4)]);
+    let selection = choose(&bytes, Some(2), no_request).unwrap();
+    resolved(
+        selection.choice,
+        4,
+        vec![hop(2, ClockHopKind::Terminal), hop(4, ClockHopKind::Source)],
+    );
+}
+
+#[test]
+fn an_id_taken_to_be_the_source_is_still_a_resolved_choice() {
+    let bytes = descriptors(&[input_terminal(1, 9), clock_source(4)]);
+    let selection = choose(&bytes, Some(1), no_request).unwrap();
+    assert!(selection.assumed_source);
+    resolved(
+        selection.choice,
+        9,
+        vec![hop(1, ClockHopKind::Terminal), hop(9, ClockHopKind::Source)],
+    );
+}
+
+fn fallback_to_the_first_source(choice: &ClockChoice) {
+    assert_eq!(choice.control_interface, AC);
+    assert_eq!(choice.source_id, 4, "the first Clock Source in descriptor order");
+    assert_eq!(choice.resolution, ClockResolution::FallbackFirstSource);
+    // Nothing was followed, so only the source is on the path.
+    assert_eq!(choice.path, vec![hop(4, ClockHopKind::Source)]);
+}
+
+#[test]
+fn an_unresolvable_topology_falls_back_to_the_first_source_and_says_why() {
+    // Two clocks behind a selector; the device will not say which pin is active.
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_source(4),
+        clock_source(5),
+        clock_selector(9, &[5, 4]),
+    ]);
+    let selection = choose(&bytes, Some(1), |_| Err("stalled".to_string())).unwrap();
+    fallback_to_the_first_source(&selection.choice);
+    let reason = selection.unresolved.expect("a fallback carries its reason");
+    assert!(reason.contains("stalled"), "{reason}");
+
+    // A terminal the descriptors do not describe.
+    let bytes = descriptors(&[input_terminal(1, 4), clock_source(4)]);
+    let selection = choose(&bytes, Some(3), no_request).unwrap();
+    fallback_to_the_first_source(&selection.choice);
+    assert!(selection.unresolved.is_some());
+
+    // A looping chain.
+    let bytes = descriptors(&[
+        input_terminal(1, 6),
+        clock_source(4),
+        clock_multiplier(6, 7),
+        clock_multiplier(7, 6),
+    ]);
+    fallback_to_the_first_source(&choose(&bytes, Some(1), no_request).unwrap().choice);
+}
+
+#[test]
+fn a_stream_without_a_terminal_link_falls_back_too() {
+    let bytes = descriptors(&[input_terminal(1, 4), clock_source(4)]);
+    let selection = choose(&bytes, None, no_request).unwrap();
+    fallback_to_the_first_source(&selection.choice);
+    assert!(selection.unresolved.expect("reason").contains("bTerminalLink"));
+}
+
+#[test]
+fn with_no_clock_source_at_all_there_is_no_choice() {
+    // Only a selector and a multiplier: nothing to fall back on.
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_selector(9, &[7]),
+        clock_multiplier(7, 0),
+    ]);
+    assert!(choose(&bytes, Some(1), no_request).is_err());
+}
+
+#[test]
+fn a_uac1_device_has_no_clock_to_choose() {
+    // UAC 1.0 sets the rate on the endpoint and describes no clock entities, so the
+    // transport finds no clock and `StreamFormat::clock` is `None`.
+    let uac1_input_terminal = vec![12, 0x24, 0x02, 1, 0x01, 0x01, 0, 2, 3, 0, 0, 0];
+    let graph = ClockGraph::parse(&uac1_input_terminal);
+    assert!(!graph.has_clock_entities());
+    assert!(graph.select_clock(AC, Some(1), no_request).is_err());
+}
+
+#[test]
+fn clock_codes_are_stable() {
+    assert_eq!(ClockResolution::Resolved.code(), "resolved");
+    assert_eq!(ClockResolution::FallbackFirstSource.code(), "fallback_first_source");
+    assert_eq!(ClockHopKind::Terminal.code(), "terminal");
+    assert_eq!(
+        ClockHopKind::Selector {
+            selected_pin: 1,
+            pin_count: 2
+        }
+        .code(),
+        "selector"
+    );
+    assert_eq!(ClockHopKind::Multiplier.code(), "multiplier");
+    assert_eq!(ClockHopKind::Source.code(), "source");
 }
