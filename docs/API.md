@@ -328,6 +328,8 @@ Closures `Fn(DacEvent) + Send + Sync` are listeners.
 | `Error(Error)` | The stream failed. Followed by `StateChanged(Failed)`. |
 | `DeviceLost` | The device is gone. Also delivered as `Error(DeviceLost)` for a stream. |
 
+A stream that failed stays open in the `Failed` state (writes return `InvalidState`) until you close it; `open_stream` refuses to start another one before that.
+
 The listener passed to `open_stream` receives the stream's events. Events about
 the device itself (`VolumeChanged`, `DeviceLost`) go to the listener set with
 `Dac::set_listener` and also to the stream's listener while a stream is open.
