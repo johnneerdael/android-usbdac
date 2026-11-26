@@ -149,7 +149,7 @@ One more failure is not an exception: **a per-packet transfer error ends the str
 
 **Without a DAC.** Code the writer and the transport against `PcmOutput`, which is an interface: a fake that records the bytes, the calls and their order tests the writer loop, the seek order (flush after the decoder moved, no stale chunk written), the end-of-queue drain and the gapless path with no hardware. usbdac's own tests do the same against a fake DAC (`transport/fake_dac.rs`) and a fake native layer. They do not tell you that a DAC will play.
 
-**With a DAC.** usbdac has run on one phone and one DAC, so every other pairing is a test. Adapt this matrix, and record the phone, Android version, DAC, cable and hub:
+**With a DAC.** Start with the [recorded hardware coverage](evidence.md#hardware-status). Adapt this matrix to your devices and record the phone, Android version, DAC, cable and hub.
 
 | Check | What to look for |
 |---|---|
@@ -176,5 +176,5 @@ Send what you find, with the log, to [the issue tracker](https://github.com/john
 - `abiFilters` and the AAR: the library carries arm64-v8a, armeabi-v7a, x86_64 and x86 (about 1.9 MB uncompressed for arm64-v8a). Do not publish an app built from an AAR made with `-Pusbdac.abis` or `-Pusbdac.skipNative=true`.
 - R8: the library ships consumer rules that keep `Native`, `AAudioNative` and `NativeListener`. Keep them if you replace the rules.
 - The manifest merges `android.hardware.usb.host` with `required="false"`, so your app is still offered on phones without host mode (the managed output works there).
-- Say in your own release notes what is verified. This library has run on one phone and one DAC.
+- Say in your own release notes which phones, DACs, formats and output paths you verified.
 - Credit: usbdac is MIT licensed. The `NOTICE` file records that it began from Flick's USB driver. Include both notices as the licence asks.

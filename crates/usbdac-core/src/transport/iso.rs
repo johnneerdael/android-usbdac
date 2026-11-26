@@ -216,7 +216,8 @@ impl IsoTransferSlot {
     }
 
     /// Reuse the capture buffer without copying or exposing captured audio.
-    pub(super) fn submit_capture(&mut self, handle: &DeviceHandle<Context>, endpoint: u8, packet_bytes: usize) -> Result<(), String> {
+    pub(super) fn submit_capture(&mut self, handle: &DeviceHandle<Context>, endpoint: u8, packet_bytes: usize,
+        trace: Option<&crate::feedback_diagnostics::FeedbackRecorder>) -> Result<(), String> {
         if self.in_flight { return Err("capture slot already submitted".into()); }
         self.retirement_context = Some(handle.context().clone());
         unsafe {
@@ -231,6 +232,9 @@ impl IsoTransferSlot {
                 (*self.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(index)).length = packet_bytes as u32;
             }
             let result = libusb_submit_transfer(self.transfer.as_ptr());
+            if let Some(trace) = trace {
+                trace.record(crate::FeedbackTraceEvent::Submit { slot: Some(self.slot_index), status: result });
+            }
             if result != 0 {
                 return Err(if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
                     "USB DAC disconnected (implicit capture submit)".into()
@@ -349,6 +353,8 @@ impl Drop for IsoTransferSlot {
 /// is submitted once and re-armed from the same event loop after completion.
 /// It polls over at most the bus queue (and 16 ms), so a report is never older
 /// than what is queued for the DAC.
+const NO_FEEDBACK_PACKET_STATUS: i32 = i32::MIN;
+
 pub(super) struct FeedbackTransferSlot {
     pub(super) transfer: std::ptr::NonNull<libusb_transfer>,
     pub(super) user_data: *mut IsoTransferUserData,
@@ -359,6 +365,7 @@ pub(super) struct FeedbackTransferSlot {
     pub(super) in_flight: bool,
     retirement_context: Option<Context>,
     pub(super) submit_no_device: bool,
+    pub(super) last_submit_status: Option<i32>,
     retry_at: Instant,
 }
 
@@ -405,11 +412,13 @@ impl FeedbackTransferSlot {
             in_flight: false,
             retirement_context: None,
             submit_no_device: false,
+            last_submit_status: None,
             retry_at: Instant::now(),
         })
     }
 
     pub(super) fn submit(&mut self, handle: &DeviceHandle<Context>) -> Result<(), String> {
+        self.last_submit_status = None;
         if self.in_flight {
             return Err("feedback transfer slot already in flight".to_string());
         }
@@ -433,13 +442,17 @@ impl FeedbackTransferSlot {
                         self.timeout_ms,
                     );
                     for index in 0..self.packet_count {
-                        (*self
+                        let packet = &mut *self
                             .transfer
                             .as_mut()
                             .iso_packet_desc
                             .as_mut_ptr()
-                            .add(index))
-                        .length = self.packet_bytes as u32;
+                            .add(index);
+                        packet.length = self.packet_bytes as u32;
+                        // A transfer can fail before every packet is reported.
+                        // Do not reuse lengths or statuses from its last poll.
+                        packet.actual_length = 0;
+                        packet.status = NO_FEEDBACK_PACKET_STATUS;
                     }
                 }
                 TransferType::Interrupt => {
@@ -463,6 +476,7 @@ impl FeedbackTransferSlot {
             }
 
             let submit_result = libusb_submit_transfer(self.transfer.as_ptr());
+            self.last_submit_status = Some(submit_result);
             self.submit_no_device = submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE;
             if submit_result != 0 {
                 return Err(format!(
@@ -483,21 +497,23 @@ impl FeedbackTransferSlot {
 
     fn newest_valid_report(&self, scheduler: &IsoPacketScheduler, service_us: u32,
         speed: Speed, max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
-        actual_length: usize) -> Option<(f64, f64)> {
+        actual_length: usize, transfer_status: i32) -> Option<(f64, f64)> {
         let buffer = unsafe { &(*self.user_data).buffer };
         if self.endpoint.transfer_type == TransferType::Isochronous {
             let transfer = unsafe { self.transfer.as_ref() };
             if transfer.num_iso_packets < 0 || transfer.num_iso_packets as usize != self.packet_count {
-                counters.errors = counters.errors.saturating_add(1);
+                if transfer_status == LIBUSB_TRANSFER_COMPLETED {
+                    counters.errors = counters.errors.saturating_add(1);
+                }
                 return None;
             }
-            select_feedback_report(buffer, (0..self.packet_count).map(|index| {
+            inspect_feedback_packets(buffer, (0..self.packet_count).map(|index| {
                 let packet = unsafe { &*transfer.iso_packet_desc.as_ptr().add(index) };
                 (packet.status, packet.length as usize, packet.actual_length as usize)
-            }), scheduler, service_us, speed, max_frames, per_service, counters)
+            }), scheduler, service_us, speed, max_frames, per_service, counters, transfer_status, true)
         } else {
-            select_feedback_report(buffer, [(LIBUSB_TRANSFER_COMPLETED, self.packet_bytes, actual_length)],
-                scheduler, service_us, speed, max_frames, per_service, counters)
+            inspect_feedback_packets(buffer, [(transfer_status, self.packet_bytes, actual_length)],
+                scheduler, service_us, speed, max_frames, per_service, counters, transfer_status, false)
         }
     }
 
@@ -549,42 +565,190 @@ pub(super) struct FeedbackCounters {
     rate_rejected: u64,
     last_report_bytes: [u8; 4],
     last_report_len: usize,
+    pub(super) diagnostics: Option<crate::ExplicitFeedbackDiagnostics>,
+    pub(super) diagnostics_dirty: bool,
+    pub(super) trace: Option<Arc<crate::feedback_diagnostics::FeedbackRecorder>>,
+    pub(super) infer_service_interval: bool,
+    selected_timebase: Option<FeedbackTimebase>,
+    service_interval_confirmations: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackTimebase {
+    Bus,
+    OutService,
+}
+
+const SERVICE_INTERVAL_CONFIRMATIONS: u8 = 3;
+
+impl FeedbackCounters {
+    pub(super) fn record_submit(&mut self, status: Option<i32>) {
+        if let Some(status) = status {
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.record_submit(status);
+                self.diagnostics_dirty = true;
+            }
+            if let Some(trace) = &self.trace {
+                trace.record(crate::FeedbackTraceEvent::Submit { slot: None, status });
+            }
+        }
+    }
+
+    fn select_timebase(&mut self, timebase: FeedbackTimebase, speed: Speed, inferred: bool) {
+        self.selected_timebase = Some(timebase);
+        let unit = match (timebase, speed) {
+            (FeedbackTimebase::OutService, _) => "out_service_interval",
+            (_, Speed::Full) => "usb_frame",
+            _ => "usb_microframe",
+        };
+        if let Some(diagnostics) = self.diagnostics.as_mut() {
+            diagnostics.timebase = Some(unit);
+            diagnostics.inferred_timebase = inferred;
+        }
+        if let Some(trace) = &self.trace {
+            trace.record(crate::FeedbackTraceEvent::Timebase { unit, inferred });
+        }
+        if inferred {
+            log_info!("[USB] Explicit feedback timebase inferred: {} ({} matching completions)",
+                unit, SERVICE_INTERVAL_CONFIRMATIONS);
+        }
+    }
+
+    fn record_valid_bytes(&mut self, bytes: &[u8]) {
+        self.last_report_bytes = [0; 4];
+        self.last_report_bytes[..bytes.len()].copy_from_slice(bytes);
+        self.last_report_len = bytes.len();
+    }
 }
 
 /// Scan requested packet spans, never a shortened/concatenated actual-length prefix.
 /// Validate all candidates before selecting one; update the EWMA only once per transfer.
+#[cfg(test)]
 fn select_feedback_report(
     buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
     scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
     max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
 ) -> Option<(f64, f64)> {
+    inspect_feedback_packets(buffer, packets, scheduler, service_us, speed, max_frames,
+        per_service, counters, LIBUSB_TRANSFER_COMPLETED, true)
+}
+
+fn inspect_feedback_packets(
+    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
+    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
+    transfer_status: i32, is_iso: bool,
+) -> Option<(f64, f64)> {
+    use crate::ExplicitFeedbackOutcome as Outcome;
     let mut offset = 0usize;
     let mut newest = None;
-    for (status, requested, actual) in packets {
+    let mut newest_service_interval = None;
+    let mut conflicting_report = false;
+    let detecting = !per_service && counters.selected_timebase.is_none()
+        && counters.infer_service_interval && speed == Speed::High && service_us > 125;
+    let inferred_service_interval = !per_service && counters.selected_timebase == Some(FeedbackTimebase::OutService);
+    for (index, (status, requested, actual)) in packets.into_iter().enumerate() {
         let start = offset;
         offset = offset.saturating_add(requested);
-        if status != LIBUSB_TRANSFER_COMPLETED {
-            counters.errors = counters.errors.saturating_add(1);
-            continue;
-        }
-        if actual == 0 {
-            counters.empty_polls = counters.empty_polls.saturating_add(1);
-            continue;
-        }
         let report = (actual <= requested && offset <= buffer.len())
             .then(|| buffer.get(start..start.saturating_add(actual))).flatten();
-        let decoded = report.and_then(|bytes| decode_feedback_report_with_scale(bytes, service_us, speed, per_service));
-        if let Some((frames, rate)) = decoded.filter(|(frames, _)|
-            scheduler.feedback_rate_is_plausible(*frames) && frames.ceil() <= max_frames as f64) {
-            newest = Some((frames, rate));
-            let bytes = report.unwrap();
-            counters.last_report_bytes = [0; 4];
-            counters.last_report_bytes[..bytes.len()].copy_from_slice(bytes);
-            counters.last_report_len = bytes.len();
+        let mut decoded = None;
+        let outcome = if transfer_status != LIBUSB_TRANSFER_COMPLETED {
+            Outcome::TransferFailed
+        } else if status != LIBUSB_TRANSFER_COMPLETED {
+            Outcome::PacketFailed
+        } else if actual == 0 {
+            Outcome::Empty
+        } else if let Some(bytes) = report.filter(|bytes| matches!(bytes.len(), 3 | 4)) {
+            if !inferred_service_interval || bytes.len() == 4 {
+                decoded = decode_feedback_report_with_scale(
+                    bytes, service_us, speed, per_service || inferred_service_interval,
+                );
+            }
+            match decoded {
+                None => Outcome::InvalidEncoding,
+                Some((frames, _)) if !scheduler.feedback_rate_is_plausible(frames) => {
+                    let compatible = (detecting && bytes.len() == 4)
+                        .then(|| decode_feedback_report_with_scale(bytes, service_us, speed, true))
+                        .flatten()
+                        .filter(|(frames, _)| scheduler.feedback_rate_is_plausible(*frames)
+                            && frames.ceil() <= max_frames as f64);
+                    if let Some(rate) = compatible {
+                        newest_service_interval = Some((rate, bytes));
+                        decoded = Some(rate);
+                        Outcome::TimebaseCandidate
+                    } else {
+                        conflicting_report = true;
+                        Outcome::RateOutOfRange
+                    }
+                }
+                Some((frames, _)) if frames.ceil() > max_frames as f64 => Outcome::PacketCapacityExceeded,
+                Some(_) => {
+                    newest = decoded;
+                    counters.record_valid_bytes(bytes);
+                    Outcome::Valid
+                }
+            }
         } else {
-            if decoded.is_none() { counters.malformed = counters.malformed.saturating_add(1); }
-            else { counters.rate_rejected = counters.rate_rejected.saturating_add(1); }
-            counters.rejected = counters.rejected.saturating_add(1);
+            Outcome::InvalidLength
+        };
+        match outcome {
+            Outcome::Valid | Outcome::TransferFailed | Outcome::TimebaseCandidate => {}
+            Outcome::Empty => counters.empty_polls = counters.empty_polls.saturating_add(1),
+            Outcome::PacketFailed => counters.errors = counters.errors.saturating_add(1),
+            Outcome::InvalidLength | Outcome::InvalidEncoding => {
+                counters.malformed = counters.malformed.saturating_add(1);
+                counters.rejected = counters.rejected.saturating_add(1);
+            }
+            Outcome::RateOutOfRange | Outcome::PacketCapacityExceeded => {
+                counters.rate_rejected = counters.rate_rejected.saturating_add(1);
+                counters.rejected = counters.rejected.saturating_add(1);
+            }
+        }
+        if counters.diagnostics.is_some() || counters.trace.is_some() {
+            let packet_status = (is_iso && status != NO_FEEDBACK_PACKET_STATUS).then_some(status);
+            let raw = if counters.trace.is_some() {
+                // Copy only bytes inside this packet's submitted span. A
+                // failed transfer can still report a partial IN packet.
+                buffer.get(start..offset)
+                    .map(|span| &span[..actual.min(span.len())])
+                    .unwrap_or_default()
+            } else {
+                &[]
+            };
+            let sample = crate::ExplicitFeedbackPacket::new(
+                outcome, transfer_status, packet_status, requested, actual, raw, decoded,
+            );
+            if let Some(diagnostics) = counters.diagnostics.as_mut() {
+                diagnostics.record_packet(sample, is_iso);
+            }
+            if let Some(trace) = &counters.trace {
+                trace.record(crate::FeedbackTraceEvent::ExplicitPacket { index, sample });
+            }
+        }
+    }
+    if counters.selected_timebase.is_none() {
+        if newest.is_some() {
+            // A conforming report always wins, even if an earlier packet in
+            // the same completion resembled a different timebase.
+            let unit = if per_service && speed == Speed::High && counters.last_report_len == 4 {
+                FeedbackTimebase::OutService
+            } else {
+                FeedbackTimebase::Bus
+            };
+            counters.select_timebase(unit, speed, false);
+        } else if let Some((decoded, bytes)) = newest_service_interval.filter(|_| !conflicting_report) {
+            // Count once per successful completion. A batch containing many
+            // identical packets is only one observation. Empty polls do not
+            // count or extend the existing feedback deadline.
+            counters.service_interval_confirmations += 1;
+            if counters.service_interval_confirmations == SERVICE_INTERVAL_CONFIRMATIONS {
+                counters.record_valid_bytes(bytes);
+                counters.select_timebase(FeedbackTimebase::OutService, speed, true);
+                newest = Some(decoded);
+            }
+        } else if conflicting_report {
+            counters.service_interval_confirmations = 0;
         }
     }
     newest
@@ -618,13 +782,23 @@ pub(super) fn pump_feedback_transfer(
 ) -> Result<(), FeedbackFault> {
     if let Some((status, completed_at, actual_length)) = slot.take_completion() {
         slot.mark_completed();
+        if let Some(diagnostics) = counters.diagnostics.as_mut() {
+            diagnostics.record_transfer(status);
+            counters.diagnostics_dirty = true;
+        }
+        if let Some(trace) = &counters.trace {
+            trace.record_at(completed_at, crate::FeedbackTraceEvent::Completion {
+                slot: None, status, actual_bytes: actual_length,
+            });
+        }
+        let report = slot.newest_valid_report(scheduler, data_service_interval_us, speed,
+            max_frames, per_service, counters, actual_length, status);
         if let Some(fault) = feedback_completion_fault(status, usb_stop_requested(stop), slot.endpoint.address) {
             return Err(fault);
         }
         match status {
             LIBUSB_TRANSFER_COMPLETED => {
-                if let Some((frames, rate)) = slot.newest_valid_report(scheduler, data_service_interval_us,
-                    speed, max_frames, per_service, counters, actual_length) {
+                if let Some((frames, rate)) = report {
                     // A report delivered beyond the old lease cannot restart it.
                     // Use callback time: a timely report processed slightly late is valid.
                     if !health.report_is_timely(completed_at, started_at, counters.last_report_at) {
@@ -654,7 +828,9 @@ pub(super) fn pump_feedback_transfer(
         }
     }
     if !usb_stop_requested(stop) && !slot.in_flight && Instant::now() >= slot.retry_at {
-        if let Err(error) = slot.submit(handle) {
+        let submission = slot.submit(handle);
+        counters.record_submit(slot.last_submit_status);
+        if let Err(error) = submission {
             if let Some(fault) = feedback_submit_failure(error.clone(), slot.submit_no_device, false) { return Err(fault); }
             counters.errors = counters.errors.saturating_add(1);
             slot.retry_at = Instant::now() + Duration::from_millis(5);
@@ -909,6 +1085,110 @@ mod explicit_feedback_tests {
             total += packet_bytes.into_iter().map(|n| n / 8).sum::<usize>();
         }
         assert!((total as f64 - selected.0 * packets as f64).abs() < 1.0);
+    }
+
+    #[test]
+    fn trace_distinguishes_rejected_rate_and_capacity_from_transport_failures() {
+        use crate::ExplicitFeedbackOutcome as Outcome;
+        let recorder = Arc::new(crate::feedback_diagnostics::FeedbackRecorder::new(Instant::now()));
+        let mut counters = FeedbackCounters {
+            trace: Some(recorder),
+            diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
+            ..Default::default()
+        };
+        let rate = q16(48.0);
+        assert!(select_feedback_report(&rate, [(0, 4, 4)], &scheduler(250), 250,
+            Speed::High, 128, false, &mut counters).is_none());
+        let capacity = q16(6.005);
+        assert!(select_feedback_report(&capacity, [(0, 4, 4)], &scheduler(125), 125,
+            Speed::High, 6, false, &mut counters).is_none());
+        let mut partial = q16(6.0).to_vec();
+        partial.extend_from_slice(&[0; 4]);
+        assert!(inspect_feedback_packets(&partial,
+            [(0, 4, 4), (NO_FEEDBACK_PACKET_STATUS, 4, 0)], &scheduler(125), 125,
+            Speed::High, 7, false, &mut counters, LIBUSB_TRANSFER_TIMED_OUT, true).is_none());
+        let diagnostics = counters.diagnostics.unwrap();
+        let sample = |outcome| diagnostics.packet_samples().find(|sample| sample.outcome == outcome).unwrap();
+        assert_eq!(sample(Outcome::RateOutOfRange).decoded_rate_hz, Some(384_000.0));
+        assert_eq!(sample(Outcome::RateOutOfRange).raw_bytes(), rate);
+        assert_eq!(sample(Outcome::PacketCapacityExceeded).raw_bytes(), capacity);
+        assert_eq!(sample(Outcome::TransferFailed).transfer_status, LIBUSB_TRANSFER_TIMED_OUT);
+        assert_eq!(sample(Outcome::TransferFailed).packet_status, Some(0));
+        assert_eq!(sample(Outcome::TransferFailed).raw_bytes(), &partial[..4]);
+        assert_eq!(diagnostics.packet_status_counts[7], 1);
+    }
+
+    #[test]
+    fn summary_has_no_raw_bytes_with_trace_disabled() {
+        let mut counters = FeedbackCounters {
+            diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
+            ..Default::default()
+        };
+        let report = q16(48.0);
+        select_feedback_report(&report, [(0, 4, 4)], &scheduler(125), 125,
+            Speed::High, 7, false, &mut counters);
+        let diagnostics = counters.diagnostics.unwrap();
+        let sample = diagnostics.packet_samples().next().unwrap();
+        assert_eq!(sample.outcome, crate::ExplicitFeedbackOutcome::RateOutOfRange);
+        assert_eq!(sample.actual_bytes, 4);
+        assert!(sample.raw_bytes().is_empty());
+    }
+
+    #[test]
+    fn ap80_pcm_report_calibrates_from_three_completions_and_keeps_that_timebase() {
+        // AP80 Pro-X c502:0072, 16-bit stereo PCM, alt 2. OUT is serviced
+        // every 250 us and the IN feedback is polled every 1 ms.
+        let report = [0x46, 0x09, 0x0b, 0x00];
+        let standard = q16(44_100.0 / 8000.0);
+        let scheduler = IsoPacketScheduler::new(44_100, 4, 250);
+        let mut counters = FeedbackCounters {
+            infer_service_interval: true,
+            diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
+            ..Default::default()
+        };
+        // Two reports in a single completion still count as one observation.
+        let batch = [report, report].concat();
+        assert!(select_feedback_report(&batch, [(0, 4, 4), (0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
+        let (frames, rate) = select_feedback_report(&report, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).unwrap();
+        assert!((frames - 11.036_224).abs() < 0.000_001);
+        assert!((rate - 44_144.897).abs() < 0.001);
+        let diagnostics = counters.diagnostics.unwrap();
+        assert_eq!(diagnostics.timebase, Some("out_service_interval"));
+        assert!(diagnostics.inferred_timebase);
+        // A later report with different units is refused.
+        assert!(select_feedback_report(&standard, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
+    }
+
+    #[test]
+    fn calibration_requires_verified_rate_and_prefers_a_valid_standard_report() {
+        let alternate = q16(11.025);
+        let standard = q16(5.5125);
+        let scheduler = IsoPacketScheduler::new(44_100, 4, 250);
+        let mut counters = FeedbackCounters::default();
+        for _ in 0..4 {
+            assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
+                250, Speed::High, 256, false, &mut counters).is_none());
+        }
+        assert!(counters.selected_timebase.is_none());
+        counters.infer_service_interval = true;
+        // The alternate interpretation needs at least 12 frames of capacity.
+        for _ in 0..4 {
+            assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
+                250, Speed::High, 11, false, &mut counters).is_none());
+        }
+        assert!(counters.selected_timebase.is_none());
+        let batch = [alternate, standard, alternate].concat();
+        let (_, rate) = select_feedback_report(&batch, [(0, 4, 4); 3], &scheduler,
+            250, Speed::High, 256, false, &mut counters).unwrap();
+        assert!((rate - 44_100.0).abs() < 0.1);
+        assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
+        assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
     }
 
     #[test]

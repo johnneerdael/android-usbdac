@@ -732,6 +732,7 @@ pub(super) fn start_stream_inner(
     // GET_CUR after switching to the streaming alt setting and if the
     // rate is wrong, try one more SET_CUR + verify cycle.
     // Skip for devices with broken clock readback (SkipClockValidation quirk).
+    let mut post_alt_readback_hz = None;
     if let Some(clock) = clock {
         let skip_clock_validation = settings().skip_clock_validation();
         if skip_clock_validation && playback_format.dsd_transport == DsdTransportMode::None {
@@ -766,6 +767,9 @@ pub(super) fn start_stream_inner(
                         reported_sample_rate = retry.reported_sample_rate;
                         clock_verification_passed = retry.rate_verified
                             && retry.reported_sample_rate == Some(playback_format.sample_rate);
+                        if clock_verification_passed {
+                            post_alt_readback_hz = retry.reported_sample_rate;
+                        }
                         set_clock_verification(
                             clock_control_attempted,
                             clock_control_succeeded,
@@ -797,10 +801,13 @@ pub(super) fn start_stream_inner(
                                 playback_format.sample_rate, clock.clock_id,
                             );
                         }
-                    } else if playback_format.dsd_transport != DsdTransportMode::None {
-                        reported_sample_rate = Some(post_alt_rate);
-                        clock_verification_passed = true;
-                        set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
+                    } else {
+                        post_alt_readback_hz = Some(post_alt_rate);
+                        if playback_format.dsd_transport != DsdTransportMode::None {
+                            reported_sample_rate = Some(post_alt_rate);
+                            clock_verification_passed = true;
+                            set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
+                        }
                     }
                 }
                 Err(error) => {
@@ -992,6 +999,7 @@ pub(super) fn start_stream_inner(
                     playback_format.sample_rate,
                 );
                 if !valid {
+                    post_alt_readback_hz = None;
                     dev_eprintln!(
                         "[clock-diag] DAC reports Clock Valid=false at {}Hz on clock {} — PLL has not locked to the DoP carrier; periodic dropouts are expected until it locks or accepts another rate",
                         playback_format.sample_rate,
@@ -1045,7 +1053,7 @@ pub(super) fn start_stream_inner(
         config.buffer_target_ms as usize,
         config.start_threshold_ms as usize,
         config.processing_buffer_target_ms as usize,
-    ));
+    ).with_feedback_trace(config.capture_feedback_trace));
     runtime_stats.implicit_feedback.store(candidate.implicit_feedback.is_some(), Ordering::Release);
     runtime_stats.feedback_required.store(candidate.implicit_feedback.is_some()
         || (candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_some()), Ordering::Release);
@@ -1086,7 +1094,7 @@ pub(super) fn start_stream_inner(
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, post_alt_readback_hz);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);

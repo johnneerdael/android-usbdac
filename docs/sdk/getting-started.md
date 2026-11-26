@@ -138,7 +138,10 @@ UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
 
 ```kotlin
     private fun openDevice(dac: DacDeviceInfo) {
-        val config = DacConfig(requireHardwareVolume = !fixedVolumeBox.isChecked)
+        val config = DacConfig(
+            requireHardwareVolume = !fixedVolumeBox.isChecked,
+            captureFeedbackTrace = feedbackTraceBox.isChecked,
+        )
         // UsbDac.open() blocks while it claims interfaces and scans descriptors.
         io.execute {
             try {

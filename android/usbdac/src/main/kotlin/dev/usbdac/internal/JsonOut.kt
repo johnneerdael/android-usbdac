@@ -52,6 +52,7 @@ internal fun DacConfig.toNativeJson(): String =
         .putIfNotNull("padded_24bit", padded24Bit)
         .put("allow_unsynchronized_async", allowUnsynchronizedAsync)
         .put("disable_feedback", disableFeedback)
+        .put("capture_feedback_trace", captureFeedbackTrace)
         .put("realtime_priority", realtimePriority)
         .put("hand_back", "keep")
         .put("bus_queue_ms", busQueueMs)

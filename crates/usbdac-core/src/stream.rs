@@ -461,6 +461,14 @@ impl DacStream {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A bounded snapshot of the explicit USB feedback path for this stream.
+    ///
+    /// Available after the worker has selected the endpoint, including after
+    /// a feedback failure. Other pacing modes return `None`.
+    pub fn explicit_feedback_diagnostics(&self) -> Option<crate::ExplicitFeedbackDiagnostics> {
+        *self.shared().stats.explicit_feedback_diagnostics.lock()
+    }
+
     pub fn stats(&self) -> StreamStats {
         use std::sync::atomic::Ordering::Relaxed;
         let shared = self.shared();

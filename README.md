@@ -9,6 +9,7 @@ the stream is bit-perfect, with the reason when verification fails.
 UAC2 devices and handles intermittent explicit feedback with a bounded recovery
 window. Read [how USB pacing works](docs/sdk/decisions-clock.md#feedback) or check
 your stream's [pacing and feedback lock](docs/sdk/controls.md#diagnostics-the-clock-and-the-pacing).
+For support sessions, see [collecting a USB feedback report](docs/sdk/troubleshooting.md#collect-a-feedback-support-report).
 
 | Integrating with | Start here |
 |---|---|
@@ -53,11 +54,10 @@ technically, and in plain terms. In short:
 Several of these came from studying how two other open-source players, Mornye
 and BitChord, behave with the same DACs. No code from either was used.
 
-**Status: 0.1.** Direct USB has played
-on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U) through a build
-of Flick that runs on this library. The 0.1.1 feedback changes have automated
-coverage. See [hardware status](docs/sdk/evidence.md#hardware-status) for the
-device and format coverage.
+**Status: 0.1.** Direct USB PCM has played on a OnePlus 15 with an iBasso DC04U
+in Flick and with a Hidizs AP80 Pro-X in a development build of the SDK sample.
+See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
+formats and paths.
 
 ## Layout
 

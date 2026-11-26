@@ -162,6 +162,7 @@ use encode::*;
 use iso::*;
 use negotiate::*;
 use output::*;
+pub(crate) use ring::RuntimeStats;
 use ring::*;
 use scan::*;
 use session::*;

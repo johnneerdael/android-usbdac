@@ -5,7 +5,7 @@ usbdac is the result of 18 decisions. Each was made after reading how Flick, Mor
 Two things to know before reading them.
 
 - **usbdac copies no code from Mornye or BitChord.** Their behaviour was studied. usbdac began as Flick's driver, which is MIT licensed and credited in [`NOTICE`](https://github.com/johnneerdael/android-usbdac/blob/main/NOTICE), and has been substantially reworked. [The drivers page](drivers.md) says who the three are, which revisions were read and how.
-- **Most of the evidence is not from usbdac's own hardware tests.** usbdac's Rust driver has played PCM on one phone and one DAC (OnePlus 15 and iBasso DC04U) inside a Flick build. Much of the hard data in these pages comes from Flick's pull requests on that pair and from other projects' commits and issues. Each decision says which kind of evidence it rests on, and [the evidence page](evidence.md) lists what is verified and what is not.
+- **The evidence has several sources.** Direct USB PCM has played on a OnePlus 15 with the iBasso DC04U in Flick and the AP80 Pro-X in the SDK sample. Other evidence comes from host tests and public commits or issue reports. [Evidence and status](evidence.md)
 
 ## The decisions
 
