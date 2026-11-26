@@ -2,9 +2,14 @@
 
 This document describes the public Rust API of `usbdac-core`, the JNI contract
 of `libusbdac.so`, the JSON schemas and event codes that contract uses, the
-sample layouts the stream accepts, the threading rules, and what "bit-perfect"
-means here. Version 0.1; nothing in it has been run on hardware as a standalone
-library (see the README).
+sample layouts, the threading rules and the conditions for bit-perfect output.
+Direct USB PCM has played through Flick on one phone and DAC combination.
+
+Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core) to use
+the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.0`,
+then follow the lifecycle below to open the device and stream decoded audio.
+The [Rust API reference](https://docs.rs/usbdac-core)
+covers individual types and methods.
 
 Contents
 

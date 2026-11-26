@@ -1,15 +1,21 @@
 # usbdac
 
-Bit-perfect USB DAC playback for Android apps, as a library.
+Add direct USB DAC playback to an Android audio app. usbdac sends decoded PCM,
+DoP or native DSD to the DAC through USB, bypassing Android's mixer on the
+direct path. Your app can control the DAC's hardware volume and show whether
+the stream is bit-perfect, with the reason when verification fails.
 
-usbdac lets an app send music straight to a USB DAC, bypassing Android's audio
-mixer, so the DAC receives exactly the numbers that are in the file. It handles
-PCM at the DAC's native depth, DSD (DoP and native), the DAC's own hardware
-volume, and it reports honestly whether the output really is bit-perfect, and
-why not when it isn't.
+| Integrating with | Start here |
+|---|---|
+| Kotlin on Android 8.0+ | Add `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
+| Rust on Android or Linux | Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor to the driver. [Rust API reference](https://docs.rs/usbdac-core) |
 
-- **Guide and API reference:** https://johnneerdael.github.io/android-usbdac/
-- **Releases (AAR, native libraries, Rust crate):** https://github.com/johnneerdael/android-usbdac/releases
+Use `OutputSelector` when your Android player needs one PCM playback integration
+that can use direct USB, Android-managed audio or AAudio exclusive as the device
+and permissions allow. [SDK guide](https://johnneerdael.github.io/android-usbdac/)
+
+Download the AAR, native libraries and crate archives from
+[GitHub Releases](https://github.com/johnneerdael/android-usbdac/releases).
 
 ## Where it came from, and what changed
 
@@ -39,7 +45,7 @@ technically, and in plain terms. In short:
 Several of these came from studying how two other open-source players, Mornye
 and BitChord, behave with the same DACs. No code from either was used.
 
-**Status: 0.1 pre-release.** All automated checks pass. Direct USB has played
+**Status: 0.1.** Direct USB has played
 on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U) through a build
 of Flick that runs on this library. Other phones and DACs, DSD, the Kotlin SDK
 and the two Android-managed outputs are not yet confirmed on hardware.
@@ -125,6 +131,9 @@ and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
 `android_logger`.
 
 ## Minimal Rust example
+
+Add the core crate with `cargo add usbdac-core@0.1.0`. The example logs
+through the `log` crate.
 
 ```rust
 use std::sync::Arc;

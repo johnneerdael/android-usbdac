@@ -1,14 +1,21 @@
 # Getting started
 
-This page takes an app from nothing to audio on a USB DAC. The code is from the sample app in `android/sample`, which does all of it in a few hundred lines.
+Add the Android AAR and play your first audio through a USB DAC. The examples
+come from the sample app in `android/sample`. For a Rust integration that owns
+USB access, use [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core)
+and follow the [native API guide](native-api.html#2-lifecycle).
 
 The quickest way is to let the library choose the output. Add the library (step 1) and the manifest (step 2), then follow [the quick path](#the-quick-path-let-the-library-choose): one `OutputSelector`, one call, and the app has a ready `PcmOutput` with the reason for it and the guarantee that applies. Steps 3 to 10 do the same thing by hand, with every decision in the app's hands: finding the DAC, asking for permission, negotiating, opening the stream. They are what the selector does for you, and the way to go when an app needs control the selector does not give.
 
 ## 1. Add the library
 
-The AAR is published to GitHub Packages as `dev.usbdac:usbdac`. GitHub Packages requires a login even for public packages: create a personal access token with the `read:packages` scope and give it to Gradle, for example in `~/.gradle/gradle.properties` (`gpr.user`, `gpr.token`) or as the environment variables `GITHUB_ACTOR` and `GITHUB_TOKEN`.
+Add `dev.usbdac:usbdac` from the project's GitHub Packages Maven registry. It
+requires your GitHub username and a classic personal access token with
+`read:packages`, including for public packages. Set `gpr.user` and `gpr.token`
+in `~/.gradle/gradle.properties`, or supply `GITHUB_ACTOR` and `GITHUB_TOKEN`
+in the build environment.
 
-In `settings.gradle.kts` (replace `OWNER/usbdac` with the repository that publishes the package):
+Add the Maven repository in `settings.gradle.kts`.
 
 ```gradle
 dependencyResolutionManagement {
@@ -26,15 +33,29 @@ dependencyResolutionManagement {
 }
 ```
 
-In the module's `build.gradle.kts`:
+Add the dependency in your app module's `build.gradle.kts`.
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.0-alpha.6")
+    implementation("dev.usbdac:usbdac:0.1.0")
 }
 ```
 
-To try it without a login, build the library yourself (`./gradlew :usbdac:publishToMavenLocal` in `android/`, then add `mavenLocal()`), or take the AAR from the GitHub Release and add it as a file dependency together with `kotlinx-coroutines-core`.
+For a download without registry credentials, put `usbdac-0.1.0.aar`
+from the [0.1.0 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.0)
+in your app module's `libs/` directory. Use these dependencies in place of
+the registry coordinate.
+
+```gradle
+dependencies {
+    implementation(files("libs/usbdac-0.1.0.aar"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+}
+```
+
+If you build from source, run `./gradlew :usbdac:publishToMavenLocal` in
+`android/`, add `mavenLocal()` to your repositories and depend on
+`dev.usbdac:usbdac:0.1.0`. The Maven metadata brings in coroutines.
 
 The library needs Android 8.0 (API 26) or later. An app that uses the published AAR needs no Rust and no NDK; [building from source](#building-from-source) does.
 

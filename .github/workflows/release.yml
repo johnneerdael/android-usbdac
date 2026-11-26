@@ -1,19 +1,17 @@
 name: Release
 
-# A tag `v<version>` builds the AAR, publishes it to GitHub Packages and creates a GitHub Release.
-# "Run workflow" repeats that for an existing tag, for example after a failed run.
+# Run this workflow against the release commit on main. It builds and publishes
+# the packages before creating the GitHub Release and its tag.
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing tag to release, such as v0.1.0
+      version:
+        description: Version to build and publish, such as 0.1.0
         required: true
         type: string
       skip_package:
-        description: Do not publish to GitHub Packages (a version can be published only once)
+        description: Skip the Android AAR upload if GitHub Packages already has this version
         required: false
         type: boolean
         default: false
@@ -22,14 +20,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ inputs.version }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   NDK_VERSION: 28.2.13676358
   CARGO_NDK_VERSION: 4.1.2
-  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  TAG: v${{ inputs.version }}
 
 jobs:
   package:
@@ -41,29 +39,33 @@ jobs:
       packages: write
     outputs:
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check that the tag matches the version
+      - name: Select and verify the release source
         id: version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release versions use MAJOR.MINOR.PATCH (got $RELEASE_VERSION)"; exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            git checkout --detach "refs/tags/$TAG"
+          fi
           gradle_version=$(sed -n 's/^VERSION_NAME=//p' android/gradle.properties)
           cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[profile/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml)
-          echo "tag=$TAG gradle=$gradle_version cargo=$cargo_version"
-          if [ -z "$gradle_version" ] || [ -z "$cargo_version" ]; then
-            echo "could not read the version from android/gradle.properties or Cargo.toml"; exit 1
+          echo "requested=$RELEASE_VERSION gradle=$gradle_version cargo=$cargo_version"
+          if [ "$gradle_version" != "$RELEASE_VERSION" ] || [ "$cargo_version" != "$RELEASE_VERSION" ]; then
+            echo "Cargo.toml and android/gradle.properties must both match $RELEASE_VERSION"; exit 1
           fi
-          if [ "$gradle_version" != "$cargo_version" ]; then
-            echo "android/gradle.properties says $gradle_version but the Cargo workspace says $cargo_version"; exit 1
-          fi
-          if [ "$TAG" != "v$gradle_version" ]; then
-            echo "the tag is $TAG but the version is $gradle_version (expected v$gradle_version)"; exit 1
-          fi
-          echo "version=$gradle_version" >> "$GITHUB_OUTPUT"
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust and the Android targets
         run: |
@@ -128,8 +130,43 @@ jobs:
         working-directory: android
         run: ./gradlew :usbdac:publishReleasePublicationToStagingRepository --console=plain
 
+      - name: Check whether the Rust crate version is published
+        id: crates
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          status=$(curl --silent --show-error --retry 3 --max-time 30 \
+            --output "$RUNNER_TEMP/usbdac-core-index.jsonl" --write-out '%{http_code}' \
+            https://index.crates.io/us/bd/usbdac-core)
+          case "$status" in
+            200)
+              published=$(jq -s --arg version "$VERSION" 'any(.[]; .vers == $version)' \
+                "$RUNNER_TEMP/usbdac-core-index.jsonl")
+              ;;
+            404) published=false ;;
+            *) echo "crates.io index returned HTTP $status"; exit 1 ;;
+          esac
+          if [ "$published" = true ]; then
+            crate="usbdac-core-$VERSION"
+            published_commit=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
+              "https://static.crates.io/crates/usbdac-core/$crate.crate" |
+              tar -xzOf - "$crate/.cargo_vcs_info.json" | jq -er '.git.sha1')
+            if [ "$published_commit" != "$(git rev-parse HEAD)" ]; then
+              echo "crates.io already has $crate from $published_commit. Rerun the original release build."; exit 1
+            fi
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "usbdac-core $VERSION already published: $published"
+
+      - name: Publish the Rust crate to crates.io
+        if: steps.crates.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        run: cargo publish --locked --package usbdac-core
+
       - name: Publish to GitHub Packages
-        if: ${{ github.event_name == 'push' || !inputs.skip_package }}
+        if: ${{ !inputs.skip_package }}
         working-directory: android
         env:
           # The build reads GITHUB_ACTOR and GITHUB_REPOSITORY, which Actions sets, and this token.
@@ -139,6 +176,7 @@ jobs:
       - name: Collect the release assets
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          PUBLISHED_MAVEN: ${{ !inputs.skip_package }}
         run: |
           set -euo pipefail
           assets="$PWD/release-assets"
@@ -157,21 +195,25 @@ jobs:
           (cd "$assets" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
           # Release notes from the commits since the previous tag.
-          previous=$(git describe --tags --abbrev=0 "refs/tags/$TAG^" 2>/dev/null || true)
+          previous=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
           {
             echo "## Changes"
             echo
             if [ -n "$previous" ]; then
-              git log --no-merges --pretty='- %s (%h)' "$previous..refs/tags/$TAG"
+              git log --no-merges --pretty='- %s (%h)' "$previous..HEAD"
             else
-              git log --no-merges --pretty='- %s (%h)' "refs/tags/$TAG"
+              git log --no-merges --pretty='- %s (%h)' HEAD
             fi
             echo
             echo "## Files"
             echo
-            echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library, also published to GitHub Packages as \`dev.usbdac:usbdac:$VERSION\`."
+            if [ "$PUBLISHED_MAVEN" = true ]; then
+              echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library, also published to GitHub Packages as \`dev.usbdac:usbdac:$VERSION\`."
+            else
+              echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library and its Maven metadata."
+            fi
             echo "- \`usbdac-$VERSION-jniLibs.zip\`: \`libusbdac.so\` for arm64-v8a, armeabi-v7a, x86_64 and x86."
-            echo "- \`usbdac-core-$VERSION.crate\`: the Rust driver crate."
+            echo "- \`usbdac-core-$VERSION.crate\`: the Rust USB DAC driver, also available as [usbdac-core $VERSION on crates.io](https://crates.io/crates/usbdac-core/$VERSION)."
             echo "- \`SHA256SUMS.txt\`: SHA-256 checksums of the files above."
           } > release-notes.md
           cat release-notes.md
@@ -203,18 +245,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           VERSION: ${{ needs.package.outputs.version }}
+          COMMIT: ${{ needs.package.outputs.commit }}
         run: |
           set -euo pipefail
-          files=$(find dist/release-assets -type f | sort)
-          prerelease=()
-          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          files=(dist/release-assets/*)
           if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
             echo "$TAG already has a release: replacing its files and notes"
-            # shellcheck disable=SC2086
-            gh release upload "$TAG" $files --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --notes-file dist/release-notes.md
+            gh release upload "$TAG" "${files[@]}" --repo "$REPO" --clobber
+            gh release edit "$TAG" --repo "$REPO" --target "$COMMIT" --draft=false \
+              --notes-file dist/release-notes.md
           else
-            # shellcheck disable=SC2086
-            gh release create "$TAG" $files --repo "$REPO" --verify-tag \
-              --title "usbdac $VERSION" --notes-file dist/release-notes.md "${prerelease[@]}"
+            gh release create "$TAG" "${files[@]}" --repo "$REPO" --target "$COMMIT" \
+              --title "usbdac $VERSION" --notes-file dist/release-notes.md
           fi
