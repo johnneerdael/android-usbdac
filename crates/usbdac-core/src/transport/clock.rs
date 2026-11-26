@@ -1,21 +1,129 @@
 use super::*;
+use crate::clock_resolution::{ClockHopKind, RateRatio};
 
-pub(super) fn find_audio_control_clock(
-    device: &Device<Context>,
-    handle: &DeviceHandle<Context>,
-    terminal_link: Option<u8>,
-) -> Option<AudioControlClock> {
-    find_audio_control_clock_choice(device, handle, terminal_link).map(|(clock, _)| clock)
+/// Audio 2.0 5.2.5.3: GET_CUR numerator/denominator are positive u16.
+/// No multiplier SET exists: the standard declares both controls read-only.
+fn read_uac2_multiplier(handle: &DeviceHandle<Context>, control: u8, entity: u8) -> Result<(u16, u16), String> {
+    read_multiplier_factors(|selector, bytes| {
+        itf_timed_read_control(handle, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+            UAC2_REQUEST_GET_CUR, u16::from(selector) << 8,
+            (u16::from(entity) << 8) | u16::from(control), bytes, Duration::from_millis(500))
+            .map_err(|e| format!("multiplier {entity} GET_CUR {selector}: {e}"))
+    })
+}
+fn read_multiplier_factors(mut read: impl FnMut(u8, &mut [u8]) -> Result<usize, String>) -> Result<(u16,u16), String> {
+    let mut factors = [0u16; 2];
+    for (index, factor) in factors.iter_mut().enumerate() {
+        let mut bytes = [0; 2];
+        let n = read(index as u8 + 1, &mut bytes)?;
+        if n != 2 { return Err(format!("multiplier control returned {n} bytes, expected 2")); }
+        *factor = u16::from_le_bytes(bytes);
+        if *factor == 0 { return Err("multiplier factor is zero".into()); }
+    }
+    Ok((factors[0], factors[1]))
+}
+pub(super) fn prove_uac2_clock_choice(handle: &DeviceHandle<Context>, graph: &ClockGraph, choice: &ClockChoice) -> Result<ClockChoice, String> {
+    if has_multiplier(Some(choice)) && !graph.multiplier_choice_source_exact(choice) {
+        return Err("multiplier path has no exact readable source".into());
+    }
+    let mut proven = choice.clone();
+    for hop in &mut proven.path {
+        if matches!(hop.kind, ClockHopKind::Multiplier | ClockHopKind::RateMultiplier { .. }) {
+            if !graph.multiplier_readable(hop.id) { return Err(format!("multiplier {} has no exact read-only controls", hop.id)); }
+            let (numerator, denominator) = read_uac2_multiplier(handle, choice.control_interface, hop.id)?;
+            if let ClockHopKind::RateMultiplier { numerator: n, denominator: d } = hop.kind {
+                if (n,d) != (numerator,denominator) { return Err("multiplier raw factors drifted".into()); }
+            }
+            hop.kind = ClockHopKind::RateMultiplier { numerator, denominator };
+        }
+    }
+    uac2_clock_ratio(Some(&proven))?;
+    Ok(proven)
+}
+pub(super) fn uac2_clock_ratio(choice: Option<&ClockChoice>) -> Result<RateRatio,String> {
+    let mut factors = Vec::new();
+    if let Some(choice) = choice {
+        for hop in &choice.path {
+            match hop.kind {
+                ClockHopKind::Multiplier => return Err("unproved clock multiplier cadence".into()),
+                ClockHopKind::RateMultiplier { numerator, denominator } => factors.push((numerator, denominator)),
+                _ => {}
+            }
+        }
+    }
+    RateRatio::from_factors(&factors)
+}
+pub(super) fn verify_uac2_clock_factors(handle: &DeviceHandle<Context>, choice: &ClockChoice) -> Result<(),String> {
+    uac2_clock_ratio(Some(choice))?;
+    for hop in &choice.path {
+        if let ClockHopKind::RateMultiplier { numerator, denominator } = hop.kind {
+            if read_uac2_multiplier(handle, choice.control_interface, hop.id)? != (numerator,denominator) {
+                return Err(format!("multiplier {} raw factors drifted", hop.id));
+            }
+        }
+    }
+    Ok(())
+}
+fn verify_active_uac2_choice(handle: &DeviceHandle<Context>, clock: AudioControlClock, choice: &ClockChoice) -> Result<(), String> {
+    if choice.control_interface != clock.interface_number || choice.source_id != clock.clock_id {
+        return Err("clock choice source/interface changed".into());
+    }
+    verify_uac2_clock_factors(handle, choice)?;
+    for hop in &choice.path {
+        if let ClockHopKind::Selector { selected_pin, pin_count } = hop.kind {
+            if pin_count > 1 && get_clock_selector_pin(handle, choice.control_interface, hop.id)? != selected_pin {
+                return Err(format!("clock selector {} drifted from selected route", hop.id));
+            }
+        }
+    }
+    Ok(())
+}
+fn has_multiplier(choice: Option<&ClockChoice>) -> bool {
+    choice.is_some_and(|c| c.path.iter().any(|h| matches!(h.kind, ClockHopKind::Multiplier | ClockHopKind::RateMultiplier { .. })))
+}
+fn project_wire_ranges(ratio: RateRatio, ranges: Vec<SamplingFrequencySubrange>) -> Vec<SamplingFrequencySubrange> {
+    ranges.into_iter().filter_map(|r| ratio.project_range(r.min,r.max,r.res)
+        .map(|(min,max,res)| SamplingFrequencySubrange { min,max,res })).collect()
+}
+pub(super) fn get_wire_frequency(handle: &DeviceHandle<Context>, clock: AudioControlClock, choice: Option<&ClockChoice>) -> Result<u32,String> {
+    if !has_multiplier(choice) { return get_sampling_frequency(handle,clock.interface_number,clock.clock_id); }
+    let ratio = uac2_clock_ratio(choice)?;
+    if let Some(c) = choice { verify_active_uac2_choice(handle,clock,c)?; }
+    let source = get_sampling_frequency(handle,clock.interface_number,clock.clock_id)?;
+    if let Some(c) = choice { verify_active_uac2_choice(handle,clock,c)?; }
+    ratio.wire_rate(source).ok_or_else(|| "source rate does not map to exact positive wire Hz".into())
+}
+pub(super) fn get_wire_frequency_ranges(handle: &DeviceHandle<Context>, clock: AudioControlClock, choice: Option<&ClockChoice>) -> Result<Vec<SamplingFrequencySubrange>,String> {
+    if !has_multiplier(choice) { return get_sampling_frequency_ranges(handle,clock.interface_number,clock.clock_id); }
+    let ratio = uac2_clock_ratio(choice)?;
+    if let Some(c) = choice { verify_active_uac2_choice(handle,clock,c)?; }
+    let ranges = get_sampling_frequency_ranges(handle,clock.interface_number,clock.clock_id)?;
+    if let Some(c) = choice { verify_active_uac2_choice(handle,clock,c)?; }
+    Ok(project_wire_ranges(ratio,ranges))
+}
+pub(super) fn apply_wire_frequency(handle: &DeviceHandle<Context>, clock: AudioControlClock, choice: Option<&ClockChoice>, wire_rate: u32, settle_delay_ms: u64) -> ClockApplyOutcome {
+    if !has_multiplier(choice) { return apply_sampling_frequency(handle,clock.interface_number,clock.clock_id,wire_rate,settle_delay_ms); }
+    let result = (|| {
+        let c = choice.ok_or("missing multiplier clock choice")?;
+        if c.source_id != clock.clock_id || c.control_interface != clock.interface_number { return Err("multiplier source changed".into()); }
+        let rate = get_wire_frequency(handle,clock,choice)?;
+        if rate != wire_rate { return Err(format!("multiplier wire rate {rate} differs from requested {wire_rate}")); }
+        let controls = uac2_source_controls(handle,clock.interface_number,clock.clock_id).ok_or("missing exact source controls")?;
+        crate::clock_resolution::clock_validity(controls, || get_clock_validity(handle,clock.interface_number,clock.clock_id))?;
+        verify_active_uac2_choice(handle,clock,c)?;
+        Ok(rate)
+    })();
+    let (clock_ok,reported_sample_rate,message) = match result { Ok(rate) => (true,Some(rate),None), Err(e) => (false,None,Some(e)) };
+    ClockApplyOutcome { clock_ok, rate_verified: clock_ok, reported_sample_rate, known_mismatch: !clock_ok, set_cur_succeeded: false, message }
 }
 
-/// [`find_audio_control_clock`], with how the clock was reached for
-/// `StreamFormat::clock`.
+/// Resolve and prove the stream's current AudioControl clock and cadence.
 pub(super) fn find_audio_control_clock_choice(
     device: &Device<Context>,
     handle: &DeviceHandle<Context>,
     terminal_link: Option<u8>,
-) -> Option<(AudioControlClock, ClockChoice)> {
-    let config_descriptor = device.active_config_descriptor().ok()?;
+) -> Result<Option<(AudioControlClock, ClockChoice)>, String> {
+    let Ok(config_descriptor) = device.active_config_descriptor() else { return Ok(None); };
 
     for interface in config_descriptor.interfaces() {
         for descriptor in interface.descriptors() {
@@ -100,24 +208,26 @@ pub(super) fn find_audio_control_clock_choice(
                             selection.choice.source_id,
                         ),
                     }
+                    let proven = match prove_uac2_clock_choice(handle, &graph, &selection.choice) {
+                        Ok(choice) => choice,
+                        Err(error) => return Err(format!("Clock multiplier proof failed: {error}")),
+                    };
                     let clock = AudioControlClock {
                         interface_number: ac_iface,
                         clock_id: selection.choice.source_id,
                     };
-                    return Some((clock, selection.choice));
+                    return Ok(Some((clock, proven)));
                 }
-                Err(reason) => log_warn!(
-                    "[USB] Could not resolve the clock for bTerminalLink={:?} on AC interface {}: {}",
-                    terminal_link,
-                    ac_iface,
-                    reason,
-                ),
+                Err(reason) => {
+                    if terminal_link.is_some_and(|id| graph.terminal_may_use_multiplier(id)) { return Err(reason); }
+                    log_warn!("[USB] Could not resolve clock on AC interface {ac_iface}: {reason}");
+                },
             }
         }
     }
 
     dev_eprintln!("[USB] No AudioControl clock source entity found in any interface descriptor");
-    None
+    Ok(None)
 }
 
 /// CX_CLOCK_SELECTOR_CONTROL GET_CUR: the 1-based input pin a Clock Selector
@@ -488,11 +598,11 @@ pub(super) fn discover_stream_sample_rate_ranges(
         return pre_parsed_ranges.to_vec();
     }
 
-    let Some(clock) = find_audio_control_clock(device, handle, terminal_link) else {
+    let Ok(Some((clock, choice))) = find_audio_control_clock_choice(device, handle, terminal_link) else {
         return Vec::new();
     };
 
-    match get_sampling_frequency_ranges(handle, clock.interface_number, clock.clock_id) {
+    match get_wire_frequency_ranges(handle, clock, Some(&choice)) {
         Ok(ranges) => ranges,
         Err(error) => {
             dev_eprintln!(
@@ -857,15 +967,16 @@ pub(super) fn strict_implicit_clock(
             get_clock_selector_pin(handle, control_interface, selector)
         })
         .ok()?;
-    if !resolved.proves_identity_cadence() {
+    if resolved.assumed_source {
         return None;
     }
-    Some(ClockChoice {
+    let choice = ClockChoice {
         control_interface,
         source_id: resolved.clock_id,
         path: resolved.hops,
         resolution: crate::clock_resolution::ClockResolution::Resolved,
-    })
+    };
+    prove_uac2_clock_choice(handle, &graph, &choice).ok()
 }
 
 // Kept outside SessionState so frozen registration/test fixtures need no new
@@ -876,6 +987,8 @@ struct SelectedClockRoute {
     control: u8,
     streaming: u8,
     plan: crate::clock_resolution::ClockPlan,
+    choice: Option<ClockChoice>,
+    frequency: Option<CaptureFrequency>,
 }
 static SELECTED_CLOCK_ROUTE: Mutex<Option<SelectedClockRoute>> = Mutex::new(None);
 
@@ -937,17 +1050,18 @@ pub(super) fn selectable_clock_ranges(
     }) else {
         return Vec::new();
     };
-    let mut sources = HashSet::new();
+    let mut sources = Vec::new();
     let mut ranges = Vec::new();
     for plan in plans {
-        if !sources.insert(plan.source_id) {
-            continue;
-        }
+        let Ok(choice) = prove_uac2_clock_choice(handle, &graph, &graph.choice_for_plan(control, terminal, &plan)) else { continue; };
+        let Ok(ratio) = uac2_clock_ratio(Some(&choice)) else { continue; };
+        if sources.contains(&(plan.source_id, ratio)) { continue; }
+        sources.push((plan.source_id, ratio));
         if sources.len() > 8 {
             break;
         }
         if let Ok((_, _, found)) = probe_clock_source(handle, control, plan.source_id, plan.source_controls) {
-            ranges.extend(found);
+            if verify_uac2_clock_factors(handle, &choice).is_ok() { ranges.extend(project_wire_ranges(ratio, found)); }
         }
     }
     ranges
@@ -1043,10 +1157,7 @@ pub(super) fn select_requested_clock_route(
     candidate: &IsoStreamCandidate,
     rate: u32,
 ) -> Result<(), String> {
-    // Alternate paths have not proved the complete implicit playback/IN pair.
-    if candidate.implicit_feedback.is_some() {
-        return Ok(());
-    }
+    let implicit = candidate.implicit_feedback.is_some();
     let device = claimed.handle.device();
     let Some((control, graph)) =
         owning_clock_graph(&device, &claimed.handle, candidate.interface_number)
@@ -1056,6 +1167,20 @@ pub(super) fn select_requested_clock_route(
     let Some(terminal) = candidate.terminal_link else {
         return Ok(());
     };
+    // Ordinary implicit pairs retain their original no-mutation fast path.
+    // Only a descriptor branch containing a multiplier needs stricter proof.
+    if implicit && !graph.terminal_may_use_multiplier(terminal) {
+        return Ok(());
+    }
+    // A malformed or unknown multiplier may not be erased by a first-source
+    // fallback when strict enumeration has no usable path.
+    let current_multiplier = match graph.resolve_terminal_clock(terminal, |id| get_clock_selector_pin(&claimed.handle, control, id)) {
+        Ok(resolved) => resolved.hops.iter().any(|h| matches!(h.kind, ClockHopKind::Multiplier)),
+        Err(_) => graph.terminal_may_use_multiplier(terminal),
+    };
+    if implicit && !current_multiplier {
+        return Ok(());
+    }
     claimed.ensure_interface_claimed(control)?;
     let mut reads = 0usize;
     let Ok(plans) = graph.enumerate_plans(terminal, |id| {
@@ -1065,59 +1190,113 @@ pub(super) fn select_requested_clock_route(
         }
         get_clock_selector_pin(&claimed.handle, control, id)
     }) else {
-        return Ok(());
+        return if current_multiplier { Err("no exact readable multiplier clock plan".into()) } else { Ok(()) };
     };
-    let mut io = UsbClockPlanIo {
-        handle: &claimed.handle,
-        control,
-        rate,
-        allow_program: false,
-    };
-    let mut sources = HashSet::new();
-    for plan in plans.into_iter().take(8) {
-        // Preserve paths to shared sources if an earlier application fails,
-        // but cap all hardware attempts independently of the pure search.
-        sources.insert(plan.source_id);
-        if sources.len() > 8 {
-            break;
-        }
-        let Ok((validity, current, ranges)) = probe_clock_source(&claimed.handle, control, plan.source_id, plan.source_controls) else {
-            continue;
-        };
-        if !sampling_frequency_ranges_support_rate(&ranges, rate) {
-            continue;
-        }
-        let needs_program = validity == crate::clock_resolution::ClockValidity::Unreported && current != rate;
-        if (plan.selectors.iter().any(|pin| pin.original != pin.target) || needs_program)
-            && !stop_owned_clock_alternates(claimed, candidate.interface_number)?
-        {
-            // Never alter a clock shared with an unclaimed sibling interface.
-            continue;
-        }
-        io.allow_program = true;
-        match plan.apply(&mut io) {
-            Ok(()) => {
-                let exact = graph
-                    .resolve_terminal_clock(terminal, |id| {
-                        get_clock_selector_pin(&claimed.handle, control, id)
-                    })
-                    .is_ok_and(|resolved| {
-                        resolved.clock_id == plan.source_id && resolved.path == plan.path
+    // Multiplier paths own source-rate mutation here, under the complete
+    // function claim. The later generic apply only verifies terminal cadence.
+    let mut multiplier_seen = false;
+    for plan in plans.iter().take(8) {
+        let raw = graph.choice_for_plan(control, terminal, plan);
+        if !has_multiplier(Some(&raw)) {
+            if implicit { continue; }
+            let mut io = UsbClockPlanIo { handle: &claimed.handle, control, rate, allow_program: false };
+            let Ok((validity, current, ranges)) = probe_clock_source(&claimed.handle, control, plan.source_id, plan.source_controls) else {
+                continue;
+            };
+            if !sampling_frequency_ranges_support_rate(&ranges, rate) {
+                continue;
+            }
+            let needs_program = validity == crate::clock_resolution::ClockValidity::Unreported && current != rate;
+            if (plan.selectors.iter().any(|pin| pin.original != pin.target) || needs_program)
+                && !stop_owned_clock_alternates(claimed, candidate.interface_number)?
+            {
+                // Never alter a clock shared with an unclaimed sibling interface.
+                continue;
+            }
+            io.allow_program = true;
+            match plan.apply(&mut io) {
+                Ok(()) => {
+                    let exact = graph
+                        .resolve_terminal_clock(terminal, |id| {
+                            get_clock_selector_pin(&claimed.handle, control, id)
+                        })
+                        .is_ok_and(|resolved| {
+                            resolved.clock_id == plan.source_id && resolved.path == plan.path
+                        });
+                    *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute {
+                        fd: claimed.device_fd,
+                        control,
+                        streaming: candidate.interface_number,
+                        plan: plan.clone(),
+                        choice: None,
+                        frequency: None,
                     });
-                *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute {
-                    fd: claimed.device_fd,
-                    control,
-                    streaming: candidate.interface_number,
-                    plan,
-                });
-                if !exact {
-                    restore_requested_clock_route(claimed)?;
-                    return Err("clock route changed immediately after selector transaction".into());
+                    if !exact {
+                        restore_requested_clock_route(claimed)?;
+                        return Err("clock route changed immediately after selector transaction".into());
+                    }
+                    return Ok(());
                 }
+                Err(error) if !error.rollback_errors.is_empty() => return Err(error.to_string()),
+                Err(error) => log_warn!("[USB] Rejected clock path: {error}"),
+            }
+            continue;
+        }
+        multiplier_seen = true;
+        if implicit && plan.selectors.iter().any(|p| p.original != p.target) { continue; }
+        let Ok(choice) = prove_uac2_clock_choice(&claimed.handle, &graph, &raw) else { continue; };
+        let Some(source_rate) = uac2_clock_ratio(Some(&choice))?.source_rate(rate) else { continue; };
+        let Ok(original) = get_sampling_frequency(&claimed.handle, control, plan.source_id) else { continue; };
+        if original == 0 || !matches!(plan.source_controls & 3, 1 | 3) { continue; }
+        let mutation = capture_clock_mutates(plan, original, source_rate);
+        if mutation {
+            let Ok(ranges) = get_sampling_frequency_ranges(&claimed.handle, control, plan.source_id) else { continue; };
+            if !capture_ranges_serve(&ranges, source_rate) || !capture_ranges_serve(&ranges, original) { continue; }
+            if !stop_complete_capture_clock_function(claimed, candidate.interface_number)? { continue; }
+        }
+        let frequency = CaptureFrequency { source: plan.source_id, original, target: source_rate };
+        let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control, rate: source_rate, allow_program: mutation }, expected_frequency: original, program_attempted: false, factors: Some(&choice), route: &plan };
+        verify_uac2_clock_factors(&claimed.handle, &choice)?;
+        if mutation {
+            *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute { fd: claimed.device_fd, control, streaming: candidate.interface_number, plan: plan.clone(), choice: Some(choice.clone()), frequency: Some(frequency) });
+        }
+        let outcome = plan.apply(&mut io);
+        let factors = verify_uac2_clock_factors(&claimed.handle, &choice);
+        if factors.is_err() {
+            return Err("multiplier factors changed during clock selection; preserving external state".into());
+        }
+        match outcome {
+            Ok(()) => {
+                *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute { fd: claimed.device_fd, control, streaming: candidate.interface_number, plan: plan.clone(), choice: Some(choice), frequency: Some(frequency) });
+                let exact = graph.resolve_terminal_clock(terminal, |id| get_clock_selector_pin(&claimed.handle, control, id)).is_ok_and(|r| r.clock_id == plan.source_id && r.path == plan.path);
+                if !exact { restore_requested_clock_route(claimed)?; return Err("multiplier route drifted after selection".into()); }
                 return Ok(());
             }
-            Err(error) if !error.rollback_errors.is_empty() => return Err(error.to_string()),
-            Err(error) => log_warn!("[USB] Rejected clock path: {error}"),
+            Err(error) => {
+                let restored = if io.program_attempted { restore_capture_frequency(&mut io, frequency) } else { Ok(()) };
+                if !error.rollback_errors.is_empty() || restored.is_err() { return Err(format!("multiplier clock transaction: {error}; frequency rollback: {restored:?}")); }
+                if mutation { *SELECTED_CLOCK_ROUTE.lock() = None; }
+            }
+        }
+    }
+    if multiplier_seen || current_multiplier {
+        // A readable alternate cannot turn the currently unresolved multiplier
+        // route into a legacy identity route.
+        let current = graph.resolve_terminal_clock(terminal, |id| get_clock_selector_pin(&claimed.handle, control, id)).map_err(|e| e.to_string())?;
+        if current.hops.iter().any(|h| matches!(h.kind, ClockHopKind::Multiplier)) {
+            let choice = ClockChoice { control_interface: control, source_id: current.clock_id, path: current.hops, resolution: crate::clock_resolution::ClockResolution::Resolved };
+            let proven = prove_uac2_clock_choice(&claimed.handle, &graph, &choice)?;
+            let clock = AudioControlClock { interface_number: control, clock_id: proven.source_id };
+            // Preserve a proven current cadence for NearestSupported fallback.
+            // Exact policy is enforced by the caller comparing returned wire Hz.
+            get_wire_frequency(&claimed.handle, clock, Some(&proven))?;
+            let controls = uac2_source_controls(&claimed.handle, control, proven.source_id).ok_or("missing multiplier source controls")?;
+            crate::clock_resolution::clock_validity(controls, || get_clock_validity(&claimed.handle, control, proven.source_id))?;
+            if let Some(plan) = plans.iter().find(|p| p.source_id == proven.source_id && p.path == current.path && p.selectors.iter().all(|s| s.original == s.target)) {
+                let source = get_sampling_frequency(&claimed.handle, control, proven.source_id)?;
+                verify_uac2_clock_factors(&claimed.handle, &proven)?;
+                *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute { fd: claimed.device_fd, control, streaming: candidate.interface_number, plan: plan.clone(), frequency: Some(CaptureFrequency { source: proven.source_id, original: source, target: source }), choice: Some(proven) });
+            }
         }
     }
     Ok(())
@@ -1131,6 +1310,7 @@ pub(super) struct CaptureClockRoute {
     streaming: u8,
     plan: crate::clock_resolution::ClockPlan,
     frequency: CaptureFrequency,
+    choice: ClockChoice,
 }
 #[derive(Clone, Copy)]
 struct CaptureFrequency { source: u8, original: u32, target: u32 }
@@ -1138,12 +1318,14 @@ trait CaptureFrequencyIo {
     fn read_frequency(&mut self, source: u8) -> Result<u32, String>;
     fn write_frequency(&mut self, source: u8, rate: u32) -> Result<(), String>;
 }
-struct CaptureClockIo<'a> { usb: UsbClockPlanIo<'a>, expected_frequency: u32, program_attempted: bool }
+struct CaptureClockIo<'a> { usb: UsbClockPlanIo<'a>, expected_frequency: u32, program_attempted: bool, factors: Option<&'a ClockChoice>, route: &'a crate::clock_resolution::ClockPlan }
 impl CaptureFrequencyIo for CaptureClockIo<'_> {
     fn read_frequency(&mut self, source: u8) -> Result<u32, String> {
+        if let Some(choice) = self.factors { verify_uac2_clock_factors(self.usb.handle, choice)?; }
         get_sampling_frequency(self.usb.handle, self.usb.control, source)
     }
     fn write_frequency(&mut self, source: u8, rate: u32) -> Result<(), String> {
+        if let Some(choice) = self.factors { verify_uac2_clock_factors(self.usb.handle, choice)?; }
         set_sampling_frequency(self.usb.handle, self.usb.control, source, rate)?;
         thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
         Ok(())
@@ -1154,6 +1336,11 @@ impl crate::clock_resolution::ClockPlanIo for CaptureClockIo<'_> {
         crate::clock_resolution::ClockPlanIo::read_pin(&mut self.usb, selector)
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        if let Some(choice) = self.factors { verify_uac2_clock_factors(self.usb.handle, choice)?; }
+        if let Some(saved) = self.route.selectors.iter().find(|p| p.selector == selector) {
+            let actual = get_clock_selector_pin(self.usb.handle, self.usb.control, selector)?;
+            if actual != saved.original && actual != saved.target { return Err("selector drifted; preserving external change".into()); }
+        }
         crate::clock_resolution::ClockPlanIo::write_pin(&mut self.usb, selector, pin)
     }
     fn validate_source(&mut self, source: u8, controls: u32) -> Result<(), String> {
@@ -1249,20 +1436,25 @@ pub(super) fn select_capture_clock_route(
     })?;
     let mut last = "no capture source serves the exact requested rate".to_string();
     for plan in plans.into_iter().take(8) {
+        let Ok(choice) = prove_uac2_clock_choice(&claimed.handle, &graph, &graph.choice_for_plan(control, terminal, &plan)) else { continue; };
+        let Some(source_rate) = uac2_clock_ratio(Some(&choice))?.source_rate(rate) else { continue; };
         if !matches!(plan.source_controls & 3, 1 | 3) { continue; }
         let Ok(original) = get_sampling_frequency(&claimed.handle, control, plan.source_id) else { continue; };
         if original == 0 { continue; }
-        let mutation = capture_clock_mutates(&plan, original, rate);
+        let mutation = capture_clock_mutates(&plan, original, source_rate);
         if mutation {
             let Ok(ranges) = get_sampling_frequency_ranges(&claimed.handle, control, plan.source_id) else { continue; };
-            if !capture_ranges_serve(&ranges, rate)
+            if !capture_ranges_serve(&ranges, source_rate)
                 || !capture_ranges_serve(&ranges, original) { continue; }
             if !stop_complete_capture_clock_function(claimed, streaming)? { continue; }
         }
-        let frequency = CaptureFrequency { source: plan.source_id, original, target: rate };
-        let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control, rate, allow_program: mutation }, expected_frequency: original, program_attempted: false };
-        *saved = Some(CaptureClockRoute { control, streaming, plan: plan.clone(), frequency });
-        match plan.apply(&mut io) {
+        let frequency = CaptureFrequency { source: plan.source_id, original, target: source_rate };
+        let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control, rate: source_rate, allow_program: mutation }, expected_frequency: original, program_attempted: false, factors: Some(&choice), route: &plan };
+        *saved = Some(CaptureClockRoute { control, streaming, plan: plan.clone(), frequency, choice: choice.clone() });
+        verify_uac2_clock_factors(&claimed.handle, &choice)?;
+        let outcome = plan.apply(&mut io);
+        verify_uac2_clock_factors(&claimed.handle, &choice)?;
+        match outcome {
             Ok(()) => {
                 let resolved = graph.resolve_terminal_clock(terminal, |id| {
                     get_clock_selector_pin(&claimed.handle, control, id)
@@ -1291,7 +1483,7 @@ pub(super) fn select_capture_clock_route(
     }
     Err(last)
 }
-fn stop_complete_capture_clock_function(claimed: &ClaimedHandle, streaming: u8) -> Result<bool, String> {
+pub(super) fn stop_complete_capture_clock_function(claimed: &ClaimedHandle, streaming: u8) -> Result<bool, String> {
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
     let raw = read_active_configuration_bytes(&claimed.handle, &config).ok_or("cannot re-read capture function")?;
     let functions = audio_functions(&raw);
@@ -1303,6 +1495,7 @@ fn stop_complete_capture_clock_function(claimed: &ClaimedHandle, streaming: u8) 
     stop_owned_clock_alternates(claimed, streaming)
 }
 pub(super) fn restore_capture_clock_route(claimed: &ClaimedHandle, saved: &CaptureClockRoute) -> Result<(), String> {
+    verify_uac2_clock_factors(&claimed.handle, &saved.choice)?;
     let mutation = saved.frequency.original != saved.frequency.target
         || saved.plan.selectors.iter().any(|pin| pin.original != pin.target);
     if !mutation { return Ok(()); }
@@ -1311,8 +1504,9 @@ pub(super) fn restore_capture_clock_route(claimed: &ClaimedHandle, saved: &Captu
     }
     let mut io = CaptureClockIo { usb: UsbClockPlanIo {
         handle: &claimed.handle, control: saved.control, rate: saved.frequency.target, allow_program: false,
-    }, expected_frequency: saved.frequency.target, program_attempted: false };
-    restore_capture_transaction(&mut io, &saved.plan, saved.frequency)
+    }, expected_frequency: saved.frequency.target, program_attempted: false, factors: Some(&saved.choice), route: &saved.plan };
+    restore_capture_transaction(&mut io, &saved.plan, saved.frequency)?;
+    verify_uac2_clock_factors(&claimed.handle, &saved.choice)
 }
 
 /// A negotiated plan's selected pins must remain identical until open; never
@@ -1325,6 +1519,13 @@ pub(super) fn verify_requested_clock_route(
     let Some(selected) = selected.filter(|r| r.fd == claimed.device_fd) else {
         return Ok(());
     };
+    let rate = if let Some(choice) = selected.choice.as_ref() {
+        verify_uac2_clock_factors(&claimed.handle, choice)?;
+        let source = uac2_clock_ratio(Some(choice))?.source_rate(rate).ok_or("requested rate is not exact at clock source")?;
+        if get_sampling_frequency(&claimed.handle, selected.control, choice.source_id)? != source { return Err("negotiated multiplier source frequency drifted".into()); }
+        verify_uac2_clock_factors(&claimed.handle, choice)?;
+        source
+    } else { rate };
     let mut current = selected.plan;
     for pin in &mut current.selectors {
         pin.original = pin.target;
@@ -1346,6 +1547,18 @@ pub(super) fn restore_requested_clock_route(claimed: &ClaimedHandle) -> Result<(
     let Some(selected) = slot.as_ref().filter(|r| r.fd == claimed.device_fd) else {
         return Ok(());
     };
+    if let (Some(choice), Some(frequency)) = (&selected.choice, selected.frequency) {
+        verify_uac2_clock_factors(&claimed.handle, choice)?;
+        let mutation = capture_clock_mutates(&selected.plan, frequency.original, frequency.target);
+        if mutation && !stop_complete_capture_clock_function(claimed, selected.streaming)? {
+            return Err("multiplier hand-back requires complete idle function ownership".into());
+        }
+        let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control: selected.control, rate: frequency.target, allow_program: false }, expected_frequency: frequency.target, program_attempted: false, factors: Some(choice), route: &selected.plan };
+        restore_capture_transaction(&mut io, &selected.plan, frequency)?;
+        verify_uac2_clock_factors(&claimed.handle, choice)?;
+        *slot = None;
+        return Ok(());
+    }
     if selected
         .plan
         .selectors
@@ -1520,5 +1733,41 @@ mod capture_clock_transaction_tests {
         let mut waits = 0;
         assert_eq!(retry_programmed_clock_validity(false, || Ok(false), || waits += 1), Ok(false));
         assert_eq!(waits, 0);
+    }
+}
+
+#[cfg(test)]
+mod uac2_multiplier_control_tests {
+    use super::*;
+    #[test]
+    fn multiplier_reads_two_exact_little_endian_positive_controls() {
+        let mut selectors = Vec::new();
+        let factors = read_multiplier_factors(|selector, bytes| {
+            selectors.push(selector);
+            bytes.copy_from_slice(if selector == 1 { &[0x34,0x12] } else { &[0x78,0x56] });
+            Ok(2)
+        }).unwrap();
+        assert_eq!(selectors, vec![1,2]);
+        assert_eq!(factors, (0x1234,0x5678));
+        for count in [0,1,3] {
+            assert!(read_multiplier_factors(|_, bytes| { bytes[0] = 1; Ok(count) }).is_err());
+        }
+        assert!(read_multiplier_factors(|_, _| Ok(2)).is_err());
+        assert!(read_multiplier_factors(|_, _| Err("stall".into())).is_err());
+    }
+    #[test]
+    fn unknown_ratios_fail_closed_and_raw_identity_remains_multiplier_backed() {
+        let mut choice = ClockChoice { control_interface: 0, source_id: 9,
+            path: vec![crate::clock_resolution::ClockHop { id: 8, kind: ClockHopKind::Multiplier }],
+            resolution: crate::clock_resolution::ClockResolution::Resolved };
+        assert!(uac2_clock_ratio(Some(&choice)).is_err());
+        choice.path[0].kind = ClockHopKind::RateMultiplier { numerator: 2, denominator: 2 };
+        assert_eq!(uac2_clock_ratio(Some(&choice)).unwrap(), RateRatio::IDENTITY);
+        assert!(has_multiplier(Some(&choice)));
+        choice.path[0].kind = ClockHopKind::RateMultiplier { numerator: 3, denominator: 2 };
+        let projected = project_wire_ranges(uac2_clock_ratio(Some(&choice)).unwrap(), vec![SamplingFrequencySubrange { min: 48000, max: 96000, res: 48000 }]);
+        assert_eq!(projected[0].min, 72000);
+        assert_eq!(projected[0].max, 144000);
+        assert_eq!(projected[0].res, 72000);
     }
 }

@@ -663,3 +663,37 @@ pair, timing-gap recovery, and exact fixed-pipe and exclusion cases.
 The local four-ABI AAR SHA-256 is
 `439c6eddf25a5002b6ca577405252c9ddded25adbcbe5907ccac2d685ad233e9`.
 Both additions still need target-hardware validation.
+
+### UAC2 clock multipliers
+
+The UAC2 multiplier reports the numerator and denominator through
+two read-only, two-byte CUR controls. Retain the raw values alongside
+the terminal's resolved selector path. Reuse exact rational conversion
+to project the source's supported range to endpoint rates. Program only
+the verified root source when a change is needed and the whole affected
+function is owned and idle. Preserve the existing handling of ordinary
+UAC2 clocks and device-specific clock controls. [USB Audio 2.0 §§4.7.2.3 and 5.2.5.3](https://usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf#page=99)
+
+Playback, native DSD word cadence, and capture packet sizes use the
+wire rate. Program and restore source frequencies in the source's
+rate domain. A verified multiplier route requires exact readback after
+alternate activation. Compare effective ratios and overlapping raw
+clock hops before pairing an implicit feedback source. Independent
+duplex streams with different wire rates can share a root only if
+their requested rates resolve to the same source frequency.
+
+Acceptance needs a UAC2 device with a readable multiplier and a
+non-unit ratio. Trace the requested endpoint rate, the derived root
+SET_CUR, and the rate read back after alternate activation. Verify the
+selected pins and raw factors again before capture or playback starts.
+Exercise a direct clock and a multiplier path on the same selector
+when the hardware offers both. Confirm that hand-back restores the
+saved source rate while preserving external clock changes.
+
+Rust workspace tests, Android arm64 NDK checks, the Android sample
+build and SDK snippet checks passed. Tests distinguish ordinary clock
+fallback from a looping multiplier path and cover exact rates, raw
+factor drift and implicit-clock pairing. The four-ABI local AAR
+SHA-256 is
+`4157a1cc315e45d03a22cb5685c3937951ba1375ec1ed42c58e180f64c2e9580`.
+Physical testing of a UAC2 multiplier path is pending.

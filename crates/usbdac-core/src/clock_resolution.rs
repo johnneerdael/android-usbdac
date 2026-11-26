@@ -100,7 +100,7 @@ pub enum ClockHopKind {
     Selector { selected_pin: u8, pin_count: u8 },
     /// A Clock Multiplier (one clock input).
     Multiplier,
-    /// An ADC3 Clock Multiplier whose exact current ratio was read back.
+    /// A Clock Multiplier whose exact current ratio was read back.
     /// The output cadence is the input cadence times numerator/denominator.
     RateMultiplier { numerator: u16, denominator: u16 },
     /// A Clock Source: the end of the path.
@@ -140,9 +140,10 @@ pub(crate) struct ClockGraph {
     exact_sources: HashSet<u8>,
     selector_controls: HashMap<u8, u32>,
     source_controls: HashMap<u8, u32>,
-    /// Only ADC3 multipliers with readable numerator and denominator controls.
+    /// Multipliers with exact descriptors and readable numerator/denominator.
     readable_multipliers: HashSet<u8>,
     duplicate_ids: HashSet<u8>,
+    multiplier_ids: HashSet<u8>,
 }
 
 impl ClockGraph {
@@ -155,6 +156,14 @@ impl ClockGraph {
         while index + 2 < descriptors.len() {
             let length = descriptors[index] as usize;
             if length < 3 || index + length > descriptors.len() {
+                // Retain an identifiable truncated multiplier as malformed.
+                // Otherwise its terminal link could become an assumed source.
+                let remainder = &descriptors[index..];
+                if remainder.len() >= 4 && remainder[1] == USB_DT_CS_INTERFACE
+                    && remainder[2] == UAC2_CLOCK_MULTIPLIER {
+                    graph.multiplier_ids.insert(remainder[3]);
+                    graph.entities.insert(remainder[3], ClockEntity::Malformed);
+                }
                 break;
             }
             let descriptor = &descriptors[index..index + length];
@@ -211,6 +220,12 @@ impl ClockGraph {
                     graph.entities.insert(descriptor[3], entity);
                 }
                 UAC2_CLOCK_MULTIPLIER if length >= 4 => {
+                    graph.multiplier_ids.insert(descriptor[3]);
+                    // Audio 2.0 4.7.2.3: both controls must be read-only.
+                    if length == 7 && descriptor[3] != 0 && descriptor[4] != 0
+                        && descriptor[5] == 0x05 {
+                        graph.readable_multipliers.insert(descriptor[3]);
+                    }
                     let entity = AudioControlParser
                         .parse_clock_multiplier(descriptor)
                         .map(|multiplier| ClockEntity::Multiplier(multiplier.b_c_source_id))
@@ -267,12 +282,51 @@ impl ClockGraph {
         Ok(graph)
     }
 
+    pub(crate) fn multiplier_choice_source_exact(&self, choice: &ClockChoice) -> bool {
+        self.exact_sources.contains(&choice.source_id)
+            && matches!(self.source_controls.get(&choice.source_id).copied().unwrap_or(0) & 3, 1 | 3)
+            && choice.path.iter().all(|h| h.id != 0 && !self.duplicate_ids.contains(&h.id))
+    }
+
+    pub(crate) fn multiplier_readable(&self, id: u8) -> bool {
+        self.readable_multipliers.contains(&id) && !self.duplicate_ids.contains(&id)
+    }
+
+    pub(crate) fn choice_for_plan(&self, control: u8, terminal: u8, plan: &ClockPlan) -> ClockChoice {
+        let mut path = vec![ClockHop { id: terminal, kind: ClockHopKind::Terminal }];
+        for &id in &plan.path {
+            let kind = match self.entities.get(&id) {
+                Some(ClockEntity::Multiplier(_)) => ClockHopKind::Multiplier,
+                Some(ClockEntity::Selector(inputs)) => ClockHopKind::Selector {
+                    selected_pin: plan.selectors.iter().find(|p| p.selector == id).map_or(1, |p| p.target),
+                    pin_count: inputs.len() as u8,
+                },
+                _ => ClockHopKind::Source,
+            };
+            path.push(ClockHop { id, kind });
+        }
+        ClockChoice { control_interface: control, source_id: plan.source_id, path, resolution: ClockResolution::Resolved }
+    }
+
+    // Only the affected terminal branch loses legacy fallback; unrelated sparse
+    // topologies retain it. Traversal is bounded and never asks hardware.
+    pub(crate) fn terminal_may_use_multiplier(&self, terminal: u8) -> bool {
+        let mut pending: Vec<_> = self.terminal_clock.get(&terminal).copied().into_iter().collect();
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) { continue; }
+            if self.multiplier_ids.contains(&id) { return true; }
+            if let Some(ClockEntity::Selector(inputs)) = self.entities.get(&id) { pending.extend(inputs); }
+        }
+        false
+    }
+
     /// Enumerate exact selectable UAC2 paths, current pin first at every branch.
     /// Reads are cached per selector; a failed/illegal read cannot be safely
     /// restored and therefore excludes that selector entirely. This never uses
-    /// the legacy first-source or sparse-descriptor fallback. An unknown
-    /// UAC2 multiplier ratios remain unsupported. Readable ADC3 multipliers
-    /// may be traversed; ADC3 transport must read and verify their ratios.
+    /// the legacy first-source or sparse-descriptor fallback. Exact readable
+    /// multiplier descriptors may be traversed; transport must read and verify
+    /// their current raw factors before treating a plan as a known cadence.
     pub(crate) fn enumerate_plans(
         &self,
         terminal_id: u8,
@@ -455,6 +509,9 @@ impl ClockGraph {
                 Err(error) => error.to_string(),
             },
         };
+        if terminal_link.is_some_and(|id| self.terminal_may_use_multiplier(id)) {
+            return Err(format!("unresolved multiplier clock path: {unresolved}"));
+        }
         match self.first_clock_source() {
             Some(source_id) => Ok(ClockSelection {
                 choice: ClockChoice {
@@ -726,6 +783,7 @@ pub(crate) struct ResolvedClock {
     pub assumed_source: bool,
 }
 
+#[cfg(test)]
 impl ResolvedClock {
     /// Shared source IDs prove equal sample cadence only without an unknown
     /// multiplier ratio, and only when the source is actually described.
@@ -1218,5 +1276,33 @@ mod adc3_plan_tests {
         let mut duplicate = descriptors(3);
         duplicate.extend_from_slice(&[12, 0x24, 0x0b, 20, 1, 7, 0, 0, 0, 0, 0, 0]);
         assert!(ClockGraph::parse_adc3(&duplicate).is_err());
+    }
+}
+
+#[cfg(test)]
+mod uac2_exact_multiplier_graph_tests {
+    use super::*;
+    fn descriptors(controls: u8) -> Vec<u8> {
+        vec![8,0x24,2,1,0,0,0,11, 7,0x24,0x0c,11,10,controls,0, 8,0x24,0x0a,10,0,5,0,0]
+    }
+    #[test]
+    fn only_exact_readonly_multiplier_controls_produce_plans() {
+        for controls in 0..=15 {
+            let graph = ClockGraph::parse(&descriptors(controls));
+            assert_eq!(graph.enumerate_plans(1, |_| unreachable!()).is_ok(), controls == 5);
+        }
+        let graph = ClockGraph::parse(&descriptors(5));
+        let plan = graph.enumerate_plans(1, |_| unreachable!()).unwrap().remove(0);
+        assert_eq!(plan.path, vec![11,10]);
+        assert!(matches!(graph.choice_for_plan(0,1,&plan).path[1].kind, ClockHopKind::Multiplier));
+    }
+    #[test]
+    fn malformed_multiplier_branch_cannot_erase_into_fallback() {
+        let graph = ClockGraph::parse(&[8,0x24,2,1,0,0,0,11, 4,0x24,0x0c,11, 8,0x24,0x0a,10,0,5,0,0]);
+        assert!(graph.select_clock(0,Some(1), |_| unreachable!()).is_err());
+        // An unrelated missing terminal retains the historical source fallback.
+        assert!(graph.select_clock(0,Some(2), |_| unreachable!()).is_ok());
+        let truncated = ClockGraph::parse(&[8,0x24,2,1,0,0,0,11, 8,0x24,0x0a,10,0,5,0,0, 7,0x24,0x0c,11]);
+        assert!(truncated.select_clock(0,Some(1), |_| unreachable!()).is_err());
     }
 }

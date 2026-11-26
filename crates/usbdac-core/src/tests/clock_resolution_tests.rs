@@ -526,14 +526,23 @@ fn an_unresolvable_topology_falls_back_to_the_first_source_and_says_why() {
     fallback_to_the_first_source(&selection.choice);
     assert!(selection.unresolved.is_some());
 
-    // A looping chain.
+    // An ordinary looping selector chain retains the legacy fallback.
+    let bytes = descriptors(&[
+        input_terminal(1, 6),
+        clock_source(4),
+        clock_selector(6, &[7]),
+        clock_selector(7, &[6]),
+    ]);
+    fallback_to_the_first_source(&choose(&bytes, Some(1), no_request).unwrap().choice);
+
+    // An unresolved multiplier cadence cannot become an identity fallback.
     let bytes = descriptors(&[
         input_terminal(1, 6),
         clock_source(4),
         clock_multiplier(6, 7),
         clock_multiplier(7, 6),
     ]);
-    fallback_to_the_first_source(&choose(&bytes, Some(1), no_request).unwrap().choice);
+    assert!(choose(&bytes, Some(1), no_request).is_err());
 }
 
 #[test]

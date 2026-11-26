@@ -205,7 +205,15 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         route.choice.clone().map(|choice| (AudioControlClock {
             interface_number: choice.control_interface, clock_id: choice.source_id,
         }, choice))
-    } else { candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate) };
+    } else {
+        match candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate) {
+            Ok(choice) => choice,
+            Err(error) => {
+                cleanup_claimed_handle(claimed_handle, None, lock_requested);
+                return Err(Error::Transfer(error));
+            }
+        }
+    };
     if clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState("clock route changed since negotiation".into()));
@@ -223,7 +231,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         }
     }
     // ADC3 must never enter the generic UAC2 frequency programming branch.
-    let clock = if adc3_route.is_some() { None } else { clock_choice.map(|(clock, _)| clock) };
+    let uac2_choice = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(_, choice)| choice) };
+    let multiplied_clock = uac2_choice_has_multiplier(uac2_choice);
+    if let Err(error) = uac2_clock_ratio(uac2_choice) {
+        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+        return Err(Error::Transfer(error));
+    }
+    let clock = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(clock, _)| *clock) };
     let clock_detection_msg = match (adc3_route.as_ref(), &clock) {
         (Some(route), _) => match route.choice.as_ref() {
             Some(choice) => format!("ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
@@ -386,10 +400,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 // already programmed the clock. The alt-setting reset to 0 above
                 // can cause some DACs to revert to a default rate (384kHz etc.),
                 // and cached state from a prior session cannot be trusted.
-                let clock_outcome = apply_sampling_frequency(
+                let clock_outcome = apply_wire_frequency(
                     &claimed_handle.handle,
-                    clock.interface_number,
-                    clock.clock_id,
+                    clock,
+                    uac2_choice,
                     playback_format.sample_rate,
                     clock_settle_delay_ms,
                 );
@@ -446,6 +460,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 );
 
                 if clock_outcome.set_cur_succeeded
+                    && !multiplied_clock
                     && !clock_verification_passed
                     && !clock_outcome.known_mismatch
                 {
@@ -464,13 +479,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 }
             }
             DacMode::FixedClock | DacMode::AdaptiveStreaming => {
-                reported_sample_rate = get_sampling_frequency(
+                reported_sample_rate = get_wire_frequency(
                     &claimed_handle.handle,
-                    clock.interface_number,
-                    clock.clock_id,
+                    clock,
+                    uac2_choice,
                 )
                 .ok()
-                .or(reported_sample_rate);
+                .or(if multiplied_clock { None } else { reported_sample_rate });
 
                 if let Some(actual_rate) = reported_sample_rate {
                     if actual_rate != playback_format.sample_rate {
@@ -494,12 +509,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     } else {
                         clock_verification_passed = true;
                     }
-                } else if let Ok(ranges) = get_sampling_frequency_ranges(
+                } else if let Ok(ranges) = get_wire_frequency_ranges(
                     &claimed_handle.handle,
-                    clock.interface_number,
-                    clock.clock_id,
+                    clock,
+                    uac2_choice,
                 ) {
-                    if sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate)
+                    if !multiplied_clock && sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate)
                     {
                         reported_sample_rate = Some(playback_format.sample_rate);
                         clock_verification_passed = true;
@@ -817,30 +832,37 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // Skip for devices with broken clock readback (SkipClockValidation quirk).
     if let Some(clock) = clock {
         let skip_clock_validation = settings().skip_clock_validation();
-        if skip_clock_validation && playback_format.dsd_transport == DsdTransportMode::None {
+        if skip_clock_validation && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
             dev_eprintln!(
                 "[USB] Skipping post-alt GET_CUR re-verification (SkipClockValidation quirk)",
             );
         } else {
-            match get_sampling_frequency(
+            match get_wire_frequency(
                 &claimed_handle.handle,
-                clock.interface_number,
-                clock.clock_id,
+                clock,
+                uac2_choice,
             ) {
                 Ok(post_alt_rate) => {
                     dev_eprintln!(
                         "[USB] GET_CUR (post-alt): clock {} reports {}Hz (expected {}Hz)",
                         clock.clock_id, post_alt_rate, playback_format.sample_rate,
                     );
-                    if post_alt_rate != playback_format.sample_rate {
+                    if multiplied_clock {
+                        // The route plan owns root programming. A changed source or
+                        // multiplier after activation must not be silently repaired.
+                        reported_sample_rate = Some(post_alt_rate);
+                        clock_verification_passed = post_alt_rate == playback_format.sample_rate;
+                        set_clock_verification(clock_control_attempted, clock_control_succeeded,
+                            clock_verification_passed, reported_sample_rate);
+                    } else if post_alt_rate != playback_format.sample_rate {
                         dev_eprintln!(
                             "[USB] DAC clock drifted after alt-setting change ({} -> {}Hz); re-issuing SET_CUR",
                             playback_format.sample_rate, post_alt_rate,
                         );
-                        let retry = apply_sampling_frequency(
+                        let retry = apply_wire_frequency(
                             &claimed_handle.handle,
-                            clock.interface_number,
-                            clock.clock_id,
+                            clock,
+                            uac2_choice,
                             playback_format.sample_rate,
                             clock_settle_delay_ms,
                         );
@@ -863,6 +885,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                         );
 
                         if retry.set_cur_succeeded
+                            && !multiplied_clock
                             && playback_format.dsd_transport == DsdTransportMode::None
                             && !clock_verification_passed
                             && !retry.known_mismatch
@@ -880,7 +903,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                                 playback_format.sample_rate, clock.clock_id,
                             );
                         }
-                    } else if playback_format.dsd_transport != DsdTransportMode::None {
+                    } else if multiplied_clock || playback_format.dsd_transport != DsdTransportMode::None {
                         reported_sample_rate = Some(post_alt_rate);
                         clock_verification_passed = true;
                         set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
@@ -891,7 +914,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                         "[USB] GET_CUR (post-alt): failed for clock {}: {}",
                         clock.clock_id, error,
                     );
-                    if playback_format.dsd_transport != DsdTransportMode::None {
+                    if multiplied_clock || playback_format.dsd_transport != DsdTransportMode::None {
                         reported_sample_rate = None;
                         clock_verification_passed = false;
                         set_clock_verification(clock_control_attempted, clock_control_succeeded, false, None);
@@ -932,7 +955,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         // silently. Skip verification and trust the SET_CUR.
         let skip_clock_validation = settings().skip_clock_validation();
 
-        if skip_clock_validation && playback_format.dsd_transport == DsdTransportMode::None {
+        if skip_clock_validation && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
             dev_eprintln!(
                 "[USB] Clock verification failed but SkipClockValidation quirk is active — trusting SET_CUR for {}Hz",
                 playback_format.sample_rate,
@@ -960,7 +983,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 clock_control_attempted,
                 clock_control_succeeded,
             );
-            if settings().require_verified_rate() {
+            if settings().require_verified_rate() || multiplied_clock {
                 dev_eprintln!("[USB] {}", refusal);
                 set_last_error(Some(refusal.clone()));
                 set_direct_mode_refusal_reason(Some(refusal.clone()));
@@ -987,7 +1010,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             // when operating correctly at the requested rate.
             let ignore_invalid_rate = settings().ignore_invalid_sample_rate();
 
-            if ignore_invalid_rate && playback_format.dsd_transport == DsdTransportMode::None {
+            if ignore_invalid_rate && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
                 dev_eprintln!(
                     "[USB] DAC reported {}Hz (expected {}Hz) but IgnoreInvalidSampleRate quirk is active — continuing",
                     rate, playback_format.sample_rate,

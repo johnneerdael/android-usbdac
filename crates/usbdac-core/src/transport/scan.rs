@@ -66,10 +66,10 @@ fn structural_feedback_interfaces(
             let mut rates = Vec::new();
             for source in &inventory {
                 let ranges = if source.rates.is_empty() {
-                    get_sampling_frequency_ranges(
+                    get_wire_frequency_ranges(
                         handle,
-                        source.control_interface,
-                        source.clock.source_id,
+                        AudioControlClock { interface_number: source.control_interface, clock_id: source.clock.source_id },
+                        Some(&source.clock),
                     )
                     .unwrap_or_default()
                 } else {
@@ -371,15 +371,15 @@ fn resolve_implicit_source(
         else {
             continue;
         };
-        if out_clock.source_id != source.clock.source_id {
+        if !implicit_clocks_compatible(&out_clock, &source.clock) {
             continue;
         }
         if let Some(sample_rate) = sample_rate {
             let rates = if source.rates.is_empty() {
-                get_sampling_frequency_ranges(
+                get_wire_frequency_ranges(
                     handle,
-                    source.control_interface,
-                    source.clock.source_id,
+                    AudioControlClock { interface_number: source.control_interface, clock_id: source.clock.source_id },
+                    Some(&source.clock),
                 )
                 .unwrap_or_default()
             } else {
@@ -400,6 +400,27 @@ fn resolve_implicit_source(
         matching.push((source.source, rank));
     }
     choose_implicit_source(matching, out_alt)
+}
+
+pub(super) fn uac2_choice_has_multiplier(choice: Option<&ClockChoice>) -> bool {
+    use crate::clock_resolution::ClockHopKind;
+    choice.is_some_and(|choice| choice.path.iter().any(|hop|
+        matches!(hop.kind, ClockHopKind::Multiplier | ClockHopKind::RateMultiplier { .. })))
+}
+
+/// Implicit feedback shares a wire cadence, not just a source entity ID.
+fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool {
+    use crate::clock_resolution::ClockResolution;
+    if output.resolution != ClockResolution::Resolved || input.resolution != ClockResolution::Resolved
+        || output.control_interface != input.control_interface || output.source_id != input.source_id {
+        return false;
+    }
+    let (Ok(output_ratio), Ok(input_ratio)) = (uac2_clock_ratio(Some(output)), uac2_clock_ratio(Some(input))) else {
+        return false;
+    };
+    output_ratio == input_ratio && output.path.iter().all(|left| {
+        input.path.iter().all(|right| left.id != right.id || left.kind == right.kind)
+    })
 }
 
 fn choose_implicit_source(
@@ -424,41 +445,42 @@ pub(super) fn candidate_audio_control_clock_choice(
     device: &Device<Context>,
     handle: &DeviceHandle<Context>,
     candidate: &IsoStreamCandidate,
-) -> Option<(AudioControlClock, ClockChoice)> {
-    // ADC3 reports the same resolved public clock identity, but retains its
-    // own protocol-specific programming path.
-    if device.active_config_descriptor().ok()?.interfaces().flat_map(|i| i.descriptors())
+) -> Result<Option<(AudioControlClock, ClockChoice)>, String> {
+    // ADC3 reports the same public identity with its protocol-specific proof.
+    let config = device.active_config_descriptor().map_err(|error| error.to_string())?;
+    if config.interfaces().flat_map(|i| i.descriptors())
         .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30) {
-        let route = adc3_route_for_candidate(device, handle, candidate).ok()??;
-        let choice = route.choice?;
-        return Some((AudioControlClock { interface_number: choice.control_interface, clock_id: choice.source_id }, choice));
+        let route = adc3_route_for_candidate(device, handle, candidate)?
+            .ok_or_else(|| "ADC3 playback route disappeared".to_string())?;
+        return Ok(route.choice.map(|choice| (AudioControlClock {
+            interface_number: choice.control_interface, clock_id: choice.source_id,
+        }, choice)));
     }
     if let Some(source) = candidate.implicit_feedback {
-        let config = device.active_config_descriptor().ok()?;
         let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed);
-        let source = inventory.iter().find(|entry| entry.source == source)?;
+        let source = inventory.iter().find(|entry| entry.source == source)
+            .ok_or_else(|| "implicit feedback source clock proof disappeared".to_string())?;
         let clock = strict_implicit_clock(
-            &config,
-            handle,
-            source.control_interface,
-            candidate.terminal_link,
-        )?;
-        if clock.source_id != source.clock.source_id {
-            return None;
+            &config, handle, source.control_interface, candidate.terminal_link,
+        ).ok_or_else(|| "implicit playback clock could not be proved".to_string())?;
+        if !implicit_clocks_compatible(&clock, &source.clock) {
+            return Err("implicit playback and feedback clock paths disagree".into());
         }
-        Some((
-            AudioControlClock {
-                interface_number: clock.control_interface,
-                clock_id: clock.source_id,
-            },
-            clock,
-        ))
+        Ok(Some((AudioControlClock {
+            interface_number: clock.control_interface, clock_id: clock.source_id,
+        }, clock)))
     } else {
         if let Some((control, graph)) = owning_clock_graph(device, handle, candidate.interface_number) {
-            let selected = graph.select_clock(control, candidate.terminal_link, |id| {
+            let selected = match graph.select_clock(control, candidate.terminal_link, |id| {
                 get_clock_selector_pin(handle, control, id)
-            }).ok()?;
-            return Some((AudioControlClock { interface_number: control, clock_id: selected.choice.source_id }, selected.choice));
+            }) {
+                Ok(selected) => selected,
+                Err(error) if candidate.terminal_link.is_some_and(|terminal|
+                    graph.terminal_may_use_multiplier(terminal)) => return Err(error),
+                Err(_) => return Ok(None),
+            };
+            let choice = prove_uac2_clock_choice(handle, &graph, &selected.choice)?;
+            return Ok(Some((AudioControlClock { interface_number: control, clock_id: choice.source_id }, choice)));
         }
         find_audio_control_clock_choice(device, handle, candidate.terminal_link)
     }
@@ -529,10 +551,10 @@ fn discover_candidate_rate_ranges(
             if let Some(clock) =
                 strict_implicit_clock(config, handle, source.control_interface, terminal)
             {
-                return get_sampling_frequency_ranges(
+                return get_wire_frequency_ranges(
                     handle,
-                    clock.control_interface,
-                    clock.source_id,
+                    AudioControlClock { interface_number: clock.control_interface, clock_id: clock.source_id },
+                    Some(&clock),
                 )
                 .unwrap_or_default();
             }
@@ -1881,6 +1903,35 @@ pub(super) fn first_playback_stream(device: &Device<Context>) -> Option<(u8, u8,
 #[cfg(test)]
 mod implicit_discovery_tests {
     use super::*;
+    #[test]
+    fn implicit_clock_proof_compares_exact_ratios_and_shared_raw_hops() {
+        use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution};
+        let choice = |factors: &[(u8, u16, u16)]| ClockChoice {
+            control_interface: 0,
+            source_id: 10,
+            resolution: ClockResolution::Resolved,
+            path: factors.iter().map(|&(id, numerator, denominator)| ClockHop {
+                id, kind: ClockHopKind::RateMultiplier { numerator, denominator },
+            }).collect(),
+        };
+        let output = choice(&[(3, 3, 2)]);
+        let equivalent = choice(&[(4, 6, 4)]);
+        assert!(implicit_clocks_compatible(&output, &equivalent));
+        assert!(!implicit_clocks_compatible(&output, &choice(&[(4, 1, 1)])));
+        // Equal effective ratios cannot conceal disagreement on shared controls.
+        assert!(!implicit_clocks_compatible(&output, &choice(&[(3, 6, 4)])));
+        let identity = choice(&[(4, 2, 2)]);
+        assert!(uac2_choice_has_multiplier(Some(&identity)));
+        assert!(implicit_clocks_compatible(&identity, &choice(&[])));
+        let mut unread = identity;
+        unread.path[0].kind = ClockHopKind::Multiplier;
+        assert!(!implicit_clocks_compatible(&unread, &unread));
+        assert!(!implicit_clocks_compatible(&choice(&[(4, 0, 1)]), &choice(&[])));
+        let mut other_source = equivalent;
+        other_source.source_id = 11;
+        assert!(!implicit_clocks_compatible(&output, &other_source));
+    }
+
     fn source(interface: u8, alt: u8, address: u8, capacity: usize) -> ImplicitFeedbackSource {
         ImplicitFeedbackSource {
             interface_number: interface,

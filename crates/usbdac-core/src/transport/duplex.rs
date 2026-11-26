@@ -11,7 +11,7 @@ pub(super) struct Attachment {
     error: Arc<Mutex<Option<Error>>>,
     retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
-    original_rate: Mutex<Option<(ClockChoice, u32)>>,
+    original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
 }
 
 /// Equality of rates is insufficient to establish independent clock ownership.
@@ -90,15 +90,30 @@ fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         }
     }
     let output = route.as_ref().and_then(|route| route.choice.as_ref()).or(expected.clock.as_ref());
-    let output_rate = route.as_ref().map_or(Ok(expected.sample_rate), |route| route.source_rate(expected.sample_rate))
-        .map_err(Error::Control)?;
-    let input_rate = capture_source_rate(endpoint)?;
-    clock_pair(output, input_clock(claimed, endpoint).as_ref(), output_rate, input_rate)
+    let input = input_clock(claimed, endpoint);
+    let output_rate = if let Some(route) = route.as_ref() {
+        route.source_rate(expected.sample_rate).map_err(Error::Control)?
+    } else {
+        uac2_source_rate(output, expected.sample_rate)?
+    };
+    let input_rate = capture_source_rate(endpoint, input.as_ref())?;
+    clock_pair(output, input.as_ref(), output_rate, input_rate)
 }
 
-fn capture_source_rate(endpoint: &CaptureEndpoint) -> Result<u32, Error> {
-    endpoint.adc3_route.as_ref().map_or(Ok(endpoint.format.sample_rate()),
-        |route| route.source_rate(endpoint.format.sample_rate())).map_err(Error::Control)
+fn capture_source_rate(endpoint: &CaptureEndpoint, choice: Option<&ClockChoice>) -> Result<u32, Error> {
+    if let Some(route) = endpoint.adc3_route.as_ref() {
+        route.source_rate(endpoint.format.sample_rate()).map_err(Error::Control)
+    } else {
+        uac2_source_rate(choice, endpoint.format.sample_rate())
+    }
+}
+
+fn uac2_source_rate(choice: Option<&ClockChoice>, wire_rate: u32) -> Result<u32, Error> {
+    let ratio = uac2_clock_ratio(choice).map_err(Error::Control)?;
+    ratio.source_rate(wire_rate).ok_or_else(|| Error::Unsupported {
+        reason: "duplex wire rate has no exact representable root source rate".into(),
+        offered: vec![],
+    })
 }
 
 pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
@@ -152,21 +167,32 @@ impl Attachment {
                 } else { Some(48_000) }
             } else {
                 let clock = choice.ok_or_else(|| Error::Control("shared capture source disappeared".into()))?;
-                get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id).ok()
+                verify_uac2_clock_factors(&claimed.handle, &clock).map_err(Error::Control)?;
+                get_wire_frequency(&claimed.handle, AudioControlClock {
+                    interface_number: clock.control_interface, clock_id: clock.source_id,
+                }, Some(&clock)).ok()
             };
             if reported != Some(self.endpoint.format.sample_rate()) {
                 return Err(Error::ClockUnverified { requested_hz: self.endpoint.format.sample_rate(), reported_hz: reported });
             }
         } else {
+            let mut expected_source = None;
             if let Some(clock) = input_clock(claimed, &self.endpoint) {
                 let original = get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id).map_err(Error::Control)?;
-                if original != capture_source_rate(&self.endpoint)? {
-                    *self.original_rate.lock() = Some((clock, original));
+                let target = capture_source_rate(&self.endpoint, Some(&clock))?;
+                if self.endpoint.adc3_route.is_none() {
+                    verify_uac2_clock_factors(&claimed.handle, &clock).map_err(Error::Control)?;
+                    expected_source = Some((clock.clone(), original));
+                }
+                if original != target {
+                    *self.original_rate.lock() = Some((clock, original, target));
                 }
             }
-            capture_stream::configure_capture_endpoint(claimed, &self.endpoint)?;
+            capture_stream::configure_capture_endpoint_guarded(claimed, &self.endpoint,
+                expected_source.as_ref().map(|(choice, original)| (choice, *original)))?;
         }
-        let current = candidate_audio_control_clock_choice(&claimed.handle.device(), &claimed.handle, playback);
+        let current = candidate_audio_control_clock_choice(&claimed.handle.device(), &claimed.handle, playback)
+            .map_err(Error::Control)?;
         if current.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
             return Err(Error::InvalidState("playback clock route changed while configuring duplex capture".into()));
         }
@@ -227,7 +253,7 @@ impl Attachment {
     pub(super) fn failure(&self) -> Option<Error> { self.error.lock().clone() }
     pub(super) fn retirement_guard(&self) -> Retirement { Retirement(self.retired.clone()) }
     fn restore_rate(&self, claimed: &ClaimedHandle) -> bool {
-        let Some((clock, rate)) = self.original_rate.lock().take() else { return true; };
+        let Some((clock, rate, target)) = self.original_rate.lock().take() else { return true; };
         // Only a distinct source can have a saved rate. Retire callbacks and
         // reset its alternate before restoring that source, while still awake.
         let result = claimed.set_alternate_setting(self.endpoint.interface, 0)
@@ -239,15 +265,31 @@ impl Attachment {
                     let actual = adc3::adc3_capture_route_for_endpoint(claimed, &config,
                         self.endpoint.interface, self.endpoint.alternate, route)?;
                     if &actual != route { return Err("ADC3 capture route changed before rollback".into()); }
+                } else {
+                    if clock.path.iter().any(|hop| matches!(hop.kind,
+                        crate::clock_resolution::ClockHopKind::RateMultiplier { .. }))
+                        && !clock::stop_complete_capture_clock_function(claimed, self.endpoint.interface)? {
+                        return Err("capture multiplier rollback requires complete idle function ownership".into());
+                    }
+                    verify_uac2_clock_factors(&claimed.handle, &clock)?;
+                    if input_clock(claimed, &self.endpoint).as_ref() != Some(&clock) {
+                        return Err("capture clock route drifted; preserving external frequency".into());
+                    }
                 }
                 let current = get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id)?;
                 if current == rate { return Ok(()); }
-                if current != capture_source_rate(&self.endpoint).map_err(|e| e.message())? {
+                if current != target {
                     return Err("capture source drifted; preserving external frequency".into());
                 }
                 set_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id, rate)
             })
             .and_then(|()| {
+                if self.endpoint.adc3_route.is_none() {
+                    verify_uac2_clock_factors(&claimed.handle, &clock)?;
+                    if input_clock(claimed, &self.endpoint).as_ref() != Some(&clock) {
+                        return Err("capture clock route changed during rollback".into());
+                    }
+                }
                 if get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id)? == rate { Ok(()) }
                 else { Err("duplex capture clock rollback did not verify".into()) }
             });
@@ -522,15 +564,34 @@ mod tests {
         assert!(retired.load(Ordering::Acquire));
     }
     #[test]
+    fn capture_root_conversion_requires_proven_factors() {
+        use crate::clock_resolution::{ClockHop, ClockHopKind};
+        let mut input = clock(0, 4);
+        input.path.push(ClockHop { id: 8, kind: ClockHopKind::Multiplier });
+        assert!(uac2_clock_ratio(Some(&input)).is_err());
+        input.path[0].kind = ClockHopKind::RateMultiplier { numerator: 2, denominator: 1 };
+        assert_eq!(uac2_clock_ratio(Some(&input)).unwrap().source_rate(96_000).unwrap(), 48_000);
+        assert!(uac2_clock_ratio(Some(&input)).unwrap().source_rate(44_101).is_none());
+    }
+    #[test]
+    fn shared_factor_snapshots_must_agree_even_at_equal_effective_ratio() {
+        use crate::clock_resolution::{ClockHop, ClockHopKind};
+        let mut output = clock(0, 4);
+        let mut input = clock(0, 4);
+        output.path.push(ClockHop { id: 8, kind: ClockHopKind::RateMultiplier { numerator: 2, denominator: 2 } });
+        input.path.push(ClockHop { id: 8, kind: ClockHopKind::RateMultiplier { numerator: 1, denominator: 1 } });
+        assert!(clock_pair(Some(&output), Some(&input), 48_000, 48_000).is_err());
+    }
+    #[test]
     fn shared_sources_accept_different_wire_cadences_only_at_the_same_source_rate() {
-        use crate::clock_resolution::{ClockHop, ClockHopKind, RateRatio};
+        use crate::clock_resolution::{ClockHop, ClockHopKind};
         let mut output = clock(0, 4);
         output.path.push(ClockHop { id: 8, kind: ClockHopKind::RateMultiplier { numerator: 2, denominator: 1 } });
         let input = clock(0, 4);
-        let output_source = RateRatio::from_factors(&[(2, 1)]).unwrap().source_rate(96_000).unwrap();
+        let output_source = uac2_clock_ratio(Some(&output)).unwrap().source_rate(96_000).unwrap();
         assert!(clock_pair(Some(&output), Some(&input), output_source, 48_000).is_ok());
         // Equal wire rates can conflict when only one path multiplies them.
-        let output_source = RateRatio::from_factors(&[(2, 1)]).unwrap().source_rate(48_000).unwrap();
+        let output_source = uac2_clock_ratio(Some(&output)).unwrap().source_rate(48_000).unwrap();
         assert!(clock_pair(Some(&output), Some(&input), output_source, 48_000).is_err());
     }
 

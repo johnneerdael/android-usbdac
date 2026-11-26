@@ -92,6 +92,7 @@ pub(super) fn negotiate_playback_format(
         select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
             .map_err(Error::Transfer)?;
         let clock = candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
+            .map_err(Error::Transfer)?
             .map(|(clock, choice)| { clock_choice = Some(choice); clock });
 
         let mut effective_format = requested_format;
@@ -111,16 +112,21 @@ pub(super) fn negotiate_playback_format(
             set_clock_status(Some(ClockStatus {
                 reported_sample_rate: None,
             }));
-            let current_rate = get_sampling_frequency(
+            // Raw multiplier hops must never degrade to the generic fixed-clock fallback.
+            uac2_clock_ratio(clock_choice.as_ref()).map_err(Error::Transfer)?;
+            if let Some(choice) = clock_choice.as_ref() {
+                verify_uac2_clock_factors(&claimed_handle.handle, choice).map_err(Error::Transfer)?;
+            }
+            let current_rate = get_wire_frequency(
                 &claimed_handle.handle,
-                clock.interface_number,
-                clock.clock_id,
+                clock,
+                clock_choice.as_ref(),
             )
             .ok();
-            let supported_ranges = get_sampling_frequency_ranges(
+            let supported_ranges = get_wire_frequency_ranges(
                 &claimed_handle.handle,
-                clock.interface_number,
-                clock.clock_id,
+                clock,
+                clock_choice.as_ref(),
             )
             .ok();
 
@@ -137,10 +143,10 @@ pub(super) fn negotiate_playback_format(
                     candidate.endpoint_address,
                     requested_format.sample_rate,
                 );
-                let clock_outcome = apply_sampling_frequency(
+                let clock_outcome = apply_wire_frequency(
                     &claimed_handle.handle,
-                    clock.interface_number,
-                    clock.clock_id,
+                    clock,
+                    clock_choice.as_ref(),
                     requested_format.sample_rate,
                     settings().settle_delay_ms(),
                 );
@@ -186,23 +192,38 @@ pub(super) fn negotiate_playback_format(
                 });
             }
 
+            if uac2_choice_has_multiplier(clock_choice.as_ref())
+                && current_rate.is_none() {
+                return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate, reported_hz: reported_rate });
+            }
             if requested_format.dsd_transport == DsdTransportMode::Native {
                 return Err(Error::Unsupported {
                     reason: "native DSD requires its exact wire clock rate".into(),
                     offered: offered_alt_settings(),
                 });
             }
-            if let Some(actual_rate) = choose_adaptive_sample_rate(
-                requested_format.sample_rate,
-                current_rate,
-                supported_ranges.as_deref(),
-                capability_model.as_ref(),
-                &usb_device,
-                &claimed_handle.handle,
-                speed,
-                requested_format,
-                &claimed_handle.claimed_interfaces,
-            )? {
+            let adaptive_rate = if uac2_choice_has_multiplier(clock_choice.as_ref()) {
+                // A multiplied route can fall back only to its proven current
+                // wire cadence; RANGE alone does not establish a running rate.
+                current_rate.filter(|rate| select_stream_candidate(
+                    &usb_device, &claimed_handle.handle,
+                    PlaybackFormat { sample_rate: *rate, ..requested_format },
+                    speed, &claimed_handle.claimed_interfaces,
+                ).is_ok())
+            } else {
+                choose_adaptive_sample_rate(
+                    requested_format.sample_rate,
+                    current_rate,
+                    supported_ranges.as_deref(),
+                    capability_model.as_ref(),
+                    &usb_device,
+                    &claimed_handle.handle,
+                    speed,
+                    requested_format,
+                    &claimed_handle.claimed_interfaces,
+                )?
+            };
+            if let Some(actual_rate) = adaptive_rate {
                 effective_format.sample_rate = actual_rate;
                 dac_mode = if actual_rate == requested_format.sample_rate {
                     DacMode::FixedClock
@@ -213,6 +234,9 @@ pub(super) fn negotiate_playback_format(
                 rate_verified =
                     current_rate == Some(actual_rate) || reported_rate == Some(actual_rate);
             } else {
+                if uac2_choice_has_multiplier(clock_choice.as_ref()) {
+                    return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate, reported_hz: reported_rate });
+                }
                 let message = last_message.unwrap_or_else(|| {
                     format!(
                         "Unable to verify DAC rate for requested {} Hz during negotiation; continuing with direct USB at the requested stream rate",

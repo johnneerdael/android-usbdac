@@ -564,6 +564,14 @@ pub(super) fn configure_capture_endpoint(
     claimed: &ClaimedHandle,
     candidate: &CaptureEndpoint,
 ) -> Result<(), Error> {
+    configure_capture_endpoint_guarded(claimed, candidate, None)
+}
+
+pub(super) fn configure_capture_endpoint_guarded(
+    claimed: &ClaimedHandle,
+    candidate: &CaptureEndpoint,
+    expected_source: Option<(&ClockChoice, u32)>,
+) -> Result<(), Error> {
     claimed
         .ensure_interface_claimed(candidate.control)
         .map_err(Error::Claim)?;
@@ -668,8 +676,19 @@ pub(super) fn configure_capture_endpoint(
                 reported_hz: None,
             });
         }
-        let reported =
-            get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id).ok();
+        let ratio = uac2_clock_ratio(Some(&choice)).map_err(Error::Control)?;
+        let source_rate = ratio.source_rate(rate).ok_or_else(|| Error::Unsupported {
+            reason: "capture wire rate has no exact representable root source rate".into(),
+            offered: vec![],
+        })?;
+        let clock = AudioControlClock { interface_number: candidate.control, clock_id: choice.source_id };
+        verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
+        let original_source = get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id)
+            .map_err(Error::Control)?;
+        if expected_source.is_some_and(|(expected, original)| expected != &choice || original != original_source) {
+            return Err(Error::InvalidState("capture clock changed since its rollback snapshot".into()));
+        }
+        let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
         if reported != Some(rate) {
             if source[5] & 3 != 3 {
                 return Err(Error::ClockUnverified {
@@ -680,17 +699,31 @@ pub(super) fn configure_capture_endpoint(
             let ranges =
                 get_sampling_frequency_ranges(&claimed.handle, candidate.control, choice.source_id)
                     .map_err(Error::Control)?;
-            if !sampling_frequency_ranges_support_rate(&ranges, rate) {
+            if !sampling_frequency_ranges_support_rate(&ranges, source_rate) {
                 return Err(Error::Unsupported {
                     reason: "capture source does not support the exact requested rate".into(),
                     offered: vec![],
                 });
             }
-            set_sampling_frequency(&claimed.handle, candidate.control, choice.source_id, rate)
+            // A multiplier-backed source belongs to the complete function;
+            // never change it while an unowned sibling can consume that root.
+            if choice.path.iter().any(|hop| matches!(hop.kind,
+                crate::clock_resolution::ClockHopKind::RateMultiplier { .. }))
+                && !clock::stop_complete_capture_clock_function(claimed, candidate.interface).map_err(Error::Control)? {
+                return Err(Error::Control("capture multiplier programming requires complete idle function ownership".into()));
+            }
+            verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
+            if strict_implicit_clock(&config, &claimed.handle, candidate.control, Some(candidate.terminal)).as_ref() != Some(&choice) {
+                return Err(Error::InvalidState("capture clock route changed before source programming".into()));
+            }
+            if get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id).map_err(Error::Control)? != original_source {
+                return Err(Error::InvalidState("capture source changed before programming".into()));
+            }
+            set_sampling_frequency(&claimed.handle, candidate.control, choice.source_id, source_rate)
                 .map_err(Error::Control)?;
         }
-        let reported =
-            get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id).ok();
+        verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
+        let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
         if reported != Some(rate) {
             return Err(Error::ClockUnverified {
                 requested_hz: rate,
@@ -722,8 +755,22 @@ pub(super) fn configure_capture_endpoint(
                 "capture clock route changed during activation".into(),
             ));
         }
+        // Activation can change clock controls without changing a selector.
+        // Prove both the exact factor snapshot and terminal wire cadence again.
+        verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
+        let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
+        verify_capture_wire_rate(rate, reported)?;
+        if source[5] & 0x04 != 0
+            && get_clock_validity(&claimed.handle, candidate.control, choice.source_id) != Ok(true) {
+            return Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported });
+        }
     }
     Ok(())
+}
+
+fn verify_capture_wire_rate(rate: u32, reported: Option<u32>) -> Result<(), Error> {
+    if reported == Some(rate) { Ok(()) }
+    else { Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported }) }
 }
 
 /// Deferred metadata has fixed size and is never locked by a reader. Capture
@@ -1301,6 +1348,13 @@ fn run_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capture_activation_requires_the_exact_terminal_wire_rate() {
+        assert!(super::verify_capture_wire_rate(96_000, Some(96_000)).is_ok());
+        // A 48 kHz root under a 2:1 path must not be reported as wire timing.
+        assert!(super::verify_capture_wire_rate(96_000, Some(48_000)).is_err());
+        assert!(super::verify_capture_wire_rate(96_000, None).is_err());
+    }
     use super::*;
     use crate::capture::{CaptureState, ChannelPosition};
 
