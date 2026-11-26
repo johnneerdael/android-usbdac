@@ -20,6 +20,7 @@ import markdown
 # (file name without extension, navigation title). The order is the navigation order.
 GUIDE_PAGES = [
     ("index", "Overview"),
+    ("improvements", "What usbdac improves"),
     ("getting-started", "Getting started"),
     ("controls", "Controls and configuration"),
     ("bit-perfect", "Bit-perfect output"),

@@ -1,5 +1,7 @@
 # usbdac for Android
 
+usbdac gives any Android app bit-perfect playback to a USB DAC, with the DAC's own volume control, DSD, and an indicator that tells the truth about whether the sound is untouched. It started from the USB driver of the Flick music player and has been reworked well beyond it; [what usbdac improves](improvements.md) lists every change, each with a plain-language explanation.
+
 usbdac plays audio from an Android app to a USB DAC. It comes as an Android library (an AAR, package `dev.usbdac`) with three ways to get audio out:
 
 - **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with the DAC's feedback endpoint, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
@@ -8,11 +10,10 @@ usbdac plays audio from an Android app to a USB DAC. It comes as an Android libr
 
 ## Status
 
-This is version 0.1.
+This is a 0.1 pre-release.
 
-- The USB driver is the one that runs inside the Flick music player. It has been used with real DACs there.
-- Everything around it is new: the push-model stream API, the event thread, the hardware-volume handle, the JNI layer, this Kotlin SDK, the managed transport and the AAudio transport. It compiles, the pure logic has JVM unit tests, and the build produces the AAR and the sample app. **None of it has been run on a phone or a DAC yet.** Expect to find problems on hardware, and report them with the logcat of the tag `usbdac`.
-- The workflows in `.github/workflows` have never run on GitHub.
+- **Automated checks pass.** The driver has several hundred tests that run without a DAC, the Kotlin layer has its own, and every push builds the library and the sample app for four processor types.
+- **Nothing has been confirmed on hardware yet.** The driver grew out of code that has played to real DACs inside Flick, but it has changed a great deal since, and the public API, the Kotlin SDK and the two non-USB outputs are new. A build of Flick that runs on this library exists for hardware testing. Expect to find problems, and report them with the logcat of the tag `usbdac`.
 
 ## Which transport to use
 
@@ -53,6 +54,8 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 - One open `DacSession` per process in this version.
 
 ## The guide
+
+Start with [what usbdac improves](improvements.md) for the overview of every change from the driver it started from, in technical and in plain terms. Then:
 
 1. [Getting started](getting-started.md): the dependency, the manifest, permission, open, negotiate, the write loop, pause and seek.
 2. [Controls and configuration](controls.md): every option and control, with its default, its effect and its effect on bit-perfect output.

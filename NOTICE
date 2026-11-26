@@ -8,8 +8,8 @@ parsers, clock topology resolution, isochronous packet scheduling and
 validation, transport loss accounting, output position accounting, payload
 audits and hardware volume controls in `crates/usbdac-core` were extracted from
 Flick's `rust/src/uac2/` module (commit 86ffa87f) and then restructured behind a
-standalone, handle-based API. The behaviour tuned on hardware in Flick is kept
-as it was unless the git history of this repository says otherwise.
+standalone, handle-based API. Much of the behaviour has since been changed; the
+differences are listed in docs/sdk/improvements.md and in the git history.
 
 No code from any other project was copied into this repository.
 

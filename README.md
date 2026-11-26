@@ -1,36 +1,61 @@
 # usbdac
 
-Bit-perfect direct USB DAC output for Android and Linux, as a library.
+Bit-perfect USB DAC playback for Android apps, as a library.
 
-usbdac drives a USB Audio Class 1.0/2.0 DAC through usbfs without the platform
-audio stack: PCM at the DAC's native depth, DSD over PCM (DoP) and native DSD;
-isochronous transfers paced by the DAC's explicit feedback endpoint; honest
-accounting of lost audio and of whether the output is bit-perfect; and the DAC's
-own hardware volume. It never resamples, dithers or scales samples unless the host
-turns on software gain (or itself uses the opt-in conversion helpers, which the
-direct path never calls).
+usbdac lets an app send music straight to a USB DAC, bypassing Android's audio
+mixer, so the DAC receives exactly the numbers that are in the file. It handles
+PCM at the DAC's native depth, DSD (DoP and native), the DAC's own hardware
+volume, and it reports honestly whether the output really is bit-perfect, and
+why not when it isn't.
 
-**Status: v0.1, derived from Flick, not yet run on hardware as a standalone
-library.** The USB transport is the driver that runs inside the Flick music
-player (see [NOTICE](NOTICE)). What is new, and has only been exercised by host
-tests, is everything around it: the handle-based push API, the event thread, the
-configuration, the hardware-volume handle and the JNI layer.
+- **Guide and API reference:** https://johnneerdael.github.io/android-usbdac/
+- **Releases (AAR, native libraries, Rust crate):** https://github.com/johnneerdael/android-usbdac/releases
+
+## Where it came from, and what changed
+
+usbdac started from the USB DAC driver of the [Flick](https://github.com/moss-apps/Flick)
+music player. It is no longer that driver. The code was taken out of the app,
+given a public API, and improved in ways Flick's own driver has not been.
+[What usbdac improves](docs/sdk/improvements.md) explains each change twice:
+technically, and in plain terms. In short:
+
+| Area | What usbdac adds | In plain terms |
+|---|---|---|
+| Clock handling | Follows clock selectors and multipliers to the clock in use | No wrong pitch or silence on DACs with more than one clock |
+| Transfer queue | Always 16 ms on the bus, never 256 packets | Avoids a stall seen on real hardware; controls feel equally quick on every DAC |
+| Fault handling | Recovers from timed-out transfers and counts lost audio exactly | A brief USB hiccup no longer stops the music |
+| Buffering | 250 ms reserve that shrinks while software volume is active | More protection against gaps without slower controls |
+| Pause and seek | Pause holds the audio and sends silence; flush cancels what is on the bus | Pause stops at once, resume loses nothing, seeks are heard immediately |
+| Position | Counted from what the DAC confirmed | Progress bar and lyrics match what you hear |
+| Start-up safety | Volume lowered to at most -40 dB before the first sample; no volume control means no playback unless allowed | Plugging in a DAC cannot blast your ears |
+| Volume | Useful slider range, latest-wins writes, works without a stream, key and system-panel helpers, original level handed back | The volume behaves the way phone volume does, and other apps get the DAC back as it was |
+| Power | Stream released after a long pause | Less battery used while paused |
+| Honesty | Bit-perfect flag with a named reason when false; chosen clock and pacing reported | An indicator that goes out when the sound is compromised, and says why |
+| Outputs | Direct USB, Android-managed, and AAudio exclusive behind one interface | One integration serves phones with dongles and players with built-in DACs |
+| Conversion | Optional resampling, bit-depth and mono-to-stereo, always labelled | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
+| Packaging | Rust core, Kotlin API, sample app, tests, published builds | A dependency and a few dozen lines instead of writing a USB driver |
+
+Several of these came from studying how two other open-source players, Mornye
+and BitChord, behave with the same DACs. No code from either was used.
+
+**Status: 0.1 pre-release.** All automated checks pass. Nothing has been
+confirmed on hardware yet; a build of Flick that runs on this library exists
+for that purpose.
 
 ## Layout
 
 ```text
-crates/usbdac-core/   the driver: no JNI, no application types
-crates/usbdac-jni/    libusbdac.so, the JNI bindings (package dev.usbdac)
+crates/usbdac-core/   the driver (Rust): no JNI, no application types
+crates/usbdac-jni/    libusbdac.so, the JNI bindings
+android/usbdac/       the Android library (AAR, Kotlin, package dev.usbdac)
+android/sample/       a small app that exercises every feature
+docs/sdk/             the SDK guide (published to the site above)
 docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
 ```
 
-An Android library (AAR) with the Kotlin side of `dev.usbdac.internal.Native` is
-meant to sit on top of the JNI layer; it is not part of this repository yet.
-
-The JNI crate also carries a second, non-USB output: an AAudio exclusive-mode
-stream for devices with an internal DAC (`dev.usbdac.internal.AAudioNative`,
-[docs/API.md](docs/API.md) section 13). It loads `libaaudio.so` at run time, so
-`libusbdac.so` has no link-time dependency on it.
+Besides direct USB, the library carries two outputs that go through Android:
+an `AudioTrack`-based one that asks Android 14 and later for its bit-perfect
+mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 
 ## What it does
 
