@@ -1,8 +1,17 @@
 # usbdac for Android
 
-usbdac gives any Android app bit-perfect playback to a USB DAC, with the DAC's own volume control, DSD, and an indicator that tells the truth about whether the sound is untouched. It started from the USB driver of the Flick music player and has been reworked well beyond it; [what usbdac improves](improvements.md) lists every change, each with a plain-language explanation.
+Add direct USB DAC playback to your Android audio app. With direct USB, your
+app can play PCM, DoP or native DSD, control the DAC's hardware volume and
+report whether the stream is bit-perfect. For PCM playback across devices,
+`OutputSelector` gives your app a single interface and reports which route it
+opened and what it could verify.
 
-usbdac plays audio from an Android app to a USB DAC. It comes as an Android library (an AAR, package `dev.usbdac`) with three ways to get audio out, and a selector that picks one for the app (see [automatic output](automatic-output.md)):
+- Add the AAR with Gradle for Android apps. It bundles the native code for all
+  four Android ABIs. [Android quickstart](getting-started.md)
+- Add `usbdac-core` with Cargo for Rust apps on Android or Linux that manage
+  USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
+
+## Playback routes
 
 - **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with the DAC's feedback endpoint, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
 - **Android-managed.** An `AudioTrack` at the source's own rate and bit depth, through Android's audio stack, behind the same `PcmOutput` interface. On Android 14 and later the library asks the platform for its bit-perfect mixer behavior for a USB device. This is the route for apps that must not take the DAC away from the rest of the system.

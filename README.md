@@ -1,15 +1,21 @@
 # usbdac
 
-Bit-perfect USB DAC playback for Android apps, as a library.
+Add direct USB DAC playback to an Android audio app. usbdac sends decoded PCM,
+DoP or native DSD to the DAC through USB, bypassing Android's mixer on the
+direct path. Your app can control the DAC's hardware volume and show whether
+the stream is bit-perfect, with the reason when verification fails.
 
-usbdac lets an app send music straight to a USB DAC, bypassing Android's audio
-mixer, so the DAC receives exactly the numbers that are in the file. It handles
-PCM at the DAC's native depth, DSD (DoP and native), the DAC's own hardware
-volume, and it reports honestly whether the output really is bit-perfect, and
-why not when it isn't.
+| Integrating with | Start here |
+|---|---|
+| Kotlin on Android 8.0+ | Add the AAR to your Gradle app. It bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
+| Rust on Android or Linux | Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor to the driver. [Rust API reference](https://docs.rs/usbdac-core) |
 
-- **Guide and API reference:** https://johnneerdael.github.io/android-usbdac/
-- **Releases (AAR, native libraries, Rust crate):** https://github.com/johnneerdael/android-usbdac/releases
+Use `OutputSelector` when your Android player needs one PCM playback integration
+that can use direct USB, Android-managed audio or AAudio exclusive as the device
+and permissions allow. [SDK guide](https://johnneerdael.github.io/android-usbdac/)
+
+Download the AAR, native libraries and crate archives from
+[GitHub Releases](https://github.com/johnneerdael/android-usbdac/releases).
 
 ## Where it came from, and what changed
 
@@ -125,6 +131,10 @@ and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
 `android_logger`.
 
 ## Minimal Rust example
+
+For this prerelease, add the core crate with
+`cargo add usbdac-core@0.1.0-alpha.6`. The example logs through the `log`
+crate.
 
 ```rust
 use std::sync::Arc;

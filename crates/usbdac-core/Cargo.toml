@@ -1,6 +1,12 @@
 [package]
 name = "usbdac-core"
-description = "Bit-perfect direct USB DAC output (UAC 1.0/2.0, PCM, DoP, native DSD) over usbfs, without the platform audio stack."
+description = "Direct USB DAC playback for Rust audio applications on Android and Linux, with PCM, DoP, native DSD and bit-perfect reporting."
+repository = "https://github.com/johnneerdael/android-usbdac"
+homepage = "https://johnneerdael.github.io/android-usbdac/"
+documentation = "https://docs.rs/usbdac-core"
+readme = "README.md"
+keywords = ["audio", "usb", "dac", "dsd", "android"]
+categories = ["multimedia::audio", "hardware-support"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
