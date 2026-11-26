@@ -70,6 +70,31 @@ Nothing in this library decodes MQA, and it does not offer unfolding in software
 
 Neither state is `isVerified`. See [transports](transports.md).
 
+## The AAudio output
+
+`AAudioExclusiveOutput` asks the platform for an exclusive AAudio stream at the source's own rate, channel count and format, and writes your bytes into it unchanged. It reads back what the platform granted, and its `bitPerfect` is **always** `NotVerified(blocker = null, reason)`: an app cannot see what the audio HAL and the device do with the samples, so the library never claims `Verified`. The reason is as precise as the grant allows:
+
+| `grant.verdict` | The reason says |
+|---|---|
+| `exclusive` | Exclusive mode was granted at the requested rate, format and channel count: the app mixer is bypassed, but the device's audio HAL is not verifiable from an app. On Android 14 and later it adds that the hardware reports the same rate, format and channel count |
+| `shared` | The platform granted shared mode, not exclusive: the audio goes through the system mixer, which can resample, mix it with other sounds and apply volume and effects. With `requireExclusive` on (the default) the open fails instead |
+| `hardware_rate`, `hardware_format`, `hardware_channels` | (Android 14 and later) The hardware runs another rate, format or channel count than the stream: AAudio converts before the device |
+
+A stream that would play the bytes wrongly (another rate, channel count or format than the one you write) is not reported but refused: `open` fails with `UNSUPPORTED`. Nothing is dithered, scaled or resampled by the library on this path, and a decoder that outputs float and converts to integers has already changed the samples before they reach `write`, as for every output. See [transports](transports.md#aaudio-exclusive-aaudioexclusiveoutput).
+
+## Conversion is not bit-perfect
+
+The direct path never converts. If the app converts before writing (a rate the DAC refuses, a depth it lacks), the stream is only as bit-perfect as the conversion is exact. `ConversionPlan.kind` says which it is:
+
+| `ConversionKind` | Examples | `ConvertingOutput.bitPerfect` |
+|---|---|---|
+| `NONE` | The formats are the same | The target's state |
+| `BIT_EXACT` | 16-bit to 24 or 32 (the new low bits are zero), 24-bit packed to 24-bit in 4 bytes and back: every sample value is unchanged | The target's state: still `Verified` if the stream is |
+| `LOSSLESS` | Mono duplicated to stereo; 16 or 24-bit integers carried in a float | `NotVerified(null, plan.description)`: the audio is not identical |
+| `LOSSY` | A new sample rate; fewer bits; floats to integers | `NotVerified(null, plan.description)`: **not bit-perfect** |
+
+So `RatePolicy.NEAREST_SUPPORTED` plus a `ConversionPlan` lets an app play a rate the DAC refuses, and the library says plainly that this is not bit-perfect: the DAC's stream can be `Verified` (the bytes reach it unmodified) while the *audio* is not the source's, which is why `ConvertingOutput` reports the plan, not the transport. The description is a sentence such as "Lossy conversion, not bit-perfect: resampled from 44100 Hz to 48000 Hz (windowed-sinc polyphase, high quality, stopband about 110 dB); quantised to 24-bit in a 4-byte slot with TPDF dither (full scale saturates)." The measured quality of the resampler (passband flat to 0.00004 dB, stopband 109 dB or better, nothing aliased into the output with `HIGH`) is in [the native API document](native-api.html#14-conversion-helpers): a good resampler is still a resampler. MQA signalling in the low bits does not survive any lossy step, and DoP and native DSD are never converted (`UNSUPPORTED`).
+
 ## The states at a glance
 
 | `BitPerfectState` | From | `isVerified` | What it says |
@@ -78,3 +103,5 @@ Neither state is `isVerified`. See [transports](transports.md).
 | `NotVerified(blocker, reason)` | `DacStream` | `false` | The first failing condition, with a sentence for a status line |
 | `RequestedViaPlatform(detail)` | `AndroidManagedOutput` | `false` | The platform accepted a bit-perfect request |
 | `Unverifiable(reason)` | `AndroidManagedOutput` | `false` | Nothing can be said |
+| `NotVerified(null, reason)` | `AAudioExclusiveOutput` | `false` | The grant's exact reason: exclusive but not verifiable, shared, or converted before the hardware |
+| `NotVerified(null, description)` | `ConvertingOutput` | `false` | The plan's description: what was done to the audio before it reached the output |

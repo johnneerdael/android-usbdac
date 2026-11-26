@@ -134,6 +134,21 @@ Every failure is a `DacException` with a typed `code` (see [troubleshooting](tro
 
 `StreamRequest.pcm(rate, channels, bitDepth)` asks for exactly that. By default a rate the DAC cannot run fails with `UNSUPPORTED`; the library never resamples. With `RatePolicy.NEAREST_SUPPORTED` the returned `StreamFormat` carries the rate the DAC will run (`rateDiffersFromRequest`), and you have to resample. `StreamRequest.dop(...)` and `StreamRequest.dsdNative(...)` ask for DSD; see [bit-perfect output](bit-perfect.md).
 
+### When the DAC refuses what you have
+
+`RatePolicy.EXACT` fails with `UNSUPPORTED` for a rate the DAC cannot run, and the library never resamples. If the app must play it anyway, it can ask for the nearest rate and convert before writing. The conversion is opt-in, it sits in front of the stream, and **it is not bit-perfect**:
+
+```kotlin
+fun openConverting(session: DacSession, source: StreamRequest, wireBitDepth: Int = source.bitDepth): ConvertingOutput {
+    val wire = source.copy(bitDepth = wireBitDepth, ratePolicy = RatePolicy.NEAREST_SUPPORTED)
+    val format = session.negotiate(wire)
+    val plan = ConversionPlan.between(source, format, ConversionOptions())
+    return ConvertingOutput(session.openStream(format), PcmConverter.create(plan))
+}
+```
+
+`negotiate` with `RatePolicy.NEAREST_SUPPORTED` returns the rate the DAC runs (`StreamFormat.rateDiffersFromRequest`). `ConversionPlan.between(source, format)` works out the smallest chain from what the host has to what the DAC runs, and says how much damage it does (`plan.kind`, `plan.description`): a changed rate is `LOSSY`, and so are fewer bits; mono to stereo is `LOSSLESS` but not identical; widening to more bits (the new low bits are zero) and moving a sample between slot sizes are `BIT_EXACT` and keep the stream bit-perfect. The `ConvertingOutput` is a `PcmOutput`: write the **source** format to it, and its `playedFrames`, `latencyFrames` and `writableBytes` are in source units, so the position arithmetic below is unchanged. Its `bitPerfect` is `NotVerified` with the plan's description whenever the plan is not `NONE` or `BIT_EXACT`. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) and [controls](controls.md#conversion-conversionoptions) have the details; DoP and native DSD are never converted. Build the plan and the converter off the main thread (negotiating takes 100 ms or more, and a resampler synthesises its filter).
+
 ## 6. Write audio
 
 `write` takes bytes in the **wire layout** of the stream's `StreamFormat`: whole frames of `bytesPerFrame` bytes, channels interleaved, little-endian, each sample left-justified in a slot of `subslotBytes` bytes. The layouts are tabled in [the native API document](native-api.html#4-sample-layouts); in short, 16-bit PCM is `i16`, 24-bit in a 3-byte slot is packed, and 24-bit in a 4-byte slot is the sample shifted left by 8.
@@ -204,10 +219,13 @@ The buffer is deep (250 ms by default) so that a stall upstream does not become 
 | Position | `startTime + playedFrames / counterRateHz`, with `startTime` set at each flush |
 | Volume | `DacSession.volume` (hardware). Software gain only if you accept losing bit-perfect output |
 
-`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once, and cancels the audio already on the bus (`busQueueMs`, 16 ms by default; `DacConfig.cancelInFlightOnFlush`), so a seek is heard within a couple of milliseconds. The cancelled audio is not lost audio and the flag stays bit-perfect. `pause()` sends silence so the DAC stays locked. The sample's buttons:
+`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once, and cancels the audio already on the bus (`busQueueMs`, 16 ms by default; `DacConfig.cancelInFlightOnFlush`), so a seek is heard within a couple of milliseconds. The cancelled audio is not lost audio and the flag stays bit-perfect. `pause()` sends silence so the DAC stays locked. The sample's buttons (the same calls drive the other two outputs, which the sample reaches through `other`):
 
 ```kotlin
-        click(R.id.flushButton) { stream?.flush() }
+        click(R.id.flushButton) {
+            stream?.flush()
+            other?.flush()
+        }
 ```
 
 ```kotlin
@@ -248,6 +266,10 @@ class Transport(private val output: PcmOutput, private val format: StreamFormat,
     fun endOfAudio() = output.drain()
 }
 ```
+
+### Other outputs
+
+Everything above is written against `PcmOutput`, so the same writer, transport and position code runs on the other two outputs: `AndroidManagedOutput` (an `AudioTrack`) and `AAudioExclusiveOutput` (an exclusive AAudio stream, the route for a player with an internal DAC). They need no `DacSession`: open one, write the PCM in the encoding of the request, and control it as above. The sample's output spinner switches between the three; [transports](transports.md) says what differs.
 
 ## 8. Volume
 

@@ -246,3 +246,60 @@ Call `idle.onPaused()` when playback pauses and `idle.onResumed()` when it resum
 | `UsbDac.nativeVersion` | The native library's version string; loads `libusbdac.so` |
 
 The managed transport's controls are in [transports](transports.md).
+
+## The AAudio output: `AAudioConfig`
+
+Pass an `AAudioConfig` to `AAudioExclusiveOutput.open(context, request, device, config)`. The request supplies the rate, the channel count and (with `floatSamples`) the sample layout; nothing is converted. "Bit-perfect impact" says whether the option can change what `bitPerfect` reports: the AAudio output is never `Verified`, so the question is whether it changes the reason.
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `requireExclusive` | `Boolean` | `true` | Fail `open` with `EXCLUSIVE_UNAVAILABLE` when the platform grants only a shared stream (AAudio falls back to shared on its own when exclusive is not available). Off, the output opens and `grant.sharingMode` is `SHARED` | On: a stream that opens is exclusive. Off: a shared stream reports that the system mixer is in the path |
+| `floatSamples` | `Boolean` | `false` | With `bitDepth` 32, carry 32-bit float instead of 32-bit integers. Any other depth with it on fails `INVALID_ARGUMENT` | None; the bytes are not converted either way |
+| `performanceMode` | `AAudioPerformanceMode` | `LOW_LATENCY` | How the platform schedules the stream: `NONE`, `POWER_SAVING` or `LOW_LATENCY`. Exclusive (memory-mapped) streams are normally granted only in `LOW_LATENCY` | An exclusive stream is unlikely in the other modes |
+| `bufferTargetMs` | `Int` | 250 | The depth `writableBytes` fills the output's ring to. Between `startThresholdMs` and `bufferCapacityMs` | None |
+| `bufferCapacityMs` | `Int` | 500 | The ring's capacity: `write` never accepts more. At most 10000, and the ring must fit in 64 MiB | None |
+| `startThresholdMs` | `Int` | 100 | Audio the ring must hold before playback starts, and before it resumes after a flush or an underrun. At least 1 | None |
+| `deviceBufferBursts` | `Int?` | `null` | The device-side buffer in bursts of `grant.framesPerBurst` frames; `null` is the platform's default (usually 2). A larger buffer rides out scheduling hiccups at the price of latency | None |
+
+A deeper ring costs nothing in responsiveness if you `flush()` on every seek, stop and track change, exactly as for a direct stream.
+
+### Reading the output
+
+| Member | Type | What it is |
+|---|---|---|
+| `grant` | `AAudioGrant` | What the platform granted, read back after opening: `sharingMode`, `sampleRate`, `channels`, `format`, `framesPerBurst`, `bufferCapacityFrames`, `bufferSizeFrames`, `deviceId`, `performanceMode`, `usesMmap`, `hardware` (Android 14+), `asRequested`, `verdict`, `reason` |
+| `bitPerfect` | `StateFlow<BitPerfectState>` | `NotVerified(null, grant.reason)`, never `Verified`. After a disconnect the reason says the route failed and keeps what was known before |
+| `state` | `StateFlow<StreamState>` | `BUFFERING`, `PLAYING`, `PAUSED`, `DRAINING`, `DRAINED`, `CLOSED`, `FAILED`. Refreshed by every call you make and by the platform's error callback |
+| `events` | `SharedFlow<AAudioEvent>` | `Disconnected`, `Failed`, `Underrun`, `Xrun`, `StateChanged`. A buffer of 64; a collector that cannot keep up misses the oldest |
+| `xrunCount` | `Int` | AAudio's count of device-side underruns since the stream opened |
+| `underrunCount` | `Long` | How often the output's own ring ran dry because the host wrote too slowly |
+| `playedFrames`, `latencyFrames` | `Long` | At the stream's rate; see [transports](transports.md#what-aaudio-guarantees) |
+
+`write`, `writableBytes`, `play`, `pause`, `flush`, `drain`, `isDrained` and `close` behave as in the table of [the stream](#the-stream-dacstream-and-pcmoutput), with these differences: `pause()` plays silence on a stream that stays open, `latencyFrames` counts the ring plus what AAudio holds, and `close()` takes up to about half a second.
+
+## Conversion: `ConversionOptions`
+
+The conversion helpers are opt-in and never touch the direct path by themselves: `ConversionPlan.between(request, format, options)` plans, `PcmConverter.create(plan)` builds the converter, `ConvertingOutput(target, converter)` puts it in front of any `PcmOutput`. Every plan but `NONE` and `BIT_EXACT` changes the audio; "bit-perfect impact" says what the option does to the verdict, which is `NotVerified` with the plan's description for those.
+
+| Option | Type | Default | Effect | Bit-perfect impact |
+|---|---|---|---|---|
+| `narrowing` | `NarrowingMode` | `TPDF_DITHER` | Where bits are dropped (narrowing, floats to integers, the rounding of resampled values): `TRUNCATE` rounds toward negative infinity; `TPDF_DITHER` adds triangular noise of one step before rounding to nearest, so the error is signal-independent noise at half a step RMS (-98 dBFS at 16 bits) | Both are lossy; neither is bit-perfect |
+| `quality` | `ResampleQuality` | `HIGH` | `HIGH`: stopband about 110 dB, no aliasing into the output, passband flat to 91% of the lower Nyquist frequency (20.07 kHz at 44.1 kHz). `FAST`: stopband about 84 dB, passband to 90%, about 2.5 times cheaper. Measured numbers are in [the native API document](native-api.html#14-conversion-helpers) | A rate change is lossy either way |
+| `headroomDb` | `Double` | 0.0 | Gain after resampling, 0 to -60 dB. A resampled signal can exceed its input's peak (a full-scale square wave by 3 dB); integer outputs saturate at full scale, never wrap, and `PcmConverter.clippedSamples` counts them. `-3.5` keeps even that from clipping. At 0 the gain at DC is exactly 1 | Any value other than 0 changes the level; the plan's description says so |
+| `ditherSeed` | `Long?` | `null` | Seed of the dither's generator: the same seed gives the same output. Not negative | None |
+| `sourceLayout` | `PcmLayout?` | `null` | The layout of the source samples when it is not the one `StreamRequest.bitDepth` implies (16: `PCM_16`, 24: `PCM_24_PACKED`, 32: `PCM_32`): `FLOAT_32` or `PCM_24_IN_32` | A float source is converted to integers: lossy |
+
+What the plan can contain, and how each step is classified:
+
+| Step (`ConversionStep.code`) | `kind` | Notes |
+|---|---|---|
+| `widen` | `BIT_EXACT` | More bits; the new low bits are zero; every value is unchanged. 16 to 24 or 32, 24 to 32 |
+| `repack` | `BIT_EXACT` | The same bits in another slot: 24-bit packed in 3 bytes to 24-bit in 4 and back |
+| `mono_to_stereo` | `LOSSLESS` | The sample duplicated. The only channel change there is |
+| `int_to_float` | `LOSSLESS` up to 24 bits, `LOSSY` for 32 | A float holds 24 bits exactly |
+| `narrow` | `LOSSY` | Fewer bits, truncated or dithered |
+| `quantise` | `LOSSY` | A float, or resampled values, rounded to integers; full scale saturates |
+| `resample` | `LOSSY` | The polyphase windowed-sinc converter |
+
+`PcmConverter` (not thread-safe: one thread at a time) has `convert(input, output)` and `finish(output)` on direct buffers, `reset()`, `clippedSamples` and `plan`; `plan.delayFrames` is the audio the resampler holds back and `plan.minOutputBytes` the smallest output buffer `convert` makes progress with. `ConvertingOutput` takes care of both. Its controls are those of [`PcmOutput`](#the-stream-dacstream-and-pcmoutput) with these differences: `write`, `writableBytes`, `playedFrames` and `latencyFrames` are in the **source** format and rate; `flush()` also resets the converter; `drain()` writes the resampler's tail and then drains the target (poll `isDrained`); `close()` closes the target and the converter.
+

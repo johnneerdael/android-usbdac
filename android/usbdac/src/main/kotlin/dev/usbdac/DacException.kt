@@ -62,6 +62,12 @@ public enum class DacErrorCode(internal val wireName: String?) {
     /** Android refused to open the USB device or gave no usable file descriptor. */
     OPEN_FAILED(null),
 
+    /**
+     * [AAudioConfig.requireExclusive] is on and the platform granted only a shared AAudio stream:
+     * the system mixer would be in the path. Open with `requireExclusive = false` to accept it.
+     */
+    EXCLUSIVE_UNAVAILABLE("exclusive_unavailable"),
+
     /** A code this version of the library does not know. */
     UNKNOWN(null);
 

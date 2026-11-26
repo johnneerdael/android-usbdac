@@ -12,6 +12,8 @@
 //! call them off the main thread. `streamWrite` and the cheap getters never
 //! block.
 
+mod aaudio;
+mod convert;
 mod json;
 mod listener;
 mod registry;

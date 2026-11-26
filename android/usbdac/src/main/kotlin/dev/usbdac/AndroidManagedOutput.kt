@@ -33,7 +33,7 @@ import java.nio.ByteBuffer
  *   still mix, scale or resample.
  *
  * Nothing here resamples or converts: the track is created at the request's rate and bit depth, and
- * you write PCM in that encoding (see [open]). Output over AAudio exclusive mode is not implemented.
+ * you write PCM in that encoding (see [open]). For an exclusive AAudio stream see [AAudioExclusiveOutput].
  *
  * Position and latency come from `AudioTrack.getPlaybackHeadPosition`: they are best-effort
  * and exclude the platform's and the DAC's own latency. The behaviour of [flush] and [drain] follows

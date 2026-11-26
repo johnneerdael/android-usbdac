@@ -20,13 +20,16 @@ Contents
 10. [JNI contract](#10-jni-contract)
 11. [JSON schemas](#11-json-schemas)
 12. [Limits of v0.1](#12-limits-of-v01)
+13. [AAudio exclusive output](#13-aaudio-exclusive-output)
+14. [Conversion helpers](#14-conversion-helpers)
 
 ## 1. Principles
 
 - **Bit-perfect by default.** The library never resamples, dithers or scales
   samples. The only operation that changes sample values is software gain, and
   only when the host asks for it (`set_software_gain` with a value other than
-  1.0). It is refused for DoP and native DSD.
+  1.0). It is refused for DoP and native DSD. (The opt-in conversion helpers of
+  section 14 are a separate module that the direct path never calls.)
 - **Push model.** The library owns a ring buffer and one USB output thread. The
   host writes audio from its own thread. There is no render thread and no
   callback into the host on the audio path.
@@ -91,7 +94,8 @@ dac.close(self) -> Result<()>                      // also on drop
   `InvalidState` while a stream is open. With `RatePolicy::Exact` a rate the DAC
   cannot run is `Unsupported { offered }`. With `NearestSupported` the returned
   format carries the rate the DAC will run (`rate_differs_from_request()`), and
-  the host must resample. Nothing is resampled by the library.
+  the host must resample. Nothing is resampled by the library on this path; the
+  host that wants it done can use the conversion helpers of section 14.
 - `open_stream` switches the alternate setting, re-verifies the clock and
   starts the output thread (100 ms or more). Errors include
   `ClockUnverified` (see `DacConfig::require_verified_rate`), `Unsupported`,
@@ -862,3 +866,451 @@ feedback report).
 - Not run on hardware as a standalone library. The transport is the code that
   ran in Flick; the layers around it (handle API, push ring, events, JNI) have
   only been exercised by host tests.
+- The AAudio output (section 13) is not part of the Rust API of `usbdac-core`; it
+  lives in the JNI crate, is Android only, and has never opened a stream on a
+  device.
+
+## 13. AAudio exclusive output
+
+A second output next to the USB transport, for a device whose DAC is internal (a
+digital audio player). It is not a USB feature and has nothing to do with
+`Dac`: the JNI crate asks Android for an exclusive-mode AAudio stream at the
+source's own rate, channel count and sample format, and feeds it the bytes the
+host writes, unchanged. It is the object `dev.usbdac.internal.AAudioNative`,
+separate from `Native`; the Kotlin class on top is `AAudioExclusiveOutput`.
+
+**What it promises.** No conversion, resampling, dithering or scaling: the
+bytes written are the bytes AAudio is handed, and the stream is requested with
+`AAUDIO_SHARING_MODE_EXCLUSIVE`, the exact rate and channel count and the
+requested format, direction output, usage media, content type music. **What it
+cannot promise.** An app cannot see past AAudio, so the output is never
+reported bit-perfect-verified. Section 13.4 lists the reasons it reports.
+
+### 13.1 Lifecycle and functions
+
+```
+aaudioOpen(requestJson, listener, apiLevel) -> handle    open the stream (not started)
+aaudioGrant(handle) -> json                              what the platform granted, and the verdict
+  (the host decides: refuse a shared stream, or go on)
+aaudioStart(handle)                                      request the start; the stream plays silence
+aaudioWrite / WritableBytes / Play / Pause / Flush / Drain / IsDrained
+aaudioState / PlayedFrames / LatencyFrames / Xruns / Underruns
+aaudioClose(handle)                                      stop and release
+```
+
+```kotlin
+package dev.usbdac.internal
+
+internal object AAudioNative {
+    init { System.loadLibrary("usbdac") }
+
+    @JvmStatic external fun aaudioOpen(requestJson: String, listener: Any, apiLevel: Int): Long
+    @JvmStatic external fun aaudioGrant(handle: Long): String
+    @JvmStatic external fun aaudioStart(handle: Long)
+    @JvmStatic external fun aaudioClose(handle: Long)
+    @JvmStatic external fun aaudioWrite(handle: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
+    @JvmStatic external fun aaudioWritableBytes(handle: Long): Int
+    @JvmStatic external fun aaudioPlay(handle: Long)
+    @JvmStatic external fun aaudioPause(handle: Long)
+    @JvmStatic external fun aaudioFlush(handle: Long)
+    @JvmStatic external fun aaudioDrain(handle: Long)
+    @JvmStatic external fun aaudioIsDrained(handle: Long): Boolean
+    @JvmStatic external fun aaudioState(handle: Long): Int
+    @JvmStatic external fun aaudioPlayedFrames(handle: Long): Long
+    @JvmStatic external fun aaudioLatencyFrames(handle: Long): Long
+    @JvmStatic external fun aaudioXruns(handle: Long): Int
+    @JvmStatic external fun aaudioUnderruns(handle: Long): Long
+}
+```
+
+The exported symbols are `Java_dev_usbdac_internal_AAudioNative_<name>`. Handles
+are opaque ids from the same counter as every other handle. `listener` is any
+object with `onEvent(type: Int, a: Long, b: Double, message: String?)` (the
+`NativeListener` interface); the library keeps a global reference until the
+output is closed. `apiLevel` is `Build.VERSION.SDK_INT`. Failures are
+`IllegalStateException("usbdac:<code>: <message>")` as in section 10.
+
+### 13.2 Request
+
+```json
+{ "sample_rate": 96000, "channels": 2, "format": "i24", "device_id": 7,
+  "performance_mode": "low_latency", "buffer_target_ms": 250,
+  "buffer_capacity_ms": 500, "start_threshold_ms": 100, "device_buffer_bursts": null }
+```
+
+`sample_rate` (8000 to 768000), `channels` (1 to 8) and `format` are required.
+`format` is `i16` (signed 16-bit), `i24` (signed 24-bit packed in 3 bytes),
+`i32` (signed 32-bit) or `float` (32-bit IEEE); all little-endian and
+interleaved. `device_id` is `AudioDeviceInfo.getId()`, 0 for the platform's
+choice. `performance_mode` is `none`, `power_saving` or `low_latency` (the
+default). The buffer keys default as shown; `buffer_target_ms` must be at most
+`buffer_capacity_ms` and at least `start_threshold_ms`, and the ring must fit in
+64 MiB. `device_buffer_bursts` (null: the platform's default) sizes the device
+buffer in bursts. A request that fails these checks is `invalid_argument`.
+
+The format needs an Android release: `i16` and `float` need API 26 (AAudio
+itself), `i24` and `i32` need API 31. Below that the open fails with
+`unsupported` and a message naming both API levels. Nothing is converted to make
+a request fit.
+
+### 13.3 Grant
+
+```json
+{ "sharing": "exclusive", "sample_rate": 96000, "channels": 2,
+  "format": "i24", "format_raw": 3,
+  "frames_per_burst": 96, "buffer_capacity_frames": 960, "buffer_size_frames": 192,
+  "device_id": 7, "performance_mode": "low_latency", "mmap": true,
+  "hardware": null,
+  "as_requested": true, "verdict": "exclusive",
+  "reason": "Exclusive mode was granted at the requested rate, format and channel count: the app mixer is bypassed, but the device's audio HAL is not verifiable from an app." }
+```
+
+Everything but the last three keys is read back from the stream after it opened.
+`mmap` (the memory-mapped path exclusive streams use) is `null` below Android 9.
+`hardware` is `{ "sample_rate", "channels", "format", "format_raw" }` on Android
+14 (API 34) and later, where AAudio reports what the device itself runs at, and
+`null` before. `format` is `null` for a format this library does not carry.
+
+### 13.4 The verdict
+
+`as_requested` is true when the stream is exclusive and nothing below differs.
+`verdict` names the most serious difference, and `reason` is the sentence the
+Kotlin side puts in `NotVerified`. The differences, in the order they are
+reported:
+
+| `verdict` | Meaning | `aaudioOpen` |
+|---|---|---|
+| `exclusive` | exclusive, at the requested rate, format and channel count, and (on API 34+) the hardware agrees | succeeds |
+| `shared` | the platform granted a shared stream: the system mixer is in the path | succeeds; the host may refuse |
+| `rate_changed` | the stream runs at another rate than requested | fails `unsupported` |
+| `format_changed` | the stream's format is another than requested | fails `unsupported` |
+| `channels_changed` | the stream has another channel count | fails `unsupported` |
+| `hardware_rate`, `hardware_format`, `hardware_channels` | (API 34+) the hardware runs another rate, format or channel count than the stream, so AAudio converts before the device | succeeds |
+
+A stream whose rate, format or channel count differs from the one the ring holds
+would play the bytes at the wrong speed or as noise, so it is never started: the
+open fails and the stream is closed. A shared stream and a conversion before the
+hardware are playable and are reported instead. With several differences the
+`reason` lists them all, separated by `;`.
+
+The output is **never** verified. Even when `verdict` is `exclusive`, what the
+audio HAL and the device do with the samples (volume, effects, resampling in
+firmware) cannot be seen from an app.
+
+### 13.5 Playing
+
+The stream is opened with a data callback. AAudio's own buffer is a few
+milliseconds deep, which no host loop that sleeps for a few milliseconds can
+keep full, so the output puts a ring of `buffer_capacity_ms` in front of it and
+the callback (on AAudio's real-time thread, without locks or allocation) copies
+from the ring. The host sees the same push model as the USB stream:
+
+- `aaudioWrite` takes whole frames, never blocks, and returns the bytes taken
+  (a short count means the ring is full). It reads `count` bytes from `offset` of
+  a direct buffer and does not move the buffer's position. After `aaudioDrain`
+  (until `aaudioFlush`) it fails `invalid_state`; after a disconnect
+  `device_lost`.
+- `aaudioWritableBytes` is the room up to `buffer_target_ms`, a whole number of
+  frames, and 0 after drain or failure.
+- Nothing plays until the ring holds `start_threshold_ms`; the stream then runs
+  and the state goes from buffering to playing. The device is fed silence until
+  then, while paused, and after an underrun. An underrun (the ring ran dry
+  while playing) is counted by `aaudioUnderruns` and playback waits for the start
+  threshold again instead of stuttering.
+- `aaudioPause` plays silence and keeps the ring and the stream open
+  (and exclusive); `aaudioPlay` continues where the ring was. A long pause holds
+  the device: close the output instead.
+- `aaudioFlush` drops the ring (the callback applies it within one burst),
+  resets `aaudioPlayedFrames` to 0 at once, and re-arms the start threshold. Audio
+  the device already holds still plays and is not counted. It also clears a drain.
+- `aaudioDrain` declares the end of the audio: the ring plays out, a tail
+  shorter than the start threshold included, and the padded end is not an
+  underrun. `aaudioIsDrained` is true when everything written since the last
+  flush has been presented by the device.
+- `aaudioState` is 0 buffering, 1 playing, 2 paused, 3 draining, 4 drained,
+  5 closed, 6 failed, as for a stream.
+
+**Position.** `aaudioPlayedFrames` is the number of music frames the device has
+presented since the start or the last flush, in the stream's rate. The device is
+fed silence as well as music, so the count of music frames among the frames
+AAudio has presented is kept separately: the callback counts the music and the
+silence it hands over, and the position is `min(music, presented - silence handed
+over before the last music frame)`. `presented` is `AAudioStream_getTimestamp`
+extrapolated to now while the stream runs (never past `AAudioStream_getFramesRead`;
+an implausible timestamp is ignored), else the frames read. The result lags the
+audible position by at most the device's own buffer, never leads it, is
+monotonic between flushes, and does not move while paused. `aaudioLatencyFrames`
+is the ring plus the music the device holds.
+
+`aaudioXruns` is AAudio's own count of device-side underruns
+(`AAudioStream_getXRunCount`); `aaudioUnderruns` counts the ring running dry.
+
+### 13.6 Events and errors
+
+`onEvent(type, a, b, message)` from AAudio's error-callback thread:
+
+| `type` | Event | `a` | `message` |
+|---|---|---|---|
+| 0 | the route was disconnected (device unplugged, routing changed) | the AAudio error code (`-899`) | text |
+| 1 | another AAudio error | the AAudio error code | text |
+
+Both mark the output failed (state 6, writes `device_lost`) before the event is
+sent. The library never closes the stream from the callback; the host closes it.
+No event is delivered after `aaudioClose` returns.
+
+AAudio result codes map to the library's codes: `DISCONNECTED` is `device_lost`;
+`ILLEGAL_ARGUMENT`, `OUT_OF_RANGE`, `NULL` are `invalid_argument`;
+`INVALID_STATE`, `INVALID_HANDLE` are `invalid_state`; `UNIMPLEMENTED`,
+`INVALID_FORMAT`, `INVALID_RATE` are `unsupported`; `UNAVAILABLE`,
+`NO_FREE_HANDLES` (another app holds the device) are `busy`; everything else is
+`transfer`. Off Android `aaudioOpen` fails with `platform_unsupported`. The Kotlin layer adds one code of its own,
+`exclusive_unavailable`, when `requireExclusive` is on and the grant is shared.
+
+### 13.7 Loading
+
+`libaaudio.so` is opened with `dlopen` on the first `aaudioOpen` and every
+function is resolved with `dlsym`. The library therefore has no link-time
+dependency on AAudio and loads on every Android release the SDK supports; the
+functions that exist only on newer releases (usage and content type, API 28; the
+MMAP query, API 28; the hardware format, API 34) are optional, and without them
+the grant simply lacks that information. If `libaaudio.so` cannot be opened the
+open fails with `unsupported`.
+
+### 13.8 Threading
+
+As for a stream (section 6): `aaudioWrite` and the getters never block and are
+safe from any thread, with one writer; `aaudioOpen` and `aaudioClose` block (the
+close for up to about half a second while the stream stops).
+
+Nothing in this section has run on a device: the logic is covered by host tests
+with a simulated device and the Kotlin layer by JVM tests with a fake native
+layer, and the AAudio calls themselves have never opened a stream.
+
+## 14. Conversion helpers
+
+The direct USB path never converts anything. For a host that has audio in one
+format and a DAC that runs another (a rate refused under
+`RatePolicy::NearestSupported`, a depth the DAC lacks), `usbdac_core::convert`
+plans, classifies and runs the conversion. It is pure Rust with no platform code,
+it is opt-in, and **everything but the first two kinds below is not bit-perfect.**
+It is exposed to Kotlin as `ConversionPlan`, `PcmConverter` and `ConvertingOutput`
+through `dev.usbdac.internal.ConvertNative`.
+
+### 14.1 Planning
+
+```rust
+ConversionPlan::between(&StreamRequest, &StreamFormat, &ConvertOptions) -> Result<ConversionPlan, ConvertError>
+ConversionPlan::pcm(source: PcmFormat, target: PcmFormat, &ConvertOptions) -> Result<ConversionPlan, ConvertError>
+plan.kind() -> ConversionKind          // None | BitExact | Lossless | Lossy
+plan.description() -> &str             // a sentence for a status line
+plan.steps() -> &[Step]
+plan.preserves_bit_perfect() -> bool   // kind <= BitExact
+PcmFormat { sample_rate, channels, sample: SampleFormat }
+SampleFormat::{ Int { bits, slot_bytes }, Float32 }     // I16, I24, I24_IN_32, I32 constants
+```
+
+`between` takes the request the host made (its source samples are in the layout of
+the request's `bit_depth`: 16, packed 24 or 32, unless
+`ConvertOptions::source_sample` says float or 24-in-4) and the format `negotiate`
+returned (its layout is `valid_bits` left-justified in `subslot_bytes`, section 4).
+DoP and native DSD are refused (`Unsupported`): a rate or depth change would
+destroy them. The minimal chain is chosen, in the order the converter runs it:
+resample, then the sample step, then mono to stereo.
+
+| `ConversionKind` | Steps in it | Bit-perfect |
+|---|---|---|
+| `None` | no step: the formats are the same, the bytes are copied | stays so |
+| `BitExact` | `Widen` (more bits, the new low bits are zero, every value is unchanged) and `Repack` (the same bits in another slot: 24-bit packed to 24-bit in 4 bytes and back) | stays so: the stream is verified as it was |
+| `Lossless` | `MonoToStereo` (the sample duplicated); `IntToFloat` of up to 24 bits (a float holds them exactly) | no: the audio is not identical |
+| `Lossy` | `Narrow` (fewer bits), `Quantise` (a float, or resampled values, rounded to integers), `IntToFloat` of 32 bits (rounded to 24 significant bits), `Resample` | no |
+
+The plan's kind is the largest of its steps'. Anything else than mono to stereo
+is `Unsupported` for channels (no downmix, no upmix); rates are 8000 to 768000 Hz.
+
+`ConvertOptions` (all with defaults): `narrowing` is `TpdfDither` (the default) or
+`Truncate`; `quality` is `High` (default) or `Fast`; `headroom_db` (0 to -60,
+default 0); `dither_seed`; `source_sample`.
+
+### 14.2 Running
+
+```rust
+let mut converter = Converter::new(&plan)?;
+converter.process(input: &[u8], output: &mut [u8]) -> Result<Processed { consumed, produced }, ConvertError>
+converter.finish(output: &mut [u8]) -> Result<usize, ConvertError>     // the resampler's tail; call until 0
+converter.reset()                                                      // a new stream, or a seek
+converter.delay_frames() -> usize          // source frames held back (0 unless resampling)
+converter.min_output_bytes() -> usize      // the output size process makes progress with
+converter.clipped_samples() -> u64
+```
+
+`process` takes whole source frames from the front of `input` and writes whole
+target frames to `output`, as many as fit in either; the caller keeps what was not
+consumed. The output buffer must hold at least `min_output_bytes()` (the frames one
+source frame turns into). `finish` flushes the filter by feeding it silence, so the
+total output for `N` input frames is exactly `ceil(N * L / M)` frames (14.4); after
+it `process` fails `InvalidState` until `reset`. Chunking changes nothing: the
+output is bit-identical whatever the chunk sizes (tested).
+
+Everything the converter needs is allocated in `Converter::new`: `process`,
+`finish` and `reset` do not allocate (tested with a counting allocator, for every
+kind of plan). Integer-to-integer plans run on an integer engine without floating
+point, so a `BitExact` plan is exact by construction; the others decode to `f64`,
+which holds every integer layout exactly.
+
+### 14.3 Narrowing, dither and clipping
+
+Where bits are dropped (an integer narrowing, a float to integers, the rounding of
+resampled values) `Truncate` rounds toward negative infinity, and `TpdfDither`
+adds triangular-PDF noise of one step peak before rounding to nearest: the error
+becomes signal-independent, zero-mean, at half a step RMS (-98 dBFS at 16 bits,
+tested), at most 1.5 steps. The generator is a xorshift64*, seeded by
+`dither_seed`: the same seed gives the same output, and `reset` rewinds it.
+
+Integer outputs **saturate at full scale and never wrap**, and `clipped_samples()`
+counts the saturations. A non-finite float input sample is replaced by silence.
+Whether a resampled signal clips depends on the signal: a band-limited
+reconstruction can exceed its input's peak. Measured: a full-scale 1 kHz square
+wave resampled from 44.1 to 48 kHz peaks at 1.41 (+3.0 dB), and clips; a
+full-scale sine does not (the passband ripple is 0.00004 dB, less than one 16-bit
+step at full scale: tested for 100 Hz to 19 kHz at 16 bits with truncation). The
+strategy is therefore: unity gain by default (DC gain exactly 1, so a resampled stream is as loud as the
+source), saturation with a count, and `headroom_db` for material that can
+overshoot (`-3.5` keeps the square wave above from clipping, tested). The
+headroom applies after resampling only.
+
+### 14.4 The resampler
+
+A polyphase windowed-sinc converter for any rational ratio, written from the textbook
+design (the module documentation of `convert/resample.rs` has the derivation).
+For rates `fi` and `fo` with `g = gcd`, `L = fo / g` and `M = fi / g`: output `n`
+sits at input time `n * M / L`, and is the dot product of `T` input samples with
+the coefficients of phase `(n * M) mod L`, a Kaiser-windowed sinc evaluated at
+the exact fractional position, each phase normalised to sum to 1. Streaming with
+per-channel history; chunks of any size.
+
+- **Alignment and latency.** The filter is zero-phase: output frame `n` is aligned
+  with source time `n * M / L` exactly, so a position needs no correction:
+  `source_position = played_target_frames * fi / fo`. What the converter holds back is
+  `T/2` source frames (`delay_frames()`, 1.8 ms at 44.1 kHz for `High`), the
+  algorithmic latency, which `ConvertingOutput.latencyFrames` adds. `finish` pads with
+  `T/2` zeros, which makes the total output `ceil(N * L / M)`.
+- **Design targets.** `High`: passband to 91% of the lower Nyquist frequency
+  (20.07 kHz at 44.1 kHz), stopband from the Nyquist frequency itself (so nothing
+  aliases into the output), designed for 110 dB. `Fast`: passband to 90%, stopband
+  from 110% of the Nyquist frequency (content between them aliases into the top
+  10% of the band), designed for 84 dB, about 2.5 times cheaper (2.9 times fewer taps).
+- **Limits.** Rates 8000 to 768000 Hz; a ratio is refused (`Unsupported`) if it needs
+  more than 4.5 million coefficients (for the standard 44.1 and 48 kHz families
+  up to 768 kHz the most is 410 000: 44.1 to 768 kHz is 2560 phases of 160 taps,
+  768 to 44.1 kHz 147 phases of 2752 taps). A ratio that does not reduce to small
+  integers (44.1 to 47.993 kHz would be 47993 phases) is refused.
+
+**Measured quality** (`cargo test -p usbdac-core quality -- --nocapture` prints it;
+tones through the converter, least-squares sine fits, all in `f64`). Passband
+ripple is the peak-to-peak gain over 13 tones from 150 Hz to the passband edge;
+"spur" is everything in the output except the tone (images, aliases, harmonics
+and numerical noise), relative to the tone, the worst of those 13; stopband is
+the weakest attenuation over 11 tones from just above the stopband edge to the
+input's Nyquist frequency, where the whole output is alias (downsampling only).
+
+| Pair | `High` ripple | `High` spur | `High` stopband | `Fast` ripple | `Fast` spur | `Fast` stopband |
+|---|---|---|---|---|---|---|
+| 44.1 to 48 kHz | 0.000011 dB | -120.7 dB | (up) | 0.00084 dB | -83.9 dB | (up) |
+| 48 to 44.1 kHz | 0.000026 dB | -126.5 dB | 110.0 dB | 0.00045 dB | -94.0 dB | none above Nyquist |
+| 44.1 to 96 kHz | 0.000011 dB | -120.7 dB | (up) | 0.00084 dB | -83.8 dB | (up) |
+| 96 to 44.1 kHz | 0.000036 dB | -137.8 dB | 112.5 dB | 0.00076 dB | -105.2 dB | 84.0 dB |
+| 96 to 48 kHz | 0.000012 dB | -246.5 dB | 109.2 dB | 0.00085 dB | -246.1 dB | 83.8 dB |
+| 88.2 to 48 kHz | 0.000020 dB | -141.9 dB | 109.9 dB | 0.00082 dB | -104.7 dB | 84.4 dB |
+| 192 to 44.1 kHz | 0.000036 dB | -144.1 dB | 112.5 dB | 0.00028 dB | -117.5 dB | 96.4 dB |
+| 44.1 to 192 kHz | 0.000011 dB | -120.8 dB | (up) | 0.00084 dB | -83.8 dB | (up) |
+| 384 to 48 kHz | 0.000037 dB | -247.6 dB | 112.3 dB | 0.00045 dB | -247.7 dB | 97.2 dB |
+| 768 to 44.1 kHz | 0.000030 dB | -156.4 dB | 112.5 dB | not run | | |
+| 44.1 to 768 kHz | 0.000007 dB | -120.8 dB | (up) | not run | | |
+
+The tests assert stopband above 105 dB, spur below -110 dB and ripple below
+0.0002 dB for `High`; stopband above 80 dB, spur below -80 dB and ripple below
+0.002 dB for `Fast`. The gain at DC is 1 to within 1e-13 in every phase. An
+impulse comes back at the same instant, symmetric. A 1 kHz tone at -6 dBFS from
+44.1 kHz 16-bit to 48 kHz 24-bit comes out with its peak within 0.001 of 0.5 and
+everything else below -90 dB (the 16-bit input's own rounding noise is about
+-92 dB relative to that tone).
+
+**Cost** (`cargo run --release -p usbdac-core --example convert_bench`, Apple
+silicon, one core, stereo 24-bit): `High` converts 44.1 to 48 kHz at 385 times
+real time (0.26% of a core), 96 to 44.1 kHz at 220 times, 44.1 to 192 kHz at 91 times,
+44.1 to 768 kHz at 22 times and 768 to 44.1 kHz at 29 times (3.5% of a core). `Fast` is
+2.3 to 2.6 times faster. Building a converter takes 0.7 ms (44.1 to 48 kHz), 2.7 ms
+(44.1 to 192 kHz) and about 10 ms for the two extremes. Integer re-layouts run at
+thousands of times real time; narrowing 32 to 16 bits with dither at 1550 times. A phone core
+is several times slower than that machine; nothing here has run on one.
+
+### 14.5 JNI contract
+
+The object `dev.usbdac.internal.ConvertNative`, exported as
+`Java_dev_usbdac_internal_ConvertNative_<name>`; handles are opaque ids; failures
+are `IllegalStateException("usbdac:<code>: <message>")` with the codes
+`unsupported`, `invalid_argument` and `invalid_state`.
+
+```kotlin
+internal object ConvertNative {
+    init { System.loadLibrary("usbdac") }
+
+    @JvmStatic external fun convertPlan(requestJson: String): String
+    @JvmStatic external fun convertCreate(requestJson: String): Long
+    @JvmStatic external fun convertClose(handle: Long)
+    @JvmStatic external fun convertProcess(handle: Long, input: ByteBuffer, inOffset: Int, inCount: Int,
+                                           output: ByteBuffer, outOffset: Int, outCapacity: Int): Long
+    @JvmStatic external fun convertFinish(handle: Long, output: ByteBuffer, outOffset: Int, outCapacity: Int): Int
+    @JvmStatic external fun convertReset(handle: Long)
+    @JvmStatic external fun convertClipped(handle: Long): Long
+}
+```
+
+`convertProcess` takes two **direct** buffers, which must not overlap, reads `inCount`
+bytes from `inOffset` and writes at most `outCapacity` bytes at `outOffset`, moves
+neither position, and returns `(consumed shl 32) or produced` in bytes.
+`convertFinish` returns the bytes written. `convertCreate` synthesises the filter
+(a few milliseconds for a resampling plan): call it off the main thread.
+`convertPlan` does no audio work.
+
+**Request** (`convertPlan`, `convertCreate`):
+
+```json
+{ "source": { "sample_rate": 44100, "channels": 2, "sample": { "kind": "int", "bits": 16, "slot_bytes": 2 } },
+  "target": { "sample_rate": 48000, "channels": 2, "sample": { "kind": "int", "bits": 24, "slot_bytes": 4 } },
+  "options": { "narrowing": "tpdf", "quality": "high", "headroom_db": 0.0, "dither_seed": null } }
+```
+
+`sample` is `{ "kind": "int", "bits", "slot_bytes" }` (8 to 32 bits in a slot of
+1 to 4 bytes that holds them) or `{ "kind": "float" }`. `options` and each key in
+it are optional; `narrowing` is `tpdf` or `truncate`, `quality` is `high` or `fast`.
+
+**Plan** (`convertPlan`):
+
+```json
+{ "kind": "lossy", "description": "Lossy conversion, not bit-perfect: resampled from 44100 Hz to 48000 Hz (windowed-sinc polyphase, high quality, stopband about 110 dB); quantised to 24-bit in a 4-byte slot with TPDF dither (full scale saturates).",
+  "preserves_bit_perfect": false, "resamples": true,
+  "steps": [ { "code": "resample", "kind": "lossy", "description": "..." }, { "code": "quantise", "kind": "lossy", "description": "..." } ],
+  "source": { "sample_rate": 44100, "channels": 2, "sample": {}, "bytes_per_frame": 4 },
+  "target": { "sample_rate": 48000, "channels": 2, "sample": {}, "bytes_per_frame": 8 },
+  "source_frame_bytes": 4, "target_frame_bytes": 8, "delay_frames": 80, "min_output_bytes": 16,
+  "filter": { "l": 160, "m": 147, "taps": 160, "passband_hz": 20065.5, "stopband_hz": 22050.0, "design_attenuation_db": 110.0 } }
+```
+
+`kind` is `none`, `bit_exact`, `lossless` or `lossy`; `step.code` is `resample`,
+`widen`, `repack`, `narrow`, `int_to_float`, `quantise` or `mono_to_stereo`;
+`filter` is `null` unless the plan resamples.
+
+### 14.6 The Kotlin side
+
+`ConversionPlan.between(request, format, options)` calls `convertPlan`;
+`PcmConverter.create(plan)` calls `convertCreate`; `PcmConverter.convert` and
+`finish` wrap `convertProcess` and `convertFinish` and move the buffers' positions.
+`ConvertingOutput(target, converter)` is a `PcmOutput` that converts on the way in
+and reports everything in source units: `playedFrames = target.playedFrames * fi / fo`,
+`latencyFrames = (target latency + converted frames the target has not taken) * fi / fo + delay_frames`,
+`writableBytes` in source bytes. Converted audio the target cannot take is held (one
+chunk) and delivered first on the next call; `drain()` writes the resampler's tail
+before it drains the target; `flush()` resets the converter. Its
+`bitPerfect` is the target's for `None` and `BitExact` plans and
+`NotVerified(null, plan.description)` otherwise.

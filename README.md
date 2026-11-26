@@ -7,7 +7,8 @@ audio stack: PCM at the DAC's native depth, DSD over PCM (DoP) and native DSD;
 isochronous transfers paced by the DAC's explicit feedback endpoint; honest
 accounting of lost audio and of whether the output is bit-perfect; and the DAC's
 own hardware volume. It never resamples, dithers or scales samples unless the host
-turns on software gain.
+turns on software gain (or itself uses the opt-in conversion helpers, which the
+direct path never calls).
 
 **Status: v0.1, derived from Flick, not yet run on hardware as a standalone
 library.** The USB transport is the driver that runs inside the Flick music
@@ -25,6 +26,11 @@ docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
 
 An Android library (AAR) with the Kotlin side of `dev.usbdac.internal.Native` is
 meant to sit on top of the JNI layer; it is not part of this repository yet.
+
+The JNI crate also carries a second, non-USB output: an AAudio exclusive-mode
+stream for devices with an internal DAC (`dev.usbdac.internal.AAudioNative`,
+[docs/API.md](docs/API.md) section 13). It loads `libaaudio.so` at run time, so
+`libusbdac.so` has no link-time dependency on it.
 
 ## What it does
 
@@ -49,6 +55,11 @@ meant to sit on top of the JNI layer; it is not part of this repository yet.
   volume is lowered to at most -40 dB when the DAC opens (never raising a
   channel, verified by reading it back), and a DAC without a usable hardware
   volume refuses to stream unless the host allows a fixed level.
+- Opt-in conversion helpers (`usbdac_core::convert`): a polyphase windowed-sinc
+  resampler, integer widening and narrowing with TPDF dither, float and mono-to-stereo,
+  planned and classified (`None`, `BitExact`, `Lossless`, `Lossy`) so a host can play a
+  rate the DAC refuses and say honestly that it is not bit-perfect. The direct path never
+  calls them (`docs/API.md` section 14).
 - Events through one library thread: state changes, underruns, lost frames,
   bit-perfect changes, volume changes, stale feedback, errors, device loss.
 
