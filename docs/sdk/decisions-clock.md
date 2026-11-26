@@ -53,8 +53,11 @@ it to the OUT service interval. The capacity check rounds the required frame
 count up, since some packets carry that larger size. UAC2 does not advertise
 alternate feedback units. For four-byte high-speed reports outside the
 standard rate window, the driver can test OUT service interval units against
-an independent clock readback. Three matching transfer completions are
-required. It keeps the selected timebase for the stream. A trace-backed
+an independent clock readback. The first stream on a route needs three
+matching transfer completions. Later streams on the same USB configuration,
+interface, alternate setting and endpoints can reuse the learned units
+after validating fresh timing. Closing the DAC clears the remembered units.
+A trace-backed
 [`ExplicitFeedbackPerServiceInterval` quirk](controls.md#quirks) can force the
 alternate units when clock readback is unavailable.
 

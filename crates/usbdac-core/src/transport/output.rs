@@ -554,6 +554,16 @@ pub(super) fn run_usb_output_loop(
     let feedback_per_service = settings().has(crate::Quirk::ExplicitFeedbackPerServiceInterval);
     let feedback_health = feedback_endpoint.filter(|_| candidate.sync_type == SyncType::Asynchronous).map(|endpoint| ExplicitFeedbackHealth::new(
         endpoint.service_interval_us, candidate.is_uac1.then_some(endpoint.refresh)));
+    let mut feedback_route = feedback_endpoint
+        .filter(|_| feedback_health.is_some()
+            && !feedback_per_service
+            && feedback_counters.infer_service_interval
+            && candidate.usb_speed == Speed::High
+            && candidate.service_interval_us > 125)
+        .map(|endpoint| FeedbackTimebaseRoute::new(&candidate, endpoint));
+    if let Some(route) = feedback_route {
+        feedback_counters.cached_service_interval = state.service_interval_feedback_routes.lock().contains(&route);
+    }
     if let Some(endpoint) = feedback_endpoint.filter(|_| feedback_health.is_some()) {
         feedback_counters.diagnostics = Some(crate::ExplicitFeedbackDiagnostics {
             endpoint: endpoint.address,
@@ -886,6 +896,18 @@ pub(super) fn run_usb_output_loop(
                 feedback_health.expect("selected explicit pipe has health deadlines"),
                 stream_started_at,
             );
+            // Commit the hint only once live timing has accepted a timely
+            // report. A conforming report removes an older alternate hint.
+            if feedback_counters.reports != 0 {
+                if let Some(route) = feedback_route.take() {
+                    let mut routes = state.service_interval_feedback_routes.lock();
+                    if feedback_counters.selected_service_interval() {
+                        routes.insert(route);
+                    } else {
+                        routes.remove(&route);
+                    }
+                }
+            }
             publish_feedback_counters(&runtime_stats, &feedback_counters);
             publish_feedback_evidence(&runtime_stats, &mut feedback_counters, false);
             if let Err(error) = result {

@@ -71,6 +71,8 @@ class MainActivity : Activity() {
     private var waitingForPermission: DacDeviceInfo? = null // a DAC the selector would use directly if it were allowed
     private var other: PcmOutput? = null // the output of the automatic, managed or AAudio choice, while one is playing
     private var otherPaused = false
+    // Accessed on io, alongside stream and session teardown.
+    private var lastFeedbackReport: String? = null
     private var streamJobs = mutableListOf<Job>()
     private val events = ArrayDeque<String>()
 
@@ -245,7 +247,12 @@ class MainActivity : Activity() {
         showFormats()
 
         opened.events.onEach { log(it.toString()) }.launchIn(scope)
-        opened.state.onEach { if (it == DacState.LOST) { log("the DAC was unplugged"); closeSession() } }.launchIn(scope)
+        opened.state.onEach {
+            if (it == DacState.LOST && session === opened) {
+                log("the DAC was unplugged")
+                closeSession()
+            }
+        }.launchIn(scope)
 
         val volume = opened.volume
         // What the library did to the DAC's level before any stream could start.
@@ -268,15 +275,27 @@ class MainActivity : Activity() {
 
     private fun closeSession() {
         val closing = session ?: return
+        if ((other as? SelectedOutput)?.session === closing) {
+            stopOther()
+            return
+        }
+        clearDacSession()
         stopStream()
+        // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
+        io.execute {
+            runCatching { closing.close() }
+            retainFeedbackReport(closing)
+            runOnUiThread { log("session closed") }
+        }
+    }
+
+    private fun clearDacSession() {
         session = null
         capabilitiesText.text = ""
         volumeBar.isEnabled = false
         muteBox.isEnabled = false
         volumeText.text = "DAC volume: none"
         startupText.text = ""
-        // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
-        io.execute { runCatching { closing.close() }; runOnUiThread { log("session closed") } }
     }
 
     // ---- playback ----
@@ -439,6 +458,7 @@ class MainActivity : Activity() {
 
     private fun stopOther() {
         val closing = other ?: return
+        val closingSession = (closing as? SelectedOutput)?.session
         other = null
         streamJobs.forEach { it.cancel() }
         streamJobs.clear()
@@ -447,9 +467,10 @@ class MainActivity : Activity() {
         io.execute {
             writer?.stop()
             runCatching { closing.close() }
+            closingSession?.let(::retainFeedbackReport)
         }
         // The output closed its DAC session too; clear what the volume controls were showing.
-        if (closing is SelectedOutput && closing.session != null) closeSession()
+        if (closingSession != null && session === closingSession) clearDacSession()
     }
 
     private fun describeOther(output: PcmOutput): String = buildString {
@@ -500,11 +521,16 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun retainFeedbackReport(closedSession: DacSession) {
+        runCatching { closedSession.feedbackTraceJson() }
+            .getOrNull()
+            ?.let { lastFeedbackReport = it }
+    }
+
     private fun copyFeedbackTrace() {
         val active = session ?: (other as? SelectedOutput)?.session
-        if (active == null) return log("open a direct USB session before exporting a feedback report")
         io.execute {
-            val result = runCatching { active.feedbackTraceJson() }
+            val result = runCatching { active?.feedbackTraceJson() ?: lastFeedbackReport }
             runOnUiThread {
                 result.onSuccess { report ->
                     if (report == null) {

@@ -258,6 +258,7 @@ pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
         hardware_volume_state: None,
         startup_volume: None,
         runtime_stats: None,
+        service_interval_feedback_routes: Default::default(),
     });
     drop(guard);
     if let Err(error) = ensure_idle_lock() {
@@ -697,5 +698,6 @@ pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionSta
         hardware_volume_state: None,
         startup_volume: None,
         runtime_stats,
+        service_interval_feedback_routes: Default::default(),
     }
 }

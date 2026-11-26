@@ -569,6 +569,7 @@ pub(super) struct FeedbackCounters {
     pub(super) diagnostics_dirty: bool,
     pub(super) trace: Option<Arc<crate::feedback_diagnostics::FeedbackRecorder>>,
     pub(super) infer_service_interval: bool,
+    pub(super) cached_service_interval: bool,
     selected_timebase: Option<FeedbackTimebase>,
     service_interval_confirmations: u8,
 }
@@ -582,6 +583,10 @@ enum FeedbackTimebase {
 const SERVICE_INTERVAL_CONFIRMATIONS: u8 = 3;
 
 impl FeedbackCounters {
+    pub(super) fn selected_service_interval(&self) -> bool {
+        self.selected_timebase == Some(FeedbackTimebase::OutService)
+    }
+
     pub(super) fn record_submit(&mut self, status: Option<i32>) {
         if let Some(status) = status {
             if let Some(diagnostics) = self.diagnostics.as_mut() {
@@ -604,11 +609,14 @@ impl FeedbackCounters {
         if let Some(diagnostics) = self.diagnostics.as_mut() {
             diagnostics.timebase = Some(unit);
             diagnostics.inferred_timebase = inferred;
+            diagnostics.reused_timebase = inferred && self.cached_service_interval;
         }
         if let Some(trace) = &self.trace {
             trace.record(crate::FeedbackTraceEvent::Timebase { unit, inferred });
         }
-        if inferred {
+        if inferred && self.cached_service_interval {
+            log_info!("[USB] Explicit feedback timebase reused for DAC session: {}", unit);
+        } else if inferred {
             log_info!("[USB] Explicit feedback timebase inferred: {} ({} matching completions)",
                 unit, SERVICE_INTERVAL_CONFIRMATIONS);
         }
@@ -742,13 +750,16 @@ fn inspect_feedback_packets(
             // identical packets is only one observation. Empty polls do not
             // count or extend the existing feedback deadline.
             counters.service_interval_confirmations += 1;
-            if counters.service_interval_confirmations == SERVICE_INTERVAL_CONFIRMATIONS {
+            if counters.cached_service_interval
+                || counters.service_interval_confirmations == SERVICE_INTERVAL_CONFIRMATIONS
+            {
                 counters.record_valid_bytes(bytes);
                 counters.select_timebase(FeedbackTimebase::OutService, speed, true);
                 newest = Some(decoded);
             }
         } else if conflicting_report {
             counters.service_interval_confirmations = 0;
+            counters.cached_service_interval = false;
         }
     }
     newest
@@ -1189,6 +1200,45 @@ mod explicit_feedback_tests {
         assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
         assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
             250, Speed::High, 256, false, &mut counters).is_none());
+    }
+
+    #[test]
+    fn saved_units_still_require_a_fresh_report_and_clock() {
+        let alternate = q16(12.0);
+        let scheduler = IsoPacketScheduler::new(48_000, 4, 250);
+        let mut counters = FeedbackCounters {
+            cached_service_interval: true,
+            diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
+            ..Default::default()
+        };
+        assert!(select_feedback_report(&alternate, [(0, 4, 0)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(counters.selected_timebase.is_none());
+        assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters).is_none());
+
+        // A second stream at a different rate can reuse the saved units after
+        // checking them against its own readback and packet capacity.
+        counters.infer_service_interval = true;
+        counters.cached_service_interval = true;
+        assert_eq!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
+            250, Speed::High, 256, false, &mut counters), Some((12.0, 48_000.0)));
+        assert!(counters.selected_service_interval());
+        assert!(counters.diagnostics.unwrap().reused_timebase);
+    }
+
+    #[test]
+    fn standard_timing_supersedes_saved_service_interval_units() {
+        let scheduler = IsoPacketScheduler::new(48_000, 4, 250);
+        let mut counters = FeedbackCounters {
+            infer_service_interval: true,
+            cached_service_interval: true,
+            ..Default::default()
+        };
+        let batch = [q16(12.0), q16(6.0)].concat();
+        assert_eq!(select_feedback_report(&batch, [(0, 4, 4); 2], &scheduler,
+            250, Speed::High, 256, false, &mut counters), Some((12.0, 48_000.0)));
+        assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
     }
 
     #[test]

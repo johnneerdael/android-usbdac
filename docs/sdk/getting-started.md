@@ -361,7 +361,11 @@ To make the system volume panel and the background volume keys drive the DAC thr
 
 ```kotlin
         // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
-        io.execute { runCatching { closing.close() }; runOnUiThread { log("session closed") } }
+        io.execute {
+            runCatching { closing.close() }
+            retainFeedbackReport(closing)
+            runOnUiThread { log("session closed") }
+        }
 ```
 
 `DacStream.close()` releases only the stream. The session, the volume and the claim stay, and you can open another stream. `DacSession.close()` also hands the volume back (by default it writes back the level the DAC had before the library first changed it), releases the interfaces, asks Android to rebind its USB audio driver, and closes the USB connection. Closing takes about 100 ms or more.

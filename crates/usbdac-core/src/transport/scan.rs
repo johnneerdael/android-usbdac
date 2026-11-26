@@ -884,6 +884,7 @@ pub(super) fn select_stream_candidate(
                 }
 
                 candidates.push(IsoStreamCandidate {
+                    configuration_number: config_descriptor.number(),
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
                     endpoint_address: endpoint.address(),
