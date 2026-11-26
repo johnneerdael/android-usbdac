@@ -11,7 +11,7 @@ what prevented verification.
 Find published versions on [crates.io](https://crates.io/crates/usbdac-core).
 
 ```sh
-cargo add usbdac-core@0.1.0
+cargo add usbdac-core@0.1.1
 ```
 
 1. Open the USB device, claim its AudioControl and playback AudioStreaming

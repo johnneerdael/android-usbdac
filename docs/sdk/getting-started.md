@@ -37,25 +37,25 @@ Add the dependency in your app module's `build.gradle.kts`.
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.0")
+    implementation("dev.usbdac:usbdac:0.1.1")
 }
 ```
 
-For a download without registry credentials, put `usbdac-0.1.0.aar`
-from the [0.1.0 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.0)
+For a download without registry credentials, put `usbdac-0.1.1.aar`
+from the [0.1.1 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.1)
 in your app module's `libs/` directory. Use these dependencies in place of
 the registry coordinate.
 
 ```gradle
 dependencies {
-    implementation(files("libs/usbdac-0.1.0.aar"))
+    implementation(files("libs/usbdac-0.1.1.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
 ```
 
 If you build from source, run `./gradlew :usbdac:publishToMavenLocal` in
 `android/`, add `mavenLocal()` to your repositories and depend on
-`dev.usbdac:usbdac:0.1.0`. The Maven metadata brings in coroutines.
+`dev.usbdac:usbdac:0.1.1`. The Maven metadata brings in coroutines.
 
 The library needs Android 8.0 (API 26) or later. An app that uses the published AAR needs no Rust and no NDK; [building from source](#building-from-source) does.
 

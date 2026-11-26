@@ -20,7 +20,7 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 | 5 | [How DSD is carried](decisions-stream.md#dsd) | Capability from descriptors, byte order from quirks; the library owns the DoP marker | Tests. Not run on a DAC |
 | 6 | [Which clock gets the rate](decisions-clock.md#clock-path) | Walk selectors and multipliers to the source, check the range, verify by read-back | Hardware for a plain clock. Tests for selectors |
 | 7 | [How the host follows the DAC's clock](decisions-clock.md#feedback) | Explicit feedback, 10.14 or 16.16, 2 % band, smoothed; stale is a warning | Tests. Smoothing is an open question |
-| 8 | [DACs that need implicit feedback](decisions-clock.md#implicit-feedback) | Refuse by name; allow only on request, never bit-perfect | Tests |
+| 8 | [DACs that need implicit feedback](decisions-clock.md#implicit-feedback) | Use a compatible shared-clock source or return a typed refusal | Tests |
 | 9 | [Who owns the volume](decisions-volume.md#volume-ownership) | The DAC's own control; software gain exists and ends bit-perfect | Tests |
 | 10 | [How a slider writes to the DAC](decisions-volume.md#volume-writes) | Floor at -80 dB, latest write wins, control ioctl on the same descriptor, works without a stream | Tests |
 | 11 | [The first sound, and what the DAC is left at](decisions-volume.md#startup-volume) | Lower to at most -40 dB, never raise, hand the original back | Tests |
@@ -66,7 +66,7 @@ Short answers; the decision pages have the file paths and the reasoning. "Flick"
 - **Four transfers of about 4 ms or eight of about 2 ms, 16 ms in all.** The two shapes are in practice the same queue.
 - **The 2 % band on feedback.** A report more than 2 % from nominal is ignored by all four, because a broken feedback endpoint must not push packets past the endpoint's capacity.
 - **Count what the DAC actually took.** Position and "played" frames come from completed transfers in three of the four.
-- **Refuse what cannot be paced.** Three of the four refuse implicit feedback (Flick streams it at the nominal rate with a warning).
+- **Refuse what cannot be paced.** At the comparison baseline, three of the four refuse implicit feedback. Flick uses nominal pacing with a warning. usbdac 0.1.1 can pace compatible UAC2 routes from an IN source.
 
 ## Where they differ, and which differences are open
 
