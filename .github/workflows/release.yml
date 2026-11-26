@@ -100,6 +100,19 @@ jobs:
       - name: Test the Rust workspace
         run: cargo test --workspace
 
+      # Plugin downloads from the Gradle and Maven repositories fail intermittently on
+      # hosted runners. Resolve them first, with retries, so a transient outage does not
+      # fail the build.
+      - name: Resolve Gradle plugins (with retries)
+        working-directory: android
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if ./gradlew help -Pusbdac.skipNative=true --console=plain -q; then exit 0; fi
+            echo "Plugin resolution failed (attempt $attempt); retrying in 30 s"
+            sleep 30
+          done
+          exit 1
+
       - name: Build the AAR (all four ABIs), run the unit tests, build the sample
         working-directory: android
         run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug --console=plain
