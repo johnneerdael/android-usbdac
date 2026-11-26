@@ -321,6 +321,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
 
     if let Some(source) = candidate.implicit_feedback.filter(|source| source.interface_number != candidate.interface_number) {
+        if !claimed_handle.claimed_interfaces.contains(&source.interface_number) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Claim("implicit source interface was not claimed".into()));
+        }
         if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Claim(error));
         }
@@ -630,6 +634,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     if let Some(capture) = attachment.as_ref() {
         if let Err(error) = capture.configure(&claimed_handle, &candidate, expected) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
+        }
+    }
+    if let Some(route) = adc3_route.as_ref() {
+        if let Err(error) = verify_adc3_implicit_activation(&claimed_handle, &candidate, route, playback_format.sample_rate) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Transfer(error));
         }
     }
     if let Some(source) = candidate.implicit_feedback {

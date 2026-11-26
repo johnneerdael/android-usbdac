@@ -14,7 +14,7 @@ pub(super) fn preflight_implicit_feedback_interfaces(
     validate_android_usb_claims(&claimed, &config)?;
     Ok((
         config.number(),
-        structural_feedback_interfaces(&config, &claimed.handle, resolve_device_speed(&usb)),
+        structural_feedback_interfaces(&config, &claimed.handle, resolve_device_speed(&usb), &claimed.claimed_interfaces),
     ))
 }
 
@@ -22,6 +22,7 @@ fn structural_feedback_interfaces(
     config: &ConfigDescriptor,
     handle: &DeviceHandle<Context>,
     speed: Speed,
+    claimed: &[u8],
 ) -> Vec<u8> {
     if settings().disable_feedback() {
         return Vec::new();
@@ -121,6 +122,7 @@ fn structural_feedback_interfaces(
             }
         }
     }
+    interfaces.extend(adc3_feedback_interfaces(config, handle, speed, claimed));
     interfaces.sort_unstable();
     interfaces.dedup();
     interfaces
@@ -399,6 +401,7 @@ pub(super) fn validate_registration_handoff(
         &config,
         &claimed.handle,
         resolve_device_speed(&claimed.handle.device()),
+        &claimed.claimed_interfaces,
     );
     if unavailable.iter().any(|id| !optional.contains(id)) {
         return Err(
@@ -681,6 +684,7 @@ pub(super) fn build_usb_capability_model(
         let ranges = if let Some(clock) = route.clock.as_ref() {
             get_sampling_frequency_ranges(handle, route.control, clock.id).unwrap_or_default()
         } else { vec![SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }] };
+        let ranges = adc3_capacity_ranges(&candidate, &ranges);
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
             endpoint_address: candidate.endpoint_address, format: AltFormat::Pcm,
@@ -693,7 +697,9 @@ pub(super) fn build_usb_capability_model(
             uac_version:UacVersion::V3,endpoint_interval:candidate.endpoint_interval,
             usage:endpoint_usage(candidate.usage_type),refresh:candidate.refresh,
             synch_address:candidate.synch_address,
-            pacing:Some(admitted_pacing(candidate.sync_type,candidate.feedback_endpoint.map(|f|f.address))),
+            pacing:Some(if let Some(source) = candidate.implicit_feedback {
+                crate::capabilities::Pacing::ImplicitFeedback { interface_number: source.interface_number, alt_setting: source.alt_setting, endpoint: source.address }
+            } else { admitted_pacing(candidate.sync_type,candidate.feedback_endpoint.map(|f|f.address)) }),
         });
     }
     supported_sample_rates.sort_unstable();
@@ -998,7 +1004,9 @@ pub(super) fn select_stream_candidate(
             let supported = if let Some(clock) = route.clock.as_ref() {
                 get_sampling_frequency_ranges(handle,route.control,clock.id).map(|r|sampling_frequency_ranges_support_rate(&r,playback_format.sample_rate)).unwrap_or(false)
             } else { playback_format.sample_rate == 48_000 };
-            if supported && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {
+            if supported && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
+                playback_format.sample_rate, source.service_interval_us, source.bytes_per_frame))
+                && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {
                 candidates.push(candidate);
             }
         }
@@ -1282,6 +1290,7 @@ fn validate_android_usb_claims_with_capture(
         config_descriptor,
         &claimed_handle.handle,
         resolve_device_speed(&claimed_handle.handle.device()),
+        &claimed_handle.claimed_interfaces,
     )
     .into_iter()
     .collect();

@@ -15,6 +15,7 @@ pub(super) struct Adc3Route {
     terminal: u8,
     endpoint: (u8, u8, u16, u32),
     feedback: Option<(u8, u8, usize)>,
+    implicit: Option<Box<Adc3Route>>,
     companions: Vec<(u8, [u8; 6])>,
     extended_companions: Vec<(u8, [u8; 8])>,
     pcm: (u16, u8, u8),
@@ -515,11 +516,13 @@ pub(super) fn adc3_route_for_candidate(
     let plan = saved.as_ref().filter(|r| r.config == config.number()
         && r.interface == candidate.interface_number && r.alt == candidate.alt_setting)
         .and_then(|r| r.plan.as_ref());
-    adc3_alternate_plan(&config, handle, &alt, candidate.usb_speed, false, plan).map(|(_, mut r)| {
-        r.clock_context = saved.as_ref().filter(|saved| saved.plan.as_ref() == r.plan.as_ref())
-            .and_then(|saved| saved.clock_context.clone());
-        Some(r)
-    })
+    let (actual, mut route) = adc3_alternate_plan(&config, handle, &alt, candidate.usb_speed, false, plan)?;
+    if actual.implicit_feedback != candidate.implicit_feedback {
+        return Err("ADC3 implicit source changed since selection".into());
+    }
+    route.clock_context = saved.as_ref().filter(|saved| saved.plan.as_ref() == route.plan.as_ref())
+        .and_then(|saved| saved.clock_context.clone());
+    Ok(Some(route))
 }
 fn adc3_alternate(
     config: &ConfigDescriptor,
@@ -682,8 +685,21 @@ fn adc3_alternate_plan(
     capture: bool,
     plan: Option<&ClockPlan>,
 ) -> Result<(IsoStreamCandidate, Adc3Route), String> {
+    adc3_alternate_overlay(config, handle, alt, speed, capture, plan, true)
+}
+
+// A peer may follow the sink's shared selector targets without owning its plan.
+fn adc3_alternate_overlay(
+    config: &ConfigDescriptor, handle: &DeviceHandle<Context>, alt: &rusb::InterfaceDescriptor,
+    speed: Speed, capture: bool, plan: Option<&ClockPlan>, verify_plan: bool,
+) -> Result<(IsoStreamCandidate, Adc3Route), String> {
     let (iad, profile, extra) = owning_function(config, handle, alt.interface_number())?;
     let control = iad.b_first_interface;
+    if profile == wire::FunctionProfile::Full && alt.endpoint_descriptors().filter(|e|
+        e.transfer_type() == TransferType::Isochronous
+            && matches!(e.usage_type(), UsageType::Data | UsageType::FeedbackData)).count() != 1 {
+        return Err("ADC3 AS alternate must own exactly one audio data endpoint".into());
+    }
     let endpoints: Vec<_> = alt
         .endpoint_descriptors()
         .filter(|e| {
@@ -694,7 +710,9 @@ fn adc3_alternate_plan(
                     Direction::Out
                 })
                 && e.transfer_type() == TransferType::Isochronous
-                && e.usage_type() == UsageType::Data
+                && (e.usage_type() == UsageType::Data
+                    || (capture && profile == wire::FunctionProfile::Full
+                        && e.usage_type() == UsageType::FeedbackData))
         })
         .collect();
     let [ep] = endpoints.as_slice() else {
@@ -712,16 +730,7 @@ fn adc3_alternate_plan(
     } else {
         adc3_feedback(alt, ep, speed)?
     };
-    if !capture
-        && ep.sync_type() == SyncType::Asynchronous
-        && (feedback.is_none() || settings().disable_feedback())
-    {
-        return Err("ADC3 asynchronous playback requires enabled explicit feedback".into());
-    }
-    if !matches!(
-        ep.sync_type(),
-        SyncType::Asynchronous | SyncType::Synchronous
-    ) {
+    if !adc3_sync_supported(profile, capture, ep.sync_type()) {
         return Err("ADC3 synchronization unsupported".into());
     }
     let mut route = Adc3Route {
@@ -740,6 +749,7 @@ fn adc3_alternate_plan(
             service_interval_micros(speed, ep.interval()),
         ),
         feedback: feedback.map(|f| (f.address, f.interval, f.max_packet_bytes)),
+        implicit: None,
         companions: data_companion.map(|d| (ep.address(), d)).into_iter()
             .chain(feedback_companion.zip(feedback).map(|(d, f)| (f.address, d)))
             .collect(),
@@ -815,7 +825,7 @@ fn adc3_alternate_plan(
                 return Err("ADC3 cluster has no channels".into());
             }
             let (source, choice) = clock_route(handle, control, h.terminal_link, &extra, capture, plan)?;
-            if let Some(plan) = plan {
+            if let Some(plan) = plan.filter(|_| verify_plan) {
                 if source.id != plan.source_id || source.controls.0 != plan.source_controls
                     || choice.path.iter().skip(1).map(|h| h.id).collect::<Vec<_>>() != plan.path {
                     return Err("ADC3 alternate clock topology changed".into());
@@ -840,7 +850,7 @@ fn adc3_alternate_plan(
         }
     };
     route.pcm = (channels, subslot, bits);
-    let candidate = IsoStreamCandidate {
+    let mut candidate = IsoStreamCandidate {
         interface_number: alt.interface_number(),
         alt_setting: alt.setting_number(),
         endpoint_address: ep.address(),
@@ -864,8 +874,225 @@ fn adc3_alternate_plan(
         terminal_link: Some(route.terminal),
         is_uac1: false,
     };
+    if adc3_requires_implicit(profile, capture, candidate.sync_type, feedback.is_some(),
+        ep.synch_address() != 0 || alt.endpoint_descriptors().any(|e| e.usage_type() == UsageType::Feedback),
+        settings().disable_feedback())? {
+        let (source, source_route) = adc3_implicit_source(config, handle, &candidate, &route, plan)?;
+        candidate.implicit_feedback = Some(source);
+        route.implicit = Some(Box::new(source_route));
+    }
+    candidate.sample_rates = representative_sample_rates_from_ranges(&adc3_capacity_ranges(&candidate, &rates));
     Ok((candidate, route))
 }
+
+fn adc3_requires_implicit(profile: wire::FunctionProfile, capture: bool, sync: SyncType,
+    explicit: bool, advertised_explicit: bool, disabled: bool) -> Result<bool, String> {
+    if capture || sync != SyncType::Asynchronous { return Ok(false); }
+    if disabled { return Err("ADC3 asynchronous playback requires enabled feedback".into()); }
+    if explicit { return Ok(false); }
+    // A malformed advertised explicit pipe cannot authorize a different source.
+    if advertised_explicit { return Err("ADC3 advertised explicit feedback is unusable".into()); }
+    if profile != wire::FunctionProfile::Full {
+        return Err("BADD asynchronous playback requires explicit feedback".into());
+    }
+    Ok(true)
+}
+
+fn adc3_route_domain_required(route: &Adc3Route, domain: &wire::PowerDomain) -> bool {
+    domain.entities.contains(&route.terminal) || route.choice.as_ref().map_or(false, |choice|
+        choice.path.iter().any(|hop| domain.entities.contains(&hop.id)))
+}
+
+/// Keep the implicit source's terminal and clock powered until both alts stop.
+fn prepare_adc3_implicit_power(claimed: &ClaimedHandle, route: &Adc3Route) -> Result<(), String> {
+    let Some(source) = route.implicit.as_deref() else { return Ok(()); };
+    if !claimed.claimed_interfaces.contains(&source.interface) {
+        return Err("ADC3 implicit source interface was not claimed".into());
+    }
+    claimed.adc3_power.verify_idle(source.interface)?;
+    for domain in source.domains.iter().filter(|domain| adc3_route_domain_required(source, domain)) {
+        claimed.adc3_power.acquire(source.control, domain)?;
+    }
+    Ok(())
+}
+
+/// Re-read the current peer path after selector/rate programming, before IN activation.
+/// Compare with the retained negotiated target, never choose a replacement peer.
+pub(super) fn verify_adc3_implicit_activation(claimed: &ClaimedHandle, candidate: &IsoStreamCandidate,
+    route: &Adc3Route, rate: u32) -> Result<(), String> {
+    let Some(expected) = route.implicit.as_deref() else { return Ok(()); };
+    if settings().disable_feedback() || !claimed.claimed_interfaces.contains(&expected.interface) {
+        return Err("ADC3 implicit source disabled or unclaimed".into());
+    }
+    let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
+    let alt = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
+        d.interface_number() == expected.interface && d.setting_number() == expected.alt)
+        .ok_or("ADC3 implicit source alternate disappeared")?;
+    let (input, actual) = adc3_alternate(&config, &claimed.handle, &alt, candidate.usb_speed, true)?;
+    if &actual != expected || input.sync_type != SyncType::Asynchronous
+        || input.usage_type != UsageType::FeedbackData || input.service_interval_us != candidate.service_interval_us
+        || !adc3_shared_clock(route, &actual)
+        || input.max_packet_bytes < required_max_packet_bytes(rate, input.service_interval_us,
+            usize::from(input.channels) * usize::from(input.subslot_size)) {
+        return Err("ADC3 implicit source signature or clock changed before activation".into());
+    }
+    for domain in expected.domains.iter().filter(|domain| adc3_route_domain_required(expected, domain)) {
+        if PowerUsb(&claimed.adc3_power).read(expected.control, domain.id)? != 0 {
+            return Err("ADC3 implicit source power changed before activation".into());
+        }
+    }
+    validate_adc3_clock(&claimed.handle, &actual, rate, false)
+}
+
+/// Deduplicate clock-target proofs only when every viable target names one pipe.
+fn adc3_preflight_pipe(proofs: &[ImplicitFeedbackSource]) -> Option<u8> {
+    let first = proofs.first()?;
+    proofs.iter().all(|source|
+        (source.interface_number, source.address) == (first.interface_number, first.address))
+        .then_some(first.interface_number)
+}
+
+/// Read-only Android claim preflight. Requests target only the already owned AC.
+/// A writable selector target may prove the pair before Android claims its IN AS.
+pub(super) fn adc3_feedback_interfaces(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
+    speed: Speed, claimed: &[u8]) -> Vec<u8> {
+    if settings().disable_feedback() { return Vec::new(); }
+    let mut result = Vec::new();
+    for alt in config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
+        d.class_code() == 1 && d.sub_class_code() == 2 && d.protocol_code() == 0x30
+            && d.setting_number() != 0 && claimed.contains(&d.interface_number())) {
+        let Ok((iad, profile, extra)) = owning_function(config, handle, alt.interface_number()) else { continue; };
+        if profile != wire::FunctionProfile::Full || !claimed.contains(&iad.b_first_interface) { continue; }
+        if let Ok((candidate, _)) = adc3_alternate(config, handle, &alt, speed, false) {
+            if !candidate.sample_rates.is_empty() {
+                if let Some(source) = candidate.implicit_feedback { result.push(source.interface_number); }
+            }
+            // Preserve current exact routes and explicit-feedback preference.
+            continue;
+        }
+        let endpoints: Vec<_> = alt.endpoint_descriptors().filter(|e|
+            e.direction() == Direction::Out && e.transfer_type() == TransferType::Isochronous
+                && e.usage_type() == UsageType::Data).collect();
+        let [endpoint] = endpoints.as_slice() else { continue; };
+        if endpoint.sync_type() != SyncType::Asynchronous
+            || explicit_feedback_ambiguous(&alt, endpoint.synch_address(), endpoint.sync_type()) { continue; }
+        let Ok((explicit, _)) = adc3_feedback(&alt, endpoint, speed) else { continue; };
+        if adc3_requires_implicit(profile, false, endpoint.sync_type(), explicit.is_some(),
+            endpoint.synch_address() != 0 || alt.endpoint_descriptors().any(|e| e.usage_type() == UsageType::Feedback),
+            false) != Ok(true) { continue; }
+        let headers: Vec<_> = DescriptorIter::new(alt.extra())
+            .filter(|d| d.get(1) == Some(&0x24) && d.get(2) == Some(&1)).collect();
+        let [header] = headers.as_slice() else { continue; };
+        let Ok(header) = wire::parse_as_header(header) else { continue; };
+        let Ok(plans) = adc3_plans(handle, iad.b_first_interface, header.terminal_link, &extra) else { continue; };
+        // Inspect every viable plan within the existing eight-target policy.
+        // Truncation could hide a conflicting source pipe, so fail closed.
+        if plans.len() > 8 { continue; }
+        let mut proofs = Vec::new();
+        for plan in plans.iter().filter(|p| p.selectors.iter().any(|pin| pin.original != pin.target)) {
+            if let Ok((candidate, _)) = adc3_alternate_plan(config, handle, &alt, speed, false, Some(plan)) {
+                if !candidate.sample_rates.is_empty() {
+                    if let Some(source) = candidate.implicit_feedback { proofs.push(source); }
+                }
+            }
+        }
+        if let Some(interface) = adc3_preflight_pipe(&proofs) { result.push(interface); }
+    }
+    result.sort_unstable(); result.dedup(); result
+}
+
+/// ADC3 section 3.11.4.1 permits nominal SOF pacing for an Adaptive sink.
+/// Adaptive sources need a feedforward OUT protocol which this worker does not implement.
+fn adc3_sync_supported(profile: wire::FunctionProfile, capture: bool, sync: SyncType) -> bool {
+    matches!(sync, SyncType::Asynchronous | SyncType::Synchronous)
+        || (!capture && profile == wire::FunctionProfile::Full && sync == SyncType::Adaptive)
+}
+
+fn adc3_shared_clock(output: &Adc3Route, input: &Adc3Route) -> bool {
+    if output.profile != wire::FunctionProfile::Full || input.profile != wire::FunctionProfile::Full
+        || (output.config, output.first, output.count, output.control) != (input.config, input.first, input.count, input.control)
+        || output.clock.is_none() || output.clock != input.clock {
+        return false;
+    }
+    let (Some(out), Some(input)) = (&output.choice, &input.choice) else { return false; };
+    out.resolution == ClockResolution::Resolved && input.resolution == ClockResolution::Resolved
+        && out.source_id == input.source_id
+        && out.path.iter().all(|left| input.path.iter().all(|right|
+            left.id != right.id || left.kind == right.kind))
+}
+
+fn adc3_implicit_pair(output: &IsoStreamCandidate, output_route: &Adc3Route,
+    input: &IsoStreamCandidate, input_route: &Adc3Route) -> bool {
+    output.sync_type == SyncType::Asynchronous && input.sync_type == SyncType::Asynchronous
+        && output.interface_number != input.interface_number
+        && input.usage_type == UsageType::FeedbackData
+        && input.service_interval_us == output.service_interval_us
+        && input.channels != 0 && input.subslot_size != 0
+        && input.max_packet_bytes != 0 && output.max_packet_bytes != 0
+        && adc3_shared_clock(output_route, input_route)
+}
+
+fn adc3_unique_implicit(mut matches: Vec<(ImplicitFeedbackSource, Adc3Route)>)
+    -> Result<(ImplicitFeedbackSource, Adc3Route), String> {
+    let Some((first, _)) = matches.first() else { return Err("ADC3 implicit feedback source missing".into()); };
+    if matches.iter().any(|(source, _)|
+        (source.interface_number, source.address) != (first.interface_number, first.address)) {
+        return Err("ADC3 implicit feedback source ambiguous".into());
+    }
+    // Alternate shapes of one proven pipe are not independent sources (3.14.2).
+    // Prefer maximum whole-frame rate coverage, then lower reserved bandwidth
+    // and finally the stable alternate number. Retain that exact route afterward.
+    matches.sort_by_key(|(source, _)| (
+        std::cmp::Reverse(source.max_packet_bytes / source.bytes_per_frame),
+        source.max_packet_bytes, source.alt_setting,
+    ));
+    Ok(matches.remove(0))
+}
+
+fn adc3_implicit_source(
+    config: &ConfigDescriptor, handle: &DeviceHandle<Context>, output: &IsoStreamCandidate,
+    output_route: &Adc3Route, plan: Option<&ClockPlan>,
+) -> Result<(ImplicitFeedbackSource, Adc3Route), String> {
+    let mut matches = Vec::new();
+    for alt in config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
+        d.class_code() == 1 && d.sub_class_code() == 2 && d.protocol_code() == 0x30
+            && d.setting_number() != 0
+            && d.interface_number() >= output_route.first
+            && u16::from(d.interface_number()) < u16::from(output_route.first) + u16::from(output_route.count)) {
+        if alt.interface_number() == output.interface_number { continue; }
+        // Explicit USB usage marking is required. Endpoint/interface adjacency is no association.
+        if !alt.endpoint_descriptors().any(|e| e.direction() == Direction::In
+            && e.transfer_type() == TransferType::Isochronous && e.sync_type() == SyncType::Asynchronous
+            && e.usage_type() == UsageType::FeedbackData) { continue; }
+        let Ok((input, mut route)) = adc3_alternate_overlay(config, handle, &alt, output.usb_speed, true, plan, false) else { continue; };
+        if !adc3_implicit_pair(output, output_route, &input, &route) { continue; }
+        route.plan = None; // The sink owns the common selector transaction.
+        matches.push((ImplicitFeedbackSource {
+            interface_number: input.interface_number, alt_setting: input.alt_setting, address: input.endpoint_address,
+            bytes_per_frame: usize::from(input.channels) * usize::from(input.subslot_size),
+            service_interval_us: input.service_interval_us, max_packet_bytes: input.max_packet_bytes,
+        }, route));
+    }
+    adc3_unique_implicit(matches)
+}
+
+pub(super) fn adc3_capacity_ranges(candidate: &IsoStreamCandidate, ranges: &[SamplingFrequencySubrange]) -> Vec<SamplingFrequencySubrange> {
+    let ceiling = |capacity: usize, stride: usize, interval: u32| -> u32 {
+        if stride == 0 || interval == 0 { return 0; }
+        ((capacity / stride) as u64 * 1_000_000 / u64::from(interval)).min(u64::from(u32::MAX)) as u32
+    };
+    let mut max = ceiling(candidate.max_packet_bytes, usize::from(candidate.channels) * usize::from(candidate.subslot_size), candidate.service_interval_us);
+    if let Some(source) = candidate.implicit_feedback {
+        max = max.min(ceiling(source.max_packet_bytes, source.bytes_per_frame, source.service_interval_us));
+    }
+    ranges.iter().filter_map(|r| {
+        if r.min == 0 || r.min > r.max || r.min > max { return None; }
+        let upper = r.max.min(max);
+        let upper = if r.res == 0 { upper } else { r.min + (upper - r.min) / r.res * r.res };
+        Some(SamplingFrequencySubrange { min: r.min, max: upper, res: r.res })
+    }).collect()
+}
+
 pub(super) fn adc3_candidates(
     device: &Device<Context>,
     handle: &DeviceHandle<Context>,
@@ -896,7 +1123,8 @@ pub(super) fn adc3_candidates(
         }
         match adc3_alternate(&config, handle, &alt, speed, false) {
             Ok(pair) => {
-                if claimed.contains(&pair.1.control) {
+                if claimed.contains(&pair.1.control)
+                    && pair.0.implicit_feedback.map_or(true, |source| claimed.contains(&source.interface_number)) {
                     result.push(pair);
                 }
             }
@@ -964,7 +1192,8 @@ pub(super) fn adc3_capture_candidates(
                 && d.setting_number() != 0
                 && claimed.claimed_interfaces.contains(&d.interface_number())
                 && d.endpoint_descriptors()
-                    .any(|e| e.direction() == Direction::In && e.usage_type() == UsageType::Data)
+                    .any(|e| e.direction() == Direction::In
+                        && matches!(e.usage_type(), UsageType::Data | UsageType::FeedbackData))
         })
     {
         let checkpoint = claimed.adc3_power.pending.lock().len();
@@ -972,7 +1201,17 @@ pub(super) fn adc3_capture_candidates(
             prepare_adc3_alternate_power(claimed, config, &alt, true)?;
             let saved = if planned_clock { NEGOTIATED.lock().clone() } else { None };
             let plan = capture_peer_plan(saved.as_ref(), config.number(), alt.interface_number());
-            let (candidate, route) = adc3_alternate_plan(config, &claimed.handle, &alt, speed, true, plan)?;
+            let implicit = saved.as_ref().and_then(|r| r.implicit.as_deref()).filter(|r|
+                r.interface == alt.interface_number() && r.alt == alt.setting_number());
+            let (candidate, mut route) = if implicit.is_some() {
+                adc3_alternate_overlay(config, &claimed.handle, &alt, speed, true, plan, false)?
+            } else {
+                adc3_alternate_plan(config, &claimed.handle, &alt, speed, true, plan)?
+            };
+            if let Some(expected) = implicit {
+                route.plan = None;
+                if &route != expected { return Err("ADC3 shared capture source changed".into()); }
+            }
             let supports = if let Some(clock) = &route.clock {
                 sampling_frequency_ranges_support_rate(
                     &get_sampling_frequency_ranges(&claimed.handle, route.control, clock.id)?,
@@ -1032,7 +1271,8 @@ pub(super) fn select_standalone_adc3_capture(
         alt.class_code() == 1 && alt.sub_class_code() == 2 && alt.protocol_code() == 0x30
         && alt.setting_number() != 0 && claimed.claimed_interfaces.contains(&alt.interface_number())
         && alt.endpoint_descriptors().any(|ep| ep.direction() == Direction::In
-            && ep.transfer_type() == TransferType::Isochronous && ep.usage_type() == UsageType::Data)).collect();
+            && ep.transfer_type() == TransferType::Isochronous
+            && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData))).collect();
     for alt in &alts {
         prepare_adc3_alternate_power(claimed, config, alt, true)?;
         let Ok(pair) = adc3_alternate(config, &claimed.handle, alt, speed, true) else { continue; };
@@ -1127,6 +1367,11 @@ pub(super) fn configure_adc3(
     route: &Adc3Route,
     rate: u32,
 ) -> Result<(), String> {
+    validate_adc3_clock(handle, route, rate, true)
+}
+
+fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: u32,
+    allow_frequency_write: bool) -> Result<(), String> {
     if matches!(route.profile, wire::FunctionProfile::Badd(_)) {
         return if rate == 48000 {
             Ok(())
@@ -1153,6 +1398,7 @@ pub(super) fn configure_adc3(
     let mut current = [0; 4];
     read_exact(handle, route.control, source.id, 1, 1, &mut current)?;
     if u32::from_le_bytes(current) != rate {
+        if !allow_frequency_write { return Err("ADC3 source frequency changed before activation".into()); }
         if source.controls.access(1) != wire::ControlAccess::ReadWrite {
             return Err("ADC3 source frequency is read-only and differs".into());
         }
@@ -1533,7 +1779,8 @@ fn adc3_clock_context(claimed: &ClaimedHandle, config: &ConfigDescriptor,
         let [header] = headers.as_slice() else { return Err("ADC3 peer AS header missing or ambiguous".into()); };
         let terminal = wire::parse_as_header(header).map_err(|e| e.to_string())?.terminal_link;
         let directions: HashSet<_> = alt.endpoint_descriptors()
-            .filter(|ep| ep.transfer_type() == TransferType::Isochronous && ep.usage_type() == UsageType::Data)
+            .filter(|ep| ep.transfer_type() == TransferType::Isochronous
+                && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData))
             .map(|ep| ep.direction() == Direction::In).collect();
         if directions.is_empty() { return Err("ADC3 peer has no proven data direction".into()); }
         for capture in directions {
@@ -1571,7 +1818,8 @@ fn adc3_alternative_routes(
     claimed: &ClaimedHandle, config: &ConfigDescriptor, alt: &rusb::InterfaceDescriptor, speed: Speed, requested: PlaybackFormat,
 ) -> Result<Vec<(IsoStreamCandidate, Adc3Route)>, String> {
     adc3_directional_alternative_routes(claimed, config, alt, speed, false, |candidate, route| {
-        adc3_candidate_matches(&claimed.handle, candidate, route, requested)
+        candidate.implicit_feedback.map_or(true, |source| claimed.claimed_interfaces.contains(&source.interface_number))
+            && adc3_candidate_matches(&claimed.handle, candidate, route, requested)
     })
 }
 fn adc3_directional_alternative_routes(
@@ -1689,7 +1937,8 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
         d.interface_number() == candidate.interface_number && d.setting_number() == candidate.alt_setting)
         .ok_or("ADC3 alternate disappeared")?;
     let requested = PlaybackFormat { sample_rate: rate, channels: candidate.channels, bit_depth: candidate.bit_resolution, is_dop: false, dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
-    for (_, route) in adc3_alternative_routes(claimed, &config, &alt, candidate.usb_speed, requested)? {
+    for (alternative, route) in adc3_alternative_routes(claimed, &config, &alt, candidate.usb_speed, requested)? {
+        if alternative.implicit_feedback != candidate.implicit_feedback { continue; }
         match apply_adc3_clock_plan(claimed, &route, rate) {
             Ok(()) => return Ok(route),
             Err(error) if claimed.adc3_power.clock.lock().is_some() => return Err(error),
@@ -1706,15 +1955,18 @@ pub(super) fn select_owned_stream_candidate(
 ) -> Result<IsoStreamCandidate, SelectError> {
     let device = claimed.handle.device();
     let saved = NEGOTIATED.lock().clone();
-    if let Some(route) = saved.filter(|r| r.plan.is_some()) {
+    if let Some(route) = saved.filter(|r| r.plan.is_some() || r.implicit.is_some()) {
         let config = device.active_config_descriptor().map_err(|e| SelectError::NoMatch(e.to_string()))?;
         let alt = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
             d.interface_number() == route.interface && d.setting_number() == route.alt)
             .ok_or_else(|| SelectError::NoMatch("ADC3 negotiated alternate disappeared".into()))?;
+        prepare_adc3_implicit_power(claimed, &route).map_err(SelectError::NoMatch)?;
         prepare_adc3_alternate_power(claimed, &config, &alt, false).map_err(SelectError::NoMatch)?;
-        guard_adc3_clock_mutation(claimed, &route).map_err(SelectError::NoMatch)?;
-        for domain in &route.domains {
-            claimed.adc3_power.acquire(route.control, domain).map_err(SelectError::NoMatch)?;
+        if route.plan.is_some() { guard_adc3_clock_mutation(claimed, &route).map_err(SelectError::NoMatch)?; }
+        if route.plan.is_some() {
+            for domain in &route.domains {
+                claimed.adc3_power.acquire(route.control, domain).map_err(SelectError::NoMatch)?;
+            }
         }
         let (candidate, mut actual) = adc3_alternate_plan(&config, &claimed.handle, &alt, speed, false, route.plan.as_ref())
             .map_err(SelectError::NoMatch)?;
@@ -1745,6 +1997,9 @@ pub(super) fn select_owned_stream_candidate(
             .ok_or_else(|| SelectError::NoMatch("selected interface disappeared".into()))?;
         prepare_adc3_alternate_power(claimed, &config, &alt, false)
             .map_err(SelectError::NoMatch)?;
+        if let Some(route) = adc3_route_for_candidate(&device, &claimed.handle, candidate).map_err(SelectError::NoMatch)? {
+            prepare_adc3_implicit_power(claimed, &route).map_err(SelectError::NoMatch)?;
+        }
         return initial;
     }
     if requested.dsd_transport != DsdTransportMode::None {
@@ -1770,8 +2025,10 @@ pub(super) fn select_owned_stream_candidate(
             .and_then(|_| adc3_alternate(&config, &claimed.handle, &alt, speed, false));
         match attempt {
             Ok((candidate, route))
-                if adc3_candidate_matches(&claimed.handle, &candidate, &route, requested) =>
+                if candidate.implicit_feedback.map_or(true, |source| claimed.claimed_interfaces.contains(&source.interface_number))
+                    && adc3_candidate_matches(&claimed.handle, &candidate, &route, requested) =>
             {
+                prepare_adc3_implicit_power(claimed, &route).map_err(SelectError::NoMatch)?;
                 return Ok(candidate)
             }
             Ok(_) => {}
@@ -1785,6 +2042,7 @@ pub(super) fn select_owned_stream_candidate(
                             claimed.adc3_power.acquire(route.control, domain).map_err(SelectError::NoMatch)?;
                         }
                     }
+                    prepare_adc3_implicit_power(claimed, &route).map_err(SelectError::NoMatch)?;
                     remember_adc3_route(route);
                     return Ok(candidate);
                 }
@@ -1819,6 +2077,8 @@ fn adc3_candidate_matches(
         requested.sample_rate == 48000
     };
     supported
+        && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
+            requested.sample_rate, source.service_interval_us, source.bytes_per_frame))
         && candidate.max_packet_bytes
             >= required_max_packet_bytes(
                 requested.sample_rate,
@@ -1879,6 +2139,86 @@ pub(super) fn adc3_badd_volume_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pcm_candidate() -> IsoStreamCandidate {
+        IsoStreamCandidate {
+            interface_number: 5, alt_setting: 1, endpoint_address: 1, endpoint_interval: 4,
+            service_interval_us: 1000, usb_speed: Speed::High, max_packet_bytes: 768,
+            sync_type: SyncType::Asynchronous, usage_type: UsageType::Data, format_tag: FORMAT_TAG_PCM,
+            uac2_formats: None, native_dsd: None, channels: 2, subslot_size: 4, bit_resolution: 32,
+            sample_rates: vec![48000, 96000], refresh: 0, synch_address: 0, feedback_endpoint: None,
+            implicit_feedback: None, terminal_link: Some(1), is_uac1: false,
+        }
+    }
+    fn implicit_pcm_candidate() -> IsoStreamCandidate {
+        let mut source = pcm_candidate();
+        source.interface_number = 6;
+        source.endpoint_address = 0x81;
+        source.usage_type = UsageType::FeedbackData;
+        source
+    }
+    #[test]
+    fn full_adc3_adaptive_sink_uses_nominal_pacing_but_source_requires_feedforward() {
+        let full = wire::FunctionProfile::Full;
+        assert!(adc3_sync_supported(full, false, SyncType::Adaptive));
+        assert_eq!(admitted_pacing(SyncType::Adaptive, None), crate::capabilities::Pacing::Adaptive);
+        assert!(!adc3_sync_supported(full, true, SyncType::Adaptive));
+        assert!(!adc3_sync_supported(full, false, SyncType::NoSync));
+        let badd = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
+        assert!(!adc3_sync_supported(badd, false, SyncType::Adaptive));
+        for capture in [true, false] {
+            for profile in [full, badd] {
+                assert!(adc3_sync_supported(profile, capture, SyncType::Asynchronous));
+                assert!(adc3_sync_supported(profile, capture, SyncType::Synchronous));
+            }
+        }
+    }
+    #[test]
+    fn adc3_explicit_feedback_remains_first_and_malformed_or_disabled_feedback_is_refused() {
+        let full = wire::FunctionProfile::Full;
+        let badd = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
+        for profile in [full, badd] {
+            assert_eq!(adc3_requires_implicit(profile, false, SyncType::Asynchronous, true, true, false), Ok(false));
+            assert!(adc3_requires_implicit(profile, false, SyncType::Asynchronous, true, true, true).is_err());
+            assert!(adc3_requires_implicit(profile, false, SyncType::Asynchronous, false, true, false).is_err());
+            assert_eq!(adc3_requires_implicit(profile, true, SyncType::Asynchronous, false, false, true), Ok(false));
+        }
+        assert_eq!(adc3_requires_implicit(full, false, SyncType::Asynchronous, false, false, false), Ok(true));
+        assert!(adc3_requires_implicit(full, false, SyncType::Asynchronous, false, false, true).is_err());
+        assert!(adc3_requires_implicit(badd, false, SyncType::Asynchronous, false, false, false).is_err());
+        assert_eq!(adc3_requires_implicit(full, false, SyncType::Adaptive, false, false, true), Ok(false));
+    }
+    #[test]
+    fn adc3_preflight_target_plans_must_prove_one_source_pipe() {
+        let proof = ImplicitFeedbackSource { interface_number: 6, alt_setting: 1, address: 0x81,
+            bytes_per_frame: 8, service_interval_us: 1000, max_packet_bytes: 768 };
+        assert_eq!(adc3_preflight_pipe(&[]), None);
+        assert_eq!(adc3_preflight_pipe(&[proof]), Some(6));
+        let mut alternate = proof; alternate.alt_setting = 3; alternate.bytes_per_frame = 4;
+        assert_eq!(adc3_preflight_pipe(&[proof, alternate, proof]), Some(6));
+        let mut another_interface = proof; another_interface.interface_number = 7;
+        assert_eq!(adc3_preflight_pipe(&[proof, another_interface]), None);
+        let mut another_address = proof; another_address.address = 0x82;
+        assert_eq!(adc3_preflight_pipe(&[proof, another_address]), None);
+    }
+    #[test]
+    fn adc3_ranges_honor_both_wire_capacities_and_step_alignment() {
+        let mut sink = pcm_candidate();
+        let ranges = [SamplingFrequencySubrange { min: 44100, max: 192000, res: 100 }];
+        let bounded = adc3_capacity_ranges(&sink, &ranges);
+        assert_eq!((bounded[0].min, bounded[0].max, bounded[0].res), (44100, 96000, 100));
+        sink.implicit_feedback = Some(ImplicitFeedbackSource { interface_number: 6, alt_setting: 2,
+            address: 0x81, bytes_per_frame: 6, service_interval_us: 1000, max_packet_bytes: 300 });
+        assert_eq!(adc3_capacity_ranges(&sink, &ranges)[0].max, 50000);
+        sink.implicit_feedback.as_mut().unwrap().max_packet_bytes = 264;
+        assert!(adc3_capacity_ranges(&sink, &ranges).is_empty());
+        // The same formula handles validated SuperSpeed companion capacity.
+        sink.usb_speed = Speed::Super;
+        sink.service_interval_us = 125;
+        sink.max_packet_bytes = 48;
+        sink.implicit_feedback.as_mut().unwrap().service_interval_us = 125;
+        sink.implicit_feedback.as_mut().unwrap().max_packet_bytes = 42;
+        assert_eq!(adc3_capacity_ranges(&sink, &ranges)[0].max, 48000);
+    }
     #[test]
     fn superspeed_uses_advertised_service_capacity_and_interval() {
         // 1024 * 4 packets * 3 bursts = 12288 theoretical bytes; the
@@ -2172,6 +2512,7 @@ mod tests {
             terminal: 1,
             endpoint: (1, 4, 196, 1000),
             feedback: Some((0x81, 4, 4)),
+            implicit: None,
             companions: vec![],
             extended_companions: vec![],
             pcm: (2, 2, 16),
@@ -2209,6 +2550,62 @@ mod tests {
                 group: 0
             }]
         );
+        let mut out = route.clone();
+        out.count = 3;
+        out.clock = Some(wire::ClockSource { id: 9, attributes: 1, controls: wire::Controls(7), reference_terminal: 0, string_id: 0 });
+        let mut input = out.clone();
+        input.interface = 6;
+        input.terminal = 6;
+        input.endpoint.0 = 0x81;
+        let sink = pcm_candidate();
+        let source = implicit_pcm_candidate();
+        assert!(adc3_implicit_pair(&sink, &out, &source, &input));
+        let pair = (ImplicitFeedbackSource { interface_number: 6, alt_setting: 1, address: 0x81,
+            bytes_per_frame: 8, service_interval_us: 1000, max_packet_bytes: 768 }, input.clone());
+        assert!(adc3_unique_implicit(vec![]).is_err());
+        assert!(adc3_unique_implicit(vec![pair.clone()]).is_ok());
+        assert!(adc3_unique_implicit(vec![pair.clone(), pair.clone()]).is_ok());
+        let mut other = pair.clone(); other.0.interface_number = 7;
+        assert!(adc3_unique_implicit(vec![pair.clone(), other]).is_err());
+        let mut other = pair.clone(); other.0.address = 0x82;
+        assert!(adc3_unique_implicit(vec![pair.clone(), other]).is_err());
+        let mut narrow = pair.clone(); narrow.0.alt_setting = 2; narrow.0.bytes_per_frame = 4;
+        assert_eq!(adc3_unique_implicit(vec![pair.clone(), narrow.clone()]).unwrap().0.alt_setting, 2);
+        let mut lean = narrow.clone(); lean.0.alt_setting = 3; lean.0.bytes_per_frame = 2; lean.0.max_packet_bytes = 384;
+        assert_eq!(adc3_unique_implicit(vec![pair.clone(), narrow, lean.clone()]).unwrap().0.alt_setting, 3);
+        let mut stable = lean.clone(); stable.0.alt_setting = 1;
+        assert_eq!(adc3_unique_implicit(vec![lean, stable]).unwrap().0.alt_setting, 1);
+        for sync in [SyncType::Adaptive, SyncType::Synchronous, SyncType::NoSync] {
+            let mut bad = implicit_pcm_candidate(); bad.sync_type = sync;
+            assert!(!adc3_implicit_pair(&sink, &out, &bad, &input));
+        }
+        let mut bad = implicit_pcm_candidate(); bad.usage_type = UsageType::Data;
+        assert!(!adc3_implicit_pair(&sink, &out, &bad, &input));
+        let mut bad = implicit_pcm_candidate(); bad.service_interval_us = 125;
+        assert!(!adc3_implicit_pair(&sink, &out, &bad, &input));
+        let mut bad = implicit_pcm_candidate(); bad.interface_number = sink.interface_number;
+        assert!(!adc3_implicit_pair(&sink, &out, &bad, &input));
+        let mut bad = input.clone(); bad.clock.as_mut().unwrap().id = 10;
+        assert!(!adc3_shared_clock(&out, &bad));
+        let mut bad = input.clone(); bad.first = 8;
+        assert!(!adc3_shared_clock(&out, &bad));
+        let mut bad = input.clone(); bad.config = 2;
+        assert!(!adc3_shared_clock(&out, &bad));
+        let mut bad = input.clone();
+        bad.choice.as_mut().unwrap().path[0].kind = ClockHopKind::Selector { selected_pin: 2, pin_count: 2 };
+        assert!(!adc3_shared_clock(&out, &bad));
+        assert!(adc3_route_domain_required(&out, &domain(10)));
+        let mut unrelated = domain(12); unrelated.entities = vec![99];
+        assert!(!adc3_route_domain_required(&out, &unrelated));
+        let mut clock_domain = domain(13); clock_domain.entities = vec![8];
+        assert!(adc3_route_domain_required(&out, &clock_domain));
+        let mut implicit_route = out.clone(); implicit_route.implicit = Some(Box::new(input.clone()));
+        let mut drift = implicit_route.clone(); drift.implicit.as_mut().unwrap().terminal = 7;
+        assert_ne!(implicit_route, drift);
+        let mut drift = implicit_route.clone(); drift.implicit.as_mut().unwrap().domains[0].recovery_d1 += 1;
+        assert_ne!(implicit_route, drift);
+        let mut drift = implicit_route.clone(); drift.implicit.as_mut().unwrap().endpoint.1 = 3;
+        assert_ne!(implicit_route, drift);
         let map = capture_channel_map(&route).unwrap();
         let format = crate::capture::CaptureFormat::pcm(96_000, 16, 2, map.clone()).unwrap();
         let mut exact = crate::capture::CaptureRequest { sample_rate: 96_000,

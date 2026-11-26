@@ -508,3 +508,57 @@ native library for all four ABIs. Its SHA-256 is
 `2385559d2cefebb6d698c49d53e8ab149ede3e216bfd408ac92b75d55c7fb1d3`.
 The Clarett profiles and feedback workarounds still need physical
 verification on the matching devices.
+
+## Full ADC3 synchronization
+
+Full ADC3 permits host-paced adaptive playback. An asynchronous sink
+can also use implicit feedback from a marked asynchronous IN stream
+in the same Audio Function. The two streams must share the device
+clock and each needs its own AudioStreaming interface. Require a
+unique source, compatible service intervals, and whole PCM frames
+within the capacity of both endpoints at the selected rate. Keep the
+source and sink available while audio flows. A duplex reader sharing
+the same IN endpoint receives data from the feedback transfer pool.
+[USB Audio 3.0 §§3.11.4 and 3.14.2](https://amatriz.net/PDFs/Audio30.pdf#page=25),
+[ALSA synchronization endpoint selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/pcm.c#L331-L411)
+
+For physical acceptance, use a full ADC3 asynchronous pair with a
+known channel map and packet trace. Confirm the selected clock and
+USB claims, then reconcile completed IN frame counts with scheduled
+OUT counts across the lock window. Open the same IN endpoint for
+capture and verify the playback/capture byte sequences and one shared
+transfer pool. Exercise stop and detach and confirm alternate and
+power hand-back. Test adaptive playback separately with a trace of
+the nominal OUT frame pattern. Adaptive capture requires its own
+feedforward implementation. BADD has a separate profile contract.
+
+For standalone adaptive capture, select the same alternate's unique
+isochronous OUT feedback endpoint with the class-defined No
+Synchronization and Feedback usage fields. Validate its interval and
+capacity independently of the audio IN pipe. ALSA sends a nominal
+rate word in each feedback packet. It sends three bytes of 10.14 at
+full speed and four bytes of 16.16 at high speed and above. Use bus
+frame or microframe units for the word. The capture owner can keep a
+small periodic OUT transfer pool running alongside data IN and retire
+both before setting alt zero. A stall, detach or missed send deadline
+must become a capture error. A paired adaptive device where audio OUT
+supplies implicit feedforward requires proof of the common clock and
+ownership of both audio streams. [USB Audio 3.0 §§3.11.4.2–3 and 4.8.2](https://amatriz.net/PDFs/Audio30.pdf#page=100), [ALSA outbound sync packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L324-L370)
+
+## Synchronization and FCP validation checkpoint
+
+Playback-only Android discovery can prove a marked UAC3 timing
+source using either the current shared clock or a bounded writable
+selector plan. The open path rechecks the selected source and its
+power state before activating either stream. Rust tests exercised
+ambiguous sources, selector and route drift, and both endpoints'
+rate capacity. The FCP adapter exercised the exact command sequence,
+multi-block firmware-map reads and rejection of malformed maps.
+
+The Rust workspace, Android arm64 NDK check, Kotlin unit tests,
+sample build and SDK snippet check passed. The Android release AAR
+declares `fcpRead` and exports its JNI symbol on all four ABIs.
+The local AAR SHA-256 is
+`8ad2f6ea78adb1c1724e1a815150b5cdf3fcf0fd7d4aa964d1773a33adb45aac`.
+Physical UAC3 and FCP acceptance is pending. The Android host was
+online with the iBasso DC04U detached.
