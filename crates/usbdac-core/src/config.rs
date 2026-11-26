@@ -120,13 +120,16 @@ pub struct DacConfig {
     /// Quirks added to the built-in table for this session.
     pub quirks: Vec<QuirkOverride>,
     /// Allow streaming an asynchronous endpoint that has no explicit feedback
-    /// endpoint (it would need implicit feedback, which is not supported). By
+    /// source. By
     /// default `negotiate` and `open_stream` refuse it with
     /// [`Error::ImplicitFeedbackUnsupported`]. Allowed, it streams at the nominal
     /// rate, host-paced, and any drift between the DAC's clock and the host's
     /// timing ends in underruns or overruns on the DAC; the stream is never
     /// bit-perfect (`DacStream::bit_perfect_blocker` says why). Default `false`.
     pub allow_unsynchronized_async: bool,
+    /// Disable explicit and implicit feedback for diagnosis. Default `false`.
+    /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.
+    pub disable_feedback: bool,
     /// Ask for `SCHED_FIFO` (nice -16 as a fallback) on the output thread.
     /// Android only; ignored elsewhere. Default `true`.
     pub realtime_priority: bool,
@@ -176,6 +179,7 @@ impl Default for DacConfig {
             padded_24bit: None,
             quirks: Vec::new(),
             allow_unsynchronized_async: false,
+            disable_feedback: false,
             realtime_priority: true,
             hand_back: HandBack::default(),
             bus_queue_ms: DEFAULT_BUS_QUEUE_MS,
@@ -243,7 +247,10 @@ mod tests {
         assert_eq!(config.bus_queue_ms, 16);
         assert_eq!(config.transfers_in_flight, 8);
         assert!(config.cancel_in_flight_on_flush);
-        assert_eq!(config.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+        assert_eq!(
+            config.startup_volume,
+            StartupVolume::Attenuate { max_db: -40.0 }
+        );
         assert!(config.require_hardware_volume);
         config.validate().unwrap();
     }
@@ -271,9 +278,17 @@ mod tests {
             (StartupVolume::Attenuate { max_db: 3.0 }, false),
             (StartupVolume::Attenuate { max_db: -200.0 }, false),
             (StartupVolume::Attenuate { max_db: f64::NAN }, false),
-            (StartupVolume::Attenuate { max_db: f64::NEG_INFINITY }, false),
+            (
+                StartupVolume::Attenuate {
+                    max_db: f64::NEG_INFINITY,
+                },
+                false,
+            ),
         ] {
-            let config = DacConfig { startup_volume, ..DacConfig::default() };
+            let config = DacConfig {
+                startup_volume,
+                ..DacConfig::default()
+            };
             assert_eq!(config.validate().is_ok(), ok, "{startup_volume:?}");
         }
         let error = DacConfig {
@@ -287,15 +302,46 @@ mod tests {
 
     #[test]
     fn the_bus_queue_is_validated_at_both_ends_of_its_range() {
-        for (bus_queue_ms, ok) in [(0, false), (3, false), (4, true), (16, true), (64, true), (65, false)] {
-            let config = DacConfig { bus_queue_ms, ..DacConfig::default() };
+        for (bus_queue_ms, ok) in [
+            (0, false),
+            (3, false),
+            (4, true),
+            (16, true),
+            (64, true),
+            (65, false),
+        ] {
+            let config = DacConfig {
+                bus_queue_ms,
+                ..DacConfig::default()
+            };
             assert_eq!(config.validate().is_ok(), ok, "bus_queue_ms={bus_queue_ms}");
         }
-        for (transfers_in_flight, ok) in [(0, false), (1, false), (2, true), (8, true), (16, true), (17, false)] {
-            let config = DacConfig { transfers_in_flight, ..DacConfig::default() };
-            assert_eq!(config.validate().is_ok(), ok, "transfers_in_flight={transfers_in_flight}");
+        for (transfers_in_flight, ok) in [
+            (0, false),
+            (1, false),
+            (2, true),
+            (8, true),
+            (16, true),
+            (17, false),
+        ] {
+            let config = DacConfig {
+                transfers_in_flight,
+                ..DacConfig::default()
+            };
+            assert_eq!(
+                config.validate().is_ok(),
+                ok,
+                "transfers_in_flight={transfers_in_flight}"
+            );
         }
-        let error = DacConfig { bus_queue_ms: 3, ..DacConfig::default() }.validate().unwrap_err();
-        assert!(matches!(&error, Error::InvalidArgument(message) if message.contains("bus_queue_ms")));
+        let error = DacConfig {
+            bus_queue_ms: 3,
+            ..DacConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::InvalidArgument(message) if message.contains("bus_queue_ms"))
+        );
     }
 }

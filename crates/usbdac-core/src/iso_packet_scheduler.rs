@@ -109,6 +109,7 @@ pub(crate) struct IsoPacketScheduler {
     packets_per_transfer: usize,
     feedback_frames_per_packet: Option<f64>,
     feedback_remainder: f64,
+    packet_pattern: Option<Vec<usize>>,
 }
 
 impl IsoPacketScheduler {
@@ -136,6 +137,7 @@ impl IsoPacketScheduler {
             packets_per_transfer: geometry.packets_per_transfer,
             feedback_frames_per_packet: None,
             feedback_remainder: 0.0,
+            packet_pattern: None,
         }
     }
 
@@ -143,7 +145,14 @@ impl IsoPacketScheduler {
         self.packets_per_transfer
     }
 
+    /// Commit one validated implicit vector; consumed exactly once.
+    pub(crate) fn set_packet_pattern(&mut self, pattern: Vec<usize>) {
+        assert!(self.packet_pattern.is_none());
+        self.packet_pattern = Some(pattern);
+    }
+
     pub(crate) fn next_transfer_packet_bytes(&mut self) -> Vec<usize> {
+        if let Some(pattern) = self.packet_pattern.take() { return pattern; }
         (0..self.packets_per_transfer)
             .map(|_| self.next_packet_bytes())
             .collect()

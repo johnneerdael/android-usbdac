@@ -34,12 +34,12 @@ pub(crate) fn select_explicit_feedback_endpoint(
 
     // UAC1 and some UAC2 devices link the feedback endpoint explicitly.
     if synch_address != 0 {
-        if let Some(endpoint) = endpoints
+        return Ok(endpoints
             .iter()
-            .find(|endpoint| endpoint.address == synch_address)
-        {
-            return Ok(Some(*endpoint));
-        }
+            .find(|endpoint| {
+                endpoint.address == synch_address && endpoint.usage_type != UsageType::FeedbackData
+            })
+            .copied());
     }
 
     if sync_type != SyncType::Asynchronous {
@@ -56,5 +56,48 @@ pub(crate) fn select_explicit_feedback_endpoint(
         [] => Ok(None),
         [endpoint] => Ok(Some(*endpoint)),
         _ => Err(candidates.iter().map(|endpoint| endpoint.address).collect()),
+    }
+}
+
+#[cfg(test)]
+mod implicit_link_tests {
+    use super::*;
+    fn endpoint(address: u8, usage_type: UsageType) -> FeedbackEndpointCandidate {
+        FeedbackEndpointCandidate {
+            alt_setting: 1,
+            address,
+            transfer_type: TransferType::Isochronous,
+            usage_type,
+            interval: 1,
+            max_packet_size: 4,
+        }
+    }
+    #[test]
+    fn declared_marked_data_never_falls_through_to_unrelated_explicit_pipe() {
+        let explicit = endpoint(0x81, UsageType::Feedback);
+        let marked = endpoint(0x82, UsageType::FeedbackData);
+        assert!(select_explicit_feedback_endpoint(
+            1,
+            0x82,
+            SyncType::Asynchronous,
+            [explicit, marked]
+        )
+        .unwrap()
+        .is_none());
+        assert!(select_explicit_feedback_endpoint(
+            1,
+            0x83,
+            SyncType::Asynchronous,
+            [explicit, marked]
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            select_explicit_feedback_endpoint(1, 0, SyncType::Asynchronous, [explicit, marked])
+                .unwrap()
+                .unwrap()
+                .address,
+            0x81
+        );
     }
 }

@@ -66,6 +66,9 @@ private fun syncType(name: String?): SyncType = when (name) {
 private fun pacing(json: JSONObject?): Pacing? = json?.let {
     when (it.stringOrNull("mode")) {
         "explicit_feedback" -> Pacing.ExplicitFeedback(it.optInt("feedback_endpoint"))
+        "implicit_feedback" -> it.optJSONObject("implicit_feedback")?.let { source ->
+            Pacing.ImplicitFeedback(source.getInt("interface_number"), source.getInt("alt_setting"), source.getInt("endpoint"))
+        } ?: Pacing.Unknown
         "adaptive" -> Pacing.Adaptive
         "synchronous" -> Pacing.Synchronous
         "unsynchronized" -> Pacing.Unsynchronized
@@ -238,6 +241,19 @@ internal fun parseStats(json: String): DacStreamStats {
         maxSubmitGapUs = v.optLong("max_submit_gap_us"),
         effectiveRateHz = v.optDouble("effective_rate_hz", 0.0),
         feedbackActive = v.optBoolean("feedback_active"),
+        feedbackLocked = v.optBoolean("feedback_locked"),
+        feedbackEmpty = v.optLong("feedback_empty"),
+        implicitFifoDepth = v.optInt("implicit_fifo_depth"),
+        implicitFifoHighWater = v.optInt("implicit_fifo_high_water"),
+        implicitWaits = v.optLong("implicit_waits"),
+        implicitEmptyBus = v.optLong("implicit_empty_bus"),
+        implicitOverruns = v.optLong("implicit_overruns"),
+        implicitInTransfers = v.optLong("implicit_in_transfers"),
+        implicitOutOfOrder = v.optLong("implicit_out_of_order"),
+        implicitInvalidPackets = v.optLong("implicit_invalid_packets"),
+        implicitMeasuredFrames = v.optLong("implicit_measured_frames"),
+        implicitScheduledFrames = v.optLong("implicit_scheduled_frames"),
+
         feedbackReports = v.optLong("feedback_reports"),
         feedbackTimeouts = v.optLong("feedback_timeouts"),
         feedbackErrors = v.optLong("feedback_errors"),

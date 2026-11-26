@@ -52,7 +52,6 @@ impl Default for LifecycleState {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub(super) struct SessionState {
     pub(super) device: UsbDevice,
@@ -139,10 +138,22 @@ pub(super) struct IsoStreamCandidate {
     pub(super) refresh: u8,
     pub(super) synch_address: u8,
     pub(super) feedback_endpoint: Option<FeedbackEndpoint>,
+    pub(super) implicit_feedback: Option<ImplicitFeedbackSource>,
     /// bTerminalLink from the AS_GENERAL descriptor, used to trace the
     /// UAC2 topology to the correct Clock Entity.
     pub(super) terminal_link: Option<u8>,
     pub(super) is_uac1: bool,
+}
+
+/// A proven audio IN source; mutually exclusive with the explicit feedback pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImplicitFeedbackSource {
+    pub(super) interface_number: u8,
+    pub(super) alt_setting: u8,
+    pub(super) address: u8,
+    pub(super) bytes_per_frame: usize,
+    pub(super) service_interval_us: u32,
+    pub(super) max_packet_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,12 +189,12 @@ pub(super) struct StreamingInterfaceFormat {
     pub(super) sample_rate_ranges: Vec<SamplingFrequencySubrange>,
 }
 
-
 /// Why no alternate setting could be selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectError {
     /// Nothing carries the requested format.
     NoMatch(String),
+    Claim(String),
     /// The only alternate settings that carry it are asynchronous endpoints with
     /// no explicit feedback endpoint, which would need implicit feedback, and
     /// `allow_unsynchronized_async` is off.
@@ -193,12 +204,15 @@ pub(crate) enum SelectError {
 impl SelectError {
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::NoMatch(message) | Self::ImplicitFeedback(message) => message,
+            Self::NoMatch(message) | Self::Claim(message) | Self::ImplicitFeedback(message) => {
+                message
+            }
         }
     }
 
     pub(crate) fn into_error(self, offered: Vec<crate::capabilities::AltSetting>) -> crate::Error {
         match self {
+            Self::Claim(reason) => crate::Error::Claim(reason),
             Self::NoMatch(reason) => crate::Error::Unsupported { reason, offered },
             Self::ImplicitFeedback(_) => crate::Error::ImplicitFeedbackUnsupported,
         }

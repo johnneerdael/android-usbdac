@@ -162,6 +162,23 @@ fn init_logging(level: i32) {
 
 // ---- DAC ------------------------------------------------------------------
 
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_feedback_preflight<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    device_info_json: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let info = json::parse_device_info(&string_of(env, &device_info_json)?)?;
+        let (configuration_id, interfaces) = Dac::feedback_preflight(fd, &info)?;
+        java_string(
+            env,
+            &serde_json::json!({"configuration_id": configuration_id, "interfaces": interfaces}),
+        )
+    })
+}
+
 /// Opens the DAC behind `fd`. `deviceInfoJson` and `configJson` (nullable) are
 /// documented in `docs/API.md`. Returns the DAC handle.
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -177,6 +194,15 @@ pub fn dac_open<'l>(
         let config = json::parse_config(optional_string_of(env, &config_json)?.as_deref())?;
         let dac = Dac::open(fd, info, config)?;
         Ok(registry::insert_dac(DacEntry::new(dac)) as i64)
+    })
+}
+
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_await_retirement<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) -> bool {
+    run(&mut env, |_env| {
+        Ok(Dac::await_usb_retirement(std::time::Duration::from_millis(
+            500,
+        )))
     })
 }
 
@@ -362,7 +388,9 @@ pub fn stream_is_drained<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, strea
 /// 4 drained, 5 closed, 6 failed.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn stream_state<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, stream: i64) -> i32 {
-    run(&mut env, |_env| Ok(registry::stream(stream)?.state().code()))
+    run(&mut env, |_env| {
+        Ok(registry::stream(stream)?.state().code())
+    })
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -388,8 +416,14 @@ pub fn stream_stats<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, stream: i6
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn stream_is_bit_perfect<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, stream: i64) -> bool {
-    run(&mut env, |_env| Ok(registry::stream(stream)?.is_bit_perfect()))
+pub fn stream_is_bit_perfect<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    stream: i64,
+) -> bool {
+    run(&mut env, |_env| {
+        Ok(registry::stream(stream)?.is_bit_perfect())
+    })
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -399,26 +433,27 @@ pub fn stream_set_software_gain<'l>(
     stream: i64,
     gain: f32,
 ) {
-    run(&mut env, |_env| Ok(registry::stream(stream)?.set_software_gain(gain)?))
+    run(&mut env, |_env| {
+        Ok(registry::stream(stream)?.set_software_gain(gain)?)
+    })
 }
 
 // ---- volume ---------------------------------------------------------------
 
 fn volume_of(dac: i64) -> Outcome<usbdac_core::VolumeControl> {
-    registry::dac(dac)?
-        .dac
-        .volume()
-        .ok_or_else(|| Failure::Dac(Error::Control("the DAC has no hardware volume control".into())))
+    registry::dac(dac)?.dac.volume().ok_or_else(|| {
+        Failure::Dac(Error::Control(
+            "the DAC has no hardware volume control".into(),
+        ))
+    })
 }
 
 /// The volume range as JSON, or `null` if the DAC has no hardware volume.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn volume_range<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> JString<'l> {
-    run(&mut env, |env| {
-        match registry::dac(dac)?.dac.volume() {
-            Some(volume) => java_string(env, &json::volume_range(&volume.range()?)),
-            None => Ok(JString::null()),
-        }
+    run(&mut env, |env| match registry::dac(dac)?.dac.volume() {
+        Some(volume) => java_string(env, &json::volume_range(&volume.range()?)),
+        None => Ok(JString::null()),
     })
 }
 
@@ -449,7 +484,10 @@ pub fn volume_set_fraction<'l>(
     fraction: f64,
 ) -> JString<'l> {
     run(&mut env, |env| {
-        java_string(env, &json::volume_state(&volume_of(dac)?.set_fraction(fraction)?))
+        java_string(
+            env,
+            &json::volume_state(&volume_of(dac)?.set_fraction(fraction)?),
+        )
     })
 }
 
@@ -465,7 +503,10 @@ pub fn volume_step<'l>(
     run(&mut env, |env| {
         let direction = direction.clamp(-1, 1) as i8;
         let steps = steps.clamp(0, 255) as u8;
-        java_string(env, &json::volume_state(&volume_of(dac)?.step(direction, steps)?))
+        java_string(
+            env,
+            &json::volume_state(&volume_of(dac)?.step(direction, steps)?),
+        )
     })
 }
 
@@ -485,11 +526,9 @@ pub fn volume_set_mute<'l>(
 /// (`docs/API.md` section 11), or `null` if the DAC has no hardware volume.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn volume_startup<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> JString<'l> {
-    run(&mut env, |env| {
-        match registry::dac(dac)?.dac.volume() {
-            Some(volume) => java_string(env, &json::startup_report(&volume.startup())),
-            None => Ok(JString::null()),
-        }
+    run(&mut env, |env| match registry::dac(dac)?.dac.volume() {
+        Some(volume) => java_string(env, &json::startup_report(&volume.startup())),
+        None => Ok(JString::null()),
     })
 }
 

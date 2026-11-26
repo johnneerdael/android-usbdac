@@ -190,4 +190,17 @@ public data class DacStreamStats(
     /** The sample rate the last feedback report implies; `null` before the first one. */
     val feedbackRateHz: Double?,
     val feedbackStale: Boolean,
+    val feedbackLocked: Boolean = false,
+    val feedbackEmpty: Long = 0,
+    val implicitFifoDepth: Int = 0,
+    val implicitFifoHighWater: Int = 0,
+    val implicitWaits: Long = 0,
+    val implicitEmptyBus: Long = 0,
+    val implicitOverruns: Long = 0,
+    val implicitInTransfers: Long = 0,
+    val implicitOutOfOrder: Long = 0,
+    val implicitInvalidPackets: Long = 0,
+    val implicitMeasuredFrames: Long = 0,
+    val implicitScheduledFrames: Long = 0,
+
 )

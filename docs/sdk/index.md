@@ -23,7 +23,7 @@ opened and what it could verify.
 
 ## Playback routes
 
-- **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with the DAC's feedback endpoint, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
+- **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with explicit feedback or packet counts from a compatible shared-clock IN stream, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
 - **Android-managed.** An `AudioTrack` at the source's own rate and bit depth, through Android's audio stack, behind the same `PcmOutput` interface. On Android 14 and later the library asks the platform for its bit-perfect mixer behavior for a USB device. This is the route for apps that must not take the DAC away from the rest of the system.
 - **AAudio exclusive.** An AAudio stream in exclusive mode at the source's own rate, channel count and sample format, behind the same interface. This is the route for players with an internal DAC: it asks the platform to bypass the app mixer, and reports exactly what was granted. It is never reported bit-perfect-verified, because an app cannot see past AAudio.
 

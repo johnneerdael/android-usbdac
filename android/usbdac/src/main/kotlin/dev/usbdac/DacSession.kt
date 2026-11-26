@@ -173,7 +173,8 @@ public class DacSession private constructor(
      * The volume is restored after the stream has stopped, so a level louder than the current one
      * is never heard.
      *
-     * @throws DacException if the native library fails to close; everything else is still released.
+     * @throws DacException if the native library fails to close. USB ownership remains held until
+     *   all native transfers retire, then Android receives the interfaces.
      */
     public fun close(handBack: HandBack) {
         if (!closed.compareAndSet(false, true)) return
@@ -191,10 +192,22 @@ public class DacSession private constructor(
                 failure = error
             }
         } finally {
-            claims.release()
-            runCatching { connection.close() }
+            fun releaseHostOwnership() {
+                claims.release()
+                runCatching { connection.close() }
+                onClosed()
+            }
+            if (runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+                releaseHostOwnership()
+            } else {
+                Thread({
+                    while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+                        runCatching { Thread.sleep(50) }
+                    }
+                    releaseHostOwnership()
+                }, "usbdac-retirement").start()
+            }
             mutableState.value = DacState.CLOSED
-            onClosed()
         }
         failure?.let { throw it }
     }

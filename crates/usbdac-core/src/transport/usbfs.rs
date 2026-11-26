@@ -61,7 +61,9 @@ impl UsbDevice {
         data: &mut [u8],
     ) -> std::io::Result<usize> {
         if !self.claimed_interfaces.contains(&(index as u8)) {
-            return Err(std::io::Error::other("AudioControl interface is not claimed"));
+            return Err(std::io::Error::other(
+                "AudioControl interface is not claimed",
+            ));
         }
         let length = u16::try_from(data.len()).map_err(std::io::Error::other)?;
         #[cfg(test)]
@@ -91,12 +93,12 @@ impl UsbDevice {
     }
 }
 
-
 pub(super) struct IdleLock {
     pub(super) device_fd: RawFd,
     pub(super) context: Context,
     pub(super) handle: DeviceHandle<Context>,
     pub(super) claimed_interfaces: Arc<[u8]>,
+    pub(super) active_interfaces: Mutex<Vec<u8>>,
 }
 
 pub(super) struct ClaimedHandle {
@@ -104,6 +106,7 @@ pub(super) struct ClaimedHandle {
     pub(super) context: Context,
     pub(super) handle: DeviceHandle<Context>,
     pub(super) claimed_interfaces: Arc<[u8]>,
+    pub(super) active_interfaces: Mutex<Vec<u8>>,
 }
 
 // linux/usbdevice_fs.h; use libc's architecture-specific ioctl encoding.
@@ -147,7 +150,8 @@ const fn ioctl_nr<T>(read: bool, write: bool, number: u8) -> IoctlRequest {
 }
 
 pub(super) const USBDEVFS_CONTROL: IoctlRequest = ioctl_nr::<UsbfsControlTransfer>(true, true, 0);
-pub(super) const USBDEVFS_SETINTERFACE: IoctlRequest = ioctl_nr::<UsbfsSetInterface>(true, false, 4);
+pub(super) const USBDEVFS_SETINTERFACE: IoctlRequest =
+    ioctl_nr::<UsbfsSetInterface>(true, false, 4);
 
 impl From<IdleLock> for ClaimedHandle {
     fn from(value: IdleLock) -> Self {
@@ -156,6 +160,7 @@ impl From<IdleLock> for ClaimedHandle {
             context: value.context,
             handle: value.handle,
             claimed_interfaces: value.claimed_interfaces,
+            active_interfaces: value.active_interfaces,
         }
     }
 }
@@ -167,6 +172,7 @@ impl ClaimedHandle {
             context: self.context,
             handle: self.handle,
             claimed_interfaces: self.claimed_interfaces,
+            active_interfaces: self.active_interfaces,
         }
     }
 
@@ -180,7 +186,11 @@ impl ClaimedHandle {
         Ok(())
     }
 
-    pub(super) fn set_alternate_setting(&self, interface_number: u8, alternate_setting: u8) -> Result<(), String> {
+    pub(super) fn set_alternate_setting(
+        &self,
+        interface_number: u8,
+        alternate_setting: u8,
+    ) -> Result<(), String> {
         self.ensure_interface_claimed(interface_number)?;
         let request = UsbfsSetInterface {
             interface: interface_number.into(),
@@ -193,13 +203,16 @@ impl ClaimedHandle {
         if result < 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        let mut active = self.active_interfaces.lock();
+        active.retain(|number| *number != interface_number);
+        if alternate_setting != 0 {
+            active.push(interface_number);
+        }
         Ok(())
     }
 }
 
-pub(super) fn open_claimed_usb_handle(
-    device: &UsbDevice,
-) -> Result<ClaimedHandle, String> {
+pub(super) fn open_claimed_usb_handle(device: &UsbDevice) -> Result<ClaimedHandle, String> {
     if let Some(lock) = IDLE_LOCK.lock().take() {
         if lock.device_fd == device.fd {
             return Ok(lock.into());
@@ -209,9 +222,7 @@ pub(super) fn open_claimed_usb_handle(
     wrap_android_usb_handle(device)
 }
 
-pub(super) fn wrap_android_usb_handle(
-    device: &UsbDevice,
-) -> Result<ClaimedHandle, String> {
+pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandle, String> {
     prepare_direct_usb_libusb();
 
     let context =
@@ -224,6 +235,7 @@ pub(super) fn wrap_android_usb_handle(
         context,
         handle,
         claimed_interfaces: Arc::clone(&device.claimed_interfaces),
+        active_interfaces: Mutex::new(Vec::new()),
     })
 }
 
@@ -232,12 +244,23 @@ pub(super) fn cleanup_claimed_handle(
     active_interface: Option<u8>,
     keep_locked: bool,
 ) {
+    let mut active = claimed_handle.active_interfaces.lock().clone();
     if let Some(interface_number) = active_interface {
-        let _ = claimed_handle.set_alternate_setting(interface_number, 0);
+        if !active.contains(&interface_number) {
+            active.push(interface_number);
+        }
+    }
+    let mut reset_ok = true;
+    for interface_number in active.into_iter().rev() {
+        if claimed_handle
+            .set_alternate_setting(interface_number, 0)
+            .is_err()
+        {
+            reset_ok = false;
+        }
     }
 
-    if keep_locked && current_lock_requested_for_fd(claimed_handle.device_fd) {
+    if reset_ok && keep_locked && current_lock_requested_for_fd(claimed_handle.device_fd) {
         *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());
     }
 }
-

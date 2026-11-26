@@ -377,14 +377,33 @@ pub(crate) struct ResolvedClock {
     pub assumed_source: bool,
 }
 
+impl ResolvedClock {
+    /// Shared source IDs prove equal sample cadence only without an unknown
+    /// multiplier ratio, and only when the source is actually described.
+    pub(crate) fn proves_identity_cadence(&self) -> bool {
+        !self.assumed_source
+            && !self
+                .hops
+                .iter()
+                .any(|hop| matches!(hop.kind, ClockHopKind::Multiplier))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClockResolveError {
     TerminalNotFound(u8),
     TerminalHasNoClock(u8),
     MalformedEntity(u8),
     SelectorWithoutInputs(u8),
-    PinUnavailable { selector: u8, reason: String },
-    PinOutOfRange { selector: u8, pin: u8, inputs: usize },
+    PinUnavailable {
+        selector: u8,
+        reason: String,
+    },
+    PinOutOfRange {
+        selector: u8,
+        pin: u8,
+        inputs: usize,
+    },
     Loop(u8),
     TooDeep,
 }
@@ -395,11 +414,16 @@ impl fmt::Display for ClockResolveError {
             Self::TerminalNotFound(id) => {
                 write!(f, "terminal {id} is not in the AudioControl descriptors")
             }
-            Self::TerminalHasNoClock(id) => write!(f, "terminal {id} names no clock (bCSourceID 0)"),
+            Self::TerminalHasNoClock(id) => {
+                write!(f, "terminal {id} names no clock (bCSourceID 0)")
+            }
             Self::MalformedEntity(id) => write!(f, "clock entity {id} has a malformed descriptor"),
             Self::SelectorWithoutInputs(id) => write!(f, "clock selector {id} has no input pins"),
             Self::PinUnavailable { selector, reason } => {
-                write!(f, "current pin of clock selector {selector} is unavailable: {reason}")
+                write!(
+                    f,
+                    "current pin of clock selector {selector} is unavailable: {reason}"
+                )
             }
             Self::PinOutOfRange {
                 selector,
@@ -418,7 +442,10 @@ impl fmt::Display for ClockResolveError {
 /// Concatenate the class-specific descriptors of one AudioControl interface
 /// from a raw configuration descriptor. Used when the platform hands back no
 /// `extra` bytes for the interface.
-pub(crate) fn audio_control_descriptors_from_config(raw: &[u8], ac_interface_number: u8) -> Vec<u8> {
+pub(crate) fn audio_control_descriptors_from_config(
+    raw: &[u8],
+    ac_interface_number: u8,
+) -> Vec<u8> {
     let mut collected = Vec::new();
     let mut inside_ac_interface = false;
     let mut pos = 0usize;
@@ -438,4 +465,29 @@ pub(crate) fn audio_control_descriptors_from_config(raw: &[u8], ac_interface_num
         }
     }
     collected
+}
+
+#[cfg(test)]
+mod implicit_clock_tests {
+    use super::*;
+    #[test]
+    fn implicit_proof_rejects_sparse_sources_and_unknown_multiplier_ratios() {
+        let terminal = [8, 0x24, 2, 1, 0, 0, 0, 10];
+        let mut descriptors = terminal.to_vec();
+        let sparse = ClockGraph::parse(&descriptors)
+            .resolve_terminal_clock(1, |_| unreachable!())
+            .unwrap();
+        assert!(!sparse.proves_identity_cadence());
+        descriptors.extend_from_slice(&[8, 0x24, 0x0a, 10, 0, 0, 0, 0]);
+        let direct = ClockGraph::parse(&descriptors)
+            .resolve_terminal_clock(1, |_| unreachable!())
+            .unwrap();
+        assert!(direct.proves_identity_cadence());
+        descriptors[7] = 11;
+        descriptors.extend_from_slice(&[7, 0x24, 0x0c, 11, 10, 0, 0]);
+        let multiplied = ClockGraph::parse(&descriptors)
+            .resolve_terminal_clock(1, |_| unreachable!())
+            .unwrap();
+        assert!(!multiplied.proves_identity_cadence());
+    }
 }

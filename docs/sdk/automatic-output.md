@@ -64,7 +64,7 @@ The first output in this list that works for the request is chosen.
    - a USB DAC is attached and the app holds permission for it;
    - the DAC opens, has a usable hardware volume (unless `DacConfig.requireHardwareVolume` is off) and negotiates the request.
 
-   With `allowConversion`, a request the DAC cannot run as it is goes through a `ConversionPlan` to the nearest format it does run. The decision then says so, and the guarantee drops (see [conversion](#conversion)). A DAC that needs implicit feedback, a DAC without a hardware volume, a DAC another session holds, and any other failure to open or negotiate are rejected with their typed reason, and the selection goes on.
+   With `allowConversion`, a request the DAC cannot run as it is goes through a `ConversionPlan` to the nearest format it does run. The decision then says so, and the guarantee drops (see [conversion](#conversion)). If the requested asynchronous route has no usable feedback, the DAC lacks the required hardware volume, another session holds the DAC, or open or negotiation fails, the selection records the typed reason and moves to the next output.
 2. **Android's bit-perfect mixer** (`ANDROID_BIT_PERFECT`), when audio is routed to a USB device, the Android version is 14 or later, and the platform offers its bit-perfect mixer behavior for exactly the request's format on that device. After opening, the library checks that the platform kept the request, and falls through if it did not.
 3. **Exclusive AAudio** (`AAUDIO_EXCLUSIVE`), when audio is not routed to Bluetooth or a cast device and the platform grants an exclusive stream at exactly the request's rate, channel count and sample format, with the hardware agreeing (Android 14 and later report it). The stream is opened to read the grant and not started, so nothing is heard and nothing is converted; `open` keeps that very stream. When audio is routed to a USB device this step is tried only if `allowDirectUsb` is on, because an exclusive stream keeps the DAC from other apps.
 4. **Standard output** (`ANDROID_STANDARD`), an ordinary `AudioTrack`, for PCM that Android can carry. A Bluetooth or cast route goes straight here, and the decision says so.
@@ -79,7 +79,8 @@ Some examples of what that gives, on devices as they are usually met:
 | The same, permission not given yet | The next best (bit-perfect mixer on Android 14, otherwise AAudio or standard), and `needsUsbPermission` names the DAC |
 | The same, the listener does not allow taking over the DAC | Bit-perfect mixer on Android 14 and later; otherwise the standard output |
 | A digital audio player with an internal DAC and nothing plugged in | Exclusive AAudio, if the platform grants it; otherwise standard |
-| A DAC that needs implicit feedback, on Android 13 | Whatever follows: AAudio if the platform grants it on that route, else standard |
+| A DAC with a compatible implicit feedback source | Direct USB if the other requirements hold |
+| An asynchronous DAC without usable feedback on Android 13 | Exclusive AAudio if the platform grants it on that route, otherwise standard |
 | Bluetooth headphones connected | Standard output, whatever else is plugged in |
 
 These are what the order produces. None of it has been confirmed on devices; see [what is not verified](#what-is-not-verified).
@@ -199,7 +200,7 @@ fun describeDecision(decision: OutputDecision): String = buildString {
 | `PLATFORM_TOO_OLD` | This Android release cannot do it |
 | `ROUTE_UNSUITABLE` | Audio goes to Bluetooth or a cast device |
 | `REQUEST_NOT_SUPPORTED` | The output cannot carry this request: DSD on a mixer, a rate or depth the DAC does not run |
-| `IMPLICIT_FEEDBACK` | The DAC needs implicit feedback, which the library does not support |
+| `IMPLICIT_FEEDBACK` | The requested asynchronous route has no compatible feedback source |
 | `NO_HARDWARE_VOLUME` | The DAC has no usable hardware volume and `requireHardwareVolume` is on |
 | `BUSY` | Another session or app holds the device |
 | `EXCLUSIVE_NOT_GRANTED` | The platform granted a shared AAudio stream |

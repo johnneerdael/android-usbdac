@@ -3,6 +3,433 @@ use crate::capabilities::{
     AltFormat, AltSetting, EndpointUsage, LinkSpeed, RateRange, SyncKind, UacVersion,
 };
 
+/// Read-only preflight: base AudioControl/playback claims are already held.
+/// No alternate is activated and no capture transfer is allocated or submitted.
+pub(super) fn preflight_implicit_feedback_interfaces(
+    device: &UsbDevice,
+) -> Result<(u8, Vec<u8>), String> {
+    let claimed = wrap_android_usb_handle(device)?;
+    let usb = claimed.handle.device();
+    let config = usb.active_config_descriptor().map_err(|e| e.to_string())?;
+    validate_android_usb_claims(&claimed, &config)?;
+    Ok((
+        config.number(),
+        structural_feedback_interfaces(&config, &claimed.handle, resolve_device_speed(&usb)),
+    ))
+}
+
+fn structural_feedback_interfaces(
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    speed: Speed,
+) -> Vec<u8> {
+    if settings().disable_feedback() {
+        return Vec::new();
+    }
+
+    let inventory = implicit_source_inventory(config, handle, speed);
+    let mut interfaces = Vec::new();
+    for out in config.interfaces().flat_map(|i| i.descriptors()) {
+        if out.class_code() != USB_CLASS_AUDIO
+            || out.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
+            || out.setting_number() == 0
+        {
+            continue;
+        }
+        let Some(format) = parse_android_streaming_interface_format(&out) else {
+            continue;
+        };
+        if format.is_uac1 || format.format_tag != FORMAT_TAG_PCM {
+            continue;
+        }
+        for ep in out.endpoint_descriptors() {
+            if ep.direction() != Direction::Out
+                || ep.transfer_type() != TransferType::Isochronous
+                || ep.sync_type() != SyncType::Asynchronous
+                || !(1..=16).contains(&ep.interval())
+                || !matches!(
+                    ep.usage_type(),
+                    UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
+                )
+                || !valid_implicit_packet_capacity(ep.max_packet_size(), speed)
+                || find_feedback_endpoint(&out, ep.synch_address(), ep.sync_type(), speed).is_some()
+                || explicit_feedback_ambiguous(&out, ep.synch_address(), ep.sync_type())
+            {
+                continue;
+            }
+            let interval = service_interval_micros(speed, ep.interval());
+            let stride = usize::from(format.channels) * usize::from(format.subslot_size);
+            if stride == 0 {
+                continue;
+            }
+            let mut rates = Vec::new();
+            for source in &inventory {
+                let ranges = if source.rates.is_empty() {
+                    get_sampling_frequency_ranges(
+                        handle,
+                        source.control_interface,
+                        source.clock.source_id,
+                    )
+                    .unwrap_or_default()
+                } else {
+                    source.rates.clone()
+                };
+                rates.extend(representative_sample_rates_from_ranges(&ranges));
+            }
+            rates.sort_unstable();
+            rates.dedup();
+            if rates.is_empty() {
+                if let Some(source) = resolve_implicit_source(
+                    &inventory,
+                    config,
+                    handle,
+                    out.interface_number(),
+                    out.setting_number(),
+                    format.terminal_link,
+                    ep.synch_address(),
+                    interval,
+                    None,
+                ) {
+                    interfaces.push(source.interface_number);
+                }
+            } else {
+                for rate in rates {
+                    if (!format.sample_rate_ranges.is_empty()
+                        && !sampling_frequency_ranges_support_rate(
+                            &format.sample_rate_ranges,
+                            rate,
+                        ))
+                        || effective_iso_packet_bytes(ep.max_packet_size(), speed)
+                            < required_max_packet_bytes(rate, interval, stride)
+                    {
+                        continue;
+                    }
+                    if let Some(source) = resolve_implicit_source(
+                        &inventory,
+                        config,
+                        handle,
+                        out.interface_number(),
+                        out.setting_number(),
+                        format.terminal_link,
+                        ep.synch_address(),
+                        interval,
+                        Some(rate),
+                    ) {
+                        interfaces.push(source.interface_number);
+                    }
+                }
+            }
+        }
+    }
+    interfaces.sort_unstable();
+    interfaces.dedup();
+    interfaces
+}
+
+struct ImplicitSourceCandidate {
+    source: ImplicitFeedbackSource,
+    control_interface: u8,
+    function_interfaces: Vec<u8>,
+    clock: ClockChoice,
+    rates: Vec<SamplingFrequencySubrange>,
+    marked: bool,
+}
+
+/// Audio IADs are authoritative function membership; no adjacency heuristic.
+fn audio_functions(raw: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset + 2 <= raw.len() {
+        let len = usize::from(raw[offset]);
+        if len < 2 || offset + len > raw.len() {
+            break;
+        }
+        let d = &raw[offset..offset + len];
+        if d[1] == 0x0b && len >= 8 && d[4] == USB_CLASS_AUDIO && d[5] == 0 && d[6] == 0x20 {
+            let first = d[2];
+            let count = d[3];
+            if count > 0 && u16::from(first) + u16::from(count) <= 256 {
+                result.push((first, (0..count).map(|n| first + n).collect()));
+            }
+        }
+        offset += len;
+    }
+    result
+}
+
+fn implicit_source_inventory(
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    speed: Speed,
+) -> Vec<ImplicitSourceCandidate> {
+    if !matches!(speed, Speed::Full | Speed::High) {
+        return Vec::new();
+    }
+    let Some(raw) = read_active_configuration_bytes(handle, config) else {
+        return Vec::new();
+    };
+    let functions = audio_functions(&raw);
+    let mut result = Vec::new();
+    for interface in config.interfaces() {
+        for alt in interface.descriptors() {
+            if alt.class_code() != USB_CLASS_AUDIO
+                || alt.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
+                || alt.setting_number() == 0
+            {
+                continue;
+            }
+            let Some(format) = parse_android_streaming_interface_format(&alt) else {
+                continue;
+            };
+            let stride = usize::from(format.channels) * usize::from(format.subslot_size);
+            if format.is_uac1
+                || format.format_tag != FORMAT_TAG_PCM
+                || stride == 0
+                || format.bit_resolution == 0
+                || format.bit_resolution > format.subslot_size.saturating_mul(8)
+            {
+                continue;
+            }
+            let matching: Vec<_> = functions
+                .iter()
+                .filter(|(_, ids)| ids.contains(&alt.interface_number()))
+                .collect();
+            let [(control, ids)] = matching.as_slice() else {
+                continue;
+            };
+            let Some(clock) = strict_implicit_clock(config, handle, *control, format.terminal_link)
+            else {
+                continue;
+            };
+            for ep in alt.endpoint_descriptors() {
+                if ep.direction() != Direction::In
+                    || ep.transfer_type() != TransferType::Isochronous
+                    || ep.sync_type() != SyncType::Asynchronous
+                    || !(1..=16).contains(&ep.interval())
+                    || !valid_implicit_packet_capacity(ep.max_packet_size(), speed)
+                    || !matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
+                {
+                    continue;
+                }
+                let capacity = effective_iso_packet_bytes(ep.max_packet_size(), speed);
+                if capacity < stride {
+                    continue;
+                }
+                result.push(ImplicitSourceCandidate {
+                    source: ImplicitFeedbackSource {
+                        interface_number: alt.interface_number(),
+                        alt_setting: alt.setting_number(),
+                        address: ep.address(),
+                        bytes_per_frame: stride,
+                        service_interval_us: service_interval_micros(speed, ep.interval()),
+                        max_packet_bytes: capacity,
+                    },
+                    control_interface: *control,
+                    function_interfaces: ids.clone(),
+                    clock: clock.clone(),
+                    rates: format.sample_rate_ranges.clone(),
+                    marked: ep.usage_type() == UsageType::FeedbackData,
+                });
+            }
+        }
+    }
+    result
+}
+
+fn resolve_implicit_source(
+    inventory: &[ImplicitSourceCandidate],
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    out_interface: u8,
+    out_alt: u8,
+    out_terminal: Option<u8>,
+    linked_address: u8,
+    service_interval_us: u32,
+    sample_rate: Option<u32>,
+) -> Option<ImplicitFeedbackSource> {
+    let mut matching = Vec::new();
+    for source in inventory {
+        if !source.function_interfaces.contains(&out_interface)
+            || (source.source.interface_number == out_interface
+                && source.source.alt_setting != out_alt)
+            || source.source.service_interval_us != service_interval_us
+            || (linked_address != 0 && source.source.address != linked_address)
+            || (linked_address == 0
+                && !source.marked
+                && (source.source.interface_number != out_interface.saturating_add(1)
+                    || source.source.alt_setting != out_alt))
+        {
+            continue;
+        }
+        let Some(out_clock) =
+            strict_implicit_clock(config, handle, source.control_interface, out_terminal)
+        else {
+            continue;
+        };
+        if out_clock.source_id != source.clock.source_id {
+            continue;
+        }
+        if let Some(sample_rate) = sample_rate {
+            let rates = if source.rates.is_empty() {
+                get_sampling_frequency_ranges(
+                    handle,
+                    source.control_interface,
+                    source.clock.source_id,
+                )
+                .unwrap_or_default()
+            } else {
+                source.rates.clone()
+            };
+            if rates.is_empty()
+                || !sampling_frequency_ranges_support_rate(&rates, sample_rate)
+                || source.source.max_packet_bytes
+                    < required_max_packet_bytes(
+                        sample_rate,
+                        service_interval_us,
+                        source.source.bytes_per_frame,
+                    )
+            {
+                continue;
+            }
+        }
+        matching.push((
+            source.source,
+            if linked_address != 0 {
+                0
+            } else if source.marked {
+                1
+            } else {
+                2
+            },
+        ));
+    }
+    choose_implicit_source(matching, out_alt)
+}
+
+fn choose_implicit_source(
+    mut matching: Vec<(ImplicitFeedbackSource, u8)>,
+    out_alt: u8,
+) -> Option<ImplicitFeedbackSource> {
+    let rank = matching.iter().map(|(_, rank)| *rank).min()?;
+    matching.retain(|(_, r)| *r == rank);
+    matching.sort_by_key(|(s, _)| (s.alt_setting != out_alt, s.max_packet_bytes, s.alt_setting));
+    let first = matching.first()?.0;
+    if matching
+        .iter()
+        .any(|(s, _)| s.interface_number != first.interface_number || s.address != first.address)
+    {
+        return None;
+    }
+    Some(first)
+}
+
+/// Resolve the selected playback clock within the proven implicit function.
+pub(super) fn candidate_audio_control_clock_choice(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    candidate: &IsoStreamCandidate,
+) -> Option<(AudioControlClock, ClockChoice)> {
+    if let Some(source) = candidate.implicit_feedback {
+        let config = device.active_config_descriptor().ok()?;
+        let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed);
+        let source = inventory.iter().find(|entry| entry.source == source)?;
+        let clock = strict_implicit_clock(
+            &config,
+            handle,
+            source.control_interface,
+            candidate.terminal_link,
+        )?;
+        if clock.source_id != source.clock.source_id {
+            return None;
+        }
+        Some((
+            AudioControlClock {
+                interface_number: clock.control_interface,
+                clock_id: clock.source_id,
+            },
+            clock,
+        ))
+    } else {
+        find_audio_control_clock_choice(device, handle, candidate.terminal_link)
+    }
+}
+
+/// Check registration-only Android metadata without expanding runtime device
+/// state; actual successful claims remain authoritative for every selection.
+pub(super) fn validate_registration_handoff(
+    device: &UsbDevice,
+    expected_configuration: Option<u8>,
+    unavailable: &[u8],
+) -> Result<(), String> {
+    let claimed = wrap_android_usb_handle(device)?;
+    let config = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    if expected_configuration.is_some_and(|expected| expected != config.number()) {
+        return Err(format!(
+            "USB active configuration changed: expected {:?}, got {}",
+            expected_configuration,
+            config.number()
+        ));
+    }
+    validate_android_usb_claims(&claimed, &config)?;
+    let unavailable_set: HashSet<_> = unavailable.iter().copied().collect();
+    if unavailable_set.len() != unavailable.len()
+        || unavailable
+            .iter()
+            .any(|id| device.claimed_interfaces.contains(id))
+    {
+        return Err(
+            "Unavailable feedback interfaces contain duplicates or overlap successful claims"
+                .to_string(),
+        );
+    }
+    let optional = structural_feedback_interfaces(
+        &config,
+        &claimed.handle,
+        resolve_device_speed(&claimed.handle.device()),
+    );
+    if unavailable.iter().any(|id| !optional.contains(id)) {
+        return Err(
+            "Unavailable feedback interface is outside the native preflight allowlist".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn discover_candidate_rate_ranges(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    config: &ConfigDescriptor,
+    sources: &[ImplicitSourceCandidate],
+    interface: u8,
+    terminal: Option<u8>,
+    parsed: &[SamplingFrequencySubrange],
+) -> Vec<SamplingFrequencySubrange> {
+    if !parsed.is_empty() {
+        return parsed.to_vec();
+    }
+    // A function-proven clock takes precedence over the legacy global lookup,
+    // whose first AC interface could contain the same local terminal ID.
+    for source in sources {
+        if source.function_interfaces.contains(&interface) {
+            if let Some(clock) =
+                strict_implicit_clock(config, handle, source.control_interface, terminal)
+            {
+                return get_sampling_frequency_ranges(
+                    handle,
+                    clock.control_interface,
+                    clock.source_id,
+                )
+                .unwrap_or_default();
+            }
+        }
+    }
+    discover_stream_sample_rate_ranges(device, handle, interface, terminal, parsed)
+}
+
 pub(super) fn inspect_usb_capabilities(device: &UsbDevice) -> Result<CapabilityModel, String> {
     let claimed_handle = wrap_android_usb_handle(device)?;
     let inspected_device = claimed_handle.handle.device();
@@ -16,6 +443,7 @@ pub(super) fn inspect_usb_capabilities(device: &UsbDevice) -> Result<CapabilityM
         &inspected_device,
         &claimed_handle.handle,
         resolve_device_speed(&inspected_device),
+        &claimed_handle.claimed_interfaces,
     )
 }
 
@@ -23,11 +451,17 @@ pub(super) fn build_usb_capability_model(
     device: &Device<Context>,
     handle: &DeviceHandle<Context>,
     speed: Speed,
+    claimed_interfaces: &[u8],
 ) -> Result<CapabilityModel, String> {
     let config_descriptor = device
         .active_config_descriptor()
         .map_err(|error| format!("Failed to read active USB config descriptor: {}", error))?;
 
+    let implicit_sources = if settings().disable_feedback() {
+        Vec::new()
+    } else {
+        implicit_source_inventory(&config_descriptor, handle, speed)
+    };
     let mut alt_settings = Vec::new();
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
@@ -43,7 +477,8 @@ pub(super) fn build_usb_capability_model(
                 continue;
             }
 
-            let Some(mut stream_format) = parse_android_streaming_interface_format(&descriptor) else {
+            let Some(mut stream_format) = parse_android_streaming_interface_format(&descriptor)
+            else {
                 continue;
             };
             if stream_format.format_tag == FORMAT_TAG_DSD {
@@ -54,9 +489,11 @@ pub(super) fn build_usb_capability_model(
             let sample_rate_ranges = stream_rate_cache
                 .entry((descriptor.interface_number(), stream_format.terminal_link))
                 .or_insert_with(|| {
-                    discover_stream_sample_rate_ranges(
+                    discover_candidate_rate_ranges(
                         device,
                         handle,
+                        &config_descriptor,
+                        &implicit_sources,
                         descriptor.interface_number(),
                         stream_format.terminal_link,
                         &stream_format.sample_rate_ranges,
@@ -70,10 +507,7 @@ pub(super) fn build_usb_capability_model(
             } else {
                 speed
             };
-            dev_eprintln!(
-                "[USB] build_usb_capability_model using speed={:?}",
-                speed
-            );
+            dev_eprintln!("[USB] build_usb_capability_model using speed={:?}", speed);
             effective_speed = speed;
             for endpoint in descriptor.endpoint_descriptors() {
                 if endpoint.direction() != Direction::Out
@@ -86,13 +520,62 @@ pub(super) fn build_usb_capability_model(
                 let max_packet_bytes =
                     effective_iso_packet_bytes(endpoint.max_packet_size(), speed);
 
-                let feedback_address = find_feedback_endpoint(
+                if explicit_feedback_ambiguous(
+                    &descriptor,
+                    endpoint.synch_address(),
+                    endpoint.sync_type(),
+                ) {
+                    continue;
+                }
+                let discovered_feedback = find_feedback_endpoint(
                     &descriptor,
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
-                )
-                .map(|feedback| feedback.address);
+                );
+                let feedback_address = discovered_feedback.map(|feedback| feedback.address);
+                let implicit = if discovered_feedback.is_none()
+                    && endpoint.sync_type() == SyncType::Asynchronous
+                    && !stream_format.is_uac1
+                    && stream_format.format_tag == FORMAT_TAG_PCM
+                {
+                    sample_rates.iter().find_map(|rate| {
+                        resolve_implicit_source(
+                            &implicit_sources,
+                            &config_descriptor,
+                            handle,
+                            descriptor.interface_number(),
+                            descriptor.setting_number(),
+                            stream_format.terminal_link,
+                            endpoint.synch_address(),
+                            service_interval_us,
+                            Some(*rate),
+                        )
+                    })
+                } else {
+                    None
+                }
+                .filter(|source| claimed_interfaces.contains(&source.interface_number));
+                let pacing = if let Some(source) = implicit {
+                    Some(crate::capabilities::Pacing::ImplicitFeedback {
+                        interface_number: source.interface_number,
+                        alt_setting: source.alt_setting,
+                        endpoint: source.address,
+                    })
+                } else if settings().disable_feedback() && discovered_feedback.is_some() {
+                    if settings().allow_unsynchronized_async() {
+                        Some(admitted_pacing(endpoint.sync_type(), None))
+                    } else {
+                        None
+                    }
+                } else {
+                    endpoint_pacing(
+                        endpoint.sync_type(),
+                        endpoint.synch_address(),
+                        feedback_address,
+                        settings().allow_unsynchronized_async(),
+                    )
+                };
                 supported_sample_rates.extend(sample_rates.iter().copied());
                 alt_settings.push(AltSetting {
                     interface_number: descriptor.interface_number(),
@@ -124,12 +607,7 @@ pub(super) fn build_usb_capability_model(
                     usage: endpoint_usage(endpoint.usage_type()),
                     refresh: endpoint.refresh(),
                     synch_address: endpoint.synch_address(),
-                    pacing: endpoint_pacing(
-                        endpoint.sync_type(),
-                        endpoint.synch_address(),
-                        feedback_address,
-                        settings().allow_unsynchronized_async(),
-                    ),
+                    pacing,
                 });
             }
         }
@@ -159,11 +637,17 @@ pub(super) fn select_stream_candidate(
     handle: &DeviceHandle<Context>,
     playback_format: PlaybackFormat,
     speed: Speed,
+    claimed_interfaces: &[u8],
 ) -> Result<IsoStreamCandidate, SelectError> {
     let config_descriptor = device.active_config_descriptor().map_err(|error| {
-        SelectError::NoMatch(format!("Failed to read active USB config descriptor: {}", error))
+        SelectError::NoMatch(format!(
+            "Failed to read active USB config descriptor: {}",
+            error
+        ))
     })?;
+    let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed);
     let mut refused_unsynchronized = false;
+    let mut refused_claim = None;
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
@@ -197,9 +681,11 @@ pub(super) fn select_stream_candidate(
             let sample_rate_ranges = stream_rate_cache
                 .entry((descriptor.interface_number(), stream_format.terminal_link))
                 .or_insert_with(|| {
-                    discover_stream_sample_rate_ranges(
+                    discover_candidate_rate_ranges(
                         device,
                         handle,
+                        &config_descriptor,
+                        &implicit_sources,
                         descriptor.interface_number(),
                         stream_format.terminal_link,
                         &stream_format.sample_rate_ranges,
@@ -239,6 +725,9 @@ pub(super) fn select_stream_candidate(
             }
 
             for endpoint in descriptor.endpoint_descriptors() {
+                if !claimed_interfaces.contains(&descriptor.interface_number()) {
+                    continue;
+                }
                 if descriptor.setting_number() == 0 {
                     continue;
                 }
@@ -278,12 +767,50 @@ pub(super) fn select_stream_candidate(
                 let service_interval_us = service_interval_micros(speed, endpoint.interval());
                 let max_packet_bytes =
                     effective_iso_packet_bytes(endpoint.max_packet_size(), speed);
-                let feedback_endpoint = find_feedback_endpoint(
+                if explicit_feedback_ambiguous(
+                    &descriptor,
+                    endpoint.synch_address(),
+                    endpoint.sync_type(),
+                ) {
+                    continue;
+                }
+                let discovered_feedback = find_feedback_endpoint(
                     &descriptor,
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
                 );
+                let discovered_implicit = if endpoint.sync_type() == SyncType::Asynchronous
+                    && discovered_feedback.is_none()
+                    && !stream_format.is_uac1
+                    && stream_format.format_tag == FORMAT_TAG_PCM
+                    && (1..=16).contains(&endpoint.interval())
+                    && valid_implicit_packet_capacity(endpoint.max_packet_size(), speed)
+                {
+                    resolve_implicit_source(
+                        &implicit_sources,
+                        &config_descriptor,
+                        handle,
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        stream_format.terminal_link,
+                        endpoint.synch_address(),
+                        service_interval_us,
+                        Some(effective_sample_rate),
+                    )
+                } else {
+                    None
+                };
+                let implicit_feedback = if settings().disable_feedback() {
+                    None
+                } else {
+                    discovered_implicit
+                };
+                let feedback_endpoint = if settings().disable_feedback() {
+                    None
+                } else {
+                    discovered_feedback
+                };
                 let bytes_per_frame =
                     stream_format.subslot_size as usize * stream_format.channels as usize;
                 let required_max_packet_bytes = required_max_packet_bytes(
@@ -311,10 +838,26 @@ pub(super) fn select_stream_candidate(
                     compatibility_penalty,
                 );
 
+                if bytes_per_frame == 0 || max_packet_bytes < required_max_packet_bytes {
+                    continue;
+                }
+                if let Some(source) = implicit_feedback {
+                    if !claimed_interfaces.contains(&source.interface_number) {
+                        refused_claim = Some(source.interface_number);
+                        continue;
+                    }
+                }
+                if settings().disable_feedback()
+                    && endpoint.sync_type() == SyncType::Asynchronous
+                    && !allow_unsynchronized_async
+                {
+                    refused_unsynchronized = true;
+                    continue;
+                }
                 match admit_endpoint(
                     endpoint.sync_type(),
                     endpoint.synch_address(),
-                    feedback_endpoint.is_some(),
+                    discovered_feedback.is_some() || discovered_implicit.is_some(),
                     allow_unsynchronized_async,
                 ) {
                     EndpointAdmission::Admit => {}
@@ -340,10 +883,6 @@ pub(super) fn select_stream_candidate(
                     }
                 }
 
-                if max_packet_bytes < required_max_packet_bytes {
-                    continue;
-                }
-
                 candidates.push(IsoStreamCandidate {
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
@@ -362,6 +901,7 @@ pub(super) fn select_stream_candidate(
                     refresh: endpoint.refresh(),
                     synch_address: endpoint.synch_address(),
                     feedback_endpoint,
+                    implicit_feedback,
                     terminal_link: stream_format.terminal_link,
                     is_uac1: stream_format.is_uac1,
                 });
@@ -383,6 +923,11 @@ pub(super) fn select_stream_candidate(
             candidate.subslot_size as usize * candidate.channels as usize,
         );
         (
+            u8::from(
+                candidate.sync_type == SyncType::Asynchronous
+                    && candidate.feedback_endpoint.is_none()
+                    && candidate.implicit_feedback.is_none(),
+            ),
             transport_container_preference_rank(
                 candidate,
                 playback_format,
@@ -401,9 +946,12 @@ pub(super) fn select_stream_candidate(
         format!("{} Hz", playback_format.sample_rate)
     };
     candidates.into_iter().next().ok_or_else(|| {
+        if let Some(interface) = refused_claim {
+            return SelectError::Claim(format!("Required implicit feedback interface {interface} was not claimed"));
+        }
         if refused_unsynchronized {
             return SelectError::ImplicitFeedback(format!(
-                "The only isochronous OUT endpoints that can carry {} / {}-bit / {} ch are asynchronous without an explicit feedback endpoint (implicit feedback is not supported)",
+                "The only isochronous OUT endpoints that can carry {} / {}-bit / {} ch are asynchronous without a usable claimed feedback source",
                 label_rate, playback_format.bit_depth, playback_format.channels
             ));
         }
@@ -443,6 +991,12 @@ pub(super) fn log_iso_endpoint_descriptors(
     );
 
     if candidate.sync_type != SyncType::Asynchronous {
+        return;
+    }
+    if let Some(source) = candidate.implicit_feedback {
+        log_info!("[USB] Implicit feedback source interface={} alt={} endpoint=0x{:02x} stride={} interval={}us capacity={}",
+            source.interface_number, source.alt_setting, source.address, source.bytes_per_frame,
+            source.service_interval_us, source.max_packet_bytes);
         return;
     }
     if candidate.feedback_endpoint.is_some() {
@@ -487,6 +1041,29 @@ pub(super) fn log_iso_endpoint_descriptors(
             }
         }
     }
+}
+
+fn explicit_feedback_ambiguous(
+    descriptor: &rusb::InterfaceDescriptor,
+    address: u8,
+    sync: SyncType,
+) -> bool {
+    select_explicit_feedback_endpoint(
+        descriptor.setting_number(),
+        address,
+        sync,
+        descriptor
+            .endpoint_descriptors()
+            .map(|ep| FeedbackEndpointCandidate {
+                alt_setting: descriptor.setting_number(),
+                address: ep.address(),
+                transfer_type: ep.transfer_type(),
+                usage_type: ep.usage_type(),
+                interval: ep.interval(),
+                max_packet_size: ep.max_packet_size(),
+            }),
+    )
+    .is_err()
 }
 
 pub(super) fn find_feedback_endpoint(
@@ -582,16 +1159,48 @@ pub(super) fn validate_android_usb_claims(
         }
     }
     if !has_control || !has_playback {
-        return Err("USB configuration is missing audio control or playback interfaces".to_string());
+        return Err(
+            "USB configuration is missing audio control or playback interfaces".to_string(),
+        );
     }
     let claimed: HashSet<_> = claimed_handle.claimed_interfaces.iter().copied().collect();
-    if claimed != required || claimed.len() != claimed_handle.claimed_interfaces.len() {
+    // Refuse an incomplete base handoff before any topology GET_CUR/GET_RANGE
+    // request can make libusb implicitly claim a control interface.
+    if !required.is_subset(&claimed) || claimed.len() != claimed_handle.claimed_interfaces.len() {
+        return Err(format!(
+            "The host's USB claims {:?} omit required audio control/playback interfaces {:?} or contain duplicates",
+            claimed_handle.claimed_interfaces, required,
+        ));
+    }
+    let optional: HashSet<_> = structural_feedback_interfaces(
+        config_descriptor,
+        &claimed_handle.handle,
+        resolve_device_speed(&claimed_handle.handle.device()),
+    )
+    .into_iter()
+    .collect();
+    if !required.is_subset(&claimed)
+        || !claimed.is_subset(&required.union(&optional).copied().collect())
+        || claimed.len() != claimed_handle.claimed_interfaces.len()
+    {
         return Err(format!(
             "The host's USB claims {:?} don't match required audio control/playback interfaces {:?}",
             claimed_handle.claimed_interfaces, required
         ));
     }
     Ok(())
+}
+
+/// Reject reserved transaction encodings before deriving an implicit capacity.
+fn valid_implicit_packet_capacity(raw: u16, speed: Speed) -> bool {
+    if raw & 0xe000 != 0 || raw & 0x07ff == 0 {
+        return false;
+    }
+    match speed {
+        Speed::Full => raw & 0x1800 == 0,
+        Speed::High => (raw >> 11) & 3 != 3,
+        _ => false,
+    }
 }
 
 pub(super) fn effective_iso_packet_bytes(raw_max_packet_size: u16, speed: Speed) -> usize {
@@ -624,7 +1233,9 @@ pub(super) fn resolve_device_speed(device: &Device<Context>) -> Speed {
     if let Some(inferred) = infer_speed_from_sysfs(bus, addr) {
         dev_eprintln!(
             "[USB] libusb reported Unknown speed; inferred {:?} from sysfs (bus={}, addr={})",
-            inferred, bus, addr
+            inferred,
+            bus,
+            addr
         );
         return inferred;
     }
@@ -900,9 +1511,9 @@ pub(super) fn validate_transport_against_playback_format(
         };
         if candidate.subslot_size < min_subslot_size as u8 {
             return Err(format!(
-            "USB direct requires at least {} bytes per subslot for {}-bit transport, got {}",
-            min_subslot_size, playback_format.bit_depth, candidate.subslot_size
-        ));
+                "USB direct requires at least {} bytes per subslot for {}-bit transport, got {}",
+                min_subslot_size, playback_format.bit_depth, candidate.subslot_size
+            ));
         }
     }
     Ok(())
@@ -926,7 +1537,6 @@ pub(super) fn current_lock_requested_for_fd(device_fd: RawFd) -> bool {
         .map(|state| state.lock_requested && state.device.fd == device_fd)
         .unwrap_or(false)
 }
-
 
 pub(super) fn alt_format(format_tag: u16) -> AltFormat {
     match format_tag {
@@ -1008,7 +1618,11 @@ pub(super) fn first_playback_stream(device: &Device<Context>) -> Option<(u8, u8,
             let Some(terminal_link) = format.terminal_link else {
                 continue;
             };
-            let found = (descriptor.interface_number(), terminal_link, format.channels);
+            let found = (
+                descriptor.interface_number(),
+                terminal_link,
+                format.channels,
+            );
             if format.format_tag == FORMAT_TAG_PCM {
                 return Some(found);
             }
@@ -1016,4 +1630,75 @@ pub(super) fn first_playback_stream(device: &Device<Context>) -> Option<(u8, u8,
         }
     }
     fallback
+}
+
+#[cfg(test)]
+mod implicit_discovery_tests {
+    use super::*;
+    fn source(interface: u8, alt: u8, address: u8, capacity: usize) -> ImplicitFeedbackSource {
+        ImplicitFeedbackSource {
+            interface_number: interface,
+            alt_setting: alt,
+            address,
+            bytes_per_frame: 6,
+            service_interval_us: 1000,
+            max_packet_bytes: capacity,
+        }
+    }
+    #[test]
+    fn prioritizes_declaration_then_marked_source() {
+        let plain = source(2, 1, 0x81, 288);
+        let marked = source(3, 1, 0x82, 288);
+        assert_eq!(
+            choose_implicit_source(vec![(plain, 2), (marked, 1)], 1),
+            Some(marked)
+        );
+        assert_eq!(
+            choose_implicit_source(vec![(plain, 0), (marked, 1)], 1),
+            Some(plain)
+        );
+    }
+    #[test]
+    fn alternate_preference_keeps_one_pipe_and_rejects_distinct_ambiguity() {
+        let matching_alt = source(2, 2, 0x81, 400);
+        let smaller_alt = source(2, 1, 0x81, 288);
+        assert_eq!(
+            choose_implicit_source(vec![(smaller_alt, 1), (matching_alt, 1)], 2),
+            Some(matching_alt)
+        );
+        assert_eq!(
+            choose_implicit_source(vec![(smaller_alt, 1), (matching_alt, 1)], 3),
+            Some(smaller_alt)
+        );
+        assert_eq!(
+            choose_implicit_source(vec![(smaller_alt, 1), (source(3, 1, 0x82, 288), 1)], 1),
+            None
+        );
+    }
+    #[test]
+    fn implicit_capacity_rejects_reserved_and_wrong_speed_encodings() {
+        assert!(valid_implicit_packet_capacity(288, Speed::Full));
+        assert!(valid_implicit_packet_capacity(288 | (2 << 11), Speed::High));
+        assert!(!valid_implicit_packet_capacity(
+            288 | (1 << 11),
+            Speed::Full
+        ));
+        assert!(!valid_implicit_packet_capacity(
+            288 | (3 << 11),
+            Speed::High
+        ));
+        for reserved in [0x2000, 0x4000, 0x8000] {
+            assert!(!valid_implicit_packet_capacity(288 | reserved, Speed::High));
+        }
+        assert!(!valid_implicit_packet_capacity(0, Speed::High));
+        assert!(!valid_implicit_packet_capacity(288, Speed::Unknown));
+    }
+    #[test]
+    fn audio_function_membership_requires_valid_uac2_iad() {
+        let raw = [8, 0x0b, 4, 3, 1, 0, 0x20, 0];
+        assert_eq!(audio_functions(&raw), vec![(4, vec![4, 5, 6])]);
+        assert!(audio_functions(&raw[..7]).is_empty());
+        assert!(audio_functions(&[8, 0x0b, 255, 2, 1, 0, 0x20, 0]).is_empty());
+        assert!(audio_functions(&[8, 0x0b, 4, 3, 1, 0, 0, 0]).is_empty());
+    }
 }

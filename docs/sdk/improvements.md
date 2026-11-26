@@ -36,7 +36,7 @@ usbdac keeps a quarter of a second of audio ready (the original kept a tenth). T
 
 ### DACs it cannot pace properly are refused, not played badly
 
-A DAC and a phone each keep their own time, and the DAC must tell the phone how fast to send. Most hi-fi DACs do this through a dedicated return channel ("explicit feedback"), which usbdac supports. A few devices, mostly recording interfaces, expect the phone to work it out from their recording input ("implicit feedback"), which usbdac does not support. Those are refused with a clear error so the app can use Android's own output instead. An app can override this and accept the consequences.
+A DAC and a phone each keep their own time. A dedicated return channel can report the DAC's rate through explicit feedback. Compatible recording interfaces provide implicit feedback through the number of frames in each IN packet. The driver validates the IN and OUT clock and cadence before using the source. If no feedback route is usable, the app can use Android's own output or opt into nominal pacing.
 
 **In plain terms:** rather than play such a device with a click every few minutes as the two clocks drift apart, usbdac says "I can't drive this one properly" and lets the app fall back.
 
@@ -109,7 +109,7 @@ This is also what makes MQA work without any MQA code: an MQA file is ordinary a
 
 ### Diagnostics a developer can act on
 
-For each stream, usbdac reports which clock it chose and the path it followed to get there, and how the stream is being kept in time with the DAC (explicit feedback, adaptive, synchronous, or unsynchronised).
+For each stream, usbdac reports which clock it chose and the path it followed to get there, and how the stream is being kept in time with the DAC (explicit feedback, implicit feedback, adaptive, synchronous, or unsynchronised).
 
 **In plain terms:** when a user reports "wrong pitch on my DAC", the developer can see what the library decided without needing USB test equipment.
 
@@ -145,7 +145,6 @@ A Kotlin API for Android, a sample app that the guide's code is taken from, auto
 
 ## What it does not do yet
 
-- **Implicit feedback** is not supported; such devices are refused (see above).
 - **One DAC at a time** per app.
 - **Playback only**, for USB Audio Class 1 and 2 devices.
 - **Only lightly tested on hardware.** One phone and one DAC so far, through a build of Flick that runs on this library.

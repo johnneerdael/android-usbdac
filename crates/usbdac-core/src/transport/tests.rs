@@ -546,6 +546,7 @@ mod pcm_ring_hold_tests {
             refresh: 0,
             synch_address: 0,
             feedback_endpoint: None,
+            implicit_feedback: None,
             terminal_link: None,
             is_uac1: false,
         }

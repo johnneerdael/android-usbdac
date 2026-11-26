@@ -36,6 +36,7 @@ pub enum BitPerfectBlocker {
     /// nominal rate because `DacConfig::allow_unsynchronized_async` is on.
     UnsynchronizedAsync,
     /// The wire payload audit has not seen real audio (yet), or lost it.
+    FeedbackUnlocked,
     PayloadUnverified,
 }
 
@@ -51,6 +52,7 @@ impl BitPerfectBlocker {
             Self::ClockUnverified => "clock_unverified",
             Self::SoftwareGain => "software_gain",
             Self::UnsynchronizedAsync => "unsynchronized_async",
+            Self::FeedbackUnlocked => "feedback_unlocked",
             Self::PayloadUnverified => "payload_unverified",
         }
     }
@@ -65,6 +67,7 @@ impl BitPerfectBlocker {
             Self::UnsynchronizedAsync => {
                 "asynchronous endpoint without feedback, host-paced at the nominal rate"
             }
+            Self::FeedbackUnlocked => "implicit feedback has not locked",
             Self::PayloadUnverified => "wire payload audit failed",
         }
     }
@@ -126,6 +129,19 @@ pub struct StreamStats {
     /// The sample rate the last feedback report implies.
     pub feedback_rate_hz: Option<f64>,
     pub feedback_stale: bool,
+    pub feedback_locked: bool,
+    pub feedback_empty: u64,
+    pub implicit_fifo_depth: u32,
+    pub implicit_fifo_high_water: u32,
+    pub implicit_waits: u64,
+    pub implicit_empty_bus: u64,
+    pub implicit_overruns: u64,
+    pub implicit_in_transfers: u64,
+    pub implicit_out_of_order: u64,
+    pub implicit_invalid_packets: u64,
+    pub implicit_measured_frames: u64,
+    pub implicit_scheduled_frames: u64,
+
     /// The transfers have been lossless for long enough (about 256 ms) with no
     /// underrun and no lost audio. A stream that lost audio is never stable
     /// again.
@@ -481,8 +497,8 @@ impl DacStream {
             last_submit_gap_us: stats.last_submit_gap_us.load(Relaxed),
             max_submit_gap_us: stats.max_submit_gap_us.load(Relaxed),
             effective_rate_hz: stats.effective_consumer_rate_milli_hz.load(Relaxed) as f64 / 1_000.0,
-            feedback_active: self.inner.format.explicit_feedback
-                && matches!(self.inner.format.sync_type, crate::SyncKind::Asynchronous),
+            feedback_active: if stats.implicit_feedback.load(Relaxed) { stats.feedback_locked.load(Relaxed) } else { self.inner.format.explicit_feedback
+                && matches!(self.inner.format.sync_type, crate::SyncKind::Asynchronous) },
             feedback_reports: stats.feedback_reports.load(Relaxed),
             feedback_timeouts: stats.feedback_timeouts.load(Relaxed),
             feedback_errors: stats.feedback_errors.load(Relaxed),
@@ -492,6 +508,19 @@ impl DacStream {
             feedback_rate_hz: (stats.feedback_reports.load(Relaxed) > 0)
                 .then(|| stats.feedback_rate_milli_hz.load(Relaxed) as f64 / 1_000.0),
             feedback_stale: stats.feedback_stale.load(Relaxed),
+            feedback_locked: stats.feedback_locked.load(Relaxed),
+            feedback_empty: stats.feedback_empty.load(Relaxed),
+            implicit_fifo_depth: stats.implicit_fifo_depth.load(Relaxed) as u32,
+            implicit_fifo_high_water: stats.implicit_fifo_high_water.load(Relaxed) as u32,
+            implicit_waits: stats.implicit_waits.load(Relaxed),
+            implicit_empty_bus: stats.implicit_empty_bus.load(Relaxed),
+            implicit_overruns: stats.implicit_overruns.load(Relaxed),
+            implicit_in_transfers: stats.implicit_in_transfers.load(Relaxed),
+            implicit_out_of_order: stats.implicit_out_of_order.load(Relaxed),
+            implicit_invalid_packets: stats.implicit_invalid_packets.load(Relaxed),
+            implicit_measured_frames: stats.implicit_measured_frames.load(Relaxed),
+            implicit_scheduled_frames: stats.implicit_scheduled_frames.load(Relaxed),
+
             stable: verdicts.stable,
             clock_verified: verdicts.clock_verified,
             payload_verified: verdicts.payload_verified,

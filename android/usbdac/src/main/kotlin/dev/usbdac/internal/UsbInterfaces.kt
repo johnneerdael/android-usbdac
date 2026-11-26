@@ -67,7 +67,7 @@ internal fun UsbInterface.toInfo(): InterfaceInfo =
         },
     )
 
-private fun UsbConfiguration.interfaces(): List<UsbInterface> =
+internal fun UsbConfiguration.interfaces(): List<UsbInterface> =
     (0 until interfaceCount).map(::getInterface)
 
 /** Every interface of every configuration. Enough to tell whether a device can play audio at all. */
@@ -79,15 +79,18 @@ internal fun UsbDevice.allInterfaces(): List<UsbInterface> =
  * simple; with several, interface numbers only mean something inside the selected one, so the
  * selected configuration is asked for with the standard GET_CONFIGURATION request.
  */
-internal fun UsbDevice.activeInterfaces(connection: UsbDeviceConnection): List<UsbInterface> {
+internal fun UsbDevice.activeConfiguration(connection: UsbDeviceConnection): UsbConfiguration {
     val configurations = (0 until configurationCount).map(::getConfiguration)
-    configurations.singleOrNull()?.let { return it.interfaces() }
+    configurations.singleOrNull()?.let { return it }
     val value = ByteArray(1)
     val read = connection.controlTransfer(UsbConstants.USB_DIR_IN, REQUEST_GET_CONFIGURATION, 0, 0, value, 1, 500)
     val active = configurations.firstOrNull { read == 1 && it.id == (value[0].toInt() and 0xff) }
         ?: throw DacException(DacErrorCode.CLAIM, "Could not read the active USB configuration of $deviceName.")
-    return active.interfaces()
+    return active
 }
+
+internal fun UsbDevice.activeInterfaces(connection: UsbDeviceConnection): List<UsbInterface> =
+    activeConfiguration(connection).interfaces()
 
 private const val REQUEST_GET_CONFIGURATION = 0x08
 
@@ -108,6 +111,18 @@ internal class ClaimedInterfaces private constructor(
     private val claimed: MutableList<UsbInterface>,
 ) {
     val ids: List<Int> get() = claimed.map { it.id }
+
+    /** Optional claims are independent: one rejected source leaves other playback routes usable. */
+    fun claimOptional(interfaces: List<UsbInterface>, sourceIds: List<Int>): List<Int> {
+        return claimOptionalSources(sourceIds, ids) { id ->
+            val candidates = interfaces.filter { it.id == id && it.toInfo().isAudioStreaming }
+            val target = candidates.firstOrNull { it.alternateSetting == 0 } ?: candidates.firstOrNull()
+            if (target != null && runCatching { connection.claimInterface(target, true) }.getOrDefault(false)) {
+                claimed += target
+                true
+            } else false
+        }
+    }
 
     fun release() {
         for (usbInterface in claimed.asReversed()) {
@@ -152,3 +167,7 @@ internal class ClaimedInterfaces private constructor(
         }
     }
 }
+
+/** Claim sources independently, preserving successful ownership when another source is unavailable. */
+internal fun claimOptionalSources(sourceIds: List<Int>, alreadyClaimed: List<Int>, claim: (Int) -> Boolean): List<Int> =
+    sourceIds.distinct().filterNot { it in alreadyClaimed }.filterNot { claim(it) }

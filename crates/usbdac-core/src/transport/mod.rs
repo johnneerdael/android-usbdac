@@ -171,3 +171,6 @@ use stream_open::*;
 use types::*;
 use usbfs::*;
 use volume_hw::*;
+
+mod implicit;
+use implicit::*;

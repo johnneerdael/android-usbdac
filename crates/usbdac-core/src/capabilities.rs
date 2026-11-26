@@ -9,8 +9,8 @@ use crate::volume::VolumeRange;
 /// `UsbDeviceConnection.getFileDescriptor()` after claiming the audio
 /// interfaces with `claimInterface`; `claimed_interfaces` lists those interface
 /// numbers. The library never claims or releases interfaces itself: it checks
-/// that the host claimed exactly the AudioControl interface(s) and the
-/// playback AudioStreaming interface(s) of the active configuration.
+/// that the host claimed all AudioControl and playback AudioStreaming interfaces
+/// of the active configuration, plus only preflight-approved feedback sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub vendor_id: u16,
@@ -23,6 +23,10 @@ pub struct DeviceInfo {
     pub device_name: Option<String>,
     /// Interface numbers the host has claimed.
     pub claimed_interfaces: Vec<u8>,
+    /// Active configuration identified by feedback claim preflight.
+    pub configuration_id: Option<u8>,
+    /// Plausible feedback sources the host could not claim.
+    pub unavailable_feedback_interfaces: Vec<u8>,
 }
 
 impl DeviceInfo {
@@ -34,6 +38,8 @@ impl DeviceInfo {
             manufacturer_name: None,
             device_name: None,
             claimed_interfaces: Vec::new(),
+            configuration_id: None,
+            unavailable_feedback_interfaces: Vec::new(),
         }
     }
 
@@ -93,6 +99,12 @@ pub enum Pacing {
     /// An asynchronous endpoint whose explicit feedback endpoint (`endpoint`,
     /// the address) is polled; packet sizes follow the rate the DAC reports.
     ExplicitFeedback { endpoint: u8 },
+    /// Packet frame counts follow a compatible capture audio endpoint.
+    ImplicitFeedback {
+        interface_number: u8,
+        alt_setting: u8,
+        endpoint: u8,
+    },
     /// An adaptive endpoint: the DAC follows the host's packet timing.
     Adaptive,
     /// A synchronous endpoint: the DAC and the host share the bus clock.
@@ -107,11 +119,12 @@ pub enum Pacing {
 }
 
 impl Pacing {
-    /// Stable identifier: `explicit_feedback`, `adaptive`, `synchronous`,
+    /// Stable identifier: `explicit_feedback`, `implicit_feedback`, `adaptive`, `synchronous`,
     /// `unsynchronized`.
     pub fn code(self) -> &'static str {
         match self {
             Self::ExplicitFeedback { .. } => "explicit_feedback",
+            Self::ImplicitFeedback { .. } => "implicit_feedback",
             Self::Adaptive => "adaptive",
             Self::Synchronous => "synchronous",
             Self::Unsynchronized => "unsynchronized",

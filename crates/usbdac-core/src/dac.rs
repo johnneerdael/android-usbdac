@@ -98,18 +98,38 @@ pub struct Dac {
 
 impl std::fmt::Debug for Dac {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Dac").field("info", &self.shared.info).finish_non_exhaustive()
+        f.debug_struct("Dac")
+            .field("info", &self.shared.info)
+            .finish_non_exhaustive()
     }
 }
 
 impl Dac {
+    /// Wait until USB activity has retired before releasing the host's claimed interfaces and FD.
+    ///
+    /// After [`Dac::close`] returns a transfer timeout, retain all host ownership
+    /// and call this until it returns `true`. This does not require a live `Dac` handle.
+    pub fn await_usb_retirement(timeout: Duration) -> bool {
+        transport::api::await_usb_retirement(timeout)
+    }
+
+    /// Identify optional capture interfaces after the host claims the base audio interfaces.
+    /// Returns the active configuration ID and source interface numbers without starting audio.
+    pub fn feedback_preflight(fd: RawFd, info: &DeviceInfo) -> Result<(u8, Vec<u8>)> {
+        let _guard = OPEN_GUARD.lock();
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
+        transport::api::feedback_preflight(fd, info)
+    }
+
     /// Opens the DAC behind `fd`.
     ///
     /// `fd` is the usbfs file descriptor of the device (on Android
     /// `UsbDeviceConnection.getFileDescriptor()`); the library duplicates it, so
     /// the host keeps ownership of its own. `info.claimed_interfaces` must be
-    /// exactly the AudioControl and playback AudioStreaming interfaces the host
-    /// has claimed.
+    /// the AudioControl and playback AudioStreaming interfaces plus any
+    /// optional capture sources identified by [`Dac::feedback_preflight`].
     ///
     /// Opening scans the descriptors, finds the hardware volume control, records
     /// the DAC's current level and, with the default
@@ -230,7 +250,10 @@ impl Dac {
     /// Closes the DAC: stops the stream if one is open, hands the volume back
     /// as [`DacConfig::hand_back`] says, and releases the session so another
     /// [`Dac::open`] can succeed. The host may then release its interfaces and
-    /// close its connection. Dropping the `Dac` does the same.
+    /// close its connection after success. If closing times out, keep all host
+    /// claims and the connection until [`Dac::await_usb_retirement`] returns
+    /// `true`. Dropping the `Dac` initiates the same cleanup, but cannot report
+    /// a timeout; hosts must still wait for retirement before releasing claims.
     pub fn close(self) -> Result<()> {
         self.shared.shutdown(None)
     }
@@ -368,7 +391,10 @@ mod tests {
         dac.close_with(CloseVolume::Keep).unwrap();
         assert_eq!(fake.raw(), lowered, "the level was not touched");
         assert_ne!(lowered, vec![ORIGINAL_RAW; 2]);
-        assert!(fake.original_recorded(), "a later open still knows the true original");
+        assert!(
+            fake.original_recorded(),
+            "a later open still knows the true original"
+        );
         assert!(!transport::session::session_registered());
     }
 
@@ -380,7 +406,11 @@ mod tests {
         let dac = fake_dac_handle(DacConfig::default());
         dac.close_with(CloseVolume::Forget).unwrap();
         assert_eq!(fake.raw(), lowered);
-        assert_eq!(fake.dac.lock().unwrap().volume_writes.len(), writes, "nothing was written");
+        assert_eq!(
+            fake.dac.lock().unwrap().volume_writes.len(),
+            writes,
+            "nothing was written"
+        );
         assert!(!fake.original_recorded());
     }
 
@@ -389,7 +419,9 @@ mod tests {
         let fake = lowered_with_a_record();
         let lowered = fake.raw();
         let dac = fake_dac_handle(DacConfig::default());
-        dac.shared.events.emit_dac(crate::events::DacEvent::DeviceLost);
+        dac.shared
+            .events
+            .emit_dac(crate::events::DacEvent::DeviceLost);
         dac.close_with(CloseVolume::Restore).unwrap();
         assert_eq!(fake.raw(), lowered, "no write to a DAC that is gone");
         assert!(!fake.original_recorded());
@@ -400,7 +432,11 @@ mod tests {
         use crate::transport::fake_dac::ORIGINAL_RAW;
         let fake = lowered_with_a_record();
         fake_dac_handle(DacConfig::default()).close().unwrap();
-        assert_eq!(fake.raw(), vec![ORIGINAL_RAW; 2], "the default is to restore");
+        assert_eq!(
+            fake.raw(),
+            vec![ORIGINAL_RAW; 2],
+            "the default is to restore"
+        );
         drop(fake);
 
         let fake = lowered_with_a_record();
@@ -464,7 +500,11 @@ mod tests {
         assert!(settings::settings().dsd_big_endian());
         dac.set_dsd_overrides(Some(false), None).unwrap();
         assert!(!settings::settings().dsd_big_endian());
-        assert_eq!(settings::settings().settle_delay_ms(), 80, "the device quirk is still there");
+        assert_eq!(
+            settings::settings().settle_delay_ms(),
+            80,
+            "the device quirk is still there"
+        );
         // `None` goes back to the quirk.
         dac.set_dsd_overrides(None, None).unwrap();
         assert!(settings::settings().dsd_big_endian());
@@ -500,7 +540,10 @@ mod tests {
         let volume = VolumeControl::new(shared.clone());
 
         let range = volume.range().unwrap();
-        assert_eq!((range.min_db, range.max_db, range.res_db), (-80.0, 0.0, 1.0));
+        assert_eq!(
+            (range.min_db, range.max_db, range.res_db),
+            (-80.0, 0.0, 1.0)
+        );
         let initial = volume.get().unwrap();
         assert_eq!(initial.db, -64.0);
         assert_eq!(initial.muted, Some(false));
@@ -513,7 +556,11 @@ mod tests {
         let half = volume.set_fraction(0.5).unwrap();
         assert!((half.fraction - 0.5).abs() < 0.01, "{half:?}");
         assert_eq!(volume.set_mute(true).unwrap().muted, Some(true));
-        assert_eq!(volume.original_db(), None, "nothing was recorded by the fake");
+        assert_eq!(
+            volume.original_db(),
+            None,
+            "nothing was recorded by the fake"
+        );
 
         // An unreachable DAC fails the call; the handle stays usable.
         fake.dac.lock().unwrap().unreachable = true;
@@ -536,7 +583,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(changes.len(), 4, "set_db, step, set_fraction, set_mute: {changes:?}");
+        assert_eq!(
+            changes.len(),
+            4,
+            "set_db, step, set_fraction, set_mute: {changes:?}"
+        );
         assert_eq!(changes[0], -30.0);
 
         shared.closed.store(true, Ordering::Release);

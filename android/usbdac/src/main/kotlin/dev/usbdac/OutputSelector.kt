@@ -417,11 +417,11 @@ public class OutputSelector internal constructor(
         val format = negotiated.format
         val plan = negotiated.plan
         val unsynchronized = format.pacing == Pacing.Unsynchronized ||
-            (format.syncType == SyncType.ASYNCHRONOUS && !format.explicitFeedback)
+            (format.pacing == Pacing.Unknown && format.syncType == SyncType.ASYNCHRONOUS && !format.explicitFeedback)
         val guarantee = if ((plan?.preservesBitPerfect ?: true) && !unsynchronized) Guarantee.VERIFIED_BY_LIBRARY else Guarantee.NONE
         val reason = buildString {
             append("The library drives ${dac.productName} directly over USB (${describe(format)}): ")
-            append("Android's mixer, resampler and volume are out of the path, and the library verifies the stream itself.")
+            append("Android's mixer, resampler and volume are out of the path. Live stream diagnostics report whether clock and feedback are verified.")
             if (plan != null) {
                 if (plan.preservesBitPerfect) {
                     append(" The DAC does not run the request as it is, so the audio is first converted without changing any sample value: ${plan.description}")

@@ -158,61 +158,7 @@ pub(super) fn read_audio_control_descriptors_from_raw_config(
     config_descriptor: &ConfigDescriptor,
     ac_interface_number: u8,
 ) -> Option<Vec<u8>> {
-    let config_value = config_descriptor.number();
-    let mut raw = vec![0u8; 1024];
-    let request_type: u8 = 0x80;
-    let descriptor_type_config: u8 = 0x02;
-    let read = handle
-        .read_control(
-            request_type,
-            0x06,
-            (descriptor_type_config as u16) << 8 | config_value as u16,
-            0,
-            &mut raw,
-            Duration::from_secs(1),
-        )
-        .ok()?;
-
-    if read < 4 {
-        log::error!(
-            "[USB] Raw GET_DESCRIPTOR returned only {} bytes; cannot parse config descriptor",
-            read,
-        );
-        return None;
-    }
-    let total_length = u16::from_le_bytes([raw[2], raw[3]]) as usize;
-    if total_length > read {
-        let mut full_raw = vec![0u8; total_length];
-        match handle.read_control(
-            request_type,
-            0x06,
-            (descriptor_type_config as u16) << 8 | config_value as u16,
-            0,
-            &mut full_raw,
-            Duration::from_secs(1),
-        ) {
-            Ok(n) => {
-                raw = full_raw;
-                raw.truncate(n);
-            }
-            Err(error) => {
-                log::error!(
-                    "[USB] Raw GET_DESCRIPTOR full read failed: {}; using partial {} bytes",
-                    error,
-                    read,
-                );
-                raw.truncate(read);
-            }
-        }
-    } else {
-        raw.truncate(read);
-    }
-
-    log::info!(
-        "[USB] Raw config descriptor: {} bytes for config {}",
-        raw.len(),
-        config_value,
-    );
+    let raw = read_active_configuration_bytes(handle, config_descriptor)?;
     let descriptors = audio_control_descriptors_from_config(&raw, ac_interface_number);
     if descriptors.is_empty() {
         log::error!(
@@ -537,7 +483,9 @@ pub(super) fn discover_stream_sample_rate_ranges(
     }
 }
 
-pub(super) fn representative_sample_rates_from_ranges(ranges: &[SamplingFrequencySubrange]) -> Vec<u32> {
+pub(super) fn representative_sample_rates_from_ranges(
+    ranges: &[SamplingFrequencySubrange],
+) -> Vec<u32> {
     const COMMON_SAMPLE_RATES: &[u32] = &[
         8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000,
         176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
@@ -653,13 +601,18 @@ pub(super) fn apply_sampling_frequency(
         Ok(current_rate) => {
             dev_eprintln!(
                 "[USB] GET_CUR (pre-SET): clock {} on interface {} reports {}Hz (target={}Hz)",
-                clock_id, interface_number, current_rate, sample_rate,
+                clock_id,
+                interface_number,
+                current_rate,
+                sample_rate,
             );
         }
         Err(error) => {
             dev_eprintln!(
                 "[USB] GET_CUR (pre-SET): failed for clock {} on interface {}: {}",
-                clock_id, interface_number, error,
+                clock_id,
+                interface_number,
+                error,
             );
         }
     }
@@ -700,7 +653,9 @@ pub(super) fn apply_sampling_frequency(
                         Ok(valid) => {
                             dev_eprintln!(
                                 "[USB] Clock Validity: clock {} valid={} (after SET_CUR {}Hz)",
-                                clock_id, valid, sample_rate,
+                                clock_id,
+                                valid,
+                                sample_rate,
                             );
                             Some(valid)
                         }
@@ -715,14 +670,18 @@ pub(super) fn apply_sampling_frequency(
                     if clock_valid == Some(false) {
                         dev_eprintln!(
                             "[USB] Clock {} reports INVALID after SET_CUR {}Hz; retrying",
-                            clock_id, sample_rate,
+                            clock_id,
+                            sample_rate,
                         );
                         thread::sleep(Duration::from_millis(settle_delay_ms));
                         continue;
                     }
                     dev_eprintln!(
                         "[USB] SET_CUR verified: {} Hz on clock {} interface {} after attempt {}",
-                        sample_rate, clock_id, interface_number, attempt,
+                        sample_rate,
+                        clock_id,
+                        interface_number,
+                        attempt,
                     );
                     return ClockApplyOutcome {
                         clock_ok: true,
@@ -788,3 +747,88 @@ pub(super) fn apply_sampling_frequency(
     }
 }
 
+/// GET_DESCRIPTOR indexes configurations, rather than using bConfigurationValue.
+/// Verify the value as well so preflight never pairs across a configuration change.
+pub(super) fn read_active_configuration_bytes(
+    handle: &DeviceHandle<Context>,
+    config: &ConfigDescriptor,
+) -> Option<Vec<u8>> {
+    let device = handle.device();
+    let count = device.device_descriptor().ok()?.num_configurations();
+    let index = (0..count).find(|index| {
+        device
+            .config_descriptor(*index)
+            .ok()
+            .is_some_and(|c| c.number() == config.number())
+    })?;
+    let mut header = [0u8; 9];
+    let n = handle
+        .read_control(
+            0x80,
+            0x06,
+            0x0200 | u16::from(index),
+            0,
+            &mut header,
+            Duration::from_secs(1),
+        )
+        .ok()?;
+    if n != header.len() || header[5] != config.number() {
+        return None;
+    }
+    let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
+    if length < header.len() {
+        return None;
+    }
+    let mut bytes = vec![0u8; length];
+    let n = handle
+        .read_control(
+            0x80,
+            0x06,
+            0x0200 | u16::from(index),
+            0,
+            &mut bytes,
+            Duration::from_secs(1),
+        )
+        .ok()?;
+    (n == length && bytes[5] == config.number()).then_some(bytes)
+}
+
+/// Strict implicit proof never uses the playback path's sparse-source fallback.
+pub(super) fn strict_implicit_clock(
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    control_interface: u8,
+    terminal: Option<u8>,
+) -> Option<ClockChoice> {
+    let terminal = terminal?;
+    let descriptor = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .find(|d| {
+            d.interface_number() == control_interface
+                && d.class_code() == USB_CLASS_AUDIO
+                && d.sub_class_code() == USB_SUBCLASS_AUDIOCONTROL
+        })?;
+    let raw;
+    let extra = if descriptor.extra().is_empty() {
+        raw = read_audio_control_descriptors_from_raw_config(handle, config, control_interface)?;
+        raw.as_slice()
+    } else {
+        descriptor.extra()
+    };
+    let graph = ClockGraph::parse(extra);
+    let resolved = graph
+        .resolve_terminal_clock(terminal, |selector| {
+            get_clock_selector_pin(handle, control_interface, selector)
+        })
+        .ok()?;
+    if !resolved.proves_identity_cadence() {
+        return None;
+    }
+    Some(ClockChoice {
+        control_interface,
+        source_id: resolved.clock_id,
+        path: resolved.hops,
+        resolution: crate::clock_resolution::ClockResolution::Resolved,
+    })
+}

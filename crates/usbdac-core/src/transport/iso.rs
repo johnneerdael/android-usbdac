@@ -78,6 +78,7 @@ pub(super) struct IsoTransferSlot {
     pub(super) queued_epoch: u64,
     pub(super) submitted_at: Option<Instant>,
     pub(super) in_flight: bool,
+    retirement_context: Option<Context>,
     /// The flush asked libusb to cancel this transfer. Cleared when it comes
     /// back, whatever its status: a transfer that finished first is still
     /// accounted as played.
@@ -132,6 +133,7 @@ impl IsoTransferSlot {
             queued_epoch: 0,
             submitted_at: None,
             in_flight: false,
+            retirement_context: None,
             cancelled_for_flush: false,
         })
     }
@@ -154,6 +156,7 @@ impl IsoTransferSlot {
             ));
         }
 
+        self.retirement_context = Some(handle.context().clone());
         unsafe {
             let user_data = &mut *self.user_data;
             if payload.transfer_buffer.len() > user_data.buffer.len() {
@@ -209,6 +212,34 @@ impl IsoTransferSlot {
         self.packet_sizes.copy_from_slice(&payload.packet_sizes);
         self.submitted_at = Some(Instant::now());
         self.in_flight = true;
+        Ok(())
+    }
+
+    /// Reuse the capture buffer without copying or exposing captured audio.
+    pub(super) fn submit_capture(&mut self, handle: &DeviceHandle<Context>, endpoint: u8, packet_bytes: usize) -> Result<(), String> {
+        if self.in_flight { return Err("capture slot already submitted".into()); }
+        self.retirement_context = Some(handle.context().clone());
+        unsafe {
+            let data = &mut *self.user_data;
+            data.completion.reset();
+            let bytes = packet_bytes.checked_mul(self.packet_sizes.len()).ok_or("capture size overflow")?;
+            if bytes > data.buffer.len() { return Err("capture buffer too small".into()); }
+            libusb_fill_iso_transfer(self.transfer.as_mut(), handle.as_raw(), endpoint,
+                data.buffer.as_mut_ptr(), bytes as i32, self.packet_sizes.len() as i32,
+                iso_transfer_callback, self.user_data as *mut c_void, ISO_TRANSFER_TIMEOUT_MS);
+            for index in 0..self.packet_sizes.len() {
+                (*self.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(index)).length = packet_bytes as u32;
+            }
+            let result = libusb_submit_transfer(self.transfer.as_ptr());
+            if result != 0 {
+                return Err(if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                    "USB DAC disconnected (implicit capture submit)".into()
+                } else { format!("implicit capture submit failed: {}", result) });
+            }
+            self.packet_sizes.fill(packet_bytes);
+            self.in_flight = true;
+            self.submitted_at = Some(Instant::now());
+        }
         Ok(())
     }
 
@@ -288,14 +319,18 @@ impl IsoTransferSlot {
 impl Drop for IsoTransferSlot {
     fn drop(&mut self) {
         if self.in_flight {
-            // libusb still owns the transfer and its buffer. Freeing either
-            // here risks a use-after-free inside libusb's event thread, so
-            // leak them instead of crashing.
-            dev_eprintln!(
-                "[USB] in-flight isochronous transfer survived teardown drain; leaking slot to avoid use-after-free"
-            );
-            std::mem::forget(unsafe { Box::from_raw(self.user_data) });
-            return;
+            // Also protects unwinding: the handle/FD owner outlives the slots.
+            self.cancel();
+            if let Some(context) = self.retirement_context.clone() {
+                let mut warned = false;
+                while self.in_flight {
+                    if self.take_completion().is_some() { self.mark_completed(); break; }
+                    if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
+                        if !warned { log_warn!("USB unwind cancellation retirement pending: {}", error); warned = true; }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
         }
 
         unsafe {
@@ -322,6 +357,7 @@ pub(super) struct FeedbackTransferSlot {
     pub(super) packet_bytes: usize,
     pub(super) timeout_ms: u32,
     pub(super) in_flight: bool,
+    retirement_context: Option<Context>,
 }
 
 impl FeedbackTransferSlot {
@@ -365,6 +401,7 @@ impl FeedbackTransferSlot {
             packet_bytes,
             timeout_ms,
             in_flight: false,
+            retirement_context: None,
         })
     }
 
@@ -373,6 +410,7 @@ impl FeedbackTransferSlot {
             return Err("feedback transfer slot already in flight".to_string());
         }
 
+        self.retirement_context = Some(handle.context().clone());
         unsafe {
             let user_data = &mut *self.user_data;
             user_data.completion.reset();
@@ -492,11 +530,17 @@ impl FeedbackTransferSlot {
 impl Drop for FeedbackTransferSlot {
     fn drop(&mut self) {
         if self.in_flight {
-            dev_eprintln!(
-                "[USB] in-flight feedback transfer survived teardown drain; leaking slot to avoid use-after-free"
-            );
-            std::mem::forget(unsafe { Box::from_raw(self.user_data) });
-            return;
+            self.cancel();
+            if let Some(context) = self.retirement_context.clone() {
+                let mut warned = false;
+                while self.in_flight {
+                    if self.take_completion().is_some() { self.mark_completed(); break; }
+                    if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
+                        if !warned { log_warn!("USB unwind cancellation retirement pending: {}", error); warned = true; }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
         }
 
         unsafe {

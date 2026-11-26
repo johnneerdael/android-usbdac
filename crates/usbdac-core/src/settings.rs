@@ -56,6 +56,10 @@ impl Settings {
         self.config.allow_unsynchronized_async
     }
 
+    pub(crate) fn disable_feedback(&self) -> bool {
+        self.config.disable_feedback
+    }
+
     pub(crate) fn require_verified_rate(&self) -> bool {
         self.config.require_verified_rate || self.has(Quirk::RequireVerifiedRate)
     }

@@ -18,6 +18,7 @@ public enum class BitPerfectBlocker(
         "unsynchronized_async",
         "The DAC's asynchronous endpoint has no feedback endpoint; the stream is paced at the nominal rate.",
     ),
+    FEEDBACK_UNLOCKED("feedback_unlocked", "The feedback source has not established valid live pacing."),
     PAYLOAD_UNVERIFIED("payload_unverified", "The wire payload audit has not seen real audio yet, or lost it."),
 
     /** A blocker this version of the library does not know. */

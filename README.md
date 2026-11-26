@@ -74,17 +74,19 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   bit order per device).
 - Output: a ring buffer (250 ms target, 500 ms capacity by default) feeds eight
   isochronous transfers in flight, 16 ms queued on the bus at every service
-  interval and for every encoding, never 256 packets; explicit feedback
-  endpoints are polled asynchronously and steer the packet sizes.
+  interval and for every encoding, never 256 packets. Explicit rate reports and
+  implicit capture packet counts steer asynchronous playback packet sizes.
 - Flush: `flush()` drops the ring and cancels what is already on the bus (not
   counted as played, lost or an underrun), so a seek is heard at once.
 - Reporting: played frames and latency counted on completed transfers, lost
   frames (timed-out and short transfers) latched, an audit of the wire payload,
   and `is_bit_perfect()` combining them with the clock verification, with
   `bit_perfect_blocker()` saying what stands in the way.
-- Pacing: asynchronous endpoints without an explicit feedback endpoint (implicit
-  feedback) are refused with `Error::ImplicitFeedbackUnsupported` unless
-  `DacConfig::allow_unsynchronized_async` streams them at the nominal rate.
+- Pacing: implicit feedback uses a compatible IN stream on the same clock and
+  service interval. Only that stream’s packet lengths feed the playback scheduler.
+  An asynchronous route without usable feedback is refused unless
+  `DacConfig::allow_unsynchronized_async` permits nominal timing. See the
+  [engineering handover](docs/design/usb-audio-feedback-handover.md).
 - Volume: the Feature Unit's volume and mute, with read-back verification, a dB
   and a 0..1 view, the level the DAC had before, and a hand-back on close. The
   volume is lowered to at most -40 dB when the DAC opens (never raising a

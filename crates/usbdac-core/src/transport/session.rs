@@ -420,7 +420,7 @@ pub(super) fn set_clock_verification(
 /// What stands in the way of a bit-perfect claim, if anything. The order is the
 /// order of precedence of the reported reason.
 pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBlocker> {
-    if !state.stream_active {
+    if !state.stream_active || state.runtime_stats.as_ref().is_some_and(|stats| stats.failed.load(Ordering::Acquire) || stats.closed.load(Ordering::Acquire)) {
         return Some(BitPerfectBlocker::NoStream);
     }
 
@@ -450,6 +450,9 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
         || requested.channels != effective.channels
     {
         return Some(BitPerfectBlocker::FormatChanged);
+    }
+    if state.runtime_stats.as_ref().is_some_and(|stats| stats.implicit_feedback.load(Ordering::Acquire) && !stats.feedback_locked.load(Ordering::Acquire)) {
+        return Some(BitPerfectBlocker::FeedbackUnlocked);
     }
     if !state.clock_verification_passed {
         return Some(BitPerfectBlocker::ClockUnverified);

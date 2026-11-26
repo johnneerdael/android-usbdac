@@ -138,6 +138,8 @@ public data class DacConfig @JvmOverloads constructor(
      * timing ends in underruns or overruns at the DAC, and the stream is never bit-perfect.
      */
     val allowUnsynchronizedAsync: Boolean = false,
+    /** Disable both feedback modes for diagnosis; nominal async still requires opt-in. */
+    val disableFeedback: Boolean = false,
 
     /** Ask for real-time scheduling (`SCHED_FIFO`, falling back to nice -16) for the USB output thread. Default `true`. */
     val realtimePriority: Boolean = true,

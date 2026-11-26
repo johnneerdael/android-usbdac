@@ -26,8 +26,10 @@ internal object Native {
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 
+    @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
+    @JvmStatic external fun dacAwaitRetirement(): Boolean
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)

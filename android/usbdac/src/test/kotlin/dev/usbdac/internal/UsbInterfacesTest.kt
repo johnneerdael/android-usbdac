@@ -7,6 +7,19 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UsbInterfacesTest {
+    @Test
+    fun optionalClaimRefusalKeepsOtherSourcesAndSkipsBaseClaims() {
+        val attempted = mutableListOf<Int>()
+        val owned = mutableListOf(0, 1)
+        val unavailable = claimOptionalSources(listOf(1, 2, 3, 2, 4), owned.toList()) { id ->
+            attempted += id
+            (id != 3).also { if (it) owned += id }
+        }
+        assertEquals(listOf(2, 3, 4), attempted)
+        assertEquals(listOf(3), unavailable)
+        assertEquals(listOf(0, 1, 2, 4), owned)
+    }
+
     private val audio = 1
     private val hid = 3
 

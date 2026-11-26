@@ -25,6 +25,7 @@ import dev.usbdac.OutputSelector
 import dev.usbdac.SelectedOutput
 import dev.usbdac.ConvertingOutput
 import dev.usbdac.DacStream
+import dev.usbdac.Pacing
 import dev.usbdac.PcmOutput
 import dev.usbdac.StreamFormat
 import dev.usbdac.StreamRequest
@@ -462,13 +463,20 @@ class MainActivity : Activity() {
             statusText.text = if (current == null) "" else runCatching {
                 val rate = current.format.counterRateHz
                 val stats = current.stats()
+                val feedback = when {
+                    stats.feedbackStale -> "stale"
+                    stats.feedbackActive -> "${stats.feedbackReports} reports"
+                    current.format.pacing is Pacing.ExplicitFeedback ||
+                        current.format.pacing is Pacing.ImplicitFeedback -> "waiting for lock"
+                    else -> "off"
+                }
                 "state ${current.state.value}   ${current.bitPerfect.value}\n" +
                     "played ${current.playedFrames} frames (%.1f s)\n".format(current.playedFrames / rate.toDouble()) +
                     "latency ${current.latencyFrames} frames (%.0f ms)   writable ${current.writableBytes} bytes\n".format(
                         current.latencyFrames * 1000.0 / rate,
                     ) +
                     "buffer ${stats.bufferMs}/${stats.bufferTargetMs} ms   underruns ${stats.underruns}   lost ${stats.lostFrames}\n" +
-                    "effective %.1f Hz   feedback ${if (stats.feedbackActive) "${stats.feedbackReports} reports" else "off"}\n".format(
+                    "effective %.1f Hz   feedback $feedback\n".format(
                         stats.effectiveRateHz,
                     ) +
                     describeFormat(current.format)

@@ -50,6 +50,7 @@ internal fun DacConfig.toNativeJson(): String =
         .putIfNotNull("dsd_subslot", dsdSubslot)
         .putIfNotNull("padded_24bit", padded24Bit)
         .put("allow_unsynchronized_async", allowUnsynchronizedAsync)
+        .put("disable_feedback", disableFeedback)
         .put("realtime_priority", realtimePriority)
         .put("hand_back", "keep")
         .put("bus_queue_ms", busQueueMs)
@@ -91,6 +92,8 @@ internal fun deviceInfoJson(
     manufacturerName: String?,
     deviceName: String?,
     claimedInterfaces: List<Int>,
+    configurationId: Int? = null,
+    unavailableFeedbackInterfaces: List<Int> = emptyList(),
 ): String =
     JSONObject()
         .put("vendor_id", vendorId)
@@ -99,4 +102,6 @@ internal fun deviceInfoJson(
         .putIfNotNull("manufacturer_name", manufacturerName)
         .putIfNotNull("device_name", deviceName)
         .put("claimed_interfaces", JSONArray(claimedInterfaces))
+        .putIfNotNull("configuration_id", configurationId)
+        .put("unavailable_feedback_interfaces", JSONArray(unavailableFeedbackInterfaces))
         .toString()

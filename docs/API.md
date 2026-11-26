@@ -144,7 +144,8 @@ dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD by
 | `dsd_subslot` | `None` | Subslot size (1, 2, 4) for native DSD alternate settings. `None`: the device quirk, else the descriptor. |
 | `padded_24bit` | `None` | Prefer the 4-byte subslot for 24-bit PCM. `None`: the device quirk, else off. |
 | `quirks` | empty | `QuirkOverride { vendor_id, product_id, name_contains, quirks: Vec<Quirk> }`, added to the built-in table. |
-| `allow_unsynchronized_async` | `false` | Stream an asynchronous endpoint that has no explicit feedback endpoint at the nominal rate instead of refusing it (see below). |
+| `allow_unsynchronized_async` | `false` | Allow an otherwise valid asynchronous endpoint without usable feedback to stream at the nominal rate. |
+| `disable_feedback` | `false` | Disable both feedback modes for this session. The asynchronous nominal option still applies. |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
 | `startup_volume` | `Attenuate { max_db: -40.0 }` | What `open` does with the hardware volume before any stream can start: `Attenuate { max_db }` lowers every channel to `min(its level, max_db)`, `Keep` leaves it. See section 8. |
@@ -307,6 +308,7 @@ opens, on the same terminal; a DAC whose selector is switched between the two ca
 | Endpoint | `Pacing` |
 |---|---|
 | Asynchronous, explicit feedback endpoint resolved | `ExplicitFeedback { endpoint }` (the feedback endpoint's address; it is polled) |
+| Asynchronous, shared-clock IN stream resolved | `ImplicitFeedback { interface_number, alt_setting, endpoint }` (the capture source supplies frame counts) |
 | Adaptive | `Adaptive` (a declared feedback endpoint is ignored) |
 | Synchronous | `Synchronous` (likewise) |
 | Asynchronous, no feedback endpoint, streamed because `allow_unsynchronized_async` is on | `Unsynchronized` (also the `UnsynchronizedAsync` blocker; never bit-perfect) |
@@ -402,13 +404,17 @@ stream.host_processing() -> bool
 now), `buffer_capacity_ms`, `transfer_queue_depth`,
 `last_turnaround_us`, `max_turnaround_us`, `last_submit_gap_us`,
 `max_submit_gap_us`, `effective_rate_hz`, `feedback_active`,
-`feedback_reports`, `feedback_timeouts`, `feedback_errors`,
+`feedback_locked`, `feedback_empty`, `feedback_reports`, `feedback_timeouts`, `feedback_errors`,
 `feedback_rejected`, `feedback_age_ms`, `feedback_rate_hz`, `feedback_stale`,
 `stable` (lossless transfers for about 256 ms, no underrun, no lost audio),
 `clock_verified` (the DAC confirmed the sampling frequency, or the device quirk
 trusts its `SET_CUR`), `payload_verified` (the wire payload audit passes) and
 `payload_constant_for_ms` (how long the payload has been failing the audit, while
-it does). Frame counters are in `counter_rate_hz()` units.
+it does). Frame counters are in `counter_rate_hz()` units, except implicit
+`implicit_measured_frames` and `implicit_scheduled_frames`, which count USB
+wire frames. Implicit timing stats also report FIFO depth and high-water mark,
+waits, empty OUT queue events, overruns, IN completions, out-of-order
+completions and invalid IN packets.
 
 ### `Error`
 
@@ -418,7 +424,7 @@ it does). Frame counters are in `counter_rate_hz()` units.
 | `PlatformUnsupported` | `platform_unsupported` | Not Linux or Android. |
 | `Claim(String)` | `claim` | Bad descriptor, interfaces not claimed as required, libusb could not take the descriptor. |
 | `Unsupported { reason, offered }` | `unsupported` | No alternate setting carries the request; `offered` lists what the DAC has. |
-| `ImplicitFeedbackUnsupported` | `implicit_feedback_unsupported` | The only endpoint that can carry the request is asynchronous with no explicit feedback endpoint. See below. |
+| `ImplicitFeedbackUnsupported` | `implicit_feedback_unsupported` | The request needs an asynchronous route and no compatible feedback source is available. See below. |
 | `ClockUnverified { requested_hz, reported_hz }` | `clock_unverified` | The DAC did not confirm the rate and `require_verified_rate` is on, or it reported a different rate. |
 | `DeviceLost` | `device_lost` | Unplugged or stopped answering. |
 | `Transfer(String)` | `transfer` | An isochronous transfer or the stream machinery failed. |
@@ -431,15 +437,14 @@ it does). Frame counters are in `counter_rate_hz()` units.
 
 ### Asynchronous endpoints without feedback
 
-An asynchronous OUT endpoint runs on the DAC's own clock and tells the host the
-true rate through an explicit feedback endpoint. One that has no feedback
-endpoint would need *implicit* feedback (rate information carried by an
-associated IN data endpoint), which this library does not do. Left alone, the
-host's packet timing and the DAC's clock drift apart until the DAC under- or
-overruns.
+An asynchronous OUT endpoint runs on the DAC's own clock. Explicit feedback
+reports that rate on a dedicated IN endpoint. Implicit feedback uses whole-frame
+counts from an associated audio IN endpoint with a compatible clock, wire rate
+and service interval. Implicit source selection preserves the playback samples. On Android, any capture-only interface held for feedback is returned
+when the DAC session closes.
 
-By default `negotiate` and `open_stream` therefore refuse such an alternate
-setting with `Error::ImplicitFeedbackUnsupported` when it is the only way to
+By default `negotiate` and `open_stream` refuse an asynchronous route without
+usable feedback with `Error::ImplicitFeedbackUnsupported` when it is the only way to
 carry the request (a DAC that also offers a synchronised alternate setting for
 the same format uses that one). With `DacConfig::allow_unsynchronized_async` the
 stream runs at the nominal rate, host-paced; the format reports `sync_type ==

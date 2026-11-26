@@ -13,7 +13,9 @@ use crate::format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 const DOP_CARRIER_RATES: [u32; 4] = [176_400, 352_800, 705_600, 1_411_200];
 
 /// The transport format a request asks for.
-pub(crate) fn playback_format_from_request(request: &StreamRequest) -> Result<PlaybackFormat, Error> {
+pub(crate) fn playback_format_from_request(
+    request: &StreamRequest,
+) -> Result<PlaybackFormat, Error> {
     let invalid = |message: &str| Err(Error::InvalidArgument(message.to_string()));
     if request.channels == 0 || request.channels > 32 {
         return invalid("channels must be between 1 and 32");
@@ -127,7 +129,13 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     let handle = open_claimed_usb_handle(&device).map_err(Error::Claim)?;
     let usb_device = handle.handle.device();
     let speed = resolve_device_speed(&usb_device);
-    let candidate = select_stream_candidate(&usb_device, &handle.handle, effective, speed);
+    let candidate = select_stream_candidate(
+        &usb_device,
+        &handle.handle,
+        effective,
+        speed,
+        &device.claimed_interfaces,
+    );
     cleanup_claimed_handle(handle, None, lock_requested);
     let candidate = candidate.map_err(|error| error.into_error(offered_alt_settings()))?;
 
@@ -151,9 +159,18 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
         link_speed: link_speed_of(candidate.usb_speed),
         service_interval_us: candidate.service_interval_us,
         // The candidate was admitted, so it has a pacing.
-        pacing: admitted_pacing(
-            candidate.sync_type,
-            candidate.feedback_endpoint.map(|feedback| feedback.address),
+        pacing: candidate.implicit_feedback.as_ref().map_or_else(
+            || {
+                admitted_pacing(
+                    candidate.sync_type,
+                    candidate.feedback_endpoint.map(|feedback| feedback.address),
+                )
+            },
+            |source| crate::Pacing::ImplicitFeedback {
+                interface_number: source.interface_number,
+                alt_setting: source.alt_setting,
+                endpoint: source.address,
+            },
         ),
         clock,
     })
@@ -190,14 +207,16 @@ pub(crate) fn open_stream(format: &StreamFormat, events: EventSink) -> Result<St
             && again.alt_setting == format.alt_setting
             && again.sample_rate == format.sample_rate
             && again.subslot_bytes == format.subslot_bytes
-            && again.valid_bits == format.valid_bits;
+            && again.valid_bits == format.valid_bits
+            && again.endpoint_address == format.endpoint_address
+            && again.pacing == format.pacing;
         if !same {
             return Err(Error::InvalidState(
                 "the DAC no longer offers that format; negotiate again".to_string(),
             ));
         }
     }
-    start_stream(events)
+    start_stream(events, format)
 }
 
 /// The DAC's capabilities, from the descriptor scan done at open.
@@ -207,13 +226,24 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
         return Err(Error::InvalidState("no DAC is open".to_string()));
     };
     let Some(model) = state.capability_model.as_ref() else {
-        return Err(Error::InvalidState("the DAC has not been scanned".to_string()));
+        return Err(Error::InvalidState(
+            "the DAC has not been scanned".to_string(),
+        ));
     };
     let alts = &model.alt_settings;
-    let pcm: Vec<&AltSetting> = alts.iter().filter(|alt| alt.format == AltFormat::Pcm).collect();
-    let dsd: Vec<&AltSetting> = alts.iter().filter(|alt| alt.format == AltFormat::Dsd).collect();
+    let pcm: Vec<&AltSetting> = alts
+        .iter()
+        .filter(|alt| alt.format == AltFormat::Pcm)
+        .collect();
+    let dsd: Vec<&AltSetting> = alts
+        .iter()
+        .filter(|alt| alt.format == AltFormat::Dsd)
+        .collect();
 
-    let mut pcm_sample_rates: Vec<u32> = pcm.iter().flat_map(|alt| alt.sample_rates.iter().copied()).collect();
+    let mut pcm_sample_rates: Vec<u32> = pcm
+        .iter()
+        .flat_map(|alt| alt.sample_rates.iter().copied())
+        .collect();
     pcm_sample_rates.sort_unstable();
     pcm_sample_rates.dedup();
     let mut pcm_bit_depths: Vec<u8> = pcm.iter().map(|alt| alt.valid_bits).collect();
@@ -238,14 +268,20 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     let dop_max_carrier = pcm
         .iter()
         .filter(|alt| alt.valid_bits >= 24)
-        .flat_map(|alt| DOP_CARRIER_RATES.iter().copied().filter(move |rate| supports(alt, *rate)))
+        .flat_map(|alt| {
+            DOP_CARRIER_RATES
+                .iter()
+                .copied()
+                .filter(move |rate| supports(alt, *rate))
+        })
         .max();
     let mut native_dsd_bit_rates: Vec<u32> = dsd
         .iter()
         .flat_map(|alt| {
-            alt.sample_rates
-                .iter()
-                .map(move |rate| rate.saturating_mul(8).saturating_mul(u32::from(alt.subslot_bytes)))
+            alt.sample_rates.iter().map(move |rate| {
+                rate.saturating_mul(8)
+                    .saturating_mul(u32::from(alt.subslot_bytes))
+            })
         })
         .collect();
     native_dsd_bit_rates.sort_unstable();
@@ -284,10 +320,7 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
 
 /// Opens the DAC: checks the host's claims, scans the descriptors, takes the
 /// idle handle and finds the hardware volume control.
-pub(crate) fn open_device(
-    fd: RawFd,
-    info: &crate::capabilities::DeviceInfo,
-) -> Result<(), Error> {
+pub(crate) fn open_device(fd: RawFd, info: &crate::capabilities::DeviceInfo) -> Result<(), Error> {
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         return Err(Error::PlatformUnsupported);
     }
@@ -298,6 +331,12 @@ pub(crate) fn open_device(
         info.product_name.clone(),
         info.device_name.clone(),
         info.claimed_interfaces.clone(),
+    )
+    .map_err(Error::Claim)?;
+    validate_registration_handoff(
+        &device,
+        info.configuration_id,
+        &info.unavailable_feedback_interfaces,
     )
     .map_err(Error::Claim)?;
     register_device(device)?;
@@ -316,3 +355,24 @@ pub(crate) fn close_device(action: u32, timeout: Duration) -> bool {
 pub(crate) const ORIGINAL_VOLUME_ACTION_KEEP: u32 = ORIGINAL_VOLUME_KEEP;
 pub(crate) const ORIGINAL_VOLUME_ACTION_RESTORE: u32 = ORIGINAL_VOLUME_RESTORE;
 pub(crate) const ORIGINAL_VOLUME_ACTION_FORGET: u32 = ORIGINAL_VOLUME_FORGET;
+
+/// Read-only descriptor and clock-route preflight; never activates capture.
+pub(crate) fn feedback_preflight(
+    fd: RawFd,
+    info: &crate::DeviceInfo,
+) -> Result<(u8, Vec<u8>), Error> {
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        info.claimed_interfaces.clone(),
+    )
+    .map_err(Error::Claim)?;
+    preflight_implicit_feedback_interfaces(&device).map_err(Error::Claim)
+}
+
+pub(crate) fn await_usb_retirement(timeout: Duration) -> bool {
+    wait_for_session_stop(timeout) && !super::session::session_registered()
+}

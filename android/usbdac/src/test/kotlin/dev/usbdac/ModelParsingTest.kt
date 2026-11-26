@@ -18,6 +18,21 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
+    fun implicitPacingKeepsSourceAndLiveLockSeparate() {
+        val json = JSONObject(Fixtures.FORMAT)
+            .put("explicit_feedback", false)
+            .put("pacing", JSONObject().put("mode", "implicit_feedback").put("implicit_feedback",
+                JSONObject().put("interface_number", 2).put("alt_setting", 3).put("endpoint", 130)))
+        val format = parseStreamFormat(json.toString())
+        assertEquals(Pacing.ImplicitFeedback(2, 3, 130), format.pacing)
+        assertFalse(format.explicitFeedback)
+        assertTrue(JSONObject(DacConfig(disableFeedback = true).toNativeJson()).getBoolean("disable_feedback"))
+        val claims = JSONObject(deviceInfoJson(1, 2, null, null, null, listOf(0, 1, 2), 4, listOf(3)))
+        assertEquals(4, claims.getInt("configuration_id"))
+        assertEquals(3, claims.getJSONArray("unavailable_feedback_interfaces").getInt(0))
+    }
+
+    @Test
     fun capabilitiesParseFromTheDocumentedSchema() {
         val capabilities = parseCapabilities(Fixtures.CAPABILITIES)
         assertEquals(UacVersion.V2, capabilities.uacVersion)

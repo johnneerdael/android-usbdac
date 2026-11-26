@@ -43,8 +43,19 @@ fn sync(kind: SyncKind) -> &'static str {
 /// `{ "mode": "explicit_feedback", "feedback_endpoint": 129 }`; the endpoint is `null`
 /// for every other mode.
 pub fn pacing(pacing: Pacing) -> Value {
+    let implicit = match pacing {
+        Pacing::ImplicitFeedback {
+            interface_number,
+            alt_setting,
+            endpoint,
+        } => Some(
+            json!({ "interface_number": interface_number, "alt_setting": alt_setting, "endpoint": endpoint }),
+        ),
+        _ => None,
+    };
     json!({
         "mode": pacing.code(),
+        "implicit_feedback": implicit,
         "feedback_endpoint": pacing.feedback_endpoint(),
     })
 }
@@ -180,7 +191,7 @@ pub fn stream_format(format_id: u64, format: &StreamFormat) -> Value {
 }
 
 pub fn stream_stats(stats: &StreamStats) -> Value {
-    json!({
+    let Value::Object(mut value) = json!({
         "state": stats.state.code(),
         "bit_perfect": stats.bit_perfect,
         "bit_perfect_blocker": stats.bit_perfect_blocker.map(|blocker| blocker.code()),
@@ -206,7 +217,24 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
         "last_submit_gap_us": stats.last_submit_gap_us,
         "max_submit_gap_us": stats.max_submit_gap_us,
         "effective_rate_hz": stats.effective_rate_hz,
+    }) else {
+        unreachable!("stats serialize as an object")
+    };
+    let Value::Object(feedback) = json!({
         "feedback_active": stats.feedback_active,
+        "feedback_locked": stats.feedback_locked,
+        "feedback_empty": stats.feedback_empty,
+        "implicit_fifo_depth": stats.implicit_fifo_depth,
+        "implicit_fifo_high_water": stats.implicit_fifo_high_water,
+        "implicit_waits": stats.implicit_waits,
+        "implicit_empty_bus": stats.implicit_empty_bus,
+        "implicit_overruns": stats.implicit_overruns,
+        "implicit_in_transfers": stats.implicit_in_transfers,
+        "implicit_out_of_order": stats.implicit_out_of_order,
+        "implicit_invalid_packets": stats.implicit_invalid_packets,
+        "implicit_measured_frames": stats.implicit_measured_frames,
+        "implicit_scheduled_frames": stats.implicit_scheduled_frames,
+
         "feedback_reports": stats.feedback_reports,
         "feedback_timeouts": stats.feedback_timeouts,
         "feedback_errors": stats.feedback_errors,
@@ -214,7 +242,11 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
         "feedback_age_ms": stats.feedback_age_ms,
         "feedback_rate_hz": stats.feedback_rate_hz,
         "feedback_stale": stats.feedback_stale,
-    })
+    }) else {
+        unreachable!("feedback stats serialize as an object")
+    };
+    value.extend(feedback);
+    Value::Object(value)
 }
 
 /// Event type codes of `onEvent(type, a, b, message)`.
@@ -251,7 +283,12 @@ pub fn error_code(error: &Error) -> i64 {
 /// The `(type, a, b, message)` of an `onEvent` call.
 pub fn event(event: &DacEvent) -> (i32, i64, f64, Option<String>) {
     match event {
-        DacEvent::StateChanged(state) => (event_type::STATE_CHANGED, i64::from(state.code()), 0.0, None),
+        DacEvent::StateChanged(state) => (
+            event_type::STATE_CHANGED,
+            i64::from(state.code()),
+            0.0,
+            None,
+        ),
         DacEvent::Underrun => (event_type::UNDERRUN, 0, 0.0, None),
         DacEvent::LostFrames { frames } => (
             event_type::LOST_FRAMES,
@@ -259,7 +296,9 @@ pub fn event(event: &DacEvent) -> (i32, i64, f64, Option<String>) {
             0.0,
             None,
         ),
-        DacEvent::BitPerfectChanged(on) => (event_type::BIT_PERFECT_CHANGED, i64::from(*on), 0.0, None),
+        DacEvent::BitPerfectChanged(on) => {
+            (event_type::BIT_PERFECT_CHANGED, i64::from(*on), 0.0, None)
+        }
         DacEvent::VolumeChanged(state) => (
             event_type::VOLUME_CHANGED,
             match state.muted {
@@ -400,7 +439,24 @@ pub fn parse_device_info(json: &str) -> Decoded<DeviceInfo> {
             let number = entry
                 .as_u64()
                 .ok_or_else(|| BadRequest("claimed_interfaces holds interface numbers".into()))?;
-            info.claimed_interfaces.push(narrow(number, "claimed_interfaces")?);
+            info.claimed_interfaces
+                .push(narrow(number, "claimed_interfaces")?);
+        }
+    }
+    if let Some(value) = uint(map, "configuration_id")? {
+        info.configuration_id = Some(narrow(value, "configuration_id")?);
+    }
+    if let Some(list) = map.get("unavailable_feedback_interfaces") {
+        for entry in list
+            .as_array()
+            .ok_or_else(|| BadRequest("unavailable_feedback_interfaces must be an array".into()))?
+        {
+            info.unavailable_feedback_interfaces.push(narrow(
+                entry.as_u64().ok_or_else(|| {
+                    BadRequest("unavailable_feedback_interfaces holds interface numbers".into())
+                })?,
+                "unavailable_feedback_interfaces",
+            )?);
         }
     }
     Ok(info)
@@ -425,11 +481,15 @@ fn parse_quirk(value: &Value) -> Decoded<Quirk> {
                 .ok_or_else(|| BadRequest(format!("quirk {name} takes a number")))?;
             match name.as_str() {
                 "settle_delay_ms" => Ok(Quirk::SettleDelayMs(number)),
-                "dsd_subslot_size" => Ok(Quirk::DsdSubslotSize(narrow(number, "dsd_subslot_size")?)),
+                "dsd_subslot_size" => {
+                    Ok(Quirk::DsdSubslotSize(narrow(number, "dsd_subslot_size")?))
+                }
                 other => Err(unknown(other)),
             }
         }
-        _ => Err(BadRequest("a quirk is a name or a single-entry object".into())),
+        _ => Err(BadRequest(
+            "a quirk is a name or a single-entry object".into(),
+        )),
     }
 }
 
@@ -461,6 +521,9 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
         config.dsd_subslot = Some(narrow(subslot, "dsd_subslot")?);
     }
     config.padded_24bit = boolean(map, "padded_24bit")?;
+    if let Some(value) = boolean(map, "disable_feedback")? {
+        config.disable_feedback = value;
+    }
     if let Some(value) = boolean(map, "allow_unsynchronized_async")? {
         config.allow_unsynchronized_async = value;
     }
@@ -530,10 +593,14 @@ mod tests {
 
     #[test]
     fn requests_decode_for_each_encoding() {
-        let pcm = parse_request(r#"{"sample_rate":44100,"channels":2,"bit_depth":16}"#).ok().unwrap();
+        let pcm = parse_request(r#"{"sample_rate":44100,"channels":2,"bit_depth":16}"#)
+            .ok()
+            .unwrap();
         assert_eq!(pcm, StreamRequest::pcm(44_100, 2, 16));
 
-        let dop = parse_request(r#"{"encoding":"dop","dsd_bit_rate":2822400,"channels":2}"#).ok().unwrap();
+        let dop = parse_request(r#"{"encoding":"dop","dsd_bit_rate":2822400,"channels":2}"#)
+            .ok()
+            .unwrap();
         assert_eq!(dop, StreamRequest::dop(2_822_400, 2));
 
         let native = parse_request(
@@ -551,12 +618,23 @@ mod tests {
     fn a_bad_request_says_what_is_wrong() {
         for (json, needle) in [
             ("[]", "JSON object"),
-            (r#"{"channels":2,"bit_depth":16}"#, "sample_rate is required"),
-            (r#"{"channels":2,"sample_rate":44100,"bit_depth":16,"encoding":"mp3"}"#, "unknown encoding"),
-            (r#"{"channels":99999,"sample_rate":44100,"bit_depth":16}"#, "out of range"),
+            (
+                r#"{"channels":2,"bit_depth":16}"#,
+                "sample_rate is required",
+            ),
+            (
+                r#"{"channels":2,"sample_rate":44100,"bit_depth":16,"encoding":"mp3"}"#,
+                "unknown encoding",
+            ),
+            (
+                r#"{"channels":99999,"sample_rate":44100,"bit_depth":16}"#,
+                "out of range",
+            ),
             ("{", "stream request"),
         ] {
-            let error = parse_request(json).err().unwrap_or_else(|| panic!("{json} must fail"));
+            let error = parse_request(json)
+                .err()
+                .unwrap_or_else(|| panic!("{json} must fail"));
             assert!(error.0.contains(needle), "{json}: {}", error.0);
         }
     }
@@ -585,16 +663,27 @@ mod tests {
         assert_eq!(config.hand_back, HandBack::Keep);
         assert!(config.allow_unsynchronized_async);
         assert_eq!(config.dsd_big_endian, Some(true));
-        assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (16, 8), "unset: the defaults");
+        assert_eq!(
+            (config.bus_queue_ms, config.transfers_in_flight),
+            (16, 8),
+            "unset: the defaults"
+        );
         assert!(config.cancel_in_flight_on_flush, "unset: on");
         assert_eq!(config.quirks.len(), 1);
         assert_eq!(
             config.quirks[0].quirks,
-            vec![Quirk::SkipClockValidation, Quirk::SettleDelayMs(80), Quirk::DsdSubslotSize(2)]
+            vec![
+                Quirk::SkipClockValidation,
+                Quirk::SettleDelayMs(80),
+                Quirk::DsdSubslotSize(2)
+            ]
         );
         assert_eq!(parse_config(None).ok().unwrap(), DacConfig::default());
         assert!(parse_config(Some(r#"{"hand_back":"sometimes"}"#)).is_err());
-        assert!(parse_config(Some(r#"{"quirks":[{"vendor_id":1,"product_id":2,"quirks":["nope"]}]}"#)).is_err());
+        assert!(parse_config(Some(
+            r#"{"quirks":[{"vendor_id":1,"product_id":2,"quirks":["nope"]}]}"#
+        ))
+        .is_err());
     }
 
     #[test]
@@ -604,16 +693,29 @@ mod tests {
             .unwrap();
         assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (32, 4));
         config.validate().unwrap();
-        assert!(parse_config(Some(r#"{"bus_queue_ms":-1}"#)).is_err(), "not a non-negative integer");
+        assert!(
+            parse_config(Some(r#"{"bus_queue_ms":-1}"#)).is_err(),
+            "not a non-negative integer"
+        );
         // Out-of-range values decode; the core's validation names them at open.
         let out_of_range = parse_config(Some(r#"{"bus_queue_ms":3}"#)).ok().unwrap();
-        assert!(matches!(out_of_range.validate(), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            out_of_range.validate(),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
     fn the_flush_cancel_key_decodes_and_defaults_on() {
-        assert!(parse_config(Some("{}")).ok().unwrap().cancel_in_flight_on_flush);
-        let off = parse_config(Some(r#"{"cancel_in_flight_on_flush":false}"#)).ok().unwrap();
+        assert!(
+            parse_config(Some("{}"))
+                .ok()
+                .unwrap()
+                .cancel_in_flight_on_flush
+        );
+        let off = parse_config(Some(r#"{"cancel_in_flight_on_flush":false}"#))
+            .ok()
+            .unwrap();
         assert!(!off.cancel_in_flight_on_flush);
         assert!(parse_config(Some(r#"{"cancel_in_flight_on_flush":"no"}"#)).is_err());
     }
@@ -621,31 +723,50 @@ mod tests {
     #[test]
     fn the_startup_volume_keys_decode_and_default_to_protection() {
         let defaults = parse_config(Some("{}")).ok().unwrap();
-        assert_eq!(defaults.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+        assert_eq!(
+            defaults.startup_volume,
+            StartupVolume::Attenuate { max_db: -40.0 }
+        );
         assert!(defaults.require_hardware_volume);
 
-        let keep = parse_config(Some(r#"{"startup_volume":"keep","require_hardware_volume":false}"#))
-            .ok()
-            .unwrap();
+        let keep = parse_config(Some(
+            r#"{"startup_volume":"keep","require_hardware_volume":false}"#,
+        ))
+        .ok()
+        .unwrap();
         assert_eq!(keep.startup_volume, StartupVolume::Keep);
         assert!(!keep.require_hardware_volume);
 
-        let ceiling = parse_config(Some(r#"{"startup_volume":"attenuate","startup_volume_max_db":-25.5}"#))
-            .ok()
-            .unwrap();
-        assert_eq!(ceiling.startup_volume, StartupVolume::Attenuate { max_db: -25.5 });
+        let ceiling = parse_config(Some(
+            r#"{"startup_volume":"attenuate","startup_volume_max_db":-25.5}"#,
+        ))
+        .ok()
+        .unwrap();
+        assert_eq!(
+            ceiling.startup_volume,
+            StartupVolume::Attenuate { max_db: -25.5 }
+        );
         // A ceiling alone means attenuate; "keep" ignores it.
-        let alone = parse_config(Some(r#"{"startup_volume_max_db":-30}"#)).ok().unwrap();
-        assert_eq!(alone.startup_volume, StartupVolume::Attenuate { max_db: -30.0 });
-        let ignored = parse_config(Some(r#"{"startup_volume":"keep","startup_volume_max_db":-30}"#))
+        let alone = parse_config(Some(r#"{"startup_volume_max_db":-30}"#))
             .ok()
             .unwrap();
+        assert_eq!(
+            alone.startup_volume,
+            StartupVolume::Attenuate { max_db: -30.0 }
+        );
+        let ignored = parse_config(Some(
+            r#"{"startup_volume":"keep","startup_volume_max_db":-30}"#,
+        ))
+        .ok()
+        .unwrap();
         assert_eq!(ignored.startup_volume, StartupVolume::Keep);
 
         assert!(parse_config(Some(r#"{"startup_volume":"loud"}"#)).is_err());
         assert!(parse_config(Some(r#"{"startup_volume_max_db":"quiet"}"#)).is_err());
         // Out-of-range values decode; validation names them at open.
-        let loud = parse_config(Some(r#"{"startup_volume_max_db":6}"#)).ok().unwrap();
+        let loud = parse_config(Some(r#"{"startup_volume_max_db":6}"#))
+            .ok()
+            .unwrap();
         assert!(matches!(loud.validate(), Err(Error::InvalidArgument(_))));
     }
 
@@ -658,17 +779,43 @@ mod tests {
     }
 
     #[test]
+    fn implicit_source_and_claim_plan_preserve_identity() {
+        assert_eq!(
+            pacing(Pacing::ImplicitFeedback {
+                interface_number: 2,
+                alt_setting: 3,
+                endpoint: 0x82
+            }),
+            json!({"mode":"implicit_feedback","feedback_endpoint":null,"implicit_feedback":{"interface_number":2,"alt_setting":3,"endpoint":130}})
+        );
+        let info = parse_device_info(r#"{"vendor_id":1,"product_id":2,"configuration_id":4,"claimed_interfaces":[0,1,2],"unavailable_feedback_interfaces":[3]}"#).ok().unwrap();
+        assert_eq!(info.configuration_id, Some(4));
+        assert_eq!(info.claimed_interfaces, [0, 1, 2]);
+        assert_eq!(info.unavailable_feedback_interfaces, [3]);
+        assert!(
+            parse_config(Some(r#"{"disable_feedback":true}"#))
+                .ok()
+                .unwrap()
+                .disable_feedback
+        );
+        assert!(!parse_config(None).ok().unwrap().disable_feedback);
+    }
+
+    #[test]
     fn pacing_encodes_its_mode_and_only_an_explicit_feedback_endpoint() {
         assert_eq!(
             pacing(Pacing::ExplicitFeedback { endpoint: 0x81 }),
-            json!({ "mode": "explicit_feedback", "feedback_endpoint": 129 })
+            json!({ "mode": "explicit_feedback", "feedback_endpoint": 129, "implicit_feedback": null })
         );
         for (value, mode) in [
             (Pacing::Adaptive, "adaptive"),
             (Pacing::Synchronous, "synchronous"),
             (Pacing::Unsynchronized, "unsynchronized"),
         ] {
-            assert_eq!(pacing(value), json!({ "mode": mode, "feedback_endpoint": null }));
+            assert_eq!(
+                pacing(value),
+                json!({ "mode": mode, "feedback_endpoint": null, "implicit_feedback": null })
+            );
         }
     }
 
@@ -679,13 +826,25 @@ mod tests {
             control_interface: 0,
             source_id: 5,
             path: vec![
-                ClockHop { id: 1, kind: ClockHopKind::Terminal },
+                ClockHop {
+                    id: 1,
+                    kind: ClockHopKind::Terminal,
+                },
                 ClockHop {
                     id: 9,
-                    kind: ClockHopKind::Selector { selected_pin: 2, pin_count: 2 },
+                    kind: ClockHopKind::Selector {
+                        selected_pin: 2,
+                        pin_count: 2,
+                    },
                 },
-                ClockHop { id: 8, kind: ClockHopKind::Multiplier },
-                ClockHop { id: 5, kind: ClockHopKind::Source },
+                ClockHop {
+                    id: 8,
+                    kind: ClockHopKind::Multiplier,
+                },
+                ClockHop {
+                    id: 5,
+                    kind: ClockHopKind::Source,
+                },
             ],
             resolution: ClockResolution::Resolved,
         };
@@ -707,7 +866,10 @@ mod tests {
         let fallback = ClockChoice {
             control_interface: 0,
             source_id: 4,
-            path: vec![ClockHop { id: 4, kind: ClockHopKind::Source }],
+            path: vec![ClockHop {
+                id: 4,
+                kind: ClockHopKind::Source,
+            }],
             resolution: ClockResolution::FallbackFirstSource,
         };
         let value = clock_choice(&fallback);
@@ -718,9 +880,15 @@ mod tests {
     #[test]
     fn events_encode_to_the_documented_codes() {
         use usbdac_core::StreamState;
-        assert_eq!(event(&DacEvent::StateChanged(StreamState::Paused)), (0, 2, 0.0, None));
+        assert_eq!(
+            event(&DacEvent::StateChanged(StreamState::Paused)),
+            (0, 2, 0.0, None)
+        );
         assert_eq!(event(&DacEvent::Underrun), (1, 0, 0.0, None));
-        assert_eq!(event(&DacEvent::LostFrames { frames: 44 }), (2, 44, 0.0, None));
+        assert_eq!(
+            event(&DacEvent::LostFrames { frames: 44 }),
+            (2, 44, 0.0, None)
+        );
         assert_eq!(event(&DacEvent::BitPerfectChanged(true)), (3, 1, 0.0, None));
         assert_eq!(event(&DacEvent::FeedbackStale), (5, 0, 0.0, None));
         assert_eq!(event(&DacEvent::DeviceLost), (7, 0, 0.0, None));

@@ -11,7 +11,9 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import dev.usbdac.internal.ClaimedInterfaces
 import dev.usbdac.internal.Native
-import dev.usbdac.internal.activeInterfaces
+import dev.usbdac.internal.interfaces
+import dev.usbdac.internal.activeConfiguration
+import org.json.JSONObject
 import dev.usbdac.internal.allInterfaces
 import dev.usbdac.internal.deviceInfoJson
 import dev.usbdac.internal.hasPlayback
@@ -192,23 +194,38 @@ public object UsbDac {
             val fd = connection.fileDescriptor
             if (fd < 0) throw DacException(DacErrorCode.OPEN_FAILED, "Android gave no file descriptor for ${device.productName}")
 
-            val interfaces = device.device.activeInterfaces(connection)
+            val activeConfiguration = device.device.activeConfiguration(connection)
+            val interfaces = activeConfiguration.interfaces()
             val plan = planClaims(interfaces.map { it.toInfo() })
                 ?: throw DacException(
                     DacErrorCode.UNSUPPORTED,
                     "${device.productName} has no AudioControl interface together with a playback AudioStreaming interface",
                 )
-            claims = ClaimedInterfaces.claim(connection, interfaces, plan, device.productName)
+            val ownedClaims = ClaimedInterfaces.claim(connection, interfaces, plan, device.productName)
+            claims = ownedClaims
 
-            val infoJson = deviceInfoJson(
+            fun infoJson(configurationId: Int? = null, unavailable: List<Int> = emptyList()) = deviceInfoJson(
                 vendorId = device.vendorId,
                 productId = device.productId,
                 productName = device.productName,
                 manufacturerName = device.manufacturerName,
                 deviceName = device.deviceName,
-                claimedInterfaces = claims.ids,
+                claimedInterfaces = ownedClaims.ids,
+                configurationId = configurationId,
+                unavailableFeedbackInterfaces = unavailable,
             )
-            val dac = nativeCall { Native.dacOpen(fd, infoJson, config.toNativeJson()) }
+            var configurationId: Int? = activeConfiguration.id
+            var unavailable: List<Int> = emptyList()
+            if (!config.disableFeedback) {
+                val preflight = JSONObject(nativeCall { Native.dacFeedbackPreflight(fd, infoJson()) })
+                configurationId = preflight.getInt("configuration_id")
+                if (activeConfiguration.id != configurationId || device.device.activeConfiguration(connection).id != configurationId) {
+                    throw DacException(DacErrorCode.CLAIM, "The active USB configuration changed during feedback preflight.")
+                }
+                val sources = preflight.getJSONArray("interfaces")
+                unavailable = ownedClaims.claimOptional(interfaces, (0 until sources.length()).map(sources::getInt))
+            }
+            val dac = nativeCall { Native.dacOpen(fd, infoJson(configurationId, unavailable), config.toNativeJson()) }
             val session = try {
                 DacSession.create(dac, device, config, connection, claims) { sessionOpen.set(false) }
             } catch (error: Throwable) {

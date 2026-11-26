@@ -26,8 +26,13 @@ pub(super) fn negotiate_playback_format(
     let negotiated = (|| {
         let usb_device = claimed_handle.handle.device();
         let speed = resolve_device_speed(&usb_device);
-        let capability_model =
-            build_usb_capability_model(&usb_device, &claimed_handle.handle, speed).ok();
+        let capability_model = build_usb_capability_model(
+            &usb_device,
+            &claimed_handle.handle,
+            speed,
+            &claimed_handle.claimed_interfaces,
+        )
+        .ok();
         set_capability_model(capability_model.clone());
 
         let candidate = match select_stream_candidate(
@@ -35,6 +40,7 @@ pub(super) fn negotiate_playback_format(
             &claimed_handle.handle,
             requested_format,
             speed,
+            &claimed_handle.claimed_interfaces,
         ) {
             Ok(c) => c,
             Err(error) => {
@@ -46,15 +52,12 @@ pub(super) fn negotiate_playback_format(
 
         // Find clock entity AFTER selecting candidate so we can trace the
         // topology using the candidate's bTerminalLink.
-        let clock = find_audio_control_clock_choice(
-            &usb_device,
-            &claimed_handle.handle,
-            candidate.terminal_link,
-        )
-        .map(|(clock, choice)| {
-            clock_choice = Some(choice);
-            clock
-        });
+        let clock =
+            candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
+                .map(|(clock, choice)| {
+                    clock_choice = Some(choice);
+                    clock
+                });
 
         if let Err(error) = claimed_handle.ensure_interface_claimed(candidate.interface_number) {
             set_last_error(Some(error.clone()));
@@ -175,6 +178,7 @@ pub(super) fn negotiate_playback_format(
                 &claimed_handle.handle,
                 speed,
                 requested_format,
+                &claimed_handle.claimed_interfaces,
             )? {
                 effective_format.sample_rate = actual_rate;
                 dac_mode = if actual_rate == requested_format.sample_rate {
@@ -207,7 +211,8 @@ pub(super) fn negotiate_playback_format(
                 Ok(()) => {
                     dev_eprintln!(
                         "[USB] UAC1 SET_CUR: endpoint=0x{:02x} rate={}Hz",
-                        candidate.endpoint_address, requested_format.sample_rate
+                        candidate.endpoint_address,
+                        requested_format.sample_rate
                     );
                     dac_mode = DacMode::FixedClock;
                     reported_rate = Some(requested_format.sample_rate);
@@ -219,7 +224,8 @@ pub(super) fn negotiate_playback_format(
                 Err(e) => {
                     dev_eprintln!(
                         "[USB] UAC1 SET_CUR failed for endpoint=0x{:02x}: {}",
-                        candidate.endpoint_address, e
+                        candidate.endpoint_address,
+                        e
                     );
                     // Defer the verdict: many UAC1 DACs (FiiO BR13) STALL every
                     // SET_CUR encoding while the streaming alt setting is
@@ -244,6 +250,7 @@ pub(super) fn negotiate_playback_format(
             &claimed_handle.handle,
             speed,
             requested_format,
+            &claimed_handle.claimed_interfaces,
         )? {
             effective_format.sample_rate = actual_rate;
             dac_mode = if actual_rate == requested_format.sample_rate {
@@ -273,6 +280,29 @@ pub(super) fn negotiate_playback_format(
             last_message = Some(message);
         }
 
+        // A changed effective rate must satisfy the same pairing and capacity
+        // proof. In particular an implicit clock cannot silently degrade to the
+        // playback path's unverified fixed-clock fallback.
+        if candidate.implicit_feedback.is_some() {
+            if !rate_verified
+                || clock_choice.as_ref().is_none_or(|choice| {
+                    choice.resolution != crate::clock_resolution::ClockResolution::Resolved
+                })
+            {
+                return Err(Error::ImplicitFeedbackUnsupported);
+            }
+            let selected = select_stream_candidate(
+                &usb_device,
+                &claimed_handle.handle,
+                effective_format,
+                speed,
+                &claimed_handle.claimed_interfaces,
+            )
+            .map_err(|e| e.into_error(offered_alt_settings()))?;
+            if selected.implicit_feedback != candidate.implicit_feedback {
+                return Err(Error::ImplicitFeedbackUnsupported);
+            }
+        }
         reported_rate = reported_rate.or(Some(effective_format.sample_rate));
         set_effective_playback_format(effective_format);
         set_dac_mode(dac_mode);
@@ -301,6 +331,7 @@ pub(super) fn choose_adaptive_sample_rate(
     handle: &DeviceHandle<Context>,
     speed: Speed,
     requested_format: PlaybackFormat,
+    claimed_interfaces: &[u8],
 ) -> Result<Option<u32>, crate::Error> {
     let has_rate_evidence = current_rate.is_some()
         || supported_ranges.is_some_and(|ranges| !ranges.is_empty())
@@ -347,7 +378,9 @@ pub(super) fn choose_adaptive_sample_rate(
             sample_rate: candidate_rate,
             ..requested_format
         };
-        if select_stream_candidate(device, handle, candidate_format, speed).is_ok() {
+        if select_stream_candidate(device, handle, candidate_format, speed, claimed_interfaces)
+            .is_ok()
+        {
             return Ok(Some(candidate_rate));
         }
     }
@@ -405,9 +438,7 @@ pub(super) fn candidate_rates_from_supported_ranges(
     candidates
 }
 
-pub(super) fn sanitize_playback_format(
-    playback_format: PlaybackFormat,
-) -> PlaybackFormat {
+pub(super) fn sanitize_playback_format(playback_format: PlaybackFormat) -> PlaybackFormat {
     let bit_depth = if playback_format.is_dop {
         match playback_format.bit_depth {
             24 | 32 => playback_format.bit_depth,
@@ -490,4 +521,3 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
         playback_format,
     )
 }
-

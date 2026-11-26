@@ -1,5 +1,28 @@
 use super::*;
 
+/// Keep alternate ownership with the handle, including spawn failure and
+/// unwinding. Declared before the transfer pools so their Drops retire USB
+/// callbacks before this owner resets interfaces or releases the handle.
+pub(super) struct StreamUsbOwner {
+    claimed: Option<ClaimedHandle>,
+    lock_requested: bool,
+}
+impl StreamUsbOwner {
+    fn new(claimed: ClaimedHandle, lock_requested: bool) -> Self {
+        Self { claimed: Some(claimed), lock_requested }
+    }
+    pub(super) fn claimed(&self) -> &ClaimedHandle {
+        self.claimed.as_ref().expect("live USB stream owner")
+    }
+}
+impl Drop for StreamUsbOwner {
+    fn drop(&mut self) {
+        if let Some(claimed) = self.claimed.take() {
+            cleanup_claimed_handle(claimed, None, self.lock_requested);
+        }
+    }
+}
+
 /// What a running stream hands back to its owner.
 pub(crate) struct StreamHandle {
     pub(crate) stop: Arc<AtomicBool>,
@@ -8,16 +31,22 @@ pub(crate) struct StreamHandle {
 }
 
 impl StreamHandle {
-    /// Stops the output thread and waits for it. Idempotent.
+    /// Request stop and wait briefly; a stalled cancellation retains ownership in the worker.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
         match self.thread.take() {
-            Some(handle) => handle.join().map_err(|payload| {
-                format!(
-                    "USB output thread panicked: {}",
-                    panic_payload_message(payload.as_ref())
-                )
-            }),
+            Some(handle) => {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !handle.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if !handle.is_finished() {
+                    // The worker retains SessionGuard, context, handle, FD and
+                    // all transfer storage until cancellation really retires.
+                    return Err("USB output is still retiring cancelled transfers".into());
+                }
+                handle.join().map_err(|payload| format!("USB output thread panicked: {}", panic_payload_message(payload.as_ref())))
+            }
             None => Ok(()),
         }
     }
@@ -31,7 +60,7 @@ impl Drop for StreamHandle {
 
 /// Opens the stream for the format the negotiation stored: programs the clock,
 /// switches the alternate setting and starts the output thread.
-pub(crate) fn start_stream(events: EventSink) -> Result<StreamHandle, Error> {
+pub(crate) fn start_stream(events: EventSink, expected: &crate::StreamFormat) -> Result<StreamHandle, Error> {
     // Wait briefly for a previous stream's thread to finish its teardown: a
     // stream closed a moment ago may still be releasing the interface.
     for attempt in 0..15 {
@@ -56,13 +85,14 @@ pub(crate) fn start_stream(events: EventSink) -> Result<StreamHandle, Error> {
         }
         Arc::new(SessionGuard::start_locked())
     };
-    start_stream_inner(events, &session)
+    start_stream_inner(events, &session, expected)
 }
 
 #[allow(unused_assignments)]
 pub(super) fn start_stream_inner(
     events: EventSink,
     session: &Arc<SessionGuard>,
+    expected: &crate::StreamFormat,
 ) -> Result<StreamHandle, Error> {
     let config = settings().config.clone();
     let (state, mut playback_format) = {
@@ -91,10 +121,10 @@ pub(super) fn start_stream_inner(
     let speed = resolve_device_speed(&device);
     let lock_requested = current_lock_requested_for_fd(state.device.fd);
     set_capability_model(
-        build_usb_capability_model(&device, &claimed_handle.handle, speed).ok(),
+        build_usb_capability_model(&device, &claimed_handle.handle, speed, &claimed_handle.claimed_interfaces).ok(),
     );
     let candidate =
-        match select_stream_candidate(&device, &claimed_handle.handle, playback_format, speed) {
+        match select_stream_candidate(&device, &claimed_handle.handle, playback_format, speed, &claimed_handle.claimed_interfaces) {
             Ok(candidate) => candidate,
             Err(error) => {
                 set_last_error(Some(error.message().to_string()));
@@ -107,6 +137,24 @@ pub(super) fn start_stream_inner(
                 return Err(error.into_error(offered_alt_settings()));
             }
         };
+    let selected_pacing = if let Some(source) = candidate.implicit_feedback {
+        crate::capabilities::Pacing::ImplicitFeedback { interface_number: source.interface_number,
+            alt_setting: source.alt_setting, endpoint: source.address }
+    } else if candidate.feedback_endpoint.is_some() {
+        crate::capabilities::Pacing::ExplicitFeedback { endpoint: candidate.feedback_endpoint.unwrap().address }
+    } else if candidate.sync_type == SyncType::Asynchronous {
+        crate::capabilities::Pacing::Unsynchronized
+    } else { expected.pacing };
+    let selected_rate = if playback_format.dsd_transport == DsdTransportMode::Native {
+        playback_format.dsd_bit_rate / (8 * u32::from(candidate.subslot_size).max(1))
+    } else { playback_format.sample_rate };
+    if expected.interface_number != candidate.interface_number || expected.alt_setting != candidate.alt_setting
+        || expected.endpoint_address != candidate.endpoint_address || expected.pacing != selected_pacing
+        || expected.sample_rate != selected_rate || expected.subslot_bytes != candidate.subslot_size
+        || expected.channels != candidate.channels || expected.service_interval_us != candidate.service_interval_us {
+        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        return Err(Error::InvalidState("USB stream candidate changed since negotiation; negotiate again".into()));
+    }
     if playback_format.dsd_transport == DsdTransportMode::Native {
         // Native DSD clock frames contain subslot_size bytes per channel.
         // The producer still supplies interleaved byte-rate samples.
@@ -129,7 +177,12 @@ pub(super) fn start_stream_inner(
             current.requested_playback_format = Some(requested_playback_format);
         }
     }
-    let clock = find_audio_control_clock(&device, &claimed_handle.handle, candidate.terminal_link);
+    let clock_choice = candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate);
+    if candidate.implicit_feedback.is_some() && clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
+        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        return Err(Error::InvalidState("implicit clock route changed since negotiation".into()));
+    }
+    let clock = clock_choice.map(|(clock, _)| clock);
     let clock_detection_msg = match &clock {
         Some(c) => format!(
             "Clock found: interface={}, clockId={}, via_terminal_link={:?}",
@@ -231,6 +284,14 @@ pub(super) fn start_stream_inner(
         return Err(Error::Claim(error));
     }
 
+    if let Some(source) = candidate.implicit_feedback.filter(|source| source.interface_number != candidate.interface_number) {
+        if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Claim(error));
+        }
+        if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, 0) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error));
+        }
+    }
     if let Err(error) = claimed_handle.set_alternate_setting(candidate.interface_number, 0) {
         let message = format!(
             "Failed to reset USB interface {} to alt 0: {}",
@@ -513,6 +574,21 @@ pub(super) fn start_stream_inner(
         set_last_error(Some(message));
     }
 
+    if let Some(source) = candidate.implicit_feedback {
+        if source.interface_number != candidate.interface_number {
+            if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
+                cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+                return Err(Error::Claim(error));
+            }
+            if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, source.alt_setting) {
+                cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+                return Err(Error::Transfer(format!("implicit feedback alternate activation failed: {}", error)));
+            }
+        } else if source.alt_setting != candidate.alt_setting {
+            cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+            return Err(Error::Transfer("implicit source alternate conflicts with playback".into()));
+        }
+    }
     if let Err(error) =
         claimed_handle.set_alternate_setting(candidate.interface_number, candidate.alt_setting)
     {
@@ -951,7 +1027,7 @@ pub(super) fn start_stream_inner(
     set_last_error(None);
     set_direct_mode_refusal_reason(None);
     let unsynchronized_async =
-        candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none();
+        candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none() && candidate.implicit_feedback.is_none();
     if unsynchronized_async {
         log_warn!(
             "[USB] Streaming an asynchronous endpoint without a feedback endpoint at the nominal rate (allow_unsynchronized_async); the stream is not bit-perfect"
@@ -970,6 +1046,7 @@ pub(super) fn start_stream_inner(
         config.start_threshold_ms as usize,
         config.processing_buffer_target_ms as usize,
     ));
+    runtime_stats.implicit_feedback.store(candidate.implicit_feedback.is_some(), Ordering::Release);
     set_runtime_stats(Some(Arc::clone(&runtime_stats)));
     let pcm_buffer = Arc::new(Mutex::new(PcmRing::new(
         runtime_stats.buffer_capacity_samples,
@@ -995,6 +1072,7 @@ pub(super) fn start_stream_inner(
     // Publish before spawning: the output thread can fail immediately and must
     // not have its error state overwritten by the caller.
     set_engine_state(EngineState::Streaming, None);
+    let stream_usb_owner = StreamUsbOwner::new(claimed_handle, lock_requested);
     let thread_handle = match thread::Builder::new()
         .name("usbdac-output".to_string())
         .spawn(move || {
@@ -1006,7 +1084,7 @@ pub(super) fn start_stream_inner(
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(claimed_handle, candidate, state, usb_shared, usb_stop);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);

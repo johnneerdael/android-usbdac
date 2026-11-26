@@ -21,6 +21,11 @@ public sealed interface Pacing {
         override val description: String get() = "explicit feedback (endpoint 0x%02x)".format(endpoint)
     }
 
+    /** Capture audio frame counts pace playback; source identity is selected, not a live lock verdict. */
+    public data class ImplicitFeedback(val interfaceNumber: Int, val altSetting: Int, val endpoint: Int) : Pacing {
+        override val description: String get() = "implicit feedback (interface $interfaceNumber, alt $altSetting, endpoint 0x%02x)".format(endpoint)
+    }
+
     /** An adaptive endpoint: the DAC follows the host's packet timing. */
     public data object Adaptive : Pacing {
         override val description: String get() = "adaptive (the DAC follows the host's packets)"
