@@ -187,4 +187,33 @@ For physical acceptance, compare all bank widths, occupied destination
 slots, fixed sources and coefficients with ALSA FCP on the same firmware.
 Check both a fully configured device and a device with its vendor
 interface unavailable. Verify loss of USB ownership and detach during
-an in-flight read. The current API exposes routing discovery only.
+an in-flight read.
+
+### Firmware-described mixer and mux edits
+
+Fetch a fresh native snapshot while the device is idle. In Android,
+`ScarlettRouting.readFcpSnapshot()` supplies the session-owned input to
+`applyFcp`. Rust uses `Dac::fcp_routing_apply()` with the expected readback.
+Choose each route by bank and destination pin. A source pin of zero
+turns the route off. Choose mixer coefficients by one-based output and
+input. The upstream FCP gain control accepts raw coefficients from 0
+through 32613. The device map identifies fixed destinations and bank
+readback identifies routes unavailable at a particular rate.
+
+Compare the expected topology and affected raw payloads with live
+readback before sending edits. Send full mixer rows or mux banks and
+verify them after writing. Roll back the affected targets in reverse
+order after an uncertain write. Preserve a changed target if it no
+longer matches the transaction's original or intended payload. For
+`HandBack::RestoreOriginal`, remember the first value and last verified
+write separately for each affected row or bank, then restore only
+targets that still match the library's last value. The library applies
+changes to live routing without issuing a settings-save command.
+[FCP mixer and mux writes](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp.c#L315-L468),
+[FCP gain control limits](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/mix.c#L286-L307)
+
+On physical hardware, select a spare destination and muted mixer
+channel. Observe a route and gain change and compare raw banks and
+rows with ALSA FCP. After a separate controller changes one edited
+target, close the session under `RestoreOriginal` and check that the
+other library-owned targets revert and the external change survives.

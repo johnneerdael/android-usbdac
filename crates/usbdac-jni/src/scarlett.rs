@@ -40,10 +40,23 @@ fn mux_failure(v: &MuxFailure<String>) -> Value {
         MuxFailure::Verification{bank,actual} => json!({"kind":"verification","bank":bank,"actual_bank":mux_bank(actual)}),
     }
 }
+fn fcp_target(v: &FcpTarget) -> Value {
+    match v { FcpTarget::Bank(bank) => json!({"kind":"bank","index":bank}),
+        FcpTarget::Mix(output) => json!({"kind":"mix","index":output}) }
+}
+fn fcp_failure(v: &FcpFailure<String>) -> Value {
+    match v {
+        FcpFailure::Read(e) => read_error(e),
+        FcpFailure::Invalid(e) => json!({"kind":"invalid","detail":format!("{e:?}")}),
+        FcpFailure::Drift => json!({"kind":"drift"}),
+        FcpFailure::Verification(target) => json!({"kind":"verification","target":fcp_target(target)}),
+    }
+}
 fn failure(v: usbdac_core::routing::RoutingSessionError) -> Value {
     use usbdac_core::routing::RoutingSessionError as E;
     let detail=v.to_string();
     let error=match v {
+        E::Fcp(e)=>json!({"kind":"fcp","cause":fcp_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(target,cause)|json!({"target":fcp_target(target),"cause":fcp_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
         E::Scarlett(e)=>json!({"kind":"read","cause":read_error(&e),"detail":detail}),
         E::ScarlettMux(e)=>json!({"kind":"mux","cause":mux_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(bank,cause)|json!({"bank":bank,"cause":mux_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
         E::ScarlettMix(e)=>json!({"kind":"mix","cause":mix_failure(&e.failure),"rollback_failure":e.rollback.as_ref().map(mix_failure),"detail":detail}),
@@ -134,12 +147,74 @@ pub fn scarlett_capability<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64
 pub fn scarlett_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
     run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_read(){Ok(v)=>json!({"value":{"model":v.model.candidate().key(),"firmware":v.model.firmware(),"mixer_inputs":v.model.mixer_inputs(),"mixer_outputs":v.model.mixer_outputs(),"mux_zero":v.mux_zero.iter().map(|r|json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>(),"mixes":v.mixes.iter().map(row).collect::<Vec<_>>()}}),Err(e)=>failure(e)};java_string(env,&v)})
 }
+fn fcp_read_value(dac: i64, remember: bool) -> Outcome<Value> {
+    let entry=registry::dac(dac)?;
+    Ok(match entry.dac.fcp_routing_read() {
+        Ok(v)=>{
+            let mut value=fcp_readback(&v);
+            if remember { value["snapshot_id"]=json!(entry.remember_fcp(v)?); }
+            json!({"value":value})
+        }, Err(e)=>failure(e),
+    })
+}
+/// Stateless polling never consumes or evicts native edit baselines.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn fcp_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| java_string(env,&fcp_read_value(dac,false)?))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn fcp_read_snapshot<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| java_string(env,&fcp_read_value(dac,true)?))
+}
+fn word(v: &Value, key: &str) -> Outcome<u16> {
+    v[key].as_u64().and_then(|n|u16::try_from(n).ok())
+        .ok_or_else(||Failure::Bad(format!("FCP {key} must be unsigned 16-bit")))
+}
+fn parse_fcp_edits(v: &Value) -> Outcome<(Vec<FcpRouteEdit>, Vec<FcpMixEdit>)> {
+    if !v.as_object().is_some_and(|v|v.keys().all(|k|matches!(k.as_str(),"routes"|"mixes"))) {
+        return Err(Failure::Bad("FCP edits contain only routes and mixes".into()));
+    }
+    let max_routes = 3 * usize::from(u8::MAX);
+    let routes=v["routes"].as_array().filter(|a|a.len()<=max_routes)
+        .ok_or_else(||Failure::Bad(format!("FCP requires at most {max_routes} typed routes")))?;
+    let mixes=v["mixes"].as_array().filter(|a|a.len()<=4096)
+        .ok_or_else(||Failure::Bad("FCP requires at most 4096 typed coefficients".into()))?;
+    if routes.is_empty() && mixes.is_empty() { return Err(Failure::Bad("FCP edits are empty".into())); }
+    let routes=routes.iter().map(|v| {
+        if !v.as_object().is_some_and(|v|v.keys().all(|k|matches!(k.as_str(),"bank"|"destination"|"source"))) {
+            return Err(Failure::Bad("FCP routes contain only bank, destination and source".into()));
+        }
+        let bank=byte(v,"bank")?;
+        if bank>2 { return Err(Failure::Bad("FCP bank must be 0 to 2".into())); }
+        Ok(FcpRouteEdit {bank,destination:word(v,"destination")?,source:word(v,"source")?})
+    }).collect::<Outcome<Vec<_>>>()?;
+    let mixes=mixes.iter().map(|v| {
+        if !v.as_object().is_some_and(|v|v.keys().all(|k|matches!(k.as_str(),"output"|"input"|"coefficient"))) {
+            return Err(Failure::Bad("FCP mixes contain only output, input and coefficient".into()));
+        }
+        let output=byte(v,"output")?; let input=byte(v,"input")?; let coefficient=word(v,"coefficient")?;
+        if output==0 || input==0 || coefficient>32613 {
+            return Err(Failure::Bad("FCP mixes require one-based coordinates and coefficient 0 to 32613".into()));
+        }
+        Ok(FcpMixEdit {output,input,coefficient})
+    }).collect::<Outcome<Vec<_>>>()?;
+    Ok((routes,mixes))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn fcp_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,snapshot:i64,edits:JString<'l>)->JString<'l> {
     run(&mut env,|env| {
+        let input=string_of(env,&edits)?;
+        if input.len()>262144 { return Err(Failure::Bad("FCP edits exceed 262144 bytes".into())); }
+        let (routes,mixes)=parse_fcp_edits(&serde_json::from_str::<Value>(&input).map_err(|e|Failure::Bad(e.to_string()))?)?;
         let entry=registry::dac(dac)?;
-        let result=match entry.dac.fcp_routing_read() {
-            Ok(v)=>json!({"value":fcp_readback(&v)}), Err(e)=>failure(e),
+        let expected=entry.fcp(snapshot)?;
+        let result=match entry.dac.fcp_routing_apply(&expected,&routes,&mixes) {
+            Ok(report)=>{
+                let original=fcp_readback(&report.original);
+                let mut verified=fcp_readback(&report.verified);
+                verified["snapshot_id"]=json!(entry.remember_fcp(report.verified)?);
+                json!({"value":{"original":original,"verified":verified}})
+            }, Err(e)=>failure(e),
         };
         java_string(env,&result)
     })
@@ -152,6 +227,34 @@ pub fn scarlett_mix_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,
 mod tests {
     use super::*;
     #[test]
+    fn fcp_typed_edits_reject_raw_proof_and_out_of_range_coefficients() {
+        let mut v=json!({"routes":[{"bank":2,"destination":65535,"source":0}],"mixes":[{"output":1,"input":255,"coefficient":32613}]});
+        let (routes,mixes)=parse_fcp_edits(&v).unwrap();
+        assert_eq!(routes[0],FcpRouteEdit {bank:2,destination:65535,source:0});
+        assert_eq!(mixes[0].coefficient,32613);
+        v["expected"]=json!({"banks":[]}); assert!(parse_fcp_edits(&v).is_err());
+        v.as_object_mut().unwrap().remove("expected");
+        v["mixes"][0]["coefficient"]=json!(32614); assert!(parse_fcp_edits(&v).is_err());
+        v["mixes"][0]["coefficient"]=json!(0);
+        v["mixes"][0]["input"]=json!(0); assert!(parse_fcp_edits(&v).is_err());
+        v["mixes"][0]["input"]=json!(1);
+        v["routes"][0]["raw_words"]=json!([1]); assert!(parse_fcp_edits(&v).is_err());
+        assert!(parse_fcp_edits(&json!({"routes":[],"mixes":[]})).is_err());
+    }
+    #[test]
+    fn fcp_failures_preserve_bank_and_row_rollback_targets() {
+        let v=failure(usbdac_core::routing::RoutingSessionError::Fcp(FcpWriteError {
+            failure:FcpFailure::Verification(FcpTarget::Mix(2)),
+            rollback:vec![(FcpTarget::Bank(1),FcpFailure::Read(ReadError::Io("restore bank".into()))),
+                (FcpTarget::Mix(2),FcpFailure::Verification(FcpTarget::Mix(2)))],
+        }));
+        assert_eq!(v["error"]["kind"],"fcp");
+        assert_eq!(v["error"]["cause"]["target"],json!({"kind":"mix","index":2}));
+        assert_eq!(v["error"]["rollback_failures"][0]["target"],json!({"kind":"bank","index":1}));
+        assert_eq!(v["error"]["rollback_failures"][0]["cause"]["detail"],"restore bank");
+        assert_eq!(v["error"]["rollback_failures"][1]["cause"]["kind"],"verification");
+    }
+    #[test]
     fn fcp_bridge_preserves_firmware_pins_fixed_routes_and_unsigned_banks() {
         let v=fcp_readback(&FcpReadback {
             model:CandidateModel::Scarlett16i16Gen4,firmware:0xffff_ffff,
@@ -162,6 +265,7 @@ mod tests {
             mixes:vec![MixReadback {output:1,coefficients:vec![65535]}],
         });
         assert_eq!(v["model"],"scarlett_16i16_gen4");
+        assert!(v.get("snapshot_id").is_none()); // Stateless readback serialization never admits a token.
         assert_eq!(v["sources"][0]["fixed_source"],Value::Null);
         assert_eq!(v["destinations"][0]["fixed_source"],65535);
         assert_eq!(v["destinations"][0]["name"],"Fixed Output");

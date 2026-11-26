@@ -31,10 +31,21 @@ impl Dac {
 
     /// Read firmware-defined modern Focusrite FCP pins, mux banks and mix rows.
     /// Requires idle ownership and an explicit exact-model vendor-interface claim.
-    /// This API does not expose edits or persistent configuration commands.
+    /// Does not send persistent configuration commands.
     pub fn fcp_routing_read(&self) -> Result<crate::scarlett::FcpReadback, RoutingSessionError> {
         self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
         routing_hw::fcp_read()
+    }
+
+    /// Apply typed firmware pin routes and mixer coefficients against a fresh readback.
+    /// Requires idle ownership and explicit vendor claim. Verify every affected target,
+    /// restore attempted targets on failure, and preserve external edits at hand-back.
+    /// No persistent configuration commands are sent. Physically unvalidated.
+    pub fn fcp_routing_apply(&self, expected: &crate::scarlett::FcpReadback,
+        routes: &[crate::scarlett::FcpRouteEdit], mixes: &[crate::scarlett::FcpMixEdit])
+        -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::fcp_apply(expected, routes, mixes)
     }
 
     /// Apply bounded half-dB replacements to one complete Scarlett mixer row.

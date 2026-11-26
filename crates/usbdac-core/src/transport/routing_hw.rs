@@ -55,6 +55,7 @@ pub enum RoutingSessionError {
     Scarlett(crate::scarlett::ReadError<String>),
     ScarlettMix(crate::scarlett::MixWriteError<String>),
     ScarlettMux(crate::scarlett::MuxWriteError<String>),
+    Fcp(crate::scarlett::FcpWriteError<String>),
 }
 
 impl std::fmt::Display for RoutingSessionError {
@@ -383,6 +384,138 @@ pub(crate) fn fcp_read() -> Result<crate::scarlett::FcpReadback, RoutingSessionE
     Ok(readback)
 }
 
+struct RecordedFcp {
+    device: UsbDevice,
+    configuration: u8,
+    descriptors: Vec<u8>,
+    original: crate::scarlett::FcpReadback,
+    last: crate::scarlett::FcpReadback,
+    uncertain: bool,
+}
+static ORIGINAL_FCP: Mutex<Option<RecordedFcp>> = Mutex::new(None);
+
+pub(crate) fn fcp_apply(
+    expected: &crate::scarlett::FcpReadback,
+    routes: &[crate::scarlett::FcpRouteEdit],
+    mixes: &[crate::scarlett::FcpMixEdit],
+) -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let mut records = ORIGINAL_FCP.lock();
+    if let Some(record) = records.as_ref() {
+        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+            || record.configuration != configuration || record.descriptors != descriptors
+            || record.uncertain || !crate::scarlett::same_fcp_layout(&record.last, expected)
+        {
+            return Err(RoutingSessionError::Drift("FCP attachment/configuration or rollback state changed".into()));
+        }
+        for bank in &expected.banks {
+            if routes.iter().any(|edit|edit.bank == bank.bank) {
+                if let (Some(original),Some(last)) = (record.original.banks.iter().find(|b|b.bank==bank.bank),record.last.banks.iter().find(|b|b.bank==bank.bank)) {
+                    if original != last && bank != last {
+                        return Err(RoutingSessionError::Drift("FCP bank differs from last verified library write".into()));
+                    }
+                }
+            }
+        }
+        for row in &expected.mixes {
+            if mixes.iter().any(|edit|edit.output == row.output) {
+                if let (Some(original),Some(last)) = (record.original.mixes.iter().find(|r|r.output==row.output),record.last.mixes.iter().find(|r|r.output==row.output)) {
+                    if original != last && row != last {
+                        return Err(RoutingSessionError::Drift("FCP row differs from last verified library write".into()));
+                    }
+                }
+            }
+        }
+    }
+    let report = match with_scarlett_io(&device, configuration, true, |io, candidate| {
+        crate::scarlett::apply_fcp(io, candidate, expected, routes, mixes).map_err(RoutingSessionError::Fcp)
+    }) {
+        Ok(report) => report,
+        Err(error) => {
+            if let RoutingSessionError::Fcp(failure) = &error {
+                invalidate_route_caches();
+                if !failure.rollback.is_empty() {
+                    let record = records.get_or_insert_with(|| RecordedFcp {
+                        device: device.clone(), configuration, descriptors: descriptors.clone(),
+                        original: expected.clone(), last: expected.clone(), uncertain: true,
+                    });
+                    record.uncertain = true;
+                    log_warn!("[USB] FCP rollback uncertain; configured hand-back will preserve targets differing from prior verified state");
+                }
+            }
+            return Err(error);
+        }
+    };
+    if report.original != report.verified {
+        invalidate_route_caches();
+        let record = records.get_or_insert_with(|| RecordedFcp {
+            device: device.clone(), configuration, descriptors: descriptors.clone(),
+            original: report.original.clone(), last: report.verified.clone(), uncertain: false,
+        });
+        let (original, last) = merge_fcp_provenance(&record.original, &record.last, &report.original, &report.verified);
+        record.original = original;
+        record.last = last;
+    }
+    let (after, raw) = active_descriptors(&device)?;
+    if configuration != after || descriptors != raw {
+        return Err(RoutingSessionError::Drift("configuration changed during FCP routing write".into()));
+    }
+    Ok(report)
+}
+
+// Preserve per-target first-before/last-verified pairs. A later read may contain
+// unrelated external edits; those must never become owned hand-back changes.
+fn merge_fcp_provenance(
+    original: &crate::scarlett::FcpReadback, last: &crate::scarlett::FcpReadback,
+    before: &crate::scarlett::FcpReadback, verified: &crate::scarlett::FcpReadback,
+) -> (crate::scarlett::FcpReadback, crate::scarlett::FcpReadback) {
+    let mut merged_original = before.clone();
+    let mut merged_last = verified.clone();
+    for (index, bank) in before.banks.iter().enumerate() {
+        if let (Some(old), Some(previous)) = (original.banks.iter().find(|b|b.bank==bank.bank), last.banks.iter().find(|b|b.bank==bank.bank)) {
+            if old != previous {
+                merged_original.banks[index] = old.clone();
+                if bank == &verified.banks[index] { merged_last.banks[index] = previous.clone(); }
+            }
+        }
+    }
+    for (index, row) in before.mixes.iter().enumerate() {
+        if let (Some(old), Some(previous)) = (original.mixes.iter().find(|r|r.output==row.output), last.mixes.iter().find(|r|r.output==row.output)) {
+            if old != previous {
+                merged_original.mixes[index] = old.clone();
+                if row == &verified.mixes[index] { merged_last.mixes[index] = previous.clone(); }
+            }
+        }
+    }
+    (merged_original, merged_last)
+}
+
+fn finish_fcp_hand_back() {
+    let Some(record) = ORIGINAL_FCP.lock().take() else { return; };
+    if settings().config.hand_back != crate::HandBack::RestoreOriginal { return; }
+    if record.uncertain {
+        log_warn!("[USB] FCP rollback uncertain; hand-back will restore only targets matching prior verified values");
+    }
+    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else { return; };
+    let restore = || -> Result<(), RoutingSessionError> {
+        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner) {
+            return Err(RoutingSessionError::Drift("FCP attachment changed before hand-back".into()));
+        }
+        let (number, raw) = active_descriptors(&device)?;
+        if number != record.configuration || raw != record.descriptors {
+            return Err(RoutingSessionError::Drift("FCP configuration changed before hand-back".into()));
+        }
+        with_scarlett_io(&device, number, true, |io, candidate| {
+            crate::scarlett::restore_fcp(io, candidate, &record.last, &record.original)
+                .map_err(RoutingSessionError::Fcp)
+        })
+    };
+    if let Err(error) = restore() { log_warn!("[USB] Original FCP routing not restored: {error}"); }
+}
+
 pub(crate) fn scarlett_mix_apply(
     edit: &crate::scarlett::MixRowEdit,
 ) -> Result<crate::scarlett::MixWriteReport, RoutingSessionError> {
@@ -532,6 +665,7 @@ pub(crate) fn scarlett_mux_apply(
 }
 
 fn finish_scarlett_hand_back() {
+    finish_fcp_hand_back();
     let Some(record) = ORIGINAL_SCARLETT.lock().take() else {
         return;
     };
@@ -2153,5 +2287,37 @@ mod tests {
         ));
         io.pin = 1;
         assert!(verify_values(&inventory, &mut io, &expected).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fcp_provenance_tests {
+    use super::*;
+    use crate::scarlett::{CandidateModel, FcpBank, FcpReadback, MixReadback};
+    #[test]
+    fn unrelated_external_values_never_become_hand_back_changes() {
+        let original = FcpReadback {
+            model: CandidateModel::Scarlett16i16Gen4, firmware: 1,
+            mixer_inputs: 1, mixer_outputs: 2, sources: vec![], destinations: vec![],
+            banks: vec![FcpBank {bank:0,raw_words:vec![1]},FcpBank {bank:1,raw_words:vec![2]}],
+            mixes: vec![MixReadback {output:1,coefficients:vec![3]},MixReadback {output:2,coefficients:vec![4]}],
+        };
+        let mut last = original.clone();
+        last.banks[0].raw_words[0] = 10;
+        last.mixes[0].coefficients[0] = 30;
+        let mut before = last.clone();
+        before.banks[1].raw_words[0] = 20; // External change before a later unrelated edit.
+        before.mixes[0].coefficients[0] = 31; // External change to an earlier owned target.
+        let mut verified = before.clone();
+        verified.mixes[1].coefficients[0] = 40;
+        let (saved, recent) = merge_fcp_provenance(&original,&last,&before,&verified);
+        assert_eq!(saved.banks[1], recent.banks[1]);
+        assert_eq!(saved.banks[1].raw_words, vec![20]);
+        assert_eq!(saved.banks[0], original.banks[0]);
+        assert_eq!(recent.banks[0], last.banks[0]);
+        assert_eq!(saved.mixes[0], original.mixes[0]);
+        assert_eq!(recent.mixes[0], last.mixes[0]); // Fresh restore detects external 31 versus 30.
+        assert_eq!(saved.mixes[1], original.mixes[1]);
+        assert_eq!(recent.mixes[1], verified.mixes[1]);
     }
 }

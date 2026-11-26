@@ -50,7 +50,7 @@ fn failure(error: RoutingSessionError) -> Value {
         RoutingSessionError::Drift(_) => json!({"kind":"drift"}),
         RoutingSessionError::Control(e) => json!({"kind":"control","cause":control_error(&e)}),
         RoutingSessionError::Transaction(e) => json!({"kind":"transaction","failed_change":e.failed_change,"cause":control_error(&e.cause),"rollback_failures":e.rollback_failures.iter().map(|(k,e)|json!({"key":key_json(*k),"cause":control_error(e)})).collect::<Vec<_>>()}),
-        RoutingSessionError::Scarlett(_) | RoutingSessionError::ScarlettMix(_) | RoutingSessionError::ScarlettMux(_) => {
+        RoutingSessionError::Scarlett(_) | RoutingSessionError::ScarlettMix(_) | RoutingSessionError::ScarlettMux(_) | RoutingSessionError::Fcp(_) => {
             json!({"kind":"scarlett"})
         }
     };

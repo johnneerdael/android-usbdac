@@ -18,7 +18,7 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
-    fun modernFcpModelsHaveDistinctClaimKeysAndReadOnlyEntryPoint() {
+    fun modernFcpModelsHaveDistinctClaimKeysAndTypedSnapshotEntryPoints() {
         for (key in listOf("scarlett_16i16_gen4", "scarlett_18i16_gen4", "scarlett_18i20_gen4", "isa_c8x")) {
             val capability = parseScarlettCapability(JSONObject()
                 .put("model", key).put("name", key).put("configuration_id", 1)
@@ -29,7 +29,38 @@ class ModelParsingTest {
         }
         assertEquals(FcpReadback::class.java, ScarlettRouting::class.java.getMethod("readFcp").returnType)
         assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("fcpRead", Long::class.javaPrimitiveType).returnType)
-        assertFalse(ScarlettRouting::class.java.methods.any { it.name.startsWith("applyFcp") })
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("fcpReadSnapshot", Long::class.javaPrimitiveType).returnType)
+        assertEquals(FcpSnapshot::class.java, ScarlettRouting::class.java.getMethod("readFcpSnapshot").returnType)
+        assertEquals(FcpReport::class.java, ScarlettRouting::class.java.getMethod("applyFcp", FcpSnapshot::class.java, List::class.java, List::class.java).returnType)
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("fcpApply", Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, String::class.java).returnType)
+    }
+
+    @Test
+    fun fcpTypedBoundsAndStructuredFailurePreserveTargets() {
+        assertEquals(0, FcpRouteEdit(2, 65535, 0).source)
+        assertEquals(32613, FcpMixEdit(255, 255, 32613).coefficient)
+        for (invalid in listOf<() -> Any>({ FcpRouteEdit(3, 1, 0) }, { FcpRouteEdit(0, 0, 1) },
+            { FcpMixEdit(0, 1, 0) }, { FcpMixEdit(1, 1, 32614) })) {
+            assertTrue(runCatching { invalid() }.exceptionOrNull() is IllegalArgumentException)
+        }
+        val failure = parseFcpFailure(JSONObject("""{"kind":"verification","target":{"kind":"mix","index":2}}"""))
+        assertEquals(ScarlettFailureKind.VERIFICATION, failure.kind)
+        assertEquals(FcpTarget(FcpTargetKind.MIX, 2), failure.target)
+        assertNull(failure.detail)
+    }
+
+    @Test
+    fun fcpSnapshotsRejectForeignOwnersBeforeNativeWrites() {
+        val owner = ScarlettRouting(1L) {}
+        val foreign = ScarlettRouting(2L) {}
+        val readback = FcpReadback(ScarlettModel.ISA_C8X, 1L, 1, 1, emptyList(), emptyList(), emptyList(), emptyList())
+        val snapshot = FcpSnapshot(owner, 99L, readback)
+        assertTrue(runCatching { foreign.applyFcp(snapshot, listOf(FcpRouteEdit(0, 1, 0)), emptyList()) }
+            .exceptionOrNull() is IllegalArgumentException)
+        assertTrue(runCatching { owner.applyFcp(snapshot, listOf(FcpRouteEdit(0, 1, 0), FcpRouteEdit(0, 1, 2)), emptyList()) }
+            .exceptionOrNull() is IllegalArgumentException)
+        assertTrue(runCatching { owner.applyFcp(snapshot, emptyList(), listOf(FcpMixEdit(1, 1, 0), FcpMixEdit(1, 1, 2))) }
+            .exceptionOrNull() is IllegalArgumentException)
     }
 
     @Test

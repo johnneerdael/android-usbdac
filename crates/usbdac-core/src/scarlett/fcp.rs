@@ -1,4 +1,4 @@
-//! Read-only FCP topology, described by firmware rather than legacy port tables.
+//! FCP topology and transactional mixer/router edits using firmware identities.
 //! Labels are firmware identities, not a claim about physical connector wiring.
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -38,6 +38,13 @@ pub fn read_fcp<I: ReadIo>(
     mut io: I,
     candidate: CandidateModel,
 ) -> Result<FcpReadback, ReadError<I::Error>> {
+    read_state(&mut io, candidate).map(|(state, _)| state)
+}
+
+fn read_state<I: ReadIo>(
+    io: &mut I,
+    candidate: CandidateModel,
+) -> Result<(FcpReadback, u16), ReadError<I::Error>> {
     if !candidate.is_fcp() {
         return Err(ReadError::Protocol(ProtocolError::UnsupportedProtocol));
     }
@@ -47,15 +54,15 @@ pub fn read_fcp<I: ReadIo>(
         startup.len(),
     )?;
     io.prepare_notifications().map_err(ReadError::Io)?;
-    transact_mode(&mut io, Command::Init, 0, &[], 0, true)?;
-    let info = transact_mode(&mut io, Command::Info, 1, &[], 84, true)?;
+    transact_mode(io, Command::Init, 0, &[], 0, true)?;
+    let info = transact_mode(io, Command::Info, 1, &[], 84, true)?;
     let firmware = u32::from_le_bytes(info[8..12].try_into().unwrap());
     if firmware == 0 {
         return Err(ReadError::Protocol(ProtocolError::UnsupportedFirmware(0)));
     }
     let mut sequence = 2u16;
     let mut read = |command, payload: &[u8], size| {
-        let result = transact_mode(&mut io, command, sequence, payload, size, true);
+        let result = transact_mode(io, command, sequence, payload, size, true);
         sequence = sequence.wrapping_add(1);
         result
     };
@@ -118,16 +125,479 @@ pub fn read_fcp<I: ReadIo>(
                 .collect(),
         });
     }
-    Ok(FcpReadback {
-        model: candidate,
-        firmware,
-        mixer_inputs,
-        mixer_outputs,
-        sources,
-        destinations,
-        banks,
-        mixes,
+    Ok((
+        FcpReadback {
+            model: candidate,
+            firmware,
+            mixer_inputs,
+            mixer_outputs,
+            sources,
+            destinations,
+            banks,
+            mixes,
+        },
+        sequence,
+    ))
+}
+
+/// Router pins are firmware identities; source zero selects Off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FcpRouteEdit {
+    pub bank: u8,
+    pub destination: u16,
+    pub source: u16,
+}
+/// Mixer positions are one-based; editable coefficients are raw 0..=32613.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FcpMixEdit {
+    pub output: u8,
+    pub input: u8,
+    pub coefficient: u16,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FcpTarget {
+    Bank(u8),
+    Mix(u8),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FcpWriteReport {
+    pub original: FcpReadback,
+    pub verified: FcpReadback,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum FcpFailure<E> {
+    Read(ReadError<E>),
+    Invalid(ProtocolError),
+    Drift,
+    Verification(FcpTarget),
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct FcpWriteError<E> {
+    pub failure: FcpFailure<E>,
+    pub rollback: Vec<(FcpTarget, FcpFailure<E>)>,
+}
+
+fn write_error<E>(failure: FcpFailure<E>) -> FcpWriteError<E> {
+    FcpWriteError {
+        failure,
+        rollback: Vec::new(),
+    }
+}
+pub(crate) fn same_fcp_layout(a: &FcpReadback, b: &FcpReadback) -> bool {
+    a.model == b.model
+        && a.firmware == b.firmware
+        && a.mixer_inputs == b.mixer_inputs
+        && a.mixer_outputs == b.mixer_outputs
+        && a.sources == b.sources
+        && a.destinations == b.destinations
+        && a.banks.len() == b.banks.len()
+        && a.banks.iter().zip(&b.banks).all(|(a, b)| {
+            a.bank == b.bank
+                && a.raw_words.len() == b.raw_words.len()
+                && a.raw_words
+                    .iter()
+                    .zip(&b.raw_words)
+                    .all(|(a, b)| (a & 0xfff) == (b & 0xfff))
+        })
+        && a.mixes.len() == b.mixes.len()
+        && a.mixes
+            .iter()
+            .zip(&b.mixes)
+            .all(|(a, b)| a.output == b.output && a.coefficients.len() == b.coefficients.len())
+}
+fn targets(state: &FcpReadback) -> Vec<FcpTarget> {
+    state
+        .banks
+        .iter()
+        .map(|b| FcpTarget::Bank(b.bank))
+        .chain(state.mixes.iter().map(|m| FcpTarget::Mix(m.output)))
+        .collect()
+}
+fn values(state: &FcpReadback, target: FcpTarget) -> Vec<u8> {
+    match target {
+        FcpTarget::Bank(n) => state
+            .banks
+            .iter()
+            .find(|b| b.bank == n)
+            .unwrap()
+            .raw_words
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+        FcpTarget::Mix(n) => state
+            .mixes
+            .iter()
+            .find(|m| m.output == n)
+            .unwrap()
+            .coefficients
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
+    }
+}
+fn target_read<I: ReadIo>(
+    io: &mut I,
+    sequence: &mut u16,
+    state: &FcpReadback,
+    target: FcpTarget,
+) -> Result<Vec<u8>, ReadError<I::Error>> {
+    let size = values(state, target).len();
+    let (command, request) = match target {
+        FcpTarget::Bank(n) => (Command::Mux, [0, 0, (size / 4) as u8, n]),
+        FcpTarget::Mix(n) => (Command::Mix, [n - 1, 0, (size / 2) as u8, 0]),
+    };
+    let result = transact_mode(io, command, *sequence, &request, size, true);
+    *sequence = sequence.wrapping_add(1);
+    result
+}
+// Literal upstream fcp.c ABI: uint16 row, or uint16 pad + uint16 bank.
+fn target_packet(target: FcpTarget, data: &[u8]) -> (Command, Vec<u8>) {
+    let (command, mut payload) = match target {
+        FcpTarget::Bank(n) => (Command::SetMux, vec![0, 0, n, 0]),
+        FcpTarget::Mix(n) => (Command::SetMix, u16::from(n - 1).to_le_bytes().to_vec()),
+    };
+    payload.extend(data);
+    (command, payload)
+}
+fn target_write<I: ReadIo>(
+    io: &mut I,
+    sequence: &mut u16,
+    target: FcpTarget,
+    data: &[u8],
+) -> Result<(), ReadError<I::Error>> {
+    let (command, payload) = target_packet(target, data);
+    let result = transact_mode(io, command, *sequence, &payload, 0, true).map(|_| ());
+    *sequence = sequence.wrapping_add(1);
+    result
+}
+fn edited(
+    state: &FcpReadback,
+    routes: &[FcpRouteEdit],
+    mixes: &[FcpMixEdit],
+) -> Result<FcpReadback, ProtocolError> {
+    let mut result = state.clone();
+    let mut seen_routes = BTreeSet::new();
+    for edit in routes {
+        if !seen_routes.insert((edit.bank, edit.destination)) {
+            return Err(ProtocolError::DuplicateDestination);
+        }
+        let dest = state
+            .destinations
+            .iter()
+            .find(|d| d.pin == edit.destination)
+            .ok_or(ProtocolError::UnknownPort {
+                id: edit.destination,
+                source: false,
+            })?;
+        if dest.fixed_source.is_some() {
+            return Err(ProtocolError::InvalidMuxEdit);
+        }
+        if edit.source != 0 && !state.sources.iter().any(|s| s.pin == edit.source) {
+            return Err(ProtocolError::UnknownPort {
+                id: edit.source,
+                source: true,
+            });
+        }
+        let bank = result
+            .banks
+            .iter_mut()
+            .find(|b| b.bank == edit.bank)
+            .ok_or(ProtocolError::InvalidMuxBank(edit.bank))?;
+        let word = bank
+            .raw_words
+            .iter_mut()
+            .find(|w| **w != 0 && (**w & 0xfff) == u32::from(edit.destination))
+            .ok_or(ProtocolError::InvalidMuxEdit)?;
+        *word = (u32::from(edit.source) << 12) | u32::from(edit.destination);
+    }
+    let mut seen_mixes = BTreeSet::new();
+    for edit in mixes {
+        if !seen_mixes.insert((edit.output, edit.input)) {
+            return Err(ProtocolError::DuplicateMixInput(edit.input));
+        }
+        if edit.coefficient > 32613 {
+            return Err(ProtocolError::InvalidMixGain(i16::MAX));
+        }
+        let row = result
+            .mixes
+            .iter_mut()
+            .find(|m| m.output == edit.output)
+            .ok_or(ProtocolError::InvalidMixOutput(edit.output))?;
+        let value = edit
+            .input
+            .checked_sub(1)
+            .and_then(|i| row.coefficients.get_mut(usize::from(i)))
+            .ok_or(ProtocolError::InvalidMixInput(edit.input))?;
+        *value = edit.coefficient;
+    }
+    Ok(result)
+}
+
+/// Apply complete volatile rows/banks, preserving padding and every unedited value.
+/// A failed or uncertain write triggers one bounded reinitialization and guarded
+/// reverse rollback. No command persists configuration to flash.
+pub fn apply_fcp<I: ReadIo>(
+    mut io: I,
+    candidate: CandidateModel,
+    expected: &FcpReadback,
+    routes: &[FcpRouteEdit],
+    mixes: &[FcpMixEdit],
+) -> Result<FcpWriteReport, FcpWriteError<I::Error>> {
+    let (live, mut sequence) =
+        read_state(&mut io, candidate).map_err(|e| write_error(FcpFailure::Read(e)))?;
+    if live != *expected {
+        return Err(write_error(FcpFailure::Drift));
+    }
+    let proposed = edited(&live, routes, mixes).map_err(|e| write_error(FcpFailure::Invalid(e)))?;
+    let changed: Vec<_> = targets(&live)
+        .into_iter()
+        .filter(|&t| values(&live, t) != values(&proposed, t))
+        .collect();
+    let mut attempted = Vec::new();
+    for target in changed {
+        let current = match target_read(&mut io, &mut sequence, &live, target) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(rollback(
+                    &mut io,
+                    candidate,
+                    &live,
+                    &proposed,
+                    &attempted,
+                    FcpFailure::Read(e),
+                ))
+            }
+        };
+        if current != values(&live, target) {
+            return Err(rollback(
+                &mut io,
+                candidate,
+                &live,
+                &proposed,
+                &attempted,
+                FcpFailure::Drift,
+            ));
+        }
+        attempted.push(target); // Sending may mutate the device even without an ACK.
+        if let Err(e) = target_write(&mut io, &mut sequence, target, &values(&proposed, target)) {
+            return Err(rollback(
+                &mut io,
+                candidate,
+                &live,
+                &proposed,
+                &attempted,
+                FcpFailure::Read(e),
+            ));
+        }
+        match target_read(&mut io, &mut sequence, &live, target) {
+            Ok(v) if v == values(&proposed, target) => (),
+            Ok(_) => {
+                return Err(rollback(
+                    &mut io,
+                    candidate,
+                    &live,
+                    &proposed,
+                    &attempted,
+                    FcpFailure::Verification(target),
+                ))
+            }
+            Err(e) => {
+                return Err(rollback(
+                    &mut io,
+                    candidate,
+                    &live,
+                    &proposed,
+                    &attempted,
+                    FcpFailure::Read(e),
+                ))
+            }
+        }
+    }
+    // The verified snapshot records exactly the rows read back after each write.
+    Ok(FcpWriteReport {
+        original: live,
+        verified: proposed,
     })
+}
+
+fn rollback<I: ReadIo>(
+    io: &mut I,
+    candidate: CandidateModel,
+    original: &FcpReadback,
+    proposed: &FcpReadback,
+    attempted: &[FcpTarget],
+    failure: FcpFailure<I::Error>,
+) -> FcpWriteError<I::Error> {
+    let mut error = write_error(failure);
+    if attempted.is_empty() {
+        return error;
+    }
+    let (live, mut sequence) = match read_state(io, candidate) {
+        Ok(v) => v,
+        Err(e) => {
+            error
+                .rollback
+                .push((*attempted.last().unwrap(), FcpFailure::Read(e)));
+            for &target in attempted.iter().rev().skip(1) {
+                error
+                    .rollback
+                    .push((target, FcpFailure::Invalid(ProtocolError::SessionPoisoned)));
+            }
+            return error;
+        }
+    };
+    if !same_fcp_layout(&live, original) {
+        for &target in attempted.iter().rev() {
+            error.rollback.push((target, FcpFailure::Drift));
+        }
+        return error;
+    }
+    let reverse: Vec<_> = attempted.iter().rev().copied().collect();
+    for (index, &target) in reverse.iter().enumerate() {
+        if let Err(failure) = restore_target(
+            io,
+            candidate,
+            &mut sequence,
+            original,
+            proposed,
+            target,
+            true,
+        ) {
+            error.rollback.push((target, failure));
+            // A failed transport may have poisoned the sequence. Reinitialize
+            // before considering any independent remaining target.
+            match read_state(io, candidate) {
+                Ok((fresh, seq)) if same_fcp_layout(&fresh, original) => sequence = seq,
+                Ok(_) => {
+                    for &remaining in &reverse[index + 1..] {
+                        error.rollback.push((remaining, FcpFailure::Drift));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    error.rollback.push((target, FcpFailure::Read(e)));
+                    for &remaining in &reverse[index + 1..] {
+                        error.rollback.push((
+                            remaining,
+                            FcpFailure::Invalid(ProtocolError::SessionPoisoned),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    error
+}
+fn restore_target<I: ReadIo>(
+    io: &mut I,
+    candidate: CandidateModel,
+    sequence: &mut u16,
+    original: &FcpReadback,
+    last: &FcpReadback,
+    target: FcpTarget,
+    allow_original: bool,
+) -> Result<(), FcpFailure<I::Error>> {
+    let current = target_read(io, sequence, original, target).map_err(FcpFailure::Read)?;
+    let old = values(original, target);
+    if allow_original && current == old {
+        return Ok(());
+    }
+    if current != values(last, target) {
+        return Err(FcpFailure::Drift);
+    }
+    let write = target_write(io, sequence, target, &old);
+    if write.is_err() {
+        // Never reuse a possibly poisoned command stream. Initialization also
+        // verifies the attempted target, even when the write ACK was lost.
+        let (fresh, seq) = read_state(io, candidate).map_err(FcpFailure::Read)?;
+        *sequence = seq;
+        if !same_fcp_layout(&fresh, original) {
+            return Err(FcpFailure::Drift);
+        }
+        if values(&fresh, target) != old {
+            return Err(FcpFailure::Verification(target));
+        }
+        return Ok(());
+    }
+    let verified = target_read(io, sequence, original, target).map_err(FcpFailure::Read)?;
+    if verified != old {
+        return Err(FcpFailure::Verification(target));
+    }
+    Ok(())
+}
+
+/// Hand back only rows/banks still equal to the application's last readback.
+/// Independent targets continue when another target has external drift.
+pub(crate) fn restore_fcp<I: ReadIo>(
+    mut io: I,
+    candidate: CandidateModel,
+    last: &FcpReadback,
+    original: &FcpReadback,
+) -> Result<(), FcpWriteError<I::Error>> {
+    if !same_fcp_layout(last, original) {
+        return Err(write_error(FcpFailure::Drift));
+    }
+    for state in [last, original] {
+        validate_banks(&state.sources, &state.destinations, &state.banks)
+            .map_err(|e| write_error(FcpFailure::Invalid(e)))?;
+    }
+    let (live, mut sequence) =
+        read_state(&mut io, candidate).map_err(|e| write_error(FcpFailure::Read(e)))?;
+    if !same_fcp_layout(&live, original) {
+        return Err(write_error(FcpFailure::Drift));
+    }
+    let mut errors = Vec::new();
+    let changed: Vec<_> = targets(original)
+        .into_iter()
+        .rev()
+        .filter(|&t| values(original, t) != values(last, t))
+        .collect();
+    for (index, &target) in changed.iter().enumerate() {
+        if let Err(failure) = restore_target(
+            &mut io,
+            candidate,
+            &mut sequence,
+            original,
+            last,
+            target,
+            false,
+        ) {
+            let transport = matches!(&failure, FcpFailure::Read(_));
+            errors.push((target, failure));
+            if transport {
+                match read_state(&mut io, candidate) {
+                    Ok((fresh, seq)) if same_fcp_layout(&fresh, original) => sequence = seq,
+                    Ok(_) => {
+                        errors.push((target, FcpFailure::Drift));
+                        for &remaining in &changed[index + 1..] {
+                            errors.push((remaining, FcpFailure::Drift));
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        errors.push((target, FcpFailure::Read(e)));
+                        for &remaining in &changed[index + 1..] {
+                            errors.push((
+                                remaining,
+                                FcpFailure::Invalid(ProtocolError::SessionPoisoned),
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        let (_, failure) = errors.remove(0);
+        Err(FcpWriteError {
+            failure,
+            rollback: errors,
+        })
+    }
 }
 
 fn bad() -> ProtocolError {
@@ -341,6 +811,353 @@ mod tests {
         decode_map(&map()).unwrap()
     }
 
+    fn snapshot() -> FcpReadback {
+        let (sources, destinations) = topology();
+        FcpReadback {
+            model: CandidateModel::Scarlett18i20Gen4,
+            firmware: 4321,
+            mixer_inputs: 2,
+            mixer_outputs: 1,
+            sources,
+            destinations,
+            banks: vec![FcpBank {
+                bank: 0,
+                raw_words: vec![128 << 12 | 256, 0, 128 << 12 | 257],
+            }],
+            mixes: vec![MixReadback {
+                output: 1,
+                coefficients: vec![0, 65535],
+            }],
+        }
+    }
+    struct Device {
+        state: FcpReadback,
+        writes: Vec<(u32, Vec<u8>)>,
+        pending: Option<(u32, u16, Vec<u8>)>,
+        fail_write: Vec<usize>,
+        fail_ack: bool,
+        drift_on_reinit: bool,
+        initializations: usize,
+    }
+    struct DeviceIo(std::rc::Rc<std::cell::RefCell<Device>>);
+    fn device() -> (DeviceIo, std::rc::Rc<std::cell::RefCell<Device>>) {
+        let d = std::rc::Rc::new(std::cell::RefCell::new(Device {
+            state: snapshot(),
+            writes: vec![],
+            pending: None,
+            fail_write: vec![],
+            fail_ack: false,
+            drift_on_reinit: false,
+            initializations: 0,
+        }));
+        (DeviceIo(d.clone()), d)
+    }
+    impl ReadIo for DeviceIo {
+        type Error = ();
+        fn initial_read(&mut self, _: &mut [u8; 24]) -> Result<usize, ()> {
+            let mut d = self.0.borrow_mut();
+            d.initializations += 1;
+            if d.initializations > 1 && d.drift_on_reinit {
+                d.state.mixes[0].coefficients[1] = 65534;
+            }
+            Ok(24)
+        }
+        fn prepare_notifications(&mut self) -> Result<(), ()> {
+            self.0.borrow_mut().pending = None;
+            Ok(())
+        }
+        fn send_request(&mut self, bytes: &[u8]) -> Result<usize, ()> {
+            let mut d = self.0.borrow_mut();
+            let command = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let seq = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+            let p = &bytes[16..];
+            let response = match command {
+                0 => vec![],
+                2 => {
+                    let mut info = vec![0; 84];
+                    info[8..12].copy_from_slice(&d.state.firmware.to_le_bytes());
+                    info
+                }
+                0x2000 => vec![1, 2, 0, 0, 0, 0, 0, 0],
+                0x3000 => vec![3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                0x80000c => {
+                    let mut r = vec![0; 4];
+                    r[2..].copy_from_slice(&(map().len() as u16).to_le_bytes());
+                    r
+                }
+                0x80000d => map(),
+                0x3001 => values(&d.state, FcpTarget::Bank(p[3])),
+                0x2001 => values(&d.state, FcpTarget::Mix(p[0] + 1)),
+                0x3002 | 0x2002 => {
+                    d.writes.push((command, p.to_vec()));
+                    if command == 0x3002 {
+                        d.state.banks[0].raw_words = p[4..]
+                            .chunks_exact(4)
+                            .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+                            .collect();
+                    } else {
+                        d.state.mixes[0].coefficients = p[2..]
+                            .chunks_exact(2)
+                            .map(|v| u16::from_le_bytes(v.try_into().unwrap()))
+                            .collect();
+                    }
+                    if d.fail_write.contains(&d.writes.len()) {
+                        d.fail_ack = true;
+                    }
+                    vec![]
+                }
+                _ => panic!("unexpected opcode {command:x}"),
+            };
+            d.pending = Some((command, seq, response));
+            Ok(bytes.len())
+        }
+        fn next_notification(&mut self, bytes: &mut [u8; 8], _: Duration) -> Result<usize, ()> {
+            let mut d = self.0.borrow_mut();
+            if d.fail_ack {
+                d.fail_ack = false;
+                return Err(());
+            }
+            bytes[0] = 1;
+            Ok(8)
+        }
+        fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, ()> {
+            let (cmd, seq, p) = self.0.borrow_mut().pending.take().unwrap();
+            bytes.copy_from_slice(&packet(
+                match cmd {
+                    0 => Command::Init,
+                    2 => Command::Info,
+                    0x2000 => Command::MixInfo,
+                    0x3000 => Command::MuxInfo,
+                    0x80000c => Command::DevmapInfo,
+                    0x80000d => Command::DevmapRead,
+                    0x3001 => Command::Mux,
+                    0x2001 => Command::Mix,
+                    0x3002 => Command::SetMux,
+                    0x2002 => Command::SetMix,
+                    _ => unreachable!(),
+                },
+                seq,
+                &p,
+            ));
+            Ok(bytes.len())
+        }
+    }
+    #[test]
+    fn transactions_preserve_raw_neighbors_padding_and_literal_write_abi() {
+        let (io, d) = device();
+        let report = apply_fcp(
+            io,
+            snapshot().model,
+            &snapshot(),
+            &[FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 0,
+            }],
+            &[FcpMixEdit {
+                output: 1,
+                input: 1,
+                coefficient: 32613,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.verified.mixes[0].coefficients, vec![32613, 65535]);
+        assert_eq!(
+            d.borrow().writes,
+            vec![
+                (0x3002, vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 8, 0]),
+                (0x2002, vec![0, 0, 0x65, 0x7f, 0xff, 0xff])
+            ]
+        );
+        let (command, payload) = target_packet(FcpTarget::Bank(2), &vec![0; 255 * 4]);
+        assert_eq!(command, Command::SetMux);
+        assert_eq!(payload.len(), 1024);
+        assert_eq!(&payload[..4], &[0, 0, 2, 0]);
+    }
+    #[test]
+    fn edits_reject_fixed_inactive_duplicate_and_out_of_range() {
+        let s = snapshot();
+        for e in [
+            FcpRouteEdit {
+                bank: 0,
+                destination: 257,
+                source: 128,
+            },
+            FcpRouteEdit {
+                bank: 1,
+                destination: 256,
+                source: 0,
+            },
+            FcpRouteEdit {
+                bank: 0,
+                destination: 258,
+                source: 0,
+            },
+            FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 129,
+            },
+        ] {
+            assert!(edited(&s, &[e], &[]).is_err());
+        }
+        let e = FcpRouteEdit {
+            bank: 0,
+            destination: 256,
+            source: 0,
+        };
+        assert!(edited(&s, &[e, e], &[]).is_err());
+        for (output, input, coefficient) in [(0, 1, 0), (1, 0, 0), (1, 3, 0), (1, 1, 32614)] {
+            assert!(edited(
+                &s,
+                &[],
+                &[FcpMixEdit {
+                    output,
+                    input,
+                    coefficient
+                }]
+            )
+            .is_err());
+        }
+        let (io, d) = device();
+        let mut stale = s.clone();
+        stale.firmware += 1;
+        assert!(matches!(
+            apply_fcp(io, s.model, &stale, &[], &[]),
+            Err(FcpWriteError {
+                failure: FcpFailure::Drift,
+                ..
+            })
+        ));
+        assert!(d.borrow().writes.is_empty());
+        let (io, d) = device();
+        apply_fcp(io, s.model, &s, &[], &[]).unwrap();
+        assert!(d.borrow().writes.is_empty());
+        let (io, d) = device();
+        assert!(apply_fcp(io, CandidateModel::IsaC8x, &s, &[], &[]).is_err());
+        assert!(d.borrow().writes.is_empty());
+    }
+    #[test]
+    fn lost_ack_rolls_back_attempted_rows_in_reverse() {
+        let (io, d) = device();
+        d.borrow_mut().fail_write = vec![2];
+        let e = apply_fcp(
+            io,
+            snapshot().model,
+            &snapshot(),
+            &[FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 0,
+            }],
+            &[FcpMixEdit {
+                output: 1,
+                input: 1,
+                coefficient: 1,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(e.failure, FcpFailure::Read(ReadError::Io(()))));
+        assert!(e.rollback.is_empty());
+        assert_eq!(d.borrow().state, snapshot());
+        assert_eq!(
+            d.borrow()
+                .writes
+                .iter()
+                .map(|(c, _)| *c)
+                .collect::<Vec<_>>(),
+            vec![0x3002, 0x2002, 0x2002, 0x3002]
+        );
+        assert_eq!(d.borrow().initializations, 2);
+    }
+    #[test]
+    fn lost_rollback_ack_is_success_when_original_bytes_are_proven() {
+        let (io, d) = device();
+        d.borrow_mut().fail_write = vec![2, 3];
+        let e = apply_fcp(
+            io,
+            snapshot().model,
+            &snapshot(),
+            &[FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 0,
+            }],
+            &[FcpMixEdit {
+                output: 1,
+                input: 1,
+                coefficient: 1,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(e.failure, FcpFailure::Read(ReadError::Io(()))));
+        assert!(e.rollback.is_empty());
+        assert_eq!(d.borrow().state, snapshot());
+        assert_eq!(d.borrow().initializations, 3);
+    }
+    #[test]
+    fn shared_layout_compares_slot_topology_but_allows_source_and_gain_changes() {
+        let original = snapshot();
+        let mut changed = original.clone();
+        changed.banks[0].raw_words[0] = 256;
+        changed.mixes[0].coefficients[0] = 100;
+        assert!(same_fcp_layout(&original, &changed));
+        changed.banks[0].raw_words.swap(0, 1);
+        assert!(!same_fcp_layout(&original, &changed));
+    }
+    #[test]
+    fn rollback_and_handback_preserve_external_drift_and_restore_independent_rows() {
+        let (io, d) = device();
+        {
+            let mut dev = d.borrow_mut();
+            dev.fail_write = vec![2];
+            dev.drift_on_reinit = true;
+        }
+        let error = apply_fcp(
+            io,
+            snapshot().model,
+            &snapshot(),
+            &[FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 0,
+            }],
+            &[FcpMixEdit {
+                output: 1,
+                input: 1,
+                coefficient: 1,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.rollback, vec![(FcpTarget::Mix(1), FcpFailure::Drift)]);
+        assert_eq!(d.borrow().state.banks, snapshot().banks);
+        assert_eq!(d.borrow().state.mixes[0].coefficients, vec![1, 65534]);
+        let (io, d) = device();
+        let original = snapshot();
+        let last = edited(
+            &original,
+            &[FcpRouteEdit {
+                bank: 0,
+                destination: 256,
+                source: 0,
+            }],
+            &[FcpMixEdit {
+                output: 1,
+                input: 1,
+                coefficient: 1,
+            }],
+        )
+        .unwrap();
+        {
+            let mut dev = d.borrow_mut();
+            dev.state = last.clone();
+            dev.state.mixes[0].coefficients[0] = 2;
+        }
+        let error = restore_fcp(io, original.model, &last, &original).unwrap_err();
+        assert_eq!(error.failure, FcpFailure::Drift);
+        assert_eq!(d.borrow().state.banks, original.banks);
+        assert_eq!(d.borrow().state.mixes[0].coefficients[0], 2);
+    }
     #[test]
     fn map_accepts_upstream_decimal_pins_whitespace_and_terminal_nuls() {
         let mut encoded = b"\n\t".to_vec();

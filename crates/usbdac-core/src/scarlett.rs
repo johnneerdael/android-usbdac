@@ -10,9 +10,11 @@
 use std::time::{Duration, Instant};
 
 mod fcp;
-pub use fcp::{read_fcp, FcpBank, FcpPort, FcpReadback};
+pub use fcp::{read_fcp, apply_fcp, FcpBank, FcpPort, FcpReadback, FcpRouteEdit, FcpMixEdit, FcpTarget, FcpWriteReport, FcpFailure, FcpWriteError};
 
 const HEADER: usize = 16;
+pub(crate) use fcp::{restore_fcp, same_fcp_layout};
+
 pub(crate) const FCP_MAX_PAYLOAD: usize = 1024;
 // Largest admitted bank: 77 words plus the four-byte SET_MUX header.
 pub(crate) const MAX_PAYLOAD: usize = 312;

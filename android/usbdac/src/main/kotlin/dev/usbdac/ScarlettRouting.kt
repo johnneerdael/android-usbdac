@@ -39,16 +39,35 @@ public data class ScarlettReadback(val model: ScarlettModel, val firmware: Long,
 public data class FcpPort(val pin: Int, val name: String, val fixedSource: Int?)
 /** Exact unsigned mux words, including padding, in firmware order. */
 public data class FcpBank(val bank: Int, val rawWords: List<Long>)
-/** Modern Focusrite firmware topology, available through readFcp() only. */
+/** Modern Focusrite firmware topology and exact unsigned raw readback. */
 public data class FcpReadback(val model: ScarlettModel, val firmware: Long, val mixerInputs: Int,
     val mixerOutputs: Int, val sources: List<FcpPort>, val destinations: List<FcpPort>,
     val banks: List<FcpBank>, val mixes: List<ScarlettMixRow>)
+/** Opaque native-observed baseline scoped to this session; at most eight are retained. */
+public class FcpSnapshot internal constructor(internal val owner: ScarlettRouting, internal val handle: Long,
+    public val readback: FcpReadback)
+/** Firmware pin IDs; source zero disconnects the destination. */
+public data class FcpRouteEdit(val bank: Int, val destination: Int, val source: Int) {
+    init { require(bank in 0..2); require(destination in 1..65535); require(source in 0..65535) }
+}
+/** One-based mixer coordinates and a bounded wire coefficient. */
+public data class FcpMixEdit(val output: Int, val input: Int, val coefficient: Int) {
+    init { require(output in 1..255); require(input in 1..255); require(coefficient in 0..32613) }
+}
+public data class FcpReport(val original: FcpReadback, val verified: FcpSnapshot)
+public enum class FcpTargetKind { BANK, MIX }
+public data class FcpTarget(val kind: FcpTargetKind, val index: Int)
+public data class FcpFailure(val kind: ScarlettFailureKind, val detail: String?, val target: FcpTarget?)
+public data class FcpRollbackFailure(val target: FcpTarget, val cause: FcpFailure)
+public class FcpException(message: String, public val fcpFailure: FcpFailure,
+    public val fcpRollbackFailures: List<FcpRollbackFailure>) :
+    ScarlettException(ScarlettErrorKind.FCP, message, null, null, null)
 /** Half-dB units, -160 (-80 dB) through 24 (+12 dB). */
 public data class ScarlettGainEdit(val input: Int, val halfDb: Int) {
     init { require(input in 1..25); require(halfDb in -160..24) }
 }
 public data class ScarlettMixReport(val original: ScarlettMixRow, val verified: ScarlettMixRow)
-public enum class ScarlettErrorKind { READ, MIX, SESSION, DRIFT, UNSUPPORTED, MUX }
+public enum class ScarlettErrorKind { READ, MIX, SESSION, DRIFT, UNSUPPORTED, MUX, FCP }
 public enum class ScarlettFailureKind { IO, PROTOCOL, INVALID, DRIFT, VERIFICATION }
 public data class ScarlettFailure(val kind: ScarlettFailureKind, val detail: String?, val actual: ScarlettMixRow?)
 /** Original failure and failed verified restoration are reported independently. */
@@ -97,11 +116,31 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
                 ScarlettMuxRoute(port(it.getJSONObject("source")), port(it.getJSONObject("destination")))
             }, v.getJSONArray("mixes").objects().map(::row))
     }
-    /** Read modern firmware-defined FCP routing. No FCP editing API is exposed. */
+    /** Stateless read of modern firmware-defined FCP routing; preserves retained edit tokens. */
     public fun readFcp(): FcpReadback {
         checkOpen()
         return parseFcpReadback(response { Native.fcpRead(dac) })
     }
+    /** Read and retain a bounded opaque baseline for typed edits. */
+    public fun readFcpSnapshot(): FcpSnapshot {
+        checkOpen()
+        return fcpSnapshot(response { Native.fcpReadSnapshot(dac) })
+    }
+    /** Apply typed edits against native-retained proof; fresh native state is checked before writes. */
+    public fun applyFcp(expected: FcpSnapshot, routes: List<FcpRouteEdit>, mixes: List<FcpMixEdit>): FcpReport {
+        checkOpen()
+        require(expected.owner === this) { "FCP snapshot belongs to another session" }
+        require(routes.size <= 3 * 255 && mixes.size <= 4096 && (routes.isNotEmpty() || mixes.isNotEmpty()))
+        require(routes.map { it.bank to it.destination }.distinct().size == routes.size)
+        require(mixes.map { it.output to it.input }.distinct().size == mixes.size)
+        val edits = JSONObject().put("routes", JSONArray(routes.map { JSONObject().put("bank", it.bank)
+            .put("destination", it.destination).put("source", it.source) }))
+            .put("mixes", JSONArray(mixes.map { JSONObject().put("output", it.output)
+                .put("input", it.input).put("coefficient", it.coefficient) }))
+        val v = response { Native.fcpApply(dac, expected.handle, edits.toString()) }
+        return FcpReport(parseFcpReadback(v.getJSONObject("original")), fcpSnapshot(v.getJSONObject("verified")))
+    }
+    private fun fcpSnapshot(v: JSONObject): FcpSnapshot = FcpSnapshot(this, v.getLong("snapshot_id"), parseFcpReadback(v))
     /** Probe complete bank geometry. Legacy read().muxZero remains independent. */
     public fun readMux(): ScarlettMuxSnapshot {
         checkOpen()
@@ -161,9 +200,18 @@ private fun muxFailure(v: JSONObject): ScarlettMuxFailure = ScarlettMuxFailure(
     ScarlettFailureKind.valueOf(v.getString("kind").uppercase()), v.optString("detail").takeIf(String::isNotEmpty),
     v.optJSONObject("actual")?.let(::muxReadback), if (v.has("bank")) v.getInt("bank") else null,
     v.optJSONObject("actual_bank")?.let(::muxBank))
+private fun fcpTarget(v: JSONObject): FcpTarget = FcpTarget(FcpTargetKind.valueOf(v.getString("kind").uppercase()), v.getInt("index"))
+internal fun parseFcpFailure(v: JSONObject): FcpFailure = FcpFailure(
+    ScarlettFailureKind.valueOf(v.getString("kind").uppercase()), v.optString("detail").takeIf(String::isNotEmpty),
+    v.optJSONObject("target")?.let(::fcpTarget))
 private fun response(call: () -> String): JSONObject = nativeCall {
     val result = JSONObject(call())
     result.optJSONObject("error")?.let { e ->
+        if (e.getString("kind") == "fcp") {
+            throw FcpException(e.getString("detail"), parseFcpFailure(e.getJSONObject("cause")),
+                e.getJSONArray("rollback_failures").objects().map {
+                    FcpRollbackFailure(fcpTarget(it.getJSONObject("target")), parseFcpFailure(it.getJSONObject("cause"))) })
+        }
         if (e.getString("kind") == "mux") {
             throw ScarlettMuxException(e.getString("detail"), muxFailure(e.getJSONObject("cause")),
                 e.getJSONArray("rollback_failures").objects().map { ScarlettMuxRollbackFailure(it.getInt("bank"), muxFailure(it.getJSONObject("cause"))) })
