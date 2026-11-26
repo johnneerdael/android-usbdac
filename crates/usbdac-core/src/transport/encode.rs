@@ -151,6 +151,9 @@ pub(super) fn encode_usb_pcm_slots(
         if ch == 0 {
             return Err("channels is zero".to_string());
         }
+        if !matches!(ss, 1 | 2 | 4) || input.len() % (ss * ch) != 0 {
+            return Err("native DSD requires complete 1-, 2- or 4-byte channel words".into());
+        }
         if output.len() != input.len() {
             return Err(format!(
                 "USB native DSD buffer length mismatch: output {} bytes, expected {} (1:1 with {} samples)",

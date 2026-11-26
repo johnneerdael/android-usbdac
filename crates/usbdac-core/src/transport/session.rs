@@ -192,6 +192,7 @@ pub(super) fn clear_session_state() {
     // Finish any in-progress Feature Unit I/O before the host releases its claims.
     let _volume_hold = HARDWARE_VOLUME_MUTEX.lock();
     finish_original_hardware_volume();
+    finish_requested_clock_route();
     release_idle_lock();
     if LIFECYCLE_STATE.lock().engine_state != EngineState::Fallback {
         set_engine_state(EngineState::Idle, None);

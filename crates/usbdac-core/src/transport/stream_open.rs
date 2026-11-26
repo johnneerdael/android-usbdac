@@ -151,7 +151,10 @@ pub(super) fn start_stream_inner(
     if expected.interface_number != candidate.interface_number || expected.alt_setting != candidate.alt_setting
         || expected.endpoint_address != candidate.endpoint_address || expected.pacing != selected_pacing
         || expected.sample_rate != selected_rate || expected.subslot_bytes != candidate.subslot_size
-        || expected.channels != candidate.channels || expected.service_interval_us != candidate.service_interval_us {
+        || expected.channels != candidate.channels || expected.service_interval_us != candidate.service_interval_us
+        || expected.native_dsd_signature != (if playback_format.dsd_transport == DsdTransportMode::Native {
+            candidate.native_dsd.map(|p| p.signature())
+        } else { None }) {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState("USB stream candidate changed since negotiation; negotiate again".into()));
     }
@@ -178,9 +181,9 @@ pub(super) fn start_stream_inner(
         }
     }
     let clock_choice = candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate);
-    if candidate.implicit_feedback.is_some() && clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
+    if clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
-        return Err(Error::InvalidState("implicit clock route changed since negotiation".into()));
+        return Err(Error::InvalidState("clock route changed since negotiation".into()));
     }
     let clock = clock_choice.map(|(clock, _)| clock);
     let clock_detection_msg = match &clock {
@@ -304,6 +307,10 @@ pub(super) fn start_stream_inner(
         return Err(Error::Transfer(message));
     }
     thread::sleep(Duration::from_millis(50));
+    if let Err(error) = verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) {
+        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        return Err(Error::InvalidState(error));
+    }
 
     let mut clock_control_attempted = state.clock_control_attempted;
     let mut clock_control_succeeded = state.clock_control_succeeded;

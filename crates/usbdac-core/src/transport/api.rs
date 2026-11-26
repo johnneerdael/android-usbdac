@@ -173,6 +173,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
             },
         ),
         clock,
+        native_dsd_signature: if native { candidate.native_dsd.map(|p| p.signature()) } else { None },
     })
 }
 
@@ -209,7 +210,8 @@ pub(crate) fn open_stream(format: &StreamFormat, events: EventSink) -> Result<St
             && again.subslot_bytes == format.subslot_bytes
             && again.valid_bits == format.valid_bits
             && again.endpoint_address == format.endpoint_address
-            && again.pacing == format.pacing;
+            && again.pacing == format.pacing
+            && again.native_dsd_signature == format.native_dsd_signature;
         if !same {
             return Err(Error::InvalidState(
                 "the DAC no longer offers that format; negotiate again".to_string(),

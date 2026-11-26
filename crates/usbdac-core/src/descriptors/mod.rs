@@ -11,6 +11,9 @@ mod parser_trait;
 mod types;
 mod validation;
 
+/// USB Audio Class 3 descriptors and BADD profile inference.
+pub mod uac3;
+
 pub use audio_control_parser::AudioControlParser;
 pub use error::DescriptorError;
 #[cfg(test)]

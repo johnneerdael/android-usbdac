@@ -131,6 +131,8 @@ pub(super) struct IsoStreamCandidate {
     pub(super) sync_type: SyncType,
     pub(super) usage_type: UsageType,
     pub(super) format_tag: u16,
+    pub(super) uac2_formats: Option<u32>,
+    pub(super) native_dsd: Option<NativeDsdProfile>,
     pub(super) channels: u16,
     pub(super) subslot_size: u8,
     pub(super) bit_resolution: u8,
@@ -182,6 +184,8 @@ pub(super) struct SamplingFrequencySubrange {
 #[derive(Debug, Clone)]
 pub(super) struct StreamingInterfaceFormat {
     pub(super) format_tag: u16,
+    pub(super) uac2_formats: Option<u32>,
+    pub(super) native_dsd: Option<NativeDsdProfile>,
     pub(super) channels: u16,
     pub(super) subslot_size: u8,
     pub(super) bit_resolution: u8,

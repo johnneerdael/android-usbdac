@@ -24,6 +24,9 @@ pub(super) fn negotiate_playback_format(
     let mut cleanup_interface: Option<u8> = None;
     let mut clock_choice: Option<ClockChoice> = None;
     let negotiated = (|| {
+        // SessionGuard excludes transfers; restore the preceding negotiation's
+        // selector state before discovering this request's candidates.
+        restore_requested_clock_route(&claimed_handle).map_err(Error::Transfer)?;
         let usb_device = claimed_handle.handle.device();
         let speed = resolve_device_speed(&usb_device);
         let capability_model = build_usb_capability_model(
@@ -50,14 +53,15 @@ pub(super) fn negotiate_playback_format(
             }
         };
 
-        // Find clock entity AFTER selecting candidate so we can trace the
-        // topology using the candidate's bTerminalLink.
-        let clock =
-            candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
-                .map(|(clock, choice)| {
-                    clock_choice = Some(choice);
-                    clock
-                });
+        // Clock controls and packet pacing use transport words, not source bytes.
+        let requested_format = PlaybackFormat {
+            sample_rate: native_wire_rate(requested_format, candidate.subslot_size)
+                .ok_or_else(|| Error::Unsupported {
+                    reason: "native DSD rate is not a whole wire word cadence".into(),
+                    offered: offered_alt_settings(),
+                })?,
+            ..requested_format
+        };
 
         if let Err(error) = claimed_handle.ensure_interface_claimed(candidate.interface_number) {
             set_last_error(Some(error.clone()));
@@ -76,6 +80,11 @@ pub(super) fn negotiate_playback_format(
         }
         cleanup_interface = Some(candidate.interface_number);
         thread::sleep(Duration::from_millis(100));
+
+        select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
+            .map_err(Error::Transfer)?;
+        let clock = candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
+            .map(|(clock, choice)| { clock_choice = Some(choice); clock });
 
         let mut effective_format = requested_format;
         let mut dac_mode = DacMode::FullControl;
@@ -169,6 +178,12 @@ pub(super) fn negotiate_playback_format(
                 });
             }
 
+            if requested_format.dsd_transport == DsdTransportMode::Native {
+                return Err(Error::Unsupported {
+                    reason: "native DSD requires its exact wire clock rate".into(),
+                    offered: offered_alt_settings(),
+                });
+            }
             if let Some(actual_rate) = choose_adaptive_sample_rate(
                 requested_format.sample_rate,
                 current_rate,
@@ -318,6 +333,11 @@ pub(super) fn negotiate_playback_format(
         Ok(effective_format)
     })();
 
+    if negotiated.is_err() {
+        if let Err(error) = restore_requested_clock_route(&claimed_handle) {
+            log_warn!("[USB] Failed negotiation could not restore clock selectors: {error}");
+        }
+    }
     cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
     negotiated.map(|format| (format, clock_choice))
 }
@@ -333,6 +353,9 @@ pub(super) fn choose_adaptive_sample_rate(
     requested_format: PlaybackFormat,
     claimed_interfaces: &[u8],
 ) -> Result<Option<u32>, crate::Error> {
+    if requested_format.dsd_transport == DsdTransportMode::Native {
+        return Ok(current_rate.filter(|rate| *rate == requested_sample_rate));
+    }
     let has_rate_evidence = current_rate.is_some()
         || supported_ranges.is_some_and(|ranges| !ranges.is_empty())
         || capability_model
@@ -467,8 +490,11 @@ pub(super) fn transport_compatibility_penalty(
     playback_format: PlaybackFormat,
 ) -> u32 {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    let fmt_ok = stream_format.format_tag == FORMAT_TAG_PCM
-        || (is_native_dsd && stream_format.format_tag == FORMAT_TAG_DSD);
+    let fmt_ok = if is_native_dsd {
+        stream_format.native_dsd.is_some()
+    } else {
+        stream_format.format_tag == FORMAT_TAG_PCM
+    };
     if !fmt_ok {
         return u32::MAX;
     }
@@ -511,6 +537,8 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
     transport_compatibility_penalty(
         &StreamingInterfaceFormat {
             format_tag: candidate.format_tag,
+            uac2_formats: candidate.uac2_formats,
+            native_dsd: candidate.native_dsd,
             channels: candidate.channels,
             subslot_size: candidate.subslot_size,
             bit_resolution: candidate.bit_resolution,

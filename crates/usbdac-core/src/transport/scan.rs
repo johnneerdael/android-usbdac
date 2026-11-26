@@ -136,7 +136,7 @@ struct ImplicitSourceCandidate {
 }
 
 /// Audio IADs are authoritative function membership; no adjacency heuristic.
-fn audio_functions(raw: &[u8]) -> Vec<(u8, Vec<u8>)> {
+pub(super) fn audio_functions(raw: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut result = Vec::new();
     let mut offset = 0;
     while offset + 2 <= raw.len() {
@@ -350,6 +350,12 @@ pub(super) fn candidate_audio_control_clock_choice(
             clock,
         ))
     } else {
+        if let Some((control, graph)) = owning_clock_graph(device, handle, candidate.interface_number) {
+            let selected = graph.select_clock(control, candidate.terminal_link, |id| {
+                get_clock_selector_pin(handle, control, id)
+            }).ok()?;
+            return Some((AudioControlClock { interface_number: control, clock_id: selected.choice.source_id }, selected.choice));
+        }
         find_audio_control_clock_choice(device, handle, candidate.terminal_link)
     }
 }
@@ -427,6 +433,10 @@ fn discover_candidate_rate_ranges(
             }
         }
     }
+    let alternatives = selectable_clock_ranges(device, handle, interface, terminal);
+    if !alternatives.is_empty() {
+        return alternatives;
+    }
     discover_stream_sample_rate_ranges(device, handle, interface, terminal, parsed)
 }
 
@@ -466,7 +476,6 @@ pub(super) fn build_usb_capability_model(
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
-    let dsd_subslot_override = settings().dsd_subslot_override();
     let mut effective_speed = speed;
 
     for interface in config_descriptor.interfaces() {
@@ -481,11 +490,7 @@ pub(super) fn build_usb_capability_model(
             else {
                 continue;
             };
-            if stream_format.format_tag == FORMAT_TAG_DSD {
-                if let Some(ss) = dsd_subslot_override {
-                    stream_format.subslot_size = ss;
-                }
-            }
+            stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
             let sample_rate_ranges = stream_rate_cache
                 .entry((descriptor.interface_number(), stream_format.terminal_link))
                 .or_insert_with(|| {
@@ -581,7 +586,7 @@ pub(super) fn build_usb_capability_model(
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
                     endpoint_address: endpoint.address(),
-                    format: alt_format(stream_format.format_tag),
+                    format: if stream_format.format_tag == FORMAT_TAG_DSD { AltFormat::Other } else { alt_format(stream_format.format_tag) },
                     channels: stream_format.channels,
                     subslot_bytes: stream_format.subslot_size,
                     valid_bits: stream_format.bit_resolution,
@@ -609,6 +614,15 @@ pub(super) fn build_usb_capability_model(
                     synch_address: endpoint.synch_address(),
                     pacing,
                 });
+                if let Some(profile) = stream_format.native_dsd {
+                    let mut native = alt_settings.last().unwrap().clone();
+                    native.format = AltFormat::Dsd;
+                    native.subslot_bytes = profile.word_bytes;
+                    native.valid_bits = 1;
+                    alt_settings.push(native);
+                }
+                // Non-PCM masks stay visible as Other, but never masquerade as
+                // linear PCM or native DSD without a resolved profile.
             }
         }
     }
@@ -651,7 +665,6 @@ pub(super) fn select_stream_candidate(
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
-    let dsd_subslot_override = settings().dsd_subslot_override();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
     for interface in config_descriptor.interfaces() {
@@ -666,10 +679,12 @@ pub(super) fn select_stream_candidate(
                 Some(format) => format,
                 None => continue,
             };
-            if stream_format.format_tag == FORMAT_TAG_DSD {
-                if let Some(ss) = dsd_subslot_override {
-                    stream_format.subslot_size = ss;
-                }
+            stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
+            if playback_format.dsd_transport == DsdTransportMode::Native {
+                let Some(profile) = stream_format.native_dsd else { continue; };
+                stream_format.subslot_size = profile.word_bytes;
+                stream_format.bit_resolution = 1;
+                stream_format.format_tag = FORMAT_TAG_DSD;
             }
 
             let compatibility_penalty =
@@ -694,15 +709,7 @@ pub(super) fn select_stream_candidate(
                 .clone();
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
-            let effective_sample_rate = if playback_format.dsd_transport == DsdTransportMode::Native
-                && stream_format.format_tag == FORMAT_TAG_DSD
-                && playback_format.dsd_bit_rate > 0
-                && stream_format.subslot_size > 0
-            {
-                playback_format.dsd_bit_rate / (8 * u32::from(stream_format.subslot_size))
-            } else {
-                playback_format.sample_rate
-            };
+            let Some(effective_sample_rate) = native_wire_rate(playback_format, stream_format.subslot_size) else { continue; };
 
             if !sample_rate_ranges.is_empty()
                 && stream_format.format_tag != FORMAT_TAG_DSD
@@ -894,6 +901,8 @@ pub(super) fn select_stream_candidate(
                     sync_type: endpoint.sync_type(),
                     usage_type: endpoint.usage_type(),
                     format_tag: stream_format.format_tag,
+                    uac2_formats: stream_format.uac2_formats,
+                    native_dsd: stream_format.native_dsd,
                     channels: stream_format.channels,
                     subslot_size: stream_format.subslot_size,
                     bit_resolution: stream_format.bit_resolution,
@@ -1334,16 +1343,25 @@ pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
 pub(super) fn parse_android_streaming_interface_format(
     descriptor: &rusb::InterfaceDescriptor,
 ) -> Option<StreamingInterfaceFormat> {
+    parse_streaming_extra(descriptor.protocol_code(), descriptor.extra())
+}
+
+pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<StreamingInterfaceFormat> {
     let mut channels = None;
     let mut format_tag = None;
+    let mut uac2_formats = None;
     let mut subslot_size = None;
     let mut bit_resolution = None;
     let mut terminal_link = None;
     let mut sample_rate_ranges = Vec::new();
 
-    let is_uac1 = descriptor.protocol_code() != 0x20;
+    let is_uac1 = match protocol {
+        0x00 => true,
+        0x20 => false,
+        _ => return None,
+    };
 
-    for extra in DescriptorIter::new(descriptor.extra()) {
+    for extra in DescriptorIter::new(bytes) {
         if extra.len() < 3 || extra[1] != USB_DT_CS_INTERFACE {
             continue;
         }
@@ -1358,11 +1376,16 @@ pub(super) fn parse_android_streaming_interface_format(
                         format_tag = Some(u16::from_le_bytes([extra[5], extra[6]]));
                     }
                 } else if extra.len() >= 16 {
+                    if extra[5] != UAC2_FORMAT_TYPE_I { return None; }
                     channels = Some(extra[10] as u16);
-                    format_tag =
-                        Some(u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]) as u16);
+                    let bits = u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]);
+                    uac2_formats = Some(bits);
+                    format_tag = Some(uac2_primary_format(bits));
                 } else if extra.len() >= 7 {
-                    format_tag = Some(u16::from_le_bytes([extra[5], extra[6]]));
+                    // Historical private short AS dialect. It is not a standard
+                    // UAC2 bitmap, and still needs explicit device/host policy.
+                    let tag = u16::from_le_bytes([extra[5], extra[6]]);
+                    format_tag = Some(if tag == 8 { FORMAT_TAG_DSD } else { tag });
                 }
             }
             UAC2_FORMAT_TYPE if extra.get(3).copied() == Some(UAC2_FORMAT_TYPE_I) => {
@@ -1427,6 +1450,8 @@ pub(super) fn parse_android_streaming_interface_format(
 
     Some(StreamingInterfaceFormat {
         format_tag,
+        uac2_formats,
+        native_dsd: None,
         channels: channels.unwrap_or(2),
         subslot_size,
         bit_resolution,
@@ -1486,9 +1511,8 @@ pub(super) fn validate_transport_against_playback_format(
     playback_format: PlaybackFormat,
 ) -> Result<(), String> {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    if candidate.format_tag != FORMAT_TAG_PCM
-        && !(is_native_dsd && candidate.format_tag == FORMAT_TAG_DSD)
-    {
+    if if is_native_dsd { candidate.native_dsd.is_none() }
+        else { candidate.format_tag != FORMAT_TAG_PCM } {
         return Err(format!(
             "USB direct requires PCM transport, got {}",
             format_tag_label(candidate.format_tag)

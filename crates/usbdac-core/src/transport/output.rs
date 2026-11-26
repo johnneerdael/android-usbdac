@@ -451,8 +451,10 @@ pub(super) fn run_usb_output_loop(
     USB_DSD_PAYLOAD_LATCH.lock().reset();
     USB_PCM_PAYLOAD_LATCH.lock().reset();
     LAST_BIT_PERFECT_LOGGED.store(false, Ordering::Relaxed);
-    let dsd_big_endian = settings().dsd_big_endian();
-    let dsd_bit_reverse = settings().dsd_bit_reverse();
+    // The profile belongs to this selected stream; mutable session settings
+    // must never change the interpretation of queued DSD bytes.
+    let dsd_big_endian = candidate.native_dsd.is_some_and(|p| p.big_endian);
+    let dsd_bit_reverse = candidate.native_dsd.is_some_and(|p| p.bit_reverse);
     let slot_bytes = candidate.subslot_size as usize;
     if slot_bytes == 0 {
         let message = "the selected alternate setting has a zero-byte subslot".to_string();

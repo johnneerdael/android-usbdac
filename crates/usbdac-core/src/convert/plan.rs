@@ -396,6 +396,7 @@ mod tests {
             service_interval_us: 125,
             pacing: Pacing::ExplicitFeedback { endpoint: 0x81 },
             clock: None,
+            native_dsd_signature: None,
         }
     }
 

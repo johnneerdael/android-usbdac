@@ -33,7 +33,9 @@
 mod macros;
 
 pub mod convert;
+pub mod capture;
 pub mod descriptors;
+pub mod routing;
 
 mod capabilities;
 mod clock_resolution;

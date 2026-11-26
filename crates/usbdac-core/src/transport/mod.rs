@@ -100,7 +100,8 @@ const UAC2_FEATURE_UNIT: u8 = 0x06;
 const FORMAT_TAG_PCM: u16 = 0x0001;
 const FORMAT_TAG_PCM8: u16 = 0x0002;
 const FORMAT_TAG_IEEE_FLOAT: u16 = 0x0003;
-const FORMAT_TAG_DSD: u16 = 0x0008;
+// Internal resolved native transport; never a standard UAC format tag.
+const FORMAT_TAG_DSD: u16 = 0xffff;
 const UAC1_REQUEST_GET_MIN: u8 = 0x82;
 const UAC1_REQUEST_GET_MAX: u8 = 0x83;
 const UAC1_REQUEST_GET_RES: u8 = 0x84;
@@ -143,6 +144,8 @@ mod clock;
 mod encode;
 mod iso;
 mod negotiate;
+mod native_dsd;
+use native_dsd::*;
 mod output;
 mod ring;
 mod scan;

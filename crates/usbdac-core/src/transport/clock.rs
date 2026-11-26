@@ -832,3 +832,334 @@ pub(super) fn strict_implicit_clock(
         resolution: crate::clock_resolution::ClockResolution::Resolved,
     })
 }
+
+// Kept outside SessionState so frozen registration/test fixtures need no new
+// fields. USB_SESSION_GATE / SessionGuard serialize the lifecycle operations.
+#[derive(Clone)]
+struct SelectedClockRoute {
+    fd: RawFd,
+    control: u8,
+    streaming: u8,
+    plan: crate::clock_resolution::ClockPlan,
+}
+static SELECTED_CLOCK_ROUTE: Mutex<Option<SelectedClockRoute>> = Mutex::new(None);
+
+/// A unique UAC2 IAD must prove ownership before automatic selector changes.
+/// No adjacency or globally repeated terminal IDs may establish this relation.
+pub(super) fn owning_clock_graph(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    streaming: u8,
+) -> Option<(u8, ClockGraph)> {
+    let config = device.active_config_descriptor().ok()?;
+    let raw = read_active_configuration_bytes(handle, &config)?;
+    let functions = audio_functions(&raw);
+    let mut owners = functions.iter().filter(|(_, ids)| ids.contains(&streaming));
+    let (control, ids) = owners.next()?;
+    if owners.next().is_some() {
+        return None;
+    }
+    let controls: Vec<_> = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .filter(|d| {
+            ids.contains(&d.interface_number())
+                && d.class_code() == USB_CLASS_AUDIO
+                && d.sub_class_code() == USB_SUBCLASS_AUDIOCONTROL
+                && d.setting_number() == 0
+                && d.protocol_code() == 0x20
+        })
+        .collect();
+    if controls.len() != 1 || controls[0].interface_number() != *control {
+        return None;
+    }
+    let bytes = audio_control_descriptors_from_config(&raw, *control);
+    Some((*control, ClockGraph::parse(&bytes)))
+}
+
+/// Read-only discovery allows rate filtering to see sources reachable through
+/// safe writable selector paths, without selecting one during enumeration.
+/// Limit source probes independently of the pure graph's work budget.
+pub(super) fn selectable_clock_ranges(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    streaming: u8,
+    terminal: Option<u8>,
+) -> Vec<SamplingFrequencySubrange> {
+    let Some((control, graph)) = owning_clock_graph(device, handle, streaming) else {
+        return Vec::new();
+    };
+    let Some(terminal) = terminal else {
+        return Vec::new();
+    };
+    let mut reads = 0usize;
+    let Ok(plans) = graph.enumerate_plans(terminal, |id| {
+        reads += 1;
+        if reads > 16 {
+            return Err("clock selector read budget exhausted".into());
+        }
+        get_clock_selector_pin(handle, control, id)
+    }) else {
+        return Vec::new();
+    };
+    let mut sources = HashSet::new();
+    let mut ranges = Vec::new();
+    for plan in plans {
+        if !sources.insert(plan.source_id) {
+            continue;
+        }
+        if sources.len() > 8 {
+            break;
+        }
+        if get_clock_validity(handle, control, plan.source_id) != Ok(true) {
+            continue;
+        }
+        if let Ok(found) = get_sampling_frequency_ranges(handle, control, plan.source_id) {
+            ranges.extend(found);
+        }
+    }
+    ranges
+}
+
+struct UsbClockPlanIo<'a> {
+    handle: &'a DeviceHandle<Context>,
+    control: u8,
+    rate: u32,
+}
+impl crate::clock_resolution::ClockPlanIo for UsbClockPlanIo<'_> {
+    fn read_pin(&mut self, selector: u8) -> Result<u8, String> {
+        get_clock_selector_pin(self.handle, self.control, selector)
+    }
+    fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        if pin == 0 {
+            return Err("clock selector pins are one-based".into());
+        }
+        let n = self
+            .handle
+            .write_control(
+                USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                UAC2_REQUEST_SET_CUR,
+                UAC2_CLOCK_SELECTOR_CONTROL,
+                u16::from(self.control) | (u16::from(selector) << 8),
+                &[pin],
+                Duration::from_millis(500),
+            )
+            .map_err(|e| format!("Clock Selector SET_CUR failed: {e}"))?;
+        if n != 1 {
+            return Err(format!(
+                "Clock Selector SET_CUR transferred {n} bytes, expected 1"
+            ));
+        }
+        Ok(())
+    }
+    fn validate_source(&mut self, source: u8) -> Result<(), String> {
+        if !get_clock_validity(self.handle, self.control, source)? {
+            return Err(format!("clock source {source} is invalid"));
+        }
+        let ranges = get_sampling_frequency_ranges(self.handle, self.control, source)?;
+        if !sampling_frequency_ranges_support_rate(&ranges, self.rate) {
+            return Err(format!(
+                "clock source {source} does not support {} Hz",
+                self.rate
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Called only with streaming alternates at zero and no transfers. Conservative
+/// legacy fallback remains available when strict topology cannot be proven.
+pub(super) fn select_requested_clock_route(
+    claimed: &ClaimedHandle,
+    candidate: &IsoStreamCandidate,
+    rate: u32,
+) -> Result<(), String> {
+    // Alternate paths have not proved the complete implicit playback/IN pair.
+    if candidate.implicit_feedback.is_some() {
+        return Ok(());
+    }
+    let device = claimed.handle.device();
+    let Some((control, graph)) =
+        owning_clock_graph(&device, &claimed.handle, candidate.interface_number)
+    else {
+        return Ok(());
+    };
+    let Some(terminal) = candidate.terminal_link else {
+        return Ok(());
+    };
+    claimed.ensure_interface_claimed(control)?;
+    let mut reads = 0usize;
+    let Ok(plans) = graph.enumerate_plans(terminal, |id| {
+        reads += 1;
+        if reads > 16 {
+            return Err("clock selector read budget exhausted".into());
+        }
+        get_clock_selector_pin(&claimed.handle, control, id)
+    }) else {
+        return Ok(());
+    };
+    let mut io = UsbClockPlanIo {
+        handle: &claimed.handle,
+        control,
+        rate,
+    };
+    let mut sources = HashSet::new();
+    for plan in plans.into_iter().take(8) {
+        // Preserve paths to shared sources if an earlier application fails,
+        // but cap all hardware attempts independently of the pure search.
+        sources.insert(plan.source_id);
+        if sources.len() > 8 {
+            break;
+        }
+        use crate::clock_resolution::ClockPlanIo;
+        if io.validate_source(plan.source_id).is_err() {
+            continue;
+        }
+        if plan.selectors.iter().any(|pin| pin.original != pin.target)
+            && !stop_owned_clock_alternates(claimed, candidate.interface_number)?
+        {
+            // Never alter a clock shared with an unclaimed sibling interface.
+            continue;
+        }
+        match plan.apply(&mut io) {
+            Ok(()) => {
+                let exact = graph
+                    .resolve_terminal_clock(terminal, |id| {
+                        get_clock_selector_pin(&claimed.handle, control, id)
+                    })
+                    .is_ok_and(|resolved| {
+                        resolved.clock_id == plan.source_id && resolved.path == plan.path
+                    });
+                *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute {
+                    fd: claimed.device_fd,
+                    control,
+                    streaming: candidate.interface_number,
+                    plan,
+                });
+                if !exact {
+                    restore_requested_clock_route(claimed)?;
+                    return Err("clock route changed immediately after selector transaction".into());
+                }
+                return Ok(());
+            }
+            Err(error) if !error.rollback_errors.is_empty() => return Err(error.to_string()),
+            Err(error) => log_warn!("[USB] Rejected clock path: {error}"),
+        }
+    }
+    Ok(())
+}
+
+/// A negotiated plan's selected pins must remain identical until open; never
+/// silently repair drift on behalf of an old StreamFormat.
+pub(super) fn verify_requested_clock_route(
+    claimed: &ClaimedHandle,
+    rate: u32,
+) -> Result<(), String> {
+    let selected = SELECTED_CLOCK_ROUTE.lock().clone();
+    let Some(selected) = selected.filter(|r| r.fd == claimed.device_fd) else {
+        return Ok(());
+    };
+    let mut current = selected.plan;
+    for pin in &mut current.selectors {
+        pin.original = pin.target;
+    }
+    current
+        .apply(&mut UsbClockPlanIo {
+            handle: &claimed.handle,
+            control: selected.control,
+            rate,
+        })
+        .map_err(|e| format!("negotiated clock route changed or became invalid: {e}"))
+}
+
+/// Restore the first saved selector state before renegotiation or hand-back.
+/// Leave the slot populated on failure so a later safe hand-back can retry.
+pub(super) fn restore_requested_clock_route(claimed: &ClaimedHandle) -> Result<(), String> {
+    let mut slot = SELECTED_CLOCK_ROUTE.lock();
+    let Some(selected) = slot.as_ref().filter(|r| r.fd == claimed.device_fd) else {
+        return Ok(());
+    };
+    if selected
+        .plan
+        .selectors
+        .iter()
+        .any(|pin| pin.original != pin.target)
+        && !stop_owned_clock_alternates(claimed, selected.streaming)?
+    {
+        return Err("cannot restore clock route while a sibling interface is unowned".into());
+    }
+    selected
+        .plan
+        .restore(&mut UsbClockPlanIo {
+            handle: &claimed.handle,
+            control: selected.control,
+            rate: 0,
+        })
+        .map_err(|e| e.to_string())?;
+    *slot = None;
+    Ok(())
+}
+
+pub(super) fn finish_requested_clock_route() {
+    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
+        return;
+    };
+    if SELECTED_CLOCK_ROUTE
+        .lock()
+        .as_ref()
+        .is_none_or(|r| r.fd != device.fd)
+    {
+        return;
+    }
+    match open_claimed_usb_handle(&device) {
+        Ok(claimed) => {
+            if let Err(error) = restore_requested_clock_route(&claimed) {
+                log_warn!("[USB] Original clock selectors not restored: {error}");
+            }
+            cleanup_claimed_handle(claimed, None, false);
+        }
+        Err(error) => log_warn!("[USB] Cannot open clock route for hand-back: {error}"),
+    }
+    // Registration is ending, so never carry device-local IDs to a reused fd.
+    *SELECTED_CLOCK_ROUTE.lock() = None;
+}
+
+/// Stop every streaming alternate in the proven function before changing its
+/// clock tree. Missing ownership of even one sibling makes mutation unsafe.
+fn stop_owned_clock_alternates(claimed: &ClaimedHandle, streaming: u8) -> Result<bool, String> {
+    let device = claimed.handle.device();
+    let config = device
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    let Some(raw) = read_active_configuration_bytes(&claimed.handle, &config) else {
+        return Ok(false);
+    };
+    let functions = audio_functions(&raw);
+    let mut owners = functions.iter().filter(|(_, ids)| ids.contains(&streaming));
+    let Some((_, ids)) = owners.next() else {
+        return Ok(false);
+    };
+    if owners.next().is_some() {
+        return Ok(false);
+    }
+    let siblings: HashSet<_> = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .filter(|d| {
+            ids.contains(&d.interface_number())
+                && d.class_code() == USB_CLASS_AUDIO
+                && d.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+        })
+        .map(|d| d.interface_number())
+        .collect();
+    if siblings
+        .iter()
+        .any(|id| !claimed.claimed_interfaces.contains(id))
+    {
+        return Ok(false);
+    }
+    for sibling in siblings {
+        claimed.set_alternate_setting(sibling, 0)?;
+    }
+    Ok(true)
+}

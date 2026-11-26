@@ -124,6 +124,8 @@ pub struct StreamFormat {
     /// [`Dac::negotiate`](crate::Dac::negotiate). `None` when the DAC has no
     /// clock entities to set (UAC 1.0 sets the rate on the endpoint).
     pub clock: Option<ClockChoice>,
+    /// Native word width, byte order and bit order frozen at negotiation.
+    pub(crate) native_dsd_signature: Option<(u8, bool, bool)>,
 }
 
 impl StreamFormat {

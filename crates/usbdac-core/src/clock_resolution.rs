@@ -13,7 +13,7 @@
 //! Selector currently has selected.
 
 use crate::descriptors::AudioControlParser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 const USB_DT_INTERFACE: u8 = 0x04;
@@ -130,6 +130,10 @@ pub(crate) struct ClockGraph {
     terminal_clock: HashMap<u8, u8>,
     entities: HashMap<u8, ClockEntity>,
     first_source: Option<u8>,
+    // Strict selectable topology is separate from the legacy sparse fallback.
+    exact_sources: HashSet<u8>,
+    selector_controls: HashMap<u8, u8>,
+    duplicate_ids: HashSet<u8>,
 }
 
 impl ClockGraph {
@@ -138,6 +142,7 @@ impl ClockGraph {
     pub(crate) fn parse(descriptors: &[u8]) -> Self {
         let mut graph = Self::default();
         let mut index = 0usize;
+        let mut seen_ids = HashSet::new();
         while index + 2 < descriptors.len() {
             let length = descriptors[index] as usize;
             if length < 3 || index + length > descriptors.len() {
@@ -147,6 +152,19 @@ impl ClockGraph {
             index += length;
             if descriptor[1] != USB_DT_CS_INTERFACE {
                 continue;
+            }
+            if length >= 4
+                && matches!(
+                    descriptor[2],
+                    UAC2_INPUT_TERMINAL
+                        | UAC2_OUTPUT_TERMINAL
+                        | UAC2_CLOCK_SOURCE
+                        | UAC2_CLOCK_SELECTOR
+                        | UAC2_CLOCK_MULTIPLIER
+                )
+                && !seen_ids.insert(descriptor[3])
+            {
+                graph.duplicate_ids.insert(descriptor[3]);
             }
             match descriptor[2] {
                 // bTerminalID at 3; bCSourceID at 7 (Input Terminal, 4.7.2.4).
@@ -161,8 +179,19 @@ impl ClockGraph {
                 UAC2_CLOCK_SOURCE if length >= 4 => {
                     graph.entities.insert(descriptor[3], ClockEntity::Source);
                     graph.first_source.get_or_insert(descriptor[3]);
+                    if length >= 8 && descriptor[3] != 0 {
+                        graph.exact_sources.insert(descriptor[3]);
+                    }
                 }
                 UAC2_CLOCK_SELECTOR if length >= 4 => {
+                    if length >= 5 {
+                        let pins = usize::from(descriptor[4]);
+                        if length >= 7 + pins {
+                            graph
+                                .selector_controls
+                                .insert(descriptor[3], descriptor[5 + pins]);
+                        }
+                    }
                     let entity = AudioControlParser
                         .parse_clock_selector(descriptor)
                         .map(|selector| ClockEntity::Selector(selector.ba_c_source_id))
@@ -180,6 +209,39 @@ impl ClockGraph {
             }
         }
         graph
+    }
+
+    /// Enumerate exact selectable UAC2 paths, current pin first at every branch.
+    /// Reads are cached per selector; a failed/illegal read cannot be safely
+    /// restored and therefore excludes that selector entirely. This never uses
+    /// the legacy first-source or sparse-descriptor fallback. An unknown
+    /// multiplier ratio is deliberately unsupported for selectable routes.
+    pub(crate) fn enumerate_plans(
+        &self,
+        terminal_id: u8,
+        mut read_pin: impl FnMut(u8) -> Result<u8, String>,
+    ) -> Result<Vec<ClockPlan>, String> {
+        if self.duplicate_ids.contains(&terminal_id) {
+            return Err(format!("terminal {terminal_id} has a duplicate entity ID"));
+        }
+        let first = *self
+            .terminal_clock
+            .get(&terminal_id)
+            .ok_or_else(|| format!("terminal {terminal_id} has no clock link"))?;
+        let mut search = ClockSearch {
+            graph: self,
+            pins: HashMap::new(),
+            read_pin: &mut read_pin,
+            remaining: 4096,
+            plans: Vec::new(),
+        };
+        search.walk(first, &mut Vec::new(), &mut Vec::new())?;
+        if search.plans.is_empty() {
+            return Err(format!(
+                "terminal {terminal_id} has no exact selectable clock path"
+            ));
+        }
+        Ok(search.plans)
     }
 
     /// True if any clock entity was described. Without one (UAC 1.0 has none)
@@ -355,6 +417,209 @@ impl ClockGraph {
     }
 }
 
+/// One selector's snapshot and requested 1-based pin. Kept even for unchanged
+/// selectors so opening a negotiated plan can reject intervening route changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockPinPlan {
+    pub selector: u8,
+    pub original: u8,
+    pub target: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockPlan {
+    pub source_id: u8,
+    /// Root-to-source entity IDs, excluding the streaming terminal.
+    pub path: Vec<u8>,
+    /// Root-to-leaf selector order, including unchanged pins.
+    pub selectors: Vec<ClockPinPlan>,
+}
+
+/// Transport boundary shared by plan application and hand-back. Implementations
+/// must perform exact-length control transfers, including GET after each SET.
+pub(crate) trait ClockPlanIo {
+    fn read_pin(&mut self, selector: u8) -> Result<u8, String>;
+    fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String>;
+    /// Check validity and requested sampling cadence on this exact source.
+    /// Called after the whole path is selected, even when no selector changes.
+    fn validate_source(&mut self, source: u8) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockPlanError {
+    pub reason: String,
+    /// A non-empty list means the hardware route could not be restored.
+    pub rollback_errors: Vec<String>,
+}
+
+impl fmt::Display for ClockPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.reason)?;
+        for error in &self.rollback_errors {
+            write!(f, "; rollback: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ClockPlan {
+    /// Reject stale negotiation before any write. Apply downstream selectors
+    /// first, verify each write, then validate the exact source. A failed SET
+    /// may have reached hardware, so include it in the rollback attempt.
+    pub(crate) fn apply(&self, io: &mut impl ClockPlanIo) -> Result<(), ClockPlanError> {
+        let mut attempted = Vec::new();
+        let result = (|| {
+            for pin in &self.selectors {
+                verify_pin(io, pin.selector, pin.original)?;
+            }
+            for pin in self
+                .selectors
+                .iter()
+                .rev()
+                .filter(|pin| pin.original != pin.target)
+            {
+                attempted.push(pin);
+                io.write_pin(pin.selector, pin.target)?;
+                verify_pin(io, pin.selector, pin.target)?;
+            }
+            // Re-read unchanged selectors too: a route change during apply
+            // must not turn an unrelated source's validity into acceptance.
+            for pin in &self.selectors {
+                verify_pin(io, pin.selector, pin.target)?;
+            }
+            io.validate_source(self.source_id)
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(ClockPlanError {
+                reason,
+                rollback_errors: restore_pins(io, attempted.into_iter().rev()),
+            }),
+        }
+    }
+
+    /// Explicit hand-back after a successful apply. Check the whole selected
+    /// route before restoring anything, to avoid overwriting an external change.
+    pub(crate) fn restore(&self, io: &mut impl ClockPlanIo) -> Result<(), ClockPlanError> {
+        for pin in &self.selectors {
+            verify_pin(io, pin.selector, pin.target).map_err(|reason| ClockPlanError {
+                reason,
+                rollback_errors: Vec::new(),
+            })?;
+        }
+        let errors = restore_pins(io, self.selectors.iter().filter(|p| p.original != p.target));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ClockPlanError {
+                reason: "clock hand-back failed".into(),
+                rollback_errors: errors,
+            })
+        }
+    }
+}
+
+fn verify_pin(io: &mut impl ClockPlanIo, selector: u8, expected: u8) -> Result<(), String> {
+    let actual = io.read_pin(selector)?;
+    if actual != expected {
+        return Err(format!(
+            "clock selector {selector} expected pin {expected}, read {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn restore_pins<'a>(
+    io: &mut impl ClockPlanIo,
+    pins: impl Iterator<Item = &'a ClockPinPlan>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for pin in pins {
+        if let Err(error) = io
+            .write_pin(pin.selector, pin.original)
+            .and_then(|()| verify_pin(io, pin.selector, pin.original))
+        {
+            errors.push(format!("selector {}: {error}", pin.selector));
+        }
+    }
+    errors
+}
+
+struct ClockSearch<'a, F> {
+    graph: &'a ClockGraph,
+    pins: HashMap<u8, Option<u8>>,
+    read_pin: &'a mut F,
+    remaining: usize,
+    plans: Vec<ClockPlan>,
+}
+
+impl<F: FnMut(u8) -> Result<u8, String>> ClockSearch<'_, F> {
+    fn walk(
+        &mut self,
+        id: u8,
+        path: &mut Vec<u8>,
+        selectors: &mut Vec<ClockPinPlan>,
+    ) -> Result<(), String> {
+        // Bound work as well as path depth: shared DAG branches can otherwise
+        // produce exponentially many paths despite per-path cycle detection.
+        if self.remaining == 0 || self.plans.len() >= 256 {
+            return Err("clock graph enumeration exceeds its bounded search budget".into());
+        }
+        self.remaining -= 1;
+        if id == 0
+            || self.graph.duplicate_ids.contains(&id)
+            || path.len() >= MAX_CLOCK_PATH
+            || path.contains(&id)
+        {
+            return Ok(());
+        }
+        path.push(id);
+        match self.graph.entities.get(&id) {
+            Some(ClockEntity::Source) if self.graph.exact_sources.contains(&id) => {
+                self.plans.push(ClockPlan {
+                    source_id: id,
+                    path: path.clone(),
+                    selectors: selectors.clone(),
+                });
+            }
+            Some(ClockEntity::Selector(inputs))
+                if !inputs.is_empty() && self.graph.selector_controls.contains_key(&id) =>
+            {
+                let controls = self.graph.selector_controls.get(&id).copied().unwrap_or(0) & 3;
+                // UAC2: 00 absent, 01 read-only, 10 reserved, 11 read/write.
+                if inputs.len() == 1 {
+                    self.walk(inputs[0], path, selectors)?;
+                } else if controls == 1 || controls == 3 {
+                    let current = *self.pins.entry(id).or_insert_with(|| {
+                        (self.read_pin)(id)
+                            .ok()
+                            .filter(|pin| *pin > 0 && usize::from(*pin) <= inputs.len())
+                    });
+                    if let Some(current) = current {
+                        let order = std::iter::once(current).chain(
+                            (1..=inputs.len() as u8).filter(|pin| controls == 3 && *pin != current),
+                        );
+                        for target in order {
+                            selectors.push(ClockPinPlan {
+                                selector: id,
+                                original: current,
+                                target,
+                            });
+                            self.walk(inputs[usize::from(target) - 1], path, selectors)?;
+                            selectors.pop();
+                        }
+                    }
+                }
+            }
+            // Missing/malformed entities and unresolved multiplier ratios do
+            // not prove a programmable source and never produce a fallback.
+            _ => {}
+        }
+        path.pop();
+        Ok(())
+    }
+}
+
 /// What [`ClockGraph::select_clock`] chose, with what the transport logs about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClockSelection {
@@ -489,5 +754,219 @@ mod implicit_clock_tests {
             .resolve_terminal_clock(1, |_| unreachable!())
             .unwrap();
         assert!(!multiplied.proves_identity_cadence());
+    }
+}
+
+#[cfg(test)]
+mod selectable_clock_tests {
+    use super::*;
+
+    fn graph(extra: &[u8]) -> ClockGraph {
+        let mut bytes = vec![8, 0x24, 2, 1, 0, 0, 0, 10];
+        bytes.extend_from_slice(extra);
+        ClockGraph::parse(&bytes)
+    }
+
+    const SOURCES: &[u8] = &[8, 0x24, 0x0a, 20, 0, 0, 0, 0, 8, 0x24, 0x0a, 21, 0, 0, 0, 0];
+
+    fn selector(controls: u8) -> ClockGraph {
+        let mut extra = vec![9, 0x24, 0x0b, 10, 2, 20, 21, controls, 0];
+        extra.extend_from_slice(SOURCES);
+        graph(&extra)
+    }
+
+    #[derive(Default)]
+    struct Device {
+        pins: HashMap<u8, u8>,
+        writes: Vec<(u8, u8)>,
+        checked: Vec<u8>,
+        invalid_source: bool,
+        bad_write: bool,
+        fail_restore: bool,
+    }
+
+    impl ClockPlanIo for Device {
+        fn read_pin(&mut self, id: u8) -> Result<u8, String> {
+            self.pins
+                .get(&id)
+                .copied()
+                .ok_or_else(|| "missing pin".into())
+        }
+        fn write_pin(&mut self, id: u8, pin: u8) -> Result<(), String> {
+            self.writes.push((id, pin));
+            if self.fail_restore && pin == 1 {
+                return Err("restore transfer failed".into());
+            }
+            if !self.bad_write {
+                self.pins.insert(id, pin);
+            }
+            Ok(())
+        }
+        fn validate_source(&mut self, id: u8) -> Result<(), String> {
+            self.checked.push(id);
+            if self.invalid_source {
+                Err("source invalid or unsupported rate".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn valid_current_route_has_priority_and_never_sets() {
+        let plans = selector(3).enumerate_plans(1, |_| Ok(2)).unwrap();
+        assert_eq!(
+            plans.iter().map(|p| p.source_id).collect::<Vec<_>>(),
+            [21, 20]
+        );
+        let mut io = Device {
+            pins: HashMap::from([(10, 2)]),
+            ..Device::default()
+        };
+        plans[0].apply(&mut io).unwrap();
+        assert!(io.writes.is_empty());
+        assert_eq!(io.checked, [21]);
+    }
+
+    #[test]
+    fn selector_capabilities_and_illegal_pins_block_unsafe_alternatives() {
+        assert_eq!(selector(1).enumerate_plans(1, |_| Ok(1)).unwrap().len(), 1);
+        for controls in [0, 2] {
+            assert!(selector(controls)
+                .enumerate_plans(1, |_| panic!("unreadable"))
+                .is_err());
+        }
+        for pin in [0, 3] {
+            assert!(selector(3).enumerate_plans(1, |_| Ok(pin)).is_err());
+        }
+        assert!(selector(3)
+            .enumerate_plans(1, |_| Err("GET failed".into()))
+            .is_err());
+    }
+
+    #[test]
+    fn alternatives_are_verified_and_restored_on_failure_or_hand_back() {
+        let plan = selector(3).enumerate_plans(1, |_| Ok(1)).unwrap().remove(1);
+        let mut io = Device {
+            pins: HashMap::from([(10, 1)]),
+            invalid_source: true,
+            ..Device::default()
+        };
+        let failure = plan.apply(&mut io).unwrap_err();
+        assert!(failure.rollback_errors.is_empty());
+        assert_eq!(io.writes, [(10, 2), (10, 1)]);
+        io.invalid_source = false;
+        plan.apply(&mut io).unwrap();
+        plan.restore(&mut io).unwrap();
+        assert_eq!(io.pins[&10], 1);
+    }
+
+    #[test]
+    fn stale_route_and_unverified_set_cannot_validate_an_unrelated_source() {
+        let plan = selector(3).enumerate_plans(1, |_| Ok(1)).unwrap().remove(1);
+        let mut io = Device {
+            pins: HashMap::from([(10, 2)]),
+            ..Device::default()
+        };
+        assert!(plan.apply(&mut io).is_err());
+        assert!(io.writes.is_empty());
+        io.pins.insert(10, 1);
+        io.bad_write = true;
+        assert!(plan.apply(&mut io).is_err());
+        assert!(io.checked.is_empty());
+    }
+
+    #[test]
+    fn path_local_cycles_do_not_poison_shared_source_sibling() {
+        // First branch loops back to the selector; second reaches a source.
+        let mut bytes = vec![9, 0x24, 0x0b, 10, 2, 10, 20, 3, 0];
+        bytes.extend_from_slice(SOURCES);
+        let plans = graph(&bytes).enumerate_plans(1, |_| Ok(1)).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].source_id, 20);
+        // Both sibling branches may reach the same source independently.
+        bytes[5] = 20;
+        assert_eq!(
+            graph(&bytes).enumerate_plans(1, |_| Ok(1)).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn strict_routes_reject_missing_sources_multipliers_and_truncated_selectors() {
+        assert!(graph(&[]).enumerate_plans(1, |_| unreachable!()).is_err());
+        let mut bytes = vec![7, 0x24, 0x0c, 10, 20, 0, 0];
+        bytes.extend_from_slice(SOURCES);
+        assert!(graph(&bytes)
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
+        let mut bytes = vec![6, 0x24, 0x0b, 10, 1, 20];
+        bytes.extend_from_slice(SOURCES);
+        assert!(graph(&bytes)
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
+        // Legacy sparse behaviour remains explicitly available.
+        assert_eq!(
+            graph(&[])
+                .resolve_terminal_clock(1, |_| unreachable!())
+                .unwrap()
+                .clock_id,
+            10
+        );
+    }
+
+    #[test]
+    fn failed_rollback_is_visible_and_hand_back_never_overwrites_drift() {
+        let plan = selector(3).enumerate_plans(1, |_| Ok(1)).unwrap().remove(1);
+        let mut io = Device {
+            pins: HashMap::from([(10, 1)]),
+            invalid_source: true,
+            fail_restore: true,
+            ..Device::default()
+        };
+        let error = plan.apply(&mut io).unwrap_err();
+        assert_eq!(error.rollback_errors.len(), 1);
+        assert_eq!(io.pins[&10], 2);
+        io.writes.clear();
+        io.pins.insert(10, 1);
+        assert!(plan.restore(&mut io).is_err());
+        assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn duplicate_ids_and_excessive_depth_never_produce_selectable_routes() {
+        let mut bytes = vec![8, 0x24, 0x0a, 10, 0, 0, 0, 0, 8, 0x24, 0x0a, 10, 0, 0, 0, 0];
+        assert!(graph(&bytes)
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
+        bytes.clear();
+        for id in 10..27 {
+            bytes.extend_from_slice(&[8, 0x24, 0x0b, id, 1, id + 1, 0, 0]);
+        }
+        bytes.extend_from_slice(&[8, 0x24, 0x0a, 27, 0, 0, 0, 0]);
+        assert!(graph(&bytes)
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
+    }
+
+    #[test]
+    fn nested_plan_changes_leaf_first_and_restores_root_first() {
+        let mut bytes = vec![
+            9, 0x24, 0x0b, 10, 2, 20, 11, 3, 0, 9, 0x24, 0x0b, 11, 2, 20, 21, 3, 0,
+        ];
+        bytes.extend_from_slice(SOURCES);
+        let plan = graph(&bytes)
+            .enumerate_plans(1, |_| Ok(1))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut io = Device {
+            pins: HashMap::from([(10, 1), (11, 1)]),
+            ..Device::default()
+        };
+        plan.apply(&mut io).unwrap();
+        assert_eq!(io.writes, [(11, 2), (10, 2)]);
+        plan.restore(&mut io).unwrap();
+        assert_eq!(io.writes, [(11, 2), (10, 2), (10, 1), (11, 1)]);
     }
 }

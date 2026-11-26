@@ -19,6 +19,7 @@ pub(crate) const DEFAULT_CLOCK_SETTLE_DELAY_MS: u64 = 20;
 pub(crate) struct Settings {
     pub(crate) config: DacConfig,
     quirks: Vec<Quirk>,
+    device_identity: Option<(u16, u16)>,
 }
 
 impl Settings {
@@ -37,7 +38,7 @@ impl Settings {
                 quirks.extend_from_slice(&entry.quirks);
             }
         }
-        Self { config, quirks }
+        Self { config, quirks, device_identity: Some((info.vendor_id, info.product_id)) }
     }
 
     pub(crate) fn has(&self, quirk: Quirk) -> bool {
@@ -80,6 +81,24 @@ impl Settings {
         self.config
             .padded_24bit
             .unwrap_or_else(|| self.has(Quirk::PreferPadded24BitTransport))
+    }
+
+    /// Device-scoped policy is usable only for the identity read from USB.
+    pub(crate) fn native_dsd_policy(&self, vendor: u16, product: u16, descriptor_width: u8) -> Option<(u8, bool, bool)> {
+        let scoped = self.device_identity == Some((vendor, product));
+        let width = if scoped { self.dsd_subslot_override() } else { self.config.dsd_subslot };
+        let explicit_order = self.config.dsd_big_endian.is_some()
+            || (scoped && (self.has(Quirk::DsdBigEndian) || self.has(Quirk::DsdBitReverse)));
+        if width.is_none() && !explicit_order { return None; }
+        Some((width.unwrap_or(descriptor_width),
+            self.config.dsd_big_endian.unwrap_or(scoped && self.has(Quirk::DsdBigEndian)),
+            scoped && self.dsd_bit_reverse()))
+    }
+
+    pub(crate) fn native_dsd_order(&self, vendor: u16, product: u16, big_endian: bool) -> (bool, bool) {
+        let scoped = self.device_identity == Some((vendor, product));
+        (self.config.dsd_big_endian.unwrap_or(big_endian || (scoped && self.has(Quirk::DsdBigEndian))),
+         scoped && self.dsd_bit_reverse())
     }
 
     pub(crate) fn dsd_subslot_override(&self) -> Option<u8> {
@@ -207,4 +226,18 @@ mod tests {
         let other = Settings::for_device(config, &info(1, 2, "x"));
         assert!(!other.require_verified_rate());
     }
+    #[test]
+    fn native_policy_uses_actual_usb_identity_and_keeps_order_only_tuning() {
+        let dawn = Settings::for_device(DacConfig::default(), &info(12230, 61546, "MOONDROP Dawn Pro"));
+        assert_eq!(dawn.native_dsd_policy(12230, 61546, 4), Some((4, true, false)));
+        assert_eq!(dawn.native_dsd_policy(1, 2, 4), None);
+        let config = DacConfig { dsd_big_endian: Some(true), ..DacConfig::default() };
+        let host = Settings::for_device(config, &info(1, 2, "x"));
+        assert_eq!(host.native_dsd_policy(1, 2, 2), Some((2, true, false)));
+        let config = DacConfig { dsd_big_endian: Some(false), dsd_subslot: Some(1), ..DacConfig::default() };
+        let host = Settings::for_device(config, &info(1, 2, "x"));
+        assert_eq!(host.native_dsd_order(1, 2, true), (false, false));
+        assert_eq!(host.native_dsd_policy(1, 2, 4), Some((1, false, false)));
+    }
+
 }
