@@ -14,6 +14,8 @@
 
 mod aaudio;
 mod convert;
+mod capture;
+mod capture_json;
 mod json;
 mod listener;
 mod registry;
@@ -212,6 +214,9 @@ pub fn dac_await_retirement<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) ->
 pub fn dac_close<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) {
     run(&mut env, |_env| {
         let (entry, streams) = registry::remove_dac(dac)?;
+        for capture in registry::remove_dac_captures(dac) {
+            let _ = capture.close();
+        }
         for stream in streams {
             if let Ok(stream) = Arc::try_unwrap(stream) {
                 let _ = stream.close();

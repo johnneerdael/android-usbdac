@@ -48,6 +48,15 @@ pub struct ChannelMap {
 }
 
 impl ChannelMap {
+    /// Preserve an explicitly ordered map, including unknown positions. Indices
+    /// on unnamed channels must match their zero-based position on the wire.
+    pub fn from_positions(positions: Vec<ChannelPosition>) -> Result<Self, CaptureError> {
+        if positions.is_empty() || positions.len() > usize::from(u16::MAX)
+            || positions.iter().enumerate().any(|(index, position)|
+                matches!(position, ChannelPosition::Unspecified { index: named } if usize::from(*named) != index))
+        { return Err(CaptureError::InvalidChannelMap); }
+        Ok(Self { positions })
+    }
     /// Decode UAC1's wChannelConfig (Audio 1.0 section 3.7.2.3).
     pub fn uac1(channels: u16, mask: u16) -> Result<Self, CaptureError> {
         Self::from_mask(channels, u32::from(mask), 12)

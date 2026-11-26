@@ -270,6 +270,36 @@ pub fn parse_power_domain(data: &[u8]) -> Result<PowerDomain, DescriptorError> {
     })
 }
 
+/// Feature Unit controls include master channel 0 and one word per channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureUnit {
+    pub id: u8,
+    pub source_id: u8,
+    pub controls: Vec<Controls>,
+    pub string_id: u16,
+}
+pub fn parse_feature_unit(data: &[u8]) -> Result<FeatureUnit, DescriptorError> {
+    if data.len() < 11 {
+        return Err(invalid("truncated ADC3 feature unit"));
+    }
+    let length = usize::from(data[0]);
+    if length < 11 || (length - 7) % 4 != 0 {
+        return Err(invalid("invalid ADC3 feature control words"));
+    }
+    let d = descriptor(data, 7, length)?;
+    entity(d[3])?;
+    entity(d[4])?;
+    Ok(FeatureUnit {
+        id: d[3],
+        source_id: d[4],
+        controls: (5..length - 2)
+            .step_by(4)
+            .map(|at| Controls(le32(d, at)))
+            .collect(),
+        string_id: le16(d, length - 2),
+    })
+}
+
 /// Allocation bound for one USB control transfer. Callers may impose a lower bound.
 pub const MAX_CLUSTER_LENGTH: usize = u16::MAX as usize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,13 +6,14 @@
 pub(crate) enum AudioControlProtocol {
     Uac1,
     Uac2,
+    Uac3,
 }
 
 impl AudioControlProtocol {
     pub(crate) fn current_request(self) -> u8 {
         match self {
             Self::Uac1 => 0x81,
-            Self::Uac2 => 0x01,
+            Self::Uac2 | Self::Uac3 => 0x01,
         }
     }
 
@@ -20,7 +21,7 @@ impl AudioControlProtocol {
         match self {
             Self::Uac1 => controls & (1 << (selector - 1)) != 0,
             // 00 absent, 01 read-only, 10 reserved, 11 read/write.
-            Self::Uac2 => (controls >> (2 * (selector - 1))) & 3 == 3,
+            Self::Uac2 | Self::Uac3 => (controls >> (2 * (selector - 1))) & 3 == 3,
         }
     }
 

@@ -11,6 +11,7 @@ pub(super) fn negotiate_playback_format(
     requested_format: PlaybackFormat,
 ) -> Result<(PlaybackFormat, Option<ClockChoice>), crate::Error> {
     use crate::Error;
+    clear_adc3_negotiation();
     let device = {
         let guard = SESSION_STATE.lock();
         let Some(state) = guard.as_ref() else {
@@ -38,13 +39,7 @@ pub(super) fn negotiate_playback_format(
         .ok();
         set_capability_model(capability_model.clone());
 
-        let candidate = match select_stream_candidate(
-            &usb_device,
-            &claimed_handle.handle,
-            requested_format,
-            speed,
-            &claimed_handle.claimed_interfaces,
-        ) {
+        let candidate = match select_owned_stream_candidate(&claimed_handle, requested_format, speed) {
             Ok(c) => c,
             Err(error) => {
                 set_last_error(Some(error.message().to_string()));
@@ -83,6 +78,14 @@ pub(super) fn negotiate_playback_format(
         apply_itf_mode(&claimed_handle, &candidate, requested_format.dsd_transport)
             .map_err(Error::Transfer)?;
 
+        if let Some(route) = adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)? {
+            configure_adc3(&claimed_handle.handle, &route, requested_format.sample_rate).map_err(Error::Transfer)?;
+            remember_adc3_route(route);
+            set_effective_playback_format(requested_format);
+            set_dac_mode(DacMode::FixedClock);
+            set_clock_verification(true, true, true, Some(requested_format.sample_rate));
+            return Ok(requested_format);
+        }
         select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
             .map_err(Error::Transfer)?;
         let clock = candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
@@ -341,6 +344,7 @@ pub(super) fn negotiate_playback_format(
         }
     }
     let cleanup_ok = cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
+    if !cleanup_ok || negotiated.is_err() { clear_adc3_negotiation(); }
     if !cleanup_ok && negotiated.is_ok() {
         return Err(Error::Transfer("USB negotiation could not restore a PCM-safe idle state".into()));
     }

@@ -64,6 +64,7 @@ impl DeviceInfo {
 pub enum UacVersion {
     V1,
     V2,
+    V3,
     Unknown,
 }
 

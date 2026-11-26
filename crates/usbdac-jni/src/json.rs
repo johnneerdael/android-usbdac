@@ -16,6 +16,7 @@ fn uac(version: UacVersion) -> &'static str {
     match version {
         UacVersion::V1 => "v1",
         UacVersion::V2 => "v2",
+        UacVersion::V3 => "v3",
         _ => "unknown",
     }
 }

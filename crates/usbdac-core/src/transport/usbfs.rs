@@ -104,6 +104,7 @@ pub(super) struct IdleLock {
 pub(super) struct ClaimedHandle {
     // Drop before the libusb handle/context; armed only by exclusive setup.
     pub(super) itf_mode: ItfModeLease,
+    pub(super) adc3_power: Adc3PowerLease,
     pub(super) device_fd: RawFd,
     pub(super) context: Context,
     pub(super) handle: DeviceHandle<Context>,
@@ -159,6 +160,7 @@ impl From<IdleLock> for ClaimedHandle {
     fn from(value: IdleLock) -> Self {
         Self {
             itf_mode: ItfModeLease::new(value.device_fd),
+            adc3_power: Adc3PowerLease::new(value.device_fd),
             device_fd: value.device_fd,
             context: value.context,
             handle: value.handle,
@@ -237,6 +239,7 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
 
     Ok(ClaimedHandle {
         itf_mode: ItfModeLease::new(device.fd),
+        adc3_power: Adc3PowerLease::new(device.fd),
         device_fd: device.fd,
         context,
         handle,
@@ -276,6 +279,14 @@ pub(super) fn cleanup_claimed_handle(
         // Do not send vendor mode writes after an unconfirmed interface reset
         // or disconnect, including from the lease's Drop fallback.
         claimed_handle.itf_mode.disarm();
+    }
+    if reset_ok {
+        if let Err(error) = claimed_handle.adc3_power.restore() {
+            set_last_error(Some(format!("ADC3 power hand-back failed: {error}")));
+            reset_ok = false;
+        }
+    } else {
+        claimed_handle.adc3_power.disarm();
     }
     if reset_ok && keep_locked && current_lock_requested_for_fd(claimed_handle.device_fd) {
         *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());

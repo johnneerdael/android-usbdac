@@ -1,7 +1,7 @@
 package dev.usbdac
 
 /** USB Audio Class version of a DAC or of one of its alternate settings. */
-public enum class UacVersion { V1, V2, UNKNOWN }
+public enum class UacVersion { V1, V2, V3, UNKNOWN }
 
 /** USB link speed the DAC enumerated at. */
 public enum class LinkSpeed { LOW, FULL, HIGH, SUPER, SUPER_PLUS, UNKNOWN }

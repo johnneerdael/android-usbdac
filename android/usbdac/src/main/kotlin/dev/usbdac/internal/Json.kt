@@ -41,6 +41,7 @@ private fun JSONArray?.ints(): List<Int> = if (this == null) emptyList() else Li
 private fun uacVersion(name: String?): UacVersion = when (name) {
     "v1" -> UacVersion.V1
     "v2" -> UacVersion.V2
+    "v3" -> UacVersion.V3
     else -> UacVersion.UNKNOWN
 }
 

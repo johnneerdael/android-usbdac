@@ -107,6 +107,15 @@ impl std::fmt::Debug for Dac {
 }
 
 impl Dac {
+    /// Read the active configuration's explicit PCM IN claim plan before the
+    /// host claims its AudioControl and input streaming interfaces. Returns
+    /// `(configuration, control_interfaces, input_interfaces)` without audio.
+    pub fn capture_preflight(fd: RawFd, info: &DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>)> {
+        let _guard = OPEN_GUARD.lock();
+        if transport::session::session_registered() { return Err(Error::Busy); }
+        let device = transport::api::capture_preflight_device(fd, info)?;
+        Ok(device)
+    }
     /// Register an explicitly claimed capture device, including an input-only
     /// device. Claim its IN AudioStreaming interfaces and their owning
     /// AudioControl interfaces before calling; no playback claim is needed.

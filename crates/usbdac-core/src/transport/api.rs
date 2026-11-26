@@ -289,7 +289,9 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     native_dsd_bit_rates.sort_unstable();
     native_dsd_bit_rates.dedup();
 
-    let uac_version = if alts.iter().any(|alt| alt.uac_version == UacVersion::V2) {
+    let uac_version = if alts.iter().any(|alt| alt.uac_version == UacVersion::V3) {
+        UacVersion::V3
+    } else if alts.iter().any(|alt| alt.uac_version == UacVersion::V2) {
         UacVersion::V2
     } else if alts.iter().any(|alt| alt.uac_version == UacVersion::V1) {
         UacVersion::V1
@@ -359,6 +361,13 @@ pub(crate) fn open_capture_device(fd: RawFd, info: &crate::DeviceInfo) -> Result
         return Err(Error::Claim("capture registration does not accept playback feedback claim metadata".into()));
     }
     register_capture_device(device, info.configuration_id)
+}
+
+pub(crate) fn capture_preflight_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>), Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
+    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(),
+        info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
+    capture_stream::capture_claim_preflight(&device).map_err(|reason| Error::Unsupported { reason, offered: vec![] })
 }
 
 /// Closes the DAC: settles the original volume level as `action` says, stops the

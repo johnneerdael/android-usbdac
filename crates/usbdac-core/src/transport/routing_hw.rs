@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::routing::{
-    self, Access, ControlKey, ControlRequest, InputCluster, InvalidRoute, MixerUnit,
-    RouteChange, RouteReport, RouteValue, RoutingError, RoutingInventory, RoutingIo, RoutingUnit,
-    SelectorUnit, TransactionError, MAX_ROUTE_CHANGES,
+    self, Access, ControlKey, ControlRequest, InputCluster, InvalidRoute, MixerUnit, RouteChange,
+    RouteReport, RouteValue, RoutingError, RoutingInventory, RoutingIo, RoutingUnit, SelectorUnit,
+    TransactionError, MAX_ROUTE_CHANGES,
 };
 use std::collections::BTreeMap;
 
@@ -51,6 +51,7 @@ pub enum RoutingSessionError {
     Drift(String),
     Control(RoutingError<String>),
     Transaction(TransactionError<String>),
+    Scarlett(crate::scarlett::ReadError<String>),
 }
 
 impl std::fmt::Display for RoutingSessionError {
@@ -59,6 +60,216 @@ impl std::fmt::Display for RoutingSessionError {
     }
 }
 impl std::error::Error for RoutingSessionError {}
+
+/// Return one unambiguous, exact-model optional vendor claim. This is admission
+/// of an already opted-in host claim, never an instruction to acquire a claim.
+pub(super) fn scarlett_claim_interface(
+    config: &ConfigDescriptor,
+    vendor: u16,
+    product: u16,
+) -> Option<u8> {
+    scarlett_endpoint(config, vendor, product).map(|(interface, _)| interface)
+}
+
+fn scarlett_endpoint(config: &ConfigDescriptor, vendor: u16, product: u16) -> Option<(u8, u8)> {
+    crate::scarlett::CandidateModel::recognize(vendor, product)?;
+    let mut found = None;
+    for interface in config.interfaces() {
+        for descriptor in interface.descriptors() {
+            if descriptor.setting_number() != 0 || descriptor.class_code() != 0xff {
+                continue;
+            }
+            // Reject ambiguity, including a second vendor interface with a
+            // different shape, instead of guessing Focusrite Control ownership.
+            if found.is_some() || descriptor.num_endpoints() != 1 {
+                return None;
+            }
+            let endpoint = descriptor.endpoint_descriptors().next()?;
+            if endpoint.transfer_type() != TransferType::Interrupt
+                || endpoint.direction() != Direction::In
+                || endpoint.max_packet_size() != 8
+                || endpoint.interval() == 0
+                || endpoint.address() & 0x70 != 0
+                || endpoint.address() & 0x0f == 0
+            {
+                return None;
+            }
+            found = Some((descriptor.interface_number(), endpoint.address()));
+        }
+    }
+    found
+}
+
+fn scarlett_capability(
+    device: &UsbDevice,
+    configuration: u8,
+) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
+    let idle = IDLE_LOCK.lock();
+    let idle = idle
+        .as_ref()
+        .filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState(
+                "Scarlett discovery requires the idle USB owner".into(),
+            ))
+        })?;
+    let usb_device = idle.handle.device();
+    let identity = usb_device
+        .device_descriptor()
+        .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+    if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
+        return Err(RoutingSessionError::Drift(
+            "host and USB device identities differ".into(),
+        ));
+    }
+    let Some(candidate) =
+        crate::scarlett::CandidateModel::recognize(identity.vendor_id(), identity.product_id())
+    else {
+        return Ok(None);
+    };
+    let config = usb_device
+        .active_config_descriptor()
+        .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+    if config.number() != configuration {
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during Scarlett discovery".into(),
+        ));
+    }
+    let Some((interface, notification_endpoint)) =
+        scarlett_endpoint(&config, identity.vendor_id(), identity.product_id())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::scarlett::ReadCapability {
+        candidate,
+        configuration,
+        interface,
+        notification_endpoint,
+        interface_claimed: device.claimed_interfaces.contains(&interface),
+    }))
+}
+
+/// Descriptor-only read capability; does not initialize the vendor protocol.
+pub(crate) fn scarlett_discover(
+) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, _) = active_descriptors(&device)?;
+    scarlett_capability(&device, configuration)
+}
+
+struct UsbScarlettIo<'a> {
+    device: &'a UsbDevice,
+    handle: &'a DeviceHandle<Context>,
+    interface: u8,
+    endpoint: u8,
+}
+
+impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
+    type Error = String;
+    fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, String> {
+        self.device
+            .feature_unit_control(0xa1, 0, 0, u16::from(self.interface), bytes)
+            .map_err(|e| e.to_string())
+    }
+    fn prepare_notifications(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        // Drain outstanding ACKs before either initialization request. The
+        // synchronous interrupt helper owns/retires its transfer before return.
+        for _ in 0..16 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let mut data = [0; 8];
+            match self.handle.read_interrupt(
+                self.endpoint,
+                &mut data,
+                remaining.max(Duration::from_millis(1)),
+            ) {
+                Ok(8) => {}
+                Ok(_) => return Err("short Scarlett initialization notification".into()),
+                Err(rusb::Error::Timeout) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("Scarlett notification drain exceeded its bounded packet budget".into())
+    }
+    fn send_request(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        if bytes.len() < 16 || bytes.len() > 16 + crate::scarlett::MAX_PAYLOAD {
+            return Err("unbounded Scarlett request refused".into());
+        }
+        let mut request = bytes.to_vec();
+        self.device
+            .feature_unit_control(0x21, 2, 0, u16::from(self.interface), &mut request)
+            .map_err(|e| e.to_string())
+    }
+    fn next_notification(
+        &mut self,
+        bytes: &mut [u8; 8],
+        timeout: Duration,
+    ) -> Result<usize, String> {
+        self.handle
+            .read_interrupt(self.endpoint, bytes, timeout.max(Duration::from_millis(1)))
+            .map_err(|e| e.to_string())
+    }
+    fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, String> {
+        if bytes.len() < 16 || bytes.len() > 16 + crate::scarlett::MAX_PAYLOAD {
+            return Err("unbounded Scarlett response refused".into());
+        }
+        self.device
+            .feature_unit_control(0xa1, 3, 0, u16::from(self.interface), bytes)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Explicit vendor read: initialize only the already claimed, exact candidate,
+/// then admit firmware and read mux-zero/mixer state. Never SET_MUX/SET_MIX.
+pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let capability = scarlett_capability(&device, configuration)?.ok_or_else(|| {
+        RoutingSessionError::UnsupportedTopology(
+            "no exact Scarlett read candidate with a proven notification interface".into(),
+        )
+    })?;
+    if !capability.interface_claimed {
+        return Err(RoutingSessionError::Session(Error::Claim(format!(
+            "Scarlett read requires the host's explicit claim of vendor interface {}",
+            capability.interface
+        ))));
+    }
+    let readback = {
+        let idle = IDLE_LOCK.lock();
+        let idle = idle
+            .as_ref()
+            .filter(|idle| idle.device_fd == device.fd)
+            .ok_or_else(|| {
+                RoutingSessionError::Session(Error::InvalidState(
+                    "Scarlett read lost its idle USB owner".into(),
+                ))
+            })?;
+        let io = UsbScarlettIo {
+            device: &device,
+            handle: &idle.handle,
+            interface: capability.interface,
+            endpoint: capability.notification_endpoint,
+        };
+        let mut session = crate::scarlett::ReadSession::initialize(io, capability.candidate)
+            .map_err(RoutingSessionError::Scarlett)?;
+        session.read_all().map_err(RoutingSessionError::Scarlett)?
+    };
+    let (after, raw) = active_descriptors(&device)?;
+    if configuration != after || descriptors != raw {
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during Scarlett routing read".into(),
+        ));
+    }
+    Ok(readback)
+}
 
 struct UsbRoutingIo<'a> {
     device: &'a UsbDevice,

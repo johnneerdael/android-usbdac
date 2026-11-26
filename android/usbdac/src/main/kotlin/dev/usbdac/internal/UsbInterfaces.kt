@@ -19,6 +19,8 @@ internal data class InterfaceInfo(
     val interfaceSubclass: Int,
     /** Has an isochronous OUT endpoint: it can carry playback. */
     val hasIsochronousOut: Boolean,
+    /** Has a data IN endpoint; feedback-only endpoints do not count as capture. */
+    val hasIsochronousIn: Boolean = false,
 ) {
     val isAudioControl: Boolean
         get() = interfaceClass == UsbConstants.USB_CLASS_AUDIO && interfaceSubclass == SUBCLASS_AUDIO_CONTROL
@@ -38,6 +40,17 @@ internal data class ClaimPlan(val controlIds: List<Int>, val streamingIds: List<
  */
 internal fun hasPlayback(interfaces: List<InterfaceInfo>): Boolean =
     interfaces.any { it.isAudioStreaming && it.hasIsochronousOut }
+
+internal fun hasCapture(interfaces: List<InterfaceInfo>): Boolean =
+    interfaces.any { it.isAudioStreaming && it.hasIsochronousIn }
+
+/** Validate the native descriptor ownership proof against Android's active interface inventory. */
+internal fun planCaptureClaims(interfaces: List<InterfaceInfo>, controls: List<Int>, inputs: List<Int>): ClaimPlan? {
+    if (controls.isEmpty() || inputs.isEmpty() || controls.distinct() != controls || inputs.distinct() != inputs) return null
+    if (controls.any { id -> interfaces.none { it.id == id && it.isAudioControl } }) return null
+    if (inputs.any { id -> interfaces.none { it.id == id && it.isAudioStreaming && it.hasIsochronousIn } }) return null
+    return ClaimPlan(controls, inputs)
+}
 
 /**
  * The interfaces to claim for the active configuration, or `null` when it has no AudioControl
@@ -64,6 +77,11 @@ internal fun UsbInterface.toInfo(): InterfaceInfo =
         hasIsochronousOut = (0 until endpointCount).any { index ->
             val endpoint = getEndpoint(index)
             endpoint.direction == UsbConstants.USB_DIR_OUT && endpoint.type == UsbConstants.USB_ENDPOINT_XFER_ISOC
+        },
+        hasIsochronousIn = (0 until endpointCount).any { index ->
+            val endpoint = getEndpoint(index)
+            endpoint.direction == UsbConstants.USB_DIR_IN && endpoint.type == UsbConstants.USB_ENDPOINT_XFER_ISOC &&
+                ((endpoint.attributes shr 4) and 3) in listOf(0, 2)
         },
     )
 

@@ -93,3 +93,19 @@ Treat the mux as ordered destination/source pairs. Build rate-family table layou
 Exact ITF models now take the guarded native/PCM transition through normal playback negotiation and open. The owner unwinds the mode after confirmed alt reset and callback retirement. Rust can explicitly register a capture device and open a standalone, multichannel UAC1/UAC2 PCM IN stream. Rust UAC2 routing discovery and verified transactions use the active USB session and reject writes while another stream owns it.
 
 Rust workspace tests and the Android build and target checks passed. The capture and routing entry points are currently Rust-only. Remaining connected work includes Android claim and JNI surfaces, duplex sharing, ADC3 transport and configuration selection, and the Scarlett vendor adapter. Physical validation remains separate for the fixed-format, alternate and firmware cases.
+
+### Shared worker and configuration integration
+
+For duplex, extend the playback worker with an owned capture attachment. Atomically negotiate both endpoints before acquiring or changing a streaming alternate. Reject different alternates of the same interface, and require matching supported rates when two terminals share a clock. Prove independence before programming different rates on one device. Preserve separate position and loss counters when the clocks are independent.
+
+When capture requests exactly match the implicit source, give the user capture buffer validated bytes from the same completed IN packets that supply feedback lengths. A second pool on that endpoint would duplicate ownership and decouple capture timing from playback. For a distinct IN endpoint, allocate its own geometry and slot pool on the same USB event pump. Capture buffer overrun affects the reader and its counters. A broken shared timing source affects playback through the established implicit feedback failure path. Stop both paths through the existing callback retirement guard, and reset alternates only after ownership returns.
+
+On Android, explicit alternate USB configuration selection belongs to the USB connection owner before native registration. Expose the supported configuration ID to the caller, record the original active ID, select the requested configuration, verify it by GET_CONFIGURATION, then build and claim only its current interfaces. Roll back after a failed selection or claim and after the final native retirement on normal hand-back. A caller who accepted the active configuration keeps the existing direct-open behavior. Treat Android kernel or driver rejection as a typed refusal. [Android UsbDeviceConnection configuration API](https://developer.android.com/reference/android/hardware/usb/UsbDeviceConnection#setConfiguration(android.hardware.usb.UsbConfiguration))
+
+## Third validation checkpoint
+
+Android now has a separate capture-session API with descriptor-only preflight, an explicit USB permission/claim flow, whole-frame reads and stats. UAC3 playback uses the selected active ADC3 function, exact BADD or full-profile PCM layout, and verified power-domain ownership. BADD admission validates the whole function's mandatory endpoint directions and sync type. Full ADC3 retains verified selected clock pins and rejects unimplemented multiplier ratios.
+
+The Rust Scarlett read adapter admits the source-backed 18i20 Gen 2 model and firmware only, with an explicit claimed vendor interface and validated command replies. The standard UAC2 routing path has verified writes. Scarlett mux and mixer writes, broader Scarlett profile coverage, Android routing access, duplex, ADC3 capture and explicit configuration selection are separate delivery gates.
+
+Ran the Rust suite and Android builds after the integrated reviews. The target phones and audio devices still need physical acceptance for new capture, native mode, clock and hardware-routing paths.

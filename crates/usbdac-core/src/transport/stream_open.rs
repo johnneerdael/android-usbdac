@@ -124,7 +124,7 @@ pub(super) fn start_stream_inner(
         build_usb_capability_model(&device, &claimed_handle.handle, speed, &claimed_handle.claimed_interfaces).ok(),
     );
     let candidate =
-        match select_stream_candidate(&device, &claimed_handle.handle, playback_format, speed, &claimed_handle.claimed_interfaces) {
+        match select_owned_stream_candidate(&claimed_handle, playback_format, speed) {
             Ok(candidate) => candidate,
             Err(error) => {
                 set_last_error(Some(error.message().to_string()));
@@ -180,6 +180,15 @@ pub(super) fn start_stream_inner(
             current.requested_playback_format = Some(requested_playback_format);
         }
     }
+    let adc3_route = match adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) {
+        Ok(route) => route,
+        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
+    };
+    if let Some(route) = adc3_route.as_ref() {
+        if let Err(error) = verify_adc3_route(route) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::InvalidState(error));
+        }
+    }
     let clock_choice = candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate);
     if clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
@@ -210,7 +219,7 @@ pub(super) fn start_stream_inner(
         candidate.terminal_link,
         candidate.interface_number,
         candidate.channels,
-        clock.map(|clock| clock.interface_number),
+        adc3_route.as_ref().map(|route| route.control).or_else(|| clock.map(|clock| clock.interface_number)),
     );
     // The stream's own terminal may have no volume control, or one the start-up
     // step could not make safe: with a control required, nothing is programmed.
@@ -496,6 +505,15 @@ pub(super) fn start_stream_inner(
                 );
             }
         }
+    } else if let Some(route) = adc3_route.as_ref() {
+        if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error));
+        }
+        clock_control_attempted = true;
+        clock_control_succeeded = true;
+        clock_verification_passed = true;
+        reported_sample_rate = Some(playback_format.sample_rate);
+        set_clock_verification(true, true, true, reported_sample_rate);
     } else if candidate.is_uac1 {
         // UAC1 has no UAC2 clock entity; the sample rate is set endpoint-level
         // via SET_CUR (UAC1_SAM_FREQ_CONTROL 0x0100) on the streaming endpoint.
@@ -614,6 +632,13 @@ pub(super) fn start_stream_inner(
         return Err(Error::Transfer(msg));
     }
     thread::sleep(Duration::from_millis(50));
+
+    if let Some(route) = adc3_route.as_ref() {
+        if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
+            cleanup_claimed_handle(claimed_handle, Some(candidate.interface_number), lock_requested);
+            return Err(Error::Transfer(error));
+        }
+    }
 
     // UAC1: endpoint SET_CUR is only reliable once the streaming alt setting
     // is active. Re-issue it; success here upgrades the clock verdict even if

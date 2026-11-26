@@ -199,6 +199,7 @@ pub(super) fn clear_session_state() {
         set_engine_state(EngineState::Idle, None);
     }
     *SESSION_STATE.lock() = None;
+    adc3::clear_adc3_negotiation();
     crate::settings::reset();
 }
 

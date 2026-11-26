@@ -35,6 +35,38 @@ pub(super) fn parse_audio_control_topologies(
                 continue;
             }
 
+            if descriptor.protocol_code() == 0x30 {
+                let mut topology = AudioControlTopology {
+                    interface_number: descriptor.interface_number(), protocol: AudioControlProtocol::Uac3,
+                    streaming_interfaces: Vec::new(), input_terminals: Vec::new(), feature_units: Vec::new(),
+                    output_terminals: Vec::new(), sources: Vec::new(),
+                };
+                for d in DescriptorIter::new(descriptor.extra()).filter(|d|d.get(1)==Some(&0x24)) {
+                    match d.get(2).copied() {
+                        Some(2) => {
+                            let t=crate::descriptors::uac3::parse_input_terminal(d).map_err(|e|e.to_string())?;
+                            topology.input_terminals.push(InputTerminal{b_terminal_id:t.id,w_terminal_type:t.terminal_type,
+                                b_assoc_terminal:t.associated_terminal,b_c_source_id:t.clock_id,b_nr_channels:0,w_channel_config:0,i_terminal:0});
+                        }
+                        Some(3) => {
+                            let t=crate::descriptors::uac3::parse_output_terminal(d).map_err(|e|e.to_string())?;
+                            topology.sources.push((t.id,vec![t.source_id]));
+                            topology.output_terminals.push(OutputTerminal{b_terminal_id:t.id,w_terminal_type:t.terminal_type,
+                                b_assoc_terminal:t.associated_terminal,b_source_id:t.source_id,i_terminal:0});
+                        }
+                        Some(7) => {
+                            let f=crate::descriptors::uac3::parse_feature_unit(d).map_err(|e|e.to_string())?;
+                            topology.sources.push((f.id,vec![f.source_id]));
+                            topology.feature_units.push(FeatureUnit{b_unit_id:f.id,b_source_id:f.source_id,b_control_size:4,
+                                bma_controls:f.controls.iter().map(|c|c.0).collect()});
+                        }
+                        _=>{}
+                    }
+                }
+                if !topology.input_terminals.is_empty() { topologies.push(topology); }
+                continue;
+            }
+
             let mut topology = AudioControlTopology {
                 interface_number: descriptor.interface_number(),
                 protocol: match descriptor.protocol_code() {
@@ -216,7 +248,7 @@ pub(super) fn read_feature_unit_volume_range(
     channel: u16,
     protocol: AudioControlProtocol,
 ) -> Result<Vec<RawRange>, String> {
-    if protocol == AudioControlProtocol::Uac2 {
+    if protocol != AudioControlProtocol::Uac1 {
         // Read the count first, then request exactly the advertised response.
         // Some DAC firmware rejects an oversized RANGE request.
         let request_type = USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE;
@@ -374,6 +406,14 @@ pub(super) fn discover_android_usb_hardware_volume_control(
     clock_interface: Option<u8>,
 ) -> Result<Option<HardwareVolumeControl>, String> {
     let terminal = terminal_link.ok_or_else(|| "no playback terminal link for USB volume".to_string())?;
+    let config = descriptors.active_config_descriptor().map_err(|e|e.to_string())?;
+    let is_adc3 = config.interfaces().flat_map(|i|i.descriptors()).any(|d|d.interface_number()==interface_number&&d.protocol_code()==0x30);
+    if is_adc3 {
+        let claimed=wrap_android_usb_handle(device)?;
+        if let Some(topology)=adc3_badd_volume_topology(descriptors,&claimed.handle,interface_number,terminal,channels)? {
+            return discover_hardware_volume_control_for_terminal(device,&topology,terminal,channels);
+        }
+    }
     let topologies = parse_audio_control_topologies(descriptors)?;
     let matches: Vec<_> = topologies.iter().filter(|topology| {
         clock_interface.map_or(true, |interface| topology.interface_number == interface)

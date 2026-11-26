@@ -260,3 +260,20 @@ fn badd_capacity_sync_speed_and_direction_are_joint_evidence() {
     )
     .is_err());
 }
+
+#[test]
+fn adc3_feature_unit_keeps_master_channel_controls_and_wide_string_id() {
+    let d = [15, 0x24, 7, 2, 1, 3, 0, 0, 0x80, 12, 0, 0, 0x40, 0x34, 0x12];
+    let unit = parse_feature_unit(&d).unwrap();
+    assert_eq!(
+        unit.controls,
+        [Controls(0x8000_0003), Controls(0x4000_000c)]
+    );
+    assert_eq!(unit.string_id, 0x1234);
+    for len in 0..d.len() {
+        assert!(parse_feature_unit(&d[..len]).is_err());
+    }
+    let mut invalid = d;
+    invalid[0] = 14;
+    assert!(parse_feature_unit(&invalid).is_err());
+}

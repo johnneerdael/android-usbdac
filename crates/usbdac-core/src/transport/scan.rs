@@ -329,6 +329,9 @@ pub(super) fn candidate_audio_control_clock_choice(
     handle: &DeviceHandle<Context>,
     candidate: &IsoStreamCandidate,
 ) -> Option<(AudioControlClock, ClockChoice)> {
+    // Protocol dispatch is decided before UAC2's graph/fallback lookup.
+    if device.active_config_descriptor().ok()?.interfaces().flat_map(|i| i.descriptors())
+        .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30) { return None; }
     if let Some(source) = candidate.implicit_feedback {
         let config = device.active_config_descriptor().ok()?;
         let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed);
@@ -627,6 +630,27 @@ pub(super) fn build_usb_capability_model(
         }
     }
 
+    for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
+        let rates = candidate.sample_rates.clone();
+        supported_sample_rates.extend(rates.iter().copied());
+        let ranges = if let Some(clock) = route.clock.as_ref() {
+            get_sampling_frequency_ranges(handle, route.control, clock.id).unwrap_or_default()
+        } else { vec![SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }] };
+        alt_settings.push(AltSetting {
+            interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
+            endpoint_address: candidate.endpoint_address, format: AltFormat::Pcm,
+            channels: candidate.channels, subslot_bytes: candidate.subslot_size,
+            valid_bits: candidate.bit_resolution,
+            rate_ranges: ranges.iter().map(|r| RateRange { min_hz:r.min,max_hz:r.max,step_hz:r.res }).collect(),
+            sample_rates:rates, sync_type:sync_kind(candidate.sync_type),
+            feedback_endpoint:candidate.feedback_endpoint.map(|f|f.address),
+            max_packet_bytes:candidate.max_packet_bytes,service_interval_us:candidate.service_interval_us,
+            uac_version:UacVersion::V3,endpoint_interval:candidate.endpoint_interval,
+            usage:endpoint_usage(candidate.usage_type),refresh:candidate.refresh,
+            synch_address:candidate.synch_address,
+            pacing:Some(admitted_pacing(candidate.sync_type,candidate.feedback_endpoint.map(|f|f.address))),
+        });
+    }
     supported_sample_rates.sort_unstable();
     supported_sample_rates.dedup();
     alt_settings.sort_by_key(|alt| {
@@ -918,6 +942,20 @@ pub(super) fn select_stream_candidate(
         }
     }
 
+    if playback_format.dsd_transport == DsdTransportMode::None {
+        for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
+            let format = StreamingInterfaceFormat { format_tag:FORMAT_TAG_PCM,uac2_formats:None,native_dsd:None,
+                channels:candidate.channels,subslot_size:candidate.subslot_size,bit_resolution:candidate.bit_resolution,
+                terminal_link:candidate.terminal_link,is_uac1:false,sample_rate_ranges:vec![] };
+            if transport_compatibility_penalty(&format,playback_format) == u32::MAX { continue; }
+            let supported = if let Some(clock) = route.clock.as_ref() {
+                get_sampling_frequency_ranges(handle,route.control,clock.id).map(|r|sampling_frequency_ranges_support_rate(&r,playback_format.sample_rate)).unwrap_or(false)
+            } else { playback_format.sample_rate == 48_000 };
+            if supported && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {
+                candidates.push(candidate);
+            }
+        }
+    }
     let dsd_bit_rate = playback_format.dsd_bit_rate;
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
     candidates.sort_by_key(|candidate| {
@@ -1052,7 +1090,7 @@ pub(super) fn log_iso_endpoint_descriptors(
     }
 }
 
-fn explicit_feedback_ambiguous(
+pub(super) fn explicit_feedback_ambiguous(
     descriptor: &rusb::InterfaceDescriptor,
     address: u8,
     sync: SyncType,
@@ -1185,13 +1223,20 @@ pub(super) fn validate_android_usb_claims(
             claimed_handle.claimed_interfaces, required,
         ));
     }
-    let optional: HashSet<_> = structural_feedback_interfaces(
+    let mut optional: HashSet<_> = structural_feedback_interfaces(
         config_descriptor,
         &claimed_handle.handle,
         resolve_device_speed(&claimed_handle.handle.device()),
     )
     .into_iter()
     .collect();
+    if let Ok(identity) = claimed_handle.handle.device().device_descriptor() {
+        optional.extend(routing_hw::scarlett_claim_interface(
+            config_descriptor,
+            identity.vendor_id(),
+            identity.product_id(),
+        ));
+    }
     if !required.is_subset(&claimed)
         || !claimed.is_subset(&required.union(&optional).copied().collect())
         || claimed.len() != claimed_handle.claimed_interfaces.len()

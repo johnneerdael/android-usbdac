@@ -27,6 +27,13 @@ internal object Native {
     @JvmStatic external fun setLogLevel(level: Int)
 
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun dacCapturePreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun dacOpenCaptureDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
+    @JvmStatic external fun captureOpen(dac: Long, requestJson: String, capacityFrames: Int): Long
+    @JvmStatic external fun captureFormat(capture: Long): String
+    @JvmStatic external fun captureStats(capture: Long): String
+    @JvmStatic external fun captureRead(capture: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
+    @JvmStatic external fun captureClose(capture: Long)
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean

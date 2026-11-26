@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use usbdac_core::DacCaptureStream;
 use usbdac_core::{Dac, DacStream, Error, StreamFormat};
 
 /// One counter for every kind of handle, so a DAC id is never also a valid
@@ -70,6 +71,49 @@ static DACS: Lazy<Mutex<HashMap<u64, Arc<DacEntry>>>> = Lazy::new(|| Mutex::new(
 type StreamTable = HashMap<u64, (u64, Arc<DacStream>)>;
 
 static STREAMS: Lazy<Mutex<StreamTable>> = Lazy::new(|| Mutex::new(HashMap::new()));
+type CaptureTable = HashMap<u64, (u64, Arc<DacCaptureStream>)>;
+static CAPTURES: Lazy<Mutex<CaptureTable>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub fn insert_capture(dac: &Arc<DacEntry>, stream: DacCaptureStream) -> Result<u64, Error> {
+    // Keep DAC removal serialized through insertion; a close racing open must
+    // either collect this capture or make insertion fail and drop the stream.
+    let dacs = DACS.lock();
+    let owner = dacs
+        .iter()
+        .find(|(_, entry)| Arc::ptr_eq(entry, dac))
+        .map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed while capture was opening".into()))?;
+    let id = next_id();
+    CAPTURES.lock().insert(id, (owner, Arc::new(stream)));
+    Ok(id)
+}
+
+pub fn capture(id: i64) -> Result<Arc<DacCaptureStream>, Error> {
+    u64::try_from(id)
+        .ok()
+        .and_then(|id| CAPTURES.lock().get(&id).map(|(_, stream)| stream.clone()))
+        .ok_or_else(|| stale("capture", id))
+}
+
+pub fn remove_capture(id: i64) -> Result<Arc<DacCaptureStream>, Error> {
+    u64::try_from(id)
+        .ok()
+        .and_then(|id| CAPTURES.lock().remove(&id).map(|(_, stream)| stream))
+        .ok_or_else(|| stale("capture", id))
+}
+
+/// Call after DAC removal, which prevents further capture handle insertion.
+pub fn remove_dac_captures(dac_id: i64) -> Vec<Arc<DacCaptureStream>> {
+    let mut table = CAPTURES.lock();
+    let ids: Vec<_> = table
+        .iter()
+        .filter(|(_, (owner, _))| *owner == dac_id as u64)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| table.remove(&id).map(|(_, stream)| stream))
+        .collect()
+}
 
 fn stale(kind: &str, id: i64) -> Error {
     Error::InvalidArgument(format!("{kind} handle {id} is not open"))
@@ -149,6 +193,9 @@ mod tests {
         assert!(matches!(stream(b as i64), Err(Error::InvalidArgument(_))));
         assert!(matches!(dac(-5), Err(Error::InvalidArgument(_))));
         assert!(matches!(remove_stream(0), Err(Error::InvalidArgument(_))));
+        assert!(matches!(capture(a as i64), Err(Error::InvalidArgument(_))));
+        assert!(matches!(remove_capture(-1), Err(Error::InvalidArgument(_))));
+        assert!(remove_dac_captures(0).is_empty());
         assert!(remove_dac(0).is_err());
     }
 }

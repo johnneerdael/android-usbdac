@@ -1,8 +1,8 @@
 # Scarlett routing follow-on
 
-The standard UAC2 Rust routing API does not implement the Scarlett mixer/mux
-protocol or establish Scarlett device coverage. Keep vendor discovery and writes
-behind a separate, exact-model protocol implementation.
+The standard UAC2 Rust routing API remains separate from the Scarlett mixer/mux
+protocol. The first vendor batch supplies a narrow read-only implementation;
+it does not establish physically validated Scarlett device coverage.
 
 Use Linux v7.0 commit `028ef9c96e96197026887c0f092424679298aae8`,
 [`sound/usb/mixer_scarlett2.c`](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c),
@@ -43,6 +43,46 @@ protocol contract; do not copy the GPL driver implementation or model tables.
    drift and unplug. Publish the exact model/firmware evidence and unsupported
    neighboring identities. Add further models as separate evidence-backed rules.
 
-This plan adds no vendor command bytes or runtime probes to standard UAC2
-routing. The next implementation batch begins with the selected target's
-protocol/identity contract and read-only discovery.
+## First source-backed read-only batch
+
+`scarlett.rs` independently implements the 16-byte little-endian envelope, the
+initialization handshake, bounded ACK processing, reply command/sequence/size/
+status validation, typed mux ports and raw unsigned mixer coefficient reads.
+No routing, persistent configuration or maintenance command builder is present.
+The request/response path uses class-interface OUT request 2 and IN request 3;
+initialization first uses IN request 0, then initialization commands 0 and 2.
+Initialization handles the documented sequence-one/reply-zero exception only
+for its two startup commands. Normal reads require exact sequence equality.
+
+The sole candidate identity is `1235:8201` (Scarlett 18i20 Gen 2). Firmware
+`1083` is the sole admitted firmware because the pinned source explicitly names
+that original protocol capture. Other firmware stops after initialization,
+before mux/mix queries. These bounds express the evidence currently selected;
+they do not imply that adjacent firmware is incompatible.
+
+The selected source-backed shape has 18 mixer inputs, 10 mixer outputs and
+56 mux destinations. Mux-zero decoding requires a complete set of distinct,
+known destination IDs and known source IDs. Mixer coefficients retain their
+wire values; no copied lookup table or inferred dB conversion is used.
+GET_MUX's zero argument is preserved as `mux_zero`; this read is not presented
+as a snapshot of all three sample-rate banks. It is also not an atomic snapshot
+of concurrent front-panel changes.
+
+`Dac::scarlett_routing_capability` performs descriptor-only discovery while
+idle. `Dac::scarlett_routing_read` explicitly initializes and reads vendor
+state. The host must opt into and already hold the vendor-interface claim.
+Admission requires one unambiguous alternate-zero vendor interface with one
+interrupt IN endpoint, an eight-byte packet size and nonzero interval. Audio
+streams and negotiation are excluded through the existing session gate; volume
+controls share the existing control mutex. USB identity and the active
+configuration are checked; descriptor drift during the read rejects its result.
+All notification transfers retire before the call returns. No claim is acquired
+or released by these methods, and existing audio/volume hand-back is unchanged.
+
+Focused inline tests cover identity and firmware exclusions, byte order,
+malformed replies, mux IDs, sequence handling, bounded notification floods and
+poisoned sessions. Hardware initialization, physical routes, actual firmware
+responses and Android execution have not been validated on a Scarlett device.
+The shared integration gate must run the new tests before reporting them as
+passing. Vendor route writes remain deferred until sample-rate-family state,
+verified rollback and physical acceptance evidence are available.

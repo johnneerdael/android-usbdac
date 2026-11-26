@@ -386,6 +386,69 @@ pub(super) fn validate_capture_registration(
     Ok(())
 }
 
+/// Standard descriptor requests only: resolve the explicit capture claim set
+/// before Android detaches any interface. No stream or class write is started.
+pub(crate) fn capture_claim_preflight(
+    device: &UsbDevice,
+) -> Result<(u8, Vec<u8>, Vec<u8>), String> {
+    let claimed = wrap_android_usb_handle(device)?;
+    let config = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    let raw = read_active_configuration_bytes(&claimed.handle, &config)
+        .ok_or("cannot read active capture configuration")?;
+    let interfaces = raw_interfaces(&raw)?;
+    let mut controls = Vec::new();
+    let mut inputs = Vec::new();
+    for interface in &interfaces {
+        if interface.class != USB_CLASS_AUDIO
+            || interface.subclass != USB_SUBCLASS_AUDIOSTREAMING
+            || interface.alternate == 0
+            || !matches!(interface.protocol, 0 | 0x20)
+        {
+            continue;
+        }
+        let Some(control) = capture_control(&raw, &interfaces, interface) else {
+            continue;
+        };
+        let probe_rate =
+            if interface.protocol == 0 {
+                let Some(format) = interface.descriptors.iter().find(|d| {
+                    d.len() >= 11 && d[1] == USB_DT_CS_INTERFACE && d[2] == 2 && d[3] == 1
+                }) else {
+                    continue;
+                };
+                u32::from_le_bytes([format[8], format[9], format[10], 0])
+            } else {
+                48_000
+            };
+        if capture_format(interface, control, probe_rate).is_none() {
+            continue;
+        }
+        if interface.descriptors.iter().any(|ep| {
+            ep.len() >= 7
+                && ep[1] == 5
+                && ep[2] & 0x80 != 0
+                && ep[2] & 0x0f != 0
+                && ep[3] & 3 == 1
+                && matches!((ep[3] >> 4) & 3, 0 | 2)
+        }) {
+            controls.push(control.number);
+            inputs.push(interface.number);
+        }
+    }
+    controls.sort_unstable();
+    controls.dedup();
+    inputs.sort_unstable();
+    inputs.dedup();
+    if inputs.is_empty() {
+        return Err("active configuration has no supported PCM capture interface".into());
+    }
+    Ok((config.number(), controls, inputs))
+}
+
 struct CaptureUsbOwner {
     claimed: Option<ClaimedHandle>,
     keep_locked: bool,

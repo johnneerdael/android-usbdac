@@ -8,6 +8,29 @@ import org.junit.Test
 
 class UsbInterfacesTest {
     @Test
+    fun explicitCaptureClaimsUseOnlyPreflightInputsAndTheirControl() {
+        val interfaces = listOf(control(0), streamingOut(1), control(4),
+            streamingInOnly(5).copy(hasIsochronousIn = true),
+            streamingInOnly(6).copy(hasIsochronousIn = true))
+        val plan = planCaptureClaims(interfaces, listOf(4), listOf(5))!!
+        assertEquals(listOf(4, 5), plan.allIds)
+        assertEquals(listOf(0, 4, 1), planClaims(interfaces)!!.allIds)
+        assertTrue(hasCapture(interfaces))
+        assertNull(planCaptureClaims(interfaces, listOf(4), listOf(1)))
+        assertNull(planCaptureClaims(interfaces, listOf(7), listOf(5)))
+        assertNull(planCaptureClaims(interfaces, listOf(4), listOf(5, 5)))
+    }
+
+    @Test
+    fun captureDiscoveryDoesNotRequirePlaybackOrAlterPlaybackPlan() {
+        val interfaces = listOf(control(0), streamingInOnly(1).copy(hasIsochronousIn = true))
+        assertTrue(hasCapture(interfaces))
+        assertFalse(hasPlayback(interfaces))
+        assertNull(planClaims(interfaces))
+        assertEquals(listOf(0, 1), planCaptureClaims(interfaces, listOf(0), listOf(1))!!.allIds)
+    }
+
+    @Test
     fun optionalClaimRefusalKeepsOtherSourcesAndSkipsBaseClaims() {
         val attempted = mutableListOf<Int>()
         val owned = mutableListOf(0, 1)

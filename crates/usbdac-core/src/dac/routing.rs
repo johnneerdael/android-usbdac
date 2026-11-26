@@ -5,6 +5,30 @@ use crate::routing::{
 use crate::transport::routing_hw;
 
 impl Dac {
+    /// Inspect the exact Scarlett read candidate and required vendor claim,
+    /// without initializing its protocol or reading proprietary state.
+    pub fn scarlett_routing_capability(
+        &self,
+    ) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
+        self.shared
+            .ensure_open()
+            .map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_discover()
+    }
+
+    /// Initialize and read source-backed Scarlett routing while idle. Requires
+    /// the host's explicit vendor-interface claim. Only 1235:8201 firmware1083
+    /// is admitted for mux/mix queries. No route, volume or persistent setting
+    /// writes are sent. Hardware behavior remains unvalidated.
+    pub fn scarlett_routing_read(
+        &self,
+    ) -> Result<crate::scarlett::RoutingReadback, RoutingSessionError> {
+        self.shared
+            .ensure_open()
+            .map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_read()
+    }
+
     /// Discover standard UAC2 selectors and mixer crosspoints on claimed
     /// AudioControl interfaces in the active configuration. No vendor protocol
     /// is inferred. Requires an idle DAC, including no open capture stream.

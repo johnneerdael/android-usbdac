@@ -36,6 +36,7 @@ pub mod convert;
 pub mod capture;
 pub mod descriptors;
 pub mod routing;
+pub mod scarlett;
 
 mod capabilities;
 mod clock_resolution;

@@ -17,6 +17,8 @@ import org.json.JSONObject
 import dev.usbdac.internal.allInterfaces
 import dev.usbdac.internal.deviceInfoJson
 import dev.usbdac.internal.hasPlayback
+import dev.usbdac.internal.hasCapture
+import dev.usbdac.internal.planCaptureClaims
 import dev.usbdac.internal.planClaims
 import dev.usbdac.internal.toInfo
 import dev.usbdac.internal.toNativeJson
@@ -26,8 +28,8 @@ import kotlinx.coroutines.flow.callbackFlow
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * A USB device that can play audio: it has an Audio Streaming interface with an isochronous
- * OUT endpoint. Get one from [UsbDac.attachedDacs] or [UsbDac.describe].
+ * A USB audio device. Playback discovery requires an isochronous OUT interface;
+ * [UsbDac.attachedCaptureDevices] also discovers input-only devices.
  */
 public data class DacDeviceInfo(
     /** The Android device, for APIs this SDK does not wrap. */
@@ -85,6 +87,18 @@ public object UsbDac {
     /** The USB devices attached now that can play audio. */
     public fun attachedDacs(context: Context): List<DacDeviceInfo> =
         usbManager(context).deviceList.values.mapNotNull(::describe).sortedBy { it.deviceName }
+
+    /** Attached USB audio inputs, including devices with no playback interface. */
+    public fun attachedCaptureDevices(context: Context): List<DacDeviceInfo> =
+        usbManager(context).deviceList.values.mapNotNull(::describeCapture).sortedBy { it.deviceName }
+
+    /** Describe an input-capable device; exact PCM support is checked after USB permission. */
+    public fun describeCapture(device: UsbDevice): DacDeviceInfo? {
+        if (!hasCapture(device.allInterfaces().map { it.toInfo() })) return null
+        return DacDeviceInfo(device, device.vendorId, device.productId,
+            device.productName?.takeIf { it.isNotBlank() } ?: "USB audio input",
+            device.manufacturerName?.takeIf { it.isNotBlank() }, device.deviceName)
+    }
 
     /**
      * Describes [device] if it can play audio, otherwise returns `null`. Use it on the device an
@@ -161,6 +175,72 @@ public object UsbDac {
 
     /** One session per process: the native library refuses a second one, and so do we, before touching USB. */
     private val sessionOpen = AtomicBoolean(false)
+
+    /**
+     * Open explicit standalone USB input after USB permission through [requestPermission]. Android
+     * applies microphone privacy and device permission policy. Declare/request RECORD_AUDIO when
+     * the app's other microphone APIs or its platform policy require it; this raw USB path adds no
+     * blanket microphone permission gate and requests no permissions automatically.
+     * Native descriptor preflight claims only supported PCM IN interfaces and their owning
+     * AudioControl interfaces in the active configuration. Call off the main thread.
+     */
+    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacCaptureSession {
+        val app = context.applicationContext
+        val manager = usbManager(app)
+        if (!manager.hasPermission(device.device)) {
+            throw DacException(DacErrorCode.PERMISSION_DENIED, "no USB permission for ${device.productName}")
+        }
+        if (!sessionOpen.compareAndSet(false, true)) throw DacException(DacErrorCode.BUSY, "another USB audio session is open")
+        var connection: android.hardware.usb.UsbDeviceConnection? = null
+        var claims: ClaimedInterfaces? = null
+        var nativeDac = 0L
+        try {
+            val opened = manager.openDevice(device.device)
+                ?: throw DacException(DacErrorCode.OPEN_FAILED, "Android could not open ${device.productName}")
+            connection = opened
+            val fd = opened.fileDescriptor
+            if (fd < 0) throw DacException(DacErrorCode.OPEN_FAILED, "Android gave no capture file descriptor")
+            val active = device.device.activeConfiguration(opened)
+            val interfaces = active.interfaces()
+            fun infoJson(ids: List<Int>, configuration: Int) = deviceInfoJson(
+                device.vendorId, device.productId, device.productName, device.manufacturerName,
+                device.deviceName, ids, configurationId = configuration,
+            )
+            val preflight = nativeCall { JSONObject(Native.dacCapturePreflight(fd, infoJson(emptyList(), active.id))) }
+            val configuration = preflight.getInt("configuration_id")
+            if (configuration != active.id || device.device.activeConfiguration(opened).id != configuration) {
+                throw DacException(DacErrorCode.CLAIM, "active configuration changed during capture preflight")
+            }
+            fun ids(key: String): List<Int> = preflight.getJSONArray(key).let { array ->
+                (0 until array.length()).map(array::getInt)
+            }
+            val plan = planCaptureClaims(interfaces.map { it.toInfo() }, ids("control_interfaces"), ids("input_interfaces"))
+                ?: throw DacException(DacErrorCode.CLAIM, "capture preflight does not match Android's active interfaces")
+            val owned = ClaimedInterfaces.claim(opened, interfaces, plan, device.productName)
+            claims = owned
+            if (device.device.activeConfiguration(opened).id != configuration) {
+                throw DacException(DacErrorCode.CLAIM, "active configuration changed while claiming capture")
+            }
+            nativeDac = nativeCall { Native.dacOpenCaptureDevice(fd, infoJson(owned.ids, configuration), config.toNativeJson()) }
+            return DacCaptureSession(nativeDac, device, opened, owned) { sessionOpen.set(false) }
+        } catch (error: Throwable) {
+            if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
+            val retainedClaims = claims
+            val retainedConnection = connection
+            fun release() {
+                retainedClaims?.release()
+                runCatching { retainedConnection?.close() }
+                sessionOpen.set(false)
+            }
+            if (nativeDac == 0L || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
+            else Thread({
+                while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
+                release()
+            }, "usbdac-capture-open-retirement").start()
+            if (error is SecurityException) throw DacException(DacErrorCode.PERMISSION_DENIED, "Android denied USB capture permission", error)
+            throw error
+        }
+    }
 
     /**
      * Opens [device] for direct output.
