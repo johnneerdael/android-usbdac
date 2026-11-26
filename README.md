@@ -62,8 +62,15 @@ cargo ndk -t arm64-v8a check --workspace
 cargo ndk -t arm64-v8a build -p usbdac-jni --release     # target/aarch64-linux-android/release/libusbdac.so
 ```
 
-`cargo check --target aarch64-linux-android` needs the NDK's clang on `PATH`
-for the same reason (libusb is compiled from source); `cargo ndk` arranges it.
+Plain `cargo check --target aarch64-linux-android` also works once the NDK's
+clang is reachable, because libusb is compiled from source:
+
+```sh
+NDKBIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin   # linux-x86_64 on Linux
+PATH=$NDKBIN:$PATH CC_aarch64_linux_android=aarch64-linux-android26-clang \
+  AR_aarch64_linux_android=llvm-ar cargo check --workspace --target aarch64-linux-android
+```
+
 Add `-t armeabi-v7a`, `x86_64`, ... for other ABIs. `usbdac-core` depends on
 `rusb`, `libusb1-sys`, `parking_lot`, `once_cell`, `crossbeam-channel`, `log`
 and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
