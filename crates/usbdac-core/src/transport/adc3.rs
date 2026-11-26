@@ -15,8 +15,11 @@ pub(super) struct Adc3Route {
     terminal: u8,
     endpoint: (u8, u8, u16, u32),
     packet_bytes: usize,
+    sync_type: SyncType,
+    usage_type: UsageType,
     feedback: Option<(u8, u8, usize)>,
     pub(super) feedforward: Option<FeedforwardEndpoint>,
+    pub(super) implicit_feedforward: bool,
     implicit: Option<Box<Adc3Route>>,
     companions: Vec<(u8, [u8; 6])>,
     extended_companions: Vec<(u8, [u8; 8])>,
@@ -844,6 +847,11 @@ fn adc3_feedforward(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
     Ok((FeedforwardEndpoint { address: ep.address(), interval: ep.interval(), service_us: service,
         bytes, full_speed: speed == Speed::Full }, companion))
 }
+fn adaptive_implicit_inventory(profile: wire::FunctionProfile, duplex: bool,
+    endpoints: usize, synch_address: u8, disabled: bool) -> bool {
+    profile == wire::FunctionProfile::Full && duplex && endpoints == 1
+        && synch_address == 0 && !disabled
+}
 fn validate_feedforward_descriptor(d: &[u8], speed: Speed) -> Result<(), String> {
     let bytes = match speed { Speed::Full => 3, Speed::High | Speed::Super | Speed::SuperPlus => 4,
         _ => return Err("ADC3 feedforward requires known USB speed".into()) };
@@ -873,13 +881,13 @@ fn adc3_alternate_plan(
     capture: bool,
     plan: Option<&ClockPlan>,
 ) -> Result<(IsoStreamCandidate, Adc3Route), String> {
-    adc3_alternate_overlay(config, handle, alt, speed, capture, plan, true)
+    adc3_alternate_overlay(config, handle, alt, speed, capture, plan, true, false)
 }
 
 // A peer may follow the sink's shared selector targets without owning its plan.
 fn adc3_alternate_overlay(
     config: &ConfigDescriptor, handle: &DeviceHandle<Context>, alt: &rusb::InterfaceDescriptor,
-    speed: Speed, capture: bool, plan: Option<&ClockPlan>, verify_plan: bool,
+    speed: Speed, capture: bool, plan: Option<&ClockPlan>, verify_plan: bool, allow_implicit_feedforward: bool,
 ) -> Result<(IsoStreamCandidate, Adc3Route), String> {
     let (iad, profile, extra) = owning_function(config, handle, alt.interface_number())?;
     let control = iad.b_first_interface;
@@ -899,13 +907,18 @@ fn adc3_alternate_overlay(
                 })
                 && e.transfer_type() == TransferType::Isochronous
                 && (e.usage_type() == UsageType::Data
-                    || (capture && profile == wire::FunctionProfile::Full
-                        && e.usage_type() == UsageType::FeedbackData))
+                    || (profile == wire::FunctionProfile::Full
+                        && e.usage_type() == UsageType::FeedbackData
+                        && (capture || e.sync_type() == SyncType::Adaptive)))
         })
         .collect();
     let [ep] = endpoints.as_slice() else {
         return Err("ADC3 alternate must have one data endpoint in the requested direction".into());
     };
+    if !capture && ep.sync_type() == SyncType::Adaptive && ep.usage_type() == UsageType::FeedbackData
+        && (alt.endpoint_descriptors().count() != 1 || ep.synch_address() != 0) {
+        return Err("ADC3 marked adaptive OUT must have no extra feedback endpoints".into());
+    }
     let (packet_bytes, service_us, data_companion) = adc3_endpoint_geometry(ep, speed)?;
     if matches!(profile, wire::FunctionProfile::Badd(_)) {
         badd_ss_continuous_geometry(ep.max_packet_size(), ep.interval(), data_companion)?;
@@ -921,9 +934,15 @@ fn adc3_alternate_overlay(
     if !adc3_sync_supported(profile, capture, ep.sync_type()) {
         return Err("ADC3 synchronization unsupported".into());
     }
+    let implicit_feedforward = capture && ep.sync_type() == SyncType::Adaptive
+        && adaptive_implicit_inventory(profile, allow_implicit_feedforward,
+            alt.endpoint_descriptors().count(), ep.synch_address(), settings().disable_feedback());
     let (feedforward, feedforward_companion) = if capture && ep.sync_type() == SyncType::Adaptive {
-        let (pipe, companion) = adc3_feedforward(config, handle, alt, speed)?;
-        (Some(pipe), companion)
+        if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
+        if implicit_feedforward { (None, None) } else {
+            let (pipe, companion) = adc3_feedforward(config, handle, alt, speed)?;
+            (Some(pipe), companion)
+        }
     } else { (None, None) };
     let mut route = Adc3Route {
         config: config.number(),
@@ -941,8 +960,11 @@ fn adc3_alternate_overlay(
             service_interval_micros(speed, ep.interval()),
         ),
         packet_bytes,
+        sync_type: ep.sync_type(),
+        usage_type: ep.usage_type(),
         feedback: feedback.map(|f| (f.address, f.interval, f.max_packet_bytes)),
         feedforward,
+        implicit_feedforward,
         implicit: None,
         companions: data_companion.map(|d| (ep.address(), d)).into_iter()
             .chain(feedback_companion.zip(feedback).map(|(d, f)| (f.address, d)))
@@ -1217,6 +1239,32 @@ fn adc3_shared_clock(output: &Adc3Route, input: &Adc3Route) -> bool {
             left.id != right.id || left.kind == right.kind))
 }
 
+/// Full ADC3 3.11.4.3: the selected marked adaptive sink supplies device
+/// feedforward timing. Service intervals may differ; no packet sizes are copied.
+pub(super) fn validate_adaptive_duplex(output: &IsoStreamCandidate, output_route: &Adc3Route,
+    output_rate: u32, input_route: &Adc3Route, input_rate: u32) -> Result<(), String> {
+    if !input_route.implicit_feedforward { return Ok(()); }
+    let capacity = |route: &Adc3Route, rate| route.packet_bytes >= required_max_packet_bytes(
+        rate, route.endpoint.3, usize::from(route.pcm.0) * usize::from(route.pcm.1));
+    if settings().disable_feedback() || output.sync_type != SyncType::Adaptive
+        || output.usage_type != UsageType::FeedbackData || output.endpoint_address & 0x80 != 0
+        || output_route.sync_type != SyncType::Adaptive || output_route.usage_type != UsageType::FeedbackData
+        || input_route.sync_type != SyncType::Adaptive
+        || (output.interface_number, output.alt_setting, output.endpoint_address)
+            != (output_route.interface, output_route.alt, output_route.endpoint.0)
+        || (output.channels, output.subslot_size, output.bit_resolution) != output_route.pcm
+        || output.service_interval_us != output_route.endpoint.3 || output.max_packet_bytes != output_route.packet_bytes
+        || input_route.endpoint.0 & 0x80 == 0 || output.interface_number == input_route.interface
+        || output_route.feedforward.is_some() || output_route.feedback.is_some()
+        || output.implicit_feedback.is_some() || input_route.feedforward.is_some()
+        || output_rate != input_rate || !adc3_shared_clock(output_route, input_route)
+        || output_route.source_rate(output_rate)? != input_route.source_rate(input_rate)?
+        || !capacity(output_route, output_rate) || !capacity(input_route, input_rate) {
+        return Err("ADC3 adaptive capture requires the selected marked adaptive OUT in the same clocked function at the same wire rate".into());
+    }
+    Ok(())
+}
+
 fn adc3_implicit_pair(output: &IsoStreamCandidate, output_route: &Adc3Route,
     input: &IsoStreamCandidate, input_route: &Adc3Route) -> bool {
     output.sync_type == SyncType::Asynchronous && input.sync_type == SyncType::Asynchronous
@@ -1260,7 +1308,7 @@ fn adc3_implicit_source(
         if !alt.endpoint_descriptors().any(|e| e.direction() == Direction::In
             && e.transfer_type() == TransferType::Isochronous && e.sync_type() == SyncType::Asynchronous
             && e.usage_type() == UsageType::FeedbackData) { continue; }
-        let Ok((input, mut route)) = adc3_alternate_overlay(config, handle, &alt, output.usb_speed, true, plan, false) else { continue; };
+        let Ok((input, mut route)) = adc3_alternate_overlay(config, handle, &alt, output.usb_speed, true, plan, false, false) else { continue; };
         if !adc3_implicit_pair(output, output_route, &input, &route) { continue; }
         route.plan = None; // The sink owns the common selector transaction.
         matches.push((ImplicitFeedbackSource {
@@ -1348,13 +1396,9 @@ pub(super) fn adc3_capture_route_for_endpoint(
         .find(|d| d.interface_number() == interface && d.setting_number() == alternate)
         .ok_or("ADC3 capture interface disappeared")?;
     let plan = capture_peer_plan(Some(expected), config.number(), interface);
-    adc3_alternate_plan(
-        config,
-        &claimed.handle,
-        &alt,
-        resolve_device_speed(&claimed.handle.device()),
-        true,
-        plan,
+    adc3_alternate_overlay(
+        config, &claimed.handle, &alt, resolve_device_speed(&claimed.handle.device()),
+        true, plan, !expected.implicit_feedforward, expected.implicit_feedforward,
     )
     .map(|(_, mut route)| { route.clock_context = expected.clock_context.clone(); route })
 }
@@ -1400,16 +1444,22 @@ pub(super) fn adc3_capture_candidates(
             let implicit = saved.as_ref().and_then(|r| r.implicit.as_deref()).filter(|r|
                 r.interface == alt.interface_number() && r.alt == alt.setting_number());
             let (candidate, mut route) = if implicit.is_some() {
-                adc3_alternate_overlay(config, &claimed.handle, &alt, speed, true, plan, false)?
+                adc3_alternate_overlay(config, &claimed.handle, &alt, speed, true, plan, false, false)?
             } else {
-                adc3_alternate_plan(config, &claimed.handle, &alt, speed, true, plan)?
+                adc3_alternate_overlay(config, &claimed.handle, &alt, speed, true, plan,
+                    false, planned_clock && saved.is_some())?
             };
+            // Keep the projected selector overlay until raw multiplier factors
+            // and projected wire ranges have been validated against that path.
+            let supports = sampling_frequency_ranges_support_rate(
+                &adc3_wire_ranges(&claimed.handle, &route)?, rate);
             if let Some(expected) = implicit {
                 route.plan = None;
                 if &route != expected { return Err("ADC3 shared capture source changed".into()); }
             }
-            let supports = sampling_frequency_ranges_support_rate(
-                &adc3_wire_ranges(&claimed.handle, &route)?, rate);
+            for domain in route.domains.iter().filter(|d| adc3_route_domain_required(&route, d)) {
+                claimed.adc3_power.acquire(route.control, domain)?;
+            }
             if supports && route.feedforward.map_or(true, |pipe| pipe.nominal(rate).is_ok())
                 && candidate.max_packet_bytes
                     >= required_max_packet_bytes(
@@ -1563,6 +1613,9 @@ pub(super) fn configure_adc3(
 }
 
 fn validate_adaptive_capture_rate(route: &Adc3Route, rate: u32) -> Result<(), String> {
+    if route.implicit_feedforward && settings().disable_feedback() {
+        return Err("ADC3 implicit feedforward disabled".into());
+    }
     if let Some(pipe) = route.feedforward {
         if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
         validate_feedforward_capacity(pipe, rate, route.packet_bytes, route.endpoint.3,
@@ -2104,7 +2157,7 @@ fn adc3_directional_alternative_routes(
 pub(super) fn apply_adc3_clock_plan(claimed: &ClaimedHandle, route: &Adc3Route, rate: u32) -> Result<(), String> {
     let Some(plan) = route.plan.as_ref() else { return Ok(()); };
     let interfaces = guard_adc3_clock_mutation(claimed, route)?;
-    for domain in &route.domains { claimed.adc3_power.acquire(route.control, domain)?; }
+    for domain in route.domains.iter().filter(|d| adc3_route_domain_required(route, d)) { claimed.adc3_power.acquire(route.control, domain)?; }
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
     let (_, profile, extra) = owning_function(&config, &claimed.handle, route.interface)?;
     if profile != wire::FunctionProfile::Full
@@ -2196,7 +2249,7 @@ pub(super) fn select_owned_stream_candidate(
         prepare_adc3_alternate_power(claimed, &config, &alt, false).map_err(SelectError::NoMatch)?;
         if route.plan.is_some() { guard_adc3_clock_mutation(claimed, &route).map_err(SelectError::NoMatch)?; }
         if route.plan.is_some() {
-            for domain in &route.domains {
+            for domain in route.domains.iter().filter(|d| adc3_route_domain_required(&route, d)) {
                 claimed.adc3_power.acquire(route.control, domain).map_err(SelectError::NoMatch)?;
             }
         }
@@ -2448,6 +2501,19 @@ mod tests {
         assert!(hs.nominal(32_767_999).is_ok());
         assert!(hs.nominal(32_768_000).is_err());
         assert!(FeedforwardEndpoint { bytes: 4, ..fs }.nominal(48_000).is_err());
+    }
+    #[test]
+    fn adaptive_implicit_inventory_is_duplex_only_and_never_hides_extra_endpoints() {
+        let full = wire::FunctionProfile::Full;
+        assert!(adaptive_implicit_inventory(full, true, 1, 0, false));
+        assert!(!adaptive_implicit_inventory(full, false, 1, 0, false));
+        assert!(!adaptive_implicit_inventory(full, true, 1, 0, true));
+        for endpoints in [0, 2, 3] {
+            assert!(!adaptive_implicit_inventory(full, true, endpoints, 0, false));
+        }
+        assert!(!adaptive_implicit_inventory(full, true, 1, 2, false));
+        assert!(!adaptive_implicit_inventory(wire::FunctionProfile::Badd(wire::BaddProfile::Headset),
+            true, 1, 0, false));
     }
     #[test]
     fn adaptive_capture_preserves_extended_in_capacity_for_rate_checks() {
@@ -2835,8 +2901,11 @@ mod tests {
             terminal: 1,
             endpoint: (1, 4, 196, 1000),
             packet_bytes: 196,
+            sync_type: SyncType::Asynchronous,
+            usage_type: UsageType::Data,
             feedback: Some((0x81, 4, 4)),
             feedforward: None,
+            implicit_feedforward: false,
             implicit: None,
             companions: vec![],
             extended_companions: vec![],
@@ -2885,6 +2954,45 @@ mod tests {
         let sink = pcm_candidate();
         let source = implicit_pcm_candidate();
         assert!(adc3_implicit_pair(&sink, &out, &source, &input));
+        // Adaptive feedforward reverses the timing direction. Each endpoint
+        // keeps its own valid interval and capacity rather than mirroring IN.
+        let adaptive_candidate = || IsoStreamCandidate {
+            sync_type: SyncType::Adaptive,
+            usage_type: UsageType::FeedbackData,
+            subslot_size: 2,
+            bit_resolution: 16,
+            max_packet_bytes: 196,
+            ..pcm_candidate()
+        };
+        let adaptive = adaptive_candidate();
+        let mut adaptive_out = out.clone(); adaptive_out.feedback = None;
+        adaptive_out.sync_type = SyncType::Adaptive; adaptive_out.usage_type = UsageType::FeedbackData;
+        let mut adaptive_in = input.clone(); adaptive_in.implicit_feedforward = true;
+        adaptive_in.sync_type = SyncType::Adaptive;
+        adaptive_in.endpoint.3 = 125; adaptive_in.packet_bytes = 28;
+        assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 48_000, &adaptive_in, 48_000).is_ok());
+        for mutation in 0..11 {
+            let mut bad_out = adaptive_candidate(); let mut bad_input = adaptive_in.clone();
+            let mut bad_route = adaptive_out.clone();
+            match mutation {
+                0 => bad_out.usage_type = UsageType::Data,
+                1 => bad_out.sync_type = SyncType::Asynchronous,
+                2 => bad_out.interface_number = bad_input.interface,
+                3 => bad_input.first += 1,
+                4 => bad_input.clock.as_mut().unwrap().id += 1,
+                5 => bad_input.packet_bytes = 1,
+                6 => bad_route.packet_bytes = 1,
+                7 => bad_route.feedback = Some((0x82, 4, 4)),
+                8 => bad_route.usage_type = UsageType::Data,
+                9 => bad_route.sync_type = SyncType::Synchronous,
+                _ => bad_input.choice.as_mut().unwrap().path[0].kind = ClockHopKind::Selector { selected_pin: 2, pin_count: 2 },
+            }
+            assert!(validate_adaptive_duplex(&bad_out, &bad_route, 48_000, &bad_input, 48_000).is_err(), "mutation {mutation}");
+        }
+        assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 96_000, &adaptive_in, 48_000).is_err());
+        let mut direct = adaptive_in.clone(); direct.feedforward = Some(FeedforwardEndpoint {
+            address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false });
+        assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 48_000, &direct, 48_000).is_err());
         let mut scaled_out = out.clone();
         scaled_out.choice = Some(ratio_choice(&[(7, 2, 4)]));
         let mut scaled_in = input.clone();

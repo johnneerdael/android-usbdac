@@ -170,6 +170,24 @@ pub(super) fn publish_transport_loss(runtime_stats: &RuntimeStats, tracker: &Los
     }
 }
 
+/// A playback completion advances an adaptive source's USB clock only when
+/// every submitted packet was accepted unchanged. Held wire silence (pause or
+/// flush refill) qualifies by the same geometry as music.
+pub(super) fn qualifies_implicit_feedforward_completion(
+    status: i32,
+    stats: &CompletionStats,
+    packet_sizes: &[usize],
+    bytes_per_frame: usize,
+    queued_frames: u64,
+) -> bool {
+    status == LIBUSB_TRANSFER_COMPLETED
+        && *stats == CompletionStats::default()
+        && queued_frames > 0
+        && bytes_per_frame > 0
+        && packet_sizes.iter().any(|&bytes| bytes > 0)
+        && packet_sizes.iter().all(|bytes| bytes % bytes_per_frame == 0)
+}
+
 pub(super) fn update_transfer_timing_stats(
     runtime_stats: &RuntimeStats,
     turnaround_us: u64,
@@ -588,7 +606,7 @@ pub(super) fn run_usb_output_loop(
     let mut slots = Vec::with_capacity(transfer_slot_count);
     let mut active_slots = 0usize;
     let mut explicit_feedback_fault = feedback_start_error.is_some();
-    let mut explicit_flush_deadline: Option<Instant> = None;
+    let mut out_flush_deadline: Option<Instant> = None;
     let mut fatal_error: Option<String> = feedback_start_error;
     let mut implicit_feedback_fault = false;
     let mut capture_failure: Option<Error> = None;
@@ -665,6 +683,8 @@ pub(super) fn run_usb_output_loop(
             Err(error) => fatal_error = Some(error),
         }
     }
+    let capture_uses_implicit_feedforward = capture_pool.as_ref()
+        .is_some_and(|pool| pool.uses_implicit_feedforward());
     // Duplex readiness requires a completed, fully valid adaptive-source
     // feedforward send, under this same USB event owner.
     while fatal_error.is_none() && !usb_stop_requested(&stop)
@@ -793,6 +813,14 @@ pub(super) fn run_usb_output_loop(
                 break;
             }
             if candidate.implicit_feedback.is_some() { runtime_stats.implicit_scheduled_frames.fetch_add(scheduled as u64, Ordering::Relaxed); }
+            if active_slots == 0 {
+                if let Some(pool) = capture_pool.as_mut() {
+                    pool.note_playback_submitted(
+                        slot.submitted_at.expect("successful OUT submit records its timestamp"),
+                        Duration::from_micros(geometry.transfer_us()),
+                    );
+                }
+            }
             active_slots = active_slots.saturating_add(1);
         }
     }
@@ -804,6 +832,12 @@ pub(super) fn run_usb_output_loop(
         shared.refresh_state();
     }
 
+    if fatal_error.is_none() && !usb_stop_requested(&stop)
+        && capture_uses_implicit_feedforward && active_slots == 0 {
+        let error = Error::Transfer("implicit feedforward started with an empty OUT bus queue".into());
+        fatal_error = Some(error.to_string());
+        capture_failure = Some(error);
+    }
     if let Some(engine) = implicit.as_mut() { engine.running = active_slots > 0; }
     while fatal_error.is_none() && !usb_stop_requested(&stop) {
         if active_slots == 0 && implicit.is_none() { break; }
@@ -811,6 +845,7 @@ pub(super) fn run_usb_output_loop(
         if let Err(error) = context.handle_events(Some(if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
         } else { Duration::from_millis(50) })) {
+            device_lost = error == rusb::Error::NoDevice;
             fatal_error = Some(format!("libusb_handle_events failed: {}", error));
             break;
         }
@@ -824,11 +859,13 @@ pub(super) fn run_usb_output_loop(
             handled_flush_epoch = flush_epoch;
             if bus_config.cancel_in_flight_on_flush {
                 let started = Instant::now();
-                let cancel_result = if implicit.is_some() || feedback_slot.is_some() {
+                let cancel_result = if implicit.is_some() || feedback_slot.is_some()
+                    || capture_uses_implicit_feedforward {
                     let targets = flush_cancel_targets(flush_epoch, slots.iter().map(|slot| (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)));
                     for &index in &targets { slots[index].cancel_for_flush(); }
-                    if feedback_slot.is_some() && !targets.is_empty() {
-                        explicit_flush_deadline.get_or_insert(started + FLUSH_CANCEL_TIMEOUT);
+                    if (feedback_slot.is_some() || capture_uses_implicit_feedforward)
+                        && !targets.is_empty() {
+                        out_flush_deadline.get_or_insert(started + FLUSH_CANCEL_TIMEOUT);
                     }
                     Ok(targets.len())
                 } else { cancel_stale_transfers_for_flush(&context, &mut slots, flush_epoch) };
@@ -851,7 +888,10 @@ pub(super) fn run_usb_output_loop(
             }
         }
 
-        if let Some(pool) = capture_pool.as_mut() {
+        // Adaptive implicit feedforward must see this event batch's validated
+        // OUT completions before it decides whether capture timing is stale.
+        // Preserve the established order for explicit and ordinary capture.
+        if let Some(pool) = capture_pool.as_mut().filter(|pool| !pool.uses_implicit_feedforward()) {
             if let Err(error) = pool.pump(&handle, &stop) {
                 device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
             }
@@ -902,13 +942,14 @@ pub(super) fn run_usb_output_loop(
             }
         }
 
+        let mut latest_playback_completion = None;
         for slot in slots.iter_mut() {
             let Some((status, completed_at, _actual_length)) = slot.take_completion() else {
                 continue;
             };
 
-            if slot.cancelled_for_flush && explicit_flush_deadline.is_some_and(|deadline| completed_at >= deadline) {
-                fatal_error = Some("explicit OUT flush cancellation acknowledgement deadline expired".into());
+            if slot.cancelled_for_flush && out_flush_deadline.is_some_and(|deadline| completed_at >= deadline) {
+                fatal_error = Some("OUT flush cancellation acknowledgement deadline expired".into());
             }
 
             // Cancelled because the stream was flushed: the audio was never
@@ -1013,6 +1054,15 @@ pub(super) fn run_usb_output_loop(
                     break;
                 }
             };
+
+            if capture_uses_implicit_feedforward && qualifies_implicit_feedforward_completion(
+                status, &completion_stats, &slot.packet_sizes, bytes_per_frame, queued_frame_count,
+            ) {
+                // Slot iteration is not callback order. Publish the freshest
+                // accepted timestamp once, without substituting wall time.
+                latest_playback_completion = Some(latest_playback_completion
+                    .map_or(completed_at, |previous: Instant| previous.max(completed_at)));
+            }
 
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
                 .with_held(completed_held);
@@ -1251,11 +1301,11 @@ pub(super) fn run_usb_output_loop(
                 set_usb_stream_stable(false);
             }
         }
-        if let Some(deadline) = explicit_flush_deadline {
+        if let Some(deadline) = out_flush_deadline {
             if !slots.iter().any(|slot| slot.in_flight && slot.cancelled_for_flush) {
-                explicit_flush_deadline = None;
+                out_flush_deadline = None;
             } else if Instant::now() >= deadline {
-                fatal_error = Some("explicit OUT flush cancellation acknowledgement deadline expired".into());
+                fatal_error = Some("OUT flush cancellation acknowledgement deadline expired".into());
             }
         }
         if fatal_error.is_none() && !usb_stop_requested(&stop) {
@@ -1290,6 +1340,24 @@ pub(super) fn run_usb_output_loop(
                     fatal_error = Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)".into());
                 }
                 runtime_stats.transfer_queue_depth.store(active_slots, Ordering::Relaxed);
+            }
+        }
+        if fatal_error.is_none() && !usb_stop_requested(&stop) {
+            if let Some(pool) = capture_pool.as_mut().filter(|pool| pool.uses_implicit_feedforward()) {
+                // An absent OUT queue cannot clock an adaptive IN endpoint.
+                // Fail the shared owner before pumping any further capture.
+                let result = if active_slots == 0 {
+                    Err(Error::Transfer("implicit feedforward observed an empty OUT bus queue".into()))
+                } else {
+                    latest_playback_completion
+                        .map_or(Ok(()), |at| pool.note_playback_completed(at))
+                        .and_then(|()| pool.pump(&handle, &stop))
+                };
+                if let Err(error) = result {
+                    device_lost = error == Error::DeviceLost;
+                    fatal_error = Some(error.to_string());
+                    capture_failure = Some(error);
+                }
             }
         }
         publish_inflight_music(&slots, &runtime_stats);
@@ -1446,5 +1514,53 @@ mod duplex_failure_tests {
         assert_eq!(classify_stream_failure(Some(&typed.to_string()), false, Some(typed.clone())), Some(typed));
         assert_eq!(classify_stream_failure(Some("capture completion failed"), false, Some(Error::DeviceLost)), Some(Error::DeviceLost));
         assert_eq!(classify_stream_failure(None, false, None), None);
+    }
+}
+
+#[cfg(test)]
+mod implicit_feedforward_completion_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_complete_integral_cadence_including_requested_empty_intervals() {
+        // A low-rate cadence may deliberately request an empty service interval.
+        assert!(qualifies_implicit_feedforward_completion(
+            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[0, 4, 0, 4], 4, 2,
+        ));
+        assert!(!qualifies_implicit_feedforward_completion(
+            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[0, 0], 4, 0,
+        ));
+        assert!(!qualifies_implicit_feedforward_completion(
+            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[5, 3], 4, 2,
+        ));
+        assert!(!qualifies_implicit_feedforward_completion(
+            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[4], 0, 1,
+        ));
+    }
+
+    #[test]
+    fn rejects_every_noncompleted_status_even_with_full_packet_accounting() {
+        for status in [LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_CANCELLED,
+            LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_STALL,
+            LIBUSB_TRANSFER_OVERFLOW] {
+            assert!(!qualifies_implicit_feedforward_completion(
+                status, &CompletionStats::default(), &[24, 24], 4, 12,
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_loss_short_packets_and_lossless_repacketization() {
+        for stats in [
+            CompletionStats { short_packets: 1, ..CompletionStats::default() },
+            CompletionStats { zero_packets: 1, ..CompletionStats::default() },
+            CompletionStats { descriptor_rewrites: 1, ..CompletionStats::default() },
+            CompletionStats { shortfall_frames: 1, ..CompletionStats::default() },
+            CompletionStats { lost_bytes: 1, ..CompletionStats::default() },
+        ] {
+            assert!(!qualifies_implicit_feedforward_completion(
+                LIBUSB_TRANSFER_COMPLETED, &stats, &[24, 24], 4, 12,
+            ));
+        }
     }
 }

@@ -80,6 +80,8 @@ fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, endpoint: &CaptureEndpoint) -> Result<(), Error> {
     let route = adc3_route_for_candidate(&claimed.handle.device(), &claimed.handle, playback).map_err(Error::Control)?;
     if let (Some(output), Some(input)) = (route.as_ref(), endpoint.adc3_route.as_ref()) {
+        adc3::validate_adaptive_duplex(playback, output, expected.sample_rate,
+            input, endpoint.format.sample_rate()).map_err(Error::Control)?;
         // BADD prescribes a common fixed 48 kHz cadence for both directions
         // within one AudioControl function, without programmable Clock Sources.
         if output.clock.is_none() && input.clock.is_none() && output.control == input.control
@@ -202,6 +204,26 @@ impl Attachment {
         if let Err(error) = &result { *self.error.lock() = Some(error.clone()); }
         result
     }
+    fn discard_before_timing(&self, slot: &IsoTransferSlot, status: i32,
+        scratch: &mut [CapturePacket]) -> Result<(), Error> {
+        let mut stats = crate::capture::CaptureStats::default();
+        let result = match capture_stream::inspect_slot(slot, status, scratch) {
+            Ok((data, detached)) => {
+                let result = stats.record_completion(data.len(), &slot.packet_sizes, scratch,
+                    true, 0, self.endpoint.format.bytes_per_frame())
+                    .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")));
+                if detached { Err(Error::DeviceLost) } else { result }
+            }
+            Err(error) => {
+                if status == LIBUSB_TRANSFER_COMPLETED { stats.malformed_completions = 1; }
+                else { stats.failed_transfers = 1; }
+                Err(error)
+            }
+        };
+        self.deferred.record(stats);
+        if let Err(error) = &result { *self.error.lock() = Some(error.clone()); }
+        result
+    }
     pub(super) fn failure(&self) -> Option<Error> { self.error.lock().clone() }
     pub(super) fn retirement_guard(&self) -> Retirement { Retirement(self.retired.clone()) }
     fn restore_rate(&self, claimed: &ClaimedHandle) -> bool {
@@ -271,9 +293,60 @@ pub(super) fn cleanup_claimed(claimed: ClaimedHandle, attachment: Option<&Arc<At
     capture_restored && owner_restored
 }
 
+/// Capture timing is authorized by wholly accepted playback callbacks only.
+/// Once a deadline is missed, a late callback cannot restart the same session.
+struct ImplicitFeedforwardHealth {
+    submitted: Option<Instant>,
+    first: Option<Instant>,
+    latest: Option<Instant>,
+    startup: Duration,
+    fresh: Duration,
+    failed: bool,
+}
+impl ImplicitFeedforwardHealth {
+    fn new() -> Self {
+        Self { submitted: None, first: None, latest: None,
+            startup: Duration::from_millis(500), fresh: Duration::from_millis(100), failed: false }
+    }
+    fn submitted(&mut self, at: Instant, duration: Duration) {
+        if self.submitted.is_some() || self.failed { return; }
+        self.submitted = Some(at);
+        self.startup = Duration::from_millis(500).max(duration.saturating_mul(2))
+            .min(Duration::from_secs(1));
+        self.fresh = Duration::from_millis(100).max(duration.saturating_mul(2))
+            .min(Duration::from_millis(500));
+    }
+    fn check(&mut self, at: Instant) -> Result<(), Error> {
+        if self.latest.map_or_else(|| self.submitted.is_some_and(|start|
+            at.saturating_duration_since(start) >= self.startup), |latest|
+            at.saturating_duration_since(latest) >= Duration::from_secs(1)) {
+            self.failed = true;
+        }
+        if self.failed { Err(Error::Transfer("ADC3 implicit feedforward playback timing lost".into())) }
+        else { Ok(()) }
+    }
+    fn completed(&mut self, at: Instant) -> Result<(), Error> {
+        self.check(at)?;
+        if self.submitted.is_some_and(|start| at >= start) {
+            if self.latest.is_some_and(|latest| at.saturating_duration_since(latest) >= self.fresh) {
+                // Never admit a buffered IN completion from a stale timing gap
+                // merely because a later callback has restored OUT freshness.
+                self.first = Some(at);
+            } else { self.first.get_or_insert(at); }
+            self.latest = Some(self.latest.map_or(at, |latest| latest.max(at)));
+        }
+        Ok(())
+    }
+    fn accepts(&self, at: Instant) -> bool {
+        !self.failed && self.first.is_some_and(|first| at >= first)
+            && self.latest.is_some_and(|latest| at.saturating_duration_since(latest) < self.fresh)
+    }
+}
+
 pub(super) struct InputPool {
     pub(super) slots: Vec<IsoTransferSlot>,
     feedforward: Option<capture_stream::FeedforwardPool>,
+    implicit_feedforward: Option<ImplicitFeedforwardHealth>,
     attachment: Arc<Attachment>,
     order: VecDeque<usize>,
     reordered: Vec<bool>,
@@ -290,7 +363,9 @@ impl InputPool {
             slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)?);
         }
         let feedforward = capture_stream::FeedforwardPool::for_endpoint(&attachment.endpoint)?;
-        Ok(Self { slots, feedforward, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
+        let implicit_feedforward = attachment.endpoint.adc3_route.as_ref()
+            .is_some_and(|route| route.implicit_feedforward).then(ImplicitFeedforwardHealth::new);
+        Ok(Self { slots, feedforward, implicit_feedforward, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots], scratch: vec![CapturePacket {
                 requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
     }
@@ -305,6 +380,14 @@ impl InputPool {
         Ok(())
     }
     pub(super) fn primed(&self) -> bool { self.feedforward.as_ref().map_or(true, |pool| pool.primed()) }
+    pub(super) fn uses_implicit_feedforward(&self) -> bool { self.implicit_feedforward.is_some() }
+    pub(super) fn note_playback_submitted(&mut self, at: Instant, transfer_duration: Duration) {
+        if let Some(health) = self.implicit_feedforward.as_mut() { health.submitted(at, transfer_duration); }
+    }
+    pub(super) fn note_playback_completed(&mut self, at: Instant) -> Result<(), Error> {
+        if let Some(health) = self.implicit_feedforward.as_mut() { health.completed(at)?; }
+        Ok(())
+    }
     pub(super) fn cancel(&mut self) {
         for slot in &mut self.slots { slot.cancel(); }
         if let Some(pool) = self.feedforward.as_mut() { pool.cancel(); }
@@ -315,7 +398,9 @@ impl InputPool {
         if let Some(pool) = self.feedforward.as_mut() { pool.drain(context); }
     }
     pub(super) fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+        if usb_stop_requested(stop) { return Ok(()); }
         if let Some(pool) = self.feedforward.as_mut() { pool.pump(handle, stop)?; }
+        if let Some(health) = self.implicit_feedforward.as_mut() { health.check(Instant::now())?; }
         if let Some(&head) = self.order.front() {
             for &index in self.order.iter().skip(1) {
                 if !self.slots[head].completion_ready() && self.slots[index].completion_ready() && !self.reordered[index] {
@@ -327,11 +412,11 @@ impl InputPool {
             if usb_stop_requested(stop) { break; }
             let Some((status, completed, _)) = self.slots[index].take_completion() else { break; };
             self.order.pop_front(); self.reordered[index] = false;
-            let result = if self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed)) {
+            let result = if self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
+                && self.implicit_feedforward.as_ref().map_or(true, |health| health.accepts(completed)) {
                 self.attachment.ingest(&self.slots[index], status, &mut self.scratch)
             } else {
-                capture_stream::discard_unprimed_capture(&self.slots[index], status, &mut self.scratch,
-                    self.attachment.endpoint.format.bytes_per_frame())
+                self.attachment.discard_before_timing(&self.slots[index], status, &mut self.scratch)
             };
             self.slots[index].mark_completed();
             result?;
@@ -355,6 +440,70 @@ mod tests {
     use crate::clock_resolution::ClockResolution;
     fn clock(control_interface: u8, source_id: u8) -> ClockChoice {
         ClockChoice { control_interface, source_id, path: vec![], resolution: ClockResolution::Resolved }
+    }
+    #[test]
+    fn implicit_feedforward_drops_capture_until_accepted_playback_timing() {
+        let at = Instant::now();
+        let mut health = ImplicitFeedforwardHealth::new();
+        assert!(!health.accepts(at));
+        // Polling before OUT launch cannot consume the startup deadline.
+        assert!(health.check(at + Duration::from_secs(30)).is_ok());
+        health.submitted(at, Duration::from_millis(8));
+        assert!(!health.accepts(at + Duration::from_millis(1)));
+        let first = at + Duration::from_millis(8);
+        health.completed(first).unwrap();
+        assert!(!health.accepts(first - Duration::from_millis(1)));
+        assert!(health.accepts(first));
+        assert!(!health.accepts(first + Duration::from_millis(100)));
+        // Out-of-order callbacks never move the freshness anchor backward.
+        health.completed(at + Duration::from_millis(24)).unwrap();
+        health.completed(at + Duration::from_millis(16)).unwrap();
+        assert_eq!(health.latest, Some(at + Duration::from_millis(24)));
+        assert!(health.accepts(at + Duration::from_millis(120)));
+    }
+    #[test]
+    fn implicit_feedforward_recovery_drops_the_buffered_stale_gap() {
+        let at = Instant::now();
+        let mut health = ImplicitFeedforwardHealth::new();
+        health.submitted(at, Duration::from_millis(8));
+        health.completed(at + Duration::from_millis(8)).unwrap();
+        assert!(health.accepts(at + Duration::from_millis(9)));
+        health.completed(at + Duration::from_millis(300)).unwrap();
+        assert!(!health.accepts(at + Duration::from_millis(200)));
+        assert!(!health.accepts(at + Duration::from_millis(299)));
+        assert!(health.accepts(at + Duration::from_millis(300)));
+        // A late older callback cannot reopen the previous qualification epoch.
+        health.completed(at + Duration::from_millis(16)).unwrap();
+        assert!(!health.accepts(at + Duration::from_millis(200)));
+        assert_eq!(health.latest, Some(at + Duration::from_millis(300)));
+    }
+    #[test]
+    fn implicit_feedforward_startup_and_loss_are_terminal() {
+        let at = Instant::now();
+        let mut startup = ImplicitFeedforwardHealth::new();
+        startup.submitted(at, Duration::from_millis(8));
+        // Replenishing silence or a second submit cannot extend startup.
+        startup.submitted(at + Duration::from_millis(400), Duration::from_millis(8));
+        assert!(startup.check(at + Duration::from_millis(500)).is_err());
+        assert!(startup.completed(at + Duration::from_millis(501)).is_err());
+        assert!(!startup.accepts(at + Duration::from_millis(502)));
+        let mut stale = ImplicitFeedforwardHealth::new();
+        stale.submitted(at, Duration::from_millis(8));
+        stale.completed(at + Duration::from_millis(8)).unwrap();
+        assert!(stale.check(at + Duration::from_millis(1008)).is_err());
+        assert!(stale.completed(at + Duration::from_millis(1009)).is_err());
+        assert!(!stale.accepts(at + Duration::from_millis(1010)));
+    }
+    #[test]
+    fn implicit_deadlines_account_for_composed_transfer_duration_with_a_bound() {
+        let mut health = ImplicitFeedforwardHealth::new();
+        health.submitted(Instant::now(), Duration::from_millis(300));
+        assert_eq!(health.startup, Duration::from_millis(600));
+        assert_eq!(health.fresh, Duration::from_millis(500));
+        let mut sparse = ImplicitFeedforwardHealth::new();
+        sparse.submitted(Instant::now(), Duration::from_secs(10));
+        assert_eq!(sparse.startup, Duration::from_secs(1));
+        assert_eq!(sparse.fresh, Duration::from_millis(500));
     }
     #[test]
     fn independently_resolved_paths_cannot_disagree_about_a_shared_selector() {
