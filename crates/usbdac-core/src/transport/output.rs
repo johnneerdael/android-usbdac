@@ -657,10 +657,27 @@ pub(super) fn run_usb_output_loop(
     if let Some(attachment) = capture.as_ref().filter(|a| !a.shared_implicit) {
         match duplex::InputPool::new(Arc::clone(attachment)) {
             Ok(mut pool) => {
-                if let Err(error) = pool.start(&handle, &stop) { fatal_error = Some(error); }
+                if let Err(error) = pool.start(&handle, &stop) {
+                    device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error);
+                }
                 capture_pool = Some(pool);
             }
             Err(error) => fatal_error = Some(error),
+        }
+    }
+    // Duplex readiness requires a completed, fully valid adaptive-source
+    // feedforward send, under this same USB event owner.
+    while fatal_error.is_none() && !usb_stop_requested(&stop)
+        && capture_pool.as_ref().is_some_and(|pool| !pool.primed()) {
+        if let Err(error) = context.handle_events(Some(Duration::from_millis(1))) {
+            let failure = if error == rusb::Error::NoDevice { Error::DeviceLost }
+                else { Error::Transfer(format!("duplex feedforward event pump: {error}")) };
+            device_lost = failure == Error::DeviceLost; fatal_error = Some(failure.to_string()); capture_failure = Some(failure); break;
+        }
+        if let Some(pool) = capture_pool.as_mut() {
+            if let Err(error) = pool.pump(&handle, &stop) {
+                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            }
         }
     }
     let mut implicit = None;
@@ -1310,11 +1327,11 @@ pub(super) fn run_usb_output_loop(
     runtime_stats.feedback_locked.store(false, Ordering::Release);
     shared.note_bit_perfect();
     for slot in &mut slots { slot.cancel(); }
-    if let Some(pool) = capture_pool.as_mut() { for slot in &mut pool.slots { slot.cancel(); } }
+    if let Some(pool) = capture_pool.as_mut() { pool.cancel(); }
     if let Some(engine) = implicit.as_mut() { for slot in &mut engine.slots { slot.cancel(); } }
     if let Some(slot) = feedback_slot.as_mut() { slot.cancel(); }
     drain_iso_transfer_slots(&context, &mut slots);
-    if let Some(pool) = capture_pool.as_mut() { drain_iso_transfer_slots(&context, &mut pool.slots); }
+    if let Some(pool) = capture_pool.as_mut() { pool.drain(&context); }
     if let Some(engine) = implicit.as_mut() { drain_iso_transfer_slots(&context, &mut engine.slots); }
     drain_feedback_transfer_slot(&context, &mut feedback_slot);
     runtime_stats.feedback_locked.store(false, Ordering::Release);

@@ -519,7 +519,7 @@ unique source, compatible service intervals, and whole PCM frames
 within the capacity of both endpoints at the selected rate. Keep the
 source and sink available while audio flows. A duplex reader sharing
 the same IN endpoint receives data from the feedback transfer pool.
-[USB Audio 3.0 §§3.11.4 and 3.14.2](https://amatriz.net/PDFs/Audio30.pdf#page=25),
+[USB Audio 3.0 §§3.11.4 and 3.14.2](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=25),
 [ALSA synchronization endpoint selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/pcm.c#L331-L411)
 
 For physical acceptance, use a full ADC3 asynchronous pair with a
@@ -529,8 +529,7 @@ OUT counts across the lock window. Open the same IN endpoint for
 capture and verify the playback/capture byte sequences and one shared
 transfer pool. Exercise stop and detach and confirm alternate and
 power hand-back. Test adaptive playback separately with a trace of
-the nominal OUT frame pattern. Adaptive capture requires its own
-feedforward implementation. BADD has a separate profile contract.
+the nominal OUT frame pattern. BADD has a separate profile contract.
 
 For standalone adaptive capture, select the same alternate's unique
 isochronous OUT feedback endpoint with the class-defined No
@@ -541,9 +540,11 @@ full speed and four bytes of 16.16 at high speed and above. Use bus
 frame or microframe units for the word. The capture owner can keep a
 small periodic OUT transfer pool running alongside data IN and retire
 both before setting alt zero. A stall, detach or missed send deadline
-must become a capture error. A paired adaptive device where audio OUT
-supplies implicit feedforward requires proof of the common clock and
-ownership of both audio streams. [USB Audio 3.0 §§3.11.4.2–3 and 4.8.2](https://amatriz.net/PDFs/Audio30.pdf#page=100), [ALSA outbound sync packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L324-L370)
+must become a capture error. Wait for a complete valid OUT send
+before delivering adaptive IN data, including when capture is attached
+to a duplex stream. A paired adaptive device where audio OUT supplies
+implicit feedforward still requires proof of the common clock and
+ownership of both audio streams. [USB Audio 3.0 §§3.11.4.2–3 and 4.8.2](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=101), [ALSA outbound sync packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L324-L370)
 
 ## Synchronization and FCP validation checkpoint
 
@@ -562,3 +563,44 @@ The local AAR SHA-256 is
 `8ad2f6ea78adb1c1724e1a815150b5cdf3fcf0fd7d4aa964d1773a33adb45aac`.
 Physical UAC3 and FCP acceptance is pending. The Android host was
 online with the iBasso DC04U detached.
+
+### Direct USB PCM on iBasso DC04U
+
+On November 26, 2026, the Android sample built from `97e614b`
+opened a physical DC04U (`0661:0883`) and played stereo 44.1 kHz PCM
+through Direct USB. At 297,672 delivered frames the sample showed
+`PLAYING`, `Verified`, zero underruns and zero lost frames. It showed
+explicit feedback on endpoint `0x83` with an estimated 44,099.3 Hz,
+and resolved terminal 3 to clock source 1 on AudioControl interface 1.
+The event history recorded the transition from `FEEDBACK_UNLOCKED` to
+`Verified` and showed the stream closed after the stop action. The
+sample was removed and Flick returned to foreground. Hardware volume
+readback after closing the sample was outside the captured evidence.
+
+The tested sample APK SHA-256 was
+`4dd21ec28b10fbe6276a7bff598d16dfab89a598d7cf055068b5db9aeb9184b0`.
+This observation covers the DC04U explicit-feedback PCM path on that
+build. Other devices and newer protocol paths require their own checks.
+
+### Adaptive capture and FCP edits validation
+
+Rust workspace tests, the arm64 Android NDK check, Kotlin unit tests,
+sample build and SDK snippet check passed. The Android AAR exports the
+FCP read, snapshot and apply calls on all four ABIs. Its SHA-256 is
+`1b12574cf4f36c9937643db3149ca79c12080122309a6076c8797fc6ccfc2ae6`.
+The adapter still needs hardware acceptance on an adaptive UAC3
+capture source and a modern Focusrite interface.
+
+### ADC3 clock multipliers
+
+An ADC3 Clock Multiplier exposes its current numerator and denominator
+as two-byte class controls. Retain the verified ratios with the
+selector path. Compose ratios exactly and convert the requested wire
+rate to a representable source rate before testing ranges or
+programming the source. Verify source readback and the derived wire
+rate. Keep multiplier controls read-only for automatic selection.
+Re-read their values before activation and rollback, and report drift
+if either changes. For implicit timing and duplex, compare derived
+rates as well as the shared root clock. Test fixed and fractional
+ratios, nonintegral source rates, range steps, and selector fallback
+across routes with different ratios. [USB Audio 3.0 §§3.13.11.3 and 5.2.1.15](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=128)

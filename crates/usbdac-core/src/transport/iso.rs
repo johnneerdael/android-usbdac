@@ -144,6 +144,11 @@ impl IsoTransferSlot {
         endpoint: u8,
         payload: IsoTransferPayload,
     ) -> Result<(), String> {
+        self.submit_with_timeout(handle, endpoint, payload, ISO_TRANSFER_TIMEOUT_MS)
+    }
+
+    pub(super) fn submit_with_timeout(&mut self, handle: &DeviceHandle<Context>, endpoint: u8,
+        payload: IsoTransferPayload, timeout_ms: u32) -> Result<(), String> {
         if self.in_flight {
             return Err("isochronous transfer slot already has a transfer in flight".to_string());
         }
@@ -179,7 +184,7 @@ impl IsoTransferSlot {
                 payload.packet_sizes.len() as i32,
                 iso_transfer_callback,
                 self.user_data as *mut c_void,
-                ISO_TRANSFER_TIMEOUT_MS,
+                timeout_ms,
             );
 
             for (index, packet_size) in payload.packet_sizes.iter().enumerate() {
@@ -194,6 +199,9 @@ impl IsoTransferSlot {
 
             let submit_result = libusb_submit_transfer(self.transfer.as_ptr());
             if submit_result != 0 {
+                if submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                    return Err("USB DAC disconnected (isochronous submit)".into());
+                }
                 return Err(format!(
                     "libusb_submit_transfer failed with code {}",
                     submit_result

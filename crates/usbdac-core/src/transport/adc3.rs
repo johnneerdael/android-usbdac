@@ -14,7 +14,9 @@ pub(super) struct Adc3Route {
     alt: u8,
     terminal: u8,
     endpoint: (u8, u8, u16, u32),
+    packet_bytes: usize,
     feedback: Option<(u8, u8, usize)>,
+    pub(super) feedforward: Option<FeedforwardEndpoint>,
     implicit: Option<Box<Adc3Route>>,
     companions: Vec<(u8, [u8; 6])>,
     extended_companions: Vec<(u8, [u8; 8])>,
@@ -26,6 +28,29 @@ pub(super) struct Adc3Route {
     domains: Vec<wire::PowerDomain>,
     plan: Option<ClockPlan>,
     clock_context: Option<Adc3ClockContext>,
+}
+/// Full ADC3 adaptive-source explicit host-to-device rate pipe. The rate is
+/// expressed per USB frame/microframe, independently of either pipe's interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FeedforwardEndpoint {
+    pub(super) address: u8,
+    pub(super) interval: u8,
+    pub(super) service_us: u32,
+    pub(super) bytes: usize,
+    pub(super) full_speed: bool,
+}
+impl FeedforwardEndpoint {
+    pub(super) fn nominal(self, rate: u32) -> Result<Vec<u8>, String> {
+        // Match endpoint.c: round the nominal fixed-point rate first; FS
+        // transmits that result shifted from Q16.16 to Q10.14.
+        let (value, maximum) = if self.full_speed {
+            ((((u64::from(rate) << 13) + 62) / 125) >> 2, 0x00ff_ffffu64)
+        } else { (((u64::from(rate) << 10) + 62) / 125, 0x0fff_ffffu64) };
+        if rate == 0 || value == 0 || value > maximum || self.bytes != if self.full_speed { 3 } else { 4 } {
+            return Err("ADC3 feedforward nominal rate cannot be represented".into());
+        }
+        Ok((value as u32).to_le_bytes()[..self.bytes].to_vec())
+    }
 }
 static NEGOTIATED: Lazy<Mutex<Option<Adc3Route>>> = Lazy::new(|| Mutex::new(None));
 pub(super) fn clear_adc3_negotiation() {
@@ -666,6 +691,57 @@ fn adc3_feedback(
     Ok((feedback, companion))
 }
 
+fn adc3_feedforward(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
+    alt: &rusb::InterfaceDescriptor, speed: Speed,
+) -> Result<(FeedforwardEndpoint, Option<[u8; 6]>), String> {
+    if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
+    // Section 4.8.2: exactly one explicit, same-AS OUT Feedback/NoSync pipe.
+    // Reject an implied adaptive playback pairing and any ambiguous inventory.
+    let endpoints: Vec<_> = alt.endpoint_descriptors().collect();
+    let feedback: Vec<_> = endpoints.iter().filter(|e| e.usage_type() == UsageType::Feedback).collect();
+    let [ep] = feedback.as_slice() else { return Err("ADC3 adaptive capture requires unique explicit feedforward OUT".into()); };
+    if endpoints.len() != 2 || ep.direction() != Direction::Out
+        || ep.transfer_type() != TransferType::Isochronous || ep.sync_type() != SyncType::NoSync {
+        return Err("ADC3 adaptive capture feedforward endpoint has invalid direction/type/synchronization".into());
+    }
+    let raw = read_active_configuration_bytes(handle, config).ok_or("ADC3 cannot verify feedforward descriptor")?;
+    let mut selected = false;
+    let mut found = 0;
+    let mut at = 0;
+    while at < raw.len() {
+        let n = usize::from(*raw.get(at).ok_or("ADC3 truncated descriptor")?);
+        if n < 2 || n > raw.len() - at { return Err("ADC3 malformed feedforward descriptor chain".into()); }
+        let d = &raw[at..at+n];
+        if d[1] == 4 {
+            selected = d.len() >= 9 && d[2] == alt.interface_number() && d[3] == alt.setting_number();
+        } else if selected && d[1] == 5 && d.get(2) == Some(&ep.address()) {
+            validate_feedforward_descriptor(d, speed)?;
+            found += 1;
+        }
+        at += n;
+    }
+    if found != 1 { return Err("ADC3 feedforward standard endpoint missing or duplicated".into()); }
+    let (capacity, service, companion) = adc3_endpoint_geometry(ep, speed)?;
+    let bytes = if speed == Speed::Full { 3 } else { 4 };
+    if capacity != bytes || usize::from(ep.max_packet_size()) != bytes {
+        return Err("ADC3 feedforward requires exact three/four-byte unburst capacity".into());
+    }
+    if let Some(d) = companion {
+        if d[2] != 0 || d[3] != 0 { return Err("ADC3 feedforward bursting is unsupported".into()); }
+    }
+    Ok((FeedforwardEndpoint { address: ep.address(), interval: ep.interval(), service_us: service,
+        bytes, full_speed: speed == Speed::Full }, companion))
+}
+fn validate_feedforward_descriptor(d: &[u8], speed: Speed) -> Result<(), String> {
+    let bytes = match speed { Speed::Full => 3, Speed::High | Speed::Super | Speed::SuperPlus => 4,
+        _ => return Err("ADC3 feedforward requires known USB speed".into()) };
+    if d.len() != 7 || d[0] != 7 || d[1] != 5 || d[2] & 0xf0 != 0 || d[2] & 15 == 0
+        || d[3] != 0x11 || u16::from_le_bytes([d[4], d[5]]) != bytes || !(1..=16).contains(&d[6]) {
+        return Err("ADC3 malformed feedforward standard endpoint".into());
+    }
+    Ok(())
+}
+
 fn badd_ss_continuous_geometry(packet: u16, interval: u8, companion: Option<[u8; 6]>) -> Result<(), String> {
     if let Some(d) = companion {
         if interval != 4 || d[2] != 0 || d[3] != 0
@@ -733,6 +809,10 @@ fn adc3_alternate_overlay(
     if !adc3_sync_supported(profile, capture, ep.sync_type()) {
         return Err("ADC3 synchronization unsupported".into());
     }
+    let (feedforward, feedforward_companion) = if capture && ep.sync_type() == SyncType::Adaptive {
+        let (pipe, companion) = adc3_feedforward(config, handle, alt, speed)?;
+        (Some(pipe), companion)
+    } else { (None, None) };
     let mut route = Adc3Route {
         config: config.number(),
         control,
@@ -748,10 +828,13 @@ fn adc3_alternate_overlay(
             ep.max_packet_size(),
             service_interval_micros(speed, ep.interval()),
         ),
+        packet_bytes,
         feedback: feedback.map(|f| (f.address, f.interval, f.max_packet_bytes)),
+        feedforward,
         implicit: None,
         companions: data_companion.map(|d| (ep.address(), d)).into_iter()
             .chain(feedback_companion.zip(feedback).map(|(d, f)| (f.address, d)))
+            .chain(feedforward_companion.zip(feedforward).map(|(d, f)| (f.address, d)))
             .collect(),
         extended_companions: data_companion.filter(|d| d[3] & 0x80 != 0)
             .map(|_| (ep.address(), ep.extra().unwrap()[6..14].try_into().unwrap()))
@@ -1002,10 +1085,10 @@ pub(super) fn adc3_feedback_interfaces(config: &ConfigDescriptor, handle: &Devic
 }
 
 /// ADC3 section 3.11.4.1 permits nominal SOF pacing for an Adaptive sink.
-/// Adaptive sources need a feedforward OUT protocol which this worker does not implement.
-fn adc3_sync_supported(profile: wire::FunctionProfile, capture: bool, sync: SyncType) -> bool {
+/// Full adaptive sources additionally require the explicit feedforward proof above.
+fn adc3_sync_supported(profile: wire::FunctionProfile, _capture: bool, sync: SyncType) -> bool {
     matches!(sync, SyncType::Asynchronous | SyncType::Synchronous)
-        || (!capture && profile == wire::FunctionProfile::Full && sync == SyncType::Adaptive)
+        || (profile == wire::FunctionProfile::Full && sync == SyncType::Adaptive)
 }
 
 fn adc3_shared_clock(output: &Adc3Route, input: &Adc3Route) -> bool {
@@ -1220,7 +1303,7 @@ pub(super) fn adc3_capture_candidates(
             } else {
                 rate == 48_000
             };
-            if supports
+            if supports && route.feedforward.map_or(true, |pipe| pipe.nominal(rate).is_ok())
                 && candidate.max_packet_bytes
                     >= required_max_packet_bytes(
                         rate,
@@ -1367,7 +1450,30 @@ pub(super) fn configure_adc3(
     route: &Adc3Route,
     rate: u32,
 ) -> Result<(), String> {
+    validate_adaptive_capture_rate(route, rate)?;
     validate_adc3_clock(handle, route, rate, true)
+}
+
+fn validate_adaptive_capture_rate(route: &Adc3Route, rate: u32) -> Result<(), String> {
+    if let Some(pipe) = route.feedforward {
+        if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
+        validate_feedforward_capacity(pipe, rate, route.packet_bytes, route.endpoint.3,
+            usize::from(route.pcm.0) * usize::from(route.pcm.1))?;
+    }
+    Ok(())
+}
+fn validate_feedforward_capacity(pipe: FeedforwardEndpoint, rate: u32, capacity: usize,
+    service_us: u32, stride: usize) -> Result<(), String> {
+    pipe.nominal(rate)?;
+    if capacity < required_max_packet_bytes(rate, service_us, stride) {
+        return Err("ADC3 adaptive capture rate exceeds data endpoint capacity".into());
+    }
+    Ok(())
+}
+pub(super) fn verify_adc3_capture_activation(handle: &DeviceHandle<Context>, route: &Adc3Route,
+    rate: u32) -> Result<(), String> {
+    validate_adaptive_capture_rate(route, rate)?;
+    validate_adc3_clock(handle, route, rate, false)
 }
 
 fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: u32,
@@ -2157,11 +2263,60 @@ mod tests {
         source
     }
     #[test]
+    fn adaptive_capture_nominal_rate_uses_bus_units_and_source_rounding() {
+        let fs = FeedforwardEndpoint { address: 2, interval: 1, service_us: 1000, bytes: 3, full_speed: true };
+        assert_eq!(fs.nominal(48_000).unwrap(), vec![0, 0, 12]);
+        assert_eq!(fs.nominal(44_100).unwrap(), vec![0x66, 0x06, 0x0b]);
+        assert_eq!(fs.nominal(2).unwrap(), vec![32, 0, 0]);
+        let hs = FeedforwardEndpoint { bytes: 4, full_speed: false, service_us: 125, ..fs };
+        assert_eq!(hs.nominal(48_000).unwrap(), vec![0, 0, 6, 0]);
+        assert_eq!(hs.nominal(44_100).unwrap(), vec![0x33, 0x83, 5, 0]);
+        for interval in [1, 4, 16] {
+            assert_eq!(FeedforwardEndpoint { interval, service_us: 125 << (interval - 1), ..hs }.nominal(44_100), hs.nominal(44_100));
+        }
+        assert!(fs.nominal(0).is_err());
+        assert!(fs.nominal(u32::MAX).is_err());
+        assert!(hs.nominal(u32::MAX).is_err());
+        assert!(hs.nominal(32_767_999).is_ok());
+        assert!(hs.nominal(32_768_000).is_err());
+        assert!(FeedforwardEndpoint { bytes: 4, ..fs }.nominal(48_000).is_err());
+    }
+    #[test]
+    fn adaptive_capture_preserves_extended_in_capacity_for_rate_checks() {
+        let pipe = FeedforwardEndpoint { address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false };
+        // The SSP companion's ordinary wBytesPerInterval is the sentinel 1.
+        let extra = [6, 0x30, 0, 0x80, 1, 0, 8, 0x31, 0, 0, 0, 0x10, 0, 0];
+        let (capacity, service, _) = ss_periodic_geometry(1024, 4, &extra, true).unwrap();
+        assert_eq!(capacity, 4096);
+        assert!(validate_feedforward_capacity(pipe, 192_000, capacity, service, 8).is_ok());
+        assert!(validate_feedforward_capacity(pipe, 192_000, 1, service, 8).is_err());
+        assert!(validate_feedforward_capacity(pipe, 32_768_000, usize::MAX, service, 8).is_err());
+    }
+
+    #[test]
+    fn adaptive_capture_feedforward_standard_endpoint_is_strict() {
+        let valid = [7, 5, 2, 0x11, 3, 0, 1];
+        assert!(validate_feedforward_descriptor(&valid, Speed::Full).is_ok());
+        for (offset, value) in [(0, 9), (1, 0x25), (2, 0), (2, 0x82), (2, 0x12),
+            (3, 1), (3, 0x15), (3, 0x31), (3, 0x91), (4, 4), (5, 8), (6, 0), (6, 17)] {
+            let mut bad = valid; bad[offset] = value;
+            assert!(validate_feedforward_descriptor(&bad, Speed::Full).is_err(), "{bad:?}");
+        }
+        assert!(validate_feedforward_descriptor(&valid[..6], Speed::Full).is_err());
+        assert!(validate_feedforward_descriptor(&valid, Speed::High).is_err());
+        let high = [7, 5, 2, 0x11, 4, 0, 4];
+        for speed in [Speed::High, Speed::Super, Speed::SuperPlus] {
+            assert!(validate_feedforward_descriptor(&high, speed).is_ok());
+        }
+        assert!(validate_feedforward_descriptor(&high, Speed::Unknown).is_err());
+    }
+
+    #[test]
     fn full_adc3_adaptive_sink_uses_nominal_pacing_but_source_requires_feedforward() {
         let full = wire::FunctionProfile::Full;
         assert!(adc3_sync_supported(full, false, SyncType::Adaptive));
         assert_eq!(admitted_pacing(SyncType::Adaptive, None), crate::capabilities::Pacing::Adaptive);
-        assert!(!adc3_sync_supported(full, true, SyncType::Adaptive));
+        assert!(adc3_sync_supported(full, true, SyncType::Adaptive));
         assert!(!adc3_sync_supported(full, false, SyncType::NoSync));
         let badd = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
         assert!(!adc3_sync_supported(badd, false, SyncType::Adaptive));
@@ -2511,7 +2666,9 @@ mod tests {
             alt: 1,
             terminal: 1,
             endpoint: (1, 4, 196, 1000),
+            packet_bytes: 196,
             feedback: Some((0x81, 4, 4)),
+            feedforward: None,
             implicit: None,
             companions: vec![],
             extended_companions: vec![],

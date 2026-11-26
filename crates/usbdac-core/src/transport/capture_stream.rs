@@ -637,6 +637,9 @@ pub(super) fn configure_capture_endpoint(
                 "ADC3 capture route changed during activation".into(),
             ));
         }
+        if actual.feedforward.is_some() {
+            adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate).map_err(Error::Control)?;
+        }
     } else {
         let config = claimed
             .handle
@@ -1034,6 +1037,17 @@ pub(super) fn ingest_slot(slot: &IsoTransferSlot, status: i32, buffer: &mut Capt
     if detached { Err(Error::DeviceLost) } else { result }
 }
 
+/// Keep retiring/rearming IN during feedforward startup without presenting
+/// audio produced before the host's nominal rate has a verified OUT send.
+pub(super) fn discard_unprimed_capture(slot: &IsoTransferSlot, status: i32,
+    scratch: &mut [CapturePacket], frame_bytes: usize) -> Result<(), Error> {
+    let (data, detached) = inspect_slot(slot, status, scratch)?;
+    if detached { return Err(Error::DeviceLost); }
+    crate::capture::CaptureStats::default().record_completion(data.len(), &slot.packet_sizes,
+        scratch, true, 0, frame_bytes)
+        .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")))
+}
+
 fn oldest_ready_capture(order: &VecDeque<usize>, slots: &[IsoTransferSlot]) -> Option<usize> {
     order
         .front()
@@ -1062,6 +1076,100 @@ pub(super) fn capture_queue_bytes(packet_bytes: usize, geometry: IsoQueueGeometr
         return Err(invalid());
     }
     Ok(per_transfer)
+}
+
+/// Two bounded periodic OUT URBs share the data IN worker's event owner and
+/// callback retirement. No second event thread or playback clock is involved.
+pub(super) struct FeedforwardPool {
+    pub(super) slots: Vec<IsoTransferSlot>,
+    pipe: adc3::FeedforwardEndpoint,
+    payload: Vec<u8>,
+    packets: usize,
+    scratch: Vec<CapturePacket>,
+    first_valid_send: Option<Instant>,
+    deadline: Duration,
+}
+impl FeedforwardPool {
+    pub(super) fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
+        let Some(pipe) = endpoint.adc3_route.as_ref().and_then(|r| r.feedforward) else { return Ok(None); };
+        let nominal = pipe.nominal(endpoint.format.sample_rate())?;
+        // Target 8 ms per URB, capped at 32 packets; one packet for sparse polling.
+        // bInterval schedules the transfers; it never rescales the rate value.
+        let packets = 8_000usize.div_ceil(pipe.service_us as usize)
+            .clamp(1, crate::iso_packet_scheduler::MAX_PACKETS_PER_TRANSFER);
+        let payload: Vec<_> = nominal.into_iter().cycle().take(packets * pipe.bytes).collect();
+        let mut slots = Vec::with_capacity(2);
+        for index in 0..2 { slots.push(IsoTransferSlot::new(index, packets, payload.len())?); }
+        Ok(Some(Self { slots, pipe, payload, packets,
+            scratch: vec![CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; packets],
+            first_valid_send: None,
+            deadline: Duration::from_millis(100).max(Duration::from_micros(u64::from(pipe.service_us) * packets as u64 * 4)),
+        }))
+    }
+    fn submit(&mut self, index: usize, handle: &DeviceHandle<Context>) -> Result<(), Error> {
+        self.slots[index].submit_with_timeout(handle, self.pipe.address, IsoTransferPayload {
+            packet_sizes: vec![self.pipe.bytes; self.packets], packet_samples: vec![],
+            transfer_buffer: self.payload.clone(), underrun: false, held: false,
+            frame_count: 0, music_frames: 0, epoch: 0,
+        }, self.deadline.as_millis().min(u128::from(u32::MAX)) as u32).map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost }
+            else { Error::Transfer(format!("ADC3 capture feedforward submission: {e}")) })
+    }
+    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+        for index in 0..self.slots.len() {
+            if usb_stop_requested(stop) { break; }
+            self.submit(index, handle)?;
+        }
+        Ok(())
+    }
+    pub(super) fn primed(&self) -> bool { self.first_valid_send.is_some() }
+    pub(super) fn accepts_capture(&self, completed: Instant) -> bool {
+        self.first_valid_send.is_some_and(|first| completed >= first)
+    }
+    pub(super) fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+        if usb_stop_requested(stop) { return Ok(()); }
+        for index in 0..self.slots.len() {
+            if let Some((status, completed, _)) = self.slots[index].take_completion() {
+                let result = validate_feedforward_slot(&self.slots[index], status, completed,
+                    self.deadline, self.pipe.bytes, &self.payload, &mut self.scratch);
+                self.slots[index].mark_completed();
+                result?;
+                self.first_valid_send = Some(self.first_valid_send.map_or(completed, |first| first.min(completed)));
+                self.submit(index, handle)?;
+            } else if self.slots[index].in_flight && self.slots[index].submitted_at
+                .is_some_and(|start| start.elapsed() >= self.deadline) {
+                return Err(Error::Transfer("ADC3 capture feedforward deadline missed".into()));
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn cancel(&mut self) { for slot in &mut self.slots { slot.cancel(); } }
+    pub(super) fn drain(&mut self, context: &Context) {
+        self.cancel();
+        drain_iso_transfer_slots(context, &mut self.slots);
+    }
+}
+impl Drop for FeedforwardPool {
+    fn drop(&mut self) { self.cancel(); }
+}
+fn validate_feedforward_slot(slot: &IsoTransferSlot, status: i32, completed: Instant,
+    deadline: Duration, bytes: usize, payload: &[u8], scratch: &mut [CapturePacket]) -> Result<(), Error> {
+    let (data, detached) = inspect_slot(slot, status, scratch).map_err(|error| match error {
+        Error::DeviceLost => Error::DeviceLost,
+        other => Error::Transfer(format!("ADC3 capture feedforward completion: {other}")),
+    })?;
+    if detached { return Err(Error::DeviceLost); }
+    if !slot.submitted_at.is_some_and(|start| completed.saturating_duration_since(start) < deadline) {
+        return Err(Error::Transfer("ADC3 capture feedforward deadline missed".into()));
+    }
+    validate_feedforward_packets(bytes, scratch)?;
+    if data != payload { return Err(Error::Transfer("ADC3 capture feedforward payload changed".into())); }
+    Ok(())
+}
+fn validate_feedforward_packets(bytes: usize, packets: &[CapturePacket]) -> Result<(), Error> {
+    if packets.is_empty() || packets.iter().any(|p| !p.succeeded || p.requested_bytes != bytes || p.actual_bytes != bytes) {
+        return Err(Error::Transfer("ADC3 capture feedforward short or failed isochronous packet".into()));
+    }
+    Ok(())
 }
 
 fn run_capture(
@@ -1094,6 +1202,8 @@ fn run_capture(
             .map_err(Error::Transfer)?,
         );
     }
+    let mut feedforward = FeedforwardPool::for_endpoint(endpoint).map_err(Error::Transfer)?;
+    if let Some(pool) = feedforward.as_mut() { pool.start(&owner.claimed().handle, stop)?; }
     for (index, slot) in slots.iter_mut().enumerate() {
         if usb_stop_requested(stop) {
             return Ok(());
@@ -1112,7 +1222,8 @@ fn run_capture(
         })?;
         order.push_back(index);
     }
-    let _ = ready.send(Ok(()));
+    let mut announced = false;
+    if feedforward.is_none() { let _ = ready.send(Ok(())); announced = true; }
     while !usb_stop_requested(stop) {
         owner
             .claimed()
@@ -1125,6 +1236,10 @@ fn run_capture(
                     Error::Transfer(format!("capture event pump: {e}"))
                 }
             })?;
+        if let Some(pool) = feedforward.as_mut() {
+            pool.pump(&owner.claimed().handle, stop)?;
+            if pool.primed() && !announced { let _ = ready.send(Ok(())); announced = true; }
+        }
         if let Some(&head) = order.front() {
             if !slots[head].completion_ready() {
                 for &index in order.iter().skip(1) {
@@ -1141,7 +1256,7 @@ fn run_capture(
             if usb_stop_requested(stop) {
                 break;
             }
-            let Some((status, _, _)) = slots[index].take_completion() else {
+            let Some((status, completed, _)) = slots[index].take_completion() else {
                 break;
             };
             order.pop_front();
@@ -1151,7 +1266,11 @@ fn run_capture(
                 slots[index].mark_completed();
                 break;
             }
-            let result = ingest_slot(&slots[index], status, &mut queue, &mut scratch);
+            let result = if feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed)) {
+                ingest_slot(&slots[index], status, &mut queue, &mut scratch)
+            } else {
+                discard_unprimed_capture(&slots[index], status, &mut scratch, endpoint.format.bytes_per_frame())
+            };
             drop(queue);
             slots[index].mark_completed();
             result?;
@@ -1178,6 +1297,7 @@ fn run_capture(
     for slot in &mut slots {
         slot.cancel();
     }
+    if let Some(pool) = feedforward.as_mut() { pool.drain(&owner.claimed().context); }
     Ok(())
 }
 
@@ -1216,6 +1336,18 @@ mod tests {
         let length = raw.len() as u16;
         raw[2..4].copy_from_slice(&length.to_le_bytes());
         raw
+    }
+
+    #[test]
+    fn feedforward_sends_require_every_exact_packet_and_reject_detach_geometry() {
+        let valid = CapturePacket { requested_bytes: 4, actual_bytes: 4, succeeded: true };
+        assert!(validate_feedforward_packets(4, &[valid, valid]).is_ok());
+        assert!(validate_feedforward_packets(4, &[]).is_err());
+        for packet in [CapturePacket { actual_bytes: 0, ..valid },
+            CapturePacket { actual_bytes: 3, ..valid }, CapturePacket { actual_bytes: 5, ..valid },
+            CapturePacket { requested_bytes: 3, ..valid }, CapturePacket { succeeded: false, ..valid }] {
+            assert!(validate_feedforward_packets(4, &[valid, packet]).is_err());
+        }
     }
 
     #[test]
@@ -1305,6 +1437,30 @@ mod tests {
             let user_data = &*slot.user_data;
             *user_data.completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
         }
+    }
+
+    #[test]
+    fn feedforward_completion_rejects_stall_detach_short_and_late_reports() {
+        let payload = [0, 0, 6, 0];
+        let mut slot = completed_slot(0, &payload);
+        let start = Instant::now();
+        slot.submitted_at = Some(start);
+        let deadline = Duration::from_millis(100);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start + deadline / 2,
+            deadline, 4, &payload, &mut scratch).is_ok());
+        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start + deadline,
+            deadline, 4, &payload, &mut scratch).is_err());
+        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_STALL, start,
+            deadline, 4, &payload, &mut scratch).is_err());
+        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_NO_DEVICE, start,
+            deadline, 4, &payload, &mut scratch), Err(Error::DeviceLost));
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
+        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+            deadline, 4, &payload, &mut scratch).is_err());
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
+        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+            deadline, 4, &payload, &mut scratch), Err(Error::DeviceLost));
     }
 
     #[test]

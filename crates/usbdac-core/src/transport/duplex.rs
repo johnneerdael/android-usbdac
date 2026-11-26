@@ -46,6 +46,10 @@ fn validate_alternates(playback: &IsoStreamCandidate, input: &CaptureEndpoint) -
     if playback.interface_number == input.interface && playback.alt_setting != input.alternate {
         return Err(Error::Unsupported { reason: "duplex alternates conflict on one interface".into(), offered: vec![] });
     }
+    if input.adc3_route.as_ref().and_then(|route| route.feedforward)
+        .is_some_and(|pipe| pipe.address == playback.endpoint_address) {
+        return Err(Error::Unsupported { reason: "duplex playback overlaps capture feedforward OUT ownership".into(), offered: vec![] });
+    }
     if playback.endpoint_address == input.address {
         return Err(Error::Unsupported { reason: "duplex endpoint directions overlap".into(), offered: vec![] });
     }
@@ -245,6 +249,7 @@ pub(super) fn cleanup_claimed(claimed: ClaimedHandle, attachment: Option<&Arc<At
 
 pub(super) struct InputPool {
     pub(super) slots: Vec<IsoTransferSlot>,
+    feedforward: Option<capture_stream::FeedforwardPool>,
     attachment: Arc<Attachment>,
     order: VecDeque<usize>,
     reordered: Vec<bool>,
@@ -260,19 +265,33 @@ impl InputPool {
         for index in 0..geometry.transfer_slots {
             slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)?);
         }
-        Ok(Self { slots, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
+        let feedforward = capture_stream::FeedforwardPool::for_endpoint(&attachment.endpoint)?;
+        Ok(Self { slots, feedforward, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots], scratch: vec![CapturePacket {
                 requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
     }
-    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), String> {
+    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+        if let Some(pool) = self.feedforward.as_mut() { pool.start(handle, stop)?; }
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if usb_stop_requested(stop) { break; }
-            slot.submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes)?;
+            slot.submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes)
+                .map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost } else { Error::Transfer(e) })?;
             self.order.push_back(index);
         }
         Ok(())
     }
+    pub(super) fn primed(&self) -> bool { self.feedforward.as_ref().map_or(true, |pool| pool.primed()) }
+    pub(super) fn cancel(&mut self) {
+        for slot in &mut self.slots { slot.cancel(); }
+        if let Some(pool) = self.feedforward.as_mut() { pool.cancel(); }
+    }
+    pub(super) fn drain(&mut self, context: &Context) {
+        self.cancel();
+        drain_iso_transfer_slots(context, &mut self.slots);
+        if let Some(pool) = self.feedforward.as_mut() { pool.drain(context); }
+    }
     pub(super) fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+        if let Some(pool) = self.feedforward.as_mut() { pool.pump(handle, stop)?; }
         if let Some(&head) = self.order.front() {
             for &index in self.order.iter().skip(1) {
                 if !self.slots[head].completion_ready() && self.slots[index].completion_ready() && !self.reordered[index] {
@@ -282,9 +301,14 @@ impl InputPool {
         }
         while let Some(&index) = self.order.front() {
             if usb_stop_requested(stop) { break; }
-            let Some((status, _, _)) = self.slots[index].take_completion() else { break; };
+            let Some((status, completed, _)) = self.slots[index].take_completion() else { break; };
             self.order.pop_front(); self.reordered[index] = false;
-            let result = self.attachment.ingest(&self.slots[index], status, &mut self.scratch);
+            let result = if self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed)) {
+                self.attachment.ingest(&self.slots[index], status, &mut self.scratch)
+            } else {
+                capture_stream::discard_unprimed_capture(&self.slots[index], status, &mut self.scratch,
+                    self.attachment.endpoint.format.bytes_per_frame())
+            };
             self.slots[index].mark_completed();
             result?;
             if !usb_stop_requested(stop) {
@@ -295,6 +319,10 @@ impl InputPool {
         }
         Ok(())
     }
+}
+
+impl Drop for InputPool {
+    fn drop(&mut self) { self.cancel(); }
 }
 
 #[cfg(test)]
