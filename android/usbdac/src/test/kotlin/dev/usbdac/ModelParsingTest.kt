@@ -58,6 +58,17 @@ class ModelParsingTest {
     }
 
     @Test
+    fun dopOnlyAlternateKeepsItsOwnEncodingAndWireStride() {
+        val json = JSONObject(Fixtures.CAPABILITIES)
+        json.getJSONArray("alt_settings").getJSONObject(0)
+            .put("format", "dop").put("subslot_bytes", 3).put("valid_bits", 24)
+        val alt = parseCapabilities(json.toString()).altSettings.single()
+        assertEquals(AltFormat.DOP, alt.format)
+        assertEquals(3, alt.subslotBytes)
+        assertEquals(24, alt.validBits)
+    }
+
+    @Test
     fun nullsInCapabilitiesBecomeNulls() {
         val capabilities = parseCapabilities(Fixtures.CAPABILITIES_NO_VOLUME)
         assertNull(capabilities.volume)

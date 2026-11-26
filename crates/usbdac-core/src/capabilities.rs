@@ -159,6 +159,8 @@ pub enum EndpointUsage {
 pub enum AltFormat {
     /// Linear PCM (also the carrier for DoP).
     Pcm,
+    /// DoP only, using a source-backed carrier even without advertised PCM.
+    Dop,
     /// Native DSD (format tag DSD).
     Dsd,
     /// Anything else (float, PCM8, ...); never selected.

@@ -5,8 +5,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Explicit opt-in to claim the exact native-proven vendor interface on the same USB connection. */
-public enum class VendorRouting { SCARLETT_18I20_GEN2 }
-public enum class ScarlettModel { SCARLETT_18I20_GEN2 }
+public enum class VendorRouting { SCARLETT_18I20_GEN2, VOCASTER_ONE, VOCASTER_TWO, SCARLETT_SOLO_GEN4, SCARLETT_2I2_GEN4, SCARLETT_4I4_GEN4 }
+public enum class ScarlettModel { SCARLETT_18I20_GEN2, VOCASTER_ONE, VOCASTER_TWO, SCARLETT_SOLO_GEN4, SCARLETT_2I2_GEN4, SCARLETT_4I4_GEN4 }
 public data class ScarlettCapability(val model: ScarlettModel, val name: String, val configurationId: Int,
     val interfaceId: Int, val notificationEndpoint: Int, val interfaceClaimed: Boolean)
 public enum class ScarlettPortKind { OFF, ANALOGUE, SPDIF, ADAT, MIX, PCM }
@@ -92,8 +92,8 @@ public class ScarlettRouting internal constructor(private val dac: Long, private
     /** Keep the complete fresh expected row; untouched raw coefficients are preserved exactly. */
     public fun applyMix(expected: ScarlettMixRow, gains: List<ScarlettGainEdit>): ScarlettMixReport {
         checkOpen()
-        require(expected.output in 1..10 && expected.coefficients.size == 18 && expected.coefficients.all { it in 0..65535 })
-        require(gains.size in 1..18 && gains.map { it.input }.distinct().size == gains.size)
+        require(expected.output in 1..10 && expected.coefficients.size in 1..18 && expected.coefficients.all { it in 0..65535 })
+        require(gains.size in 1..expected.coefficients.size && gains.map { it.input }.distinct().size == gains.size)
         val edit = JSONObject().put("expected", JSONObject().put("output", expected.output).put("coefficients", JSONArray(expected.coefficients)))
             .put("gains", JSONArray(gains.map { JSONObject().put("input", it.input).put("half_db", it.halfDb) }))
         val v = response { Native.scarlettMixApply(dac, edit.toString()) }

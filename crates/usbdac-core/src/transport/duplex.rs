@@ -90,7 +90,7 @@ fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
 pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, request: &CaptureRequest, capacity: usize) -> Result<Arc<Attachment>, Error> {
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
-    let mut endpoints = capture_stream::owned_capture_candidates(claimed, &config, request.sample_rate).map_err(Error::Claim)?;
+    let mut endpoints = capture_stream::owned_capture_candidates(claimed, &config, request.sample_rate, true).map_err(Error::Claim)?;
     endpoints.retain(|endpoint| endpoint.format.satisfies(request)
         && claimed.claimed_interfaces.contains(&endpoint.interface)
         && claimed.claimed_interfaces.contains(&endpoint.control));
@@ -99,6 +99,11 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     for endpoint in endpoints {
         let pair = (|| {
             let shared = validate_alternates(playback, &endpoint)?;
+            if !shared {
+                let geometry = IsoQueueGeometry::for_stream(endpoint.service_us,
+                    settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+                capture_stream::capture_queue_bytes(endpoint.packet_bytes, geometry)?;
+            }
             validate_clocks(claimed, playback, expected, &endpoint)?;
             let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
                 .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
@@ -178,17 +183,32 @@ impl Attachment {
     }
     pub(super) fn failure(&self) -> Option<Error> { self.error.lock().clone() }
     pub(super) fn retirement_guard(&self) -> Retirement { Retirement(self.retired.clone()) }
-    fn restore_rate(&self, claimed: &ClaimedHandle) {
-        let Some((clock, rate)) = self.original_rate.lock().take() else { return; };
+    fn restore_rate(&self, claimed: &ClaimedHandle) -> bool {
+        let Some((clock, rate)) = self.original_rate.lock().take() else { return true; };
         // Only a distinct source can have a saved rate. Retire callbacks and
         // reset its alternate before restoring that source, while still awake.
         let result = claimed.set_alternate_setting(self.endpoint.interface, 0)
-            .and_then(|()| set_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id, rate))
+            .and_then(|()| {
+                if self.endpoint.adc3_route.is_some() { claimed.adc3_power.verify_idle(self.endpoint.interface)?; }
+                let current = get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id)?;
+                if current == rate { return Ok(()); }
+                if current != self.endpoint.format.sample_rate() {
+                    return Err("capture source drifted; preserving external frequency".into());
+                }
+                set_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id, rate)
+            })
             .and_then(|()| {
                 if get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id)? == rate { Ok(()) }
                 else { Err("duplex capture clock rollback did not verify".into()) }
             });
-        if let Err(error) = result { set_last_error(Some(format!("capture clock rollback failed: {error}"))); }
+        if let Err(error) = result {
+            // Keep the owning ADC3 function awake when a distinct capture
+            // source could not be handed back after callback retirement.
+            claimed.adc3_power.disarm();
+            set_last_error(Some(format!("capture clock rollback failed: {error}")));
+            return false;
+        }
+        true
     }
     pub(super) fn reordered(&self) {
         self.deferred.record(crate::capture::CaptureStats {
@@ -218,8 +238,9 @@ impl Drop for Retirement {
 
 pub(super) fn cleanup_claimed(claimed: ClaimedHandle, attachment: Option<&Arc<Attachment>>,
     active_interface: Option<u8>, keep_locked: bool) -> bool {
-    if let Some(attachment) = attachment { attachment.restore_rate(&claimed); }
-    cleanup_claimed_handle(claimed, active_interface, keep_locked)
+    let capture_restored = attachment.is_none_or(|attachment| attachment.restore_rate(&claimed));
+    let owner_restored = cleanup_claimed_handle(claimed, active_interface, keep_locked && capture_restored);
+    capture_restored && owner_restored
 }
 
 pub(super) struct InputPool {
@@ -233,10 +254,11 @@ impl InputPool {
     pub(super) fn new(attachment: Arc<Attachment>) -> Result<Self, String> {
         let geometry = IsoQueueGeometry::for_stream(attachment.endpoint.service_us,
             settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+        let transfer_bytes = capture_stream::capture_queue_bytes(attachment.endpoint.packet_bytes, geometry)
+            .map_err(|error| error.message())?;
         let mut slots = Vec::with_capacity(geometry.transfer_slots);
         for index in 0..geometry.transfer_slots {
-            slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer,
-                attachment.endpoint.packet_bytes * geometry.packets_per_transfer)?);
+            slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)?);
         }
         Ok(Self { slots, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots], scratch: vec![CapturePacket {

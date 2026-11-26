@@ -706,7 +706,12 @@ pub struct BaddFormat {
 /// Interpret a nonzero Continuous Mode alternate with the exact 1 ms capacity
 /// table (BADD section 4.2 and Table 8-26). The caller must separately prove the
 /// function's mandatory alternates and common direction/synchronization contract.
-/// Bursting intervals must not reuse this table. SuperSpeed interpretation here
+/// Bursting intervals must not reuse this table: BADD section 8 explicitly
+/// derives sample width/channels from Alternate Setting 1 only. Section 4.2.2
+/// permits burst alternates but defines no interval-scaled replacement table;
+/// packet padding and synchronization headroom cannot prove an arbitrary burst
+/// alternate's format. Retain the exact continuous alternates instead.
+/// SuperSpeed interpretation here
 /// is profile geometry only; runtime admission also requires companion validation.
 pub fn infer_badd_format(
     profile: BaddProfile,

@@ -273,14 +273,17 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
             .collect();
         sampling_frequency_ranges_support_rate(&ranges, rate)
     };
-    let dop_max_carrier = pcm
+    let dop_max_carrier = alts
         .iter()
+        .filter(|alt| matches!(alt.format, AltFormat::Pcm | AltFormat::Dop))
         .filter(|alt| alt.valid_bits >= 24)
         .flat_map(|alt| {
             DOP_CARRIER_RATES
                 .iter()
                 .copied()
-                .filter(move |rate| supports(alt, *rate))
+                .filter(move |rate| supports(alt, *rate)
+                    && (alt.format != AltFormat::Dop || playback_designs_dop_capacity(
+                        alt.max_packet_bytes, alt.service_interval_us, *rate)))
         })
         .max();
     let mut native_dsd_bit_rates: Vec<u32> = dsd

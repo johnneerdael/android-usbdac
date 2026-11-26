@@ -11,6 +11,9 @@ public enum class AltFormat {
     /** Linear PCM. */
     PCM,
 
+    /** DoP carrier without independently advertised linear PCM. */
+    DOP,
+
     /** Native DSD (raw DSD bytes in a PCM-sized subslot). */
     DSD,
 

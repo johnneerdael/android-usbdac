@@ -518,6 +518,7 @@ pub(super) fn build_usb_capability_model(
                 continue;
             };
             stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
+            let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             let sample_rate_ranges = stream_rate_cache
                 .entry((descriptor.interface_number(), stream_format.terminal_link))
                 .or_insert_with(|| {
@@ -648,6 +649,26 @@ pub(super) fn build_usb_capability_model(
                     native.valid_bits = 1;
                     alt_settings.push(native);
                 }
+                if playback_designs_dop {
+                    // This exact alternate is excluded by the native resolver.
+                    let mut dop = alt_settings.last().unwrap().clone();
+                    dop.format = AltFormat::Dop;
+                    dop.subslot_bytes = 3;
+                    dop.valid_bits = 24;
+                    // Preserve the descriptor's rates but cap the projected wire
+                    // carrier by whole stereo frames per USB service interval.
+                    let ceiling = ((max_packet_bytes / 6) as u64 * 1_000_000
+                        / u64::from(service_interval_us.max(1))).min(u64::from(u32::MAX)) as u32;
+                    dop.rate_ranges.retain_mut(|range| {
+                        range.max_hz = range.max_hz.min(ceiling);
+                        range.min_hz <= range.max_hz
+                    });
+                    dop.sample_rates.retain(|rate|
+                        playback_designs_dop_capacity(max_packet_bytes, service_interval_us, *rate));
+                    if !dop.rate_ranges.is_empty() || !dop.sample_rates.is_empty() {
+                        alt_settings.push(dop);
+                    }
+                }
                 // Non-PCM masks stay visible as Other, but never masquerade as
                 // linear PCM or native DSD without a resolved profile.
             }
@@ -728,6 +749,8 @@ pub(super) fn select_stream_candidate(
                 None => continue,
             };
             stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
+            let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
+            apply_playback_designs_dop(&mut stream_format, playback_format, playback_designs_dop);
             if playback_format.dsd_transport == DsdTransportMode::Native {
                 let Some(profile) = stream_format.native_dsd else { continue; };
                 stream_format.subslot_size = profile.word_bytes;

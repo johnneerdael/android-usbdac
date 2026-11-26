@@ -439,7 +439,7 @@ public object UsbDac {
         val proof = JSONObject(nativeCall { Native.scarlettPreflight(fd, info) }).optJSONObject("capability")
             ?: throw DacException(DacErrorCode.UNSUPPORTED, "no exact native-proven Scarlett vendor interface")
         val capability = parseScarlettCapability(proof)
-        if (capability.configurationId != configurationId || capability.model != ScarlettModel.SCARLETT_18I20_GEN2 ||
+        if (capability.configurationId != configurationId || capability.model.name != optIn.name ||
             interfaces.none { it.id == capability.interfaceId && it.alternateSetting == 0 && it.interfaceClass == 255 }) {
             throw DacException(DacErrorCode.CLAIM, "Scarlett preflight differs from the selected Android configuration")
         }

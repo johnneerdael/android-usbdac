@@ -351,6 +351,7 @@ pub(super) fn owned_capture_candidates(
     claimed: &ClaimedHandle,
     config: &ConfigDescriptor,
     rate: u32,
+    planned_clock: bool,
 ) -> Result<Vec<CaptureEndpoint>, String> {
     let raw = read_active_configuration_bytes(&claimed.handle, config)
         .ok_or("cannot read active capture configuration")?;
@@ -361,7 +362,7 @@ pub(super) fn owned_capture_candidates(
     } else {
         capture_candidates(&raw, config.number(), speed, rate)?
     };
-    for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate)? {
+    for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)? {
         let format = CaptureFormat::pcm(
             rate,
             candidate.bit_resolution,
@@ -521,6 +522,7 @@ pub(crate) fn capture_claim_preflight(
 struct CaptureUsbOwner {
     claimed: Option<ClaimedHandle>,
     keep_locked: bool,
+    clock_route: Option<clock::CaptureClockRoute>,
 }
 impl CaptureUsbOwner {
     fn claimed(&self) -> &ClaimedHandle {
@@ -530,7 +532,24 @@ impl CaptureUsbOwner {
 impl Drop for CaptureUsbOwner {
     fn drop(&mut self) {
         if let Some(claimed) = self.claimed.take() {
-            cleanup_claimed_handle(claimed, None, self.keep_locked);
+            // The worker's transfer pools have retired before this owner drops.
+            // Hand the local clock back at alt zero, before cleanup releases any
+            // ADC3 power leases or returns the handle to the idle lock.
+            let mut keep_locked = self.keep_locked;
+            if let Some(route) = self.clock_route.take() {
+                let active = claimed.active_interfaces.lock().clone();
+                let idle = active.into_iter().try_for_each(|interface| {
+                    claimed.set_alternate_setting(interface, 0)
+                });
+                let restored = idle.and_then(|()| clock::restore_capture_clock_route(&claimed, &route));
+                if let Err(error) = restored {
+                    keep_locked = false;
+                    claimed.adc3_power.disarm();
+                    set_last_error(Some(format!("capture clock hand-back failed: {error}")));
+                    log_warn!("[USB] Capture clock hand-back failed: {error}");
+                }
+            }
+            cleanup_claimed_handle(claimed, None, keep_locked);
         }
     }
 }
@@ -587,6 +606,7 @@ pub(super) fn configure_capture_endpoint(
             &config,
             candidate.interface,
             candidate.alternate,
+            route,
         )
         .map_err(Error::Control)?;
         if &actual != route {
@@ -603,6 +623,7 @@ pub(super) fn configure_capture_endpoint(
             &config,
             candidate.interface,
             candidate.alternate,
+            route,
         )
         .map_err(Error::Control)?;
         if &actual != route {
@@ -846,15 +867,16 @@ pub(crate) fn open_capture(
     // This owner is created before transfer pools, so all callbacks retire
     // before an alternate is reset or the existing idle handle is returned.
     let claimed = open_claimed_usb_handle(&device).map_err(Error::Claim)?;
-    let owner = CaptureUsbOwner {
+    let mut owner = CaptureUsbOwner {
         claimed: Some(claimed),
         keep_locked: current_lock_requested_for_fd(device.fd),
+        clock_route: None,
     };
     let usb = owner.claimed().handle.device();
     let config = usb
         .active_config_descriptor()
         .map_err(|e| Error::Claim(e.to_string()))?;
-    let mut candidates = owned_capture_candidates(owner.claimed(), &config, request.sample_rate)
+    let mut candidates = owned_capture_candidates(owner.claimed(), &config, request.sample_rate, false)
         .map_err(Error::Claim)?;
     candidates.retain(|candidate| {
         candidate.format.satisfies(request)
@@ -875,12 +897,22 @@ pub(crate) fn open_capture(
         CaptureBuffer::new(endpoint.format.clone(), capacity_frames)
             .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?,
     ));
-    configure_capture_endpoint(owner.claimed(), &endpoint)?;
     let geometry = IsoQueueGeometry::for_stream(
         endpoint.service_us,
         settings().config.bus_queue_ms,
         settings().config.transfers_in_flight,
     );
+    capture_queue_bytes(endpoint.packet_bytes, geometry)?;
+    if endpoint.protocol == 0x20 {
+        let mut route = None;
+        let result = clock::select_capture_clock_route(
+            owner.claimed(), endpoint.interface, endpoint.terminal, endpoint.control,
+            endpoint.format.sample_rate(), &mut route,
+        );
+        owner.clock_route = route;
+        result.map_err(Error::Control)?;
+    }
+    configure_capture_endpoint(owner.claimed(), &endpoint)?;
     let error = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let worker_buffer = buffer.clone();
@@ -995,6 +1027,29 @@ fn oldest_ready_capture(order: &VecDeque<usize>, slots: &[IsoTransferSlot]) -> O
         .filter(|index| slots[*index].completion_ready())
 }
 
+/// Prove libusb integer widths and total backing storage before class writes
+/// or allocating a capture queue, including SSP payloads above u16::MAX.
+pub(super) fn capture_queue_bytes(packet_bytes: usize, geometry: IsoQueueGeometry) -> Result<usize, Error> {
+    let invalid = || Error::Unsupported {
+        reason: "capture packet/queue geometry exceeds libusb or host allocation bounds".into(),
+        offered: vec![],
+    };
+    if packet_bytes == 0 || packet_bytes > u32::MAX as usize
+        || geometry.packets_per_transfer == 0 || geometry.packets_per_transfer > i32::MAX as usize
+        || geometry.transfer_slots == 0 {
+        return Err(invalid());
+    }
+    let per_transfer = packet_bytes.checked_mul(geometry.packets_per_transfer).ok_or_else(invalid)?;
+    let total = per_transfer.checked_mul(geometry.transfer_slots).ok_or_else(invalid)?;
+    let packets = geometry.packets_per_transfer.checked_mul(geometry.transfer_slots).ok_or_else(invalid)?;
+    if packets >= crate::iso_packet_scheduler::PACKET_FLIGHT_LIMIT
+        || geometry.packets_per_transfer > crate::iso_packet_scheduler::MAX_PACKETS_PER_TRANSFER
+        || per_transfer > i32::MAX as usize || total > isize::MAX as usize {
+        return Err(invalid());
+    }
+    Ok(per_transfer)
+}
+
 fn run_capture(
     owner: &CaptureUsbOwner,
     endpoint: &CaptureEndpoint,
@@ -1003,6 +1058,7 @@ fn run_capture(
     stop: &AtomicBool,
     ready: &std::sync::mpsc::SyncSender<Result<(), Error>>,
 ) -> Result<(), Error> {
+    let transfer_bytes = capture_queue_bytes(endpoint.packet_bytes, geometry)?;
     let mut slots = Vec::with_capacity(geometry.transfer_slots);
     let mut order = VecDeque::with_capacity(geometry.transfer_slots);
     let mut reordered_seen = vec![false; geometry.transfer_slots];
@@ -1019,7 +1075,7 @@ fn run_capture(
             IsoTransferSlot::new(
                 index,
                 geometry.packets_per_transfer,
-                endpoint.packet_bytes * geometry.packets_per_transfer,
+                transfer_bytes,
             )
             .map_err(Error::Transfer)?,
         );
@@ -1356,4 +1412,22 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod capture_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn extended_capture_queue_checks_host_and_libusb_lengths_before_allocation() {
+        let geometry = IsoQueueGeometry::for_stream(125, 16, 8);
+        assert_eq!(capture_queue_bytes(98_303, geometry).unwrap(), 98_303 * geometry.packets_per_transfer);
+        assert!(matches!(capture_queue_bytes(0, geometry), Err(Error::Unsupported { .. })));
+        assert!(matches!(capture_queue_bytes(usize::MAX, geometry), Err(Error::Unsupported { .. })));
+        assert!(matches!(capture_queue_bytes(i32::MAX as usize, geometry), Err(Error::Unsupported { .. })));
+        let too_many = IsoQueueGeometry { transfer_slots: 256, ..geometry };
+        assert!(matches!(capture_queue_bytes(4, too_many), Err(Error::Unsupported { .. })));
+        let overflow = IsoQueueGeometry { transfer_slots: usize::MAX, ..geometry };
+        assert!(matches!(capture_queue_bytes(98_303, overflow), Err(Error::Unsupported { .. })));
+    }
 }

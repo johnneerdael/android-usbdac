@@ -17,8 +17,8 @@ impl Dac {
     }
 
     /// Initialize and read source-backed Scarlett routing while idle. Requires
-    /// the host's explicit vendor-interface claim. Only 1235:8201 firmware1083
-    /// is admitted for mux/mix queries. No route, volume or persistent setting
+    /// the host's explicit vendor-interface claim. Exact-model firmware and live geometry
+    /// guards apply before mux/mix controls become available. No route, volume or persistent setting
     /// writes are sent. Hardware behavior remains unvalidated.
     pub fn scarlett_routing_read(
         &self,

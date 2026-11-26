@@ -4,7 +4,7 @@ use serde_json::json;
 use usbdac_core::scarlett::*;
 
 fn capability(v: ReadCapability) -> Value {
-    json!({"model":"scarlett_18i20_gen2","name":v.candidate.name(),"configuration_id":v.configuration,"interface":v.interface,"notification_endpoint":v.notification_endpoint,"interface_claimed":v.interface_claimed})
+    json!({"model":v.candidate.key(),"name":v.candidate.name(),"configuration_id":v.configuration,"interface":v.interface,"notification_endpoint":v.notification_endpoint,"interface_claimed":v.interface_claimed})
 }
 fn port(v: Port) -> Value {
     match v { Port::Off => json!({"kind":"off"}), Port::Channel {kind,channel} => json!({"kind":match kind {
@@ -21,7 +21,7 @@ fn mux_bank(v: &MuxBankSnapshot) -> Value {
     json!({"bank":v.bank(),"raw_words":v.raw_words(),"routes":v.routes().iter().map(|r| json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>()})
 }
 fn mux_state(v: &MuxSnapshot) -> Value {
-    json!({"model":"scarlett_18i20_gen2","firmware":v.model.firmware(),"banks":v.banks.iter().map(mux_bank).collect::<Vec<_>>()})
+    json!({"model":v.model.candidate().key(),"firmware":v.model.firmware(),"banks":v.banks.iter().map(mux_bank).collect::<Vec<_>>()})
 }
 fn mux_failure(v: &MuxFailure<String>) -> Value {
     match v {
@@ -47,7 +47,7 @@ fn failure(v: usbdac_core::routing::RoutingSessionError) -> Value {
 fn byte(v:&Value, key:&str)->Outcome<u8> { v[key].as_u64().and_then(|n|u8::try_from(n).ok()).ok_or_else(||Failure::Bad(format!("Scarlett {key} must be a byte"))) }
 fn parse_edit(v: &Value) -> Outcome<MixRowEdit> {
     let expected=&v["expected"];
-    let coefficients=expected["coefficients"].as_array().filter(|a|a.len()==18).ok_or_else(||Failure::Bad("Scarlett expected row must contain exactly 18 raw coefficients".into()))?
+    let coefficients=expected["coefficients"].as_array().filter(|a|!a.is_empty() && a.len()<=18).ok_or_else(||Failure::Bad("Scarlett expected row must contain 1 to 18 raw coefficients; native model validation requires the exact width".into()))?
         .iter().map(|n|n.as_u64().and_then(|n|u16::try_from(n).ok()).ok_or_else(||Failure::Bad("Scarlett coefficients must be unsigned 16-bit".into()))).collect::<Outcome<Vec<_>>>()?;
     let gains=v["gains"].as_array().filter(|a|!a.is_empty() && a.len()<=18).ok_or_else(||Failure::Bad("Scarlett requires 1 to 18 gain edits".into()))?
         .iter().map(|g| {let gain=g["half_db"].as_i64().and_then(|n|i16::try_from(n).ok()).and_then(|n|MixGain::from_half_db(n).ok()).ok_or_else(||Failure::Bad("Scarlett gain must be -160 to 24 half-dB".into()))?;Ok(MixGainEdit{input:byte(g,"input")?,gain})}).collect::<Outcome<Vec<_>>>()?;
@@ -123,7 +123,7 @@ pub fn scarlett_capability<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn scarlett_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
-    run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_read(){Ok(v)=>json!({"value":{"model":"scarlett_18i20_gen2","firmware":v.model.firmware(),"mixer_inputs":v.model.mixer_inputs(),"mixer_outputs":v.model.mixer_outputs(),"mux_zero":v.mux_zero.iter().map(|r|json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>(),"mixes":v.mixes.iter().map(row).collect::<Vec<_>>()}}),Err(e)=>failure(e)};java_string(env,&v)})
+    run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_read(){Ok(v)=>json!({"value":{"model":v.model.candidate().key(),"firmware":v.model.firmware(),"mixer_inputs":v.model.mixer_inputs(),"mixer_outputs":v.model.mixer_outputs(),"mux_zero":v.mux_zero.iter().map(|r|json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>(),"mixes":v.mixes.iter().map(row).collect::<Vec<_>>()}}),Err(e)=>failure(e)};java_string(env,&v)})
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn scarlett_mix_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,edit:JString<'l>)->JString<'l> {

@@ -107,6 +107,7 @@ private fun clockChoice(json: JSONObject?): ClockChoice? = json?.let {
 private fun altFormat(name: String?): AltFormat = when (name) {
     "pcm" -> AltFormat.PCM
     "dsd" -> AltFormat.DSD
+    "dop" -> AltFormat.DOP
     else -> AltFormat.OTHER
 }
 

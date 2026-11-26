@@ -1,4 +1,4 @@
-//! Pure USB Audio 2 routing inventory and control transactions.
+//! Pure USB Audio 1/2/3 routing inventory and control transactions.
 //!
 //! Independent implementation of USB-IF Audio 2.0 sections 4.7.2.6–7,
 //! 5.2.2–3 and 5.2.5.5–6 (September 2026 errata). Mixer gains use signed
@@ -67,11 +67,19 @@ pub struct InputCluster {
     pub channels: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingProtocol {
+    Uac1,
+    Uac2,
+    Adc3,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectorUnit {
     entity: Entity,
     sources: Vec<u8>,
     access: Access,
+    protocol: RoutingProtocol,
 }
 
 impl SelectorUnit {
@@ -93,6 +101,49 @@ impl SelectorUnit {
             },
             sources: bytes[5..5 + pins].to_vec(),
             access: access(flags)?,
+            protocol: RoutingProtocol::Uac2,
+        })
+    }
+
+    /// UAC1 selectors have mandatory GET_CUR/SET_CUR and no access bitmap.
+    pub fn parse_uac1(interface: u8, bytes: &[u8]) -> Result<Self, InvalidRoute> {
+        let pins = header(bytes, 5)?;
+        if bytes.len() != 6 + pins || bytes[5..5 + pins].contains(&0) {
+            return Err(InvalidRoute::MalformedDescriptor);
+        }
+        Ok(Self {
+            entity: Entity {
+                interface,
+                id: bytes[3],
+            },
+            sources: bytes[5..5 + pins].to_vec(),
+            access: Access::ReadWrite,
+            protocol: RoutingProtocol::Uac1,
+        })
+    }
+
+    /// Full ADC3 Selector Unit, including its 32-bit access field.
+    pub fn parse_adc3(interface: u8, bytes: &[u8]) -> Result<Self, InvalidRoute> {
+        let pins = header(bytes, 6)?;
+        if bytes.len() != 11 + pins || bytes[5..5 + pins].contains(&0) {
+            return Err(InvalidRoute::MalformedDescriptor);
+        }
+        let flags = u32::from_le_bytes(bytes[5 + pins..9 + pins].try_into().unwrap());
+        if flags & !3 != 0 {
+            return Err(InvalidRoute::ReservedCapability);
+        }
+        let access = access(flags as u8)?;
+        if access == Access::Absent {
+            return Err(InvalidRoute::ReservedCapability);
+        }
+        Ok(Self {
+            entity: Entity {
+                interface,
+                id: bytes[3],
+            },
+            sources: bytes[5..5 + pins].to_vec(),
+            access,
+            protocol: RoutingProtocol::Adc3,
         })
     }
 
@@ -113,6 +164,7 @@ pub struct MixerUnit {
     inputs: Vec<InputCluster>,
     outputs: u8,
     programmable: Vec<u8>,
+    protocol: RoutingProtocol,
 }
 
 impl MixerUnit {
@@ -169,6 +221,108 @@ impl MixerUnit {
             inputs: inputs.to_vec(),
             outputs,
             programmable: bitmap.to_vec(),
+            protocol: RoutingProtocol::Uac2,
+        })
+    }
+
+    /// UAC1 uses the descriptor's explicit four-byte output cluster.
+    pub fn parse_uac1(
+        interface: u8,
+        bytes: &[u8],
+        inputs: &[InputCluster],
+    ) -> Result<Self, InvalidRoute> {
+        Self::parse_other(interface, bytes, inputs, None, RoutingProtocol::Uac1)
+    }
+
+    /// Full ADC3 output count must come from the referenced, queried HC Cluster.
+    pub fn parse_adc3(
+        interface: u8,
+        bytes: &[u8],
+        inputs: &[InputCluster],
+        outputs: u8,
+    ) -> Result<Self, InvalidRoute> {
+        Self::parse_other(
+            interface,
+            bytes,
+            inputs,
+            Some(outputs),
+            RoutingProtocol::Adc3,
+        )
+    }
+
+    fn parse_other(
+        interface: u8,
+        bytes: &[u8],
+        inputs: &[InputCluster],
+        outputs: Option<u8>,
+        protocol: RoutingProtocol,
+    ) -> Result<Self, InvalidRoute> {
+        let pins = header(
+            bytes,
+            if protocol == RoutingProtocol::Adc3 {
+                5
+            } else {
+                4
+            },
+        )?;
+        if bytes.len() < 5 + pins {
+            return Err(InvalidRoute::MalformedDescriptor);
+        }
+        if inputs.len() != pins
+            || inputs
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c.channels == 0 || c.source_id == 0 || c.source_id != bytes[5 + i])
+        {
+            return Err(InvalidRoute::UnknownInputChannels);
+        }
+        let outputs = outputs
+            .or_else(|| bytes.get(5 + pins).copied())
+            .ok_or(InvalidRoute::MalformedDescriptor)?;
+        if outputs == 0 {
+            return Err(InvalidRoute::UnknownInputChannels);
+        }
+        let channels: usize = inputs.iter().map(|c| usize::from(c.channels)).sum();
+        let cells = channels * usize::from(outputs);
+        if (protocol != RoutingProtocol::Uac1 && cells > 256)
+            || (protocol == RoutingProtocol::Uac1 && channels > 254)
+        {
+            return Err(InvalidRoute::TooManyCrosspoints);
+        }
+        let count = (cells + 7) / 8;
+        let (base, start) = if protocol == RoutingProtocol::Adc3 {
+            (13, 7)
+        } else {
+            (10, 9)
+        };
+        if bytes.len() != base + pins + count {
+            return Err(InvalidRoute::MalformedDescriptor);
+        }
+        if protocol == RoutingProtocol::Adc3 {
+            if u16::from_le_bytes([bytes[5 + pins], bytes[6 + pins]]) == 0 {
+                return Err(InvalidRoute::MalformedDescriptor);
+            }
+            let at = start + pins + count;
+            let flags = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            if flags & !15 != 0 {
+                return Err(InvalidRoute::ReservedCapability);
+            }
+            access((flags & 3) as u8)?;
+            access(((flags >> 2) & 3) as u8)?;
+        }
+        let bitmap = &bytes[start + pins..start + pins + count];
+        if cells % 8 != 0 && bitmap[count - 1] & ((1 << (8 - cells % 8)) - 1) != 0 {
+            return Err(InvalidRoute::MalformedDescriptor);
+        }
+        Ok(Self {
+            entity: Entity {
+                interface,
+                id: bytes[3],
+            },
+            inputs: inputs.to_vec(),
+            outputs,
+            programmable: bitmap.to_vec(),
+            protocol,
         })
     }
 
@@ -215,6 +369,8 @@ impl MixerUnit {
                 Access::ReadOnly
             },
             mcn: mcn as u8,
+            input_number: (previous + usize::from(channel)) as u8,
+            protocol: self.protocol,
             pins: None,
         })
     }
@@ -249,7 +405,7 @@ pub enum RoutingUnit {
 }
 
 /// Descriptor-backed inventory. Entity IDs are never matched across AC interfaces.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutingInventory {
     units: BTreeMap<Entity, RoutingUnit>,
 }
@@ -278,6 +434,8 @@ impl RoutingInventory {
                     key,
                     access: s.access,
                     mcn: 0,
+                    input_number: 0,
+                    protocol: s.protocol,
                     pins: Some(s.sources.len() as u8),
                 }),
                 _ => Err(InvalidRoute::UnknownControl),
@@ -326,6 +484,8 @@ pub struct RouteControl {
     key: ControlKey,
     access: Access,
     mcn: u8,
+    input_number: u8,
+    protocol: RoutingProtocol,
     pins: Option<u8>,
 }
 
@@ -344,8 +504,21 @@ impl RouteControl {
         };
         ControlRequest {
             request_type: if input { 0xa1 } else { 0x21 },
-            request,
-            value: 0x0100 | u16::from(self.mcn),
+            request: if input && self.protocol == RoutingProtocol::Uac1 {
+                request | 0x80
+            } else {
+                request
+            },
+            value: if self.protocol == RoutingProtocol::Uac1 {
+                match self.key {
+                    ControlKey::Selector(_) => 0,
+                    ControlKey::Crosspoint { output_channel, .. } => {
+                        (u16::from(self.input_number) << 8) | u16::from(output_channel)
+                    }
+                }
+            } else {
+                0x0100 | u16::from(self.mcn)
+            },
             index: (u16::from(entity.id) << 8) | u16::from(entity.interface),
             length,
         }
@@ -407,6 +580,24 @@ impl RouteControl {
     ) -> Result<Vec<GainRange>, RoutingError<I::Error>> {
         if self.pins.is_some() {
             return Err(RoutingError::Invalid(InvalidRoute::WrongValueType));
+        }
+        if self.protocol == RoutingProtocol::Uac1 {
+            let mut values = [0i16; 3];
+            for (slot, request) in values.iter_mut().zip([2, 3, 4]) {
+                let mut bytes = [0; 2];
+                read_exact(io, self.setup(true, request, 2), &mut bytes)?;
+                *slot = i16::from_le_bytes(bytes);
+            }
+            let range = GainRange {
+                minimum: values[0],
+                maximum: values[1],
+                resolution: values[2],
+            };
+            return if range.valid() {
+                Ok(vec![range])
+            } else {
+                Err(RoutingError::Invalid(InvalidRoute::InvalidRange))
+            };
         }
         let mut header = [0; 2];
         read_exact(io, self.setup(true, 2, 2), &mut header)?;
@@ -627,6 +818,122 @@ pub fn apply_routes<I: RoutingIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uac1_selector_and_crosspoint_use_legacy_setup_and_separate_ranges() {
+        let selector = SelectorUnit::parse_uac1(3, &[8, 0x24, 5, 7, 2, 1, 2, 0]).unwrap();
+        let mut inventory = RoutingInventory::default();
+        inventory.insert(RoutingUnit::Selector(selector)).unwrap();
+        let control = inventory
+            .control(ControlKey::Selector(Entity {
+                interface: 3,
+                id: 7,
+            }))
+            .unwrap();
+        let current = control.current_request().unwrap();
+        assert_eq!(
+            (current.request, current.value, current.length),
+            (0x81, 0, 1)
+        );
+        assert_eq!(
+            control
+                .write_request(RouteValue::SelectorPin(2))
+                .unwrap()
+                .0
+                .value,
+            0
+        );
+        let inputs = [
+            InputCluster {
+                source_id: 1,
+                channels: 1,
+            },
+            InputCluster {
+                source_id: 2,
+                channels: 1,
+            },
+        ];
+        let mixer =
+            MixerUnit::parse_uac1(3, &[13, 0x24, 4, 9, 2, 1, 2, 2, 3, 0, 0, 0xf0, 0], &inputs)
+                .unwrap();
+        let point = mixer.crosspoint(2, 1, 2).unwrap();
+        assert_eq!(point.current_request().unwrap().value, 0x0202);
+        struct LegacyIo {
+            requests: Vec<u8>,
+        }
+        impl RoutingIo for LegacyIo {
+            type Error = ();
+            fn read(&mut self, request: ControlRequest, bytes: &mut [u8]) -> Result<usize, ()> {
+                self.requests.push(request.request);
+                assert_eq!(request.value, 0x0202);
+                let value: i16 = match request.request {
+                    0x82 => -1024,
+                    0x83 => 0,
+                    0x84 => 256,
+                    _ => panic!("unexpected legacy request"),
+                };
+                bytes.copy_from_slice(&value.to_le_bytes());
+                Ok(bytes.len())
+            }
+            fn write(&mut self, _: ControlRequest, _: &[u8]) -> Result<usize, ()> {
+                panic!("range query wrote hardware")
+            }
+        }
+        let mut io = LegacyIo { requests: vec![] };
+        let ranges = point.read_gain_ranges(&mut io).unwrap();
+        assert_eq!(io.requests, [0x82, 0x83, 0x84]);
+        assert!(ranges[0].contains(-512));
+        assert!(!ranges[0].contains(-500));
+    }
+
+    #[test]
+    fn adc3_routes_use_full_access_words_mcn_and_layout_widths() {
+        let mut inventory = RoutingInventory::default();
+        inventory
+            .insert(RoutingUnit::Selector(
+                SelectorUnit::parse_adc3(3, &[13, 0x24, 6, 7, 2, 1, 2, 3, 0, 0, 0, 0, 0]).unwrap(),
+            ))
+            .unwrap();
+        let control = inventory
+            .control(ControlKey::Selector(Entity {
+                interface: 3,
+                id: 7,
+            }))
+            .unwrap();
+        assert_eq!(
+            (
+                control.current_request().unwrap().value,
+                control.current_request().unwrap().length
+            ),
+            (0x0100, 1)
+        );
+        assert!(SelectorUnit::parse_adc3(3, &[12, 0x24, 6, 7, 1, 1, 3, 0, 0, 1, 0, 0]).is_err());
+        let inputs = [InputCluster {
+            source_id: 1,
+            channels: 2,
+        }];
+        let mut bytes = vec![15, 0x24, 5, 9, 1, 1, 42, 0, 0x90, 0, 0, 0, 0, 0, 0];
+        let mixer = MixerUnit::parse_adc3(3, &bytes, &inputs, 2).unwrap();
+        let point = mixer.crosspoint(1, 2, 2).unwrap();
+        assert_eq!(
+            (
+                point.current_request().unwrap().value,
+                point.current_request().unwrap().length
+            ),
+            (0x0103, 2)
+        );
+        assert_eq!(
+            point.write_request(RouteValue::MixerGain(-512)).unwrap().1,
+            (-512i16).to_le_bytes()
+        );
+        assert_eq!(
+            mixer.crosspoint(1, 1, 2).unwrap().access(),
+            Access::ReadOnly
+        );
+        bytes[12] = 1; // reserved bit in the high byte of bmControls
+        assert!(MixerUnit::parse_adc3(3, &bytes, &inputs, 2).is_err());
+        assert!(MixerUnit::parse_adc3(3, &bytes[..7], &inputs, 2).is_err());
+    }
 
     fn selector(interface: u8, id: u8, flags: u8) -> SelectorUnit {
         SelectorUnit::parse(interface, &[9, 0x24, 5, id, 2, 1, 2, flags, 0]).unwrap()

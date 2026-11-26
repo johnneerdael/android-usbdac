@@ -319,3 +319,113 @@ The final ADB check found the phone offline. No physical acceptance
 was run. ADC3 alternate clock mutation across multiple streaming
 interfaces, optional BADD bursting, extended SSP geometry and broader
 Scarlett model/firmware evidence remain open.
+
+### Playback Designs alternate-one DoP compatibility
+
+Upstream distinguishes three wire modes for Playback Designs vendor
+`23ba`, product below `0110`. Alternate one is logical DSD_U16_LE
+expanded to three on-wire bytes per channel by adding the DoP marker.
+Alternates two and three are the direct bit-reversed native layouts.
+For alternate one, admit a source-backed, DoP-only capability even
+where the device does not claim linear PCM for that alternate. Require
+the exact identity, one unambiguous matching stereo OUT alternate,
+valid descriptor geometry, and capacity for three bytes per channel at
+the requested carrier rate. Use the existing DoP marker path. Keep
+native, DoP-only and actual advertised PCM eligibility separate in
+negotiation and capabilities. Check the alternate and whole-frame
+pacing at open and test that an unrelated RAW_DATA product cannot match
+the rule.
+[ALSA Playback Designs formats](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L1982-L2004),
+[ALSA DoP endpoint stride](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L1104-L1121)
+
+### Standard routing across class versions
+
+UAC1 addresses a mixer crosspoint with one-based input and output channel
+numbers in the two bytes of `wValue`. Query programmable crosspoint
+limits through separate GET_MIN, GET_MAX and GET_RES responses before
+writing. A Selector Unit uses a zero `wValue` and a one-byte current
+pin. UAC2 and full ADC3 instead address a mixer by its control selector
+and zero-based MCN, with a RANGE response for limits. ADC3 mixer layouts
+use a High Capability output cluster, a programmable crosspoint bitmap,
+32-bit unit controls and a 16-bit string ID; its Selector Unit also has
+32-bit access flags. Apply the existing verified snapshot transaction
+after the protocol-specific parser has proved the active function and
+upstream cluster widths. For full ADC3, distinguish equal channel
+counts from equal selector input cluster identities. Require a known
+owned power state for control operations that cannot complete while a
+domain sleeps.
+[USB-IF UAC1 audio controls §5.2.2](https://www.usb.org/sites/default/files/audio10.pdf),
+[USB-IF ADC3 via IEC 62680-1-5](https://www.iteh.eu/catalog/standards/clc/777313ac-7790-430c-8e99-17c611c46dd2/en-iec-62680-1-5-2019),
+[ALSA mixer discovery](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c#L2137-L2317)
+
+### Capture clock fallback follow-through
+
+Standalone capture currently verifies the selected source. Extend it to
+enumerate alternate sources on a writable selector when the current
+source cannot serve the exact capture format. Reuse the existing
+descriptor validity policy and require complete active-function claims.
+The capture worker's owner should retain the original pin and frequency
+snapshot. Restore it after IN callbacks retire and the altered
+interfaces reach alt zero, before releasing ADC3 power ownership.
+Keep the pending playback negotiation's saved plan separate from a
+standalone capture transaction. For duplex, resolve capture and
+playback together against the proposed selector plan and verify the
+shared-clock equality or independent frequencies before either stream
+starts. Do not apply a fallback validated for only one direction to
+an existing pair.
+[ALSA clock source validation and alternatives](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L243-L445)
+
+### Stable ALSA compatibility refresh
+
+The Linux v7.3 native DSD format decision is unchanged from the v7.0
+reference. Its quirk table adds exact RAW_DATA entries for Cambridge
+Audio streamers and HiBy FC4. Its lookup takes the first exact record
+before a vendor fallback, including the explicit Musical Fidelity M6s
+DAC RAW_DATA exclusion. Keep these source-backed exceptions ahead of
+vendor matching while retaining explicit user overrides. Linux v7.3
+also extends its slow CLOCK_VALID retry from the MOTU MicroBook IIc
+to the exact older AVB/hybrid USB identity. The retry belongs after
+rate or source programming and remains bounded. Read-only discovery
+does not need to wait for a clock it has not changed.
+[Linux v7.3 quirk table](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2423-L2553),
+[Linux v7.3 MOTU validity settling](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/clock.c#L208-L246)
+
+### Owned ADC3 routing wake
+
+Existing ADC3 routing discovery verifies known D0 state without sending
+power writes. An explicit powered routing operation can reuse
+`Adc3PowerLease` on the idle USB owner. Scope wake to the affected
+claimed AudioControl function and its routing entities before querying
+HC or class controls. Restore the prior domain state after discovery,
+read or verified transaction, including failure. Keep the snapshot's
+configuration, identity and topology proof independent of temporary
+power state. A later powered read or edit must reacquire its own lease
+and reject drift. Preserve the existing read-only discovery entry point.
+
+## Seventh validation checkpoint
+
+The exact legacy Playback Designs profile now exposes its alternate-one
+DoP capability independently of advertised PCM and direct native DSD.
+Linux v7.3 exact RAW flags and vetoes take precedence over the pinned
+vendor defaults, and the two known MOTU identities get bounded
+post-programming validity settling. Standalone UAC2 capture can try a
+verified alternate source and retain its own hand-back snapshot.
+
+Full ADC3 playback and duplex fallback can prove a fully claimed
+multi-interface function, quiesce every AS interface, verify the
+affected original and intended clock paths, and restore frequencies
+and selectors before power hand-back. Extended SSP isochronous
+payloads use validated companion lengths and the conservative ceiling
+that is valid for every SuperPlus link exposed by the USB API. Unknown
+link rate beyond that ceiling and ambiguous BADD bursting remain
+explicit refusals.
+
+UAC1 and full ADC3 selectors and mixer crosspoints now use
+protocol-specific controls behind the standard routing transaction.
+ADC3 routing currently requires known D0. Exact Vocaster One/Two and
+Scarlett Solo/2i2/4i4 Gen 4 profiles validate their firmware minima and
+complete live mixer/mux geometry before exposing vendor operations.
+
+Rust workspace tests, Android target and four-ABI builds, Kotlin
+tests, the sample build and the SDK snippet check passed. No physical
+acceptance was performed. The connected Android host was offline.

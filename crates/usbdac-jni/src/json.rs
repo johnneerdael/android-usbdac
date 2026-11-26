@@ -95,6 +95,7 @@ fn alt(alt: &AltSetting) -> Value {
         "format": match alt.format {
             AltFormat::Pcm => "pcm",
             AltFormat::Dsd => "dsd",
+            AltFormat::Dop => "dop",
             _ => "other",
         },
         "channels": alt.channels,

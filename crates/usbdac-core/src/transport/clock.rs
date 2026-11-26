@@ -385,6 +385,32 @@ pub(super) fn get_clock_validity(
     Ok(data[0] != 0)
 }
 
+// ALSA's exact MOTU identities need bounded settling after programming. Do
+// not make read-only source discovery wait or convert transfer errors to retry.
+fn retry_programmed_clock_validity(
+    slow: bool, mut read: impl FnMut() -> Result<bool, String>, mut wait: impl FnMut(),
+) -> Result<bool, String> {
+    let mut valid = read()?;
+    if slow {
+        for _ in 0..50 {
+            if valid { break; }
+            wait();
+            valid = read()?;
+        }
+    }
+    Ok(valid)
+}
+pub(super) fn get_programmed_clock_validity(
+    handle: &DeviceHandle<Context>, control: u8, source: u8,
+) -> Result<bool, String> {
+    let slow = handle.device().device_descriptor().is_ok_and(|d| {
+        d.vendor_id() == 0x07fd && matches!(d.product_id(), 0x0004 | 0x0005)
+    });
+    retry_programmed_clock_validity(slow,
+        || get_clock_validity(handle, control, source),
+        || thread::sleep(Duration::from_millis(100)))
+}
+
 pub(super) fn get_sampling_frequency_ranges(
     handle: &DeviceHandle<Context>,
     interface_number: u8,
@@ -660,11 +686,11 @@ pub(super) fn apply_sampling_frequency(
                 if reported_sample_rate == sample_rate {
                     let validity = match source_controls {
                         Some(controls) => crate::clock_resolution::clock_validity(controls, || {
-                            get_clock_validity(handle, interface_number, clock_id)
+                            get_programmed_clock_validity(handle, interface_number, clock_id)
                         }),
                         // Preserve the malformed-descriptor compatibility path;
                         // it never authorizes automatic selector changes.
-                        None => match get_clock_validity(handle, interface_number, clock_id) {
+                        None => match get_programmed_clock_validity(handle, interface_number, clock_id) {
                             Ok(true) => Ok(crate::clock_resolution::ClockValidity::ReportedValid),
                             Ok(false) => Err("clock source reports invalid".into()),
                             Err(error) => {
@@ -1097,6 +1123,198 @@ pub(super) fn select_requested_clock_route(
     Ok(())
 }
 
+/// A standalone capture owns its own snapshot; never borrow the pending
+/// playback negotiation slot, even when both sessions use the same FD.
+#[derive(Clone)]
+pub(super) struct CaptureClockRoute {
+    control: u8,
+    streaming: u8,
+    plan: crate::clock_resolution::ClockPlan,
+    frequency: CaptureFrequency,
+}
+#[derive(Clone, Copy)]
+struct CaptureFrequency { source: u8, original: u32, target: u32 }
+trait CaptureFrequencyIo {
+    fn read_frequency(&mut self, source: u8) -> Result<u32, String>;
+    fn write_frequency(&mut self, source: u8, rate: u32) -> Result<(), String>;
+}
+struct CaptureClockIo<'a> { usb: UsbClockPlanIo<'a>, expected_frequency: u32, program_attempted: bool }
+impl CaptureFrequencyIo for CaptureClockIo<'_> {
+    fn read_frequency(&mut self, source: u8) -> Result<u32, String> {
+        get_sampling_frequency(self.usb.handle, self.usb.control, source)
+    }
+    fn write_frequency(&mut self, source: u8, rate: u32) -> Result<(), String> {
+        set_sampling_frequency(self.usb.handle, self.usb.control, source, rate)?;
+        thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
+        Ok(())
+    }
+}
+impl crate::clock_resolution::ClockPlanIo for CaptureClockIo<'_> {
+    fn read_pin(&mut self, selector: u8) -> Result<u8, String> {
+        crate::clock_resolution::ClockPlanIo::read_pin(&mut self.usb, selector)
+    }
+    fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        crate::clock_resolution::ClockPlanIo::write_pin(&mut self.usb, selector, pin)
+    }
+    fn validate_source(&mut self, source: u8, controls: u32) -> Result<(), String> {
+        // A working exact current route needs no RANGE request. Any mutation,
+        // including a selector-only alternative, retains the strict RANGE proof.
+        if !matches!(controls & 3, 1 | 3) {
+            return Err("capture clock frequency is not readable".into());
+        }
+        if self.usb.allow_program {
+            let ranges = get_sampling_frequency_ranges(self.usb.handle, self.usb.control, source)?;
+            if !capture_ranges_serve(&ranges, self.usb.rate)
+                || !capture_ranges_serve(&ranges, self.expected_frequency) {
+                return Err("capture clock does not support the exact requested rate".into());
+            }
+        }
+        let before = self.read_frequency(source)?;
+        if before != self.expected_frequency {
+            return Err("capture source frequency drifted before programming".into());
+        }
+        let programmed = before != self.usb.rate;
+        if programmed {
+            if !self.usb.allow_program || controls & 3 != 3 {
+                return Err("capture clock frequency is not writable at the requested rate".into());
+            }
+            self.program_attempted = true;
+            self.write_frequency(source, self.usb.rate)?;
+        }
+        if self.read_frequency(source)? != self.usb.rate {
+            return Err("capture clock frequency readback did not match".into());
+        }
+        crate::clock_resolution::clock_validity(controls, || {
+            if programmed {
+                get_programmed_clock_validity(self.usb.handle, self.usb.control, source)
+            } else {
+                get_clock_validity(self.usb.handle, self.usb.control, source)
+            }
+        })?;
+        Ok(())
+    }
+}
+fn capture_clock_mutates(plan: &crate::clock_resolution::ClockPlan, current: u32, requested: u32) -> bool {
+    current != requested || plan.selectors.iter().any(|pin| pin.original != pin.target)
+}
+fn capture_ranges_serve(ranges: &[SamplingFrequencySubrange], rate: u32) -> bool {
+    !ranges.is_empty()
+        && !ranges.iter().any(|range| range.min == 0 || range.max < range.min
+            || (range.res == 0 && range.min != range.max))
+        && sampling_frequency_ranges_support_rate(ranges, rate)
+}
+fn restore_capture_frequency(io: &mut impl CaptureFrequencyIo, saved: CaptureFrequency) -> Result<(), String> {
+    if saved.original == saved.target { return Ok(()); }
+    let actual = io.read_frequency(saved.source)?;
+    if actual == saved.original { return Ok(()); }
+    if actual != saved.target {
+        return Err("capture frequency drifted; preserving external change".into());
+    }
+    io.write_frequency(saved.source, saved.original)?;
+    if io.read_frequency(saved.source)? != saved.original {
+        return Err("capture original frequency did not verify".into());
+    }
+    Ok(())
+}
+fn restore_capture_transaction(
+    io: &mut (impl crate::clock_resolution::ClockPlanIo + CaptureFrequencyIo),
+    plan: &crate::clock_resolution::ClockPlan, frequency: CaptureFrequency,
+) -> Result<(), String> {
+    // Check every pin before touching frequency: an external route change owns
+    // the resulting state and must not be silently repaired by capture Drop.
+    for pin in &plan.selectors {
+        if io.read_pin(pin.selector)? != pin.target {
+            return Err("capture selector drifted; preserving external change".into());
+        }
+    }
+    restore_capture_frequency(io, frequency)?;
+    plan.restore(io).map_err(|error| error.to_string())
+}
+
+/// Prefer the current exact route, then bounded writable alternatives. The
+/// caller retains even an uncertain transaction until capture ownership ends.
+pub(super) fn select_capture_clock_route(
+    claimed: &ClaimedHandle, streaming: u8, terminal: u8, control: u8, rate: u32,
+    saved: &mut Option<CaptureClockRoute>,
+) -> Result<(), String> {
+    let device = claimed.handle.device();
+    let (owner, graph) = owning_clock_graph(&device, &claimed.handle, streaming)
+        .ok_or("capture clock fallback requires a unique active UAC2 function")?;
+    if owner != control { return Err("capture clock owner changed".into()); }
+    let mut reads = 0;
+    let plans = graph.enumerate_plans(terminal, |id| {
+        reads += 1;
+        if reads > 16 { return Err("capture selector read budget exhausted".into()); }
+        get_clock_selector_pin(&claimed.handle, control, id)
+    })?;
+    let mut last = "no capture source serves the exact requested rate".to_string();
+    for plan in plans.into_iter().take(8) {
+        if !matches!(plan.source_controls & 3, 1 | 3) { continue; }
+        let Ok(original) = get_sampling_frequency(&claimed.handle, control, plan.source_id) else { continue; };
+        if original == 0 { continue; }
+        let mutation = capture_clock_mutates(&plan, original, rate);
+        if mutation {
+            let Ok(ranges) = get_sampling_frequency_ranges(&claimed.handle, control, plan.source_id) else { continue; };
+            if !capture_ranges_serve(&ranges, rate)
+                || !capture_ranges_serve(&ranges, original) { continue; }
+            if !stop_complete_capture_clock_function(claimed, streaming)? { continue; }
+        }
+        let frequency = CaptureFrequency { source: plan.source_id, original, target: rate };
+        let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control, rate, allow_program: mutation }, expected_frequency: original, program_attempted: false };
+        *saved = Some(CaptureClockRoute { control, streaming, plan: plan.clone(), frequency });
+        match plan.apply(&mut io) {
+            Ok(()) => {
+                let resolved = graph.resolve_terminal_clock(terminal, |id| {
+                    get_clock_selector_pin(&claimed.handle, control, id)
+                }).map_err(|e| e.to_string())?;
+                if resolved.clock_id != plan.source_id || resolved.path != plan.path {
+                    return Err("capture clock route changed after selection".into());
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                // ClockPlan has already rolled its attempted pins back. Restore
+                // the addressed source frequency before considering another path.
+                let restored = if io.program_attempted {
+                    restore_capture_frequency(&mut io, frequency)
+                } else { Ok(()) };
+                if !io.program_attempted {
+                    if let Some(saved) = saved.as_mut() { saved.frequency.target = original; }
+                }
+                if !error.rollback_errors.is_empty() || restored.is_err() {
+                    return Err(format!("capture clock transaction: {error}; frequency rollback: {restored:?}"));
+                }
+                *saved = None;
+                last = error.to_string();
+            }
+        }
+    }
+    Err(last)
+}
+fn stop_complete_capture_clock_function(claimed: &ClaimedHandle, streaming: u8) -> Result<bool, String> {
+    let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
+    let raw = read_active_configuration_bytes(&claimed.handle, &config).ok_or("cannot re-read capture function")?;
+    let functions = audio_functions(&raw);
+    let mut owners = functions.iter().filter(|(_, ids)| ids.contains(&streaming));
+    let Some((_, ids)) = owners.next() else { return Ok(false); };
+    if owners.next().is_some() || ids.iter().any(|id| !claimed.claimed_interfaces.contains(id)) {
+        return Ok(false);
+    }
+    stop_owned_clock_alternates(claimed, streaming)
+}
+pub(super) fn restore_capture_clock_route(claimed: &ClaimedHandle, saved: &CaptureClockRoute) -> Result<(), String> {
+    let mutation = saved.frequency.original != saved.frequency.target
+        || saved.plan.selectors.iter().any(|pin| pin.original != pin.target);
+    if !mutation { return Ok(()); }
+    if !stop_complete_capture_clock_function(claimed, saved.streaming)? {
+        return Err("capture clock hand-back requires complete idle function ownership".into());
+    }
+    let mut io = CaptureClockIo { usb: UsbClockPlanIo {
+        handle: &claimed.handle, control: saved.control, rate: saved.frequency.target, allow_program: false,
+    }, expected_frequency: saved.frequency.target, program_attempted: false };
+    restore_capture_transaction(&mut io, &saved.plan, saved.frequency)
+}
+
 /// A negotiated plan's selected pins must remain identical until open; never
 /// silently repair drift on behalf of an old StreamFormat.
 pub(super) fn verify_requested_clock_route(
@@ -1227,4 +1445,80 @@ fn itf_timed_write_control(handle: &DeviceHandle<Context>, request_type: u8, req
     let result = handle.write_control(request_type, request, value, index, data, timeout);
     if request_type & 0x60 == USB_TYPE_CLASS { itf_class_control_delay(handle); }
     result
+}
+
+#[cfg(test)]
+mod capture_clock_transaction_tests {
+    use super::*;
+    use crate::clock_resolution::{ClockPinPlan, ClockPlan, ClockPlanIo};
+
+    struct Io { pin: u8, rate: u32, writes: Vec<&'static str> }
+    impl ClockPlanIo for Io {
+        fn read_pin(&mut self, _: u8) -> Result<u8, String> { Ok(self.pin) }
+        fn write_pin(&mut self, _: u8, pin: u8) -> Result<(), String> {
+            self.writes.push("pin"); self.pin = pin; Ok(())
+        }
+        fn validate_source(&mut self, _: u8, _: u32) -> Result<(), String> { Ok(()) }
+    }
+    impl CaptureFrequencyIo for Io {
+        fn read_frequency(&mut self, _: u8) -> Result<u32, String> { Ok(self.rate) }
+        fn write_frequency(&mut self, _: u8, rate: u32) -> Result<(), String> {
+            self.writes.push("rate"); self.rate = rate; Ok(())
+        }
+    }
+    fn plan() -> ClockPlan {
+        ClockPlan { source_id: 9, source_controls: 7, path: vec![8, 9],
+            selectors: vec![ClockPinPlan { selector: 8, original: 1, target: 2 }] }
+    }
+    fn frequency() -> CaptureFrequency {
+        CaptureFrequency { source: 9, original: 44_100, target: 48_000 }
+    }
+    #[test]
+    fn exact_current_route_needs_no_mutation_but_alternatives_do() {
+        let mut selected = plan();
+        selected.selectors[0].target = selected.selectors[0].original;
+        assert!(!capture_clock_mutates(&selected, 48_000, 48_000));
+        assert!(capture_clock_mutates(&selected, 44_100, 48_000));
+        assert!(capture_clock_mutates(&plan(), 48_000, 48_000));
+    }
+    #[test]
+    fn capture_hand_back_restores_frequency_before_selector() {
+        let mut io = Io { pin: 2, rate: 48_000, writes: vec![] };
+        restore_capture_transaction(&mut io, &plan(), frequency()).unwrap();
+        assert_eq!(io.writes, ["rate", "pin"]);
+        assert_eq!((io.pin, io.rate), (1, 44_100));
+    }
+    #[test]
+    fn capture_hand_back_preserves_external_pin_or_frequency_drift() {
+        for (pin, rate) in [(3, 48_000), (2, 96_000)] {
+            let mut io = Io { pin, rate, writes: vec![] };
+            assert!(restore_capture_transaction(&mut io, &plan(), frequency()).is_err());
+            assert!(io.writes.is_empty());
+            assert_eq!((io.pin, io.rate), (pin, rate));
+        }
+    }
+    #[test]
+    fn capture_already_restored_frequency_is_not_programmed_again() {
+        let mut io = Io { pin: 2, rate: 44_100, writes: vec![] };
+        restore_capture_transaction(&mut io, &plan(), frequency()).unwrap();
+        assert_eq!(io.writes, ["pin"]);
+    }
+    #[test]
+    fn motu_validity_retry_is_bounded_and_aborts_control_errors() {
+        let mut reads = 0;
+        let mut waits = 0;
+        assert_eq!(retry_programmed_clock_validity(true, || {
+            reads += 1; Ok(reads == 3)
+        }, || waits += 1), Ok(true));
+        assert_eq!((reads, waits), (3, 2));
+        let mut waits = 0;
+        assert!(retry_programmed_clock_validity(true, || Err("disconnect".into()), || waits += 1).is_err());
+        assert_eq!(waits, 0);
+        let mut waits = 0;
+        assert_eq!(retry_programmed_clock_validity(true, || Ok(false), || waits += 1), Ok(false));
+        assert_eq!(waits, 50);
+        let mut waits = 0;
+        assert_eq!(retry_programmed_clock_validity(false, || Ok(false), || waits += 1), Ok(false));
+        assert_eq!(waits, 0);
+    }
 }

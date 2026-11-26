@@ -1,4 +1,4 @@
-//! Session-bound standard UAC2 routing. No vendor commands or extra claims.
+//! Session-bound standard UAC1/UAC2/full ADC3 routing. No vendor commands or extra claims.
 
 use super::*;
 use crate::routing::{
@@ -28,6 +28,7 @@ pub struct RoutingSnapshot {
     descriptors: Vec<u8>,
     inventory: RoutingInventory,
     selectors: Vec<RouteChange>,
+    hc_clusters: BTreeMap<(u8, u16), RoutingCluster>,
 }
 
 impl RoutingSnapshot {
@@ -74,21 +75,56 @@ pub(super) fn scarlett_claim_interface(
 }
 
 /// Descriptor-only host preclaim proof. Never claims an interface or initializes Scarlett.
-pub(crate) fn scarlett_preflight(fd: RawFd, info: &crate::DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>, Error> {
-    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
-    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(), info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
+pub(crate) fn scarlett_preflight(
+    fd: RawFd,
+    info: &crate::DeviceInfo,
+) -> Result<Option<crate::scarlett::ReadCapability>, Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Err(Error::PlatformUnsupported);
+    }
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        Vec::new(),
+    )
+    .map_err(Error::Claim)?;
     let wrapped = wrap_android_usb_handle(&device).map_err(Error::Claim)?;
     let usb = wrapped.handle.device();
-    let identity = usb.device_descriptor().map_err(|e| Error::Control(e.to_string()))?;
+    let identity = usb
+        .device_descriptor()
+        .map_err(|e| Error::Control(e.to_string()))?;
     if identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id {
-        return Err(Error::Claim("host and USB device identities differ during Scarlett preflight".into()));
+        return Err(Error::Claim(
+            "host and USB device identities differ during Scarlett preflight".into(),
+        ));
     }
-    let config = usb.active_config_descriptor().map_err(|e| Error::Control(e.to_string()))?;
-    if info.configuration_id != Some(config.number()) { return Err(Error::Claim("Scarlett preflight requires the selected active configuration".into())); }
-    let Some(candidate) = crate::scarlett::CandidateModel::recognize(identity.vendor_id(), identity.product_id()) else { return Ok(None); };
-    Ok(scarlett_endpoint(&config, identity.vendor_id(), identity.product_id()).map(|(interface, notification_endpoint)| crate::scarlett::ReadCapability {
-        candidate, configuration: config.number(), interface, notification_endpoint, interface_claimed: false,
-    }))
+    let config = usb
+        .active_config_descriptor()
+        .map_err(|e| Error::Control(e.to_string()))?;
+    if info.configuration_id != Some(config.number()) {
+        return Err(Error::Claim(
+            "Scarlett preflight requires the selected active configuration".into(),
+        ));
+    }
+    let Some(candidate) =
+        crate::scarlett::CandidateModel::recognize(identity.vendor_id(), identity.product_id())
+    else {
+        return Ok(None);
+    };
+    Ok(
+        scarlett_endpoint(&config, identity.vendor_id(), identity.product_id()).map(
+            |(interface, notification_endpoint)| crate::scarlett::ReadCapability {
+                candidate,
+                configuration: config.number(),
+                interface,
+                notification_endpoint,
+                interface_claimed: false,
+            },
+        ),
+    )
 }
 
 fn scarlett_endpoint(config: &ConfigDescriptor, vendor: u16, product: u16) -> Option<(u8, u8)> {
@@ -409,17 +445,23 @@ pub(crate) fn scarlett_mux_read() -> Result<crate::scarlett::MuxSnapshot, Routin
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
-    let snapshot = with_scarlett(&device, configuration, |session|
-        session.read_mux_banks().map_err(RoutingSessionError::Scarlett))?;
+    let snapshot = with_scarlett(&device, configuration, |session| {
+        session
+            .read_mux_banks()
+            .map_err(RoutingSessionError::Scarlett)
+    })?;
     let (after, raw) = active_descriptors(&device)?;
     if after != configuration || raw != descriptors {
-        return Err(RoutingSessionError::Drift("configuration changed during Scarlett bank read".into()));
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during Scarlett bank read".into(),
+        ));
     }
     Ok(snapshot)
 }
 
-pub(crate) fn scarlett_mux_apply(edit: &crate::scarlett::MuxEdit)
-    -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+pub(crate) fn scarlett_mux_apply(
+    edit: &crate::scarlett::MuxEdit,
+) -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -427,20 +469,30 @@ pub(crate) fn scarlett_mux_apply(edit: &crate::scarlett::MuxEdit)
     let mut records = ORIGINAL_SCARLETT.lock();
     if let Some(record) = records.as_ref() {
         if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
-            || record.configuration != configuration || record.descriptors != descriptors {
-            return Err(RoutingSessionError::Drift("Scarlett attachment/configuration changed since vendor write".into()));
+            || record.configuration != configuration
+            || record.descriptors != descriptors
+        {
+            return Err(RoutingSessionError::Drift(
+                "Scarlett attachment/configuration changed since vendor write".into(),
+            ));
         }
         if let Some((_, last)) = &record.mux {
             if last != &edit.expected {
-                return Err(RoutingSessionError::Drift("Scarlett banks differ from last verified library write".into()));
+                return Err(RoutingSessionError::Drift(
+                    "Scarlett banks differ from last verified library write".into(),
+                ));
             }
         }
     }
-    let report = match with_scarlett(&device, configuration, |session|
-        session.apply_mux(edit).map_err(RoutingSessionError::ScarlettMux)) {
+    let report = match with_scarlett(&device, configuration, |session| {
+        session
+            .apply_mux(edit)
+            .map_err(RoutingSessionError::ScarlettMux)
+    }) {
         Ok(report) => report,
         Err(error) => {
-            if matches!(&error, RoutingSessionError::ScarlettMux(failure) if !failure.rollback.is_empty()) {
+            if matches!(&error, RoutingSessionError::ScarlettMux(failure) if !failure.rollback.is_empty())
+            {
                 invalidate_route_caches();
             }
             return Err(error);
@@ -449,8 +501,11 @@ pub(crate) fn scarlett_mux_apply(edit: &crate::scarlett::MuxEdit)
     if report.original != report.verified {
         invalidate_route_caches();
         let record = records.get_or_insert_with(|| RecordedScarlett {
-            device: device.clone(), configuration, descriptors: descriptors.clone(),
-            rows: BTreeMap::new(), mux: None,
+            device: device.clone(),
+            configuration,
+            descriptors: descriptors.clone(),
+            rows: BTreeMap::new(),
+            mux: None,
         });
         match &mut record.mux {
             Some((_, last)) => *last = report.verified.clone(),
@@ -459,7 +514,9 @@ pub(crate) fn scarlett_mux_apply(edit: &crate::scarlett::MuxEdit)
     }
     let (after, raw) = active_descriptors(&device)?;
     if configuration != after || descriptors != raw {
-        return Err(RoutingSessionError::Drift("configuration changed during Scarlett mux write".into()));
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during Scarlett mux write".into(),
+        ));
     }
     Ok(report)
 }
@@ -514,10 +571,46 @@ fn finish_scarlett_hand_back() {
 
 struct UsbRoutingIo<'a> {
     device: &'a UsbDevice,
+    descriptors: &'a [u8],
 }
 
 /// Enforce the small set of setup packets this adapter is allowed to issue.
+#[cfg(test)]
 fn validate_request(request: ControlRequest, input: bool, length: usize) -> Result<(), String> {
+    validate_protocol_request(request, input, length, 0x20)
+}
+fn validate_protocol_request(
+    request: ControlRequest,
+    input: bool,
+    length: usize,
+    protocol: u8,
+) -> Result<(), String> {
+    if protocol == 0 {
+        let valid = request.request_type == if input { 0xa1 } else { 0x21 }
+            && request.index >> 8 != 0
+            && usize::from(request.length) == length
+            && if input {
+                matches!(request.request, 0x81..=0x84)
+            } else {
+                request.request == 1
+            }
+            && if request.value == 0 {
+                length == 1 && matches!(request.request, 1 | 0x81)
+            } else {
+                request.value >> 8 != 0
+                    && request.value as u8 != 0
+                    && request.value != 0xffff
+                    && length == 2
+            };
+        return if valid {
+            Ok(())
+        } else {
+            Err("refused non-routing UAC1 control".into())
+        };
+    }
+    if ![0x20, 0x30].contains(&protocol) {
+        return Err("unsupported routing protocol".into());
+    }
     let valid_length = if request.request == 1 {
         matches!(length, 1 | 2)
     } else {
@@ -536,16 +629,28 @@ fn validate_request(request: ControlRequest, input: bool, length: usize) -> Resu
     Ok(())
 }
 
+impl UsbRoutingIo<'_> {
+    fn validate(&self, request: ControlRequest, input: bool, length: usize) -> Result<(), String> {
+        let interfaces = routing_interfaces(self.descriptors, &self.device.claimed_interfaces)
+            .map_err(|e| e.to_string())?;
+        let protocol = interfaces
+            .get(&(request.index as u8))
+            .ok_or("routing interface is not claimed")?
+            .0;
+        validate_protocol_request(request, input, length, protocol)
+    }
+}
+
 impl RoutingIo for UsbRoutingIo<'_> {
     type Error = String;
     fn read(&mut self, r: ControlRequest, bytes: &mut [u8]) -> Result<usize, String> {
-        validate_request(r, true, bytes.len())?;
+        self.validate(r, true, bytes.len())?;
         self.device
             .feature_unit_control(r.request_type, r.request, r.value, r.index, bytes)
             .map_err(|e| e.to_string())
     }
     fn write(&mut self, r: ControlRequest, bytes: &[u8]) -> Result<usize, String> {
-        validate_request(r, false, bytes.len())?;
+        self.validate(r, false, bytes.len())?;
         let mut data = bytes.to_vec();
         self.device
             .feature_unit_control(r.request_type, r.request, r.value, r.index, &mut data)
@@ -635,16 +740,77 @@ fn framed(bytes: &[u8]) -> Result<Vec<&[u8]>, RoutingSessionError> {
     Ok(slices)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cluster {
-    channels: u8,
-    locations: u32,
-    names: u8,
+/// Preserve optional/common/unknown segments too: a selector requires equal
+/// Cluster content, not merely equal counts or the parsed speaker relationships.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutingCluster {
+    parsed: crate::descriptors::uac3::Cluster,
+    content: Vec<u8>,
+}
+impl RoutingCluster {
+    fn identity(&self) -> Vec<u8> {
+        // Unique descriptor IDs may differ while the described content matches.
+        self.content[..4]
+            .iter()
+            .chain(&self.content[6..])
+            .copied()
+            .collect()
+    }
+}
+fn query_routing_cluster(
+    handle: &DeviceHandle<Context>,
+    interface: u8,
+    id: u16,
+) -> Result<RoutingCluster, RoutingSessionError> {
+    use crate::descriptors::uac3;
+    let fail = |e: String| RoutingSessionError::UnsupportedTopology(e);
+    let mut prefix = [0; 6];
+    let n = handle
+        .read_control(
+            0xa1,
+            6,
+            id,
+            u16::from(interface),
+            &mut prefix,
+            Duration::from_secs(1),
+        )
+        .map_err(|e| fail(e.to_string()))?;
+    let header =
+        uac3::parse_cluster_header(&prefix[..n], id, 16 * 1024).map_err(|e| fail(e.to_string()))?;
+    let mut content = vec![0; usize::from(header.length)];
+    let n = handle
+        .read_control(
+            0xa1,
+            6,
+            id,
+            u16::from(interface),
+            &mut content,
+            Duration::from_secs(1),
+        )
+        .map_err(|e| fail(e.to_string()))?;
+    let parsed = uac3::parse_cluster(&content[..n], header).map_err(|e| fail(e.to_string()))?;
+    Ok(RoutingCluster { parsed, content })
 }
 
-fn explicit_cluster(bytes: &[u8], offset: usize) -> Result<Cluster, RoutingSessionError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cluster {
+    channels: u8,
+    identity: ClusterIdentity,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClusterIdentity {
+    Explicit { locations: u32, names: u8 },
+    Adc3(Vec<u8>),
+}
+
+fn explicit_cluster(
+    bytes: &[u8],
+    offset: usize,
+    protocol: u8,
+) -> Result<Cluster, RoutingSessionError> {
+    let width = if protocol == 0 { 4 } else { 6 };
     let part = bytes
-        .get(offset..offset + 6)
+        .get(offset..offset + width)
         .ok_or(RoutingSessionError::Invalid(
             InvalidRoute::MalformedDescriptor,
         ))?;
@@ -653,19 +819,18 @@ fn explicit_cluster(bytes: &[u8], offset: usize) -> Result<Cluster, RoutingSessi
             InvalidRoute::UnknownInputChannels,
         ));
     }
+    let locations = if protocol == 0 {
+        u32::from(u16::from_le_bytes([part[1], part[2]]))
+    } else {
+        u32::from_le_bytes([part[1], part[2], part[3], part[4]])
+    };
     Ok(Cluster {
         channels: part[0],
-        locations: u32::from_le_bytes([part[1], part[2], part[3], part[4]]),
-        names: part[5],
+        identity: ClusterIdentity::Explicit {
+            locations,
+            names: part[width - 1],
+        },
     })
-}
-
-fn resolve_cluster(
-    id: u8,
-    nodes: &BTreeMap<u8, &[u8]>,
-    path: &mut Vec<u8>,
-) -> Result<Cluster, RoutingSessionError> {
-    resolve_cluster_cached(id, nodes, path, &mut BTreeMap::new())
 }
 
 fn resolve_cluster_cached(
@@ -673,83 +838,160 @@ fn resolve_cluster_cached(
     nodes: &BTreeMap<u8, &[u8]>,
     path: &mut Vec<u8>,
     cache: &mut BTreeMap<u8, Cluster>,
+    protocol: u8,
+    interface: u8,
+    hc: &BTreeMap<(u8, u16), RoutingCluster>,
 ) -> Result<Cluster, RoutingSessionError> {
     if path.contains(&id) || path.len() >= MAX_TOPOLOGY_DEPTH {
         return Err(RoutingSessionError::UnsupportedTopology(
             "cyclic or excessive source topology".into(),
         ));
     }
-    // Repeated selector pins may share arbitrarily many upstream branches.
-    // Cache completed nodes so a bounded descriptor cannot cause exponential
-    // traversal; cycle detection still applies to the current recursion path.
     if let Some(cluster) = cache.get(&id) {
-        return Ok(*cluster);
+        return Ok(cluster.clone());
     }
     let bytes = *nodes.get(&id).ok_or_else(|| {
         RoutingSessionError::UnsupportedTopology(format!("unresolved source entity {id}"))
     })?;
     path.push(id);
-    let result = (|| match bytes[2] {
-        2 if bytes.len() == 17 => explicit_cluster(bytes, 8),
-        4 => {
+    let mixer_subtype = if protocol == 0x30 { 5 } else { 4 };
+    let selector_subtype = if protocol == 0x30 { 6 } else { 5 };
+    let feature_subtype = if protocol == 0x30 { 7 } else { 6 };
+    let result = (|| {
+        let queried = |at: usize| -> Result<Cluster, RoutingSessionError> {
+            let pair = bytes.get(at..at + 2).ok_or(RoutingSessionError::Invalid(
+                InvalidRoute::MalformedDescriptor,
+            ))?;
+            let cluster_id = u16::from_le_bytes([pair[0], pair[1]]);
+            let c = hc.get(&(interface, cluster_id)).ok_or_else(|| {
+                RoutingSessionError::UnsupportedTopology(
+                    "ADC3 routing requires a resolved HC Cluster".into(),
+                )
+            })?;
+            let channels = u8::try_from(c.parsed.channels.len())
+                .map_err(|_| RoutingSessionError::Invalid(InvalidRoute::UnknownInputChannels))?;
+            if channels == 0 {
+                return Err(RoutingSessionError::Invalid(
+                    InvalidRoute::UnknownInputChannels,
+                ));
+            }
+            Ok(Cluster {
+                channels,
+                identity: ClusterIdentity::Adc3(c.identity()),
+            })
+        };
+        if bytes[2] == 2 {
+            return match protocol {
+                0 if bytes.len() == 12 => explicit_cluster(bytes, 7, protocol),
+                0x20 if bytes.len() == 17 => explicit_cluster(bytes, 8, protocol),
+                0x30 => {
+                    crate::descriptors::uac3::parse_input_terminal(bytes)
+                        .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?;
+                    queried(12)
+                }
+                _ => Err(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                )),
+            };
+        }
+        if bytes[2] == mixer_subtype || bytes[2] == selector_subtype {
             let count = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
                 InvalidRoute::MalformedDescriptor,
             ))?);
             let sources = bytes.get(5..5 + count).ok_or(RoutingSessionError::Invalid(
                 InvalidRoute::MalformedDescriptor,
             ))?;
-            let inputs = sources
-                .iter()
-                .map(|&source_id| {
-                    Ok(InputCluster {
-                        source_id,
-                        channels: resolve_cluster_cached(source_id, nodes, path, cache)?.channels,
-                    })
-                })
-                .collect::<Result<Vec<_>, RoutingSessionError>>()?;
-            MixerUnit::parse(0, bytes, &inputs).map_err(RoutingSessionError::Invalid)?;
-            explicit_cluster(bytes, 5 + count)
-        }
-        5 => {
-            let unit = SelectorUnit::parse(0, bytes).map_err(RoutingSessionError::Invalid)?;
-            let mut cluster = None;
-            for &source in unit.sources() {
-                let next = resolve_cluster_cached(source, nodes, path, cache)?;
-                if cluster.is_some_and(|prior| prior != next) {
-                    return Err(RoutingSessionError::UnsupportedTopology(
-                        "selector input channel clusters differ".into(),
-                    ));
-                }
-                cluster = Some(next);
+            let mut clusters = Vec::new();
+            let mut inputs = Vec::new();
+            for &source_id in sources {
+                let cluster =
+                    resolve_cluster_cached(source_id, nodes, path, cache, protocol, interface, hc)?;
+                inputs.push(InputCluster {
+                    source_id,
+                    channels: cluster.channels,
+                });
+                clusters.push(cluster);
             }
-            cluster.ok_or(RoutingSessionError::Invalid(
-                InvalidRoute::UnknownInputChannels,
-            ))
+            if bytes[2] == mixer_subtype {
+                let output = if protocol == 0x30 {
+                    queried(5 + count)?
+                } else {
+                    explicit_cluster(bytes, 5 + count, protocol)?
+                };
+                parse_mixer(interface, bytes, &inputs, protocol, output.channels)?;
+                return Ok(output);
+            }
+            parse_selector(interface, bytes, protocol)?;
+            if clusters.is_empty() || clusters.iter().any(|c| c != &clusters[0]) {
+                return Err(RoutingSessionError::UnsupportedTopology(
+                    "selector input channel clusters differ or are empty".into(),
+                ));
+            }
+            return Ok(clusters.remove(0));
         }
-        6 if bytes.len() >= 10 => {
-            let cluster = resolve_cluster_cached(bytes[4], nodes, path, cache)?;
-            if bytes.len() != 6 + (usize::from(cluster.channels) + 1) * 4 {
+        if bytes[2] == feature_subtype && bytes.len() >= 6 {
+            let cluster =
+                resolve_cluster_cached(bytes[4], nodes, path, cache, protocol, interface, hc)?;
+            let valid = match protocol {
+                0 => {
+                    bytes[5] > 0
+                        && bytes.len()
+                            == 7 + (usize::from(cluster.channels) + 1) * usize::from(bytes[5])
+                }
+                0x20 => bytes.len() == 6 + (usize::from(cluster.channels) + 1) * 4,
+                0x30 => crate::descriptors::uac3::parse_feature_unit(bytes)
+                    .is_ok_and(|f| f.controls.len() == usize::from(cluster.channels) + 1),
+                _ => false,
+            };
+            if !valid {
                 return Err(RoutingSessionError::Invalid(
                     InvalidRoute::MalformedDescriptor,
                 ));
             }
-            Ok(cluster)
+            return Ok(cluster);
         }
-        _ => Err(RoutingSessionError::UnsupportedTopology(format!(
+        Err(RoutingSessionError::UnsupportedTopology(format!(
             "source entity {id} has unsupported channel topology"
-        ))),
+        )))
     })();
     path.pop();
     if let Ok(cluster) = &result {
-        cache.insert(id, *cluster);
+        cache.insert(id, cluster.clone());
     }
     result
 }
 
-fn inventory_from_config(
-    raw: &[u8],
+fn parse_selector(
+    interface: u8,
+    bytes: &[u8],
+    protocol: u8,
+) -> Result<SelectorUnit, RoutingSessionError> {
+    match protocol {
+        0 => SelectorUnit::parse_uac1(interface, bytes),
+        0x30 => SelectorUnit::parse_adc3(interface, bytes),
+        _ => SelectorUnit::parse(interface, bytes),
+    }
+    .map_err(RoutingSessionError::Invalid)
+}
+fn parse_mixer(
+    interface: u8,
+    bytes: &[u8],
+    inputs: &[InputCluster],
+    protocol: u8,
+    outputs: u8,
+) -> Result<MixerUnit, RoutingSessionError> {
+    match protocol {
+        0 => MixerUnit::parse_uac1(interface, bytes, inputs),
+        0x30 => MixerUnit::parse_adc3(interface, bytes, inputs, outputs),
+        _ => MixerUnit::parse(interface, bytes, inputs),
+    }
+    .map_err(RoutingSessionError::Invalid)
+}
+
+fn routing_interfaces<'a>(
+    raw: &'a [u8],
     claims: &[u8],
-) -> Result<RoutingInventory, RoutingSessionError> {
+) -> Result<BTreeMap<u8, (u8, Vec<&'a [u8]>)>, RoutingSessionError> {
     if raw.len() < 9
         || raw[0] != 9
         || raw[1] != 2
@@ -759,7 +1001,7 @@ fn inventory_from_config(
             InvalidRoute::MalformedDescriptor,
         ));
     }
-    let mut interfaces: BTreeMap<u8, Vec<&[u8]>> = BTreeMap::new();
+    let mut interfaces = BTreeMap::new();
     let mut current = None;
     for bytes in framed(raw)? {
         if bytes[1] == 4 {
@@ -772,22 +1014,40 @@ fn inventory_from_config(
             if bytes[3] == 0
                 && bytes[5] == 1
                 && bytes[6] == 1
-                && bytes[7] == 0x20
+                && [0, 0x20, 0x30].contains(&bytes[7])
                 && claims.contains(&bytes[2])
             {
-                if interfaces.insert(bytes[2], Vec::new()).is_some() {
+                if interfaces
+                    .insert(bytes[2], (bytes[7], Vec::new()))
+                    .is_some()
+                {
                     return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
                 }
                 current = Some(bytes[2]);
             }
         } else if bytes[1] == 0x24 {
             if let Some(interface) = current {
-                interfaces.get_mut(&interface).unwrap().push(bytes);
+                interfaces.get_mut(&interface).unwrap().1.push(bytes);
             }
         }
     }
+    Ok(interfaces)
+}
+
+#[cfg(test)]
+fn inventory_from_config(
+    raw: &[u8],
+    claims: &[u8],
+) -> Result<RoutingInventory, RoutingSessionError> {
+    inventory_with_clusters(raw, claims, &BTreeMap::new())
+}
+fn inventory_with_clusters(
+    raw: &[u8],
+    claims: &[u8],
+    hc: &BTreeMap<(u8, u16), RoutingCluster>,
+) -> Result<RoutingInventory, RoutingSessionError> {
     let mut inventory = RoutingInventory::default();
-    for (interface, descriptors) in interfaces {
+    for (interface, (protocol, descriptors)) in routing_interfaces(raw, claims)? {
         let mut nodes = BTreeMap::new();
         let mut header = None;
         for &bytes in &descriptors {
@@ -809,44 +1069,77 @@ fn inventory_from_config(
         let header = header.ok_or(RoutingSessionError::Invalid(
             InvalidRoute::MalformedDescriptor,
         ))?;
-        if header.len() != 9
-            || header[3..5] != [0, 2]
-            || usize::from(u16::from_le_bytes([header[6], header[7]]))
-                != descriptors.iter().map(|d| d.len()).sum::<usize>()
-        {
+        let total = match protocol {
+            0 if header.len() >= 8
+                && header[3..5] == [0, 1]
+                && header.len() == 8 + usize::from(header[7]) =>
+            {
+                u16::from_le_bytes([header[5], header[6]])
+            }
+            0x20 if header.len() == 9 && header[3..5] == [0, 2] => {
+                u16::from_le_bytes([header[6], header[7]])
+            }
+            0x30 => {
+                crate::descriptors::uac3::parse_ac_header(header)
+                    .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?
+                    .total_length
+            }
+            _ => {
+                return Err(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ))
+            }
+        };
+        if usize::from(total) != descriptors.iter().map(|d| d.len()).sum::<usize>() {
             return Err(RoutingSessionError::Invalid(
                 InvalidRoute::MalformedDescriptor,
             ));
         }
+        let mut cache = BTreeMap::new();
         for &bytes in nodes.values() {
-            let unit = match bytes[2] {
-                4 => {
-                    // Recursive validation also checks the upstream mixer/selector geometry.
-                    resolve_cluster(bytes[3], &nodes, &mut Vec::new())?;
-                    let count = usize::from(bytes[4]);
-                    let inputs = bytes[5..5 + count]
-                        .iter()
-                        .map(|&source_id| {
-                            Ok(InputCluster {
+            let mixer = if protocol == 0x30 { 5 } else { 4 };
+            let selector = if protocol == 0x30 { 6 } else { 5 };
+            if bytes[2] != mixer && bytes[2] != selector {
+                continue;
+            }
+            let output = resolve_cluster_cached(
+                bytes[3],
+                &nodes,
+                &mut Vec::new(),
+                &mut cache,
+                protocol,
+                interface,
+                hc,
+            )?;
+            let unit = if bytes[2] == selector {
+                RoutingUnit::Selector(parse_selector(interface, bytes, protocol)?)
+            } else {
+                let count = usize::from(bytes[4]);
+                let inputs = bytes[5..5 + count]
+                    .iter()
+                    .map(|&source_id| {
+                        Ok(InputCluster {
+                            source_id,
+                            channels: resolve_cluster_cached(
                                 source_id,
-                                channels: resolve_cluster(source_id, &nodes, &mut Vec::new())?
-                                    .channels,
-                            })
+                                &nodes,
+                                &mut Vec::new(),
+                                &mut cache,
+                                protocol,
+                                interface,
+                                hc,
+                            )?
+                            .channels,
                         })
-                        .collect::<Result<Vec<_>, RoutingSessionError>>()?;
-                    RoutingUnit::Mixer(
-                        MixerUnit::parse(interface, bytes, &inputs)
-                            .map_err(RoutingSessionError::Invalid)?,
-                    )
-                }
-                5 => {
-                    resolve_cluster(bytes[3], &nodes, &mut Vec::new())?;
-                    RoutingUnit::Selector(
-                        SelectorUnit::parse(interface, bytes)
-                            .map_err(RoutingSessionError::Invalid)?,
-                    )
-                }
-                _ => continue,
+                    })
+                    .collect::<Result<Vec<_>, RoutingSessionError>>()?;
+                RoutingUnit::Mixer(parse_mixer(
+                    interface,
+                    bytes,
+                    &inputs,
+                    protocol,
+                    output.channels,
+                )?)
             };
             inventory
                 .insert(unit)
@@ -854,6 +1147,131 @@ fn inventory_from_config(
         }
     }
     Ok(inventory)
+}
+
+/// Query only already claimed AC functions. Sleeping/unknown domains are a
+/// typed refusal: capability discovery never changes a device's power state.
+fn routing_clusters(
+    device: &UsbDevice,
+    raw: &[u8],
+) -> Result<BTreeMap<(u8, u16), RoutingCluster>, RoutingSessionError> {
+    let interfaces = routing_interfaces(raw, &device.claimed_interfaces)?;
+    let idle = IDLE_LOCK.lock();
+    let idle = idle
+        .as_ref()
+        .filter(|i| i.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState("routing lost idle owner".into()))
+        })?;
+    let mut clusters = BTreeMap::new();
+    for (interface, (protocol, descriptors)) in interfaces {
+        if protocol != 0x30 {
+            continue;
+        }
+        let mut domains = BTreeMap::new();
+        let mut members = std::collections::BTreeSet::new();
+        for bytes in &descriptors {
+            if bytes.get(2) != Some(&0x10) {
+                continue;
+            }
+            let domain = crate::descriptors::uac3::parse_power_domain(bytes)
+                .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?;
+            if domains.insert(domain.id, domain.clone()).is_some()
+                || domain.entities.iter().any(|e| !members.insert(*e))
+            {
+                return Err(RoutingSessionError::UnsupportedTopology(
+                    "ADC3 routing power domains overlap or repeat".into(),
+                ));
+            }
+        }
+        let nodes: BTreeMap<_, _> = descriptors
+            .iter()
+            .filter(|b| b.len() >= 4 && b[2] != 1)
+            .map(|b| (b[3], *b))
+            .collect();
+        let mut affected = std::collections::BTreeSet::new();
+        let mut pending: Vec<_> = nodes
+            .values()
+            .filter(|b| matches!(b[2], 5 | 6))
+            .map(|b| b[3])
+            .collect();
+        while let Some(id) = pending.pop() {
+            if !affected.insert(id) {
+                continue;
+            }
+            let bytes = nodes.get(&id).ok_or_else(|| {
+                RoutingSessionError::UnsupportedTopology("unresolved ADC3 routing source".into())
+            })?;
+            match bytes[2] {
+                5 | 6 => {
+                    let pins = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ))?);
+                    pending.extend(bytes.get(5..5 + pins).ok_or(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ))?);
+                }
+                7 => pending.push(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ))?),
+                _ => {}
+            }
+        }
+        // Prove D0 only for domains containing exposed units or their sources.
+        for id in domains
+            .values()
+            .filter(|d| d.entities.iter().any(|e| affected.contains(e)))
+            .map(|d| d.id)
+        {
+            let mut state = [0xff];
+            let n = idle
+                .handle
+                .read_control(
+                    0xa1,
+                    1,
+                    0x0200,
+                    (u16::from(id) << 8) | u16::from(interface),
+                    &mut state,
+                    Duration::from_secs(1),
+                )
+                .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+            if n != 1 || state[0] != 0 {
+                return Err(RoutingSessionError::UnsupportedTopology("ADC3 routing requires already-D0 entity domains; waking requires an owned power lease".into()));
+            }
+        }
+        for bytes in descriptors {
+            if bytes.len() < 4 || !affected.contains(&bytes[3]) {
+                continue;
+            }
+            let id = match bytes.get(2) {
+                Some(2) => Some(
+                    crate::descriptors::uac3::parse_input_terminal(bytes)
+                        .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?
+                        .cluster_id,
+                ),
+                Some(5) => {
+                    let pins = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ))?);
+                    let pair =
+                        bytes
+                            .get(5 + pins..7 + pins)
+                            .ok_or(RoutingSessionError::Invalid(
+                                InvalidRoute::MalformedDescriptor,
+                            ))?;
+                    Some(u16::from_le_bytes([pair[0], pair[1]]))
+                }
+                _ => None,
+            };
+            if let Some(id) = id {
+                if !clusters.contains_key(&(interface, id)) {
+                    let cluster = query_routing_cluster(&idle.handle, interface, id)?;
+                    clusters.insert((interface, id), cluster);
+                }
+            }
+        }
+    }
+    Ok(clusters)
 }
 
 fn verify_snapshot(
@@ -871,7 +1289,15 @@ fn verify_snapshot(
             "configuration or descriptors changed; rediscover routing".into(),
         ));
     }
-    let mut io = UsbRoutingIo { device };
+    if routing_clusters(device, &descriptors)? != snapshot.hc_clusters {
+        return Err(RoutingSessionError::Drift(
+            "ADC3 HC Clusters changed; rediscover routing".into(),
+        ));
+    }
+    let mut io = UsbRoutingIo {
+        device,
+        descriptors: &snapshot.descriptors,
+    };
     verify_values(&snapshot.inventory, &mut io, &snapshot.selectors)
 }
 
@@ -902,9 +1328,14 @@ pub(crate) fn discover() -> Result<RoutingSnapshot, RoutingSessionError> {
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
-    let inventory = inventory_from_config(&descriptors, &device.claimed_interfaces)?;
+    let hc_clusters = routing_clusters(&device, &descriptors)?;
+    let inventory =
+        inventory_with_clusters(&descriptors, &device.claimed_interfaces, &hc_clusters)?;
     let mut selectors = Vec::new();
-    let mut io = UsbRoutingIo { device: &device };
+    let mut io = UsbRoutingIo {
+        device: &device,
+        descriptors: &descriptors,
+    };
     for unit in inventory.units() {
         if let RoutingUnit::Selector(selector) = unit {
             if selector.access() != Access::Absent {
@@ -924,6 +1355,7 @@ pub(crate) fn discover() -> Result<RoutingSnapshot, RoutingSessionError> {
         descriptors,
         inventory,
         selectors,
+        hc_clusters,
     })
 }
 
@@ -939,7 +1371,10 @@ pub(crate) fn read(
         .inventory
         .control(key)
         .map_err(RoutingSessionError::Invalid)?
-        .read_current(&mut UsbRoutingIo { device: &device })
+        .read_current(&mut UsbRoutingIo {
+            device: &device,
+            descriptors: &snapshot.descriptors,
+        })
         .map_err(RoutingSessionError::Control)
 }
 
@@ -997,7 +1432,10 @@ pub(crate) fn apply(
             value: e.value,
         })
         .collect::<Vec<_>>();
-    let mut io = UsbRoutingIo { device: &device };
+    let mut io = UsbRoutingIo {
+        device: &device,
+        descriptors: &snapshot.descriptors,
+    };
     verify_values(&snapshot.inventory, &mut io, &expected)?;
     let report = match routing::apply_routes(&snapshot.inventory, &mut io, &changes) {
         Ok(report) => report,
@@ -1076,7 +1514,15 @@ pub(super) fn finish_routing_hand_back() {
                 item.value = *last;
             }
         }
-        let mut io = UsbRoutingIo { device: &device };
+        if routing_clusters(&device, &raw)? != record.snapshot.hc_clusters {
+            return Err(RoutingSessionError::Drift(
+                "ADC3 HC Clusters changed before routing hand-back".into(),
+            ));
+        }
+        let mut io = UsbRoutingIo {
+            device: &device,
+            descriptors: &record.snapshot.descriptors,
+        };
         verify_values(&record.snapshot.inventory, &mut io, &expected)?;
         let current = record
             .values
@@ -1172,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn unclaimed_and_other_protocol_interfaces_never_expose_controls() {
+    fn unclaimed_unknown_and_mismatched_protocols_never_expose_controls() {
         let entities = [terminal(1, 2, 3), terminal(2, 2, 3), selector()];
         assert_eq!(
             inventory_from_config(&configuration(&entities, 0x20), &[4])
@@ -1181,14 +1627,16 @@ mod tests {
                 .count(),
             0
         );
-        for protocol in [0, 0x30, 0xff] {
-            assert_eq!(
-                inventory_from_config(&configuration(&entities, protocol), &[3])
-                    .unwrap()
-                    .units()
-                    .count(),
-                0
-            );
+        assert_eq!(
+            inventory_from_config(&configuration(&entities, 0xff), &[3])
+                .unwrap()
+                .units()
+                .count(),
+            0
+        );
+        // Reinterpreting UAC2 descriptor bytes under another protocol is refused.
+        for protocol in [0, 0x30] {
+            assert!(inventory_from_config(&configuration(&entities, protocol), &[3]).is_err());
         }
     }
 
@@ -1261,6 +1709,99 @@ mod tests {
                 InvalidRoute::MalformedDescriptor
             ))
         ));
+    }
+
+    #[test]
+    fn uac1_inventory_resolves_explicit_source_clusters() {
+        let terminal = vec![12, 0x24, 2, 1, 1, 1, 0, 2, 3, 0, 0, 0];
+        let selector = vec![7, 0x24, 5, 7, 1, 1, 0];
+        let mixer = vec![12, 0x24, 4, 9, 1, 7, 2, 3, 0, 0, 0xf0, 0];
+        let mut raw = configuration(&[terminal, selector, mixer], 0);
+        raw[21..23].copy_from_slice(&[0, 1]);
+        let total = raw.len() - 18;
+        raw[23..25].copy_from_slice(&(total as u16).to_le_bytes());
+        raw[25] = 1;
+        raw[26] = 4;
+        let inventory = inventory_from_config(&raw, &[3]).unwrap();
+        let control = inventory
+            .control(ControlKey::Crosspoint {
+                entity: Entity {
+                    interface: 3,
+                    id: 9,
+                },
+                input_pin: 1,
+                input_channel: 2,
+                output_channel: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                control.current_request().unwrap().request,
+                control.current_request().unwrap().value
+            ),
+            (0x81, 0x0202)
+        );
+        assert!(validate_protocol_request(control.current_request().unwrap(), true, 2, 0).is_ok());
+        assert!(
+            validate_protocol_request(control.current_request().unwrap(), true, 2, 0x20).is_err()
+        );
+    }
+
+    #[test]
+    fn adc3_inventory_requires_hc_and_preserves_cluster_content_identity() {
+        use crate::descriptors::uac3::{Channel, ChannelRelationship, Cluster as HcCluster};
+        let terminal = |id, cluster| {
+            vec![
+                20, 0x24, 2, id, 1, 1, 0, 10, 0, 0, 0, 0, cluster, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        };
+        let selector = vec![13, 0x24, 6, 7, 2, 1, 2, 3, 0, 0, 0, 0, 0];
+        let mixer = vec![15, 0x24, 5, 9, 1, 7, 3, 0, 0xf0, 0, 0, 0, 0, 0, 0];
+        let entities = [terminal(1, 1), terminal(2, 2), selector, mixer];
+        let total = 10 + entities.iter().map(Vec::len).sum::<usize>();
+        let mut raw = vec![9, 2, 0, 0, 1, 1, 0, 0x80, 50, 9, 4, 3, 0, 0, 1, 1, 0x30, 0];
+        raw.extend([10, 0x24, 1, 1, total as u8, (total >> 8) as u8, 0, 0, 0, 0]);
+        for entity in entities {
+            raw.extend(entity);
+        }
+        let len = raw.len() as u16;
+        raw[2..4].copy_from_slice(&len.to_le_bytes());
+        assert!(inventory_from_config(&raw, &[3]).is_err());
+        let channel = |relationship| Channel::Information {
+            purpose: 1,
+            relationship,
+            group: 0,
+        };
+        let channels = vec![
+            channel(ChannelRelationship::Left),
+            channel(ChannelRelationship::Right),
+        ];
+        let mut hc = BTreeMap::new();
+        for id in 1..=3 {
+            hc.insert(
+                (3, id),
+                RoutingCluster {
+                    parsed: HcCluster {
+                        id,
+                        channels: channels.clone(),
+                    },
+                    content: vec![9, 0, 0x26, 0, id as u8, 0, 2, 2, 3],
+                },
+            );
+        }
+        let inventory = inventory_with_clusters(&raw, &[3], &hc).unwrap();
+        assert_eq!(inventory.units().count(), 2);
+        // Equal content with distinct IDs is legal; same count but changed content is not.
+        hc.get_mut(&(3, 2)).unwrap().content[7] = 1;
+        assert!(inventory_with_clusters(&raw, &[3], &hc).is_err());
+        hc.clear();
+        assert_eq!(
+            inventory_with_clusters(&raw, &[4], &hc)
+                .unwrap()
+                .units()
+                .count(),
+            0
+        );
     }
 
     #[test]

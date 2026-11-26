@@ -56,24 +56,36 @@ fn builtin_layout(id: UsbIdentity) -> Option<(u8, bool)> {
     }
 }
 
-// DEVICE_FLG and VENDOR_FLG RAW_DATA facts from the pinned source. Vendor
-// membership only interprets an actual UAC2 RAW_DATA descriptor; it neither
-// guesses a chipset nor authorizes any vendor control operation.
+// DEVICE_FLG and VENDOR_FLG RAW_DATA facts from Linux v7.3 quirks.c,
+// c03c1a14507dfaf8b856c2608f9ac216021fc222, lines 2426-2646.
+// Upstream stops at the first exact row, even when that row omits RAW_DATA.
+// These defaults interpret descriptors; explicit host policy remains separate.
 fn raw_data_device(id: UsbIdentity) -> bool {
-    matches!(id.vendor,
-        0x1511 | 0x152a | 0x18d1 | 0x20b1 | 0x21ed | 0x22d9 | 0x23ba
-        | 0x25ce | 0x2622 | 0x2772 | 0x278b | 0x292b | 0x2972 | 0x2ab6
-        | 0x2afd | 0x2d87 | 0x2fc6 | 0x3336 | 0x3353 | 0x35f4 | 0x3842
-        | 0xc502)
-    || matches!((id.vendor, id.product),
+    match (id.vendor, id.product) {
+        (0x152a, 0x880a) // NeuralDSP Quad Cortex
+        | (0x2772, 0x0502) // Musical Fidelity M6s DAC
+        | (0x2fc6, 0xf06b) // MOONDROP Moonriver2 Ti
+        | (0x2fc6, 0xf0b5) // iBasso DC-Elite
+        | (0x2fc6, 0xf0b7) => return false, // iBasso DC07 Pro
         (0x0661, 0x0883) // iBasso DC04 Ultra
+        | (0x152a, 0x85dd) // SMSL USB DAC
         | (0x154e, 0x300b) // Marantz SA-KI RUBY / SA-12
         | (0x16d0, 0x0ab1) // PureAudio APA DAC
         | (0x16d0, 0xeca1) // PureAudio Lotus DAC5 family
         | (0x20b1, 0x2009) // DIYINHK USB Audio 2.0
         | (0x21b4, 0x0230) // Ayre QB-9 Twenty
         | (0x21b4, 0x0232) // Ayre QX-5 Twenty
-        | (0x262a, 0x9302)) // ddHiFi TC44C
+        | (0x22e8, 0xca10) // Cambridge Audio streamers
+        | (0x262a, 0x9302) // ddHiFi TC44C
+        | (0x32bb, 0x0004) => return true, // HiBy FC4
+        _ => {}
+    }
+    // Vendor membership alone neither guesses a chipset nor authorizes writes.
+    matches!(id.vendor,
+        0x1511 | 0x152a | 0x18d1 | 0x20b1 | 0x21ed | 0x22d9 | 0x23ba
+        | 0x25ce | 0x2622 | 0x2772 | 0x278b | 0x292b | 0x2972 | 0x2ab6
+        | 0x2afd | 0x2d87 | 0x2fc6 | 0x3336 | 0x3353 | 0x35f4 | 0x3842
+        | 0xc502)
 }
 
 fn playback_designs_layout(id: UsbIdentity, alt: u8) -> Option<u8> {
@@ -93,6 +105,57 @@ fn playback_designs_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfac
         || format.bit_resolution == 0 || format.bit_resolution > width * 8 { return None; }
     Some(NativeDsdProfile { word_bytes: width, big_endian: false, bit_reverse: true,
         origin: NativeDsdOrigin::DeviceCompatibility })
+}
+
+// Legacy alt 1 has two DSD payload bytes plus one DoP marker on the wire.
+// Linux quirks.c:1988-2000, endpoint.c:1111-1121 and pcm.c's DoP writer.
+fn playback_designs_dop_profile(id: UsbIdentity, alt: u8,
+                                format: &StreamingInterfaceFormat, count: usize) -> bool {
+    id.vendor == 0x23ba && id.product < 0x0110 && alt == 1 && count == 1
+        && format.channels == 2
+        && matches!((format.subslot_size, format.bit_resolution), (2, 16) | (3, 24))
+}
+
+pub(super) fn resolve_playback_designs_dop(device: &Device<Context>, config: &ConfigDescriptor,
+                                          alt: &rusb::InterfaceDescriptor,
+                                          format: &StreamingInterfaceFormat) -> bool {
+    let Some(id) = identity(device) else { return false; };
+    if !playback_designs_dop_profile(id, alt.setting_number(), format, 1) { return false; }
+    let eligible = |d: &rusb::InterfaceDescriptor| {
+        if d.class_code() != USB_CLASS_AUDIO || d.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
+            || d.setting_number() != 1 || !matches!(d.protocol_code(), 0 | 0x20) { return false; }
+        let Some(f) = parse_android_streaming_interface_format(d) else { return false; };
+        if !playback_designs_dop_profile(id, 1, &f, 1) { return false; }
+        let mut outs = 0;
+        for ep in d.endpoint_descriptors() {
+            if ep.direction() == Direction::Out {
+                if ep.transfer_type() != TransferType::Isochronous
+                    || !matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
+                    || !(1..=16).contains(&ep.interval())
+                    || !itf_packet_geometry(ep.max_packet_size(), device.speed())
+                    || ep.max_packet_size() & 0x07ff < 6 { return false; }
+                outs += 1;
+            }
+        }
+        outs == 1
+    };
+    eligible(alt) && config.interfaces().flat_map(|i| i.descriptors()).filter(eligible).count() == 1
+}
+
+pub(super) fn playback_designs_dop_capacity(max_bytes: usize, interval_us: u32, rate: u32) -> bool {
+    interval_us > 0 && rate > 0 && max_bytes >= required_max_packet_bytes(rate, interval_us, 6)
+}
+
+/// Derive a wire carrier only for the explicit DoP request. Descriptor PCM
+/// eligibility remains unchanged for independent PCM requests and discovery.
+pub(super) fn apply_playback_designs_dop(format: &mut StreamingInterfaceFormat,
+                                       playback: PlaybackFormat, resolved: bool) {
+    if resolved && playback.is_dop && playback.dsd_transport != DsdTransportMode::Native {
+        format.format_tag = FORMAT_TAG_PCM;
+        format.subslot_size = 3;
+        format.bit_resolution = 24;
+        format.native_dsd = None;
+    }
 }
 
 fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat,
@@ -435,6 +498,10 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
         && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
         && (1..=16).contains(&ep.interval()) && ep.max_packet_size() & 0x07ff > 0).count();
     if out_count(alt) != 1 { return None; }
+    // A host native hint cannot reinterpret this source-backed DoP alternate.
+    if id.vendor == 0x23ba && id.product < 0x0110 && alt.setting_number() == 1 {
+        return None;
+    }
     let settings = settings();
     let playback_designs = playback_designs_layout(id, alt.setting_number()).and_then(|width| {
         let count = config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
@@ -530,6 +597,87 @@ mod tests {
         StreamingInterfaceFormat { format_tag: FORMAT_TAG_PCM, uac2_formats: Some(1), native_dsd: None,
             channels: 2, subslot_size: 4, bit_resolution: 32, terminal_link: None,
             is_uac1: false, sample_rate_ranges: vec![] }
+    }
+    #[test]
+    fn v73_raw_exact_rows_override_vendor_defaults() {
+        let mut raw = format(); raw.uac2_formats = Some(0x8000_0000);
+        for (vendor, product) in [(0x22e8, 0xca10), (0x32bb, 0x0004), (0x152a, 0x85dd)] {
+            let id = UsbIdentity { vendor, product, revision: 0 };
+            assert!(raw_data_device(id));
+            assert_eq!(raw_data_profile(id, &raw, 1).unwrap().signature(), (4, true, false));
+            let mut pcm = raw.clone(); pcm.uac2_formats = Some(1);
+            assert!(raw_data_profile(id, &pcm, 1).is_none());
+        }
+        for (vendor, product) in [(0x152a, 0x880a), (0x2772, 0x0502),
+            (0x2fc6, 0xf06b), (0x2fc6, 0xf0b5), (0x2fc6, 0xf0b7)] {
+            let id = UsbIdentity { vendor, product, revision: 0 };
+            assert!(!raw_data_device(id));
+            assert!(raw_data_profile(id, &raw, 1).is_none());
+            // The exact veto must not disable an otherwise admitted sibling.
+            assert!(raw_data_device(UsbIdentity { product: 0xffff, ..id }));
+        }
+        for (vendor, product) in [(0x22e8, 0xca11), (0x32bb, 0x0005)] {
+            assert!(!raw_data_device(UsbIdentity { vendor, product, revision: 0 }));
+        }
+    }
+    #[test]
+    fn legacy_dop_is_exact_and_keeps_pcm_and_native_independent() {
+        let id = UsbIdentity { vendor: 0x23ba, product: 0x010f, revision: 0 };
+        let mut f = format();
+        f.format_tag = 0; f.uac2_formats = Some(0x8000_0000);
+        f.subslot_size = 2; f.bit_resolution = 16;
+        assert!(playback_designs_dop_profile(id, 1, &f, 1));
+        for bad in [UsbIdentity { product: 0x0110, ..id }, UsbIdentity { vendor: 0x20b1, ..id }] {
+            assert!(!playback_designs_dop_profile(bad, 1, &f, 1));
+        }
+        assert!(!playback_designs_dop_profile(id, 2, &f, 1));
+        assert!(!playback_designs_dop_profile(id, 1, &f, 2));
+        assert!(playback_designs_profile(id, 1, &f, 1).is_none());
+        let mut wrong = f.clone(); wrong.subslot_size = 4; wrong.bit_resolution = 32;
+        assert!(!playback_designs_dop_profile(id, 1, &wrong, 1));
+        wrong = f.clone(); wrong.channels = 4;
+        assert!(!playback_designs_dop_profile(id, 1, &wrong, 1));
+        wrong = f.clone(); wrong.bit_resolution = 0;
+        assert!(!playback_designs_dop_profile(id, 1, &wrong, 1));
+        let mut carrier = f.clone(); carrier.subslot_size = 3; carrier.bit_resolution = 24;
+        assert!(playback_designs_dop_profile(id, 1, &carrier, 1));
+        let dop = PlaybackFormat { sample_rate:176_400, bit_depth:24, channels:2,
+            is_dop:true, dsd_transport:DsdTransportMode::DoP, dsd_bit_rate:2_822_400 };
+        let mut wire = f.clone();
+        apply_playback_designs_dop(&mut wire, dop, true);
+        assert_eq!((wire.subslot_size, wire.bit_resolution), (3, 24));
+        assert_eq!(transport_compatibility_penalty(&wire, dop), 0);
+        assert_eq!(native_wire_rate(dop, wire.subslot_size), Some(176_400));
+        assert_eq!(transport_compatibility_penalty(&wire,
+            PlaybackFormat { bit_depth:32, ..dop }), u32::MAX);
+        assert_eq!(required_max_packet_bytes(176_400, 125, 6), 138);
+        assert!(!playback_designs_dop_capacity(137, 125, 176_400));
+        assert!(playback_designs_dop_capacity(138, 125, 176_400));
+        apply_playback_designs_dop(&mut f, PlaybackFormat { is_dop:false, ..dop }, true);
+        assert_eq!(f.format_tag, 0);
+        f.format_tag = FORMAT_TAG_PCM;
+        assert_eq!(transport_compatibility_penalty(&f,
+            PlaybackFormat { is_dop:false, bit_depth:16, ..dop }), 0);
+    }
+    #[test]
+    fn legacy_dop_uses_existing_marker_phase_and_three_byte_encoder() {
+        let mut ring = PcmRing::new(8, 2);
+        assert_eq!(ring.push_samples(&[0xfa112200u32 as i32, 0xfa334400u32 as i32]), 2);
+        let mut words = [0; 4];
+        assert!(ring.pop_into_or_pad(&mut words, 2, DsdTransportMode::DoP));
+        let mut bytes = [0; 12];
+        encode_usb_pcm_slots(&words, &mut bytes, 3, 24, DsdTransportMode::DoP,
+            2, false, false).unwrap();
+        assert_eq!(bytes, [0x22,0x11,0x05,0x44,0x33,0x05,
+            0x69,0x69,0xfa,0x69,0x69,0xfa]);
+        // A later USB batch continues phase from the shared ring owner.
+        assert_eq!(ring.push_samples(&[0x05556600, 0x05778800]), 2);
+        let mut resumed = [0; 2];
+        assert!(!ring.pop_into_or_pad(&mut resumed, 2, DsdTransportMode::DoP));
+        let mut next = [0; 6];
+        encode_usb_pcm_slots(&resumed, &mut next, 3, 24, DsdTransportMode::DoP,
+            2, false, false).unwrap();
+        assert_eq!(next, [0x66,0x55,0x05,0x88,0x77,0x05]);
     }
     #[test]
     fn amanero_revisions_are_exact_and_byte_order_is_firmware_scoped() {
