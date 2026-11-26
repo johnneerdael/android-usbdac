@@ -6,7 +6,7 @@ Each entry says what changed, then what that means **in plain terms**.
 
 Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used.
 
-Nothing on this page has been confirmed on hardware yet. Every item is covered by automated tests; see [the status](index.md#status).
+Every item is covered by automated tests. Hardware testing has only begun: direct USB has played on one phone and one DAC. See [the status](index.md#status).
 
 ## Sound that does not drop out
 
@@ -148,7 +148,7 @@ A Kotlin API for Android, a sample app that the guide's code is taken from, auto
 - **Implicit feedback** is not supported; such devices are refused (see above).
 - **One DAC at a time** per app.
 - **Playback only**, for USB Audio Class 1 and 2 devices.
-- **Not yet confirmed on hardware.** A build of Flick that runs on this library exists for that purpose.
+- **Only lightly tested on hardware.** One phone and one DAC so far, through a build of Flick that runs on this library.
 
 ## Where it came from
 

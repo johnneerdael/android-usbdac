@@ -13,7 +13,7 @@ usbdac plays audio from an Android app to a USB DAC. It comes as an Android libr
 This is a 0.1 pre-release.
 
 - **Automated checks pass.** The driver has several hundred tests that run without a DAC, the Kotlin layer has its own, and every push builds the library and the sample app for four processor types.
-- **Nothing has been confirmed on hardware yet.** The driver grew out of code that has played to real DACs inside Flick, but it has changed a great deal since, and the public API, the Kotlin SDK and the two non-USB outputs are new. A build of Flick that runs on this library exists for hardware testing. Expect to find problems, and report them with the logcat of the tag `usbdac`.
+- **Hardware testing has only begun.** The Rust driver has played PCM on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U), inside a build of Flick that runs on this library. Other phones and DACs, DSD and DoP, the Kotlin SDK, the sample app, the Android-managed output and the AAudio output have not been run on hardware yet. Expect to find problems, and report them with the logcat of the tag `usbdac`.
 
 ## Which transport to use
 

@@ -39,9 +39,10 @@ technically, and in plain terms. In short:
 Several of these came from studying how two other open-source players, Mornye
 and BitChord, behave with the same DACs. No code from either was used.
 
-**Status: 0.1 pre-release.** All automated checks pass. Nothing has been
-confirmed on hardware yet; a build of Flick that runs on this library exists
-for that purpose.
+**Status: 0.1 pre-release.** All automated checks pass. Direct USB has played
+on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U) through a build
+of Flick that runs on this library. Other phones and DACs, DSD, the Kotlin SDK
+and the two Android-managed outputs are not yet confirmed on hardware.
 
 ## Layout
 
