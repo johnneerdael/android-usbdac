@@ -4,7 +4,7 @@ usbdac began as the USB DAC driver inside the Flick music player. It has since b
 
 Each entry says what changed, then what that means **in plain terms**.
 
-Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used.
+Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used. Each change has a longer entry in [the design decisions](decisions.md), with what each of the three drivers does, the evidence and the public references.
 
 Every item is covered by automated tests. Hardware testing has only begun: direct USB has played on one phone and one DAC. See [the status](index.md#status).
 

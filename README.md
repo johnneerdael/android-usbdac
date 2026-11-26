@@ -17,6 +17,8 @@ and permissions allow. [SDK guide](https://johnneerdael.github.io/android-usbdac
 Download the AAR, native libraries and crate archives from
 [GitHub Releases](https://github.com/johnneerdael/android-usbdac/releases).
 
+The same site has the developer documentation: [design decisions](https://johnneerdael.github.io/android-usbdac/decisions.html) (each compared with what Flick, Mornye and BitChord do, with the evidence and public references), an [architecture](https://johnneerdael.github.io/android-usbdac/architecture.html) page, an [integration guide](https://johnneerdael.github.io/android-usbdac/integration.html) and an [evidence and status](https://johnneerdael.github.io/android-usbdac/evidence.html) page.
+
 ## Where it came from, and what changed
 
 usbdac started from the USB DAC driver of the [Flick](https://github.com/moss-apps/Flick)

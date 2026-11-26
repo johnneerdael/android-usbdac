@@ -11,6 +11,16 @@ opened and what it could verify.
 - Add `usbdac-core` with Cargo for Rust apps on Android or Linux that manage
   USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
 
+## Where to start
+
+| If you want to ... | Read |
+|---|---|
+| Add bit-perfect USB output to a player | [The integration guide](integration.md), then [getting started](getting-started.md) |
+| Understand why it behaves as it does, and what the other open-source drivers do differently | [Design decisions](decisions.md), [the drivers studied](drivers.md) |
+| See what is proven and what is not | [Evidence and status](evidence.md) |
+| Learn how the code is organised | [Architecture](architecture.md), and [USB audio in a page](usb-audio-primer.md) if the terms are new |
+| Find a setting or an error code | [Controls and configuration](controls.md), [troubleshooting](troubleshooting.md) |
+
 ## Playback routes
 
 - **Direct USB.** The library takes the DAC away from Android's audio stack and drives it itself: it sets the DAC's clock, sends the samples in the DAC's own format over isochronous USB transfers, paces them with the DAC's feedback endpoint, and reports whether the output is bit-perfect. It also controls the DAC's own hardware volume. The USB Audio Class driver is written in Rust and sits behind a small JNI layer (`libusbdac.so`).
@@ -21,7 +31,7 @@ opened and what it could verify.
 
 This guide covers usbdac 0.1.
 
-- **Automated checks pass.** The driver has several hundred tests that run without a DAC, the Kotlin layer has its own, and every push builds the library and the sample app for four processor types.
+- **Automated checks pass.** The Rust crates have 487 tests (counted for `v0.1.0-alpha.6`) and the Kotlin layer has 237, none of which needs a DAC, and every push builds the library and the sample app for four processor types. [Evidence and status](evidence.md) says what they cover and what they cannot.
 - **Hardware testing has only begun.** The Rust driver has played PCM on one phone and one DAC (OnePlus 15, Android 16, iBasso DC04U), inside a build of Flick that runs on this library. Other phones and DACs, DSD and DoP, the Kotlin SDK, the sample app, the Android-managed output and the AAudio output have not been run on hardware yet. Expect to find problems, and report them with the logcat of the tag `usbdac`.
 
 ## Which transport to use
@@ -67,14 +77,25 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 
 ## The guide
 
-Start with [what usbdac improves](improvements.md) for the overview of every change from the driver it started from, in technical and in plain terms. Then:
+The pages come in six groups, in the navigation order.
 
-1. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
-2. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
-3. [Controls and configuration](controls.md): every option and control, with its default, its effect and its effect on bit-perfect output.
-4. [Bit-perfect output](bit-perfect.md): what the flag means, when it turns false, DSD, MQA.
-5. [Transports](transports.md): direct USB, the Android-managed output and exclusive AAudio, side by side.
+**Start.** [What usbdac improves](improvements.md): every change from the driver it started from, in technical and in plain terms.
+
+**Design decisions.** [All decisions at a glance](decisions.md), then five pages with the question, what Flick, Mornye and BitChord do, what usbdac does, the evidence, the trade-off and the public references for each: [streaming and buffering](decisions-stream.md), [clock and pacing](decisions-clock.md), [volume](decisions-volume.md), [reporting and conversion](decisions-reporting.md), [outputs and library shape](decisions-library.md).
+
+**How it works.** [Architecture](architecture.md): the layers, the modules, the life of a sample, the threads. [USB audio in a page](usb-audio-primer.md): the background the decisions assume.
+
+**Integrate.**
+
+1. [The integration guide](integration.md): what you take on, the ways to integrate, the order of the work.
+2. [The player engine](integration-player.md): what to hand over, the writer, seek, position, processing, DSD.
+3. [App, service and settings](integration-app.md): permission, lifecycle, settings, volume, the status display, failures, testing, release.
+4. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
+5. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
 6. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
-7. [Troubleshooting](troubleshooting.md): error codes and a checklist for "nothing plays".
+
+**Use.** [Controls and configuration](controls.md) (every option and control, with its default, its effect and its effect on bit-perfect output), [bit-perfect output](bit-perfect.md) (what the flag means, when it turns false, DSD, MQA), [transports](transports.md) (direct USB, the Android-managed output and exclusive AAudio, side by side) and [troubleshooting](troubleshooting.md) (error codes and a checklist for "nothing plays").
+
+**Evidence.** [The three drivers studied](drivers.md), [evidence and status](evidence.md) and [public references](references.md).
 
 The sample app in `android/sample` is the worked example for all of it. The code in this guide is taken from it, except where a block says it is not.
