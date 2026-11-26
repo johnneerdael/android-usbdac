@@ -594,13 +594,35 @@ capture source and a modern Focusrite interface.
 ### ADC3 clock multipliers
 
 An ADC3 Clock Multiplier exposes its current numerator and denominator
-as two-byte class controls. Retain the verified ratios with the
-selector path. Compose ratios exactly and convert the requested wire
-rate to a representable source rate before testing ranges or
-programming the source. Verify source readback and the derived wire
-rate. Keep multiplier controls read-only for automatic selection.
-Re-read their values before activation and rollback, and report drift
-if either changes. For implicit timing and duplex, compare derived
-rates as well as the shared root clock. Test fixed and fractional
-ratios, nonintegral source rates, range steps, and selector fallback
-across routes with different ratios. [USB Audio 3.0 §§3.13.11.3 and 5.2.1.15](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=128)
+as two-byte class controls. Read both on the owning AudioControl
+interface and retain the raw values with the selector path. Compose
+ratios exactly and convert the requested wire rate to a representable
+source rate before testing ranges or programming the source. A source
+range of 32,000–32,005 Hz with one-Hz steps and a 3/2 ratio yields wire
+rates of 48,000, 48,003, and 48,006 Hz. Verify source readback and the
+derived wire rate. Keep multiplier controls read-only for automatic
+selection. Re-read them before activation and rollback, and report
+drift if either value changes.
+
+Implicit feedback requires the same effective ratio and wire rate
+because IN frame counts directly pace OUT. Independent duplex audio
+can use different derived rates on a common root when both requests
+map to the same source frequency. Use the wire rate for packet
+capacity, startup reports, and the SDK's negotiated stream format.
+Use the source rate for frequency control transfers and hand-back.
+[USB Audio 3.0 §§3.13.11.3 and 5.2.1.15](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=128)
+
+For physical acceptance, choose an ADC3 device with a non-unit
+multiplier. Check the reported numerator and denominator, negotiate
+a wire rate that maps to a supported exact source frequency, and
+observe the source control exchange and packet cadence. Check that
+an unrepresentable request is refused before a rate write. Switch
+between two clock paths with different ratios, then confirm the
+original selector and source frequency are restored when requested.
+
+Rust workspace tests covered exact conversion, clipped range grids,
+raw factor drift, and shared-source duplex with different wire rates.
+The Android arm64 NDK check, Kotlin tests, sample build and SDK snippet
+check passed. The local AAR contains all four native ABIs. Its SHA-256
+is `af94d8ed4dc40873c2ee9f8e63284ab2f0c7f03800492b0a96756a1a480d89cd`.
+Physical verification of an ADC3 multiplier path is pending.

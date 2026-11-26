@@ -331,9 +331,14 @@ pub(super) fn candidate_audio_control_clock_choice(
     handle: &DeviceHandle<Context>,
     candidate: &IsoStreamCandidate,
 ) -> Option<(AudioControlClock, ClockChoice)> {
-    // Protocol dispatch is decided before UAC2's graph/fallback lookup.
+    // ADC3 reports the same resolved public clock identity, but retains its
+    // own protocol-specific programming path.
     if device.active_config_descriptor().ok()?.interfaces().flat_map(|i| i.descriptors())
-        .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30) { return None; }
+        .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30) {
+        let route = adc3_route_for_candidate(device, handle, candidate).ok()??;
+        let choice = route.choice?;
+        return Some((AudioControlClock { interface_number: choice.control_interface, clock_id: choice.source_id }, choice));
+    }
     if let Some(source) = candidate.implicit_feedback {
         let config = device.active_config_descriptor().ok()?;
         let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed);
@@ -681,9 +686,7 @@ pub(super) fn build_usb_capability_model(
     for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
         let rates = candidate.sample_rates.clone();
         supported_sample_rates.extend(rates.iter().copied());
-        let ranges = if let Some(clock) = route.clock.as_ref() {
-            get_sampling_frequency_ranges(handle, route.control, clock.id).unwrap_or_default()
-        } else { vec![SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }] };
+        let ranges = adc3::adc3_wire_ranges(handle, &route).unwrap_or_default();
         let ranges = adc3_capacity_ranges(&candidate, &ranges);
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
@@ -1001,9 +1004,8 @@ pub(super) fn select_stream_candidate(
                 channels:candidate.channels,subslot_size:candidate.subslot_size,bit_resolution:candidate.bit_resolution,
                 terminal_link:candidate.terminal_link,is_uac1:false,sample_rate_ranges:vec![] };
             if transport_compatibility_penalty(&format,playback_format) == u32::MAX { continue; }
-            let supported = if let Some(clock) = route.clock.as_ref() {
-                get_sampling_frequency_ranges(handle,route.control,clock.id).map(|r|sampling_frequency_ranges_support_rate(&r,playback_format.sample_rate)).unwrap_or(false)
-            } else { playback_format.sample_rate == 48_000 };
+            let supported = adc3::adc3_wire_ranges(handle, &route)
+                .map(|ranges| sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate)).unwrap_or(false);
             if supported && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
                 playback_format.sample_rate, source.service_interval_us, source.bytes_per_frame))
                 && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {

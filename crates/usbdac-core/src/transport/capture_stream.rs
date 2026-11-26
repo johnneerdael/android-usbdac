@@ -637,9 +637,7 @@ pub(super) fn configure_capture_endpoint(
                 "ADC3 capture route changed during activation".into(),
             ));
         }
-        if actual.feedforward.is_some() {
-            adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate).map_err(Error::Control)?;
-        }
+        adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate).map_err(Error::Control)?;
     } else {
         let config = claimed
             .handle

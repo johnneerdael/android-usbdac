@@ -1,6 +1,6 @@
 //! Active-configuration ADC3 PCM playback and capture. No configuration changes or clock guesses.
 use super::*;
-use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution, ClockPlan, ClockPlanIo, ClockGraph};
+use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution, ClockPlan, ClockPlanIo, ClockGraph, RateRatio};
 use crate::descriptors::uac3 as wire;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,114 @@ pub(super) struct Adc3Route {
     domains: Vec<wire::PowerDomain>,
     plan: Option<ClockPlan>,
     clock_context: Option<Adc3ClockContext>,
+}
+impl Adc3Route {
+    fn ratio(&self) -> Result<RateRatio, String> {
+        match &self.choice {
+            Some(choice) => adc3_choice_ratio(choice),
+            None if matches!(self.profile, wire::FunctionProfile::Badd(_)) => Ok(RateRatio::IDENTITY),
+            None => Err("ADC3 clock ratio missing".into()),
+        }
+    }
+    pub(super) fn source_rate(&self, wire: u32) -> Result<u32, String> {
+        self.ratio()?.source_rate(wire).ok_or_else(|| "ADC3 wire rate has no exact source rate".into())
+    }
+    pub(super) fn wire_rate(&self, source: u32) -> Result<u32, String> {
+        self.ratio()?.wire_rate(source).ok_or_else(|| "ADC3 source rate has no exact wire rate".into())
+    }
+}
+fn adc3_choice_ratio(choice: &ClockChoice) -> Result<RateRatio, String> {
+    RateRatio::from_factors(&choice.path.iter().filter_map(|hop| match hop.kind {
+        ClockHopKind::RateMultiplier { numerator, denominator } => Some((numerator, denominator)),
+        _ => None,
+    }).collect::<Vec<_>>())
+}
+fn adc3_multiplier_factors(controls: wire::Controls,
+    mut read: impl FnMut(u8, &mut [u8; 2]) -> Result<(), String>) -> Result<(u16, u16), String> {
+    let mut factors = [0; 2];
+    for selector in 1..=2 {
+        if !matches!(controls.access(selector), wire::ControlAccess::ReadOnly | wire::ControlAccess::ReadWrite) {
+            return Err("ADC3 multiplier factor is not readable".into());
+        }
+        let mut bytes = [0; 2];
+        read(selector, &mut bytes)?;
+        factors[usize::from(selector - 1)] = u16::from_le_bytes(bytes);
+    }
+    if factors.contains(&0) { return Err("ADC3 multiplier factor is zero".into()); }
+    Ok((factors[0], factors[1]))
+}
+/// Read the exact raw factors again: equivalent reduced ratios still indicate drift.
+fn verify_adc3_ratios(choice: &ClockChoice,
+    mut read: impl FnMut(u8, u8, &mut [u8; 2]) -> Result<(), String>) -> Result<(), String> {
+    for hop in &choice.path {
+        if let ClockHopKind::RateMultiplier { numerator, denominator } = hop.kind {
+            let mut actual = [0; 2];
+            for (selector, expected) in [(1, numerator), (2, denominator)] {
+                read(hop.id, selector, &mut actual)?;
+                if u16::from_le_bytes(actual) != expected {
+                    return Err("ADC3 clock multiplier changed; renegotiate".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn verify_adc3_route_ratios(route: &Adc3Route,
+    mut read: impl FnMut(u8, u8, &mut [u8; 2]) -> Result<(), String>) -> Result<(), String> {
+    if let Some(choice) = &route.choice { verify_adc3_ratios(choice, &mut read)?; }
+    if let Some(context) = &route.clock_context {
+        for peer in &context.peers {
+            verify_adc3_ratios(&peer.original, &mut read)?;
+            verify_adc3_ratios(&peer.target, &mut read)?;
+        }
+    }
+    Ok(())
+}
+pub(super) fn verify_adc3_rate_route(handle: &DeviceHandle<Context>, route: &Adc3Route) -> Result<(), String> {
+    verify_adc3_route_ratios(route, |id, selector, bytes|
+        read_exact(handle, route.control, id, selector, 1, bytes))?;
+    if let Some(choice) = &route.choice {
+        for hop in &choice.path {
+            if let ClockHopKind::Selector { selected_pin, .. } = hop.kind {
+                let mut pin = [0];
+                read_exact(handle, route.control, hop.id, 1, 1, &mut pin)?;
+                if pin[0] != selected_pin { return Err("ADC3 clock selector changed; renegotiate".into()); }
+            }
+        }
+    }
+    Ok(())
+}
+fn adc3_project_ranges(choice: &ClockChoice, ranges: &[SamplingFrequencySubrange])
+    -> Result<Vec<SamplingFrequencySubrange>, String> {
+    let ratio = adc3_choice_ratio(choice)?;
+    if ranges.is_empty() { return Err("ADC3 clock frequency ranges missing".into()); }
+    let mut projected = Vec::new();
+    for range in ranges {
+        if range.min == 0 || range.min > range.max || (range.res == 0 && range.min != range.max) {
+            return Err("ADC3 invalid clock frequency ranges".into());
+        }
+        if let Some((min, max, res)) = ratio.project_range(range.min, range.max, range.res) {
+            projected.push(SamplingFrequencySubrange { min, max, res });
+        }
+    }
+    Ok(projected)
+}
+pub(super) fn adc3_wire_ranges(handle: &DeviceHandle<Context>, route: &Adc3Route)
+    -> Result<Vec<SamplingFrequencySubrange>, String> {
+    if matches!(route.profile, wire::FunctionProfile::Badd(_)) {
+        return Ok(vec![SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }]);
+    }
+    // A planned path overlays selector targets that are not active yet. Its
+    // raw factors must already match, while pin validation belongs to apply.
+    if route.plan.is_some() {
+        verify_adc3_route_ratios(route, |entity, selector, bytes|
+            read_exact(handle, route.control, entity, selector, 1, bytes))?;
+    } else {
+        verify_adc3_rate_route(handle, route)?;
+    }
+    let source = route.clock.as_ref().ok_or("ADC3 clock source missing")?;
+    adc3_project_ranges(route.choice.as_ref().ok_or("ADC3 clock path missing")?,
+        &get_sampling_frequency_ranges(handle, route.control, source.id)?)
 }
 /// Full ADC3 adaptive-source explicit host-to-device rate pipe. The rate is
 /// expressed per USB frame/microframe, independently of either pipe's interval.
@@ -479,7 +587,11 @@ fn clock_route(
                 id = selected;
             }
             0x0d => {
-                return Err("ADC3 clock multiplier requires an implemented ratio contract".into())
+                let multiplier = wire::parse_clock_multiplier(d).map_err(|e| e.to_string())?;
+                let (numerator, denominator) = adc3_multiplier_factors(multiplier.controls,
+                    |selector, bytes| read_exact(handle, control, id, selector, 1, bytes))?;
+                path.push(ClockHop { id, kind: ClockHopKind::RateMultiplier { numerator, denominator } });
+                id = multiplier.source_id;
             }
             _ => return Err("ADC3 terminal points to unsupported clock entity".into()),
         }
@@ -922,7 +1034,7 @@ fn adc3_alternate_overlay(
                 c.channels.len() as u16,
                 h.subslot_size,
                 h.bit_resolution,
-                ranges,
+                adc3_project_ranges(&choice, &ranges)?,
             );
             route.terminal = h.terminal_link;
             route.cluster = Some(c);
@@ -1100,6 +1212,7 @@ fn adc3_shared_clock(output: &Adc3Route, input: &Adc3Route) -> bool {
     let (Some(out), Some(input)) = (&output.choice, &input.choice) else { return false; };
     out.resolution == ClockResolution::Resolved && input.resolution == ClockResolution::Resolved
         && out.source_id == input.source_id
+        && adc3_choice_ratio(out).ok().zip(adc3_choice_ratio(input).ok()).is_some_and(|(a, b)| a == b)
         && out.path.iter().all(|left| input.path.iter().all(|right|
             left.id != right.id || left.kind == right.kind))
 }
@@ -1295,14 +1408,8 @@ pub(super) fn adc3_capture_candidates(
                 route.plan = None;
                 if &route != expected { return Err("ADC3 shared capture source changed".into()); }
             }
-            let supports = if let Some(clock) = &route.clock {
-                sampling_frequency_ranges_support_rate(
-                    &get_sampling_frequency_ranges(&claimed.handle, route.control, clock.id)?,
-                    rate,
-                )
-            } else {
-                rate == 48_000
-            };
+            let supports = sampling_frequency_ranges_support_rate(
+                &adc3_wire_ranges(&claimed.handle, &route)?, rate);
             if supports && route.feedforward.map_or(true, |pipe| pipe.nominal(rate).is_ok())
                 && candidate.max_packet_bytes
                     >= required_max_packet_bytes(
@@ -1366,12 +1473,13 @@ pub(super) fn select_standalone_adc3_capture(
             read_exact(&claimed.handle, pair.1.control, clock.id, 1, 1, &mut bytes)?;
             let original = u32::from_le_bytes(bytes);
             if original == 0 { continue; }
-            Some(FrequencySnapshot { source: clock.id, original, target: request.sample_rate })
+            Some(FrequencySnapshot { source: clock.id, original, target: pair.1.source_rate(request.sample_rate)? })
         } else { None };
         if configure_adc3(&claimed.handle, &pair.1, request.sample_rate).is_ok() { return Ok(Some(pair)); }
         if let Some(frequency) = frequency {
-            if let Err(error) = restore_adc3_frequency(&mut Adc3LeaseClockIo {
-                lease: &claimed.adc3_power, control: pair.1.control }, frequency) {
+            if let Err(error) = verify_adc3_rate_route(&claimed.handle, &pair.1).and_then(|()|
+                restore_adc3_frequency(&mut Adc3LeaseClockIo {
+                    lease: &claimed.adc3_power, control: pair.1.control, ratio_route: Some(&pair.1) }, frequency)) {
                 claimed.adc3_power.disarm();
                 return Err(format!("ADC3 capture current frequency restoration uncertain: {error}"));
             }
@@ -1485,19 +1593,14 @@ fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: 
             Err("BADD rate must be 48000 Hz".into())
         };
     }
-    if let Some(choice) = route.choice.as_ref() {
-        for hop in &choice.path {
-            if let ClockHopKind::Selector { selected_pin, .. } = hop.kind {
-                let mut pin = [0];
-                read_exact(handle, route.control, hop.id, 1, 1, &mut pin)?;
-                if pin[0] != selected_pin {
-                    return Err("ADC3 clock selector changed; renegotiate".into());
-                }
-            }
-        }
-    }
+    verify_adc3_rate_route(handle, route)?;
+    let wire_rate = rate;
+    let rate = route.source_rate(wire_rate)?;
     let source = route.clock.as_ref().ok_or("ADC3 clock source missing")?;
     let ranges = get_sampling_frequency_ranges(handle, route.control, source.id)?;
+    // Apply the same raw-range validity contract during programming as during
+    // advertisement; an integral conversion alone cannot legalize a bad range.
+    adc3_project_ranges(route.choice.as_ref().ok_or("ADC3 clock path missing")?, &ranges)?;
     if !sampling_frequency_ranges_support_rate(&ranges, rate) {
         return Err("ADC3 rate outside source ranges".into());
     }
@@ -1508,13 +1611,15 @@ fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: 
         if source.controls.access(1) != wire::ControlAccess::ReadWrite {
             return Err("ADC3 source frequency is read-only and differs".into());
         }
+        verify_adc3_rate_route(handle, route)?;
         write_exact(handle, route.control, source.id, 1, &rate.to_le_bytes())?;
         thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
     }
     read_exact(handle, route.control, source.id, 1, 1, &mut current)?;
-    if u32::from_le_bytes(current) != rate {
+    if route.wire_rate(u32::from_le_bytes(current))? != wire_rate {
         return Err("ADC3 source frequency verification failed".into());
     }
+    verify_adc3_rate_route(handle, route)?;
     let validity = crate::clock_resolution::clock_validity(source.controls.0, || {
         let mut valid = [0];
         read_exact(handle, route.control, source.id, 2, 1, &mut valid)?;
@@ -1531,7 +1636,7 @@ fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: 
 pub(super) struct Adc3PowerLease {
     fd: RawFd,
     pending: Mutex<Vec<(u8, u8, u8)>>,
-    clock: Mutex<Option<(u8, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
+    clock: Mutex<Option<(Adc3Route, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
 }
 impl Adc3PowerLease {
     pub(super) fn new(fd: RawFd) -> Self {
@@ -1567,10 +1672,11 @@ impl Adc3PowerLease {
     pub(super) fn restore(&self) -> Result<(), String> {
         // Never power down an owning domain before selector hand-back. Keep
         // failed/drifted state armed for explicit reporting; do not overwrite it.
-        if let Some((control, plan, frequency, interfaces)) = self.clock.lock().take() {
-            let mut io = Adc3LeaseClockIo { lease: self, control };
-            let restore = restore_adc3_clock_transaction(&mut io, &plan, frequency, &interfaces,
-                |interface| self.verify_idle(interface));
+        if let Some((route, plan, frequency, interfaces)) = self.clock.lock().take() {
+            let mut io = Adc3LeaseClockIo { lease: self, control: route.control, ratio_route: Some(&route) };
+            let restore = io.verify_ratios().and_then(|()|
+                restore_adc3_clock_transaction(&mut io, &plan, frequency, &interfaces,
+                    |interface| self.verify_idle(interface)));
             if let Err(error) = restore {
                 // No later Drop retry may power down after uncertain hand-back.
                 self.pending.lock().clear();
@@ -1599,11 +1705,21 @@ impl Adc3PowerLease {
         self.clock.lock().take();
     }
 }
-struct Adc3LeaseClockIo<'a> { lease: &'a Adc3PowerLease, control: u8 }
+struct Adc3LeaseClockIo<'a> { lease: &'a Adc3PowerLease, control: u8, ratio_route: Option<&'a Adc3Route> }
 impl Adc3LeaseClockIo<'_> {
-    fn transfer(&self, input: bool, selector: u8, pin: &mut [u8]) -> Result<(), String> {
+    fn verify_ratios(&self) -> Result<(), String> {
+        if let Some(route) = self.ratio_route {
+            verify_adc3_route_ratios(route, |entity, selector, bytes|
+                self.transfer_control(true, entity, selector, bytes))?;
+        }
+        Ok(())
+    }
+    fn transfer(&self, input: bool, entity: u8, bytes: &mut [u8]) -> Result<(), String> {
+        self.transfer_control(input, entity, 1, bytes)
+    }
+    fn transfer_control(&self, input: bool, entity: u8, selector: u8, pin: &mut [u8]) -> Result<(), String> {
         let request = UsbfsControlTransfer { request_type: if input { 0xa1 } else { 0x21 },
-            request: 1, value: 0x0100, index: u16::from(self.control) | (u16::from(selector) << 8),
+            request: 1, value: u16::from(selector) << 8, index: u16::from(self.control) | (u16::from(entity) << 8),
             length: pin.len() as u16, timeout_ms: 1000, data: pin.as_mut_ptr().cast() };
         let n = unsafe { libc::ioctl(self.lease.fd, USBDEVFS_CONTROL, &request) };
         if n != pin.len() as i32 { return Err(format!("ADC3 clock control transferred {n}, expected {}", pin.len())); }
@@ -1615,7 +1731,9 @@ impl ClockPlanIo for Adc3LeaseClockIo<'_> {
         let mut pin = [0]; self.transfer(true, selector, &mut pin)?; Ok(pin[0])
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
-        self.transfer(false, selector, &mut [pin])
+        self.verify_ratios()?;
+        self.transfer(false, selector, &mut [pin])?;
+        self.verify_ratios()
     }
     fn validate_source(&mut self, _: u8, _: u32) -> Result<(), String> { Ok(()) }
 }
@@ -1630,9 +1748,10 @@ impl Adc3FrequencyIo for Adc3LeaseClockIo<'_> {
         let mut bytes = [0; 4]; self.transfer(true, source, &mut bytes)?; Ok(u32::from_le_bytes(bytes))
     }
     fn write_frequency(&mut self, source: u8, frequency: u32) -> Result<(), String> {
+        self.verify_ratios()?;
         self.transfer(false, source, &mut frequency.to_le_bytes())?;
         thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
-        Ok(())
+        self.verify_ratios()
     }
 }
 fn restore_adc3_clock_transaction(
@@ -1669,7 +1788,11 @@ impl ClockPlanIo for Adc3ClockIo<'_> {
         let mut pin = [0]; read_exact(self.handle, self.route.control, selector, 1, 1, &mut pin)?; Ok(pin[0])
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
-        write_exact(self.handle, self.route.control, selector, 1, &[pin])
+        verify_adc3_route_ratios(self.route, |entity, selector, bytes|
+            read_exact(self.handle, self.route.control, entity, selector, 1, bytes))?;
+        write_exact(self.handle, self.route.control, selector, 1, &[pin])?;
+        verify_adc3_route_ratios(self.route, |entity, selector, bytes|
+            read_exact(self.handle, self.route.control, entity, selector, 1, bytes))
     }
     fn validate_source(&mut self, source: u8, controls: u32) -> Result<(), String> {
         if self.route.clock.as_ref().map(|c| (c.id, c.controls.0)) != Some((source, controls)) {
@@ -1996,16 +2119,18 @@ pub(super) fn apply_adc3_clock_plan(claimed: &ClaimedHandle, route: &Adc3Route, 
     // down before reporting selector hand-back failure.
     let mut current = [0; 4];
     read_exact(&claimed.handle, route.control, plan.source_id, 1, 1, &mut current)?;
-    let frequency = FrequencySnapshot { source: plan.source_id, original: u32::from_le_bytes(current), target: rate };
+    let frequency = FrequencySnapshot { source: plan.source_id, original: u32::from_le_bytes(current), target: route.source_rate(rate)? };
     if frequency.original == 0 { return Err("ADC3 source frequency snapshot is zero".into()); }
+    verify_adc3_route_ratios(route, |entity, selector, bytes|
+        read_exact(&claimed.handle, route.control, entity, selector, 1, bytes))?;
     match plan.apply(&mut Adc3ClockIo { handle: &claimed.handle, route, rate }) {
-        Ok(()) => { *claimed.adc3_power.clock.lock() = Some((route.control, plan.clone(), frequency, interfaces.clone())); Ok(()) }
+        Ok(()) => { *claimed.adc3_power.clock.lock() = Some((route.clone(), plan.clone(), frequency, interfaces.clone())); Ok(()) }
         Err(error) => {
-            let frequency_restore = restore_adc3_frequency(&mut Adc3LeaseClockIo { lease: &claimed.adc3_power, control: route.control }, frequency);
+            let frequency_restore = restore_adc3_frequency(&mut Adc3LeaseClockIo { lease: &claimed.adc3_power, control: route.control, ratio_route: Some(&route) }, frequency);
             if !error.rollback_errors.is_empty() || frequency_restore.is_err() {
                 // Do not attempt another candidate or let Drop roll power back
                 // after an uncertain selector/frequency restoration.
-                *claimed.adc3_power.clock.lock() = Some((route.control, plan.clone(), frequency, interfaces.clone()));
+                *claimed.adc3_power.clock.lock() = Some((route.clone(), plan.clone(), frequency, interfaces.clone()));
             }
             Err(format!("ADC3 alternate clock transaction: {error}; frequency rollback: {frequency_restore:?}"))
         }
@@ -2024,7 +2149,7 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
     let current_frequency = if let Some(source) = route.clock.as_ref() {
         let mut bytes = [0; 4];
         read_exact(&claimed.handle, route.control, source.id, 1, 1, &mut bytes)?;
-        Some(FrequencySnapshot { source: source.id, original: u32::from_le_bytes(bytes), target: rate })
+        Some(FrequencySnapshot { source: source.id, original: u32::from_le_bytes(bytes), target: route.source_rate(rate)? })
     } else { None };
     let current_result = if current_frequency.is_some_and(|f| f.original == 0) {
         Err("ADC3 current source frequency is zero".into())
@@ -2033,7 +2158,8 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
         Ok(()) => return Ok(route), Err(error) => error,
     };
     if let Some(frequency) = current_frequency.filter(|f| f.original != 0) {
-        if let Err(error) = restore_adc3_frequency(&mut Adc3LeaseClockIo { lease: &claimed.adc3_power, control: route.control }, frequency) {
+        if let Err(error) = verify_adc3_rate_route(&claimed.handle, &route).and_then(|()|
+            restore_adc3_frequency(&mut Adc3LeaseClockIo { lease: &claimed.adc3_power, control: route.control, ratio_route: Some(&route) }, frequency)) {
             claimed.adc3_power.disarm();
             return Err(format!("{current_error}; ADC3 current frequency restoration uncertain: {error}"));
         }
@@ -2175,13 +2301,9 @@ fn adc3_candidate_matches(
     {
         return false;
     }
-    let supported = if let Some(clock) = route.clock.as_ref() {
-        get_sampling_frequency_ranges(handle, route.control, clock.id)
-            .map(|r| sampling_frequency_ranges_support_rate(&r, requested.sample_rate))
-            .unwrap_or(false)
-    } else {
-        requested.sample_rate == 48000
-    };
+    let supported = adc3_wire_ranges(handle, route)
+        .map(|ranges| sampling_frequency_ranges_support_rate(&ranges, requested.sample_rate))
+        .unwrap_or(false);
     supported
         && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
             requested.sample_rate, source.service_interval_us, source.bytes_per_frame))
@@ -2245,6 +2367,52 @@ pub(super) fn adc3_badd_volume_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn ratio_choice(factors: &[(u8, u16, u16)]) -> ClockChoice {
+        ClockChoice { control_interface: 0, source_id: 9, resolution: ClockResolution::Resolved,
+            path: factors.iter().map(|&(id, numerator, denominator)| ClockHop {
+                id, kind: ClockHopKind::RateMultiplier { numerator, denominator },
+            }).collect() }
+    }
+    #[test]
+    fn multiplier_controls_require_readable_nonzero_exact_factors() {
+        let mut reads = vec![];
+        assert_eq!(adc3_multiplier_factors(wire::Controls(0b1101), |selector, bytes| {
+            reads.push(selector);
+            *bytes = if selector == 1 { 147u16 } else { 160u16 }.to_le_bytes();
+            Ok(())
+        }).unwrap(), (147, 160));
+        assert_eq!(reads, vec![1, 2]);
+        for controls in [0, 0b0110, 0b1001] {
+            assert!(adc3_multiplier_factors(wire::Controls(controls), |_, _| Ok(())).is_err());
+        }
+        assert!(adc3_multiplier_factors(wire::Controls(0b0101), |_, _| Ok(())).is_err());
+        assert!(adc3_multiplier_factors(wire::Controls(0b0101), |_, _| Err("short GET_CUR".into())).is_err());
+    }
+    #[test]
+    fn multiplier_snapshot_rejects_equivalent_raw_drift() {
+        let choice = ratio_choice(&[(7, 2, 4)]);
+        assert!(verify_adc3_ratios(&choice, |_, selector, bytes| {
+            *bytes = if selector == 1 { 1u16 } else { 2u16 }.to_le_bytes(); Ok(())
+        }).is_err());
+        assert!(verify_adc3_ratios(&choice, |id, selector, bytes| {
+            assert_eq!(id, 7);
+            *bytes = if selector == 1 { 2u16 } else { 4u16 }.to_le_bytes(); Ok(())
+        }).is_ok());
+    }
+    #[test]
+    fn multiplier_ranges_project_wire_rates_and_keep_other_exact_blocks() {
+        let choice = ratio_choice(&[(7, 147, 160)]);
+        let ranges = adc3_project_ranges(&choice, &[
+            SamplingFrequencySubrange { min: 48_000, max: 96_000, res: 48_000 },
+            SamplingFrequencySubrange { min: 48_001, max: 48_001, res: 0 },
+        ]).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].min, ranges[0].max, ranges[0].res), (44_100, 88_200, 44_100));
+        assert!(adc3_project_ranges(&choice, &[
+            SamplingFrequencySubrange { min: 48_000, max: 96_000, res: 0 },
+        ]).is_err());
+        assert_eq!(adc3_choice_ratio(&choice).unwrap().source_rate(44_100), Some(48_000));
+    }
     fn pcm_candidate() -> IsoStreamCandidate {
         IsoStreamCandidate {
             interface_number: 5, alt_setting: 1, endpoint_address: 1, endpoint_interval: 4,
@@ -2717,6 +2885,16 @@ mod tests {
         let sink = pcm_candidate();
         let source = implicit_pcm_candidate();
         assert!(adc3_implicit_pair(&sink, &out, &source, &input));
+        let mut scaled_out = out.clone();
+        scaled_out.choice = Some(ratio_choice(&[(7, 2, 4)]));
+        let mut scaled_in = input.clone();
+        scaled_in.choice = Some(ratio_choice(&[(8, 1, 2)]));
+        assert!(adc3_implicit_pair(&sink, &scaled_out, &source, &scaled_in));
+        scaled_in.choice = Some(ratio_choice(&[(8, 1, 1)]));
+        assert!(!adc3_implicit_pair(&sink, &scaled_out, &source, &scaled_in));
+        // Shared entities must retain raw factors, even for equivalent ratios.
+        scaled_in.choice = Some(ratio_choice(&[(7, 1, 2)]));
+        assert!(!adc3_implicit_pair(&sink, &scaled_out, &source, &scaled_in));
         let pair = (ImplicitFeedbackSource { interface_number: 6, alt_setting: 1, address: 0x81,
             bytes_per_frame: 8, service_interval_us: 1000, max_packet_bytes: 768 }, input.clone());
         assert!(adc3_unique_implicit(vec![]).is_err());

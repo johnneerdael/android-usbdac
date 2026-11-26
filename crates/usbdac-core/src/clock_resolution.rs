@@ -16,6 +16,9 @@ use crate::descriptors::AudioControlParser;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+mod rate_ratio;
+pub(crate) use rate_ratio::RateRatio;
+
 const USB_DT_INTERFACE: u8 = 0x04;
 const USB_DT_CS_INTERFACE: u8 = 0x24;
 const USB_CLASS_AUDIO: u8 = 0x01;
@@ -97,6 +100,9 @@ pub enum ClockHopKind {
     Selector { selected_pin: u8, pin_count: u8 },
     /// A Clock Multiplier (one clock input).
     Multiplier,
+    /// An ADC3 Clock Multiplier whose exact current ratio was read back.
+    /// The output cadence is the input cadence times numerator/denominator.
+    RateMultiplier { numerator: u16, denominator: u16 },
     /// A Clock Source: the end of the path.
     Source,
 }
@@ -107,7 +113,7 @@ impl ClockHopKind {
         match self {
             Self::Terminal => "terminal",
             Self::Selector { .. } => "selector",
-            Self::Multiplier => "multiplier",
+            Self::Multiplier | Self::RateMultiplier { .. } => "multiplier",
             Self::Source => "source",
         }
     }
@@ -134,6 +140,8 @@ pub(crate) struct ClockGraph {
     exact_sources: HashSet<u8>,
     selector_controls: HashMap<u8, u32>,
     source_controls: HashMap<u8, u32>,
+    /// Only ADC3 multipliers with readable numerator and denominator controls.
+    readable_multipliers: HashSet<u8>,
     duplicate_ids: HashSet<u8>,
 }
 
@@ -247,6 +255,11 @@ impl ClockGraph {
                     graph.selector_controls.insert(c.id, c.controls.0);
                     graph.entities.insert(c.id, ClockEntity::Selector(c.sources)); }
                 0x0d => { let c = wire::parse_clock_multiplier(d).map_err(|e| e.to_string())?;
+                    if matches!(c.controls.0 & 3, 1 | 3)
+                        && matches!((c.controls.0 >> 2) & 3, 1 | 3)
+                    {
+                        graph.readable_multipliers.insert(c.id);
+                    }
                     graph.entities.insert(c.id, ClockEntity::Multiplier(c.source_id)); }
                 _ => {}
             }
@@ -258,7 +271,8 @@ impl ClockGraph {
     /// Reads are cached per selector; a failed/illegal read cannot be safely
     /// restored and therefore excludes that selector entirely. This never uses
     /// the legacy first-source or sparse-descriptor fallback. An unknown
-    /// multiplier ratio is deliberately unsupported for selectable routes.
+    /// UAC2 multiplier ratios remain unsupported. Readable ADC3 multipliers
+    /// may be traversed; ADC3 transport must read and verify their ratios.
     pub(crate) fn enumerate_plans(
         &self,
         terminal_id: u8,
@@ -678,6 +692,9 @@ impl<F: FnMut(u8) -> Result<u8, String>> ClockSearch<'_, F> {
                     }
                 }
             }
+            Some(ClockEntity::Multiplier(input)) if self.graph.readable_multipliers.contains(&id) => {
+                self.walk(*input, path, selectors)?;
+            }
             // Missing/malformed entities and unresolved multiplier ratios do
             // not prove a programmable source and never produce a fallback.
             _ => {}
@@ -713,11 +730,14 @@ impl ResolvedClock {
     /// Shared source IDs prove equal sample cadence only without an unknown
     /// multiplier ratio, and only when the source is actually described.
     pub(crate) fn proves_identity_cadence(&self) -> bool {
-        !self.assumed_source
-            && !self
-                .hops
-                .iter()
-                .any(|hop| matches!(hop.kind, ClockHopKind::Multiplier))
+        if self.assumed_source || self.hops.iter().any(|hop| matches!(hop.kind, ClockHopKind::Multiplier)) {
+            return false;
+        }
+        let factors: Vec<_> = self.hops.iter().filter_map(|hop| match hop.kind {
+            ClockHopKind::RateMultiplier { numerator, denominator } => Some((numerator, denominator)),
+            _ => None,
+        }).collect();
+        RateRatio::from_factors(&factors) == Ok(RateRatio::IDENTITY)
     }
 }
 
@@ -821,6 +841,75 @@ mod implicit_clock_tests {
             .resolve_terminal_clock(1, |_| unreachable!())
             .unwrap();
         assert!(!multiplied.proves_identity_cadence());
+    }
+
+    #[test]
+    fn implicit_proof_accounts_for_exact_multiplier_ratios() {
+        let mut clock = ResolvedClock {
+            clock_id: 10,
+            path: vec![11, 10],
+            hops: vec![ClockHop {
+                id: 11,
+                kind: ClockHopKind::RateMultiplier { numerator: 3, denominator: 2 },
+            }],
+            assumed_source: false,
+        };
+        assert_eq!(clock.hops[0].kind.code(), "multiplier");
+        assert!(!clock.proves_identity_cadence());
+        clock.hops.push(ClockHop {
+            id: 12,
+            kind: ClockHopKind::RateMultiplier { numerator: 2, denominator: 3 },
+        });
+        assert!(clock.proves_identity_cadence());
+        clock.hops.push(ClockHop { id: 13, kind: ClockHopKind::Multiplier });
+        assert!(!clock.proves_identity_cadence());
+        clock.hops.pop();
+        clock.hops[0].kind = ClockHopKind::RateMultiplier { numerator: 0, denominator: 1 };
+        assert!(!clock.proves_identity_cadence());
+    }
+}
+
+#[cfg(test)]
+mod adc3_multiplier_graph_tests {
+    use super::*;
+
+    fn descriptors(controls: u8) -> Vec<u8> {
+        // Input Terminal 1 -> Multiplier 11 -> Source 10.
+        let mut terminal = vec![0; 20];
+        terminal[..4].copy_from_slice(&[20, 0x24, 2, 1]);
+        terminal[4..6].copy_from_slice(&0x0101u16.to_le_bytes());
+        terminal[7] = 11;
+        terminal[12..14].copy_from_slice(&1u16.to_le_bytes());
+        terminal.extend_from_slice(&[11, 0x24, 0x0d, 11, 10, controls, 0, 0, 0, 0, 0]);
+        terminal.extend_from_slice(&[12, 0x24, 0x0b, 10, 1, 3, 0, 0, 0, 0, 0, 0]);
+        terminal
+    }
+
+    #[test]
+    fn adc3_enumerates_only_multipliers_with_both_controls_readable() {
+        for controls in [0x05, 0x07, 0x0d, 0x0f] {
+            let graph = ClockGraph::parse_adc3(&descriptors(controls)).unwrap();
+            let plans = graph.enumerate_plans(1, |_| unreachable!()).unwrap();
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].path, vec![11, 10]);
+            assert_eq!(plans[0].source_id, 10);
+        }
+        for controls in [0x00, 0x01, 0x04, 0x06, 0x09, 0x0a] {
+            let graph = ClockGraph::parse_adc3(&descriptors(controls)).unwrap();
+            assert!(graph.enumerate_plans(1, |_| unreachable!()).is_err());
+        }
+    }
+
+    #[test]
+    fn adc3_multiplier_paths_remain_bounded_and_require_described_sources() {
+        let mut missing = descriptors(0x05);
+        missing.truncate(31);
+        assert!(ClockGraph::parse_adc3(&missing).unwrap()
+            .enumerate_plans(1, |_| unreachable!()).is_err());
+        let mut cycle = descriptors(0x05);
+        cycle[24] = 11;
+        assert!(ClockGraph::parse_adc3(&cycle).unwrap()
+            .enumerate_plans(1, |_| unreachable!()).is_err());
     }
 }
 

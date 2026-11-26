@@ -81,6 +81,8 @@ pub(super) fn negotiate_playback_format(
         if adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)?.is_some() {
             let route = negotiate_adc3_clock(&claimed_handle, &candidate, requested_format.sample_rate)
                 .map_err(Error::Transfer)?;
+            clock_choice = route.choice.clone();
+            set_clock_status(route.choice.as_ref().map(|_| ClockStatus { reported_sample_rate: None }));
             remember_adc3_route(route);
             set_effective_playback_format(requested_format);
             set_dac_mode(DacMode::FixedClock);
@@ -306,7 +308,7 @@ pub(super) fn negotiate_playback_format(
         // playback path's unverified fixed-clock fallback.
         if candidate.implicit_feedback.is_some() {
             if !rate_verified
-                || clock_choice.as_ref().is_none_or(|choice| {
+                || clock_choice.as_ref().map_or(true, |choice| {
                     choice.resolution != crate::clock_resolution::ClockResolution::Resolved
                 })
             {

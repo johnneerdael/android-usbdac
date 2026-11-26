@@ -201,7 +201,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::InvalidState(error));
         }
     }
-    let clock_choice = candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate);
+    let clock_choice = if let Some(route) = adc3_route.as_ref() {
+        route.choice.clone().map(|choice| (AudioControlClock {
+            interface_number: choice.control_interface, clock_id: choice.source_id,
+        }, choice))
+    } else { candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate) };
     if clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState("clock route changed since negotiation".into()));
@@ -218,13 +222,19 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             return Err(Error::Transfer(error));
         }
     }
-    let clock = clock_choice.map(|(clock, _)| clock);
-    let clock_detection_msg = match &clock {
-        Some(c) => format!(
+    // ADC3 must never enter the generic UAC2 frequency programming branch.
+    let clock = if adc3_route.is_some() { None } else { clock_choice.map(|(clock, _)| clock) };
+    let clock_detection_msg = match (adc3_route.as_ref(), &clock) {
+        (Some(route), _) => match route.choice.as_ref() {
+            Some(choice) => format!("ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
+                choice.control_interface, choice.source_id, candidate.terminal_link),
+            None => "ADC3 BADD fixed 48000Hz clock".to_string(),
+        },
+        (None, Some(c)) => format!(
             "Clock found: interface={}, clockId={}, via_terminal_link={:?}",
             c.interface_number, c.clock_id, candidate.terminal_link,
         ),
-        None => "Clock NOT FOUND: no UAC2 clock entity in any AudioControl descriptor".to_string(),
+        (None, None) => "Clock NOT FOUND: no UAC2 clock entity in any AudioControl descriptor".to_string(),
     };
     dev_eprintln!(
         "[USB] Clock entity for '{}': {}",
@@ -254,7 +264,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(error);
     }
-    set_clock_status(clock.map(|_| ClockStatus {
+    set_clock_status((clock.is_some() || adc3_route.as_ref().and_then(|route| route.choice.as_ref()).is_some())
+        .then(|| ClockStatus {
         reported_sample_rate: state
             .clock_status
             .as_ref()

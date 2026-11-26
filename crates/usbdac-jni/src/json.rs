@@ -69,12 +69,17 @@ fn clock_hop(hop: &ClockHop) -> Value {
         } => (Some(selected_pin), Some(pin_count)),
         _ => (None, None),
     };
-    json!({
+    let mut value = json!({
         "id": hop.id,
         "kind": hop.kind.code(),
         "selected_pin": selected_pin,
         "pin_count": pin_count,
-    })
+    });
+    if let ClockHopKind::RateMultiplier { numerator, denominator } = hop.kind {
+        value["numerator"] = json!(numerator);
+        value["denominator"] = json!(denominator);
+    }
+    value
 }
 
 /// Which clock the sample rate was set on and how it was reached.
@@ -829,6 +834,14 @@ mod tests {
                 json!({ "mode": mode, "feedback_endpoint": null, "implicit_feedback": null })
             );
         }
+    }
+
+    #[test]
+    fn an_adc3_multiplier_keeps_the_public_kind_and_reports_its_verified_ratio() {
+        assert_eq!(clock_hop(&ClockHop { id: 7, kind: ClockHopKind::RateMultiplier {
+            numerator: 2, denominator: 1,
+        }}), json!({ "id": 7, "kind": "multiplier", "selected_pin": null,
+            "pin_count": null, "numerator": 2, "denominator": 1 }));
     }
 
     #[test]
