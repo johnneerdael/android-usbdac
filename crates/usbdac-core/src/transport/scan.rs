@@ -90,6 +90,7 @@ fn structural_feedback_interfaces(
                     ep.synch_address(),
                     interval,
                     None,
+                    out.protocol_code() == 0x20 && standard_implicit_pcm_format(&format),
                 ) {
                     interfaces.push(source.interface_number);
                 }
@@ -115,6 +116,7 @@ fn structural_feedback_interfaces(
                         ep.synch_address(),
                         interval,
                         Some(rate),
+                        out.protocol_code() == 0x20 && standard_implicit_pcm_format(&format),
                     ) {
                         interfaces.push(source.interface_number);
                     }
@@ -128,6 +130,18 @@ fn structural_feedback_interfaces(
     interfaces
 }
 
+/// A standard AS_GENERAL PCM bitmap and valid Type-I geometry are required;
+/// the historical private short AS dialect must not acquire fixed endpoint profiles.
+fn standard_implicit_pcm_format(format: &StreamingInterfaceFormat) -> bool {
+    !format.is_uac1
+        && format.uac2_formats.is_some_and(|bits| bits & 1 != 0)
+        && format.format_tag == FORMAT_TAG_PCM
+        && format.channels > 0
+        && format.subslot_size > 0
+        && format.bit_resolution > 0
+        && format.bit_resolution <= format.subslot_size.saturating_mul(8)
+}
+
 struct ImplicitSourceCandidate {
     source: ImplicitFeedbackSource,
     control_interface: u8,
@@ -135,6 +149,7 @@ struct ImplicitSourceCandidate {
     clock: ClockChoice,
     rates: Vec<SamplingFrequencySubrange>,
     marked: bool,
+    standard_pcm: bool,
 }
 
 /// Audio IADs are authoritative function membership; no adjacency heuristic.
@@ -231,11 +246,90 @@ fn implicit_source_inventory(
                     clock: clock.clone(),
                     rates: format.sample_rate_ranges.clone(),
                     marked: ep.usage_type() == UsageType::FeedbackData,
+                    standard_pcm: alt.protocol_code() == 0x20
+                        && standard_implicit_pcm_format(&format),
                 });
             }
         }
     }
     result
+}
+
+/// Exact playback rules from Linux sound/usb/implicit.c's fixed endpoint
+/// table. These identify a pipe, never waive standard UAC2/function/clock proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaybackImplicitProfile {
+    Generic,
+    Fixed { address: u8, interface: u8 },
+    Skip,
+}
+
+fn playback_implicit_profile(vendor: u16, product: u16) -> PlaybackImplicitProfile {
+    use PlaybackImplicitProfile::{Fixed, Generic, Skip};
+    match (vendor, product) {
+        (0x0763, 0x2030 | 0x2031) => Fixed { address: 0x81, interface: 3 },
+        (0x0763, 0x2080 | 0x2081)
+        | (0x2466, 0x8010)
+        | (0x31e9, 0x0001 | 0x0002)
+        | (0x0499, 0x172f)
+        | (0x0d9a, 0x00df) => Fixed { address: 0x81, interface: 2 },
+        (0x19f7, 0x000a) => Fixed { address: 0x84, interface: 3 },
+        (0x22f0, 0x0006) => Fixed { address: 0x81, interface: 3 },
+        (0x1686, 0xf029) => Fixed { address: 0x82, interface: 2 },
+        (0x2466, 0x8003) | (0x0499, 0x172a) => Fixed { address: 0x86, interface: 2 },
+        // MicroBook IIc's standard-audio entry in implicit.c; the vendor
+        // protocol entry is deliberately outside this UAC2-only resolver.
+        // DIYINHK: quirks.c QUIRK_FLAG_SKIP_IMPLICIT_FB, exact product only.
+        (0x07fd, 0x0004) | (0x20b1, 0x2009) => Skip,
+        _ => Generic,
+    }
+}
+
+/// Apply the identity rule only after a sink's explicit-feedback path has been
+/// excluded. Fixed rules cannot fall back to another marked or adjacent pipe.
+fn implicit_source_rank(
+    profile: PlaybackImplicitProfile,
+    source: ImplicitFeedbackSource,
+    marked: bool,
+    out_interface: u8,
+    out_alt: u8,
+    linked_address: u8,
+) -> Option<u8> {
+    match profile {
+        PlaybackImplicitProfile::Skip => None,
+        PlaybackImplicitProfile::Fixed { address, interface } => {
+            (source.address == address
+                && source.interface_number == interface
+                && (linked_address == 0 || linked_address == address))
+                .then_some(0)
+        }
+        PlaybackImplicitProfile::Generic => {
+            if linked_address != 0 {
+                (source.address == linked_address).then_some(0)
+            } else if marked {
+                Some(1)
+            } else {
+                (source.interface_number == out_interface.saturating_add(1)
+                    && source.alt_setting == out_alt)
+                    .then_some(2)
+            }
+        }
+    }
+}
+
+fn implicit_profile_proven(
+    profile: PlaybackImplicitProfile,
+    standard_sink: bool,
+    standard_source: bool,
+    sample_rate: Option<u32>,
+) -> bool {
+    match profile {
+        PlaybackImplicitProfile::Skip => false,
+        PlaybackImplicitProfile::Generic => true,
+        PlaybackImplicitProfile::Fixed { .. } => {
+            standard_sink && standard_source && sample_rate.is_some()
+        }
+    }
 }
 
 fn resolve_implicit_source(
@@ -248,18 +342,27 @@ fn resolve_implicit_source(
     linked_address: u8,
     service_interval_us: u32,
     sample_rate: Option<u32>,
+    standard_sink: bool,
 ) -> Option<ImplicitFeedbackSource> {
+    // The actual libusb descriptor is authoritative, not Android handoff IDs.
+    // Fail closed when identity cannot be read: otherwise a skip/fixed product
+    // could accidentally enter the generic path.
+    let identity = handle.device().device_descriptor().ok()?;
+    let profile = playback_implicit_profile(identity.vendor_id(), identity.product_id());
     let mut matching = Vec::new();
     for source in inventory {
+        if !implicit_profile_proven(profile, standard_sink, source.standard_pcm, sample_rate) {
+            continue;
+        }
+        let Some(rank) = implicit_source_rank(
+            profile, source.source, source.marked, out_interface, out_alt, linked_address,
+        ) else {
+            continue;
+        };
         if !source.function_interfaces.contains(&out_interface)
             || (source.source.interface_number == out_interface
                 && source.source.alt_setting != out_alt)
             || source.source.service_interval_us != service_interval_us
-            || (linked_address != 0 && source.source.address != linked_address)
-            || (linked_address == 0
-                && !source.marked
-                && (source.source.interface_number != out_interface.saturating_add(1)
-                    || source.source.alt_setting != out_alt))
         {
             continue;
         }
@@ -294,16 +397,7 @@ fn resolve_implicit_source(
                 continue;
             }
         }
-        matching.push((
-            source.source,
-            if linked_address != 0 {
-                0
-            } else if source.marked {
-                1
-            } else {
-                2
-            },
-        ));
+        matching.push((source.source, rank));
     }
     choose_implicit_source(matching, out_alt)
 }
@@ -591,6 +685,16 @@ pub(super) fn build_usb_capability_model(
                             endpoint.synch_address(),
                             service_interval_us,
                             Some(*rate),
+                            descriptor.protocol_code() == 0x20
+                                && standard_implicit_pcm_format(&stream_format)
+                                && (1..=16).contains(&endpoint.interval())
+                                && valid_implicit_packet_capacity(endpoint.max_packet_size(), speed)
+                                && max_packet_bytes >= required_max_packet_bytes(
+                                    *rate,
+                                    service_interval_us,
+                                    usize::from(stream_format.channels)
+                                        * usize::from(stream_format.subslot_size),
+                                ),
                         )
                     })
                 } else {
@@ -884,6 +988,8 @@ pub(super) fn select_stream_candidate(
                         endpoint.synch_address(),
                         service_interval_us,
                         Some(effective_sample_rate),
+                        descriptor.protocol_code() == 0x20
+                            && standard_implicit_pcm_format(&stream_format),
                     )
                 } else {
                     None
@@ -1785,6 +1891,95 @@ mod implicit_discovery_tests {
             max_packet_bytes: capacity,
         }
     }
+    #[test]
+    fn implicit_pcm_requires_standard_bitmap_and_valid_geometry() {
+        let mut format = StreamingInterfaceFormat {
+            format_tag: FORMAT_TAG_PCM,
+            uac2_formats: Some(1),
+            native_dsd: None,
+            channels: 2,
+            subslot_size: 3,
+            bit_resolution: 24,
+            terminal_link: Some(1),
+            is_uac1: false,
+            sample_rate_ranges: Vec::new(),
+        };
+        assert!(standard_implicit_pcm_format(&format));
+        format.uac2_formats = None;
+        assert!(!standard_implicit_pcm_format(&format));
+        format.uac2_formats = Some(2);
+        assert!(!standard_implicit_pcm_format(&format));
+        format.uac2_formats = Some(1);
+        format.is_uac1 = true;
+        assert!(!standard_implicit_pcm_format(&format));
+        format.is_uac1 = false;
+        format.channels = 0;
+        assert!(!standard_implicit_pcm_format(&format));
+        format.channels = 2;
+        format.bit_resolution = 25;
+        assert!(!standard_implicit_pcm_format(&format));
+        format.bit_resolution = 0;
+        assert!(!standard_implicit_pcm_format(&format));
+    }
+
+    #[test]
+    fn fixed_profiles_require_standard_wire_proof_and_rate_without_restricting_generic() {
+        let fixed = playback_implicit_profile(0x19f7, 0x000a);
+        assert!(implicit_profile_proven(fixed, true, true, Some(48_000)));
+        assert!(!implicit_profile_proven(fixed, false, true, Some(48_000)));
+        assert!(!implicit_profile_proven(fixed, true, false, Some(48_000)));
+        assert!(!implicit_profile_proven(fixed, true, true, None));
+        assert!(implicit_profile_proven(PlaybackImplicitProfile::Generic, false, false, None));
+        assert!(!implicit_profile_proven(PlaybackImplicitProfile::Skip, true, true, Some(48_000)));
+    }
+
+    #[test]
+    fn exact_fixed_profiles_preserve_every_linux_pipe() {
+        for (vendor, product, address, interface) in [
+            (0x0763, 0x2030, 0x81, 3), (0x0763, 0x2031, 0x81, 3),
+            (0x0763, 0x2080, 0x81, 2), (0x0763, 0x2081, 0x81, 2),
+            (0x2466, 0x8010, 0x81, 2), (0x31e9, 0x0001, 0x81, 2),
+            (0x31e9, 0x0002, 0x81, 2), (0x0499, 0x172f, 0x81, 2),
+            (0x0d9a, 0x00df, 0x81, 2), (0x19f7, 0x000a, 0x84, 3),
+            (0x22f0, 0x0006, 0x81, 3), (0x1686, 0xf029, 0x82, 2),
+            (0x2466, 0x8003, 0x86, 2), (0x0499, 0x172a, 0x86, 2),
+        ] {
+            assert_eq!(playback_implicit_profile(vendor, product),
+                PlaybackImplicitProfile::Fixed { address, interface });
+        }
+        for identity in [(0x0763, 0x9999), (0x9999, 0x2030),
+            (0x20b1, 0x200a), (0x07fd, 0x0005), (0, 0)] {
+            assert_eq!(playback_implicit_profile(identity.0, identity.1),
+                PlaybackImplicitProfile::Generic);
+        }
+    }
+
+    #[test]
+    fn fixed_profile_uses_only_exact_pipe_and_refuses_conflicting_sync_address() {
+        let profile = playback_implicit_profile(0x19f7, 0x000a);
+        let fixed = source(3, 7, 0x84, 288);
+        // Fixed-source alternates need not match the sink's alternate.
+        assert_eq!(implicit_source_rank(profile, fixed, false, 1, 1, 0), Some(0));
+        assert_eq!(implicit_source_rank(profile, fixed, false, 1, 1, 0x84), Some(0));
+        assert_eq!(implicit_source_rank(profile, fixed, true, 1, 1, 0x81), None);
+        // A marked or adjacent source cannot override the product's pipe.
+        assert_eq!(implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, 0), None);
+        assert_eq!(implicit_source_rank(profile, source(2, 1, 0x84, 288), true, 1, 1, 0), None);
+        assert_eq!(implicit_source_rank(profile, source(3, 1, 0x81, 288), true, 1, 1, 0), None);
+        assert_eq!(implicit_source_rank(PlaybackImplicitProfile::Generic, fixed, false, 1, 1, 0), None);
+    }
+
+    #[test]
+    fn standard_audio_skip_profiles_veto_linked_and_marked_implicit_sources() {
+        for identity in [(0x07fd, 0x0004), (0x20b1, 0x2009)] {
+            let profile = playback_implicit_profile(identity.0, identity.1);
+            assert_eq!(profile, PlaybackImplicitProfile::Skip);
+            for linked in [0, 0x81] {
+                assert_eq!(implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, linked), None);
+            }
+        }
+    }
+
     #[test]
     fn prioritizes_declaration_then_marked_source() {
         let plain = source(2, 1, 0x81, 288);

@@ -217,3 +217,15 @@ channel. Observe a route and gain change and compare raw banks and
 rows with ALSA FCP. After a separate controller changes one edited
 target, close the session under `RestoreOriginal` and check that the
 other library-owned targets revert and the external change survives.
+
+### First-generation Scarlett routing
+
+ALSA describes the first-generation 6i6, 8i6, 18i6, 18i8, and 18i20
+with model-specific UAC2 control maps. The matrix, output and capture
+muxes use entities `0x32`, `0x33`, and `0x34`. Matrix gains use `0x3c`.
+Model tables define the signed source IDs and the number of inputs and
+outputs. A library adapter can identify the model, prove the owning
+AudioControl interface, and read live selectors and gains before
+exposing edits. Keep device initialization outside discovery. The ALSA
+probe sets the clock to 48 kHz, which would change a user's session
+during a read. [ALSA model tables and controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L954-L1165), [ALSA Gen 1 dispatch and wire selectors](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett.c#L1300-L1390)

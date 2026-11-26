@@ -626,3 +626,40 @@ The Android arm64 NDK check, Kotlin tests, sample build and SDK snippet
 check passed. The local AAR contains all four native ABIs. Its SHA-256
 is `af94d8ed4dc40873c2ee9f8e63284ab2f0c7f03800492b0a96756a1a480d89cd`.
 Physical verification of an ADC3 multiplier path is pending.
+
+### Paired adaptive UAC3 capture
+
+For devices with two adaptive endpoints, the device can derive
+capture timing from the audio sent to its playback sink. During an
+explicit duplex open, match the marked adaptive OUT endpoint to the
+adaptive IN alternate on a separate AudioStreaming interface of the
+same full ADC3 function. Prove the common source, effective multiplier
+ratio and wire sample rate, plus each pipe's own packet capacity. The
+two service intervals can differ because each pipe follows its own
+schedule. A genuine dedicated feedforward endpoint uses the explicit
+path. [USB Audio 3.0 §§3.11.4.3 and 4.8.1.1](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=26)
+
+The worker can arm capture while the application fills the playback
+buffer. Begin the timing deadline with the first playback submission.
+Deliver capture only after a valid OUT completion and while that
+timing remains current. Complete, frame-aligned wire silence during
+pause or flush still provides timing. Retire both pipes before handing
+back their clock and power. Physical acceptance should trace first
+delivery, pause, flush, loss of OUT timing and stop.
+
+### Device-specific UAC2 timing pipes
+
+Use the ALSA fixed endpoint and interface table as a device-specific
+association for standard UAC2 PCM. Match actual USB identity and
+keep the existing function, clock, rate, and packet-geometry proof.
+A usable explicit endpoint or an exact device-specific implicit
+exclusion takes precedence over the fixed association. Proprietary
+interfaces and device startup commands require separate proof.
+[ALSA fixed endpoint table](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L42-L70),
+[ALSA exact DIYINHK exclusion](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2496-L2508)
+
+The Rust workspace and Android checks passed, including the adaptive
+pair, timing-gap recovery, and exact fixed-pipe and exclusion cases.
+The local four-ABI AAR SHA-256 is
+`439c6eddf25a5002b6ca577405252c9ddded25adbcbe5907ccac2d685ad233e9`.
+Both additions still need target-hardware validation.
