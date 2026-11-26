@@ -1,0 +1,18 @@
+usbdac
+======
+
+usbdac is derived from the direct USB DAC output driver of Flick, an Android
+music player (MIT licensed,
+Copyright (c) 2026 Flick Player Contributors). The USB Audio Class descriptor
+parsers, clock topology resolution, isochronous packet scheduling and
+validation, transport loss accounting, output position accounting, payload
+audits and hardware volume controls in `crates/usbdac-core` were extracted from
+Flick's `rust/src/uac2/` module (commit 86ffa87f) and then restructured behind a
+standalone, handle-based API. The behaviour tuned on hardware in Flick is kept
+as it was unless the git history of this repository says otherwise.
+
+No code from any other project was copied into this repository.
+
+Third-party libraries used (see Cargo.lock for exact versions): rusb and
+libusb1-sys (libusb, LGPL-2.1+, linked as a library), parking_lot, once_cell,
+crossbeam-channel, log, libc, and for the JNI crate jni, serde and serde_json.
