@@ -18,6 +18,29 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
+    fun clarettCapabilityKeysPreserveUsbAndPlusIdentityAndOptIn() {
+        for ((key, name) in listOf(
+            "clarett_usb_2pre" to "Clarett USB 2Pre",
+            "clarett_usb_4pre" to "Clarett USB 4Pre",
+            "clarett_usb_8pre" to "Clarett USB 8Pre",
+            "clarett_plus_2pre" to "Clarett+ 2Pre",
+            "clarett_plus_4pre" to "Clarett+ 4Pre",
+            "clarett_plus_8pre" to "Clarett+ 8Pre",
+        )) {
+            val capability = parseScarlettCapability(JSONObject()
+                .put("model", key).put("name", name).put("configuration_id", 1)
+                .put("interface", 4).put("notification_endpoint", 132)
+                .put("interface_claimed", false))
+            assertEquals(key, capability.model.name.lowercase())
+            assertEquals(name, capability.name)
+            assertEquals(capability.model.name, VendorRouting.valueOf(key.uppercase()).name)
+            assertEquals(4, capability.interfaceId)
+            assertFalse(capability.interfaceClaimed)
+        }
+        assertTrue(ScarlettModel.CLARETT_USB_2PRE != ScarlettModel.CLARETT_PLUS_2PRE)
+    }
+
+    @Test
     fun implicitPacingKeepsSourceAndLiveLockSeparate() {
         val json = JSONObject(Fixtures.FORMAT)
             .put("explicit_feedback", false)

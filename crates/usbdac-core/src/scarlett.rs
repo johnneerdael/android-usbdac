@@ -24,6 +24,14 @@ pub enum CandidateModel {
     Scarlett8i6Gen3,
     Scarlett18i8Gen3,
     Scarlett18i20Gen3,
+    // Exact USB identities from pinned ALSA model map (2256–2262);
+    // USB/Plus share protocol geometry, never their public model identity.
+    ClarettUsb2Pre,
+    ClarettUsb4Pre,
+    ClarettUsb8Pre,
+    ClarettPlus2Pre,
+    ClarettPlus4Pre,
+    ClarettPlus8Pre,
     VocasterOne,
     VocasterTwo,
     ScarlettSoloGen4,
@@ -42,6 +50,12 @@ impl CandidateModel {
             0x8213 => Some(Self::Scarlett8i6Gen3),
             0x8214 => Some(Self::Scarlett18i8Gen3),
             0x8215 => Some(Self::Scarlett18i20Gen3),
+            0x8206 => Some(Self::ClarettUsb2Pre),
+            0x8207 => Some(Self::ClarettUsb4Pre),
+            0x8208 => Some(Self::ClarettUsb8Pre),
+            0x820a => Some(Self::ClarettPlus2Pre),
+            0x820b => Some(Self::ClarettPlus4Pre),
+            0x820c => Some(Self::ClarettPlus8Pre),
             0x8216 => Some(Self::VocasterOne),
             0x8217 => Some(Self::VocasterTwo),
             0x8218 => Some(Self::ScarlettSoloGen4),
@@ -59,6 +73,12 @@ impl CandidateModel {
             Self::Scarlett8i6Gen3 => "scarlett_8i6_gen3",
             Self::Scarlett18i8Gen3 => "scarlett_18i8_gen3",
             Self::Scarlett18i20Gen3 => "scarlett_18i20_gen3",
+            Self::ClarettUsb2Pre => "clarett_usb_2pre",
+            Self::ClarettUsb4Pre => "clarett_usb_4pre",
+            Self::ClarettUsb8Pre => "clarett_usb_8pre",
+            Self::ClarettPlus2Pre => "clarett_plus_2pre",
+            Self::ClarettPlus4Pre => "clarett_plus_4pre",
+            Self::ClarettPlus8Pre => "clarett_plus_8pre",
             Self::VocasterOne => "vocaster_one", Self::VocasterTwo => "vocaster_two",
             Self::ScarlettSoloGen4 => "scarlett_solo_gen4",
             Self::Scarlett2i2Gen4 => "scarlett_2i2_gen4",
@@ -74,6 +94,12 @@ impl CandidateModel {
             Self::Scarlett8i6Gen3 => "Scarlett 8i6 Gen 3",
             Self::Scarlett18i8Gen3 => "Scarlett 18i8 Gen 3",
             Self::Scarlett18i20Gen3 => "Scarlett 18i20 Gen 3",
+            Self::ClarettUsb2Pre => "Clarett USB 2Pre",
+            Self::ClarettUsb4Pre => "Clarett USB 4Pre",
+            Self::ClarettUsb8Pre => "Clarett USB 8Pre",
+            Self::ClarettPlus2Pre => "Clarett+ 2Pre",
+            Self::ClarettPlus4Pre => "Clarett+ 4Pre",
+            Self::ClarettPlus8Pre => "Clarett+ 8Pre",
             Self::VocasterOne => "Vocaster One", Self::VocasterTwo => "Vocaster Two",
             Self::ScarlettSoloGen4 => "Scarlett Solo Gen 4",
             Self::Scarlett2i2Gen4 => "Scarlett 2i2 Gen 4",
@@ -92,6 +118,8 @@ impl CandidateModel {
             Self::Scarlett8i6Gen3 => firmware != 0,
             Self::Scarlett18i8Gen3 => firmware != 0,
             Self::Scarlett18i20Gen3 => firmware != 0,
+            Self::ClarettUsb2Pre | Self::ClarettUsb4Pre | Self::ClarettUsb8Pre
+                | Self::ClarettPlus2Pre | Self::ClarettPlus4Pre | Self::ClarettPlus8Pre => firmware != 0,
             Self::VocasterOne | Self::VocasterTwo => firmware >= 1769,
             Self::ScarlettSoloGen4 | Self::Scarlett2i2Gen4 => firmware >= 2115,
             Self::Scarlett4i4Gen4 => firmware >= 2089,
@@ -142,6 +170,8 @@ impl ReadModel {
     fn dsp_count(self) -> u8 {
         match self.candidate {
             CandidateModel::Scarlett18i20Gen2 | CandidateModel::Scarlett6i6Gen2 | CandidateModel::Scarlett18i8Gen2 | CandidateModel::Scarlett4i4Gen3 | CandidateModel::Scarlett8i6Gen3 | CandidateModel::Scarlett18i8Gen3 | CandidateModel::Scarlett18i20Gen3 => 0,
+            CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettUsb8Pre
+                | CandidateModel::ClarettPlus2Pre | CandidateModel::ClarettPlus4Pre | CandidateModel::ClarettPlus8Pre => 0,
             CandidateModel::VocasterOne => 1,
             _ => 2,
         }
@@ -163,6 +193,11 @@ impl ReadModel {
             CandidateModel::Scarlett8i6Gen3 => [42, 42, 42],
             CandidateModel::Scarlett18i8Gen3 => [60, 56, 50],
             CandidateModel::Scarlett18i20Gen3 => [77, 73, 46],
+            // Independent geometry contract from pinned ALSA lines 2053–2226:
+            // USB and Plus identities share the 2/4/8Pre shapes.
+            CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre => [42, 38, 32],
+            CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre => [52, 48, 44],
+            CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre => [64, 56, 46],
             CandidateModel::VocasterOne => [23, 0, 0],
             CandidateModel::VocasterTwo => [34, 0, 0],
             CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4 => [12; 3],
@@ -207,6 +242,21 @@ impl ReadModel {
             (CandidateModel::Scarlett18i20Gen3, PortKind::Adat) => [8, 8],
             (CandidateModel::Scarlett18i20Gen3, PortKind::Mix) => [12, 25],
             (CandidateModel::Scarlett18i20Gen3, PortKind::Pcm) => [20, 20],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Analogue) => [2, 4],
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Analogue) => [8, 6],
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Analogue) => [8, 10],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Spdif) => [2, 0],
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Spdif) => [2, 2],
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Spdif) => [2, 2],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Adat) => [8, 0],
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Adat) => [8, 0],
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Adat) => [8, 8],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Mix) => [10, 18],
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Mix) => [10, 18],
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Mix) => [10, 18],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Pcm) => [4, 12],
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Pcm) => [8, 18],
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Pcm) => [20, 18],
             (CandidateModel::VocasterOne, PortKind::Analogue) => [2, 4],
             (CandidateModel::VocasterOne, PortKind::Mix) => [9, 9],
             (CandidateModel::VocasterOne, PortKind::Pcm) => [4, 10],
@@ -941,6 +991,26 @@ fn bank_destinations_for(model: ReadModel, bank: u8) -> Result<Vec<u16>, Protoco
         }
         Scarlett18i20Gen3 if bank==2 => vec![(0x600,0,10),(0x080,0,10),(0x180,0,2),(0,0,24)],
         Scarlett18i20Gen3 => vec![(0x600,0,8),(0x600,10,if bank==0 {10} else {8}),(0x080,0,10),(0x180,0,2),(0x200,0,8),(0x600,8,2),(0x300,0,25),(0,0,if bank==0 {12} else {10})],
+        ClarettUsb2Pre | ClarettPlus2Pre => {
+            let mut groups = vec![(0x600,0,[12,8,2][bank as usize]),(0x080,0,4)];
+            if bank < 2 { groups.push((0x300,0,18)); }
+            groups.push((0,0,if bank == 2 {26} else {8}));
+            groups
+        }
+        ClarettUsb4Pre | ClarettPlus4Pre => {
+            let mut groups = vec![(0x600,0,[18,14,12][bank as usize]),(0x080,0,6),(0x180,0,2)];
+            if bank < 2 { groups.push((0x300,0,18)); }
+            groups.push((0,0,if bank == 2 {24} else {8}));
+            groups
+        }
+        ClarettUsb8Pre | ClarettPlus8Pre => {
+            let mut groups = vec![(0x600,0,[18,14,12][bank as usize]),(0x080,0,10),(0x180,0,2)];
+            if bank < 2 {
+                groups.extend([(0x200,0,if bank == 0 {8} else {4}),(0x300,0,18)]);
+            }
+            groups.push((0,0,if bank == 2 {22} else {8}));
+            groups
+        }
         VocasterOne => vec![(0x300,8,1),(0x600,5,5),(0x300,6,2),(0x600,0,5),(0x300,0,6),(0x080,0,4)],
         VocasterTwo => vec![(0x300,12,2),(0x600,6,8),(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
         ScarlettSoloGen4 | Scarlett2i2Gen4 => vec![(0x300,4,2),(0x300,2,2),(0x600,0,4),(0x300,0,2),(0x080,0,2)],
@@ -1601,6 +1671,101 @@ mod tests {
                         }
                         assert_eq!(session.io.base.writes,0);
                     } else { assert!(result.is_err(),"{candidate:?} accepted corrupt live proof {corrupt}"); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clarett_exact_usb_and_plus_identities_require_complete_live_reads() {
+        use CandidateModel::*;
+        for (product, candidate, key, name) in [
+            (0x8206, ClarettUsb2Pre, "clarett_usb_2pre", "Clarett USB 2Pre"),
+            (0x8207, ClarettUsb4Pre, "clarett_usb_4pre", "Clarett USB 4Pre"),
+            (0x8208, ClarettUsb8Pre, "clarett_usb_8pre", "Clarett USB 8Pre"),
+            (0x820a, ClarettPlus2Pre, "clarett_plus_2pre", "Clarett+ 2Pre"),
+            (0x820b, ClarettPlus4Pre, "clarett_plus_4pre", "Clarett+ 4Pre"),
+            (0x820c, ClarettPlus8Pre, "clarett_plus_8pre", "Clarett+ 8Pre"),
+        ] {
+            assert_eq!(CandidateModel::recognize(0x1235, product), Some(candidate));
+            assert_eq!(CandidateModel::recognize(0x1234, product), None);
+            assert_eq!(candidate.key(), key);
+            assert_eq!(candidate.name(), name);
+            assert_eq!(candidate.validate_firmware(0), Err(ProtocolError::UnsupportedFirmware(0)));
+            for firmware in [1, 1083, 4096] {
+                let model = candidate.validate_firmware(firmware).unwrap();
+                // Wrong destination, short MIX row and wrong reply sequence
+                // must fail admission even with an accepted nonzero firmware.
+                for corrupt in [0, 2, 3, 4] {
+                    let io = ProfileIo { base: MockIo { firmware, ..MockIo::default() }, model, corrupt };
+                    let result = ReadSession::initialize(io, candidate);
+                    if corrupt == 0 {
+                        let session = result.unwrap();
+                        assert_eq!(session.model(), model);
+                        let mux_reads = session.io.base.sent.iter().filter(|p| p[..4] == 0x3001u32.to_le_bytes()).count();
+                        let mix_reads = session.io.base.sent.iter().filter(|p| p[..4] == 0x2001u32.to_le_bytes()).count();
+                        assert_eq!((mux_reads, mix_reads), (1, 10));
+                        assert_eq!(session.io.base.writes, 0);
+                    } else {
+                        assert!(result.is_err(), "{candidate:?} accepted corrupt proof {corrupt}");
+                    }
+                }
+                // Unsupported or wrong optional bank geometry must not prevent
+                // read-only admission or authorize a bank write.
+                for corrupt in [1, 5] {
+                    let io = ProfileIo { base: MockIo { firmware, ..MockIo::default() }, model, corrupt };
+                    let mut session = ReadSession::initialize(io, candidate).unwrap();
+                    assert!(session.read_mux_banks().is_err());
+                    assert!(!session.poisoned);
+                    assert_eq!(session.io.base.writes, 0);
+                }
+            }
+        }
+        for product in [0x8205, 0x8209, 0x820d] {
+            assert_eq!(CandidateModel::recognize(0x1235, product), None);
+        }
+    }
+
+    #[test]
+    fn clarett_geometry_matches_independent_port_and_bank_contracts() {
+        use CandidateModel::*;
+        // Source/destination counts are independent expected protocol identities;
+        // in particular 2Pre has S/PDIF sources but no S/PDIF destinations.
+        for (candidates, counts, widths, banks) in [
+            ([ClarettUsb2Pre, ClarettPlus2Pre], [[2,4],[2,0],[8,0],[10,18],[4,12]], [42,38,32],
+                [vec![(0x600,12),(0x080,4),(0x300,18),(0,8)],
+                 vec![(0x600,8),(0x080,4),(0x300,18),(0,8)],
+                 vec![(0x600,2),(0x080,4),(0,26)]]),
+            ([ClarettUsb4Pre, ClarettPlus4Pre], [[8,6],[2,2],[8,0],[10,18],[8,18]], [52,48,44],
+                [vec![(0x600,18),(0x080,6),(0x180,2),(0x300,18),(0,8)],
+                 vec![(0x600,14),(0x080,6),(0x180,2),(0x300,18),(0,8)],
+                 vec![(0x600,12),(0x080,6),(0x180,2),(0,24)]]),
+            ([ClarettUsb8Pre, ClarettPlus8Pre], [[8,10],[2,2],[8,8],[10,18],[20,18]], [64,56,46],
+                [vec![(0x600,18),(0x080,10),(0x180,2),(0x200,8),(0x300,18),(0,8)],
+                 vec![(0x600,14),(0x080,10),(0x180,2),(0x200,4),(0x300,18),(0,8)],
+                 vec![(0x600,12),(0x080,10),(0x180,2),(0,22)]]),
+        ] {
+            for candidate in candidates {
+                let model = candidate.validate_firmware(1).unwrap();
+                assert_eq!((model.mixer_inputs(), model.mixer_outputs()), (18, 10));
+                assert_eq!(model.bank_widths(), widths);
+                for (kind, [sources, destinations]) in [PortKind::Analogue, PortKind::Spdif, PortKind::Adat, PortKind::Mix, PortKind::Pcm].into_iter().zip(counts) {
+                    assert_eq!(model.count(kind, true), sources);
+                    assert_eq!(model.count(kind, false), destinations);
+                }
+                for (bank, groups) in banks.iter().enumerate() {
+                    let expected: Vec<u16> = groups.iter().flat_map(|&(base, count)|
+                        (0..count).map(move |channel| if base == 0 { 0 } else { base + channel })).collect();
+                    assert_eq!(expected.len(), usize::from(widths[bank]));
+                    assert_eq!(bank_destinations_for(model, bank as u8).unwrap(), expected);
+                    let snapshot = MuxBankSnapshot { bank: bank as u8, model, words: expected.iter().copied().map(u32::from).collect() };
+                    validate_bank(model, &snapshot).unwrap();
+                    let mut wrong = snapshot.clone();
+                    wrong.words.swap(0, 1);
+                    assert_eq!(validate_bank(model, &wrong), Err(ProtocolError::UnsupportedMuxGeometry));
+                    let mut short = snapshot;
+                    short.words.pop();
+                    assert_eq!(validate_bank(model, &short), Err(ProtocolError::UnsupportedMuxGeometry));
                 }
             }
         }

@@ -153,3 +153,23 @@ snapshot. This also permits read-only reporting for firmware that answers
 selector zero and rejects the per-bank probes.
 [FCP information and bank wire operations](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp.c#L349-L469),
 [FCP destination slots by rate](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/mux.c#L447-L491)
+
+### Firmware-described FCP routing
+
+ALSA dispatches Scarlett 16i16, 18i16 and 18i20 Gen 4 and ISA C8X
+(`1235:821b` through `1235:821e`) to FCP. The upstream model maps name
+sources and sinks. The device's firmware map supplies the actual router
+pins and identifies fixed destinations. Start with a read-only adapter
+for those exact IDs. After verifying the claimed vendor interface and
+protocol handshake, bound the device-map read, Base64 decode and zlib
+output before parsing. Read the source and destination arrays under
+`device-specification` and combine them with live `MIX_INFO`, `MUX_INFO`
+and bank reads. Validate the pin range, uniqueness, source references
+and destination slots per bank. Keep fixed destinations read-only and
+reject rows or banks that disagree with the live shape. Carry the
+observed topology with a session so a later transactional adapter can
+detect drift before enabling edits.
+[ALSA device dispatch](https://github.com/torvalds/linux/blob/b9b3e33b70b71e516930117e21de3ad2a7723747/sound/usb/mixer_quirks.c#L4510-L4515),
+[FCP map wire read](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp.c#L930-L979),
+[FCP map decoding](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/fcp-devmap.c#L58-L152),
+[FCP route discovery](https://github.com/geoffreybennett/fcp-support/blob/02be3c9081658af9c5b1246294a054d5eb24ef60/server/mux.c#L334-L491)
