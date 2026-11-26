@@ -18,6 +18,7 @@ val githubRepository: String? = System.getenv("GITHUB_REPOSITORY")
 android {
     namespace = "dev.usbdac"
     compileSdk = 36
+    buildToolsVersion = "36.0.0"
     ndkVersion = ndkVersionPin
 
     defaultConfig {

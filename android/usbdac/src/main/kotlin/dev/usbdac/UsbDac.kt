@@ -1,5 +1,6 @@
 package dev.usbdac
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -236,6 +237,9 @@ public object UsbDac {
         return PendingIntent.getBroadcast(context, 0, Intent(action).setPackage(context.packageName), flags)
     }
 
+    // The export flag exists from Android 13; before that, receivers registered at run time are not
+    // exported to other apps unless the intent filter says so, and the system's own broadcasts arrive.
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private fun registerNotExported(context: Context, receiver: BroadcastReceiver, filter: IntentFilter) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)

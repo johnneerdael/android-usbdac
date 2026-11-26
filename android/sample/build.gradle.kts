@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "dev.usbdac.sample"
     compileSdk = 36
+    buildToolsVersion = "36.0.0"
 
     defaultConfig {
         applicationId = "dev.usbdac.sample"

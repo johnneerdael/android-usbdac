@@ -5,9 +5,9 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioMixerAttributes
 import android.media.AudioTrack
 import android.os.Build
+import dev.usbdac.internal.BitPerfectMixer
 import dev.usbdac.internal.HeadPositionTracker
 import dev.usbdac.internal.logWarning
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -306,32 +306,7 @@ public class AndroidManagedOutput private constructor(
                     "the bit-perfect mixer behavior needs Android 14; this is API ${Build.VERSION.SDK_INT}",
                 ) to none
             }
-            return try {
-                val wanted = audioManager.getSupportedMixerAttributes(device).firstOrNull {
-                    it.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT &&
-                        it.format.encoding == format.encoding &&
-                        it.format.sampleRate == format.sampleRate &&
-                        it.format.channelMask == format.channelMask
-                } ?: return BitPerfectState.Unverifiable(
-                    "the platform offers no bit-perfect mixer attributes for this format on this device",
-                ) to none
-                if (!audioManager.setPreferredMixerAttributes(attributes, device, wanted)) {
-                    return BitPerfectState.Unverifiable("the platform refused the bit-perfect request") to none
-                }
-                val undo: () -> Unit = { audioManager.clearPreferredMixerAttributes(attributes, device) }
-                val active = audioManager.getPreferredMixerAttributes(attributes, device)
-                if (active?.mixerBehavior == AudioMixerAttributes.MIXER_BEHAVIOR_BIT_PERFECT) {
-                    BitPerfectState.RequestedViaPlatform(
-                        "Android accepted the bit-perfect mixer behavior for this device and format; " +
-                            "the library cannot verify it",
-                    ) to undo
-                } else {
-                    runCatching(undo)
-                    BitPerfectState.Unverifiable("the platform did not keep the bit-perfect request") to none
-                }
-            } catch (error: SecurityException) {
-                BitPerfectState.Unverifiable("the app lacks the MODIFY_AUDIO_SETTINGS permission") to none
-            }
+            return BitPerfectMixer.request(audioManager, attributes, device, format)
         }
     }
 }
