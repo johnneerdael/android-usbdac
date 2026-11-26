@@ -238,7 +238,7 @@ fn badd_capacity_sync_speed_and_direction_are_joint_evidence() {
     assert!(infer_badd_format(
         BaddProfile::GenericIo,
         BusSpeed::High,
-        2,
+        0,
         &ep(1, 0x0d, 96, 4),
         true
     )
@@ -256,6 +256,84 @@ fn badd_capacity_sync_speed_and_direction_are_joint_evidence() {
         BusSpeed::High,
         1,
         &ep(1, 0x0d, 192, 4),
+        true
+    )
+    .is_err());
+}
+
+#[test]
+fn badd_continuous_operational_alternates_preserve_both_widths() {
+    // Linux stream.c applies the BADD packet table to operational alternates,
+    // including devices whose 24-bit format lives outside mandatory alt 1.
+    for (speed, interval) in [(BusSpeed::Full, 1), (BusSpeed::High, 4)] {
+        for (sync, capacities) in [(0x0d, [96, 144, 192, 288]), (0x05, [98, 147, 196, 294])] {
+            for address in [1, 0x81] {
+                let formats: Vec<_> = capacities
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, capacity)| {
+                        infer_badd_format(
+                            BaddProfile::GenericIo,
+                            speed,
+                            (i + 1) as u8,
+                            &ep(address, sync, capacity, interval),
+                            address == 1,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    formats
+                        .iter()
+                        .map(|f| (f.channels, f.subslot_size, f.bit_resolution))
+                        .collect::<Vec<_>>(),
+                    vec![(1, 2, 16), (1, 3, 24), (2, 2, 16), (2, 3, 24)]
+                );
+                assert!(formats.iter().all(|f| f.sample_rate == 48_000));
+                for invalid_interval in [interval - 1, interval + 1] {
+                    assert!(infer_badd_format(
+                        BaddProfile::GenericIo,
+                        speed,
+                        2,
+                        &ep(address, sync, capacities[1], invalid_interval),
+                        address == 1,
+                    )
+                    .is_err());
+                }
+            }
+        }
+    }
+    for endpoint in [
+        ep(1, 0x05, 144, 4), // synchronous capacity on asynchronous endpoint
+        ep(1, 0x0d, 147, 4),
+        ep(1, 0x09, 144, 4),    // adaptive synchronization
+        ep(1, 0x0d, 0x0890, 4), // high-bandwidth multiplier bits
+    ] {
+        assert!(
+            infer_badd_format(BaddProfile::GenericIo, BusSpeed::High, 2, &endpoint, true).is_err()
+        );
+    }
+    assert!(infer_badd_format(
+        BaddProfile::GenericIo,
+        BusSpeed::High,
+        2,
+        &ep(1, 0x05, 147, 4),
+        false
+    )
+    .is_err());
+    assert!(infer_badd_format(
+        BaddProfile::Headset,
+        BusSpeed::High,
+        2,
+        &ep(0x81, 0x0d, 288, 4),
+        false
+    )
+    .is_err());
+    assert!(infer_badd_format(
+        BaddProfile::Microphone,
+        BusSpeed::High,
+        2,
+        &ep(1, 0x0d, 144, 4),
         true
     )
     .is_err());

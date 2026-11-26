@@ -251,3 +251,71 @@ Rust and JNI tests, Android cross-target and four-ABI builds, Kotlin
 tests and the sample build passed. Physical clock switching, multichannel
 wire behavior and hardware routing have yet to be verified on target
 devices.
+
+### BADD alternate coverage
+
+BADD section 4.2 requires an empty alternate zero, a continuous
+1 ms alternate one, and support for both 16-bit and 24-bit samples.
+Table 8-26 provides eight exact continuous endpoint capacities combining
+mono/stereo, width and synchronous/asynchronous timing. ALSA applies those
+capacity cases to operational alternates without requiring alt one.
+The current transport only admits alt one. A direct follow-through is to
+recognize additional 1 ms alts with the same exact capacity and feedback
+evidence, then test a device that exposes the other sample width on a
+different alternate. Optional bursting has different intervals and needs
+its own evidence. Do not infer its width by applying the continuous
+capacity table to a different interval. SuperSpeed requires validating
+the endpoint companion service capacity before admission.
+[BADD specification via IEC](https://cdn.standards.iteh.ai/samples/102576/dceddfdc0b3e48879b48480be81b1805/IEC-62680-1-6-2019.pdf),
+[ALSA BADD format cases](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/stream.c#L897-L943)
+
+### Duplex reader contention
+
+Capture presentation is separate from USB completion timing. Both shared
+implicit and distinct duplex capture paths use a nonblocking append.
+While the reader holds the buffer, the worker continues USB and OUT
+processing and accounts for valid capture frames dropped by host
+contention separately from device packet loss. Detach classification
+works even when the buffer is unavailable. The contention regression
+holds the reader lock during completion and verifies deferred accounting
+and retirement. JNI and Kotlin expose the resulting contention counter.
+
+### SuperSpeed capacity evidence
+
+For ordinary SuperSpeed ADC3 endpoints, derive the ISO service-byte
+ceiling from the endpoint companion's `wBytesPerInterval`, checked
+against the packet, burst and Mult limits. Apply it to both directions
+and the dedicated feedback endpoint before using the existing worker.
+For BADD, the 1 ms interval and continuous capacity table still define
+the inferred format. Record the underlying endpoint and companion
+geometry in route verification. Extended SuperSpeedPlus high-bandwidth
+descriptors require a separate validated contract.
+[libusb SuperSpeed endpoint companion fields](https://libusb.sourceforge.io/api-1.0/structlibusb__ss__endpoint__companion__descriptor.html),
+[USB 3.2 specification §9.6.7](https://e2e.ti.com/cfs-file/__key/communityserver-discussions-components-files/138/USB-3.2-Revision-1.1.pdf)
+
+## Sixth validation checkpoint
+
+Full ADC3 playback can fall back to a verified alternative clock on a
+fully claimed single-stream function. Negotiation restores prior
+settings before releasing temporary power. Open reapplies the recorded
+plan after drift checks, and teardown restores the source frequency
+and selector pins before the domain state. A failed restoration remains
+visible and does not trigger speculative power writes. ADC3 playback
+and capture also accept checked ordinary SuperSpeed companions.
+Continuous BADD alternate admission covers source-described 16-bit and
+24-bit layouts beyond alt one.
+
+Android can opt into the exact vendor claim and perform Scarlett MIX
+and per-bank mux transactions. Mux editing requires a successful
+runtime geometry probe and complete bank reads, an opaque native
+snapshot, fresh comparison, readback and per-bank rollback. Duplex
+capture append uses a nonblocking worker boundary and exposes host
+contention separately from transport loss.
+
+Rust/JNI tests, Android cross-target and Kotlin tests, the four-ABI
+AAR and sample build passed. The built Kotlin native methods and
+corresponding exported JNI symbols were checked for all four ABIs.
+The final ADB check found the phone offline. No physical acceptance
+was run. ADC3 alternate clock mutation across multiple streaming
+interfaces, optional BADD bursting, extended SSP geometry and broader
+Scarlett model/firmware evidence remain open.

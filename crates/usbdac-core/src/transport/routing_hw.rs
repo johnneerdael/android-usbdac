@@ -53,6 +53,7 @@ pub enum RoutingSessionError {
     Transaction(TransactionError<String>),
     Scarlett(crate::scarlett::ReadError<String>),
     ScarlettMix(crate::scarlett::MixWriteError<String>),
+    ScarlettMux(crate::scarlett::MuxWriteError<String>),
 }
 
 impl std::fmt::Display for RoutingSessionError {
@@ -70,6 +71,24 @@ pub(super) fn scarlett_claim_interface(
     product: u16,
 ) -> Option<u8> {
     scarlett_endpoint(config, vendor, product).map(|(interface, _)| interface)
+}
+
+/// Descriptor-only host preclaim proof. Never claims an interface or initializes Scarlett.
+pub(crate) fn scarlett_preflight(fd: RawFd, info: &crate::DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>, Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
+    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(), info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
+    let wrapped = wrap_android_usb_handle(&device).map_err(Error::Claim)?;
+    let usb = wrapped.handle.device();
+    let identity = usb.device_descriptor().map_err(|e| Error::Control(e.to_string()))?;
+    if identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id {
+        return Err(Error::Claim("host and USB device identities differ during Scarlett preflight".into()));
+    }
+    let config = usb.active_config_descriptor().map_err(|e| Error::Control(e.to_string()))?;
+    if info.configuration_id != Some(config.number()) { return Err(Error::Claim("Scarlett preflight requires the selected active configuration".into())); }
+    let Some(candidate) = crate::scarlett::CandidateModel::recognize(identity.vendor_id(), identity.product_id()) else { return Ok(None); };
+    Ok(scarlett_endpoint(&config, identity.vendor_id(), identity.product_id()).map(|(interface, notification_endpoint)| crate::scarlett::ReadCapability {
+        candidate, configuration: config.number(), interface, notification_endpoint, interface_claimed: false,
+    }))
 }
 
 fn scarlett_endpoint(config: &ConfigDescriptor, vendor: u16, product: u16) -> Option<(u8, u8)> {
@@ -277,6 +296,7 @@ struct RecordedScarlett {
     configuration: u8,
     descriptors: Vec<u8>,
     rows: BTreeMap<u8, (crate::scarlett::MixReadback, crate::scarlett::MixReadback)>,
+    mux: Option<(crate::scarlett::MuxSnapshot, crate::scarlett::MuxSnapshot)>,
 }
 static ORIGINAL_SCARLETT: Mutex<Option<RecordedScarlett>> = Mutex::new(None);
 
@@ -365,6 +385,7 @@ pub(crate) fn scarlett_mix_apply(
             configuration,
             descriptors: descriptors.clone(),
             rows: BTreeMap::new(),
+            mux: None,
         });
         record
             .rows
@@ -377,6 +398,68 @@ pub(crate) fn scarlett_mix_apply(
         return Err(RoutingSessionError::Drift(
             "configuration changed during Scarlett mixer write".into(),
         ));
+    }
+    Ok(report)
+}
+
+/// Explicit capability probe and complete per-bank read; legacy reads do not
+/// invoke these optional commands, so unsupported replies leave those usable.
+pub(crate) fn scarlett_mux_read() -> Result<crate::scarlett::MuxSnapshot, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let snapshot = with_scarlett(&device, configuration, |session|
+        session.read_mux_banks().map_err(RoutingSessionError::Scarlett))?;
+    let (after, raw) = active_descriptors(&device)?;
+    if after != configuration || raw != descriptors {
+        return Err(RoutingSessionError::Drift("configuration changed during Scarlett bank read".into()));
+    }
+    Ok(snapshot)
+}
+
+pub(crate) fn scarlett_mux_apply(edit: &crate::scarlett::MuxEdit)
+    -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let (configuration, descriptors) = active_descriptors(&device)?;
+    let mut records = ORIGINAL_SCARLETT.lock();
+    if let Some(record) = records.as_ref() {
+        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+            || record.configuration != configuration || record.descriptors != descriptors {
+            return Err(RoutingSessionError::Drift("Scarlett attachment/configuration changed since vendor write".into()));
+        }
+        if let Some((_, last)) = &record.mux {
+            if last != &edit.expected {
+                return Err(RoutingSessionError::Drift("Scarlett banks differ from last verified library write".into()));
+            }
+        }
+    }
+    let report = match with_scarlett(&device, configuration, |session|
+        session.apply_mux(edit).map_err(RoutingSessionError::ScarlettMux)) {
+        Ok(report) => report,
+        Err(error) => {
+            if matches!(&error, RoutingSessionError::ScarlettMux(failure) if !failure.rollback.is_empty()) {
+                invalidate_route_caches();
+            }
+            return Err(error);
+        }
+    };
+    if report.original != report.verified {
+        invalidate_route_caches();
+        let record = records.get_or_insert_with(|| RecordedScarlett {
+            device: device.clone(), configuration, descriptors: descriptors.clone(),
+            rows: BTreeMap::new(), mux: None,
+        });
+        match &mut record.mux {
+            Some((_, last)) => *last = report.verified.clone(),
+            entry @ None => *entry = Some((report.original.clone(), report.verified.clone())),
+        }
+    }
+    let (after, raw) = active_descriptors(&device)?;
+    if configuration != after || descriptors != raw {
+        return Err(RoutingSessionError::Drift("configuration changed during Scarlett mux write".into()));
     }
     Ok(report)
 }
@@ -404,6 +487,11 @@ fn finish_scarlett_hand_back() {
             ));
         }
         with_scarlett(&device, number, |session| {
+            if let Some((original, last)) = &record.mux {
+                if let Err(error) = session.replace_mux(last, original) {
+                    log_warn!("[USB] Scarlett mux banks not restored: {:?}", error);
+                }
+            }
             for (original, last) in record.rows.values() {
                 // A fresh whole-row equality check prevents overwriting any
                 // external edit, even in an otherwise untouched coefficient.

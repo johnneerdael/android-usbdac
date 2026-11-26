@@ -41,6 +41,8 @@ public class RoutingException(public val kind: RoutingErrorKind, message: String
  * Call these blocking methods off the main thread. At most eight snapshots are retained.
  */
 public class DacRouting internal constructor(private val dac: Long, private val checkOpen: () -> Unit) {
+    public val scarlett: ScarlettRouting = ScarlettRouting(dac, checkOpen)
+
     public fun discover(): RoutingSnapshot {
         checkOpen()
         val value = response { Native.routingDiscover(dac) }

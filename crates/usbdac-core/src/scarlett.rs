@@ -3,14 +3,14 @@
 //! described there identifies firmware 1083. No other firmware is admitted.
 //!
 //! Model ports and packet decoding are source-backed; physical routing has not
-//! been validated on Scarlett hardware. GET_MUX uses only its documented zero
-//! argument here; its result does not establish all three sample-rate banks.
+//! been validated on Scarlett hardware. Legacy GET_MUX selector zero remains
+//! independent of the optional, runtime-probed complete per-bank transaction.
 //! Original coefficients remain unsigned wire values for exact restoration.
 
 use std::time::{Duration, Instant};
 
 const HEADER: usize = 16;
-pub(crate) const MAX_PAYLOAD: usize = 224;
+pub(crate) const MAX_PAYLOAD: usize = 260;
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_NOTIFICATIONS: usize = 16;
 
@@ -197,6 +197,63 @@ pub struct MixWriteError<E> {
     pub rollback: Option<MixFailure<E>>,
 }
 
+/// Full source-backed per-bank payload. Private words prevent callers from
+/// inventing a rollback baseline; every transaction also freshly rereads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxBankSnapshot {
+    bank: u8,
+    words: Vec<u32>,
+}
+impl MuxBankSnapshot {
+    pub fn bank(&self) -> u8 { self.bank }
+    pub fn raw_words(&self) -> &[u32] { &self.words }
+    pub fn routes(&self) -> Vec<MuxRoute> {
+        let model = CandidateModel::Scarlett18i20Gen2.validate_firmware(1083).unwrap();
+        self.words.iter().copied().filter(|word| *word != 0).map(|word| MuxRoute {
+            source: model.port(((word >> 12) & 0xfff) as u16, true).unwrap(),
+            destination: model.port((word & 0xfff) as u16, false).unwrap(),
+        }).collect()
+    }
+}
+
+/// Runtime-observed complete bank geometry for the admitted firmware only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxSnapshot {
+    pub model: ReadModel,
+    pub banks: Vec<MuxBankSnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxRouteEdit {
+    /// 0 = base rate, 1 = double rate, 2 = quad rate.
+    pub bank: u8,
+    pub destination: Port,
+    pub source: Port,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxEdit {
+    pub expected: MuxSnapshot,
+    pub routes: Vec<MuxRouteEdit>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxWriteReport {
+    pub original: MuxSnapshot,
+    pub verified: MuxSnapshot,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum MuxFailure<E> {
+    Read(ReadError<E>),
+    Invalid(ProtocolError),
+    Drift { actual: MuxSnapshot },
+    Verification { bank: u8, actual: MuxBankSnapshot },
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct MuxWriteError<E> {
+    pub failure: MuxFailure<E>,
+    /// Every attempted bank is restored separately, including an uncertain SET.
+    /// Empty means all attempted banks were restored and verified (or no SET).
+    pub rollback: Vec<(u8, MuxFailure<E>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingReadback {
     pub model: ReadModel,
@@ -221,6 +278,9 @@ pub enum ProtocolError {
     UnknownPort { id: u16, source: bool },
     DuplicateDestination,
     InvalidMuxBits,
+    UnsupportedMuxGeometry,
+    InvalidMuxBank(u8),
+    InvalidMuxEdit,
     AcknowledgementTimeout,
     InvalidNotification,
     SessionPoisoned,
@@ -258,6 +318,8 @@ enum Command {
     Mux,
     Mix,
     SetMix,
+    MuxInfo,
+    SetMux,
 }
 impl Command {
     fn code(self) -> u32 {
@@ -267,6 +329,8 @@ impl Command {
             Self::Mux => 0x3001,
             Self::Mix => 0x2001,
             Self::SetMix => 0x2002,
+            Self::MuxInfo => 0x3000,
+            Self::SetMux => 0x3002,
         }
     }
     fn initializing(self) -> bool {
@@ -593,6 +657,100 @@ impl<I: ReadIo> ReadSession<I> {
         }
     }
 
+    /// Probe FCP's info/read contract on this exact old firmware. Failure does
+    /// not establish write capability and does not alter legacy mux-zero/mix APIs.
+    pub fn read_mux_banks(&mut self) -> Result<MuxSnapshot, ReadError<I::Error>> {
+        let info = self.request(Command::MuxInfo, &[], 12)?;
+        let widths: Vec<_> = info[..6].chunks_exact(2)
+            .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
+        if widths != [64, 56, 46] {
+            return Err(ReadError::Protocol(ProtocolError::UnsupportedMuxGeometry));
+        }
+        let mut banks = Vec::new();
+        for bank in 0..3 { banks.push(self.read_mux_bank(bank)?); }
+        Ok(MuxSnapshot { model: self.model, banks })
+    }
+
+    fn read_mux_bank(&mut self, bank: u8) -> Result<MuxBankSnapshot, ReadError<I::Error>> {
+        let width = *[64u8, 56, 46].get(usize::from(bank))
+            .ok_or(ReadError::Protocol(ProtocolError::InvalidMuxBank(bank)))?;
+        let bytes = self.request(Command::Mux, &[0, 0, width, bank], usize::from(width) * 4)?;
+        let snapshot = MuxBankSnapshot { bank, words: bytes.chunks_exact(4)
+            .map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect() };
+        validate_bank(self.model, &snapshot).map_err(ReadError::Protocol)?;
+        Ok(snapshot)
+    }
+
+    fn set_mux_bank(&mut self, bank: &MuxBankSnapshot) -> Result<(), ReadError<I::Error>> {
+        let mut bytes = vec![0, 0, bank.bank, 0];
+        for word in &bank.words { bytes.extend(word.to_le_bytes()); }
+        self.request(Command::SetMux, &bytes, 0).map(|_| ())
+    }
+
+    pub fn apply_mux(&mut self, edit: &MuxEdit) -> Result<MuxWriteReport, MuxWriteError<I::Error>> {
+        let invalid = |e| MuxWriteError { failure: MuxFailure::Invalid(e), rollback: Vec::new() };
+        validate_snapshot(self.model, &edit.expected).map_err(invalid)?;
+        let mut target = edit.expected.clone();
+        let mut seen = Vec::new();
+        for route in &edit.routes {
+            if seen.contains(&(route.bank, route.destination)) {
+                return Err(invalid(ProtocolError::InvalidMuxEdit));
+            }
+            seen.push((route.bank, route.destination));
+            let source = port_id(self.model, route.source, true).map_err(invalid)?;
+            let destination = port_id(self.model, route.destination, false).map_err(invalid)?;
+            let bank = target.banks.get_mut(usize::from(route.bank))
+                .ok_or_else(|| invalid(ProtocolError::InvalidMuxBank(route.bank)))?;
+            let word = bank.words.iter_mut().find(|word| **word != 0 && (**word & 0xfff) == u32::from(destination))
+                .ok_or_else(|| invalid(ProtocolError::InvalidMuxEdit))?;
+            *word = u32::from(destination) | (u32::from(source) << 12);
+        }
+        self.replace_mux(&edit.expected, &target)
+    }
+
+    pub(crate) fn replace_mux(&mut self, expected: &MuxSnapshot, target: &MuxSnapshot)
+        -> Result<MuxWriteReport, MuxWriteError<I::Error>> {
+        let fail = |failure| MuxWriteError { failure, rollback: Vec::new() };
+        validate_snapshot(self.model, expected).map_err(|e| fail(MuxFailure::Invalid(e)))?;
+        validate_snapshot(self.model, target).map_err(|e| fail(MuxFailure::Invalid(e)))?;
+        // Includes info and every bank, so no write can rely on selector zero or
+        // a snapshot captured before another controller changed the graph.
+        let actual = self.read_mux_banks().map_err(|e| fail(MuxFailure::Read(e)))?;
+        if actual != *expected { return Err(fail(MuxFailure::Drift { actual })); }
+        let mut attempted = Vec::new();
+        let mut verified = actual.clone();
+        for (old, new) in expected.banks.iter().zip(&target.banks) {
+            if old == new { continue; }
+            attempted.push(old);
+            let result = self.set_mux_bank(new).map_err(MuxFailure::Read).and_then(|_| {
+                let actual = self.read_mux_bank(new.bank).map_err(MuxFailure::Read)?;
+                if actual != *new { return Err(MuxFailure::Verification { bank: new.bank, actual }); }
+                Ok(actual)
+            });
+            match result {
+                Ok(bank) => { let index = usize::from(bank.bank); verified.banks[index] = bank; },
+                Err(failure) => {
+                    let mut rollback = Vec::new();
+                    for original in attempted.iter().rev() {
+                        let restore = (|| {
+                            if self.poisoned { self.recover().map_err(MuxFailure::Read)?; }
+                            self.set_mux_bank(original).map_err(MuxFailure::Read)?;
+                            let actual = self.read_mux_bank(original.bank).map_err(MuxFailure::Read)?;
+                            if actual != **original {
+                                return Err(MuxFailure::Verification { bank: original.bank, actual });
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = restore { rollback.push((original.bank, error)); }
+                    }
+                    if !rollback.is_empty() { self.poisoned = true; }
+                    return Err(MuxWriteError { failure, rollback });
+                }
+            }
+        }
+        Ok(MuxWriteReport { original: actual, verified })
+    }
+
     pub fn read_all(&mut self) -> Result<RoutingReadback, ReadError<I::Error>> {
         let mux_zero = self.read_mux_zero()?;
         let mixes = (1..=self.model.mixer_outputs())
@@ -604,6 +762,61 @@ impl<I: ReadIo> ReadSession<I> {
             mixes,
         })
     }
+}
+
+// Independent geometry contract from the pinned ALSA model: destination
+// groups and trailing empty slots, never inferred from a successful zero read.
+fn bank_destinations(bank: u8) -> Result<Vec<u16>, ProtocolError> {
+    let (pcm, adat, padding) = match bank {
+        0 => (18, 8, 8), 1 => (14, 4, 8), 2 => (10, 0, 6),
+        _ => return Err(ProtocolError::InvalidMuxBank(bank)),
+    };
+    let mut ids = Vec::new();
+    for (base, count) in [(0x600, pcm), (0x080, 10), (0x180, 2), (0x200, adat), (0x300, 18)] {
+        ids.extend((0..count).map(|channel| base + channel));
+    }
+    ids.extend(std::iter::repeat(0).take(padding));
+    Ok(ids)
+}
+fn validate_bank(model: ReadModel, bank: &MuxBankSnapshot) -> Result<(), ProtocolError> {
+    let destinations = bank_destinations(bank.bank)?;
+    if destinations.len() != bank.words.len() { return Err(ProtocolError::UnsupportedMuxGeometry); }
+    for (&destination, &word) in destinations.iter().zip(&bank.words) {
+        if destination == 0 {
+            if word != 0 { return Err(ProtocolError::UnsupportedMuxGeometry); }
+        } else {
+            if word >> 24 != 0 || word & 0xfff != u32::from(destination) {
+                return Err(ProtocolError::UnsupportedMuxGeometry);
+            }
+            model.port(destination, false)?;
+            model.port(((word >> 12) & 0xfff) as u16, true)?;
+        }
+    }
+    Ok(())
+}
+fn validate_snapshot(model: ReadModel, snapshot: &MuxSnapshot) -> Result<(), ProtocolError> {
+    if snapshot.model != model || snapshot.banks.len() != 3 {
+        return Err(ProtocolError::UnsupportedMuxGeometry);
+    }
+    for (index, bank) in snapshot.banks.iter().enumerate() {
+        if usize::from(bank.bank) != index { return Err(ProtocolError::UnsupportedMuxGeometry); }
+        validate_bank(model, bank)?;
+    }
+    Ok(())
+}
+fn port_id(model: ReadModel, port: Port, source: bool) -> Result<u16, ProtocolError> {
+    if port == Port::Off && source { return Ok(0); }
+    if let Port::Channel { kind, channel } = port {
+        let base = match kind {
+            PortKind::Analogue => 0x080, PortKind::Spdif => 0x180,
+            PortKind::Adat => 0x200, PortKind::Mix => 0x300, PortKind::Pcm => 0x600,
+            PortKind::Off => return Err(ProtocolError::InvalidMuxEdit),
+        };
+        if channel != 0 && channel <= model.count(kind, source) {
+            return Ok(base + u16::from(channel - 1));
+        }
+    }
+    Err(ProtocolError::InvalidMuxEdit)
 }
 
 pub fn decode_mux(model: ReadModel, bytes: &[u8]) -> Result<Vec<MuxRoute>, ProtocolError> {
@@ -1102,4 +1315,147 @@ mod tests {
         ));
         assert_eq!(session.io.writes, 1);
     }
+    struct BankIo {
+        base: MockIo,
+        banks: Vec<MuxBankSnapshot>,
+        writes: Vec<u8>,
+        lost: Vec<usize>,
+        corrupt: Vec<usize>,
+        unsupported: bool,
+        bad_width: bool,
+    }
+    impl Default for BankIo {
+        fn default() -> Self {
+            Self {
+                base: MockIo::default(),
+                banks: (0..3).map(|bank| MuxBankSnapshot {
+                    bank, words: bank_destinations(bank).unwrap().into_iter().map(u32::from).collect(),
+                }).collect(),
+                writes: Vec::new(), lost: Vec::new(), corrupt: Vec::new(),
+                unsupported: false, bad_width: false,
+            }
+        }
+    }
+    impl ReadIo for BankIo {
+        type Error = &'static str;
+        fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, Self::Error> {
+            self.base.initial_read(bytes)
+        }
+        fn prepare_notifications(&mut self) -> Result<(), Self::Error> {
+            self.base.prepare_notifications()
+        }
+        fn send_request(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+            let n = self.base.send_request(bytes)?;
+            if bytes[..4] == 0x3002u32.to_le_bytes() {
+                let bank = bytes[HEADER + 2];
+                self.writes.push(bank);
+                self.banks[usize::from(bank)].words = bytes[HEADER + 4..].chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+                if self.corrupt.contains(&self.writes.len()) {
+                    self.banks[usize::from(bank)].words[0] ^= 1 << 12;
+                }
+            }
+            Ok(n)
+        }
+        fn next_notification(&mut self, bytes: &mut [u8; 8], timeout: Duration) -> Result<usize, Self::Error> {
+            self.base.next_notification(bytes, timeout)
+        }
+        fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, Self::Error> {
+            let command = u32::from_le_bytes(self.base.last[..4].try_into().unwrap());
+            if command != 0x3000 && command != 0x3001 && command != 0x3002 {
+                return self.base.receive_response(bytes);
+            }
+            if command == 0x3002 && self.lost.contains(&self.writes.len()) {
+                return Err("lost mux response");
+            }
+            bytes[..HEADER].copy_from_slice(&self.base.last[..HEADER]);
+            let payload_size = (bytes.len() - HEADER) as u16;
+            bytes[4..6].copy_from_slice(&payload_size.to_le_bytes());
+            match command {
+                0x3000 => {
+                    for (part, width) in bytes[HEADER..].chunks_exact_mut(2).zip([64u16, 56, 46, 0, 0, 0]) {
+                        part.copy_from_slice(&width.to_le_bytes());
+                    }
+                    if self.bad_width { bytes[HEADER] = 63; }
+                    if self.unsupported { bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); }
+                }
+                0x3001 => {
+                    let bank = self.base.last[HEADER + 3];
+                    assert_eq!(self.base.last[HEADER], 0);
+                    assert_eq!(self.base.last[HEADER + 1], 0);
+                    assert_eq!(usize::from(self.base.last[HEADER + 2]) * 4, bytes.len() - HEADER);
+                    for (part, word) in bytes[HEADER..].chunks_exact_mut(4).zip(&self.banks[usize::from(bank)].words) {
+                        part.copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+                0x3002 => {},
+                _ => unreachable!(),
+            }
+            Ok(bytes.len())
+        }
+    }
+    fn bank_session(io: BankIo) -> ReadSession<BankIo> {
+        ReadSession::initialize(io, CandidateModel::Scarlett18i20Gen2).unwrap()
+    }
+    fn bank_edit(session: &mut ReadSession<BankIo>) -> MuxEdit {
+        MuxEdit {
+            expected: session.read_mux_banks().unwrap(),
+            routes: vec![0, 1].into_iter().map(|bank| MuxRouteEdit {
+                bank, destination: Port::Channel { kind: PortKind::Analogue, channel: 1 },
+                source: Port::Channel { kind: PortKind::Pcm, channel: 2 },
+            }).collect(),
+        }
+    }
+    #[test]
+    fn mux_probe_requires_exact_complete_geometry_and_preserves_raw_banks() {
+        for io in [BankIo { unsupported: true, ..BankIo::default() }, BankIo { bad_width: true, ..BankIo::default() }] {
+            let mut session = bank_session(io);
+            assert!(session.read_mux_banks().is_err());
+            assert!(session.io.writes.is_empty());
+        }
+        let mut session = bank_session(BankIo::default());
+        let edit = bank_edit(&mut session);
+        let report = session.apply_mux(&edit).unwrap();
+        assert_eq!(session.io.writes, vec![0, 1]);
+        assert_eq!(report.original, edit.expected);
+        assert_eq!(report.verified.banks[2], edit.expected.banks[2]);
+        assert_eq!(&report.verified.banks[0].raw_words()[56..], &[0; 8]);
+        let mut restored = session.replace_mux(&report.verified, &report.original).unwrap();
+        assert_eq!(restored.verified, edit.expected);
+        restored.verified.banks.swap(0, 1);
+        assert!(validate_snapshot(model(), &restored.verified).is_err());
+    }
+    #[test]
+    fn mux_drift_invalid_destination_and_padding_never_write() {
+        let mut session = bank_session(BankIo::default());
+        let mut edit = bank_edit(&mut session);
+        let source = port_id(model(), Port::Channel { kind: PortKind::Pcm, channel: 2 }, true).unwrap();
+        session.io.banks[2].words[0] |= u32::from(source) << 12;
+        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Drift { .. }));
+        edit.routes[0].destination = Port::Channel { kind: PortKind::Adat, channel: 8 };
+        edit.routes[0].bank = 2;
+        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Invalid(_)));
+        edit.expected.banks[0].words[63] = 1;
+        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Invalid(_)));
+        assert!(session.io.writes.is_empty());
+    }
+    #[test]
+    fn mux_partial_lost_set_restores_each_attempted_bank_and_retains_failures() {
+        for (lost, corrupt) in [(vec![2], vec![]), (vec![], vec![2])] {
+            let mut session = bank_session(BankIo { lost, corrupt, ..BankIo::default() });
+            let edit = bank_edit(&mut session);
+            let error = session.apply_mux(&edit).unwrap_err();
+            assert!(error.rollback.is_empty());
+            assert_eq!(session.io.writes, vec![0, 1, 1, 0]);
+            assert_eq!(session.io.banks, edit.expected.banks);
+        }
+        let mut session = bank_session(BankIo { lost: vec![2, 3], ..BankIo::default() });
+        let edit = bank_edit(&mut session);
+        let error = session.apply_mux(&edit).unwrap_err();
+        assert_eq!(error.rollback.len(), 1);
+        assert_eq!(error.rollback[0].0, 1);
+        assert_eq!(session.io.writes, vec![0, 1, 1, 0]);
+        assert!(session.poisoned);
+    }
+
 }

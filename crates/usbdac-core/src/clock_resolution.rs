@@ -132,7 +132,7 @@ pub(crate) struct ClockGraph {
     first_source: Option<u8>,
     // Strict selectable topology is separate from the legacy sparse fallback.
     exact_sources: HashSet<u8>,
-    selector_controls: HashMap<u8, u8>,
+    selector_controls: HashMap<u8, u32>,
     source_controls: HashMap<u8, u32>,
     duplicate_ids: HashSet<u8>,
 }
@@ -193,7 +193,7 @@ impl ClockGraph {
                         if length >= 7 + pins {
                             graph
                                 .selector_controls
-                                .insert(descriptor[3], descriptor[5 + pins]);
+                                .insert(descriptor[3], u32::from(descriptor[5 + pins]));
                         }
                     }
                     let entity = AudioControlParser
@@ -213,6 +213,45 @@ impl ClockGraph {
             }
         }
         graph
+    }
+
+    /// Parse full ADC3 descriptors without narrowing their 32-bit controls.
+    /// Strict parsing prevents UAC2 subtype/layout assumptions from admitting
+    /// a selector in another function or an unresolved multiplier path.
+    pub(crate) fn parse_adc3(descriptors: &[u8]) -> Result<Self, String> {
+        use crate::descriptors::uac3 as wire;
+        let mut graph = Self::default();
+        let mut at = 0;
+        let mut ids = HashSet::new();
+        while at < descriptors.len() {
+            let length = usize::from(descriptors[at]);
+            if length < 3 || length > descriptors.len() - at {
+                return Err("ADC3 malformed clock descriptor chain".into());
+            }
+            let d = &descriptors[at..at + length];
+            at += length;
+            if d[1] != USB_DT_CS_INTERFACE || d[2] == 1 { continue; }
+            if d.len() < 4 || d[3] == 0 || !ids.insert(d[3]) {
+                return Err("ADC3 ambiguous clock entity ID".into());
+            }
+            match d[2] {
+                2 => { let t = wire::parse_input_terminal(d).map_err(|e| e.to_string())?;
+                    graph.terminal_clock.insert(t.id, t.clock_id); }
+                3 => { let t = wire::parse_output_terminal(d).map_err(|e| e.to_string())?;
+                    graph.terminal_clock.insert(t.id, t.clock_id); }
+                0x0b => { let c = wire::parse_clock_source(d).map_err(|e| e.to_string())?;
+                    graph.entities.insert(c.id, ClockEntity::Source);
+                    graph.exact_sources.insert(c.id);
+                    graph.source_controls.insert(c.id, c.controls.0); }
+                0x0c => { let c = wire::parse_clock_selector(d).map_err(|e| e.to_string())?;
+                    graph.selector_controls.insert(c.id, c.controls.0);
+                    graph.entities.insert(c.id, ClockEntity::Selector(c.sources)); }
+                0x0d => { let c = wire::parse_clock_multiplier(d).map_err(|e| e.to_string())?;
+                    graph.entities.insert(c.id, ClockEntity::Multiplier(c.source_id)); }
+                _ => {}
+            }
+        }
+        Ok(graph)
     }
 
     /// Enumerate exact selectable UAC2 paths, current pin first at every branch.
@@ -1054,5 +1093,41 @@ mod selectable_clock_tests {
         assert_eq!(io.writes, [(11, 2), (10, 2)]);
         plan.restore(&mut io).unwrap();
         assert_eq!(io.writes, [(11, 2), (10, 2), (10, 1), (11, 1)]);
+    }
+}
+
+#[cfg(test)]
+mod adc3_plan_tests {
+    use super::*;
+    fn descriptors(controls: u32) -> Vec<u8> {
+        let mut bytes = vec![20, 0x24, 2, 1, 1, 1, 0, 10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&[13, 0x24, 0x0c, 10, 2, 20, 21]);
+        bytes.extend_from_slice(&controls.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        for id in [20, 21] {
+            bytes.extend_from_slice(&[12, 0x24, 0x0b, id, 1]);
+            bytes.extend_from_slice(&0x8000_0007u32.to_le_bytes());
+            bytes.extend_from_slice(&[0, 0, 0]);
+        }
+        bytes
+    }
+    #[test]
+    fn adc3_current_first_enumeration_preserves_wide_controls_and_pin_snapshot() {
+        let graph = ClockGraph::parse_adc3(&descriptors(0x8000_0003)).unwrap();
+        let plans = graph.enumerate_plans(1, |_| Ok(2)).unwrap();
+        assert_eq!(plans.iter().map(|p| p.source_id).collect::<Vec<_>>(), vec![21, 20]);
+        assert_eq!(plans[1].source_controls, 0x8000_0007);
+        assert_eq!(plans[1].selectors, vec![ClockPinPlan { selector: 10, original: 2, target: 1 }]);
+    }
+    #[test]
+    fn adc3_readonly_invalid_and_duplicate_selectors_cannot_mutate() {
+        let readonly = ClockGraph::parse_adc3(&descriptors(0x8000_0001)).unwrap();
+        assert_eq!(readonly.enumerate_plans(1, |_| Ok(1)).unwrap().len(), 1);
+        assert!(readonly.enumerate_plans(1, |_| Ok(0)).is_err());
+        let reserved = ClockGraph::parse_adc3(&descriptors(0x8000_0002)).unwrap();
+        assert!(reserved.enumerate_plans(1, |_| Ok(1)).is_err());
+        let mut duplicate = descriptors(3);
+        duplicate.extend_from_slice(&[12, 0x24, 0x0b, 20, 1, 7, 0, 0, 0, 0, 0, 0]);
+        assert!(ClockGraph::parse_adc3(&duplicate).is_err());
     }
 }

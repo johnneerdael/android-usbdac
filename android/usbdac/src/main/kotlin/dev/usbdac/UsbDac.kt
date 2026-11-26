@@ -203,7 +203,15 @@ public object UsbDac {
         openCapture(context, device, config, configurationId = null)
 
     /** Select only [configurationId], or keep the active configuration when null. */
-    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacCaptureSession {
+    public fun openCapture(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacCaptureSession =
+        openCaptureDevice(context, device, config, configurationId, null)
+
+    /** Explicitly opt into the native-proven Scarlett vendor claim alongside capture claims. */
+    public fun openCaptureWithVendorRouting(context: Context, device: DacDeviceInfo, vendorRouting: VendorRouting,
+        config: DacConfig = DacConfig(), configurationId: Int? = null): DacCaptureSession =
+        openCaptureDevice(context, device, config, configurationId, vendorRouting)
+
+    private fun openCaptureDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, vendorRouting: VendorRouting?): DacCaptureSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -239,7 +247,9 @@ public object UsbDac {
             }
             val plan = planCaptureClaims(interfaces.map { it.toInfo() }, ids("control_interfaces"), ids("input_interfaces"))
                 ?: throw DacException(DacErrorCode.CLAIM, "capture preflight does not match Android's active interfaces")
-            val owned = ClaimedInterfaces.claim(opened, interfaces, plan, device.productName)
+            val vendorInterface = vendorRoutingInterface(vendorRouting, fd, device, active.id, interfaces)
+            val owned = ClaimedInterfaces.claim(opened, interfaces,
+                dev.usbdac.internal.ClaimPlan(plan.controlIds + listOfNotNull(vendorInterface), plan.streamingIds), device.productName)
             claims = owned
             if (device.device.activeConfiguration(opened).id != configuration) {
                 throw DacException(DacErrorCode.CLAIM, "active configuration changed while claiming capture")
@@ -304,7 +314,17 @@ public object UsbDac {
     public fun openDuplex(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int? = null): DacSession =
         openDevice(context, device, config, configurationId, duplex = true)
 
-    private fun openDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, duplex: Boolean): DacSession {
+    /** Explicit vendor-routing opt-in; existing open methods keep audio-only claim behavior. */
+    public fun openWithVendorRouting(context: Context, device: DacDeviceInfo, vendorRouting: VendorRouting,
+        config: DacConfig = DacConfig(), configurationId: Int? = null): DacSession =
+        openDevice(context, device, config, configurationId, duplex = false, vendorRouting = vendorRouting)
+
+    /** Explicit vendor-routing opt-in with the same proven duplex claim plan. */
+    public fun openDuplexWithVendorRouting(context: Context, device: DacDeviceInfo, vendorRouting: VendorRouting,
+        config: DacConfig = DacConfig(), configurationId: Int? = null): DacSession =
+        openDevice(context, device, config, configurationId, duplex = true, vendorRouting = vendorRouting)
+
+    private fun openDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, duplex: Boolean, vendorRouting: VendorRouting? = null): DacSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -348,7 +368,9 @@ public object UsbDac {
                 dev.usbdac.internal.ClaimPlan((playbackPlan.controlIds + capture.controlIds).distinct(),
                     (playbackPlan.streamingIds + capture.streamingIds).distinct())
             } else playbackPlan
-            val ownedClaims = ClaimedInterfaces.claim(connection, interfaces, plan, device.productName)
+            val vendorInterface = vendorRoutingInterface(vendorRouting, fd, device, activeConfiguration.id, interfaces)
+            val ownedClaims = ClaimedInterfaces.claim(connection, interfaces,
+                dev.usbdac.internal.ClaimPlan(plan.controlIds + listOfNotNull(vendorInterface), plan.streamingIds), device.productName)
             claims = ownedClaims
 
             fun infoJson(configurationId: Int? = null, unavailable: List<Int> = emptyList()) = deviceInfoJson(
@@ -408,6 +430,21 @@ public object UsbDac {
 
     private fun usbManager(context: Context): UsbManager =
         context.getSystemService(Context.USB_SERVICE) as UsbManager
+
+    private fun vendorRoutingInterface(optIn: VendorRouting?, fd: Int, device: DacDeviceInfo,
+        configurationId: Int, interfaces: List<android.hardware.usb.UsbInterface>): Int? {
+        if (optIn == null) return null
+        val info = deviceInfoJson(device.vendorId, device.productId, device.productName,
+            device.manufacturerName, device.deviceName, emptyList(), configurationId = configurationId)
+        val proof = JSONObject(nativeCall { Native.scarlettPreflight(fd, info) }).optJSONObject("capability")
+            ?: throw DacException(DacErrorCode.UNSUPPORTED, "no exact native-proven Scarlett vendor interface")
+        val capability = parseScarlettCapability(proof)
+        if (capability.configurationId != configurationId || capability.model != ScarlettModel.SCARLETT_18I20_GEN2 ||
+            interfaces.none { it.id == capability.interfaceId && it.alternateSetting == 0 && it.interfaceClass == 255 }) {
+            throw DacException(DacErrorCode.CLAIM, "Scarlett preflight differs from the selected Android configuration")
+        }
+        return capability.interfaceId
+    }
 
     private fun permissionAction(context: Context): String = "${context.packageName}.usbdac.USB_PERMISSION"
 

@@ -244,6 +244,9 @@ pub struct CaptureStats {
     pub delivered_frames: u64,
     /// Host backlog only. Never includes transport loss.
     pub overrun_frames: u64,
+    /// Valid received frames discarded because a duplex reader held the buffer.
+    /// Separate from ring backlog overruns and device transport loss.
+    pub contention_frames: u64,
     pub empty_packets: u64,
     /// Successful nonempty packets shorter than their submitted capacity.
     pub short_packets: u64,
@@ -257,6 +260,39 @@ pub struct CaptureStats {
 }
 
 impl CaptureStats {
+    /// Classify payload without copying it. The USB worker uses the same rules
+    /// when reader contention requires dropping valid frames at the host.
+    pub(crate) fn record_completion(&mut self, data_len: usize, submitted: &[usize],
+        packets: &[CapturePacket], transfer_succeeded: bool, known_missing_frames: u64,
+        frame_bytes: usize) -> Result<(), CaptureError> {
+        self.missing_frames = self.missing_frames.saturating_add(known_missing_frames);
+        if !transfer_succeeded {
+            self.failed_transfers = self.failed_transfers.saturating_add(1);
+            return Ok(());
+        }
+        let total = submitted.iter().try_fold(0usize, |total, length| total.checked_add(*length));
+        if submitted.len() != packets.len() || total != Some(data_len)
+            || submitted.iter().zip(packets).any(|(length, packet)| *length != packet.requested_bytes) {
+            self.malformed_completions = self.malformed_completions.saturating_add(1);
+            return Err(CaptureError::InvalidCompletion);
+        }
+        for (length, packet) in submitted.iter().zip(packets) {
+            if !packet.succeeded {
+                self.failed_packets = self.failed_packets.saturating_add(1);
+            } else if packet.actual_bytes > *length || packet.actual_bytes % frame_bytes != 0 {
+                self.malformed_packets = self.malformed_packets.saturating_add(1);
+            } else if packet.actual_bytes == 0 {
+                self.empty_packets = self.empty_packets.saturating_add(1);
+            } else {
+                if packet.actual_bytes < *length {
+                    self.short_packets = self.short_packets.saturating_add(1);
+                }
+                self.captured_frames = self.captured_frames.saturating_add((packet.actual_bytes / frame_bytes) as u64);
+            }
+        }
+        Ok(())
+    }
+
     /// Lower-bound device position since configure. Unknown losses make this
     /// an underestimate; host backlog does not change device position.
     pub fn device_position_frames(&self) -> u64 {
@@ -335,7 +371,7 @@ impl DacCaptureStream {
     pub fn read(&self, destination: &mut [u8]) -> crate::Result<usize> {
         self.dac.ensure_open()?;
         let handle = self.handle.lock();
-        let result = handle.buffer.lock().read(destination);
+        let result = handle.lock_buffer().read(destination);
         result.map_err(|error| match error {
             CaptureError::PartialFrame => crate::Error::InvalidArgument(
                 "capture read buffer must contain whole wire frames".into(),
@@ -351,13 +387,13 @@ impl DacCaptureStream {
     }
 
     pub fn available_frames(&self) -> usize {
-        self.handle.lock().buffer.lock().available_frames()
+        self.handle.lock().lock_buffer().available_frames()
     }
     pub fn stats(&self) -> CaptureStats {
-        self.handle.lock().buffer.lock().stats()
+        self.handle.lock().lock_buffer().stats()
     }
     pub fn state(&self) -> CaptureState {
-        self.handle.lock().buffer.lock().state()
+        self.handle.lock().lock_buffer().state()
     }
     pub fn last_error(&self) -> Option<crate::Error> {
         self.handle.lock().error.lock().clone()
@@ -372,6 +408,21 @@ impl DacCaptureStream {
 }
 
 impl CaptureBuffer {
+    pub(crate) fn merge_stats(&mut self, stats: CaptureStats) {
+        self.stats.reordered_completions = self.stats.reordered_completions.saturating_add(stats.reordered_completions);
+        self.stats.captured_frames = self.stats.captured_frames.saturating_add(stats.captured_frames);
+        self.stats.delivered_frames = self.stats.delivered_frames.saturating_add(stats.delivered_frames);
+        self.stats.overrun_frames = self.stats.overrun_frames.saturating_add(stats.overrun_frames);
+        self.stats.contention_frames = self.stats.contention_frames.saturating_add(stats.contention_frames);
+        self.stats.empty_packets = self.stats.empty_packets.saturating_add(stats.empty_packets);
+        self.stats.short_packets = self.stats.short_packets.saturating_add(stats.short_packets);
+        self.stats.failed_packets = self.stats.failed_packets.saturating_add(stats.failed_packets);
+        self.stats.malformed_packets = self.stats.malformed_packets.saturating_add(stats.malformed_packets);
+        self.stats.malformed_completions = self.stats.malformed_completions.saturating_add(stats.malformed_completions);
+        self.stats.failed_transfers = self.stats.failed_transfers.saturating_add(stats.failed_transfers);
+        self.stats.missing_frames = self.stats.missing_frames.saturating_add(stats.missing_frames);
+    }
+
     pub(crate) fn note_malformed_completion(&mut self) {
         self.stats.malformed_completions = self.stats.malformed_completions.saturating_add(1);
     }
@@ -440,43 +491,18 @@ impl CaptureBuffer {
         known_missing_frames: u64,
     ) -> Result<(), CaptureError> {
         self.require_active()?;
-        self.stats.missing_frames = self
-            .stats
-            .missing_frames
-            .saturating_add(known_missing_frames);
-        if !transfer_succeeded {
-            self.stats.failed_transfers = self.stats.failed_transfers.saturating_add(1);
-            return Ok(());
-        }
-        let total = submitted
-            .iter()
-            .try_fold(0usize, |total, length| total.checked_add(*length));
-        if submitted.len() != packets.len()
-            || total != Some(data.len())
-            || submitted
-                .iter()
-                .zip(packets)
-                .any(|(length, packet)| *length != packet.requested_bytes)
-        {
-            self.note_malformed_completion();
-            return Err(CaptureError::InvalidCompletion);
-        }
-        let frame_bytes = self.format.bytes_per_frame();
-        let mut offset = 0;
-        for (length, packet) in submitted.iter().zip(packets) {
-            if !packet.succeeded {
-                self.stats.failed_packets = self.stats.failed_packets.saturating_add(1);
-            } else if packet.actual_bytes > *length || packet.actual_bytes % frame_bytes != 0 {
-                self.stats.malformed_packets = self.stats.malformed_packets.saturating_add(1);
-            } else if packet.actual_bytes == 0 {
-                self.stats.empty_packets = self.stats.empty_packets.saturating_add(1);
-            } else {
-                if packet.actual_bytes < *length {
-                    self.stats.short_packets = self.stats.short_packets.saturating_add(1);
+        self.stats.record_completion(data.len(), submitted, packets, transfer_succeeded,
+            known_missing_frames, self.format.bytes_per_frame())?;
+        if transfer_succeeded {
+            let frame_bytes = self.format.bytes_per_frame();
+            let mut offset = 0;
+            for (length, packet) in submitted.iter().zip(packets) {
+                if packet.succeeded && packet.actual_bytes <= *length
+                    && packet.actual_bytes % frame_bytes == 0 && packet.actual_bytes != 0 {
+                    self.push_frames(&data[offset..offset + packet.actual_bytes]);
                 }
-                self.push_frames(&data[offset..offset + packet.actual_bytes]);
+                offset += length;
             }
-            offset += length;
         }
         Ok(())
     }
@@ -484,7 +510,6 @@ impl CaptureBuffer {
     fn push_frames(&mut self, mut data: &[u8]) {
         let frame_bytes = self.format.bytes_per_frame();
         let frames = data.len() / frame_bytes;
-        self.stats.captured_frames = self.stats.captured_frames.saturating_add(frames as u64);
         let dropped = self
             .queued_frames
             .saturating_add(frames)

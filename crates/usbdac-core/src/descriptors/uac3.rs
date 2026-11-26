@@ -703,8 +703,11 @@ pub struct BaddFormat {
     pub clock_id: u8,
     pub power_domain_id: u8,
 }
-/// Infer only mandatory Continuous Mode alternate #1. Bursting alternates need
-/// their own bandwidth interpretation and must not reuse this packet-size table.
+/// Interpret a nonzero Continuous Mode alternate with the exact 1 ms capacity
+/// table (BADD section 4.2 and Table 8-26). The caller must separately prove the
+/// function's mandatory alternates and common direction/synchronization contract.
+/// Bursting intervals must not reuse this table. SuperSpeed interpretation here
+/// is profile geometry only; runtime admission also requires companion validation.
 pub fn infer_badd_format(
     profile: BaddProfile,
     speed: BusSpeed,
@@ -712,9 +715,9 @@ pub fn infer_badd_format(
     endpoint: &[u8],
     explicit_feedback: bool,
 ) -> Result<BaddFormat, DescriptorError> {
-    if endpoint.len() < 7 || endpoint[0] != 7 || endpoint[1] != 5 || alternate != 1 {
+    if endpoint.len() < 7 || endpoint[0] != 7 || endpoint[1] != 5 || alternate == 0 {
         return Err(invalid(
-            "BADD requires a standard endpoint in continuous alternate 1",
+            "BADD requires a standard endpoint in a nonzero continuous alternate",
         ));
     }
     let address = endpoint[2];

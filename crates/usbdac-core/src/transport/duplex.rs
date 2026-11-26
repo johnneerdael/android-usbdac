@@ -1,6 +1,6 @@
 //! A capture attachment to the playback worker, never a second USB event owner.
 use super::*;
-use crate::capture::{CaptureBuffer, CapturePacket, CaptureRequest, CaptureState};
+use crate::capture::{CaptureBuffer, CapturePacket, CaptureRequest};
 use super::capture_stream::{CaptureEndpoint, CaptureHandle};
 use std::collections::VecDeque;
 
@@ -10,6 +10,7 @@ pub(super) struct Attachment {
     buffer: Arc<Mutex<CaptureBuffer>>,
     error: Arc<Mutex<Option<Error>>>,
     retired: Arc<AtomicBool>,
+    deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32)>>,
 }
 
@@ -104,9 +105,7 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
             Ok((shared, buffer))
         })();
         match pair {
-            Ok((shared_implicit, buffer)) => return Ok(Arc::new(Attachment { endpoint, shared_implicit,
-                buffer: Arc::new(Mutex::new(buffer)), error: Arc::new(Mutex::new(None)),
-                retired: Arc::new(AtomicBool::new(false)), original_rate: Mutex::new(None) })),
+            Ok((shared_implicit, buffer)) => return Ok(Arc::new(Attachment::new(endpoint, shared_implicit, buffer))),
             Err(error) => refusal = Some(error),
         }
     }
@@ -114,6 +113,11 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
 }
 
 impl Attachment {
+    pub(super) fn new(endpoint: CaptureEndpoint, shared_implicit: bool, buffer: CaptureBuffer) -> Self {
+        Self { endpoint, shared_implicit, buffer: Arc::new(Mutex::new(buffer)),
+            error: Arc::new(Mutex::new(None)), retired: Arc::new(AtomicBool::new(false)),
+            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None) }
+    }
     pub(super) fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         expected: &crate::StreamFormat) -> Result<(), Error> {
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
@@ -141,10 +145,34 @@ impl Attachment {
         validate_clocks(claimed, playback, expected, &self.endpoint)
     }
     pub(super) fn reader(&self, stop: Arc<AtomicBool>) -> CaptureHandle {
-        CaptureHandle { endpoint: self.endpoint.clone(), buffer: self.buffer.clone(), error: self.error.clone(), stop, worker: None, paired: true, retired: Some(self.retired.clone()) }
+        CaptureHandle { endpoint: self.endpoint.clone(), buffer: self.buffer.clone(), error: self.error.clone(), stop, worker: None, paired: true, retired: Some(self.retired.clone()), deferred: Some(self.deferred.clone()) }
     }
     pub(super) fn ingest(&self, slot: &IsoTransferSlot, status: i32, scratch: &mut [CapturePacket]) -> Result<(), Error> {
-        let result = capture_stream::ingest_slot(slot, status, &mut self.buffer.lock(), scratch);
+        let result = if let Some(mut buffer) = self.buffer.try_lock() {
+            self.deferred.merge_into(&mut buffer);
+            capture_stream::ingest_slot(slot, status, &mut buffer, scratch)
+        } else {
+            // No payload is retained while presentation owns the queue. Inspect
+            // the same descriptors and count only valid full frames as a host
+            // drop; empty/malformed/failed packets remain separate telemetry.
+            let mut stats = crate::capture::CaptureStats::default();
+            let result = match capture_stream::inspect_slot(slot, status, scratch) {
+                Ok((data, detached)) => {
+                    let result = stats.record_completion(data.len(), &slot.packet_sizes, scratch,
+                        true, 0, self.endpoint.format.bytes_per_frame())
+                        .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
+                    stats.contention_frames = stats.captured_frames;
+                    if detached { Err(Error::DeviceLost) } else { result }
+                }
+                Err(error) => {
+                    if status == LIBUSB_TRANSFER_COMPLETED { stats.malformed_completions = 1; }
+                    else { stats.failed_transfers = 1; }
+                    Err(error)
+                }
+            };
+            self.deferred.record(stats);
+            result
+        };
         if let Err(error) = &result { *self.error.lock() = Some(error.clone()); }
         result
     }
@@ -162,16 +190,21 @@ impl Attachment {
             });
         if let Err(error) = result { set_last_error(Some(format!("capture clock rollback failed: {error}"))); }
     }
-    pub(super) fn reordered(&self) { self.buffer.lock().note_reordered_completion(); }
+    pub(super) fn reordered(&self) {
+        self.deferred.record(crate::capture::CaptureStats {
+            reordered_completions: 1, ..Default::default()
+        });
+    }
     pub(super) fn finish(&self, failure: Option<Error>) {
-        let mut buffer = self.buffer.lock();
-        if let Some(error) = failure { *self.error.lock() = Some(error); buffer.fail(); }
-        else if buffer.state() == CaptureState::Active { buffer.stop(); }
+        let failed = failure.is_some();
+        if let Some(error) = failure { *self.error.lock() = Some(error); }
+        self.deferred.finish(failed);
+        if let Some(mut buffer) = self.buffer.try_lock() { self.deferred.merge_into(&mut buffer); }
     }
 }
 impl Drop for Attachment {
     fn drop(&mut self) {
-        if self.buffer.lock().state() == CaptureState::Active {
+        if !self.deferred.is_finished() {
             self.finish(Some(Error::Transfer("duplex worker stopped before capture completed".into())));
         }
     }

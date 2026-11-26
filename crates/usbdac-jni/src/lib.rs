@@ -17,6 +17,7 @@ mod convert;
 mod capture;
 mod capture_json;
 mod routing;
+mod scarlett;
 mod json;
 mod listener;
 mod registry;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use usbdac_core::{Dac, DacListener, Error};
 
 /// What went wrong inside a native call.
+#[cfg_attr(test, derive(Debug))]
 enum Failure {
     Dac(Error),
     Bad(String),

@@ -355,7 +355,12 @@ pub(super) fn owned_capture_candidates(
     let raw = read_active_configuration_bytes(&claimed.handle, config)
         .ok_or("cannot read active capture configuration")?;
     let speed = resolve_device_speed(&claimed.handle.device());
-    let mut candidates = capture_candidates(&raw, config.number(), speed, rate)?;
+    // Legacy UAC1/2 admission remains FS/HS; ADC3 resolves its own SS companion.
+    let mut candidates = if matches!(speed, Speed::Super | Speed::SuperPlus) {
+        Vec::new()
+    } else {
+        capture_candidates(&raw, config.number(), speed, rate)?
+    };
     for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate)? {
         let format = CaptureFormat::pcm(
             rate,
@@ -434,6 +439,15 @@ pub(super) fn validate_capture_registration(
                 has_input = true;
             }
         }
+    }
+    // Explicit host opt-in may add only this exact actual-device vendor interface.
+    // It never substitutes for a PCM IN interface and its owning AudioControl.
+    let identity = claimed.handle.device().device_descriptor().map_err(|e| e.to_string())?;
+    if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
+        return Err("capture host and actual USB identities differ".into());
+    }
+    if let Some(interface) = super::routing_hw::scarlett_claim_interface(&config, identity.vendor_id(), identity.product_id()) {
+        allowed.insert(interface);
     }
     if !has_input || !ids.is_subset(&allowed) {
         return Err("capture claims must contain only explicit IN interfaces and their owning AudioControl interfaces".into());
@@ -684,6 +698,68 @@ pub(super) fn configure_capture_endpoint(
     Ok(())
 }
 
+/// Deferred metadata has fixed size and is never locked by a reader. Capture
+/// presentation may hold its queue mutex for a long copy; USB completion work
+/// must still classify packets, feed implicit timing and retire every endpoint.
+#[derive(Default)]
+pub(crate) struct DeferredCapture {
+    reordered_completions: AtomicU64,
+    captured_frames: AtomicU64,
+    delivered_frames: AtomicU64,
+    overrun_frames: AtomicU64,
+    contention_frames: AtomicU64,
+    empty_packets: AtomicU64,
+    short_packets: AtomicU64,
+    failed_packets: AtomicU64,
+    malformed_packets: AtomicU64,
+    malformed_completions: AtomicU64,
+    failed_transfers: AtomicU64,
+    missing_frames: AtomicU64,
+    terminal: AtomicU32,
+}
+impl DeferredCapture {
+    pub(super) fn record(&self, stats: crate::capture::CaptureStats) {
+        self.reordered_completions.fetch_add(stats.reordered_completions, Ordering::Relaxed);
+        self.captured_frames.fetch_add(stats.captured_frames, Ordering::Relaxed);
+        self.delivered_frames.fetch_add(stats.delivered_frames, Ordering::Relaxed);
+        self.overrun_frames.fetch_add(stats.overrun_frames, Ordering::Relaxed);
+        self.contention_frames.fetch_add(stats.contention_frames, Ordering::Relaxed);
+        self.empty_packets.fetch_add(stats.empty_packets, Ordering::Relaxed);
+        self.short_packets.fetch_add(stats.short_packets, Ordering::Relaxed);
+        self.failed_packets.fetch_add(stats.failed_packets, Ordering::Relaxed);
+        self.malformed_packets.fetch_add(stats.malformed_packets, Ordering::Relaxed);
+        self.malformed_completions.fetch_add(stats.malformed_completions, Ordering::Relaxed);
+        self.failed_transfers.fetch_add(stats.failed_transfers, Ordering::Relaxed);
+        self.missing_frames.fetch_add(stats.missing_frames, Ordering::Relaxed);
+    }
+    pub(super) fn finish(&self, failed: bool) {
+        self.terminal.fetch_max(if failed { 2 } else { 1 }, Ordering::Release);
+    }
+    pub(super) fn is_finished(&self) -> bool { self.terminal.load(Ordering::Acquire) != 0 }
+    pub(super) fn merge_into(&self, buffer: &mut CaptureBuffer) {
+        let terminal = self.terminal.load(Ordering::Acquire);
+        buffer.merge_stats(crate::capture::CaptureStats {
+            reordered_completions: self.reordered_completions.swap(0, Ordering::Relaxed),
+            captured_frames: self.captured_frames.swap(0, Ordering::Relaxed),
+            delivered_frames: self.delivered_frames.swap(0, Ordering::Relaxed),
+            overrun_frames: self.overrun_frames.swap(0, Ordering::Relaxed),
+            contention_frames: self.contention_frames.swap(0, Ordering::Relaxed),
+            empty_packets: self.empty_packets.swap(0, Ordering::Relaxed),
+            short_packets: self.short_packets.swap(0, Ordering::Relaxed),
+            failed_packets: self.failed_packets.swap(0, Ordering::Relaxed),
+            malformed_packets: self.malformed_packets.swap(0, Ordering::Relaxed),
+            malformed_completions: self.malformed_completions.swap(0, Ordering::Relaxed),
+            failed_transfers: self.failed_transfers.swap(0, Ordering::Relaxed),
+            missing_frames: self.missing_frames.swap(0, Ordering::Relaxed),
+        });
+        match terminal {
+            2 => buffer.fail(),
+            1 if buffer.state() == crate::capture::CaptureState::Active => buffer.stop(),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) struct CaptureHandle {
     pub(crate) endpoint: CaptureEndpoint,
     pub(crate) buffer: Arc<Mutex<CaptureBuffer>>,
@@ -692,11 +768,17 @@ pub(crate) struct CaptureHandle {
     pub(crate) worker: Option<JoinHandle<()>>,
     pub(crate) paired: bool,
     pub(crate) retired: Option<Arc<AtomicBool>>,
+    pub(crate) deferred: Option<Arc<DeferredCapture>>,
 }
 impl CaptureHandle {
+    pub(crate) fn lock_buffer(&self) -> parking_lot::MutexGuard<'_, CaptureBuffer> {
+        let mut buffer = self.buffer.lock();
+        if let Some(deferred) = &self.deferred { deferred.merge_into(&mut buffer); }
+        buffer
+    }
     pub(crate) fn stop(&mut self) -> Result<(), Error> {
         self.stop.store(true, Ordering::Release);
-        let mut buffer = self.buffer.lock();
+        let mut buffer = self.lock_buffer();
         if buffer.state() == crate::capture::CaptureState::Active {
             buffer.stop();
         }
@@ -848,6 +930,7 @@ pub(crate) fn open_capture(
         worker: Some(worker),
         paired: false,
         retired: None,
+        deferred: None,
     };
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(handle),
@@ -864,57 +947,45 @@ pub(crate) fn open_capture(
     }
 }
 
-pub(super) fn ingest_slot(
-    slot: &IsoTransferSlot,
-    status: i32,
-    buffer: &mut CaptureBuffer,
-    scratch: &mut [CapturePacket],
-) -> Result<(), Error> {
+/// Inspect immutable submission geometry before using descriptors or payload.
+/// Device removal is recognized even when presentation has stopped or is busy.
+pub(super) fn inspect_slot<'a>(
+    slot: &'a IsoTransferSlot, status: i32, scratch: &mut [CapturePacket],
+) -> Result<(&'a [u8], bool), Error> {
     if status != LIBUSB_TRANSFER_COMPLETED {
-        buffer
-            .ingest_completion(&[], &[], &[], false, 0)
-            .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")))?;
-        return Err(if status == LIBUSB_TRANSFER_NO_DEVICE {
-            Error::DeviceLost
-        } else {
-            Error::Transfer(format!(
-                "capture transfer failed: {}",
-                iso_transfer_status_label(status)
-            ))
-        });
+        return Err(if status == LIBUSB_TRANSFER_NO_DEVICE { Error::DeviceLost }
+            else { Error::Transfer(format!("capture transfer failed: {}", iso_transfer_status_label(status))) });
     }
     let transfer = unsafe { slot.transfer.as_ref() };
     let data = unsafe { &*slot.user_data };
     if transfer.num_iso_packets != scratch.len() as i32
-        || transfer.length < 0
-        || transfer.length as usize != slot.submitted_bytes
-        || slot.submitted_bytes != data.buffer.len()
-        || transfer.endpoint != slot.submitted_endpoint
-        || transfer.buffer != data.buffer.as_ptr().cast_mut()
-    {
-        // Use the public adapter's malformed-completion accounting path.
-        buffer.note_malformed_completion();
+        || transfer.length < 0 || transfer.length as usize != slot.submitted_bytes
+        || slot.submitted_bytes != data.buffer.len() || transfer.endpoint != slot.submitted_endpoint
+        || transfer.buffer != data.buffer.as_ptr().cast_mut() {
         return Err(Error::Transfer("capture transfer geometry changed".into()));
     }
-    let descriptors =
-        unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), scratch.len()) };
+    let descriptors = unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), scratch.len()) };
     for (destination, source) in scratch.iter_mut().zip(descriptors) {
-        *destination = CapturePacket {
-            requested_bytes: source.length as usize,
-            actual_bytes: source.actual_length as usize,
-            succeeded: source.status == LIBUSB_TRANSFER_COMPLETED,
-        };
+        *destination = CapturePacket { requested_bytes: source.length as usize,
+            actual_bytes: source.actual_length as usize, succeeded: source.status == LIBUSB_TRANSFER_COMPLETED };
     }
-    buffer
-        .ingest_completion(&data.buffer, &slot.packet_sizes, scratch, true, 0)
-        .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")))?;
-    if descriptors
-        .iter()
-        .any(|packet| packet.status == LIBUSB_TRANSFER_NO_DEVICE)
-    {
-        return Err(Error::DeviceLost);
-    }
-    Ok(())
+    Ok((&data.buffer, descriptors.iter().any(|p| p.status == LIBUSB_TRANSFER_NO_DEVICE)))
+}
+
+pub(super) fn ingest_slot(slot: &IsoTransferSlot, status: i32, buffer: &mut CaptureBuffer,
+    scratch: &mut [CapturePacket]) -> Result<(), Error> {
+    let (data, detached) = match inspect_slot(slot, status, scratch) {
+        Ok(completion) => completion,
+        Err(error) => {
+            if status != LIBUSB_TRANSFER_COMPLETED {
+                let _ = buffer.ingest_completion(&[], &[], &[], false, 0);
+            } else { buffer.note_malformed_completion(); }
+            return Err(error);
+        }
+    };
+    let result = buffer.ingest_completion(data, &slot.packet_sizes, scratch, true, 0)
+        .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
+    if detached { Err(Error::DeviceLost) } else { result }
 }
 
 fn oldest_ready_capture(order: &VecDeque<usize>, slots: &[IsoTransferSlot]) -> Option<usize> {
@@ -1226,4 +1297,63 @@ mod tests {
         assert_eq!(buffer.stats().missing_frames, 0);
         assert_eq!(buffer.stats().overrun_frames, 0);
     }
+    #[test]
+    fn duplex_reader_contention_drops_only_valid_frames_without_blocking_completion_or_finish() {
+        for shared_implicit in [false, true] {
+            let endpoint = capture_candidates(&configuration(0), 1, Speed::Full, 48_000)
+                .unwrap().remove(0);
+            let buffer = CaptureBuffer::new(endpoint.format.clone(), 1).unwrap();
+            let attachment = duplex::Attachment::new(endpoint, shared_implicit, buffer);
+            let mut reader = attachment.reader(Arc::new(AtomicBool::new(false)));
+            let retirement = attachment.retirement_guard();
+            let mut slot = completed_slot(0, &[1; 12]); // stereo 24-bit: two frames
+            let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            assert_eq!(reader.lock_buffer().read(&mut [0; 6]), Ok(1));
+
+            // Deliberately retain the reader lock on this thread. Any blocking
+            // worker append or finish would deadlock here, before OUT resumes.
+            let held = reader.buffer.lock();
+            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 6; }
+            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0; }
+            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 5; }
+            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
+            assert_eq!(attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch), Err(Error::DeviceLost));
+            assert_eq!(attachment.ingest(&slot, LIBUSB_TRANSFER_NO_DEVICE, &mut scratch), Err(Error::DeviceLost));
+            unsafe { slot.transfer.as_mut().endpoint = 0x82; }
+            assert!(attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).is_err());
+            attachment.reordered();
+            attachment.finish(Some(Error::DeviceLost));
+            drop(retirement);
+            assert!(reader.retired.as_ref().unwrap().load(Ordering::Acquire));
+            drop(held);
+
+            let buffer = reader.lock_buffer();
+            let stats = buffer.stats();
+            assert_eq!(stats.captured_frames, 5);
+            assert_eq!(stats.delivered_frames, 1);
+            assert_eq!(stats.overrun_frames, 1);
+            assert_eq!(stats.contention_frames, 3);
+            assert_eq!(stats.empty_packets, 1);
+            assert_eq!(stats.short_packets, 1);
+            assert_eq!(stats.malformed_packets, 1);
+            assert_eq!(stats.failed_packets, 1);
+            assert_eq!(stats.failed_transfers, 1);
+            assert_eq!(stats.malformed_completions, 1);
+            assert_eq!(stats.reordered_completions, 1);
+            assert_eq!(stats.missing_frames, 0);
+            assert_eq!(stats.device_position_frames(), 5);
+            assert_eq!(stats.captured_frames, stats.delivered_frames + buffer.available_frames() as u64
+                + stats.overrun_frames + stats.contention_frames);
+            assert_eq!(buffer.state(), CaptureState::Failed);
+            drop(buffer);
+            assert_eq!(reader.error.lock().clone(), Some(Error::DeviceLost));
+            reader.stop().unwrap();
+        }
+    }
+
 }

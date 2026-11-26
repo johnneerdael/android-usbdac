@@ -78,8 +78,9 @@ pub(super) fn negotiate_playback_format(
         apply_itf_mode(&claimed_handle, &candidate, requested_format.dsd_transport)
             .map_err(Error::Transfer)?;
 
-        if let Some(route) = adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)? {
-            configure_adc3(&claimed_handle.handle, &route, requested_format.sample_rate).map_err(Error::Transfer)?;
+        if adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)?.is_some() {
+            let route = negotiate_adc3_clock(&claimed_handle, &candidate, requested_format.sample_rate)
+                .map_err(Error::Transfer)?;
             remember_adc3_route(route);
             set_effective_playback_format(requested_format);
             set_dac_mode(DacMode::FixedClock);

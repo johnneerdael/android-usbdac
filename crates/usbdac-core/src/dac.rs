@@ -107,6 +107,14 @@ impl std::fmt::Debug for Dac {
 }
 
 impl Dac {
+    /// Prove the exact optional Scarlett vendor claim from actual USB descriptors.
+    /// Requires the host-selected configuration; sends no proprietary requests.
+    pub fn scarlett_routing_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>> {
+        let _guard = OPEN_GUARD.lock();
+        if transport::session::session_registered() { return Err(Error::Busy); }
+        transport::routing_hw::scarlett_preflight(fd, info)
+    }
+
     /// Read the active configuration's explicit PCM IN claim plan before the
     /// host claims its AudioControl and input streaming interfaces. Returns
     /// `(configuration, control_interfaces, input_interfaces)` without audio.

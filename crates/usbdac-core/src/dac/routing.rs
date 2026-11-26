@@ -45,6 +45,23 @@ impl Dac {
         routing_hw::scarlett_mix_apply(edit)
     }
 
+    /// Probe optional per-bank support and read every raw bank including padding.
+    /// An unsupported response never enables writes; legacy reads remain usable.
+    pub fn scarlett_mux_read(&self) -> Result<crate::scarlett::MuxSnapshot, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_mux_read()
+    }
+
+    /// Apply explicit bank edits only after a fresh complete capability/geometry
+    /// read equals the expected snapshot. Restore each attempted raw bank after
+    /// any uncertain write. Configured hand-back preserves external edits.
+    /// Source-backed; physical routing has not been validated.
+    pub fn scarlett_mux_apply(&self, edit: &crate::scarlett::MuxEdit)
+        -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::scarlett_mux_apply(edit)
+    }
+
     /// Discover standard UAC2 selectors and mixer crosspoints on claimed
     /// AudioControl interfaces in the active configuration. No vendor protocol
     /// is inferred. Requires an idle DAC, including no open capture stream.

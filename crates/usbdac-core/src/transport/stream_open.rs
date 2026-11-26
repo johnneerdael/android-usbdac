@@ -206,6 +206,16 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState("clock route changed since negotiation".into()));
     }
+    if let Some(route) = adc3_route.as_ref() {
+        if capture.is_some() && adc3::adc3_has_clock_mutation(route) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::InvalidState("ADC3 alternate clock duplex is not validated".into()));
+        }
+        if let Err(error) = apply_adc3_clock_plan(&claimed_handle, route, playback_format.sample_rate) {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::Transfer(error));
+        }
+    }
     // Select and validate the complete pair while all streaming alternates are idle.
     let attachment = match capture.map(|(request, capacity)|
         duplex::prepare(&claimed_handle, &candidate, expected, request, capacity)).transpose() {

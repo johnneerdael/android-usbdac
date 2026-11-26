@@ -39,6 +39,12 @@ internal object Native {
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean
+    @JvmStatic external fun scarlettPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun scarlettCapability(dac: Long): String
+    @JvmStatic external fun scarlettRead(dac: Long): String
+    @JvmStatic external fun scarlettMuxRead(dac: Long): String
+    @JvmStatic external fun scarlettMuxApply(dac: Long, snapshot: Long, editsJson: String): String
+    @JvmStatic external fun scarlettMixApply(dac: Long, editJson: String): String
     @JvmStatic external fun routingDiscover(dac: Long): String
     @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
     @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String

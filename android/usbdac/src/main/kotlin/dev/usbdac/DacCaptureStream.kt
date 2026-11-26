@@ -51,7 +51,7 @@ public data class CaptureFormat(
 
 public enum class CaptureState { ACTIVE, STOPPED, FAILED }
 
-/** Transport loss and slow-reader backlog are separate counters. */
+/** Transport loss, slow-reader backlog and duplex reader contention are separate counters. */
 public data class CaptureStats(
     val state: CaptureState,
     val availableFrames: Long,
@@ -69,6 +69,8 @@ public data class CaptureStats(
     /** Lower-bound device position; unknown transport loss cannot be inferred from IN capacity. */
     val devicePositionFrames: Long,
     val error: DacException?,
+    /** Valid received frames dropped while a duplex reader held the capture buffer. */
+    val contentionFrames: Long = 0,
 )
 
 /**

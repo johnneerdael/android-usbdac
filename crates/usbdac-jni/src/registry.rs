@@ -25,6 +25,7 @@ pub struct DacEntry {
     formats: Mutex<Vec<(u64, StreamFormat)>>,
     streams: Mutex<Vec<u64>>,
     routing: Mutex<Vec<(u64, usbdac_core::routing::RoutingSnapshot)>>,
+    scarlett_mux: Mutex<Vec<(u64, usbdac_core::scarlett::MuxSnapshot)>>,
 }
 
 impl DacEntry {
@@ -34,6 +35,7 @@ impl DacEntry {
             formats: Mutex::new(Vec::new()),
             streams: Mutex::new(Vec::new()),
             routing: Mutex::new(Vec::new()),
+            scarlett_mux: Mutex::new(Vec::new()),
         }
     }
 
@@ -58,6 +60,26 @@ impl DacEntry {
         self.routing.lock().iter().find(|(key, _)| *key == id)
             .map(|(_, snapshot)| snapshot.clone())
             .ok_or_else(|| stale("routing snapshot", id as i64))
+    }
+
+    /// Retain only native-observed raw banks, scoped to this open DAC owner.
+    pub fn remember_scarlett_mux(&self, snapshot: usbdac_core::scarlett::MuxSnapshot) -> Result<u64, Error> {
+        let dacs = DACS.lock();
+        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
+            return Err(Error::InvalidState("DAC closed during Scarlett mux read".into()));
+        }
+        let id = next_id();
+        let mut snapshots = self.scarlett_mux.lock();
+        snapshots.push((id, snapshot));
+        if snapshots.len() > 8 { snapshots.remove(0); }
+        Ok(id)
+    }
+
+    pub fn scarlett_mux(&self, id: i64) -> Result<usbdac_core::scarlett::MuxSnapshot, Error> {
+        let id = u64::try_from(id).map_err(|_| stale("Scarlett mux snapshot", id))?;
+        self.scarlett_mux.lock().iter().find(|(key, _)| *key == id)
+            .map(|(_, snapshot)| snapshot.clone())
+            .ok_or_else(|| stale("Scarlett mux snapshot", id as i64))
     }
 
     pub fn remember_format(&self, format: StreamFormat) -> u64 {

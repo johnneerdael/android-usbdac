@@ -1,0 +1,176 @@
+//! Typed Scarlett bridge; no raw requests and no caller-supplied model proof.
+use super::*;
+use serde_json::json;
+use usbdac_core::scarlett::*;
+
+fn capability(v: ReadCapability) -> Value {
+    json!({"model":"scarlett_18i20_gen2","name":v.candidate.name(),"configuration_id":v.configuration,"interface":v.interface,"notification_endpoint":v.notification_endpoint,"interface_claimed":v.interface_claimed})
+}
+fn port(v: Port) -> Value {
+    match v { Port::Off => json!({"kind":"off"}), Port::Channel {kind,channel} => json!({"kind":match kind {
+        PortKind::Off=>"off",PortKind::Analogue=>"analogue",PortKind::Spdif=>"spdif",PortKind::Adat=>"adat",PortKind::Mix=>"mix",PortKind::Pcm=>"pcm"},"channel":channel}) }
+}
+fn row(v: &MixReadback) -> Value { json!({"output":v.output,"coefficients":v.coefficients}) }
+fn read_error(v: &ReadError<String>) -> Value {
+    match v { ReadError::Io(detail)=>json!({"kind":"io","detail":detail}),ReadError::Protocol(e)=>json!({"kind":"protocol","detail":format!("{e:?}")}) }
+}
+fn mix_failure(v: &MixFailure<String>) -> Value {
+    match v {MixFailure::Read(e)=>read_error(e),MixFailure::Invalid(e)=>json!({"kind":"invalid","detail":format!("{e:?}")}),MixFailure::Drift{actual}=>json!({"kind":"drift","actual":row(actual)}),MixFailure::Verification{actual}=>json!({"kind":"verification","actual":row(actual)})}
+}
+fn mux_bank(v: &MuxBankSnapshot) -> Value {
+    json!({"bank":v.bank(),"raw_words":v.raw_words(),"routes":v.routes().iter().map(|r| json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>()})
+}
+fn mux_state(v: &MuxSnapshot) -> Value {
+    json!({"model":"scarlett_18i20_gen2","firmware":v.model.firmware(),"banks":v.banks.iter().map(mux_bank).collect::<Vec<_>>()})
+}
+fn mux_failure(v: &MuxFailure<String>) -> Value {
+    match v {
+        MuxFailure::Read(e) => read_error(e),
+        MuxFailure::Invalid(e) => json!({"kind":"invalid","detail":format!("{e:?}")}),
+        MuxFailure::Drift{actual} => json!({"kind":"drift","actual":mux_state(actual)}),
+        MuxFailure::Verification{bank,actual} => json!({"kind":"verification","bank":bank,"actual_bank":mux_bank(actual)}),
+    }
+}
+fn failure(v: usbdac_core::routing::RoutingSessionError) -> Value {
+    use usbdac_core::routing::RoutingSessionError as E;
+    let detail=v.to_string();
+    let error=match v {
+        E::Scarlett(e)=>json!({"kind":"read","cause":read_error(&e),"detail":detail}),
+        E::ScarlettMux(e)=>json!({"kind":"mux","cause":mux_failure(&e.failure),"rollback_failures":e.rollback.iter().map(|(bank,cause)|json!({"bank":bank,"cause":mux_failure(cause)})).collect::<Vec<_>>(),"detail":detail}),
+        E::ScarlettMix(e)=>json!({"kind":"mix","cause":mix_failure(&e.failure),"rollback_failure":e.rollback.as_ref().map(mix_failure),"detail":detail}),
+        E::Session(e)=>json!({"kind":"session","session_code":e.code(),"detail":detail}),
+        E::Drift(_)=>json!({"kind":"drift","detail":detail}),
+        _=>json!({"kind":"unsupported","detail":detail}),
+    };
+    json!({"error":error})
+}
+fn byte(v:&Value, key:&str)->Outcome<u8> { v[key].as_u64().and_then(|n|u8::try_from(n).ok()).ok_or_else(||Failure::Bad(format!("Scarlett {key} must be a byte"))) }
+fn parse_edit(v: &Value) -> Outcome<MixRowEdit> {
+    let expected=&v["expected"];
+    let coefficients=expected["coefficients"].as_array().filter(|a|a.len()==18).ok_or_else(||Failure::Bad("Scarlett expected row must contain exactly 18 raw coefficients".into()))?
+        .iter().map(|n|n.as_u64().and_then(|n|u16::try_from(n).ok()).ok_or_else(||Failure::Bad("Scarlett coefficients must be unsigned 16-bit".into()))).collect::<Outcome<Vec<_>>>()?;
+    let gains=v["gains"].as_array().filter(|a|!a.is_empty() && a.len()<=18).ok_or_else(||Failure::Bad("Scarlett requires 1 to 18 gain edits".into()))?
+        .iter().map(|g| {let gain=g["half_db"].as_i64().and_then(|n|i16::try_from(n).ok()).and_then(|n|MixGain::from_half_db(n).ok()).ok_or_else(||Failure::Bad("Scarlett gain must be -160 to 24 half-dB".into()))?;Ok(MixGainEdit{input:byte(g,"input")?,gain})}).collect::<Outcome<Vec<_>>>()?;
+    Ok(MixRowEdit{expected:MixReadback{output:byte(expected,"output")?,coefficients},gains})
+}
+fn parse_port(v: &Value) -> Outcome<Port> {
+    if !v.as_object().is_some_and(|v| v.keys().all(|k| matches!(k.as_str(), "kind" | "channel"))) {
+        return Err(Failure::Bad("Scarlett ports contain only kind and channel".into()));
+    }
+    let kind = match v["kind"].as_str() {
+        Some("off") if v.get("channel").is_none() => return Ok(Port::Off),
+        Some("analogue") => PortKind::Analogue,
+        Some("spdif") => PortKind::Spdif,
+        Some("adat") => PortKind::Adat,
+        Some("mix") => PortKind::Mix,
+        Some("pcm") => PortKind::Pcm,
+        _ => return Err(Failure::Bad("unknown Scarlett port kind or OFF channel".into())),
+    };
+    let channel = byte(v, "channel")?;
+    if channel == 0 { return Err(Failure::Bad("Scarlett channels are one-based".into())); }
+    Ok(Port::Channel { kind, channel })
+}
+fn parse_mux_routes(v: &Value) -> Outcome<Vec<MuxRouteEdit>> {
+    let edits = v.as_array().filter(|a| !a.is_empty() && a.len() <= 256)
+        .ok_or_else(|| Failure::Bad("Scarlett mux requires 1 to 256 typed route edits".into()))?;
+    edits.iter().map(|v| {
+        if !v.as_object().is_some_and(|v| v.keys().all(|k| matches!(k.as_str(), "bank" | "destination" | "source"))) {
+            return Err(Failure::Bad("Scarlett mux edits contain only bank, destination and source".into()));
+        }
+        let bank = byte(v, "bank")?;
+        if bank > 2 { return Err(Failure::Bad("Scarlett mux bank must be 0 to 2".into())); }
+        Ok(MuxRouteEdit { bank, destination:parse_port(&v["destination"])?, source:parse_port(&v["source"])? })
+    }).collect()
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_mux_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| {
+        let entry=registry::dac(dac)?;
+        let result=match entry.dac.scarlett_mux_read() {
+            Ok(snapshot)=>{ let mut v=mux_state(&snapshot); v["snapshot_id"]=json!(entry.remember_scarlett_mux(snapshot)?); json!({"value":v}) },
+            Err(e)=>failure(e),
+        };
+        java_string(env,&result)
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_mux_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,snapshot:i64,edits:JString<'l>)->JString<'l> {
+    run(&mut env,|env| {
+        let input=string_of(env,&edits)?;
+        if input.len()>65536 { return Err(Failure::Bad("Scarlett mux edits exceed 65536 bytes".into())); }
+        let routes=parse_mux_routes(&serde_json::from_str::<Value>(&input).map_err(|e|Failure::Bad(e.to_string()))?)?;
+        let entry=registry::dac(dac)?;
+        let expected=entry.scarlett_mux(snapshot)?;
+        let result=match entry.dac.scarlett_mux_apply(&MuxEdit{expected,routes}) {
+            Ok(report)=>{
+                let original=mux_state(&report.original);
+                let mut verified=mux_state(&report.verified);
+                verified["snapshot_id"]=json!(entry.remember_scarlett_mux(report.verified)?);
+                json!({"value":{"original":original,"verified":verified}})
+            },
+            Err(e)=>failure(e),
+        };
+        java_string(env,&result)
+    })
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_preflight<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,fd:i32,info:JString<'l>)->JString<'l> {
+    run(&mut env,|env| {let info=json::parse_device_info(&string_of(env,&info)?)?;let v=Dac::scarlett_routing_preflight(fd,&info)?;java_string(env,&json!({"capability":v.map(capability)}))})
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_capability<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_capability(){Ok(v)=>json!({"value":{"capability":v.map(capability)}}),Err(e)=>failure(e)};java_string(env,&v)})
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_read<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64)->JString<'l> {
+    run(&mut env,|env| {let e=registry::dac(dac)?;let v=match e.dac.scarlett_routing_read(){Ok(v)=>json!({"value":{"model":"scarlett_18i20_gen2","firmware":v.model.firmware(),"mixer_inputs":v.model.mixer_inputs(),"mixer_outputs":v.model.mixer_outputs(),"mux_zero":v.mux_zero.iter().map(|r|json!({"source":port(r.source),"destination":port(r.destination)})).collect::<Vec<_>>(),"mixes":v.mixes.iter().map(row).collect::<Vec<_>>()}}),Err(e)=>failure(e)};java_string(env,&v)})
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn scarlett_mix_apply<'l>(mut env:EnvUnowned<'l>,_class:JObject<'l>,dac:i64,edit:JString<'l>)->JString<'l> {
+    run(&mut env,|env| {let input=string_of(env,&edit)?;if input.len()>8192 {return Err(Failure::Bad("Scarlett edit exceeds 8192 bytes".into()));}let edit=parse_edit(&serde_json::from_str::<Value>(&input).map_err(|e|Failure::Bad(e.to_string()))?)?;let e=registry::dac(dac)?;let v=match e.dac.scarlett_mix_apply(&edit){Ok(v)=>json!({"value":{"original":row(&v.original),"verified":row(&v.verified)}}),Err(e)=>failure(e)};java_string(env,&v)})
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mux_edits_accept_only_typed_routes_without_caller_raw_baselines() {
+        let mut edit=json!([{"bank":2,"destination":{"kind":"analogue","channel":1},"source":{"kind":"off"}}]);
+        let routes=parse_mux_routes(&edit).unwrap();
+        assert_eq!(routes[0], MuxRouteEdit {bank:2,destination:Port::Channel{kind:PortKind::Analogue,channel:1},source:Port::Off});
+        edit[0]["expected"]=json!({"banks":[]});
+        assert!(parse_mux_routes(&edit).is_err());
+        edit[0].as_object_mut().unwrap().remove("expected");
+        edit[0]["bank"]=json!(3); assert!(parse_mux_routes(&edit).is_err());
+        edit[0]["bank"]=json!(0);
+        edit[0]["source"]=json!({"kind":"off","channel":1}); assert!(parse_mux_routes(&edit).is_err());
+        edit[0]["source"]=json!({"kind":"pcm","channel":0}); assert!(parse_mux_routes(&edit).is_err());
+        edit[0]["source"]=json!({"kind":"pcm","channel":256}); assert!(parse_mux_routes(&edit).is_err());
+        edit[0]["source"]=json!({"kind":"raw","channel":1}); assert!(parse_mux_routes(&edit).is_err());
+        assert!(parse_mux_routes(&json!([])).is_err());
+        assert!(parse_mux_routes(&json!(vec![Value::Null;257])).is_err());
+    }
+    #[test]
+    fn mux_failure_preserves_every_bank_rollback_cause() {
+        let v=failure(usbdac_core::routing::RoutingSessionError::ScarlettMux(MuxWriteError {
+            failure:MuxFailure::Read(ReadError::Io("write".into())),
+            rollback:vec![(0,MuxFailure::Read(ReadError::Io("restore zero".into()))),
+                (2,MuxFailure::Invalid(ProtocolError::InvalidMuxBank(2)))],
+        }));
+        assert_eq!(v["error"]["kind"], "mux");
+        assert_eq!(v["error"]["cause"]["detail"], "write");
+        assert_eq!(v["error"]["rollback_failures"][0]["bank"], 0);
+        assert_eq!(v["error"]["rollback_failures"][0]["cause"]["detail"], "restore zero");
+        assert_eq!(v["error"]["rollback_failures"][1]["bank"], 2);
+        assert_eq!(v["error"]["rollback_failures"][1]["cause"]["kind"], "invalid");
+    }
+    #[test] fn exact_unsigned_rows_and_bounded_gains() {
+        let mut v=json!({"expected":{"output":1,"coefficients":vec![65535;18]},"gains":[{"input":1,"half_db":-160}]});
+        assert_eq!(parse_edit(&v).unwrap().expected.coefficients[0],65535);
+        v["gains"][0]["half_db"]=json!(25);assert!(parse_edit(&v).is_err());
+        v["gains"][0]["half_db"]=json!(0);v["expected"]["coefficients"][0]=json!(-1);assert!(parse_edit(&v).is_err());
+    }
+    #[test] fn mix_failure_preserves_actual_and_rollback() {
+        let v=failure(usbdac_core::routing::RoutingSessionError::ScarlettMix(MixWriteError{failure:MixFailure::Verification{actual:MixReadback{output:2,coefficients:vec![65535;18]}},rollback:Some(MixFailure::Read(ReadError::Io("restore".into())))}));
+        assert_eq!(v["error"]["cause"]["actual"]["coefficients"][0],65535);assert_eq!(v["error"]["rollback_failure"]["detail"],"restore");
+    }
+}
