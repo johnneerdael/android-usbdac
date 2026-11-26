@@ -140,6 +140,7 @@ const USB_PAYLOAD_FLICKER_GRACE_MS: u64 = 1500;
 const USB_TIMING_LOG_INTERVAL: u64 = 128;
 
 pub(crate) mod api;
+pub(crate) mod capture_stream;
 mod clock;
 mod encode;
 mod iso;
@@ -148,6 +149,7 @@ mod native_dsd;
 use native_dsd::*;
 mod output;
 mod ring;
+pub(crate) mod routing_hw;
 mod scan;
 pub(crate) mod session;
 pub(crate) mod shared;

@@ -214,6 +214,9 @@ pub enum CaptureState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CaptureStats {
+    /// Callback publication observed ahead of an older submitted transfer.
+    /// Bytes are still delivered in submission order.
+    pub reordered_completions: u64,
     /// Valid full frames received, including any subsequently dropped backlog.
     pub captured_frames: u64,
     pub delivered_frames: u64,
@@ -260,7 +263,100 @@ pub struct CaptureBuffer {
     state: CaptureState,
 }
 
+/// Standalone PCM capture running through the direct USB session. A caller may
+/// read from any thread; reads copy complete interleaved wire frames without
+/// conversion. Slow readers drop old queued frames and expose that in stats.
+pub struct DacCaptureStream {
+    dac: std::sync::Arc<crate::dac::DacShared>,
+    format: CaptureFormat,
+    interface: u8,
+    alternate: u8,
+    endpoint: u8,
+    configuration: u8,
+    handle: parking_lot::Mutex<crate::transport::capture_stream::CaptureHandle>,
+}
+
+impl DacCaptureStream {
+    pub(crate) fn new(
+        dac: std::sync::Arc<crate::dac::DacShared>,
+        handle: crate::transport::capture_stream::CaptureHandle,
+    ) -> Self {
+        Self {
+            dac,
+            format: handle.endpoint.format.clone(),
+            interface: handle.endpoint.interface,
+            alternate: handle.endpoint.alternate,
+            endpoint: handle.endpoint.address,
+            configuration: handle.endpoint.configuration,
+            handle: parking_lot::Mutex::new(handle),
+        }
+    }
+
+    pub fn format(&self) -> &CaptureFormat {
+        &self.format
+    }
+    pub fn interface_number(&self) -> u8 {
+        self.interface
+    }
+    pub fn alternate_setting(&self) -> u8 {
+        self.alternate
+    }
+    pub fn endpoint_address(&self) -> u8 {
+        self.endpoint
+    }
+    pub fn configuration_id(&self) -> u8 {
+        self.configuration
+    }
+
+    /// Return whole wire frames copied. An active empty stream returns zero.
+    /// Destination length must be a multiple of `format().bytes_per_frame()`.
+    pub fn read(&self, destination: &mut [u8]) -> crate::Result<usize> {
+        self.dac.ensure_open()?;
+        let handle = self.handle.lock();
+        let result = handle.buffer.lock().read(destination);
+        result.map_err(|error| match error {
+            CaptureError::PartialFrame => crate::Error::InvalidArgument(
+                "capture read buffer must contain whole wire frames".into(),
+            ),
+            CaptureError::Stopped => crate::Error::InvalidState("capture stream is stopped".into()),
+            CaptureError::Failed => handle
+                .error
+                .lock()
+                .clone()
+                .unwrap_or_else(|| crate::Error::Transfer("capture stream failed".into())),
+            other => crate::Error::Transfer(format!("capture read: {other:?}")),
+        })
+    }
+
+    pub fn available_frames(&self) -> usize {
+        self.handle.lock().buffer.lock().available_frames()
+    }
+    pub fn stats(&self) -> CaptureStats {
+        self.handle.lock().buffer.lock().stats()
+    }
+    pub fn state(&self) -> CaptureState {
+        self.handle.lock().buffer.lock().state()
+    }
+    pub fn last_error(&self) -> Option<crate::Error> {
+        self.handle.lock().error.lock().clone()
+    }
+
+    /// Stop and retire IN transfers before handing the interface back. A
+    /// timeout retains USB ownership in the worker; keep host claims/FD until
+    /// `Dac::await_usb_retirement` confirms retirement after closing the DAC.
+    pub fn close(&self) -> crate::Result<()> {
+        self.handle.lock().stop()
+    }
+}
+
 impl CaptureBuffer {
+    pub(crate) fn note_malformed_completion(&mut self) {
+        self.stats.malformed_completions = self.stats.malformed_completions.saturating_add(1);
+    }
+
+    pub(crate) fn note_reordered_completion(&mut self) {
+        self.stats.reordered_completions = self.stats.reordered_completions.saturating_add(1);
+    }
     pub fn new(format: CaptureFormat, capacity_frames: usize) -> Result<Self, CaptureError> {
         let bytes = capacity_frames
             .checked_mul(format.bytes_per_frame())
@@ -340,7 +436,7 @@ impl CaptureBuffer {
                 .zip(packets)
                 .any(|(length, packet)| *length != packet.requested_bytes)
         {
-            self.stats.malformed_completions = self.stats.malformed_completions.saturating_add(1);
+            self.note_malformed_completion();
             return Err(CaptureError::InvalidCompletion);
         }
         let frame_bytes = self.format.bytes_per_frame();

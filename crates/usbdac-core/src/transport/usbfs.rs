@@ -102,6 +102,8 @@ pub(super) struct IdleLock {
 }
 
 pub(super) struct ClaimedHandle {
+    // Drop before the libusb handle/context; armed only by exclusive setup.
+    pub(super) itf_mode: ItfModeLease,
     pub(super) device_fd: RawFd,
     pub(super) context: Context,
     pub(super) handle: DeviceHandle<Context>,
@@ -156,6 +158,7 @@ pub(super) const USBDEVFS_SETINTERFACE: IoctlRequest =
 impl From<IdleLock> for ClaimedHandle {
     fn from(value: IdleLock) -> Self {
         Self {
+            itf_mode: ItfModeLease::new(value.device_fd),
             device_fd: value.device_fd,
             context: value.context,
             handle: value.handle,
@@ -208,6 +211,8 @@ impl ClaimedHandle {
         if alternate_setting != 0 {
             active.push(interface_number);
         }
+        drop(active);
+        itf_interface_delay(&self.handle.device(), interface_number);
         Ok(())
     }
 }
@@ -231,6 +236,7 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
         .map_err(|error| format!("Failed to wrap USB file descriptor: {}", error))?;
 
     Ok(ClaimedHandle {
+        itf_mode: ItfModeLease::new(device.fd),
         device_fd: device.fd,
         context,
         handle,
@@ -243,7 +249,7 @@ pub(super) fn cleanup_claimed_handle(
     claimed_handle: ClaimedHandle,
     active_interface: Option<u8>,
     keep_locked: bool,
-) {
+) -> bool {
     let mut active = claimed_handle.active_interfaces.lock().clone();
     if let Some(interface_number) = active_interface {
         if !active.contains(&interface_number) {
@@ -260,7 +266,19 @@ pub(super) fn cleanup_claimed_handle(
         }
     }
 
+    if reset_ok {
+        if let Err(error) = claimed_handle.itf_mode.restore() {
+            reset_ok = false;
+            set_last_error(Some(format!("ITF PCM mode could not be restored: {error}")));
+            log_warn!("[USB] ITF PCM recovery failed; releasing ownership: {error}");
+        }
+    } else {
+        // Do not send vendor mode writes after an unconfirmed interface reset
+        // or disconnect, including from the lease's Drop fallback.
+        claimed_handle.itf_mode.disarm();
+    }
     if reset_ok && keep_locked && current_lock_requested_for_fd(claimed_handle.device_fd) {
         *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());
     }
+    reset_ok
 }

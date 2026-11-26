@@ -218,12 +218,16 @@ impl IsoTransferSlot {
     /// Reuse the capture buffer without copying or exposing captured audio.
     pub(super) fn submit_capture(&mut self, handle: &DeviceHandle<Context>, endpoint: u8, packet_bytes: usize) -> Result<(), String> {
         if self.in_flight { return Err("capture slot already submitted".into()); }
+        if endpoint & 0x80 == 0 || packet_bytes == 0 || packet_bytes > u32::MAX as usize
+            || self.packet_sizes.len() > i32::MAX as usize {
+            return Err("invalid capture request geometry".into());
+        }
         self.retirement_context = Some(handle.context().clone());
         unsafe {
             let data = &mut *self.user_data;
             data.completion.reset();
             let bytes = packet_bytes.checked_mul(self.packet_sizes.len()).ok_or("capture size overflow")?;
-            if bytes > data.buffer.len() { return Err("capture buffer too small".into()); }
+            if bytes > data.buffer.len() || bytes > i32::MAX as usize { return Err("capture buffer too small or request too large".into()); }
             libusb_fill_iso_transfer(self.transfer.as_mut(), handle.as_raw(), endpoint,
                 data.buffer.as_mut_ptr(), bytes as i32, self.packet_sizes.len() as i32,
                 iso_transfer_callback, self.user_data as *mut c_void, ISO_TRANSFER_TIMEOUT_MS);
@@ -237,6 +241,9 @@ impl IsoTransferSlot {
                 } else { format!("implicit capture submit failed: {}", result) });
             }
             self.packet_sizes.fill(packet_bytes);
+            self.generation = self.generation.saturating_add(1);
+            self.submitted_endpoint = endpoint;
+            self.submitted_bytes = bytes;
             self.in_flight = true;
             self.submitted_at = Some(Instant::now());
         }

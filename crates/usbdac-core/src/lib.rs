@@ -70,6 +70,7 @@ pub use capabilities::{
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
 pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume};
 pub use dac::Dac;
+pub use capture::{CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition, DacCaptureStream};
 pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};

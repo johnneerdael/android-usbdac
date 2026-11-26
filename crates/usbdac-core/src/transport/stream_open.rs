@@ -307,6 +307,10 @@ pub(super) fn start_stream_inner(
         return Err(Error::Transfer(message));
     }
     thread::sleep(Duration::from_millis(50));
+    if let Err(error) = apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport) {
+        cleanup_claimed_handle(claimed_handle, None, lock_requested);
+        return Err(Error::Transfer(error));
+    }
     if let Err(error) = verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
         return Err(Error::InvalidState(error));

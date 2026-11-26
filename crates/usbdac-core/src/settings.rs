@@ -110,6 +110,7 @@ impl Settings {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn dsd_big_endian(&self) -> bool {
         self.config
             .dsd_big_endian

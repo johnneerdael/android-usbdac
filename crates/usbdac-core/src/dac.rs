@@ -1,5 +1,7 @@
 //! The DAC handle.
 
+mod routing;
+
 use crate::capabilities::{Capabilities, DeviceInfo};
 use crate::config::{CloseVolume, DacConfig, HandBack};
 use crate::error::{Error, Result};
@@ -105,6 +107,35 @@ impl std::fmt::Debug for Dac {
 }
 
 impl Dac {
+    /// Register an explicitly claimed capture device, including an input-only
+    /// device. Claim its IN AudioStreaming interfaces and their owning
+    /// AudioControl interfaces before calling; no playback claim is needed.
+    /// This entry point performs no output-volume setup. Android/JNI capture
+    /// permission and claim orchestration is a separate integration step.
+    pub fn open_capture_device(fd: RawFd, info: DeviceInfo, config: DacConfig) -> Result<Dac> {
+        config.validate()?;
+        let _guard = OPEN_GUARD.lock();
+        if transport::session::session_registered() { return Err(Error::Busy); }
+        settings::install(Settings::for_device(config.clone(), &info));
+        if let Err(error) = transport::api::open_capture_device(fd, &info) {
+            settings::reset();
+            return Err(error);
+        }
+        Ok(Dac { shared: Arc::new(DacShared { events: EventHub::start(), info, config,
+            closed: AtomicBool::new(false), stream: Mutex::new(None) }) })
+    }
+
+    /// Start standalone, exact-format PCM capture on a claimed IN interface.
+    /// The capture worker exclusively owns USB until all transfers retire;
+    /// concurrent playback, duplex and routing changes are refused.
+    pub fn open_capture(&self, request: &crate::capture::CaptureRequest, capacity_frames: usize)
+        -> Result<crate::capture::DacCaptureStream>
+    {
+        self.shared.ensure_open()?;
+        let handle = transport::capture_stream::open_capture(request, capacity_frames, self.shared.events.clone())?;
+        Ok(crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), handle))
+    }
+
     /// Wait until USB activity has retired before releasing the host's claimed interfaces and FD.
     ///
     /// After [`Dac::close`] returns a transfer timeout, retain all host ownership

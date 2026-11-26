@@ -1,7 +1,8 @@
 //! Independently implemented compatibility data from Linux v7.0 quirks.c,
 //! snd_usb_interface_dsd_format_quirks (028ef9c96e96197026887c0f092424679298aae8).
 //! Alt-only upstream records require a unique eligible playback layout here.
-//! This module issues no vendor mode requests. Source evidence is not a claim
+//! Exact ITF mode transactions run only under the exclusive stream owner.
+//! Source evidence is not a claim
 //! that these devices have been physically tested with this transport.
 use super::*;
 
@@ -95,19 +96,16 @@ fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat) -> Optio
         origin: NativeDsdOrigin::DeviceCompatibility })
 }
 
-// Compatibility evidence only. Nothing outside this module can retrieve this
-// recipe, and resolve_native_dsd never consults it. Enable only after a real
-// transaction implements alt-zero ownership, control errors, restoration and
-// device-loss handling. No readback command is documented by the pinned source.
-#[allow(dead_code)]
-mod pending_itf {
+// Exact model data and mockable mode transactions. No mode readback request is
+// documented by the pinned source; hand-back therefore restores PCM-safe mode.
+mod itf {
     use super::*;
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct ModelConditions {
-        interface_delay: bool,
-        force_interface_reset: bool,
+    pub(super) struct ModelConditions {
+        pub(super) interface_delay: bool,
+        pub(super) force_interface_reset: bool,
     }
-    fn model(id: UsbIdentity) -> Option<ModelConditions> {
+    pub(super) fn model(id: UsbIdentity) -> Option<ModelConditions> {
         let (interface_delay, force_interface_reset) = match (id.vendor, id.product) {
             (0x0644, 0x8043) | (0x0644, 0x804a) => (true, false), // TEAC UD-501/503/NT-503, UD-301
             (0x0644, 0x8044) | (0x0644, 0x806b) | (0x0644, 0x807d)
@@ -121,40 +119,41 @@ mod pending_itf {
         Some(ModelConditions { interface_delay, force_interface_reset })
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Mode { PcmOrDop, NativeDsd }
+    pub(super) enum Mode { PcmOrDop, NativeDsd }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct VendorWrite {
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        payload_bytes: u16,
+    pub(super) struct VendorWrite {
+        pub(super) request_type: u8,
+        pub(super) request: u8,
+        pub(super) value: u16,
+        pub(super) index: u16,
+        pub(super) payload_bytes: u16,
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct Recipe {
-        reset_interface_to_alt_zero: u8,
-        delay_after_alt_zero_ms: u16,
-        command: VendorWrite,
-        delay_after_command_ms: u16,
-        restore_pcm: VendorWrite,
-        class_control_delay_ms: u16,
-        conditions: ModelConditions,
-        native_profile: NativeDsdProfile,
+    pub(super) struct Recipe {
+        pub(super) reset_interface_to_alt_zero: u8,
+        pub(super) delay_after_alt_zero_ms: u16,
+        pub(super) command: VendorWrite,
+        pub(super) delay_after_command_ms: u16,
+        pub(super) restore_pcm: VendorWrite,
+        pub(super) conditions: ModelConditions,
+        pub(super) native_profile: NativeDsdProfile,
     }
-    fn recipe(id: UsbIdentity, interface: u8, selected_alt: u8, alternatives: &[u8],
+    pub(super) fn recipe(id: UsbIdentity, interface: u8, selected_alt: u8, alternatives: &[u8],
               format: &StreamingInterfaceFormat, mode: Mode) -> Option<Recipe> {
         let conditions = model(id)?;
         // Source mode command addresses wIndex=1. Do not guess a different
         // control recipient on composite devices or remap arbitrary interfaces.
         if interface != 1 || !matches!(alternatives, [0, 1, 2] | [0, 1, 2, 3])
-            || alternatives.last().copied() != Some(selected_alt)
-            || format.channels != 2 || format.subslot_size != 4
-            || format.bit_resolution == 0 || format.bit_resolution > 32 { return None; }
+            || selected_alt == 0 || !alternatives.contains(&selected_alt)
+            || format.channels != 2 || !matches!(format.subslot_size, 2 | 4)
+            || format.bit_resolution == 0 || format.bit_resolution > format.subslot_size * 8
+            || (mode == Mode::NativeDsd && (alternatives.last().copied() != Some(selected_alt)
+                || format.subslot_size != 4)) { return None; }
         let restore_pcm = VendorWrite { request_type: 0x41, request: 0,
             value: 0, index: 1, payload_bytes: 0 };
         let command = VendorWrite { value: if mode == Mode::NativeDsd { 1 } else { 0 }, ..restore_pcm };
         Some(Recipe { reset_interface_to_alt_zero: interface, delay_after_alt_zero_ms: 20,
-            command, delay_after_command_ms: 20, restore_pcm, class_control_delay_ms: 20,
+            command, delay_after_command_ms: 20, restore_pcm,
             conditions, native_profile: NativeDsdProfile { word_bytes: 4, big_endian: true,
                 bit_reverse: false, origin: NativeDsdOrigin::DeviceCompatibility } })
     }
@@ -162,7 +161,7 @@ mod pending_itf {
     mod tests {
         use super::*;
         #[test]
-        fn exact_itf_model_shape_and_mode_values_remain_data_only() {
+        fn exact_itf_model_shape_and_mode_values() {
             let id = UsbIdentity { vendor: 0x0644, product: 0x8044, revision: 0 };
             let f = super::super::tests::format();
             let native = recipe(id, 1, 3, &[0, 1, 2, 3], &f, Mode::NativeDsd).unwrap();
@@ -180,6 +179,199 @@ mod pending_itf {
             // RAW-only Marantz must never inherit the ITF mode recipe.
             assert!(model(UsbIdentity { vendor: 0x154e, product: 0x300b, revision: 0 }).is_none());
         }
+    }
+}
+
+/// The descriptor plan is read-only. Executing it additionally requires the
+/// claimed-handle transaction path, which is never called from discovery.
+fn itf_descriptor_recipe(device: &Device<Context>, config: &ConfigDescriptor,
+                         descriptor: &rusb::InterfaceDescriptor,
+                         format: &StreamingInterfaceFormat, mode: itf::Mode) -> Option<itf::Recipe> {
+    let id = identity(device)?;
+    itf::model(id)?;
+    if descriptor.interface_number() != 1 || descriptor.protocol_code() != 0x20 { return None; }
+    let alternatives: Vec<_> = config.interfaces().flat_map(|i| i.descriptors())
+        .filter(|d| d.interface_number() == 1).collect();
+    let mut numbers: Vec<_> = alternatives.iter().map(|d| d.setting_number()).collect();
+    numbers.sort_unstable();
+    if !matches!(numbers.as_slice(), [0, 1, 2] | [0, 1, 2, 3]) { return None; }
+    for alt in &alternatives {
+        if alt.class_code() != USB_CLASS_AUDIO || alt.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
+            || alt.protocol_code() != 0x20 { return None; }
+        if alt.setting_number() == 0 {
+            if alt.num_endpoints() != 0 { return None; }
+            continue;
+        }
+        let f = parse_android_streaming_interface_format(alt)?;
+        if f.channels != 2 || !matches!(f.subslot_size, 2 | 4)
+            || f.bit_resolution == 0 || f.bit_resolution > f.subslot_size * 8 { return None; }
+        let mut out = 0;
+        for ep in alt.endpoint_descriptors() {
+            if ep.transfer_type() != TransferType::Isochronous || !(1..=16).contains(&ep.interval())
+                || !itf_packet_geometry(ep.max_packet_size(), device.speed()) { return None; }
+            if ep.direction() == Direction::Out && ep.usage_type() == UsageType::Data {
+                if usize::from(ep.max_packet_size() & 0x07ff) < usize::from(f.channels) * usize::from(f.subslot_size) { return None; }
+                out += 1;
+            } else if ep.direction() != Direction::In || ep.usage_type() != UsageType::Feedback {
+                return None;
+            }
+        }
+        if out != 1 { return None; }
+    }
+    itf::recipe(id, descriptor.interface_number(), descriptor.setting_number(), &numbers, format, mode)
+}
+
+fn itf_packet_geometry(raw: u16, speed: Speed) -> bool {
+    let base = raw & 0x07ff;
+    if raw & 0xe000 != 0 || base == 0 || base > 1024 || (raw >> 11) & 3 == 3 { return false; }
+    if speed == Speed::Full && (raw & 0x1800 != 0 || base > 1023) { return false; }
+    // These pinned mode recipes describe USB 2.0 Audio devices. Unknown is
+    // allowed here for Android-wrapped descriptors; selection still performs
+    // its existing effective-speed and per-service-interval capacity checks.
+    matches!(speed, Speed::Full | Speed::High | Speed::Unknown)
+}
+
+/// Every operation is explicit so ordering and rollback can be proved without
+/// USB hardware. A successful zero-alt is mandatory before every vendor write.
+trait ItfModeIo {
+    fn zero_alt(&mut self, interface: u8) -> Result<(), String>;
+    fn write_mode(&mut self, command: itf::VendorWrite) -> Result<(), String>;
+    fn delay(&mut self, milliseconds: u16);
+}
+
+fn itf_sequence(io: &mut impl ItfModeIo, recipe: itf::Recipe, restore: bool) -> Result<(), String> {
+    io.zero_alt(recipe.reset_interface_to_alt_zero)?;
+    if recipe.conditions.interface_delay { io.delay(50); }
+    io.delay(recipe.delay_after_alt_zero_ms);
+    io.write_mode(if restore { recipe.restore_pcm } else { recipe.command })?;
+    io.delay(recipe.delay_after_command_ms);
+    Ok(())
+}
+
+fn itf_switch(io: &mut impl ItfModeIo, recipe: itf::Recipe) -> Result<(), String> {
+    if let Err(error) = itf_sequence(io, recipe, false) {
+        // SET_INTERFACE failure means no mode write is permitted. The restore
+        // sequence independently proves zero-alt before sending PCM recovery.
+        return match itf_sequence(io, recipe, true) {
+            Ok(()) => Err(format!("ITF mode transaction failed; PCM restored: {error}")),
+            Err(restore) => Err(format!("ITF mode transaction failed ({error}); PCM recovery failed ({restore})")),
+        };
+    }
+    Ok(())
+}
+
+struct UsbfsItfIo { fd: RawFd }
+impl ItfModeIo for UsbfsItfIo {
+    fn zero_alt(&mut self, interface: u8) -> Result<(), String> {
+        let setting = UsbfsSetInterface { interface: u32::from(interface), altsetting: 0 };
+        if unsafe { libc::ioctl(self.fd, USBDEVFS_SETINTERFACE, &setting) } < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    fn write_mode(&mut self, command: itf::VendorWrite) -> Result<(), String> {
+        let control = UsbfsControlTransfer { request_type: command.request_type, request: command.request,
+            value: command.value, index: command.index, length: command.payload_bytes,
+            timeout_ms: 1000, data: std::ptr::null_mut() };
+        let result = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &control) };
+        if result < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        if result != 0 { return Err("ITF mode command returned unexpected data length".into()); }
+        Ok(())
+    }
+    fn delay(&mut self, milliseconds: u16) {
+        thread::sleep(Duration::from_millis(u64::from(milliseconds)));
+    }
+}
+
+/// Owned before libusb handle fields. Normal teardown calls restore only after
+/// OUT/feedback transfers retire. Drop covers failed setup/unwinding and always
+/// confirms zero-alt first, so detach/reset failures suppress the vendor write.
+pub(super) struct ItfModeLease {
+    fd: RawFd,
+    pending: Mutex<Option<itf::Recipe>>,
+}
+impl ItfModeLease {
+    pub(super) fn new(fd: RawFd) -> Self { Self { fd, pending: Mutex::new(None) } }
+    pub(super) fn disarm(&self) { *self.pending.lock() = None; }
+    pub(super) fn restore(&self) -> Result<(), String> {
+        let mut pending = self.pending.lock();
+        let Some(recipe) = *pending else { return Ok(()); };
+        // Consume before I/O: a failed zero-alt or detach must never cause a
+        // second, uncontrolled vendor-write attempt from Drop.
+        *pending = None;
+        itf_sequence(&mut UsbfsItfIo { fd: self.fd }, recipe, true)
+    }
+}
+impl Drop for ItfModeLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            log_warn!("[USB] ITF PCM recovery failed during hand-back: {error}");
+        }
+    }
+}
+
+/// Called only inside an exclusively owned, transfer-free negotiation/open.
+/// Read-only capability and selection paths never reach vendor controls.
+pub(super) fn apply_itf_mode(claimed: &ClaimedHandle, candidate: &IsoStreamCandidate,
+                             mode: DsdTransportMode) -> Result<(), String> {
+    let device = claimed.handle.device();
+    let Some(id) = identity(&device) else { return Err("cannot read actual device identity for mode selection".into()); };
+    if itf::model(id).is_none() { return Ok(()); }
+    if candidate.interface_number != 1 { return Ok(()); }
+    if SESSION_STATE.lock().as_ref().is_some_and(|state| state.device.fd == claimed.device_fd && state.stream_active) {
+        return Err("ITF mode change refused while a stream is active".into());
+    }
+    claimed.ensure_interface_claimed(1)?;
+    if !claimed.active_interfaces.lock().is_empty() {
+        return Err("ITF mode change refused while an alternate remains active".into());
+    }
+    let config = device.active_config_descriptor().map_err(|e| e.to_string())?;
+    let descriptor = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
+        d.interface_number() == candidate.interface_number && d.setting_number() == candidate.alt_setting)
+        .ok_or_else(|| "ITF selected alternate disappeared".to_string())?;
+    let format = parse_android_streaming_interface_format(&descriptor)
+        .ok_or_else(|| "ITF selected format is malformed".to_string())?;
+    let requested_mode = if mode == DsdTransportMode::Native { itf::Mode::NativeDsd } else { itf::Mode::PcmOrDop };
+    let Some(recipe) = itf_descriptor_recipe(&device, &config, &descriptor, &format, requested_mode) else {
+        // Unknown/sibling layouts retain the existing PCM path, but do not
+        // receive a guessed vendor command or newly enabled native support.
+        if mode != DsdTransportMode::Native { return Ok(()); }
+        return Err("ITF mode change requires the exact supported interface/alternate layout".into());
+    };
+    let matching_endpoint = descriptor.endpoint_descriptors().any(|ep| ep.direction() == Direction::Out
+        && ep.address() == candidate.endpoint_address && ep.interval() == candidate.endpoint_interval
+        && effective_iso_packet_bytes(ep.max_packet_size(), candidate.usb_speed) == candidate.max_packet_bytes);
+    if !matching_endpoint { return Err("ITF selected endpoint changed".into()); }
+    if mode == DsdTransportMode::Native && candidate.native_dsd.map(|p| p.signature()) != Some(recipe.native_profile.signature()) {
+        return Err("ITF native mode requires the proven U32 big-endian wire profile".into());
+    }
+    log::debug!("[USB] ITF mode transaction interface=1 alt={} native={} forceReset={}",
+        candidate.alt_setting, mode == DsdTransportMode::Native, recipe.conditions.force_interface_reset);
+    // Every transaction issues SET_INTERFACE, including models requiring a
+    // forced re-prepare after stop; no cached-alt fast path can suppress it.
+    // Arm before the write: a control error can follow a device-side change.
+    *claimed.itf_mode.pending.lock() = Some(recipe);
+    match itf_switch(&mut UsbfsItfIo { fd: claimed.device_fd }, recipe) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // itf_switch already attempted bounded rollback. Prevent duplicate
+            // writes from cleanup/Drop if the device detached during rollback.
+            *claimed.itf_mode.pending.lock() = None;
+            Err(error)
+        }
+    }
+}
+
+/// Device-specific class-control settle guard used by the clock/control layer.
+pub(super) fn itf_class_control_delay(handle: &DeviceHandle<Context>) {
+    if identity(&handle.device()).is_some_and(|id| itf::model(id).is_some()) {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(super) fn itf_interface_delay(device: &Device<Context>, interface: u8) {
+    if interface == 1 && identity(device).and_then(itf::model).is_some_and(|m| m.interface_delay) {
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -213,6 +405,11 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
                                 alt: &rusb::InterfaceDescriptor,
                                 format: &StreamingInterfaceFormat) -> Option<NativeDsdProfile> {
     let id = identity(device)?;
+    if itf::model(id).is_some() {
+        // A host hint cannot bypass this family's required mode protocol.
+        return itf_descriptor_recipe(device, config, alt, format, itf::Mode::NativeDsd)
+            .map(|recipe| recipe.native_profile);
+    }
     if (format.is_uac1 && playback_designs_layout(id, alt.setting_number()).is_none())
         || alt.setting_number() == 0 || format.channels == 0
         || format.bit_resolution == 0 || format.subslot_size == 0
@@ -439,6 +636,96 @@ mod tests {
         assert!(playback_designs_profile(UsbIdentity { vendor: 0x23bb, ..id }, 3, &f, 1).is_none());
         f.bit_resolution = 0;
         assert!(playback_designs_profile(id, 3, &f, 1).is_none());
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ItfOp { Zero(u8), Write(u16), Delay(u16) }
+    #[derive(Default)]
+    struct MockItfIo {
+        transcript: Vec<ItfOp>,
+        fail_zero_calls: Vec<usize>,
+        fail_write_calls: Vec<usize>,
+        zero_calls: usize,
+        write_calls: usize,
+    }
+    impl ItfModeIo for MockItfIo {
+        fn zero_alt(&mut self, interface: u8) -> Result<(), String> {
+            self.transcript.push(ItfOp::Zero(interface));
+            self.zero_calls += 1;
+            if self.fail_zero_calls.contains(&self.zero_calls) { Err("reset/detach".into()) } else { Ok(()) }
+        }
+        fn write_mode(&mut self, command: itf::VendorWrite) -> Result<(), String> {
+            assert_eq!((command.request_type, command.request, command.index, command.payload_bytes), (0x41, 0, 1, 0));
+            self.transcript.push(ItfOp::Write(command.value));
+            self.write_calls += 1;
+            if self.fail_write_calls.contains(&self.write_calls) { Err("control failure".into()) } else { Ok(()) }
+        }
+        fn delay(&mut self, milliseconds: u16) { self.transcript.push(ItfOp::Delay(milliseconds)); }
+    }
+    fn teac_recipe(mode: itf::Mode) -> itf::Recipe {
+        itf::recipe(UsbIdentity { vendor: 0x0644, product: 0x8044, revision: 0 },
+                    1, 3, &[0, 1, 2, 3], &format(), mode).unwrap()
+    }
+    #[test]
+    fn itf_native_then_pcm_has_zero_alt_and_documented_settle_order() {
+        let mut io = MockItfIo::default();
+        let recipe = teac_recipe(itf::Mode::NativeDsd);
+        itf_switch(&mut io, recipe).unwrap();
+        assert_eq!(io.transcript, [ItfOp::Zero(1), ItfOp::Delay(50), ItfOp::Delay(20),
+            ItfOp::Write(1), ItfOp::Delay(20)]);
+        io.transcript.clear();
+        itf_sequence(&mut io, recipe, true).unwrap();
+        assert_eq!(io.transcript, [ItfOp::Zero(1), ItfOp::Delay(50), ItfOp::Delay(20),
+            ItfOp::Write(0), ItfOp::Delay(20)]);
+        io.transcript.clear();
+        itf_switch(&mut io, teac_recipe(itf::Mode::PcmOrDop)).unwrap();
+        assert_eq!(io.transcript[3], ItfOp::Write(0));
+    }
+    #[test]
+    fn failed_itf_native_write_recovers_pcm_and_preserves_original_failure() {
+        let mut io = MockItfIo { fail_write_calls: vec![1], ..MockItfIo::default() };
+        let error = itf_switch(&mut io, teac_recipe(itf::Mode::NativeDsd)).unwrap_err();
+        assert!(error.contains("control failure"));
+        assert!(error.contains("PCM restored"));
+        assert_eq!(io.transcript, [ItfOp::Zero(1), ItfOp::Delay(50), ItfOp::Delay(20), ItfOp::Write(1),
+            ItfOp::Zero(1), ItfOp::Delay(50), ItfOp::Delay(20), ItfOp::Write(0), ItfOp::Delay(20)]);
+    }
+    #[test]
+    fn detach_or_unconfirmed_zero_alt_prevents_vendor_recovery_write() {
+        let mut io = MockItfIo { fail_zero_calls: vec![1, 2], ..MockItfIo::default() };
+        let error = itf_switch(&mut io, teac_recipe(itf::Mode::NativeDsd)).unwrap_err();
+        assert!(error.contains("PCM recovery failed"));
+        assert_eq!(io.transcript, [ItfOp::Zero(1), ItfOp::Zero(1)]);
+        let mut io = MockItfIo { fail_zero_calls: vec![2], fail_write_calls: vec![1], ..MockItfIo::default() };
+        assert!(itf_switch(&mut io, teac_recipe(itf::Mode::NativeDsd)).unwrap_err().contains("PCM recovery failed"));
+        assert_eq!(io.write_calls, 1);
+        // Failure during hand-back likewise sends no mode command.
+        let mut io = MockItfIo { fail_zero_calls: vec![1], ..MockItfIo::default() };
+        assert!(itf_sequence(&mut io, teac_recipe(itf::Mode::NativeDsd), true).is_err());
+        assert_eq!(io.write_calls, 0);
+    }
+    #[test]
+    fn pcm_and_dop_use_pcm_mode_on_their_real_alternate() {
+        let id = UsbIdentity { vendor: 0x154e, product: 0x3005, revision: 0 };
+        let mut f = format(); f.subslot_size = 2; f.bit_resolution = 16;
+        let recipe = itf::recipe(id, 1, 1, &[0, 1, 2], &f, itf::Mode::PcmOrDop).unwrap();
+        let mut io = MockItfIo::default();
+        itf_switch(&mut io, recipe).unwrap();
+        assert_eq!(io.transcript, [ItfOp::Zero(1), ItfOp::Delay(20), ItfOp::Write(0), ItfOp::Delay(20)]);
+        assert!(itf::recipe(id, 1, 1, &[0, 1, 2], &f, itf::Mode::NativeDsd).is_none());
+    }
+
+    #[test]
+    fn itf_packet_geometry_rejects_reserved_and_impossible_transactions() {
+        assert!(itf_packet_geometry(1024, Speed::High));
+        assert!(itf_packet_geometry(1024 | (2 << 11), Speed::High));
+        assert!(!itf_packet_geometry(1024 | (3 << 11), Speed::High));
+        assert!(!itf_packet_geometry(1025, Speed::High));
+        assert!(!itf_packet_geometry(0xe008, Speed::High));
+        assert!(!itf_packet_geometry(0, Speed::High));
+        assert!(!itf_packet_geometry(1024, Speed::Full));
+        assert!(!itf_packet_geometry(512 | (1 << 11), Speed::Full));
+        assert!(!itf_packet_geometry(8, Speed::Low));
     }
 
 }

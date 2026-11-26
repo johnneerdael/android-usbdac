@@ -346,6 +346,21 @@ pub(crate) fn open_device(fd: RawFd, info: &crate::capabilities::DeviceInfo) -> 
     Ok(())
 }
 
+/// Capture is explicit: validate IN claims without broadening playback's
+/// optional implicit-feedback claim policy or requiring an OUT alternate.
+pub(crate) fn open_capture_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(), Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Err(Error::PlatformUnsupported);
+    }
+    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id,
+        info.product_name.clone(), info.device_name.clone(), info.claimed_interfaces.clone())
+        .map_err(Error::Claim)?;
+    if !info.unavailable_feedback_interfaces.is_empty() {
+        return Err(Error::Claim("capture registration does not accept playback feedback claim metadata".into()));
+    }
+    register_capture_device(device, info.configuration_id)
+}
+
 /// Closes the DAC: settles the original volume level as `action` says, stops the
 /// session and waits for the output thread.
 pub(crate) fn close_device(action: u32, timeout: Duration) -> bool {

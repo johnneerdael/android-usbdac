@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 
+pub use crate::transport::routing_hw::{RouteEdit, RoutingSessionError, RoutingSnapshot};
+
 /// AudioControl interface and entity identity, scoped to the active configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entity {

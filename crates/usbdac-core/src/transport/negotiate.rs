@@ -80,6 +80,8 @@ pub(super) fn negotiate_playback_format(
         }
         cleanup_interface = Some(candidate.interface_number);
         thread::sleep(Duration::from_millis(100));
+        apply_itf_mode(&claimed_handle, &candidate, requested_format.dsd_transport)
+            .map_err(Error::Transfer)?;
 
         select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
             .map_err(Error::Transfer)?;
@@ -338,7 +340,10 @@ pub(super) fn negotiate_playback_format(
             log_warn!("[USB] Failed negotiation could not restore clock selectors: {error}");
         }
     }
-    cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
+    let cleanup_ok = cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
+    if !cleanup_ok && negotiated.is_ok() {
+        return Err(Error::Transfer("USB negotiation could not restore a PCM-safe idle state".into()));
+    }
     negotiated.map(|format| (format, clock_choice))
 }
 

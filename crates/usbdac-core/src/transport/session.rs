@@ -191,6 +191,7 @@ pub(crate) fn session_registered() -> bool {
 pub(super) fn clear_session_state() {
     // Finish any in-progress Feature Unit I/O before the host releases its claims.
     let _volume_hold = HARDWARE_VOLUME_MUTEX.lock();
+    routing_hw::finish_routing_hand_back();
     finish_original_hardware_volume();
     finish_requested_clock_route();
     release_idle_lock();
@@ -219,14 +220,32 @@ pub(super) fn complete_pending_clear_locked() {
 /// takes the idle handle. Fails with `Busy` while another DAC is registered or
 /// a previous session is still stopping.
 pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
+    register_device_mode(device, RegistrationMode::Playback)
+}
+
+/// Explicit IN registration bypasses output discovery and output volume setup.
+/// Its host claim handoff is checked by the dedicated capture validator.
+pub(super) fn register_capture_device(device: UsbDevice, configuration: Option<u8>) -> Result<(), crate::Error> {
+    register_device_mode(device, RegistrationMode::Capture { configuration })
+}
+
+enum RegistrationMode { Playback, Capture { configuration: Option<u8> } }
+
+fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(), crate::Error> {
     use crate::Error;
     let _session_gate = USB_SESSION_GATE.lock();
     complete_pending_clear_locked();
     if is_usb_session_active() || SESSION_STATE.lock().is_some() {
         return Err(Error::Busy);
     }
-    let capability_model = inspect_usb_capabilities(&device).map_err(Error::Claim)?;
-    if capability_model.alt_settings.is_empty() {
+    let capability_model = match mode {
+        RegistrationMode::Capture { configuration } => {
+            capture_stream::validate_capture_registration(&device, configuration).map_err(Error::Claim)?;
+            None
+        }
+        RegistrationMode::Playback => Some(inspect_usb_capabilities(&device).map_err(Error::Claim)?),
+    };
+    if capability_model.as_ref().is_some_and(|model| model.alt_settings.is_empty()) {
         return Err(Error::Unsupported {
             reason: "the device has no isochronous OUT audio streaming interface".to_string(),
             offered: Vec::new(),
@@ -241,7 +260,7 @@ pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
         playback_format: None,
         lock_requested: true,
         stream_active: false,
-        capability_model: Some(capability_model),
+        capability_model,
         clock_status: None,
         clock_control_attempted: false,
         clock_control_succeeded: false,

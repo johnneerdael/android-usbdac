@@ -131,8 +131,7 @@ pub(super) fn get_clock_selector_pin(
     let request_type = USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE;
     let index = (interface_number as u16) | ((selector_id as u16) << 8);
     let mut data = [0u8; 1];
-    let transferred = handle
-        .read_control(
+    let transferred = itf_timed_read_control(handle,
             request_type,
             UAC2_REQUEST_GET_CUR,
             UAC2_CLOCK_SELECTOR_CONTROL,
@@ -180,8 +179,7 @@ pub(super) fn set_sampling_frequency(
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
     let data = sample_rate.to_le_bytes();
-    handle
-        .write_control(
+    itf_timed_write_control(handle,
             request_type,
             UAC2_REQUEST_SET_CUR,
             value,
@@ -234,7 +232,7 @@ pub(super) fn set_uac1_sampling_frequency(
 
     let mut last_error = String::new();
     for (request_type, index, label) in encodings {
-        match handle.write_control(
+        match itf_timed_write_control(handle,
             request_type,
             UAC2_REQUEST_SET_CUR,
             UAC1_SAM_FREQ_CONTROL,
@@ -287,7 +285,7 @@ pub(super) fn get_uac1_sampling_frequency(
 
     let mut last_error = String::new();
     for (request_type, index, label) in encodings {
-        match handle.read_control(
+        match itf_timed_read_control(handle,
             request_type,
             UAC1_REQUEST_GET_CUR,
             UAC1_SAM_FREQ_CONTROL,
@@ -335,8 +333,7 @@ pub(super) fn get_sampling_frequency(
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
     let mut data = [0u8; 4];
-    let transferred = handle
-        .read_control(
+    let transferred = itf_timed_read_control(handle,
             request_type,
             UAC2_REQUEST_GET_CUR,
             value,
@@ -367,8 +364,7 @@ pub(super) fn get_clock_validity(
     let value = UAC2_CLOCK_SOURCE_CLOCK_VALID_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
     let mut data = [0u8; 1];
-    let transferred = handle
-        .read_control(
+    let transferred = itf_timed_read_control(handle,
             request_type,
             UAC2_REQUEST_GET_CUR,
             value,
@@ -395,8 +391,7 @@ pub(super) fn get_sampling_frequency_ranges(
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
     let mut data = [0u8; 512];
-    let transferred = handle
-        .read_control(
+    let transferred = itf_timed_read_control(handle,
             request_type,
             UAC2_REQUEST_GET_RANGE,
             value,
@@ -762,8 +757,7 @@ pub(super) fn read_active_configuration_bytes(
             .is_some_and(|c| c.number() == config.number())
     })?;
     let mut header = [0u8; 9];
-    let n = handle
-        .read_control(
+    let n = itf_timed_read_control(handle,
             0x80,
             0x06,
             0x0200 | u16::from(index),
@@ -780,8 +774,7 @@ pub(super) fn read_active_configuration_bytes(
         return None;
     }
     let mut bytes = vec![0u8; length];
-    let n = handle
-        .read_control(
+    let n = itf_timed_read_control(handle,
             0x80,
             0x06,
             0x0200 | u16::from(index),
@@ -934,9 +927,7 @@ impl crate::clock_resolution::ClockPlanIo for UsbClockPlanIo<'_> {
         if pin == 0 {
             return Err("clock selector pins are one-based".into());
         }
-        let n = self
-            .handle
-            .write_control(
+        let n = itf_timed_write_control(self.handle,
                 USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
                 UAC2_REQUEST_SET_CUR,
                 UAC2_CLOCK_SELECTOR_CONTROL,
@@ -1162,4 +1153,19 @@ fn stop_owned_clock_alternates(claimed: &ClaimedHandle, streaming: u8) -> Result
         claimed.set_alternate_setting(sibling, 0)?;
     }
     Ok(true)
+}
+
+// Preserve the clock planner and control results; only the exact ITF device
+// models add the documented post-class-control delay, including error paths.
+fn itf_timed_read_control(handle: &DeviceHandle<Context>, request_type: u8, request: u8,
+                          value: u16, index: u16, data: &mut [u8], timeout: Duration) -> rusb::Result<usize> {
+    let result = handle.read_control(request_type, request, value, index, data, timeout);
+    if request_type & 0x60 == USB_TYPE_CLASS { itf_class_control_delay(handle); }
+    result
+}
+fn itf_timed_write_control(handle: &DeviceHandle<Context>, request_type: u8, request: u8,
+                           value: u16, index: u16, data: &[u8], timeout: Duration) -> rusb::Result<usize> {
+    let result = handle.write_control(request_type, request, value, index, data, timeout);
+    if request_type & 0x60 == USB_TYPE_CLASS { itf_class_control_delay(handle); }
+    result
 }
