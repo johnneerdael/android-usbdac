@@ -2,7 +2,7 @@
 name = "usbdac-core"
 description = "Direct USB DAC playback for Rust audio applications on Android and Linux, with PCM, DoP, native DSD and bit-perfect reporting."
 repository = "https://github.com/johnneerdael/android-usbdac"
-homepage = "https://johnneerdael.github.io/android-usbdac/"
+homepage = "https://johnneerdael.github.io/usbdac/"
 documentation = "https://docs.rs/usbdac-core"
 readme = "README.md"
 keywords = ["audio", "usb", "dac", "dsd", "android"]

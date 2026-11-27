@@ -6,7 +6,7 @@ import subprocess
 from release_artifact import verify
 
 
-SITE = 'https://johnneerdael.github.io/android-usbdac'
+SITE = 'https://johnneerdael.github.io/usbdac'
 BANNER = 'branding/marketing/usbdac-readme-dark.png'
 
 

@@ -1,8 +1,8 @@
-<p align="center"><img src="https://raw.githubusercontent.com/johnneerdael/android-usbdac/main/branding/marketing/usbdac-readme-dark.png" alt="usbdac. Direct USB audio. Clear evidence." width="100%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/johnneerdael/usbdac/main/branding/marketing/usbdac-readme-dark.png" alt="usbdac. Direct USB audio. Clear evidence." width="100%"></p>
 
 # usbdac-core
 
-[Rust guide](https://johnneerdael.github.io/android-usbdac/guide-rust.html) · [API on docs.rs](https://docs.rs/usbdac-core) · [Evidence and status](https://johnneerdael.github.io/android-usbdac/evidence.html) · [Source](https://github.com/johnneerdael/android-usbdac)
+[Rust guide](https://johnneerdael.github.io/usbdac/guide-rust.html) · [API on docs.rs](https://docs.rs/usbdac-core) · [Evidence and status](https://johnneerdael.github.io/usbdac/evidence.html) · [Source](https://github.com/johnneerdael/usbdac)
 
 Drive a USB DAC directly from a Rust audio application on Android or Linux.
 `usbdac-core` handles USB Audio Class 1.0, 2.0 and 3.0 playback over usbfs so your
@@ -51,8 +51,8 @@ Direct USB PCM and native DSD have limited device-specific physical evidence. Te
 and formats before relying on it in production.
 
 - [Rust API reference](https://docs.rs/usbdac-core)
-- [Native integration guide and wire layouts](https://johnneerdael.github.io/android-usbdac/native-api.html)
-- [Android SDK quickstart for Kotlin and Gradle](https://johnneerdael.github.io/android-usbdac/getting-started.html)
+- [Native integration guide and wire layouts](https://johnneerdael.github.io/usbdac/native-api.html)
+- [Android SDK quickstart for Kotlin and Gradle](https://johnneerdael.github.io/usbdac/getting-started.html)
 
 Rust applications can subscribe to `HotplugHub` attachment/permission changes;
 Linux hosts can retain `LinuxHotplugMonitor` for native libusb hotplug events
@@ -70,5 +70,5 @@ dropping their future.
 application boundary as real playback. It supports deterministic signed PCM, unsigned 8-bit and float32 queue
 progress, pause/drain/flush, injected loss, and unplug without hardware; it is
 not a protocol emulator or a bit-perfect hardware verification claim. See the
-[Rust SDK guide](https://johnneerdael.github.io/android-usbdac/guide-rust.html) for
+[Rust SDK guide](https://johnneerdael.github.io/usbdac/guide-rust.html) for
 examples and platform/permission ownership.

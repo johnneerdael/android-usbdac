@@ -6,10 +6,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/johnneerdael/android-usbdac/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/johnneerdael/android-usbdac?style=flat-square&color=2367C9&label=release"></a>
+  <a href="https://github.com/johnneerdael/usbdac/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/johnneerdael/usbdac?style=flat-square&color=2367C9&label=release"></a>
   <a href="https://crates.io/crates/usbdac-core"><img alt="usbdac-core on crates.io" src="https://img.shields.io/crates/v/usbdac-core?style=flat-square&color=2367C9&label=crates.io"></a>
-  <a href="https://johnneerdael.github.io/android-usbdac/"><img alt="SDK guide" src="https://img.shields.io/badge/SDK%20guide-online-11151C?style=flat-square"></a>
-  <a href="https://github.com/johnneerdael/android-usbdac/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/johnneerdael/android-usbdac/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://johnneerdael.github.io/usbdac/"><img alt="SDK guide" src="https://img.shields.io/badge/SDK%20guide-online-11151C?style=flat-square"></a>
+  <a href="https://github.com/johnneerdael/usbdac/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/johnneerdael/usbdac/ci.yml?branch=main&style=flat-square&label=CI"></a>
   <img alt="Android 8.0+ and Rust" src="https://img.shields.io/badge/Android%208.0%2B%20%C2%B7%20Rust-11151C?style=flat-square">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-11151C?style=flat-square"></a>
 </p>
@@ -24,21 +24,21 @@ uses direct USB, Android-managed audio or AAudio exclusive output as the device
 and permissions allow, and says which route it opened and what it could verify.
 
 <p align="center">
-  <a href="https://johnneerdael.github.io/android-usbdac/getting-started.html"><b>Quickstart</b></a> &nbsp;·&nbsp;
-  <a href="https://johnneerdael.github.io/android-usbdac/"><b>SDK guide</b></a> &nbsp;·&nbsp;
-  <a href="https://github.com/johnneerdael/android-usbdac/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
-  <a href="https://johnneerdael.github.io/android-usbdac/evidence.html"><b>Evidence</b></a> &nbsp;·&nbsp;
-  <a href="https://github.com/johnneerdael/android-usbdac/issues"><b>Report an issue</b></a>
+  <a href="https://johnneerdael.github.io/usbdac/getting-started.html"><b>Quickstart</b></a> &nbsp;·&nbsp;
+  <a href="https://johnneerdael.github.io/usbdac/"><b>SDK guide</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/johnneerdael/usbdac/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
+  <a href="https://johnneerdael.github.io/usbdac/evidence.html"><b>Evidence</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/johnneerdael/usbdac/issues"><b>Report an issue</b></a>
 </p>
 
 ## Pick your path
 
 | You are building | Add | Start with |
 |---|---|---|
-| An Android player in Kotlin (Android 8.0+) | `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles native code for all four Android ABIs. | [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) · [Kotlin guide](https://johnneerdael.github.io/android-usbdac/guide-kotlin.html) |
-| A Media3 / ExoPlayer app | `dev.usbdac:usbdac-media3`, at the same version as the base artifact | [Media3 integration](https://johnneerdael.github.io/android-usbdac/media3.html) |
-| A Rust engine on Android or Linux | [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor. | [Rust guide](https://johnneerdael.github.io/android-usbdac/guide-rust.html) · [docs.rs](https://docs.rs/usbdac-core) |
-| A test of your own DAC | The Android or Apple Silicon macOS validator from the [latest release](https://github.com/johnneerdael/android-usbdac/releases/latest) | [Validator design](docs/design/dac-validator.md) · [macOS notes](macos/validator/README.md) |
+| An Android player in Kotlin (Android 8.0+) | `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles native code for all four Android ABIs. | [Android quickstart](https://johnneerdael.github.io/usbdac/getting-started.html) · [Kotlin guide](https://johnneerdael.github.io/usbdac/guide-kotlin.html) |
+| A Media3 / ExoPlayer app | `dev.usbdac:usbdac-media3`, at the same version as the base artifact | [Media3 integration](https://johnneerdael.github.io/usbdac/media3.html) |
+| A Rust engine on Android or Linux | [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor. | [Rust guide](https://johnneerdael.github.io/usbdac/guide-rust.html) · [docs.rs](https://docs.rs/usbdac-core) |
+| A test of your own DAC | The Android or Apple Silicon macOS validator from the [latest release](https://github.com/johnneerdael/usbdac/releases/latest) | [Validator design](docs/design/dac-validator.md) · [macOS notes](macos/validator/README.md) |
 
 ## Why usbdac
 
@@ -94,13 +94,13 @@ signed and not notarized. Remove headphones and mute the amplifier first.
 
 ## Learn more
 
-The [SDK guide](https://johnneerdael.github.io/android-usbdac/) has the developer
-documentation: [design decisions](https://johnneerdael.github.io/android-usbdac/decisions.html)
+The [SDK guide](https://johnneerdael.github.io/usbdac/) has the developer
+documentation: [design decisions](https://johnneerdael.github.io/usbdac/decisions.html)
 (each compared with what Flick, Mornye and BitChord do, with the evidence and
-public references), the [architecture](https://johnneerdael.github.io/android-usbdac/architecture.html),
-an [integration guide](https://johnneerdael.github.io/android-usbdac/integration.html),
-[troubleshooting](https://johnneerdael.github.io/android-usbdac/troubleshooting.html) and the
-[evidence and status](https://johnneerdael.github.io/android-usbdac/evidence.html) page.
+public references), the [architecture](https://johnneerdael.github.io/usbdac/architecture.html),
+an [integration guide](https://johnneerdael.github.io/usbdac/integration.html),
+[troubleshooting](https://johnneerdael.github.io/usbdac/troubleshooting.html) and the
+[evidence and status](https://johnneerdael.github.io/usbdac/evidence.html) page.
 The Rust API, JNI contract, JSON schemas and sample layouts are in [docs/API.md](docs/API.md).
 
 ## Where it came from, and what changed

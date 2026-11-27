@@ -79,8 +79,8 @@ ALL_SECTIONS = SECTIONS + [REFERENCE_SECTION]
 GUIDE_PAGES = [page for _, pages in SECTIONS for page in pages]
 SOURCE_DATA_FILES = ("alsa-quirk-flags-v7.3.json", "alsa-descriptor-quirks-v7.3.json")
 
-REPOSITORY = "https://github.com/johnneerdael/android-usbdac"
-SITE_URL = "https://johnneerdael.github.io/android-usbdac/"
+REPOSITORY = "https://github.com/johnneerdael/usbdac"
+SITE_URL = "https://johnneerdael.github.io/usbdac/"
 TAGLINE = "Direct USB audio. Clear evidence."
 DEFAULT_DESCRIPTION = ("usbdac sends PCM, DoP or native DSD straight to a USB DAC from Android and Rust apps, "
                        "and reports whether the stream is bit-perfect. SDK guide, design decisions and API reference.")
