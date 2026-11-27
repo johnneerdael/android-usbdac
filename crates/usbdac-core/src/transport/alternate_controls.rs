@@ -53,11 +53,13 @@ fn read_only_control(value: u32, name: &str) -> Result<bool, String> {
     }
 }
 
-pub(super) fn validate_valid_alternates(
+// A clear candidate bit is meaningful only after validating the entire reply
+// against the owning interface's declared alternate settings.
+pub(super) fn valid_alternate_is_available(
     response: &[u8],
     declared: &[u8],
     requested: u8,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let size = response.first().copied().unwrap_or(0) as usize;
     if !(1..=32).contains(&size) || response.len() != 1 + size {
         return Err("Valid Alternate Settings reply must contain bSize (1..32) and exactly that many bitmap bytes".into());
@@ -84,16 +86,11 @@ pub(super) fn validate_valid_alternates(
             }
         }
     }
-    let requested_index = usize::from(requested);
-    if bitmap
-        .get(requested_index / 8)
-        .map_or(true, |byte| byte & (1 << (requested_index % 8)) == 0)
-    {
-        return Err(format!(
-            "requested alternate {requested} is not currently valid"
-        ));
+    if !declared.contains(&requested) {
+        return Err(format!("requested alternate {requested} is not declared"));
     }
-    Ok(())
+    let requested_index = usize::from(requested);
+    Ok(bitmap[requested_index / 8] & (1 << (requested_index % 8)) != 0)
 }
 
 pub(super) fn validate_active_alt(response: &[u8], requested: u8) -> Result<(), String> {
@@ -148,7 +145,10 @@ mod tests {
 
     #[test]
     fn valid_alternates_enforce_exact_size_zero_and_sparse_membership() {
-        assert!(validate_valid_alternates(&[1, 0b1001], &[0, 3], 3).is_ok());
+        assert_eq!(
+            valid_alternate_is_available(&[1, 0b1001], &[0, 3], 3),
+            Ok(true)
+        );
         for response in [
             vec![],
             vec![0],
@@ -159,11 +159,13 @@ mod tests {
             vec![1, 8],
             vec![1, 11],
         ] {
-            assert!(validate_valid_alternates(&response, &[0, 3], 3).is_err());
+            assert!(valid_alternate_is_available(&response, &[0, 3], 3).is_err());
         }
-        assert!(validate_valid_alternates(&[1, 1], &[0, 3], 3).is_err());
-        assert!(validate_valid_alternates(&[1, 1], &[0, 8], 8).is_err());
-        assert!(validate_valid_alternates(&[1, 1], &[3], 0).is_err());
+        assert_eq!(valid_alternate_is_available(&[1, 1], &[0, 3], 3), Ok(false));
+        assert!(valid_alternate_is_available(&[1, 1], &[0, 8], 8).is_err());
+        assert!(valid_alternate_is_available(&[1, 1], &[3], 0).is_err());
+        assert!(valid_alternate_is_available(&[1, 1], &[0, 3], 2).is_err());
+        assert!(valid_alternate_is_available(&[1, 1], &[0, 3], 255).is_err());
     }
 
     #[test]
@@ -172,12 +174,21 @@ mod tests {
         response[0] = 32;
         response[1] = 1;
         response[32] = 0x80;
-        assert!(validate_valid_alternates(&response, &[0, 255], 255).is_ok());
-        assert!(validate_valid_alternates(&response, &[0, 254], 254).is_err());
-        assert!(validate_valid_alternates(&[1, 3], &[0, 1, 255], 1).is_err());
+        assert_eq!(
+            valid_alternate_is_available(&response, &[0, 255], 255),
+            Ok(true)
+        );
+        assert!(valid_alternate_is_available(&response, &[0, 254], 254).is_err());
+        assert!(valid_alternate_is_available(&[1, 3], &[0, 1, 255], 1).is_err());
         response[32] = 0;
-        assert!(validate_valid_alternates(&response, &[0, 255], 255).is_err());
-        assert!(validate_valid_alternates(&response, &[0, 255], 0).is_ok());
+        assert_eq!(
+            valid_alternate_is_available(&response, &[0, 255], 255),
+            Ok(false)
+        );
+        assert_eq!(
+            valid_alternate_is_available(&response, &[0, 255], 0),
+            Ok(true)
+        );
     }
 
     #[test]

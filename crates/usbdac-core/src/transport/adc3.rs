@@ -35,6 +35,8 @@ pub(super) struct Adc3Route {
     domains: Vec<wire::PowerDomain>,
     plan: Option<ClockPlan>,
     clock_context: Option<Adc3ClockContext>,
+    // Pin only live replacements; ordinary selection retains its container policy.
+    live_alternate: bool,
 }
 impl Adc3Route {
     pub(super) fn implicit_status_route(&self) -> Option<&Adc3Route> {
@@ -726,6 +728,8 @@ pub(super) fn adc3_route_for_candidate(
         .ok_or("ADC3 implicit source changed since selection")?;
     route.clock_context = saved.as_ref().filter(|saved| saved.plan.as_ref() == route.plan.as_ref())
         .and_then(|saved| saved.clock_context.clone());
+    route.live_alternate = saved.as_ref().is_some_and(|saved| saved.config == route.config
+        && saved.interface == route.interface && saved.alt == route.alt && saved.live_alternate);
     Ok(Some(route))
 }
 fn adc3_alternate(
@@ -992,6 +996,7 @@ fn adc3_alternate_base(
         domains: domains(profile, &extra, capture)?,
         plan: plan.cloned(),
         clock_context: None,
+        live_alternate: false,
     };
     let (channels, subslot, bits, rates) = match profile {
         wire::FunctionProfile::Badd(profile) => {
@@ -1609,7 +1614,16 @@ pub(super) fn select_standalone_adc3_capture(
             if original == 0 { continue; }
             Some(FrequencySnapshot { source: clock.id, original, target: pair.1.source_rate(request.sample_rate)? })
         } else { None };
-        if configure_adc3(&claimed.handle, &pair.1, request.sample_rate).is_ok() { return Ok(Some(pair)); }
+        // Only a clean live bitmap rejection permits another candidate. Keep
+        // control failures distinct, but restore the exact clock before either
+        // retrying or returning the failure.
+        let availability = if configure_adc3(&claimed.handle, &pair.1, request.sample_rate).is_ok() {
+            let availability = if pair.1.profile == wire::FunctionProfile::Full {
+                claimed.alternate_is_available(pair.1.interface, pair.1.alt)
+            } else { Ok(true) };
+            if matches!(&availability, Ok(true)) { return Ok(Some(pair)); }
+            Some(availability)
+        } else { None };
         if let Some(frequency) = frequency {
             if let Err(error) = verify_adc3_rate_route(&claimed.handle, &pair.1).and_then(|()|
                 restore_adc3_frequency(&mut Adc3LeaseClockIo {
@@ -1618,6 +1632,7 @@ pub(super) fn select_standalone_adc3_capture(
                 return Err(format!("ADC3 capture current frequency restoration uncertain: {error}"));
             }
         }
+        if let Some(Err(error)) = availability { return Err(error); }
         // A changed current selector is external drift, not permission to retry
         // with a newly observed original pin snapshot.
         if adc3_alternate(config, &claimed.handle, alt, speed, true)?.1 != pair.1 {
@@ -1627,7 +1642,16 @@ pub(super) fn select_standalone_adc3_capture(
     for alt in &alts {
         for pair in adc3_directional_alternative_routes(claimed, config, alt, speed, true, |candidate, route, _| matches(candidate, route))? {
             match apply_adc3_clock_plan(claimed, &pair.1, request.sample_rate) {
-                Ok(()) => return Ok(Some(pair)),
+                Ok(()) => {
+                    let availability = if pair.1.profile == wire::FunctionProfile::Full {
+                        claimed.alternate_is_available(pair.1.interface, pair.1.alt)
+                    } else { Ok(true) };
+                    if matches!(&availability, Ok(true)) { return Ok(Some(pair)); }
+                    // Retain acquired power while handing back the selector
+                    // and source-frequency transaction before the next choice.
+                    claimed.adc3_power.restore_clock()?;
+                    availability?;
+                }
                 Err(error) if claimed.adc3_power.clock.lock().is_some() => return Err(error),
                 Err(_) => {}
             }
@@ -1808,6 +1832,11 @@ impl Adc3PowerLease {
         acquire_domain(&mut PowerUsb(self), &mut self.pending.lock(), ac, d)
     }
     pub(super) fn restore(&self) -> Result<(), String> {
+        self.restore_clock()?;
+        let pending = std::mem::take(&mut *self.pending.lock());
+        restore_domains(&mut PowerUsb(self), pending)
+    }
+    fn restore_clock(&self) -> Result<(), String> {
         // Never power down an owning domain before selector hand-back. Keep
         // failed/drifted state armed for explicit reporting; do not overwrite it.
         if let Some((route, plan, frequency, interfaces)) = self.clock.lock().take() {
@@ -1821,8 +1850,7 @@ impl Adc3PowerLease {
                 return Err(format!("ADC3 selector hand-back: {error}"));
             }
         }
-        let pending = std::mem::take(&mut *self.pending.lock());
-        restore_domains(&mut PowerUsb(self), pending)
+        Ok(())
     }
     /// End a scoped routing wake without overwriting an external power change.
     /// Taking the snapshot first also prevents Drop from retrying drifted writes.
@@ -2283,6 +2311,89 @@ pub(super) fn apply_adc3_clock_plan(claimed: &ClaimedHandle, route: &Adc3Route, 
         }
     }
 }
+/// A clean bitmap rejection is recoverable; a failed/malformed read is terminal.
+/// Read both pipes even when OUT is unavailable so an IN read failure cannot be hidden.
+fn adc3_live_pair_available(route: &Adc3Route,
+    mut available: impl FnMut(u8, u8) -> Result<bool, String>) -> Result<bool, String> {
+    let output = available(route.interface, route.alt)?;
+    let input = match route.implicit.as_deref() {
+        Some(peer) => available(peer.interface, peer.alt)?,
+        None => true,
+    };
+    Ok(output && input)
+}
+
+fn adc3_live_route_compatible(expected: &Adc3Route, actual: &Adc3Route) -> bool {
+    let same_clock = |left: &Adc3Route, right: &Adc3Route|
+        left.clock == right.clock && left.choice == right.choice;
+    expected.profile == wire::FunctionProfile::Full && actual.profile == expected.profile
+        && (actual.config, actual.control, actual.first, actual.count, actual.interface, actual.terminal)
+            == (expected.config, expected.control, expected.first, expected.count, expected.interface, expected.terminal)
+        && (actual.pcm.0, actual.pcm.2) == (expected.pcm.0, expected.pcm.2)
+        && same_clock(expected, actual)
+        && match (expected.implicit.as_deref(), actual.implicit.as_deref()) {
+            (Some(left), Some(right)) => (left.config, left.control, left.first, left.count)
+                == (right.config, right.control, right.first, right.count)
+                && (left.interface, left.endpoint.0, left.endpoint.1, left.terminal)
+                    == (right.interface, right.endpoint.0, right.endpoint.1, right.terminal)
+                && same_clock(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// Called only after the exact requested clock is running. Discover against
+/// actual pins, without clock overlays or any selector/frequency programming.
+fn adc3_live_alternate(claimed: &ClaimedHandle, route: Adc3Route, speed: Speed, rate: u32)
+    -> Result<Adc3Route, String> {
+    if route.profile != wire::FunctionProfile::Full
+        || adc3_live_pair_available(&route, |interface, alternate|
+            claimed.alternate_is_available(interface, alternate))? {
+        return Ok(route);
+    }
+    let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
+    let requested = PlaybackFormat { sample_rate: rate, channels: route.pcm.0, bit_depth: route.pcm.2,
+        is_dop: false, dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
+    let mut options = Vec::new();
+    for alt in config.interfaces().flat_map(|i| i.descriptors()).filter(|alt|
+        alt.interface_number() == route.interface && alt.setting_number() != 0
+            && alt.class_code() == 1 && alt.sub_class_code() == 2 && alt.protocol_code() == 0x30) {
+        let Ok(pairs) = adc3_alternate_pairs(&config, &claimed.handle, &alt, speed, false, None) else { continue; };
+        for (candidate, actual, ranges) in pairs {
+            if adc3_live_route_compatible(&route, &actual)
+                && claimed.claimed_interfaces.contains(&actual.control)
+                && claimed.claimed_interfaces.contains(&actual.interface)
+                && actual.implicit.as_deref().map_or(true, |peer| claimed.claimed_interfaces.contains(&peer.interface))
+                && adc3_candidate_matches_ranges(&candidate, &ranges, requested) {
+                options.push((candidate, actual));
+            }
+        }
+    }
+    // Keep the selected OUT when another alternate of its proven IN pipe works.
+    // Otherwise prefer the original container, lower excess bandwidth and stable IDs.
+    options.sort_by_key(|(candidate, actual)| (
+        actual.alt != route.alt, candidate.subslot_size != route.pcm.1,
+        candidate.max_packet_bytes.saturating_sub(required_max_packet_bytes(rate,
+            candidate.service_interval_us, usize::from(candidate.channels) * usize::from(candidate.subslot_size))),
+        actual.alt,
+        candidate.implicit_feedback.map(|source| (std::cmp::Reverse(source.max_packet_bytes / source.bytes_per_frame),
+            source.max_packet_bytes, source.alt_setting)),
+    ));
+    for (_, mut actual) in options {
+        if !adc3_live_pair_available(&actual, |interface, alternate|
+            claimed.alternate_is_available(interface, alternate))? { continue; }
+        prepare_adc3_implicit_power(claimed, &actual)?;
+        actual.plan = route.plan.clone();
+        actual.clock_context = route.clock_context.clone();
+        // Enumeration and bitmap reads must not conceal clock drift. Reuse the
+        // activation check with frequency writes disabled before pinning the pair.
+        validate_adc3_clock(&claimed.handle, &actual, rate, false)?;
+        actual.live_alternate = true;
+        return Ok(actual);
+    }
+    Err("ADC3 no available same-clock playback alternate".into())
+}
+
 /// Preserve successful current paths; only a failed exact current configuration
 /// may lead to an alternate selector transaction.
 pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStreamCandidate, rate: u32) -> Result<Adc3Route, String> {
@@ -2291,7 +2402,7 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
         .ok_or("ADC3 route disappeared")?;
     if route.plan.is_some() {
         apply_adc3_clock_plan(claimed, &route, rate)?;
-        return Ok(route);
+        return adc3_live_alternate(claimed, route, candidate.usb_speed, rate);
     }
     let current_frequency = if let Some(source) = route.clock.as_ref() {
         let mut bytes = [0; 4];
@@ -2302,7 +2413,21 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
         Err("ADC3 current source frequency is zero".into())
     } else { configure_adc3(&claimed.handle, &route, rate) };
     let current_error = match current_result {
-        Ok(()) => return Ok(route), Err(error) => error,
+        Ok(()) => {
+            let result = adc3_live_alternate(claimed, route.clone(), candidate.usb_speed, rate);
+            if let Err(error) = &result {
+                if let Some(frequency) = current_frequency.filter(|f| f.original != 0) {
+                    if let Err(restore) = verify_adc3_rate_route(&claimed.handle, &route).and_then(|()|
+                        restore_adc3_frequency(&mut Adc3LeaseClockIo { lease: &claimed.adc3_power,
+                            control: route.control, ratio_route: Some(&route) }, frequency)) {
+                        claimed.adc3_power.disarm();
+                        return Err(format!("{error}; ADC3 current frequency restoration uncertain: {restore}"));
+                    }
+                }
+            }
+            return result;
+        }
+        Err(error) => error,
     };
     if let Some(frequency) = current_frequency.filter(|f| f.original != 0) {
         if let Err(error) = verify_adc3_rate_route(&claimed.handle, &route).and_then(|()|
@@ -2319,7 +2444,7 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
     for (alternative, route) in adc3_alternative_routes(claimed, &config, &alt, candidate.usb_speed, requested)? {
         if alternative.implicit_feedback != candidate.implicit_feedback { continue; }
         match apply_adc3_clock_plan(claimed, &route, rate) {
-            Ok(()) => return Ok(route),
+            Ok(()) => return adc3_live_alternate(claimed, route, candidate.usb_speed, rate),
             Err(error) if claimed.adc3_power.clock.lock().is_some() => return Err(error),
             Err(_) => {}
         }
@@ -2334,7 +2459,7 @@ pub(super) fn select_owned_stream_candidate(
 ) -> Result<IsoStreamCandidate, SelectError> {
     let device = claimed.handle.device();
     let saved = NEGOTIATED.lock().clone();
-    if let Some(route) = saved.filter(|r| r.plan.is_some() || r.implicit.is_some()) {
+    if let Some(route) = saved.filter(|r| r.plan.is_some() || r.implicit.is_some() || r.live_alternate) {
         let config = device.active_config_descriptor().map_err(|e| SelectError::NoMatch(e.to_string()))?;
         let alt = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
             d.interface_number() == route.interface && d.setting_number() == route.alt)
@@ -2352,6 +2477,7 @@ pub(super) fn select_owned_stream_candidate(
             .find(|(_, actual, _)| actual.implicit == route.implicit)
             .ok_or_else(|| SelectError::NoMatch("ADC3 negotiated implicit source changed".into()))?;
         actual.clock_context = route.clock_context.clone();
+        actual.live_alternate = route.live_alternate;
         if actual != route || !adc3_candidate_matches(&claimed.handle, &candidate, &actual, requested) {
             return Err(SelectError::NoMatch("ADC3 negotiated alternate clock changed".into()));
         }
@@ -3027,9 +3153,8 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(io.events, vec!["read:4:12"]);
     }
-    #[test]
-    fn negotiated_identity_rejects_configuration_cluster_and_pin_drift() {
-        let route = Adc3Route {
+    fn live_test_route() -> Adc3Route {
+        Adc3Route {
             config: 1,
             control: 4,
             first: 4,
@@ -3075,7 +3200,78 @@ mod tests {
             domains: vec![domain(10)],
             plan: None,
             clock_context: None,
-        };
+            live_alternate: false,
+        }
+    }
+
+    #[test]
+    fn live_alternate_filter_preserves_exact_function_clock_and_pcm_shape() {
+        let expected = live_test_route();
+        let mut other = expected.clone();
+        other.alt = 2;
+        other.pcm.1 = 4; // A padded container remains the same exact PCM format.
+        assert!(adc3_live_route_compatible(&expected, &other));
+        let mutations: [fn(&mut Adc3Route); 7] = [
+            |route: &mut Adc3Route| route.interface += 1,
+            |route: &mut Adc3Route| route.terminal += 1,
+            |route: &mut Adc3Route| route.first += 1,
+            |route: &mut Adc3Route| route.pcm.0 += 1,
+            |route: &mut Adc3Route| route.pcm.2 = 24,
+            |route: &mut Adc3Route| route.choice.as_mut().unwrap().source_id += 1,
+            |route: &mut Adc3Route| route.choice.as_mut().unwrap().path.push(ClockHop {
+                id: 7, kind: ClockHopKind::RateMultiplier { numerator: 2, denominator: 1 },
+            }),
+        ];
+        for mutate in mutations {
+            let mut changed = other.clone();
+            mutate(&mut changed);
+            assert!(!adc3_live_route_compatible(&expected, &changed));
+        }
+        let mut paired = expected.clone();
+        let mut input = expected.clone();
+        input.interface = 6;
+        input.endpoint.0 = 0x81;
+        paired.implicit = Some(Box::new(input));
+        let mut replacement = paired.clone();
+        replacement.implicit.as_mut().unwrap().alt = 3;
+        assert!(adc3_live_route_compatible(&paired, &replacement));
+        replacement.implicit.as_mut().unwrap().control += 1;
+        assert!(!adc3_live_route_compatible(&paired, &replacement));
+        replacement.implicit.as_mut().unwrap().control -= 1;
+        replacement.implicit.as_mut().unwrap().endpoint.0 = 0x82;
+        assert!(!adc3_live_route_compatible(&paired, &replacement));
+        let candidate = pcm_candidate();
+        let requested = PlaybackFormat { sample_rate: 48_000, channels: candidate.channels,
+            bit_depth: candidate.bit_resolution, is_dop: false, dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0 };
+        let ranges = [SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }];
+        assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges,
+            PlaybackFormat { sample_rate: 44_100, ..requested }));
+    }
+
+    #[test]
+    fn live_availability_only_rejects_clean_false_and_propagates_peer_read_failure() {
+        let mut route = live_test_route();
+        let mut peer = route.clone();
+        peer.interface = 6;
+        route.implicit = Some(Box::new(peer));
+        let mut reads = Vec::new();
+        assert_eq!(adc3_live_pair_available(&route, |interface, _| {
+            reads.push(interface);
+            Ok(interface != route.interface)
+        }), Ok(false));
+        assert_eq!(reads, vec![5, 6]);
+        assert_eq!(adc3_live_pair_available(&route, |interface, _| {
+            if interface == 6 { Err("malformed peer bitmap".into()) } else { Ok(false) }
+        }), Err("malformed peer bitmap".into()));
+        assert!(adc3_live_pair_available(&route, |_, _| Err("failed GET_CUR".into())).is_err());
+        assert_eq!(adc3_live_pair_available(&route, |_, _| Ok(true)), Ok(true));
+    }
+
+    #[test]
+    fn negotiated_identity_rejects_configuration_cluster_and_pin_drift() {
+        let route = live_test_route();
         assert_eq!(
             capture_channel_map(&route).unwrap().positions(),
             &[crate::capture::ChannelPosition::Adc3Information {

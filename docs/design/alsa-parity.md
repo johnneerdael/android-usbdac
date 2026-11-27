@@ -69,6 +69,34 @@ same native library per ABI. The AAR SHA-256 is
 `c81fef47bdda8dc448169f755d82ed50ac10d6a5456308d2f34c51dd53272453`.
 Physical alternate-control validation remains pending.
 
+### Full ADC3 alternate selection after clock setup
+
+Read Valid Alternate Settings once the requested clock is configured.
+The reply applies to the streaming interface and can govern sibling
+alternates that omit the control from their own descriptor. A valid
+bitmap can exclude an otherwise compatible setting. That result
+allows another candidate. A failed request or malformed reply stops
+the attempt. [USB-IF ADC3 §5.2.2.1.2 via IEC](https://webstore.iec.ch/en/publication/63921),
+[USB-IF UAC2 §5.2.6.1.2](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf)
+
+For playback, consider sibling OUT settings and eligible alternates
+of the same proven implicit-feedback IN pipe. Preserve the terminal,
+clock route and requested PCM rate, channels and valid bits.
+Return the replacement through normal format negotiation and pin it
+until stream open, where activation checks the live controls again.
+Standalone capture restores the original frequency or selector
+transaction before moving to its next matching candidate.
+
+For hardware acceptance, configure a rate whose live bitmap excludes
+the preferred alternate. Verify the selected replacement, repeat for
+an implicit feedback IN alternate, and confirm that a failed bitmap
+read aborts with clock and alternate ownership restored.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `db66d83e3d184cad25cda11c1c39315c290bb51f1cd353908d09d678c9d042e4`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a

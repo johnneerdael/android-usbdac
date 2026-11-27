@@ -200,13 +200,13 @@ impl ClaimedHandle {
         interface_number: u8,
         alternate_setting: u8,
     ) -> Result<(), String> {
-        self.ensure_interface_claimed(interface_number)?;
-        let controls = if alternate_setting == 0 {
-            // Always permit alt zero for recovery, even after a control failure.
-            AlternateControls::default()
-        } else {
-            self.verify_alternate_available(interface_number, alternate_setting)?
-        };
+        let (controls, available) =
+            self.inspect_alternate_availability(interface_number, alternate_setting)?;
+        if !available {
+            return Err(format!(
+                "requested alternate {alternate_setting} is not currently valid"
+            ));
+        }
         let request = UsbfsSetInterface {
             interface: interface_number.into(),
             altsetting: alternate_setting.into(),
@@ -239,11 +239,26 @@ impl ClaimedHandle {
         Ok(())
     }
 
-    fn verify_alternate_available(
+    /// Inspect live availability without selecting an alternate setting.
+    pub(super) fn alternate_is_available(
+        &self,
+        interface: u8,
+        alternate: u8,
+    ) -> Result<bool, String> {
+        self.inspect_alternate_availability(interface, alternate)
+            .map(|(_, available)| available)
+    }
+
+    fn inspect_alternate_availability(
         &self,
         interface_number: u8,
         alternate_setting: u8,
-    ) -> Result<AlternateControls, String> {
+    ) -> Result<(AlternateControls, bool), String> {
+        self.ensure_interface_claimed(interface_number)?;
+        if alternate_setting == 0 {
+            // Always permit alt zero for recovery, even after a control failure.
+            return Ok((AlternateControls::default(), true));
+        }
         let config = self
             .handle
             .device()
@@ -260,14 +275,32 @@ impl ClaimedHandle {
                 format!("USB interface {interface_number} alternate {alternate_setting} disappeared")
             })?;
         if descriptor.class_code() != 1 || descriptor.sub_class_code() != 2 {
-            return Ok(AlternateControls::default());
+            return Ok((AlternateControls::default(), true));
         }
 
         let controls = alternate_controls::advertised_controls(
             descriptor.protocol_code(),
             descriptor.extra(),
         )?;
-        if controls.valid {
+        // Valid Alternate Settings describes the whole AS interface. A sibling
+        // can advertise it even when this alternate omits its own control field.
+        // Keep Active Alternate Setting readback scoped to the selected alternate.
+        let valid_control = controls.valid
+            || interface.descriptors().any(|sibling| {
+                sibling.setting_number() != 0
+                    && sibling.setting_number() != alternate_setting
+                    && sibling.class_code() == 1
+                    && sibling.sub_class_code() == 2
+                    && sibling.protocol_code() == descriptor.protocol_code()
+                    && matches!(
+                        alternate_controls::advertised_controls(
+                            sibling.protocol_code(),
+                            sibling.extra(),
+                        ),
+                        Ok(sibling_controls) if sibling_controls.valid
+                    )
+            });
+        if valid_control {
             let declared: Vec<u8> = interface
                 .descriptors()
                 .map(|descriptor| descriptor.setting_number())
@@ -278,13 +311,14 @@ impl ClaimedHandle {
                 AS_VALID_ALT_SETTINGS_CONTROL,
                 &mut response,
             )?;
-            alternate_controls::validate_valid_alternates(
+            let available = alternate_controls::valid_alternate_is_available(
                 &response[..length],
                 &declared,
                 alternate_setting,
             )?;
+            return Ok((controls, available));
         }
-        Ok(controls)
+        Ok((controls, true))
     }
 
     fn read_alternate_control(
