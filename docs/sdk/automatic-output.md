@@ -165,6 +165,47 @@ fun outputForNextTrack(selector: OutputSelector, current: SelectedOutput?, next:
 
 A gapless sequence of tracks in one format keeps writing to the same output; the gap only appears when the output changes, which is when the format changes or the device did.
 
+## Route handoff and USB reconnect
+
+Use `OutputHandoff(selector)` when a player needs to coordinate track changes
+and USB reconnect. Call its suspending `open` after the last write to the
+outgoing output. It drains that output, closes the old session and opens the
+next one. Pass `drainTimeoutMs = null` to cut immediately on a user-selected
+track change. For gapless tracks at the same format, keep the output and
+continue writing.
+
+Observe `handoff.state`. When `Ready` offers a new output, prepare the source at
+`positionUs` and write using that output's `format`. Send user play and pause commands to
+`setPlaying`, and call `seekTo` after repositioning the source under the
+player's writer lock. Close the helper with the player.
+
+```kotlin
+fun observeHandoff(scope: CoroutineScope, handoff: OutputHandoff, onFailure: (DacException) -> Unit): Job =
+    handoff.changes
+        .onEach { change ->
+            try {
+                handoff.handleChange(change)
+            } catch (error: DacException) {
+                onFailure(error)
+            }
+        }
+        .launchIn(scope)
+```
+
+Feed attach and permission events in order. On native `DeviceLost`, call
+`onDeviceLost` with the output that raised it. `WaitingForUsb` holds the
+last reported media position. The helper automatically reopens only a
+uniquely identified USB device with the same VID, PID and serial, with USB
+permission and play intent. For a DAC without a readable serial, ask the
+listener to confirm the device and call `reconnectTo`. The player handles
+permission prompts.
+
+Use `fallbackAfterFailure` instead of `onDeviceLost` when the player has
+chosen a different output. A failed fallback leaves the direct USB reconnect
+position available. An Android bit-perfect fallback needs an active USB
+route. Switching from direct USB to a route that could play on the phone
+requires explicit `allowSystemRoute`.
+
 ## What it costs
 
 `select` and `open` block, and they look before they decide:

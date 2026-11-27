@@ -149,6 +149,12 @@ pub struct DacConfig {
     /// How many isochronous transfers are in flight at once. 2 to 16,
     /// default 8. See [`bus_queue_ms`](Self::bus_queue_ms).
     pub transfers_in_flight: u32,
+    /// Optional target for one transfer in microseconds. 125 to 32,000.
+    /// When set, the worker rounds down to whole USB service intervals (at
+    /// least one), derives the slot count from the bus queue target and uses
+    /// `transfers_in_flight` as a ceiling. Keep two slots even when one service
+    /// interval exceeds the requested period. None uses the fixed slot count.
+    pub transfer_period_us: Option<u32>,
     /// Cancel the transfers already on the bus when the stream is flushed, so
     /// the audio of the old position is not heard after a seek or a track
     /// change. The output thread cancels them, waits for the host controller to
@@ -188,6 +194,7 @@ impl Default for DacConfig {
             hand_back: HandBack::default(),
             bus_queue_ms: DEFAULT_BUS_QUEUE_MS,
             transfers_in_flight: DEFAULT_TRANSFERS_IN_FLIGHT,
+            transfer_period_us: None,
             cancel_in_flight_on_flush: true,
             startup_volume: StartupVolume::default(),
             require_hardware_volume: true,
@@ -195,7 +202,30 @@ impl Default for DacConfig {
     }
 }
 
+/// Starting points for USB bus queue tuning. Queue times are approximate and
+/// depend on the endpoint's service interval. The software ring is independent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsbQueueProfile {
+    /// Shorter USB queue and smaller transfers for interactive playback.
+    LowLatency,
+    /// The default queue and transfer count.
+    #[default]
+    Balanced,
+    /// Same target queue as Balanced with fewer, larger transfers and wakeups.
+    LowCpu,
+}
+
 impl DacConfig {
+    /// Apply the USB queue profile. All other session settings are retained.
+    pub fn with_usb_queue_profile(mut self, profile: UsbQueueProfile) -> Self {
+        (self.bus_queue_ms, self.transfers_in_flight, self.transfer_period_us) = match profile {
+            UsbQueueProfile::LowLatency => (8, 8, Some(1_000)),
+            UsbQueueProfile::Balanced => (DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT, None),
+            UsbQueueProfile::LowCpu => (16, 4, None),
+        };
+        self
+    }
+
     /// Checks the combination of values.
     pub fn validate(&self) -> Result<()> {
         let bad = |message: &str| Err(Error::InvalidArgument(message.to_string()));
@@ -228,6 +258,9 @@ impl DacConfig {
         }
         if !(2..=16).contains(&self.transfers_in_flight) {
             return bad("transfers_in_flight must be between 2 and 16");
+        }
+        if self.transfer_period_us.is_some_and(|period| !(125..=32_000).contains(&period)) {
+            return bad("transfer_period_us must be between 125 and 32000");
         }
         Ok(())
     }

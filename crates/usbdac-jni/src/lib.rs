@@ -486,6 +486,19 @@ pub fn stream_set_software_gain<'l>(
     })
 }
 
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn stream_set_host_processing<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    stream: i64,
+    active: bool,
+) {
+    run(&mut env, |_env| {
+        registry::stream(stream)?.set_host_processing(active);
+        Ok(())
+    })
+}
+
 // ---- volume ---------------------------------------------------------------
 
 fn volume_of(dac: i64) -> Outcome<usbdac_core::VolumeControl> {

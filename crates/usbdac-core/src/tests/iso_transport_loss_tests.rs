@@ -88,6 +88,33 @@ fn timed_out_urb_credits_only_packets_that_completed_in_full() {
 }
 
 #[test]
+fn isolated_failed_packet_latches_loss_and_keeps_the_stream_running() {
+    let mut packets = descriptors(&SCHEDULE, &SCHEDULE);
+    packets[3].status = LIBUSB_TRANSFER_ERROR;
+    packets[3].actual_length = 0;
+    let stats = validate_iso_packet_descriptors(&SCHEDULE, &packets, acceptance()).unwrap();
+    let loss = UrbLoss::from_completion(&stats, false, BYTES_PER_FRAME);
+
+    let mut tracker = LossTracker::new(lenient_limits());
+    let verdict = tracker.record(SCHEDULE_FRAMES, loss);
+    assert_eq!(verdict.consumed_frames, SCHEDULE_FRAMES - 6);
+    assert!(verdict.newly_latched);
+    assert_eq!(verdict.fatal, None);
+    assert_eq!(tracker.lost_frames(), 6);
+    assert_eq!(tracker.zero_packets(), 1);
+    assert_eq!(tracker.data_urb_timeouts(), 0);
+    assert!(tracker.record(SCHEDULE_FRAMES, lossless()).counts_as_successful_transfer());
+    assert!(tracker.is_latched());
+    for _ in 0..3 {
+        assert_eq!(tracker.record(SCHEDULE_FRAMES, loss).fatal, None);
+    }
+    assert!(matches!(
+        tracker.record(SCHEDULE_FRAMES, loss).fatal,
+        Some(LossLimit::ConsecutiveLossyUrbs { count: 4, limit: 3 })
+    ));
+}
+
+#[test]
 fn fully_timed_out_urb_counts_every_frame_lost() {
     let cancelled = descriptors(&SCHEDULE, &[0; 8]);
     let loss = timed_out_loss(&SCHEDULE, &cancelled);

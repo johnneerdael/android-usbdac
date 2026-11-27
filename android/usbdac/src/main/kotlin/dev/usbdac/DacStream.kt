@@ -155,6 +155,18 @@ public class DacStream internal constructor(
     }
 
     /**
+     * Use the shallower [DacConfig.processingBufferTargetMs] while the app applies EQ or
+     * other live PCM processing before [write]. Buffered audio plays through at the old
+     * depth before the new target takes effect. Restore the deeper target with `false`.
+     * This is a buffering hint and does not report what the app did to the samples.
+     * DoP and native DSD ignore it.
+     */
+    public fun setHostProcessing(active: Boolean) {
+        checkOpen()
+        nativeCall { Native.streamSetHostProcessing(handle, active) }
+    }
+
+    /**
      * Stops the stream and releases it (about 100 ms). The session stays open and the volume still
      * works; open another stream to play again. Safe to call again.
      */

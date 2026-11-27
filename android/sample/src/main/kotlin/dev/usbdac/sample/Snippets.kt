@@ -14,17 +14,20 @@ import dev.usbdac.ConvertingOutput
 import dev.usbdac.PcmConverter
 import dev.usbdac.RatePolicy
 import dev.usbdac.DacConfig
+import dev.usbdac.DacException
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
 import dev.usbdac.OutputChange
 import dev.usbdac.OutputDecision
+import dev.usbdac.OutputHandoff
 import dev.usbdac.OutputPolicy
 import dev.usbdac.OutputSelector
 import dev.usbdac.PcmOutput
 import dev.usbdac.SelectedOutput
 import dev.usbdac.StreamFormat
 import dev.usbdac.StreamRequest
+import dev.usbdac.UsbQueueProfile
 import dev.usbdac.controls.DacIdleRelease
 import dev.usbdac.controls.DacVolumeProvider
 import kotlinx.coroutines.CoroutineScope
@@ -84,6 +87,26 @@ fun outputForNextTrack(selector: OutputSelector, current: SelectedOutput?, next:
     return selector.open(next)
 }
 // endregion
+
+// region output-handoff
+fun observeHandoff(scope: CoroutineScope, handoff: OutputHandoff, onFailure: (DacException) -> Unit): Job =
+    handoff.changes
+        .onEach { change ->
+            try {
+                handoff.handleChange(change)
+            } catch (error: DacException) {
+                onFailure(error)
+            }
+        }
+        .launchIn(scope)
+// endregion
+
+fun lowCpuUsbPolicy(): OutputPolicy =
+    OutputPolicy(dacConfig = DacConfig().withUsbQueueProfile(UsbQueueProfile.LOW_CPU))
+
+fun setLiveEq(output: SelectedOutput, active: Boolean) {
+    output.stream?.setHostProcessing(active)
+}
 
 // region auto-decision
 /** What was chosen, who vouches for it, why, and why the better outputs were passed over. */

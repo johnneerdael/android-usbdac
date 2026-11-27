@@ -1544,11 +1544,7 @@ pub(crate) fn open_capture(
             CaptureBuffer::new(endpoint.format.clone(), capacity_frames)
                 .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?,
         ));
-        let geometry = IsoQueueGeometry::for_stream(
-            endpoint.service_us,
-            settings().config.bus_queue_ms,
-            settings().config.transfers_in_flight,
-        );
+        let geometry = IsoQueueGeometry::for_config(endpoint.service_us, &settings().config);
         capture_queue_bytes(endpoint.packet_bytes, geometry)?;
         if standard_uac2 {
             verify_standard_capture(owner.claimed(), &endpoint)?;
@@ -1919,8 +1915,7 @@ struct NominalCapturePool {
 impl NominalCapturePool {
     fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
         let Some(profile) = endpoint.vendor_pcm.filter(|profile| profile.requires_output_for_capture && !profile.rate_control) else { return Ok(None); };
-        let geometry = IsoQueueGeometry::for_stream(profile.output.service_us,
-            settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+        let geometry = IsoQueueGeometry::for_config(profile.output.service_us, &settings().config);
         let stride = usize::from(profile.output.channels) * usize::from(profile.output.subslot_bytes);
         let transfer_bytes = profile.output.max_packet_bytes.checked_mul(geometry.packets_per_transfer)
             .ok_or("vendor capture companion allocation overflow")?;

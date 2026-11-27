@@ -44,6 +44,22 @@ pub(crate) struct IsoQueueGeometry {
 }
 
 impl IsoQueueGeometry {
+    /// Apply an optional application period at the negotiated USB cadence.
+    /// Keep at least two slots so an ordinary completion leaves work queued.
+    pub(crate) fn for_config(service_interval_us: u32, config: &crate::DacConfig) -> Self {
+        let Some(period_us) = config.transfer_period_us else {
+            return Self::for_stream(service_interval_us, config.bus_queue_ms, config.transfers_in_flight);
+        };
+        let interval = service_interval_us.max(1);
+        let target_packets = (config.bus_queue_ms * 1_000 / interval).max(2) as usize;
+        let period_packets = (period_us / interval).max(1) as usize;
+        let packets = period_packets.min(MAX_PACKETS_PER_TRANSFER).min(target_packets / 2);
+        let slots = (target_packets / packets)
+            .min(config.transfers_in_flight as usize)
+            .min((PACKET_FLIGHT_LIMIT - 1) / packets);
+        Self::from_packets(interval, packets, slots)
+    }
+
     pub(crate) fn for_stream(
         service_interval_us: u32,
         bus_queue_ms: u32,
@@ -58,12 +74,16 @@ impl IsoQueueGeometry {
         let packets = wanted
             .clamp(1, MAX_PACKETS_PER_TRANSFER as u64)
             .min(flight_cap.max(1));
-        let completed_us = packets * interval;
+        Self::from_packets(interval as u32, packets as usize, slots as usize)
+    }
+
+    fn from_packets(service_interval_us: u32, packets: usize, slots: usize) -> Self {
+        let completed_us = packets as u64 * u64::from(service_interval_us);
         Self {
-            packets_per_transfer: packets as usize,
-            transfer_slots: slots as usize,
+            packets_per_transfer: packets,
+            transfer_slots: slots,
             stable_transfers: STABLE_WINDOW_US.div_ceil(completed_us).max(1) as usize,
-            service_interval_us: interval as u32,
+            service_interval_us,
         }
     }
 

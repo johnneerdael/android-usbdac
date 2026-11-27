@@ -22,8 +22,27 @@ A deep ring costs nothing in responsiveness if you `flush()` on every seek, stop
 | Option | Type | Default | Effect | Bit-perfect impact |
 |---|---|---|---|---|
 | `busQueueMs` | `Int` | 16 | Audio kept queued on the USB bus, 4 to 64: what a `pause()` still plays out and the headroom against a late output thread. The same for every service interval and encoding | None |
-| `transfersInFlight` | `Int` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `busQueueMs / transfersInFlight` of audio (2 ms by default) | None |
+| `transfersInFlight` | `Int` | 8 | Isochronous slots, 2 to 16. Acts as a ceiling when `transferPeriodUs` is set | None |
+| `transferPeriodUs` | `Int?` | null | Target duration for a single transfer, 125 to 32,000 µs. With no period, each transfer carries about `busQueueMs / transfersInFlight` | None |
 | `cancelInFlightOnFlush` | `Boolean` | `true` | `flush()` also cancels the transfers already on the bus, so a seek is heard at once instead of after `busQueueMs`. Off: they play out. See [flush](#the-stream-dacstream-and-pcmoutput) | None: cancelled transfers are not lost audio |
+
+`DacConfig.withUsbQueueProfile` configures the USB bus queue without changing the player ring.
+
+| Profile | Target USB queue | Transfer duration at 125 µs service | When to use |
+| --- | --- | --- | --- |
+| `BALANCED` | 16 ms | 2 ms, eight slots | Default for playback |
+| `LOW_LATENCY` | 8 ms | 1 ms, eight slots | Lower pause and handoff latency, with less headroom for a late worker |
+| `LOW_CPU` | 16 ms | 4 ms, four slots | Fewer worker wakeups, with more audio affected by each late transfer |
+
+```kotlin
+fun lowCpuUsbPolicy(): OutputPolicy =
+    OutputPolicy(dacConfig = DacConfig().withUsbQueueProfile(UsbQueueProfile.LOW_CPU))
+```
+
+A custom period is rounded down to whole USB service intervals, with at least
+one packet per transfer and two slots. The driver derives the slot count from
+the queue target and applies the selected slot ceiling. The log records the
+actual packets per transfer, slots and duration for the negotiated endpoint.
 
 The packets in flight never reach 256, and at most 32 go in a transfer. Where the configured depth would break either limit the cap wins and less is queued: `busQueueMs = 64` with eight transfers at a 125 us service interval queues 31 ms, not 64. A DAC with a 1 ms service interval used to queue 128 ms and DSD at 125 us 256 packets (one more than the measured stall point); both now queue 16 ms like every other case. A shorter queue makes a pause or a stop sound sooner and leaves less headroom for a late output thread; leave the defaults unless a DAC underruns (deepen) or a host needs the shortest pause (shorten). See [the bus queue](../API.md#the-bus-queue).
 

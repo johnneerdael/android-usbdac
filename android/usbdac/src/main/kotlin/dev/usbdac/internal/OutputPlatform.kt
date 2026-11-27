@@ -66,6 +66,13 @@ internal interface OutputPlatform {
     fun attachedDacs(): List<DacDeviceInfo>
     fun hasPermission(dac: DacDeviceInfo): Boolean
 
+    fun usbSerial(dac: DacDeviceInfo): String? =
+        try {
+            dac.device.serialNumber?.takeIf { it.isNotBlank() }
+        } catch (_: SecurityException) {
+            null
+        }
+
     /** Opens a session on [dac]; the failures of `UsbDac.open`. */
     fun openDac(dac: DacDeviceInfo, config: DacConfig): DirectLink
 

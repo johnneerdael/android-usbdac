@@ -81,6 +81,7 @@ internal object Native {
     @JvmStatic external fun streamStats(stream: Long): String
     @JvmStatic external fun streamIsBitPerfect(stream: Long): Boolean
     @JvmStatic external fun streamSetSoftwareGain(stream: Long, gain: Float)
+    @JvmStatic external fun streamSetHostProcessing(stream: Long, active: Boolean)
 
     @JvmStatic external fun volumeRange(dac: Long): String?
     @JvmStatic external fun volumeGet(dac: Long): String

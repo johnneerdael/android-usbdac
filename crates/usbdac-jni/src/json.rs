@@ -651,6 +651,9 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     if let Some(count) = uint(map, "transfers_in_flight")? {
         config.transfers_in_flight = narrow(count, "transfers_in_flight")?;
     }
+    if let Some(period) = uint(map, "transfer_period_us")? {
+        config.transfer_period_us = Some(narrow(period, "transfer_period_us")?);
+    }
     if let Some(value) = boolean(map, "cancel_in_flight_on_flush")? {
         config.cancel_in_flight_on_flush = value;
     }
@@ -809,9 +812,13 @@ mod tests {
 
     #[test]
     fn the_bus_queue_keys_decode_and_a_bad_value_is_refused() {
-        let config = parse_config(Some(r#"{"bus_queue_ms":32,"transfers_in_flight":4}"#))
+        let config = parse_config(Some(r#"{"bus_queue_ms":32,"transfers_in_flight":4,"transfer_period_us":1500}"#))
             .ok()
             .unwrap();
+        assert_eq!(config.transfer_period_us, Some(1_500));
+        assert!(config.validate().is_ok());
+        let bad = parse_config(Some(r#"{"transfer_period_us":0}"#)).ok().unwrap();
+        assert!(bad.validate().is_err());
         assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (32, 4));
         config.validate().unwrap();
         assert!(

@@ -65,6 +65,55 @@ fn the_configured_queue_sets_the_packets_and_a_transfer_stays_within_32() {
 }
 
 #[test]
+fn profiles_tune_queue_time_and_wakeups_independently() {
+    use crate::{DacConfig, UsbQueueProfile};
+
+    for interval in [125, 250, 500, 1_000] {
+        let balanced = IsoQueueGeometry::for_config(interval, &DacConfig::default());
+        assert_eq!(balanced, default_geometry(interval));
+
+        let low_cpu = DacConfig::default().with_usb_queue_profile(UsbQueueProfile::LowCpu);
+        let low_cpu = IsoQueueGeometry::for_config(interval, &low_cpu);
+        assert_eq!(low_cpu.queued_us(), balanced.queued_us());
+        assert_eq!(low_cpu.transfer_slots, 4);
+        assert_eq!(low_cpu.transfer_us(), balanced.transfer_us() * 2);
+
+        let low_latency = DacConfig::default().with_usb_queue_profile(UsbQueueProfile::LowLatency);
+        let low_latency = IsoQueueGeometry::for_config(interval, &low_latency);
+        assert_eq!(low_latency.transfer_us(), 1_000);
+        assert_eq!(low_latency.queued_us(), 8_000);
+    }
+}
+
+#[test]
+fn application_period_rounds_at_the_endpoint_and_derives_the_slot_count() {
+    use crate::DacConfig;
+
+    let config = DacConfig {
+        bus_queue_ms: 16,
+        transfers_in_flight: 12,
+        transfer_period_us: Some(3_200),
+        ..DacConfig::default()
+    };
+    let geometry = IsoQueueGeometry::for_config(250, &config);
+    assert_eq!(geometry.packets_per_transfer, 12);
+    assert_eq!(geometry.transfer_slots, 5);
+    assert_eq!(geometry.queued_us(), 15_000);
+
+    let slow = IsoQueueGeometry::for_config(32_000, &config);
+    assert_eq!((slow.packets_per_transfer, slow.transfer_slots), (1, 2));
+
+    let capped = IsoQueueGeometry::for_config(125, &DacConfig {
+        bus_queue_ms: 64,
+        transfers_in_flight: 16,
+        transfer_period_us: Some(32_000),
+        ..config
+    });
+    assert_eq!((capped.packets_per_transfer, capped.transfer_slots), (32, 7));
+    assert!(capped.packets_in_flight() < 256);
+}
+
+#[test]
 fn packets_in_flight_never_reach_256_whatever_the_configuration() {
     // The hard cap wins over bus_queue_ms: 64 ms in 8 transfers at 125 us is
     // 32 x 8 = 256 packets, which stalled on the measured phone and DAC.

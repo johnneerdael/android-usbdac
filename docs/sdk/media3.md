@@ -2,6 +2,11 @@
 
 **This page is guidance, not shipped code.** The SDK has no dependency on Media3 and ships no `AudioSink`. Nothing below has been compiled or run; the Kotlin is an outline of how the pieces map. The method names follow the `AudioSink` interface of Media3 1.x as it stands on the `release` branch at the time of writing (1.12.0-rc01); the interface has changed between versions (for example `configure(AudioSinkConfig)` replaces the deprecated `configure(Format, int, int[])`), so check the version you build with.
 
+For a route switch outside the sink, use the SDK's
+[handoff coordinator](automatic-output.md#route-handoff-and-usb-reconnect)
+to drain the current output and recover its media position. The renderer
+still owns decoder positioning and passes buffers to the selected output.
+
 ## Why a custom sink
 
 Media3's `DefaultAudioSink` creates an `AudioTrack` and runs an `AudioProcessor` chain in front of it: channel mapping, speed change, silence skipping, float conversion and more. That is the Android-managed path, and it is what you want if you are happy with it. To send decoded PCM straight to a DAC through usbdac, implement `AudioSink` yourself and hand it to the renderer (`DefaultRenderersFactory.buildAudioSink` or your own `AudioRendererFactory`). Because `DacStream` and `AndroidManagedOutput` are both a `PcmOutput`, the same sink can drive either.

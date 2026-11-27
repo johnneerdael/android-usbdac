@@ -95,10 +95,10 @@ impl CompletionStats {
 /// stream's service interval.
 ///
 /// A completed packet shorter (or, after repacketisation, longer) than the
-/// submitted length is timing data, not a transport failure: only a non-zero
-/// status, a length above the endpoint packet, a non-frame-aligned length, or
-/// a total that exceeds what was submitted is an error. Shortfall is returned
-/// so the caller can account for it without stopping playback.
+/// submitted length can be legal after repacketisation. A single generic
+/// packet error with a matching request and no delivered bytes is recoverable
+/// on an otherwise completed transfer. The caller accounts for the loss and
+/// applies the stream's loss budget. Other packet errors remain fatal.
 pub(crate) fn validate_iso_packet_descriptors(
     packet_sizes: &[usize],
     descriptors: &[libusb_iso_packet_descriptor],
@@ -114,8 +114,22 @@ pub(crate) fn validate_iso_packet_descriptors(
     }
 
     let mut stats = CompletionStats::default();
-    for (requested, packet) in packet_sizes.iter().zip(descriptors) {
+    let mut failed_packet_bytes = 0;
+    for (&requested, packet) in packet_sizes.iter().zip(descriptors) {
+        let actual = packet.actual_length as usize;
         if packet.status != LIBUSB_TRANSFER_COMPLETED {
+            if packet.status == LIBUSB_TRANSFER_ERROR
+                && !acceptance.exact
+                && failed_packet_bytes == 0
+                && requested > 0
+                && acceptance.is_frame_aligned(requested)
+                && packet.length as usize == requested
+                && actual == 0
+            {
+                failed_packet_bytes = requested;
+                stats.zero_packets += 1;
+                continue;
+            }
             return Err(format_diagnostics(
                 packet_sizes,
                 descriptors,
@@ -123,9 +137,6 @@ pub(crate) fn validate_iso_packet_descriptors(
                 "packet status is not completed",
             ));
         }
-
-        let requested = *requested;
-        let actual = packet.actual_length as usize;
 
         if packet.length as usize != requested {
             stats.descriptor_rewrites = stats.descriptor_rewrites.saturating_add(1);
@@ -193,7 +204,10 @@ pub(crate) fn validate_iso_packet_descriptors(
         ));
     }
 
-    stats.lost_bytes = (requested_total - actual_total) as u64;
+    // Never credit neighbouring packets for a known failed request. Their
+    // larger legal sizes can reflect repacketisation, not delivery of the
+    // specific audio that was scheduled in the failed packet.
+    stats.lost_bytes = (requested_total - actual_total).max(failed_packet_bytes) as u64;
     stats.shortfall_frames = stats.lost_bytes / acceptance.bytes_per_frame.max(1) as u64;
 
     Ok(stats)

@@ -639,14 +639,8 @@ pub(super) fn run_usb_output_loop(
     };
     let channels = candidate.channels as usize;
     let bytes_per_frame = slot_bytes.saturating_mul(channels);
-    // One rule for every service interval and encoding (PCM, DoP, native DSD):
-    // the same time on the bus, never 256 packets in flight.
     let bus_config = settings().config.clone();
-    let geometry = IsoQueueGeometry::for_stream(
-        candidate.service_interval_us,
-        bus_config.bus_queue_ms,
-        bus_config.transfers_in_flight,
-    );
+    let geometry = IsoQueueGeometry::for_config(candidate.service_interval_us, &bus_config);
     let mut scheduler = IsoPacketScheduler::with_geometry(
         playback_format.sample_rate,
         bytes_per_frame,
@@ -679,7 +673,12 @@ pub(super) fn run_usb_output_loop(
                     playback_format.sample_rate,
                 )
             }).unwrap_or_default();
-            match FeedbackTransfers::new(endpoint, bus_config.bus_queue_ms, compatibility) {
+            let feedback_window_ms = if bus_config.transfer_period_us.is_some() {
+                bus_config.bus_queue_ms.min(geometry.queued_us().div_ceil(1_000) as u32)
+            } else {
+                bus_config.bus_queue_ms
+            };
+            match FeedbackTransfers::new(endpoint, feedback_window_ms, compatibility) {
                 Ok(transfers) => feedback_transfers = Some(transfers),
                 Err(error) => {
                     feedback_start_error = Some(format!("explicit feedback allocation failed: {}", error));
@@ -810,7 +809,7 @@ pub(super) fn run_usb_output_loop(
     let priming_target = runtime_stats.start_threshold_samples;
     log_info!(
         "[USB] Isochronous queue: serviceIntervalUs={} packetsPerTransfer={} slots={} stableTransfers={} \
-         packetsInFlight={} transferMs={:.3} busQueueMs={:.3} (configured {}ms in {} transfers) \
+         packetsInFlight={} transferMs={:.3} busQueueMs={:.3} (target {}ms, slot limit {}, period us {:?}) \
          maxConsecutiveLossyUrbs={}",
         candidate.service_interval_us,
         geometry.packets_per_transfer,
@@ -821,6 +820,7 @@ pub(super) fn run_usb_output_loop(
         geometry.queued_us() as f64 / 1000.0,
         bus_config.bus_queue_ms,
         bus_config.transfers_in_flight,
+        bus_config.transfer_period_us,
         geometry.max_consecutive_lossy_urbs(),
     );
     log_info!(

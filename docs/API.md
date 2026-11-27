@@ -162,7 +162,14 @@ dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD by
 | `require_hardware_volume` | `true` | `open_stream` fails with `Error::VolumeUnavailable` when the DAC has no usable hardware volume control. `negotiate` and `capabilities` work either way. |
 | `cancel_in_flight_on_flush` | `true` | `flush()` also cancels the transfers already on the bus (see `flush()`). Off: they play out. |
 | `bus_queue_ms` | 16 | Audio kept queued on the USB bus, 4 to 64. One rule for every service interval and encoding (see "The bus queue"). |
-| `transfers_in_flight` | 8 | Isochronous transfers in flight at once, 2 to 16. A transfer carries `bus_queue_ms / transfers_in_flight` of audio. |
+| `transfers_in_flight` | 8 | Isochronous slots, 2 to 16. A ceiling when `transfer_period_us` is set. |
+| `transfer_period_us` | None | Optional target for one USB transfer, 125–32,000 µs. The driver derives the slot count from the queue target and endpoint cadence. |
+
+`DacConfig::with_usb_queue_profile` sets the queue knobs together. `Balanced`
+uses 16 ms across eight slots, `LowLatency` targets 8 ms with 1 ms transfers,
+and `LowCpu` uses 16 ms across four slots. For a custom period, the driver
+rounds down to whole endpoint service intervals and keeps at least two slots.
+The 32-packet per transfer and 255-packet in-flight limits still apply.
 
 #### Flush and the bus
 

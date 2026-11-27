@@ -145,6 +145,42 @@ fn test_per_packet_errors_are_rejected_even_when_lengths_match() {
 }
 
 #[test]
+fn test_failed_packet_recovery_requires_a_single_known_empty_request() {
+    let acceptance = PacketAcceptance::new(44_100, 125, 4);
+    let schedule = [24, 20, 24];
+    let mut packets = completed_packets(&schedule);
+    packets[0].status = LIBUSB_TRANSFER_ERROR;
+    packets[0].actual_length = 0;
+    packets[1].actual_length = 24; // a legal larger neighbour cannot mask the error
+
+    let stats = validate_iso_packet_descriptors(&schedule, &packets, acceptance).unwrap();
+    assert_eq!(stats.lost_bytes, 24);
+    assert_eq!(stats.shortfall_frames, 6);
+    assert!(validate_iso_packet_descriptors(&schedule, &packets, PacketAcceptance::exact()).is_err());
+
+    packets[0].length = 20;
+    assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
+    packets[0].length = 24;
+
+    packets[2].status = LIBUSB_TRANSFER_ERROR;
+    packets[2].actual_length = 0;
+    assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
+    packets[2].status = LIBUSB_TRANSFER_COMPLETED;
+    packets[2].actual_length = 24;
+
+    for status in [
+        LIBUSB_TRANSFER_NO_DEVICE,
+        LIBUSB_TRANSFER_STALL,
+        LIBUSB_TRANSFER_OVERFLOW,
+        LIBUSB_TRANSFER_CANCELLED,
+        LIBUSB_TRANSFER_TIMED_OUT,
+    ] {
+        packets[0].status = status;
+        assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
+    }
+}
+
+#[test]
 fn test_packet_count_mismatches_are_rejected_and_identified() {
     let acceptance = PacketAcceptance::new(44_100, 125, 4);
     let error = validate_iso_packet_descriptors(&[20, 24], &completed_packets(&[20]), acceptance)

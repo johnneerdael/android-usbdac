@@ -222,8 +222,7 @@ fn prepare_endpoint(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, endpoint: CaptureEndpoint, capacity: usize) -> Result<Attachment, Error> {
     let shared = validate_alternates(playback, &endpoint)?;
     if !shared {
-        let geometry = IsoQueueGeometry::for_stream(endpoint.service_us,
-            settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+        let geometry = IsoQueueGeometry::for_config(endpoint.service_us, &settings().config);
         capture_stream::capture_queue_bytes(endpoint.packet_bytes, geometry)?;
     }
     validate_clocks(claimed, playback, expected, &endpoint)?;
@@ -758,8 +757,7 @@ pub(super) struct InputPool {
 }
 impl InputPool {
     pub(super) fn new(attachment: Arc<Attachment>) -> Result<Self, String> {
-        let geometry = IsoQueueGeometry::for_stream(attachment.endpoint.service_us,
-            settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+        let geometry = IsoQueueGeometry::for_config(attachment.endpoint.service_us, &settings().config);
         let transfer_bytes = capture_stream::capture_queue_bytes(attachment.endpoint.packet_bytes, geometry)
             .map_err(|error| error.message())?;
         let mut slots = Vec::with_capacity(geometry.transfer_slots);

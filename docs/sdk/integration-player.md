@@ -114,7 +114,18 @@ Anything the engine does to the samples before `write` ends the claim that the s
 
 The library's flag is not changed by your processing. Show your own indicator as "bit-perfect" only when **both** the output's flag is `Verified` **and** your engine did nothing to the samples.
 
-With live processing, a shallower ring makes changes audible sooner. The Rust API has `set_host_processing(true)` for this, and software gain lowers the ring to 100 ms by itself. **The Kotlin SDK does not expose the host-processing hint in this version**: a Kotlin host that runs an equaliser can lower `DacConfig.bufferTargetMs` (100 ms is the depth the hint selects), at the cost of a shallower ring when nothing is processed too.
+With live processing, a shallower ring makes changes audible sooner. Use
+`DacStream.setHostProcessing(true)` in Kotlin or `set_host_processing(true)` in
+Rust when applying EQ or DSP upstream. The target changes to
+`processingBufferTargetMs` (100 ms by default) as existing audio plays out.
+Pass `false` to return to the passthrough target. The hint controls buffering.
+The app remains responsible for describing any changes it made to the source audio.
+
+```kotlin
+fun setLiveEq(output: SelectedOutput, active: Boolean) {
+    output.stream?.setHostProcessing(active)
+}
+```
 
 ## DSD sources {#dsd-sources}
 

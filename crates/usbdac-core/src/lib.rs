@@ -74,7 +74,7 @@ pub use capabilities::{
     SyncKind, UacVersion,
 };
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
-pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume};
+pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume, UsbQueueProfile};
 pub use dac::Dac;
 pub use capture::{CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition, DacCaptureStream};
 pub use error::{Error, Result};

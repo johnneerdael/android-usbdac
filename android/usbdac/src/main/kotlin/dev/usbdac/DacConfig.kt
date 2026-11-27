@@ -85,6 +85,16 @@ public data class QuirkOverride(
     val quirks: List<DacQuirk>,
 )
 
+/** Starting points for USB bus queue tuning. The software ring is independent. */
+public enum class UsbQueueProfile {
+    /** Shorter USB queue and smaller transfers for interactive playback. */
+    LOW_LATENCY,
+    /** The SDK defaults. */
+    BALANCED,
+    /** Same target queue as [BALANCED] with fewer, larger transfers and wakeups. */
+    LOW_CPU,
+}
+
 /**
  * Every tunable of a session. The defaults are what the transport was tuned with; change a
  * value only for a reason. Values left `null` follow the DAC's quirk, then a fixed default.
@@ -195,4 +205,19 @@ public data class DacConfig @JvmOverloads constructor(
      * Enable before opening a support session and export it with [DacSession.feedbackTraceJson].
      */
     val captureFeedbackTrace: Boolean = false,
-)
+
+    /**
+     * Optional target for one USB transfer in microseconds, from 125 to 32,000. The driver
+     * rounds down to whole service intervals (at least one) and derives the slot count from
+     * [busQueueMs], using [transfersInFlight] as a ceiling. It keeps at least two slots.
+     * A null period uses the fixed slot count.
+     */
+    val transferPeriodUs: Int? = null,
+) {
+    /** Apply a USB queue profile and keep this config's other session settings. */
+    public fun withUsbQueueProfile(profile: UsbQueueProfile): DacConfig = when (profile) {
+        UsbQueueProfile.LOW_LATENCY -> copy(busQueueMs = 8, transfersInFlight = 8, transferPeriodUs = 1_000)
+        UsbQueueProfile.BALANCED -> copy(busQueueMs = 16, transfersInFlight = 8, transferPeriodUs = null)
+        UsbQueueProfile.LOW_CPU -> copy(busQueueMs = 16, transfersInFlight = 4, transferPeriodUs = null)
+    }
+}

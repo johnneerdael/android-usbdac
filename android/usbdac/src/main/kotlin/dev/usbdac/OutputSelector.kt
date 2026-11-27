@@ -178,9 +178,32 @@ public class OutputSelector internal constructor(
      */
     public fun open(request: StreamRequest): SelectedOutput = synchronized(lock) {
         requireIdle()
-        val resolved = resolve(request, keep = true)
+        openResolved(resolve(request, keep = true))
+    }
+
+    internal fun openMatchingUsb(request: StreamRequest, matches: (DacDeviceInfo) -> Boolean): SelectedOutput =
+        synchronized(lock) {
+            requireIdle()
+            openResolved(resolve(request, keep = true, matchesUsb = matches))
+        }
+
+    internal fun openForHandoff(request: StreamRequest, kind: OutputKind): SelectedOutput = synchronized(lock) {
+        requireIdle()
+        if (policy.force != null && policy.force != kind) {
+            throw DacException(DacErrorCode.INVALID_STATE, "the handoff target conflicts with the forced output policy")
+        }
+        openResolved(resolve(request, keep = true, forcedKind = kind))
+    }
+
+    internal fun hasAttachedUsb(matches: (DacDeviceInfo) -> Boolean): Boolean =
+        platform.attachedDacs().any(matches)
+
+    internal fun usbSerial(dac: DacDeviceInfo): String? =
+        if (platform.hasPermission(dac)) platform.usbSerial(dac) else null
+
+    private fun openResolved(resolved: Resolution): SelectedOutput {
         val opened = checkNotNull(resolved.opened)
-        SelectedOutput(
+        return SelectedOutput(
             output = opened.output,
             decision = resolved.decision,
             format = opened.format,
@@ -242,14 +265,23 @@ public class OutputSelector internal constructor(
     }
 
     /** What one pass over the candidates learns on the way. */
-    private class Pass(val request: StreamRequest, val route: RouteView) {
+    private class Pass(
+        val request: StreamRequest,
+        val route: RouteView,
+        val matchesUsb: ((DacDeviceInfo) -> Boolean)?,
+    ) {
         var needsPermission: DacDeviceInfo? = null
     }
 
-    private fun resolve(request: StreamRequest, keep: Boolean): Resolution {
-        val pass = Pass(request, RouteView(platform.activeRoute()))
+    private fun resolve(
+        request: StreamRequest,
+        keep: Boolean,
+        matchesUsb: ((DacDeviceInfo) -> Boolean)? = null,
+        forcedKind: OutputKind? = null,
+    ): Resolution {
+        val pass = Pass(request, RouteView(platform.activeRoute()), matchesUsb)
         val rejected = mutableListOf<Rejection>()
-        val forced = policy.force
+        val forced = if (matchesUsb != null) OutputKind.DIRECT_USB else forcedKind ?: policy.force
         var firstFailure: DacException? = null
         for (kind in if (forced != null) listOf(forced) else ORDER) {
             for (attempt in attempts(kind, pass)) {
@@ -324,7 +356,12 @@ public class OutputSelector internal constructor(
             )
             return@sequence
         }
-        val dacs = platform.attachedDacs()
+        val attached = platform.attachedDacs()
+        val dacs = pass.matchesUsb?.let { attached.filter(it) } ?: attached
+        if (pass.matchesUsb != null && dacs.size != 1) {
+            yield(reject(kind, RejectionReason.NOT_AVAILABLE, "the USB target is absent or ambiguous"))
+            return@sequence
+        }
         if (dacs.isEmpty()) {
             yield(reject(kind, RejectionReason.NOT_AVAILABLE, "no USB DAC is attached"))
             return@sequence
