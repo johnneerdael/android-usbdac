@@ -418,15 +418,37 @@ public object UsbDac {
                 val activeIndex = advertised.indexOf(activeId)
                 if (activeIndex < 0) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "active configuration is not advertised")
                 val deadline = android.os.SystemClock.elapsedRealtime() + 10_000
-                val descriptors = (0 until usb.configurationCount).map { index ->
+                val rawDescriptors = (0 until usb.configurationCount).map { index ->
                     if (android.os.SystemClock.elapsedRealtime() >= deadline) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration discovery deadline expired")
-                    val descriptor = parseFallbackDescriptor(readConfigurationDescriptor(connection, index), fallbackRequest)
+                    readConfigurationDescriptor(connection, index)
+                }
+                val descriptors = rawDescriptors.mapIndexed { index, raw ->
+                    val descriptor = parseFallbackDescriptor(raw, fallbackRequest)
                     if (descriptor == null || descriptor.id != advertised[index]) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration descriptor identity or completeness could not be verified")
                     descriptor
                 }
                 if (android.os.SystemClock.elapsedRealtime() >= deadline) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration discovery deadline expired")
-                val active = descriptors[activeIndex]
+                val activeDescriptor = descriptors[activeIndex]
                 val first = descriptors[0]
+                val fullProof = activeDescriptor.fullUac3 && (!activeDescriptor.hasIsoOut || activeDescriptor.formatExcluded)
+                val rawActive = rawDescriptors[activeIndex]
+                var offset = 9
+                var hasBadd = false
+                while (offset < rawActive.size) {
+                    val length = rawActive[offset].toInt() and 0xff
+                    if ((rawActive[offset + 1].toInt() and 0xff) == 11 && length == 8 &&
+                        (rawActive[offset + 4].toInt() and 0xff) == 1 &&
+                        (rawActive[offset + 5].toInt() and 0xff) in 0x20..0x26 &&
+                        (rawActive[offset + 6].toInt() and 0xff) == 0x30) hasBadd = true
+                    offset += length
+                }
+                val witness = if (!fullProof && activeIndex != 0 && first.legacyPlayback && hasBadd &&
+                    fallbackRequest.ratePolicy == RatePolicy.EXACT && fallbackRequest.encoding == StreamEncoding.PCM) {
+                    Native.baddDescriptorWitness(fd, activeId, rawActive)
+                } else 0
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration discovery deadline expired")
+                val baddExcluded = witness == 2 || (witness == 1 && fallbackRequest.sampleRate != 48_000)
+                val active = if (baddExcluded) activeDescriptor.copy(fullUac3 = true, formatExcluded = true) else activeDescriptor
                 val candidate = legacyFallbackId(active, first, advertised)
                 if (candidate != null) {
                     val attached = manager.deviceList[usb.deviceName]

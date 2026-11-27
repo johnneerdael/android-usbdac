@@ -25,7 +25,7 @@ mod routing;
 mod scarlett;
 
 use jni::errors::ThrowRuntimeExAndDefault;
-use jni::objects::{JByteBuffer, JObject, JString};
+use jni::objects::{JByteArray, JByteBuffer, JObject, JString};
 use jni::strings::JNIString;
 use jni::{jni_mangle, jni_str, Env, EnvUnowned};
 use listener::JavaListener;
@@ -155,6 +155,34 @@ pub fn rank<'l>(
 pub fn version<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) -> JString<'l> {
     run(&mut env, |env| {
         Ok(JString::from_str(env, env!("CARGO_PKG_VERSION"))?)
+    })
+}
+
+/// Read-only BADD proof before interface claims and native registration.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn badd_descriptor_witness<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    active_id: i32,
+    snapshot: JByteArray<'l>,
+) -> i32 {
+    run(&mut env, |env| {
+        if !(1..=255).contains(&active_id) {
+            return Ok(0);
+        }
+        let len = snapshot.len(env)?;
+        if !(9..=16384).contains(&len) {
+            return Ok(0);
+        }
+        let mut bytes = vec![0i8; len];
+        snapshot.get_region(env, 0, &mut bytes)?;
+        let raw: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
+        Ok(i32::from(usbdac_core::badd_descriptor_witness(
+            fd,
+            active_id as u8,
+            &raw,
+        )))
     })
 }
 

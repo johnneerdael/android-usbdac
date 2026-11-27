@@ -26,6 +26,7 @@ internal object Native {
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 
+    @JvmStatic external fun baddDescriptorWitness(fd: Int, activeId: Int, snapshot: ByteArray): Int
     @JvmStatic external fun dacVendorPcmPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacVendorPcmClaimsPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
@@ -43,6 +44,7 @@ internal object Native {
     @JvmStatic external fun dacAwaitRetirement(): Boolean
     @JvmStatic external fun dacRetirementToken(dac: Long): Long
     @JvmStatic external fun dacAwaitRetirementToken(token: Long): Boolean
+    @JvmStatic external fun dacRetirementRoutingReport(token: Long): String
     @JvmStatic external fun dacReleaseRetirementToken(token: Long)
     @JvmStatic external fun dacAwaitConnectionRetirement(fd: Int): Boolean
     @JvmStatic external fun pioneerDjmDiscover(dac: Long): String

@@ -4,7 +4,7 @@ Turn on the native library's log first: `UsbDac.setLogLevel(4)` (debug), then `a
 
 ## Error codes
 
-Every failure is a `DacException`. `error.code` is a `DacErrorCode`, `error.detail` the message without the code, and `error.message` is `"<code>: <detail>"`.
+Most SDK failures are `DacException`s. An opt-in checked playback open may instead throw `DacPlaybackOpenException`; read its `failure` and retain its `pendingCleanup` as described in [checked playback open](integration-app.md#checked-playback-open-and-configuration-hand-back). For a `DacException`, `error.code` is a `DacErrorCode`, `error.detail` the message without the code, and `error.message` is `"<code>: <detail>"`.
 
 | Code | Where from | Meaning and what to do |
 |---|---|---|
@@ -23,7 +23,7 @@ Every failure is a `DacException`. `error.code` is a `DacErrorCode`, `error.deta
 | `EXCLUSIVE_UNAVAILABLE` | `AAudioExclusiveOutput.open` | `AAudioConfig.requireExclusive` is on and the platform granted only a shared AAudio stream. The message carries the grant's reason. Exclusive mode depends on the device and the route; open with `requireExclusive = false` to accept a shared stream, or fall back to `AndroidManagedOutput` |
 | `PERMISSION_DENIED` | `UsbDac.open` | The app has no USB permission for the device. See [permission](#permission) |
 | `OPEN_FAILED` | `UsbDac.open`, `AndroidManagedOutput.open` | Android refused to open the device or gave no file descriptor, or the `AudioTrack` could not be created |
-| `CONFIGURATION_UNAVAILABLE`, `CONFIGURATION_SELECTION_FAILED`, `CONFIGURATION_RESTORE_FAILED` | `UsbDac.open`, `openCapture`, `openDuplex` with a `configurationId`; `close` | The configuration ID is absent or advertised twice; Android rejected the selection or `GET_CONFIGURATION` did not confirm it; or the original configuration could not be confirmed again on hand-back (a configuration changed by someone else is not overwritten) |
+| `CONFIGURATION_UNAVAILABLE`, `CONFIGURATION_SELECTION_FAILED`, `CONFIGURATION_RESTORE_FAILED` | `UsbDac.open`, `openPlaybackForRequest`, `openCapture`, `openDuplex` with a `configurationId`; `close` or pending hand-back | The configuration ID is absent or advertised twice; Android rejected the selection or `GET_CONFIGURATION` did not confirm it; or the original configuration could not be confirmed again on hand-back (a configuration changed by someone else is not overwritten) |
 | `UNKNOWN` | any | A code this version of the SDK does not know, from a newer native library |
 
 ## Asynchronous endpoints without feedback

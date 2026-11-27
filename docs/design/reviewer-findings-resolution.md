@@ -37,3 +37,9 @@ The review baseline is `84197a2`, with release-fix changes through `45a3f2c`. Th
 P01–P04 distinguish the historical source-gated release from publication of immutable gate-staged bytes. Keep the AAR, Maven metadata, sources, native archive and crate digest-bound through staging and publication. Recovery verifies the original reservation and gate receipt, reuses only the immutable payload of a proven attempt, and rejects conflicting registry objects. Re-gating expired evidence is an explicit operation on the reserved source.
 
 Each implementation batch uses the existing Rust and Kotlin tests, actual host JNI where the entry point matters, and static workflow checks for release changes. Physical DAC behavior, audible transients and firmware quirks belong in the dedicated hardware ledger.
+
+## Local verification
+
+The workspace Rust tests and strict Clippy checks passed. The SDK and Media3 JVM tests and the Media3 example compilation passed against a fresh host JNI build. An opt-in host JNI check exercised the real DSD and consented DoP converters through output selection and checked PCM duration and source-frame counters. Android NDK checks passed for arm64-v8a, armeabi-v7a, x86_64 and x86 at API 26.
+
+The release pipeline was checked offline with a real crate package, a local Maven repository and receipt, digest and recovery probes. Published registry acceptance and a fresh physical or virtual USB playback run are outside this verification. The published release evidence retains its original revision and scope.

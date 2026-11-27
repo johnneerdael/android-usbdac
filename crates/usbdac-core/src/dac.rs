@@ -871,6 +871,17 @@ impl UsbRetirement {
     pub fn wait(&self, timeout: Duration) -> bool {
         self.context.retired(timeout)
     }
+
+    /// Routing hand-back outcome after this owner has retired. None means no
+    /// route changes were recorded; a pending owner is an explicit error.
+    pub fn routing_hand_back_report(
+        &self,
+    ) -> Result<Option<crate::routing::RoutingHandBackReport>> {
+        if !self.context.retired(Duration::ZERO) {
+            return Err(Error::InvalidState("USB owner has not retired".into()));
+        }
+        Ok(self.context.routing_hand_back_report())
+    }
 }
 
 impl Drop for Dac {

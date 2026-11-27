@@ -145,6 +145,9 @@ impl SessionContext {
             registry.owners.remove(&identity);
         }
     }
+    pub(crate) fn routing_hand_back_report(&self) -> Option<routing_hw::RoutingHandBackReport> {
+        self.routing_report.lock().clone()
+    }
     pub(crate) fn retired(self: &Arc<Self>, timeout: Duration) -> bool {
         let _scope = self.enter();
         super::api::await_usb_retirement(timeout)
@@ -269,6 +272,27 @@ impl ScopedU32 {
 mod tests {
     use super::*;
     use crate::transport::fake_dac;
+    #[test]
+    fn routing_report_is_cloned_and_scoped_to_its_owner() {
+        use crate::routing::{ControlKey, Entity, RoutingHandBackOutcome, RoutingHandBackReport};
+        let first = SessionContext::unregistered();
+        let second = SessionContext::unregistered();
+        let expected = RoutingHandBackReport {
+            controls: vec![(
+                ControlKey::Selector(Entity {
+                    interface: 3,
+                    id: 7,
+                }),
+                RoutingHandBackOutcome::DeadlineExpired,
+            )],
+        };
+        *first.routing_report.lock() = Some(expected.clone());
+        let mut copy = first.routing_hand_back_report().unwrap();
+        copy.controls.clear();
+        assert_eq!(first.routing_hand_back_report(), Some(expected));
+        assert_eq!(second.routing_hand_back_report(), None);
+    }
+
     #[test]
     fn independent_owners_keep_volume_payload_clock_state_and_close_separate() {
         let _serial = PAYLOAD_LATCH_TEST_LOCK

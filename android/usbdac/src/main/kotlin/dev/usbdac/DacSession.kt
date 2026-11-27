@@ -84,6 +84,8 @@ public class DacSession private constructor(
     private var duplex: DacDuplexStream? = null
 
     public val routing: DacRouting = DacRouting(dac, ::checkOpen)
+    /** Routing hand-back state, including delayed retirement after close. */
+    public val routingHandBack: RoutingHandBackState get() = routing.handBack
 
     /** State of the session. */
     public val state: StateFlow<DacState> get() = mutableState
@@ -299,6 +301,7 @@ public class DacSession private constructor(
     public fun close(handBack: HandBack) {
         if (!closed.compareAndSet(false, true)) return
         val retirement = runCatching { Native.dacRetirementToken(dac) }.getOrDefault(0L)
+        routing.beginHandBack(retirement != 0L)
         fun retired() = runCatching { if (retirement != 0L) Native.dacAwaitRetirementToken(retirement) else Native.dacAwaitConnectionRetirement(connection.fileDescriptor) }.getOrDefault(false)
         var failure: DacException? = null
         try {
@@ -320,6 +323,7 @@ public class DacSession private constructor(
             }
         } finally {
             fun releaseHostOwnership() {
+                routing.publishHandBack(retirement)
                 if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }
                 claims.release()
                 runCatching { configurationSelection.restore() }.onFailure {
@@ -357,6 +361,7 @@ public class DacSession private constructor(
         val retirementResult = runCatching { Native.dacRetirementToken(dac) }
         retirementResult.exceptionOrNull()?.let(::recordPreliminary)
         val retirement = retirementResult.getOrDefault(0L)
+        routing.beginHandBack(retirement != 0L)
         val fdResult = runCatching { connection.fileDescriptor }
         fdResult.exceptionOrNull()?.let(::recordPreliminary)
         val fd = fdResult.getOrNull()
@@ -386,6 +391,7 @@ public class DacSession private constructor(
                     } else if (released) record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment changed before configuration restoration"))
                 } else record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment is no longer present; configuration was not restored"))
             } finally {
+                routing.publishHandBack(retirement)
                 if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }.onFailure(::record)
                 runCatching { connection.close() }.onFailure(::record)
                 runCatching { onClosed() }.onFailure(::record)

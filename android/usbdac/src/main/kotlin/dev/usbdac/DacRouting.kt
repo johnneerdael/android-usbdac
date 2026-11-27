@@ -21,7 +21,25 @@ public enum class RouteAccess { ABSENT, READ_ONLY, READ_WRITE }
 public data class RouteControl(val key: RouteKey, val access: RouteAccess, val sourceEntityIds: List<Int>)
 /** Kept by the owning native DAC. Rediscover after a selector edit, drift or eviction. */
 public class RoutingSnapshot internal constructor(internal val owner: DacRouting, internal val handle: Long,
-    public val configurationId: Int, public val controls: List<RouteControl>)
+    public val configurationId: Int, public val controls: List<RouteControl>,
+    public val diagnostics: List<RoutingDiagnostic>)
+/** A function or entity excluded from discovery, with its native reason. */
+public data class RoutingDiagnostic(val audioControlInterface: Int, val entityId: Int?, val detail: String)
+public enum class RoutingHandBackOutcome {
+    RESTORED, ALREADY_ORIGINAL, EXTERNALLY_CHANGED, UNREADABLE,
+    IDENTITY_OR_TOPOLOGY_CHANGED, RESTORE_UNCERTAIN, DEADLINE_EXPIRED, DISABLED, UNKNOWN
+}
+public data class RoutingHandBackControl(val key: RouteKey, val outcome: RoutingHandBackOutcome,
+    val detail: String?, val rawOutcome: String)
+public data class RoutingHandBackReport(val controls: List<RoutingHandBackControl>)
+/** Published after native retirement; an unavailable token is never reported as success. */
+public sealed interface RoutingHandBackState {
+    public data object NotClosed : RoutingHandBackState
+    public data object Pending : RoutingHandBackState
+    public data object NoRecordedChanges : RoutingHandBackState
+    public data class Complete(val report: RoutingHandBackReport) : RoutingHandBackState
+    public data class Unavailable(val reason: String) : RoutingHandBackState
+}
 public data class RouteEdit(val key: RouteKey, val expected: RouteValue, val value: RouteValue)
 public data class RoutingReport(val changed: List<RouteKey>, val unchanged: List<RouteKey>)
 public enum class RoutingErrorKind { SESSION, INVALID, UNSUPPORTED_TOPOLOGY, DRIFT, CONTROL, TRANSACTION, SCARLETT }
@@ -43,6 +61,18 @@ public class RoutingException @JvmOverloads constructor(public val kind: Routing
  * Call these blocking methods off the main thread. At most eight snapshots are retained.
  */
 public class DacRouting internal constructor(private val dac: Long, private val checkOpen: () -> Unit) {
+    @Volatile private var handBackState: RoutingHandBackState = RoutingHandBackState.NotClosed
+    /** Retained independently of snapshots and the USB connection after close. */
+    public val handBack: RoutingHandBackState get() = handBackState
+    internal fun beginHandBack(tokenAvailable: Boolean) {
+        handBackState = if (tokenAvailable) RoutingHandBackState.Pending
+            else RoutingHandBackState.Unavailable("native retirement token unavailable")
+    }
+    internal fun publishHandBack(token: Long) {
+        if (token == 0L) return
+        handBackState = try { parseRoutingHandBack(Native.dacRetirementRoutingReport(token)) }
+            catch (error: Throwable) { RoutingHandBackState.Unavailable(error.message ?: "routing hand-back report unavailable") }
+    }
     public val pioneer: PioneerDjmRouting = PioneerDjmRouting(dac, checkOpen)
     public val scarlett: ScarlettRouting = ScarlettRouting(dac, checkOpen)
 
@@ -55,7 +85,7 @@ public class DacRouting internal constructor(private val dac: Long, private val 
             RouteControl(parseKey(it.getJSONObject("key")), RouteAccess.valueOf(it.getString("access").uppercase()),
                 it.getJSONArray("sources").let { array -> (0 until array.length()).map(array::getInt) })
         }
-        return RoutingSnapshot(this, value.getLong("snapshot_id"), value.getInt("configuration_id"), controls)
+        return RoutingSnapshot(this, value.getLong("snapshot_id"), value.getInt("configuration_id"), controls, parseRoutingDiagnostics(value))
     }
     /** Reacquire a scoped ADC3 lease when explicitly requested; snapshots hold no power. */
     @JvmOverloads
@@ -75,6 +105,28 @@ public class DacRouting internal constructor(private val dac: Long, private val 
     private fun check(snapshot: RoutingSnapshot) {
         checkOpen()
         require(snapshot.owner === this) { "routing snapshot belongs to another session" }
+    }
+}
+internal fun parseRoutingDiagnostics(value: JSONObject): List<RoutingDiagnostic> {
+    val diagnostics = value.optJSONArray("diagnostics") ?: return emptyList()
+    return (0 until diagnostics.length()).mapNotNull { index ->
+        val item = diagnostics.optJSONObject(index) ?: return@mapNotNull null
+        val interfaceId = item.opt("interface") as? Number ?: return@mapNotNull null
+        val detail = item.opt("detail") as? String ?: return@mapNotNull null
+        RoutingDiagnostic(interfaceId.toInt(), (item.opt("entity") as? Number)?.toInt(), detail)
+    }
+}
+internal fun parseRoutingHandBack(json: String): RoutingHandBackState {
+    val value = JSONObject(json)
+    return when (value.getString("status")) {
+        "no_recorded_changes" -> RoutingHandBackState.NoRecordedChanges
+        "complete" -> RoutingHandBackState.Complete(RoutingHandBackReport(value.getJSONArray("controls").objects().map { item ->
+            val raw = item.getString("outcome")
+            val outcome = RoutingHandBackOutcome.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: RoutingHandBackOutcome.UNKNOWN
+            RoutingHandBackControl(parseKey(item.getJSONObject("key")), outcome,
+                (item.opt("detail") as? String), raw)
+        }))
+        else -> RoutingHandBackState.Unavailable("unknown native hand-back status")
     }
 }
 private fun JSONArray.objects(): List<JSONObject> = (0 until length()).map(::getJSONObject)

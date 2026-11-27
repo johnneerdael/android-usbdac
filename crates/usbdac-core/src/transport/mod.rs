@@ -173,6 +173,8 @@ mod types;
 mod uac1_status;
 mod uac2_live_alternate;
 mod usbfs;
+#[doc(hidden)]
+pub use usbfs::badd_descriptor_witness;
 mod vendor_pcm;
 pub(crate) mod volume_hw;
 
