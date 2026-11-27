@@ -1,4 +1,4 @@
-package dev.usbdac.sample.player
+package dev.usbdac.media3
 
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -190,4 +190,83 @@ class UsbDacAudioSinkTest {
         assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(pcm(16, channels = 6)))
         assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(pcm(24)))
     }
+    @Test
+    fun trimsDelayAndPaddingWithoutChangingIntegerPrecisionAcrossGaplessTracks() {
+        for (bits in listOf(16, 24, 32)) {
+            val source = FakeOutputSource()
+            val sink = UsbDacAudioSink(source)
+            val format = pcm(bits).buildUpon().setEncoderDelay(2).setEncoderPadding(3).build()
+            val frameBytes = bits / 8 * 2
+            sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+            sink.play()
+            val expected = java.io.ByteArrayOutputStream()
+            repeat(2) { track ->
+                if (track > 0) sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+                val bytes = ByteArray(frameBytes * 12) { (it + track * 43).toByte() }
+                expected.write(bytes, frameBytes * 2, frameBytes * 7)
+                // Split the leading trim and trailing padding across decoder buffers.
+                for (range in listOf(0 to 1, 1 to 10, 10 to 12)) {
+                    val input = ByteBuffer.allocateDirect((range.second - range.first) * frameBytes)
+                    input.put(bytes, range.first * frameBytes, input.capacity()).flip()
+                    while (!sink.handleBuffer(input, 0, 1)) { /* output always has room */ }
+                }
+            }
+            assertArrayEquals(expected.toByteArray(), source.opened.single().written.toByteArray())
+            sink.playToEndOfStream()
+            assertFalse(sink.isEnded())
+            source.opened.single().drained = true
+            assertTrue(sink.isEnded())
+        }
+    }
+
+    @Test
+    fun paddingBackpressureConsumesEachByteOnceAndSeekDoesNotRepeatEncoderDelay() {
+        val source = FakeOutputSource(room = 4)
+        val sink = UsbDacAudioSink(source)
+        val format = pcm(16).buildUpon().setEncoderDelay(1).setEncoderPadding(2).build()
+        sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+        sink.play()
+        val buffer = audio(10, 4, fill = 7)
+        var retries = 0
+        while (!sink.handleBuffer(buffer, 0, 1)) check(++retries < 20)
+        assertEquals(7 * 4, source.opened.single().written.size())
+        sink.flush()
+        val afterSeek = audio(5, 4, fill = 9)
+        while (!sink.handleBuffer(afterSeek, 5_000_000, 1)) check(++retries < 40)
+        assertEquals(3 * 4, source.opened.single().written.size())
+        source.opened.single().played = 2
+        assertEquals(5_000_045, sink.getCurrentPositionUs(false))
+    }
+
+    @Test
+    fun rawPcmBelowOneFrameIsRejectedRatherThanSilentlyDropped() {
+        val sink = configured(FakeOutputSource())
+        assertThrows(IllegalArgumentException::class.java) {
+            sink.handleBuffer(ByteBuffer.allocateDirect(3), 0, 1)
+        }
+    }
+
+    @Test
+    fun pinnedRendererStreamChangeSequenceKeepsOneStreamAndRendererTimePosition() {
+        val source = FakeOutputSource()
+        val sink = UsbDacAudioSink(source)
+        val format = pcm(24, rate = 48_000).buildUpon().setEncoderDelay(2).setEncoderPadding(3).build()
+        // MediaCodecRenderer.setOutputStreamInfo -> renderer forwards offset, then configures raw output.
+        sink.setOutputStreamOffsetUs(1_000_000)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+        sink.play()
+        assertTrue(sink.handleBuffer(audio(12, 6, 1), 1_000_000, 1))
+        // Last old-stream buffer completes -> processed stream change -> first reused-codec format.
+        sink.setOutputStreamOffsetUs(1_000_145)
+        sink.handleDiscontinuity()
+        sink.configure(AudioSink.AudioSinkConfig.Builder(format).build())
+        assertTrue(sink.handleBuffer(audio(12, 6, 2), 1_000_145, 1))
+        val out = source.opened.single()
+        assertEquals(14 * 6, out.written.size())
+        out.played = 14
+        assertEquals(1_000_291, sink.getCurrentPositionUs(false))
+        assertFalse(out.calls.contains("flush"))
+        assertFalse(out.calls.contains("drain"))
+    }
+
 }

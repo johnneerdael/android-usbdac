@@ -1,5 +1,7 @@
 package dev.usbdac.sample.player
 
+import dev.usbdac.media3.*
+
 import android.content.Intent
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -32,7 +34,7 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         outputs = PlayerModule.outputs(this)
         player = PlayerModule.player(this, outputs)
-        session = MediaSession.Builder(this, DacVolumePlayer(player, outputs, scope)).build()
+        session = MediaSession.Builder(this, DacVolumePlayer(player, outputs.volume, scope)).build()
 
         // A DAC attached, detached or allowed, or a route that came or went. One plug raises several.
         // Nothing moves now: the output is chosen again at the next seek, skip or format change.

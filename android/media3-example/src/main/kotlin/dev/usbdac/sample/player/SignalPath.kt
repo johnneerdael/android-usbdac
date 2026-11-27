@@ -1,5 +1,7 @@
 package dev.usbdac.sample.player
 
+import dev.usbdac.media3.*
+
 import dev.usbdac.BitPerfectState
 import dev.usbdac.OutputKind
 import dev.usbdac.SelectedOutput

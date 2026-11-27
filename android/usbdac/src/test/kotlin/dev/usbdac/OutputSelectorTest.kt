@@ -914,4 +914,22 @@ class SelectedOutputTest {
         output.close()
         assertEquals("closing again does nothing", listOf("output", "session"), order)
     }
+    @Test
+    fun wideningOnlyRequiresLosslessPlanAndNeverTriesAnotherRateOrNarrowerDepth() {
+        for (proof in listOf("bit_exact", "lossy")) {
+            val platform = FakePlatform()
+            val link = platform.attach(fakeDac())
+            link.capabilities = fakeCapabilities(depths = listOf(16, 24, 32))
+            link.onNegotiate = { request ->
+                if (request.bitDepth != 32) throw unsupported()
+                fakeFormat(request.sampleRate, 32, 4)
+            }
+            platform.planKind = proof
+            val decision = selector(platform, OutputPolicy(allowWidening = true)).select(PCM_44_16)
+            assertEquals(if (proof == "bit_exact") OutputKind.DIRECT_USB else OutputKind.AAUDIO_EXCLUSIVE, decision.kind)
+            assertTrue(link.negotiated.all { it.ratePolicy == RatePolicy.EXACT })
+            assertTrue(link.negotiated.all { it.bitDepth >= 16 })
+        }
+    }
+
 }

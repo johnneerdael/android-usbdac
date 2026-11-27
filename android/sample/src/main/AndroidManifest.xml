@@ -5,11 +5,6 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
-    <!-- The player's media service (docs/sdk/guide-kotlin.md). -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
     <application
         android:allowBackup="false"
         android:label="usbdac sample"
@@ -33,13 +28,5 @@
                 android:resource="@xml/device_filter" />
         </activity>
 
-        <service
-            android:name=".player.PlaybackService"
-            android:exported="true"
-            android:foregroundServiceType="mediaPlayback">
-            <intent-filter>
-                <action android:name="androidx.media3.session.MediaSessionService" />
-            </intent-filter>
-        </service>
     </application>
 </manifest>

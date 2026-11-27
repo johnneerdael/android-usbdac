@@ -41,6 +41,16 @@ dependencies {
 }
 ```
 
+For ExoPlayer/Media3, add the optional integration at the same version. It brings the base SDK transitively; plain PCM apps need only `usbdac`.
+
+```gradle
+dependencies {
+    implementation("dev.usbdac:usbdac-media3:0.1.6")
+}
+```
+
+See [the Kotlin player guide](guide-kotlin.md) for the integer-precision sink, gapless trimming and session volume. The base AAR and sample app do not depend on Media3. When downloading AARs directly, include both core and integration AARs plus their declared Maven dependencies; a standalone AAR does not resolve dependencies automatically.
+
 For a download without registry credentials, put `usbdac-0.1.6.aar`
 from the [0.1.6 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.6)
 in your app module's `libs/` directory. Use these dependencies in place of

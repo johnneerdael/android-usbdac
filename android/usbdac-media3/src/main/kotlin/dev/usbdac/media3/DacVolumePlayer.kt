@@ -1,5 +1,8 @@
-package dev.usbdac.sample.player
+package dev.usbdac.media3
 
+import android.os.Handler
+import android.os.Looper
+import androidx.media3.common.FlagSet
 import androidx.media3.common.DeviceInfo
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.Player
@@ -31,31 +34,48 @@ import kotlin.math.roundToInt
 @kotlin.OptIn(ExperimentalCoroutinesApi::class)
 class DacVolumePlayer(
     player: Player,
-    private val outputs: DirectOutputController,
+    volumes: kotlinx.coroutines.flow.StateFlow<DacVolume?>,
     scope: CoroutineScope,
 ) : ForwardingPlayer(player) {
+    private val applicationHandler = Handler(player.applicationLooper)
     private val listeners = CopyOnWriteArrayList<Player.Listener>()
-    private var volume: DacVolume? = null
+    private var volume: DacVolume? = volumes.value
 
     init {
         // The DAC's volume appears when a direct output opens and goes when it closes.
-        outputs.selected
-            .map { it?.volume }
-            .distinctUntilChanged()
+        volumes
             .onEach { next ->
-                volume = next
-                listeners.forEach {
-                    it.onDeviceInfoChanged(getDeviceInfo())
-                    it.onAvailableCommandsChanged(getAvailableCommands())
-                    it.onDeviceVolumeChanged(getDeviceVolume(), isDeviceMuted())
+                onApplicationThread {
+                    volume = next
+                    val events = Player.Events(FlagSet.Builder().addAll(
+                        Player.EVENT_DEVICE_INFO_CHANGED, Player.EVENT_AVAILABLE_COMMANDS_CHANGED,
+                        Player.EVENT_DEVICE_VOLUME_CHANGED).build())
+                    listeners.forEach {
+                        it.onDeviceInfoChanged(getDeviceInfo())
+                        it.onAvailableCommandsChanged(getAvailableCommands())
+                        it.onDeviceVolumeChanged(getDeviceVolume(), isDeviceMuted())
+                        it.onEvents(this, events)
+                    }
                 }
             }
             .launchIn(scope)
         // The level changes from this app's slider, a key or the panel: tell the session.
-        outputs.selected
-            .flatMapLatest { it?.volume?.state ?: flowOf(null) }
-            .onEach { listeners.forEach { it.onDeviceVolumeChanged(getDeviceVolume(), isDeviceMuted()) } }
+        volumes
+            .flatMapLatest { it?.state ?: flowOf(null) }
+            .onEach {
+                onApplicationThread {
+                    val events = Player.Events(FlagSet.Builder().add(Player.EVENT_DEVICE_VOLUME_CHANGED).build())
+                    listeners.forEach {
+                        it.onDeviceVolumeChanged(getDeviceVolume(), isDeviceMuted())
+                        it.onEvents(this, events)
+                    }
+                }
+            }
             .launchIn(scope)
+    }
+
+    private fun onApplicationThread(action: () -> Unit) {
+        if (Looper.myLooper() == applicationLooper) action() else applicationHandler.post { action() }
     }
 
     override fun addListener(listener: Player.Listener) {
@@ -87,16 +107,16 @@ class DacVolumePlayer(
     }
 
     override fun getDeviceVolume(): Int =
-        volume?.let { (it.state.value.fraction * MAX).roundToInt() } ?: super.getDeviceVolume()
+        volume?.let { (it.state.value.fraction.takeUnless(Double::isNaN)?.coerceIn(0.0, 1.0)?.times(MAX)?.roundToInt() ?: 0) } ?: super.getDeviceVolume()
 
     override fun isDeviceMuted(): Boolean = volume?.let { it.state.value.muted == true } ?: super.isDeviceMuted()
 
     override fun setDeviceVolume(volume: Int) {
-        this.volume?.setFraction(volume / MAX.toDouble()) ?: super.setDeviceVolume(volume)
+        this.volume?.setFraction(volume.coerceIn(0, MAX) / MAX.toDouble()) ?: super.setDeviceVolume(volume)
     }
 
     override fun setDeviceVolume(volume: Int, flags: Int) {
-        this.volume?.setFraction(volume / MAX.toDouble()) ?: super.setDeviceVolume(volume, flags)
+        this.volume?.setFraction(volume.coerceIn(0, MAX) / MAX.toDouble()) ?: super.setDeviceVolume(volume, flags)
     }
 
     override fun increaseDeviceVolume() {

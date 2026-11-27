@@ -46,10 +46,5 @@ dependencies {
     implementation(project(":usbdac"))
     // Dispatchers.Main for the activity.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
-    // The Media3 player of docs/sdk/guide-kotlin.md (src/main/kotlin/dev/usbdac/sample/player). The
-    // library itself does not depend on Media3; only this sample does.
-    implementation("androidx.media3:media3-exoplayer:1.11.1")
-    implementation("androidx.media3:media3-session:1.11.1")
-
     testImplementation("junit:junit:4.13.2")
 }

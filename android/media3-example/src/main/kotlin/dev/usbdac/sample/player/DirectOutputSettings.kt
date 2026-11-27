@@ -1,5 +1,7 @@
 package dev.usbdac.sample.player
 
+import dev.usbdac.media3.*
+
 import dev.usbdac.DacConfig
 import dev.usbdac.OutputPolicy
 

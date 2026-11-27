@@ -102,6 +102,8 @@ public data class OutputPolicy @JvmOverloads constructor(
     val allowConversion: Boolean = false,
     val dacConfig: DacConfig = DacConfig(),
     val aaudioConfig: AAudioConfig = AAudioConfig(),
+    /** Permit same-rate, same-channel integer widening only, with a lossless conversion plan. */
+    val allowWidening: Boolean = false,
 ) {
     init {
         require(!(force == OutputKind.DIRECT_USB && !allowDirectUsb)) {

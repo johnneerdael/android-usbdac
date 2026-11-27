@@ -55,8 +55,11 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 | `padded24Bit` | `Boolean?` | `null` | Prefer the 4-byte slot for 24-bit PCM. `null`: the device's quirk, else off | None on the samples. It changes the wire layout (`StreamFormat.subslotBytes` becomes 4 and the 24-bit sample sits in the upper three bytes), and you write what the format says |
 | `dsdBigEndian` | `Boolean?` | `null` | Native DSD byte order on the wire. `null`: the device's quirk, else little-endian | None; wrong order is noise from the DAC, which the library cannot detect |
 | `dsdSubslot` | `Int?` | `null` | Slot size (1, 2 or 4) for native DSD alternate settings. `null`: the device's quirk, else the descriptor | None |
+| `asyncFallbackPolicy` | `AsyncFallbackPolicy` | `FULL_SPEED_UAC1` | Permit nominal timing only for the full-speed UAC1 PCM compatibility case; `FORBID` disables that case | Nominal asynchronous output is never bit-perfect |
+| `clockReadbackPolicy` | `ClockReadbackPolicy` | `REQUIRE_VERIFIED` | `ALLOW_UNUSABLE_AFTER_SUCCESSFUL_SET` permits zero/unavailable PCM clock readback after successful SET; positive mismatches still fail | An accepted unusable readback remains unverified |
+| `adaptiveQueue` | `Boolean` | `true` | Adapt the USB queue within native bounds after measured worker stalls | Changes transport buffering, not sample values |
 | `allowUnsynchronizedAsync` | `Boolean` | `false` | Permit an otherwise valid asynchronous route without usable feedback to play at the nominal rate. The host and DAC clocks can drift apart | Never bit-perfect while in use (blocker `UNSYNCHRONIZED_ASYNC`) |
-| `disableFeedback` | `Boolean` | `false` | Disable explicit and implicit feedback for this session. An asynchronous route still needs the nominal-timing opt-in | The same blocker applies if the route uses nominal asynchronous timing |
+| `disableFeedback` | `Boolean` | `false` | Disable explicit and implicit feedback for this session. An asynchronous route still needs an applicable nominal-timing policy | The same blocker applies if the route uses nominal asynchronous timing |
 | `captureFeedbackTrace` | `Boolean` | `false` | Retain a bounded USB feedback support report for the most recent stream. Export it with `DacSession.feedbackTraceJson()` | None |
 
 ### Quirks
@@ -154,7 +157,7 @@ A `ClockChoice` has `controlInterface` (the AudioControl interface the clock req
 | `ImplicitFeedback` | Asynchronous, with a compatible shared-clock IN source | The returned interface, alternate setting and endpoint identify the source. Its packet frame counts pace playback |
 | `Adaptive` | Adaptive | The DAC follows the host's packet timing |
 | `Synchronous` | Synchronous | The DAC and the host share the bus clock |
-| `Unsynchronized` | Asynchronous without usable feedback (streamed only with `allowUnsynchronizedAsync`), or one that declares no synchronisation | The host sends at the nominal rate and nothing comes back. For the asynchronous case this is the `UNSYNCHRONIZED_ASYNC` blocker: never bit-perfect |
+| `Unsynchronized` | Asynchronous without usable feedback (streamed only with an applicable nominal-timing policy), or one that declares no synchronisation | The host sends at the nominal rate and nothing comes back. For the asynchronous case this is the `UNSYNCHRONIZED_ASYNC` blocker: never bit-perfect |
 | `Unknown` | | A value this SDK version does not know, or a native library that predates the field |
 
 Use `format.pacing` for the selected route and `stream.stats()` for its live
@@ -322,6 +325,8 @@ fun idleRelease(scope: CoroutineScope, session: DacSession, request: StreamReque
     return idle
 }
 ```
+
+Closing discards any queued audio the DAC has not played. Record the audible position when pausing. `idle.resume()` returns `IdleResume(output, reopened)` atomically: if `reopened` is true, flush/rebase the host's counters and seek its decoder to that saved audible position before supplying PCM. If false, keep the existing stream and queue without reseeking. `DacIdleRelease` cannot perform the decoder seek itself.
 
 Call `idle.onPaused()` when playback pauses and `idle.onResumed()` when it resumes; the latter returns the stream to write to, the same one or a new one. Reopening costs 100 ms or more (negotiate and open), so the first audio after a long pause is late by that much. `idle.isReleased` is a `StateFlow<Boolean>`. Bit-perfect impact: none; a reopened stream is verified again from scratch.
 

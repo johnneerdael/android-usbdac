@@ -1,4 +1,4 @@
-package dev.usbdac.sample.player
+package dev.usbdac.media3
 
 import android.media.AudioDeviceInfo
 import androidx.media3.common.AudioAttributes
@@ -61,6 +61,14 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     private var layout: SinkLayout? = null
     private var staging: ByteBuffer? = null
 
+    // Integer PCM is retained byte for byte, including the look-behind for encoder padding.
+    private var trimStartBytes = 0L
+    private var trimEndBytes = 0
+    private var trimBuffer: ByteBuffer? = null
+    private var pendingFormat: Format? = null
+    private var receivedFrames = 0L
+    private var trimmedStartFrames = 0L
+
     private var playing = false
     private var endOfStream = false
     private var drainingForSwitch = false
@@ -93,10 +101,24 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     // region sink-configure
     override fun configure(audioSinkConfig: AudioSink.AudioSinkConfig) {
         val format = audioSinkConfig.format
+        audioSinkConfig.outputChannelMapping?.let { mapping ->
+            if (mapping.length() != format.channelCount || (0 until mapping.length()).any { mapping[it] != it }) {
+                throw AudioSink.ConfigurationException("channel remapping is not supported", format)
+            }
+        }
         val bits = bitDepthOf(format.pcmEncoding)
         if (format.sampleMimeType != MimeTypes.AUDIO_RAW || bits == null || format.channelCount !in 1..2) {
             throw AudioSink.ConfigurationException("not integer PCM in one or two channels", format)
         }
+        require(format.sampleRate > 0) { "sample rate must be positive" }
+        require(format.encoderDelay >= 0 && format.encoderPadding >= 0) { "negative encoder trim" }
+        require(format.encoderPadding.toLong() * format.channelCount * (bits / 8) <= MAX_PADDING_BYTES) {
+            "encoder padding exceeds bounded trim storage"
+        }
+        // Renderer output-format changes configure every stream, including decoder reuse.
+        layout?.let { old -> receivedFrames -= (trimBuffer?.position() ?: 0) / old.inputFrameBytes }
+        trimBuffer = null
+        pendingFormat = format
         // Nothing is opened here. The output opens in handleBuffer, after the one in use has played out.
         wanted = Wanted(format, StreamRequest.pcm(format.sampleRate, format.channelCount, bits))
     }
@@ -108,6 +130,15 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (!applyPendingConfiguration()) return false
         val out = active ?: openOutput()
         val frames = layout!!
+        pendingFormat?.let { format ->
+            // The previous handleBuffer returned true only after all non-padding bytes were written.
+            trimStartBytes = format.encoderDelay.toLong() * frames.inputFrameBytes
+            trimEndBytes = Math.multiplyExact(format.encoderPadding, frames.inputFrameBytes)
+            trimBuffer = ByteBuffer.allocateDirect(maxOf(STAGING_BYTES, trimEndBytes + STAGING_BYTES))
+                .order(ByteOrder.LITTLE_ENDIAN)
+            pendingFormat = null
+            endOfStream = false
+        }
 
         if (startMediaTimeUsNeedsInit) {
             startMediaTimeUs = maxOf(0L, presentationTimeUs)
@@ -117,7 +148,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (inputBuffer == null) {
             // The first time this buffer is offered. Check that it follows the audio written so far.
             if (!buffer.hasRemaining()) return true
-            val expectedUs = startMediaTimeUs + durationUs(submittedFrames, frames.rateHz)
+            val expectedUs = startMediaTimeUs + durationUs(receivedFrames - trimmedStartFrames, frames.rateHz)
             if (!startMediaTimeUsNeedsSync && Math.abs(expectedUs - presentationTimeUs) > 200_000) {
                 listener?.onAudioSinkError(AudioSink.UnexpectedDiscontinuityException(presentationTimeUs, expectedUs))
                 startMediaTimeUsNeedsSync = true
@@ -137,7 +168,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             return false
         }
         val done = try {
-            write(out, frames, buffer)
+            writeTrimmed(out, frames, buffer)
         } catch (error: DacException) {
             out.failure = error
             throw writeFailure(error)
@@ -147,11 +178,52 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     }
     // endregion
 
+    /** Holds the track's final padding without rounding, gain, or float conversion. */
+    private fun writeTrimmed(out: OpenedOutput, frames: SinkLayout, buffer: ByteBuffer): Boolean {
+        require(buffer.remaining() % frames.inputFrameBytes == 0) { "partial PCM frame" }
+        if (trimStartBytes > 0) {
+            val skipped = minOf(trimStartBytes, buffer.remaining().toLong()).toInt()
+            buffer.position(buffer.position() + skipped)
+            trimStartBytes -= skipped
+            receivedFrames += skipped / frames.inputFrameBytes
+            trimmedStartFrames += skipped / frames.inputFrameBytes
+        }
+        val held = checkNotNull(trimBuffer)
+        fun pump(): Boolean {
+            held.flip()
+            val fullLimit = held.limit()
+            val playable = (held.remaining() - trimEndBytes).coerceAtLeast(0)
+            held.limit(held.position() + playable)
+            if (playable > 0) write(out, frames, held)
+            val blocked = held.hasRemaining()
+            held.limit(fullLimit)
+            held.compact()
+            return !blocked
+        }
+        if (!pump()) return false
+        if (!buffer.hasRemaining()) return true
+        val targetFrames = out.output.writableBytes / frames.outputFrameBytes
+        var budget = (targetFrames.toLong() * frames.inputFrameBytes + trimEndBytes - held.position()).coerceAtLeast(0)
+        while (buffer.hasRemaining() && budget > 0) {
+            val count = minOf(buffer.remaining().toLong(), held.remaining().toLong(), budget)
+                .toInt() / frames.inputFrameBytes * frames.inputFrameBytes
+            if (count == 0) break
+            val oldLimit = buffer.limit()
+            buffer.limit(buffer.position() + count)
+            held.put(buffer)
+            buffer.limit(oldLimit)
+            receivedFrames += count / frames.inputFrameBytes
+            budget -= count
+            if (!pump()) return false
+        }
+        return !buffer.hasRemaining()
+    }
+
     // region sink-write
     /** Writes as many whole frames as the output wants now. Returns true when [buffer] is used up. */
     private fun write(out: OpenedOutput, frames: SinkLayout, buffer: ByteBuffer): Boolean {
         if (buffer.remaining() < frames.inputFrameBytes) {
-            buffer.position(buffer.limit()) // a partial frame cannot be played
+            require(!buffer.hasRemaining()) { "partial PCM frame" }
             return true
         }
         val wanted = out.output.writableBytes / frames.outputFrameBytes
@@ -199,6 +271,10 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         }
         if (!out.output.isDrained) return false
         closeActive()
+        startMediaTimeUsNeedsInit = true
+        submittedFrames = 0
+        receivedFrames = 0
+        trimmedStartFrames = 0
         return true // handleBuffer opens the new one
     }
 
@@ -213,7 +289,10 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             throw AudioSink.InitializationException("no output can play ${next.request}: ${error.message}", 0, next.format, false, error)
         }
         val write = out.format
-        if (write.subslotBytes < next.request.bitDepth / 8 || write.channels != next.request.channels) {
+        if (write.subslotBytes !in 2..4 || write.subslotBytes < next.request.bitDepth / 8 ||
+            write.validBits !in next.request.bitDepth..(write.subslotBytes * 8) ||
+            write.channels != next.request.channels || write.sampleRate != next.request.sampleRate ||
+            write.counterRateHz != next.request.sampleRate) {
             outputs.close(out)
             throw AudioSink.InitializationException("the output wants ${write}, which is not a widening of ${next.request}", 0, next.format, false, null)
         }
@@ -248,7 +327,8 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         startMediaTimeUsNeedsSync = true
     }
 
-    override fun hasPendingData(): Boolean = (active?.output?.latencyFrames ?: 0L) > 0L
+    override fun hasPendingData(): Boolean =
+        (active?.output?.latencyFrames ?: 0L) > 0L || (trimBuffer?.position() ?: 0) > trimEndBytes
     // endregion
 
     // region sink-transport
@@ -286,6 +366,11 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         startMediaTimeUsNeedsInit = true
         startMediaTimeUsNeedsSync = false
         submittedFrames = 0
+        receivedFrames = 0
+        trimmedStartFrames = 0
+        trimBuffer?.clear()
+        // A seek must not apply the track's encoder delay again. A pending configure still applies it.
+        trimStartBytes = 0
         inputBuffer = null
         endOfStream = false
         drainingForSwitch = false
@@ -333,5 +418,6 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
 
     private companion object {
         const val STAGING_BYTES = 64 * 1024
+        const val MAX_PADDING_BYTES = 16 * 1024 * 1024
     }
 }

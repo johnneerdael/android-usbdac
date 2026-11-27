@@ -1,4 +1,6 @@
-package dev.usbdac.sample.player
+package dev.usbdac.media3
+
+import dev.usbdac.media3.*
 
 import dev.usbdac.BitPerfectState
 import dev.usbdac.DacErrorCode

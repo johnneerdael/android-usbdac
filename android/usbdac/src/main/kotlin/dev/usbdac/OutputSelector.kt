@@ -426,10 +426,22 @@ public class OutputSelector internal constructor(
         } catch (error: DacException) {
             error
         }
-        if (!policy.allowConversion || first.code != DacErrorCode.UNSUPPORTED || request.encoding != StreamEncoding.PCM) throw first
+        if ((!policy.allowConversion && !policy.allowWidening) || first.code != DacErrorCode.UNSUPPORTED || request.encoding != StreamEncoding.PCM) throw first
 
         val available = link.capabilities.pcmBitDepths.distinct()
-        val others = available.filter { it > request.bitDepth }.sorted() + available.filter { it < request.bitDepth }.sortedDescending()
+        val wider = available.filter { it > request.bitDepth }.sorted()
+        if (!policy.allowConversion) {
+            for (depth in wider) {
+                converted(link, request, exact.copy(bitDepth = depth))?.let { candidate ->
+                    val format = candidate.format
+                    if (candidate.plan?.preservesBitPerfect == true && format.sampleRate == request.sampleRate &&
+                        format.channels == request.channels && format.counterRateHz == request.sampleRate &&
+                        format.validBits >= request.bitDepth) return candidate
+                }
+            }
+            throw first
+        }
+        val others = wider + available.filter { it < request.bitDepth }.sortedDescending()
         for (depth in others) {
             converted(link, request, exact.copy(bitDepth = depth))?.let { return it }
         }

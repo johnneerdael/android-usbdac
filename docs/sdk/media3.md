@@ -1,104 +1,37 @@
 # Media3 integration
 
-**This page is guidance, not shipped code.** The SDK has no dependency on Media3 and ships no `AudioSink`. Nothing below has been compiled or run; the Kotlin is an outline of how the pieces map. The method names follow the `AudioSink` interface of Media3 1.x as it stands on the `release` branch at the time of writing (1.12.0-rc01); the interface has changed between versions (for example `configure(AudioSinkConfig)` replaces the deprecated `configure(Format, int, int[])`), so check the version you build with.
+The optional `dev.usbdac:usbdac-media3` AAR publishes `UsbDacAudioSink`, `OutputSource`, `OpenedOutput`, `DacSessionOutputSource` and `DacVolumePlayer`. Use the same version as the base SDK. See [the Kotlin integration guide](guide-kotlin.md) and the compiled [`media3-example`](https://github.com/johnneerdael/android-usbdac/tree/main/android/media3-example).
 
-For a route switch outside the sink, use the SDK's
-[handoff coordinator](automatic-output.md#route-handoff-and-usb-reconnect)
-to drain the current output and recover its media position. The renderer
-still owns decoder positioning and passes buffers to the selected output.
+The module targets Media3 1.11.1's `AudioSink.AudioSinkConfig` API. It deliberately supplies a dedicated sink. `DefaultAudioSink.setAudioOutputProvider` changes the final output beneath its processor chain, where PCM may already have been converted to 16-bit or float. Replacing only that output does not prove preservation of 24- or 32-bit integer precision.
 
-## Why a custom sink
+## Sink contract
 
-Media3's `DefaultAudioSink` creates an `AudioTrack` and runs an `AudioProcessor` chain in front of it: channel mapping, speed change, silence skipping, float conversion and more. That is the Android-managed path, and it is what you want if you are happy with it. To send decoded PCM straight to a DAC through usbdac, implement `AudioSink` yourself and hand it to the renderer (`DefaultRenderersFactory.buildAudioSink` or your own `AudioRendererFactory`). Because `DacStream` and `AndroidManagedOutput` are both a `PcmOutput`, the same sink can drive either.
-
-## The mapping
-
-`handleBuffer` is called on the playback thread with a buffer that must be consumed fully before the next one is offered; it returns whether it did. That fits `PcmOutput.write`, which never blocks and returns how many bytes it took.
-
-| `AudioSink` | `PcmOutput` and the session |
+| Operation | Behavior |
 |---|---|
-| `supportsFormat`, `getFormatSupport` | Directly supported for the PCM encodings you can map to a layout the DAC offers (`capabilities.altSettings`: 16-bit, 24-bit, 32-bit at the format's rate and channel count). Unsupported otherwise, so the renderer decodes to PCM. Float is a conversion the library does not do: unsupported, or accepted knowingly as not bit-perfect |
-| `configure` | Close the previous output. `session.negotiate(StreamRequest.pcm(rate, channels, bits))`, `session.openStream(format)`. Both block for 100 ms or more, so open the `DacSession` ahead of time and keep it. Map a `DacException` to `ConfigurationException`. Build the converter from Media3's PCM layout to the stream's wire layout (see below) |
-| `play` | `output.play()` |
-| `handleBuffer(buffer, presentationTimeUs, count)` | Convert whole frames into a direct staging buffer, `output.write(staging)`, advance `buffer` by the source frames the write consumed, return `!buffer.hasRemaining()`. Remember the first `presentationTimeUs` after `configure` or `flush` as the position anchor |
-| `handleDiscontinuity` | Nothing to do for PCM |
-| `getCurrentPositionUs(sourceEnded)` | `anchorUs + output.playedFrames * 1_000_000 / counterRateHz`; `CURRENT_POSITION_NOT_SET` before the first buffer. `playedFrames` is reset by `flush()`, so set the anchor again after each flush |
-| `playToEndOfStream` | `output.drain()` and remember that it was called |
-| `isEnded` | The drain was requested and `output.isDrained` |
-| `hasPendingData` | `output.latencyFrames > 0`, or not drained |
-| `pause` | `output.pause()` |
-| `flush` | `output.flush()`, forget the anchor and any partly converted data |
-| `reset` | Close the output. Keep the session unless the player is going away |
-| `setVolume` | Do not apply it. Software gain breaks bit-perfect output. Offer the DAC's hardware volume through `DacVolume`, `DacVolumeKeys` and `DacVolumeProvider` instead |
-| `setPlaybackParameters`, `setSkipSilenceEnabled` | Speed and silence skipping change the samples. Keep the parameters at their defaults and say so in `getPlaybackParameters` |
-| `setAudioAttributes`, `setAudioSessionId`, `setAuxEffectInfo`, `enableTunnelingV21`, `disableTunneling` | No `AudioTrack` is involved; accept and ignore |
-| `getAudioTrackBufferSizeUs` | `DacConfig.bufferTargetMs * 1000` |
-| `setListener` | Call `onUnderrun` on `DacEvent.Underrun`, and map `DacEvent.StreamFailed` to the sink's error reporting |
+| Format support | Mono/stereo raw integer PCM at 16, 24 or 32 bits; float/compressed formats rejected |
+| Configure | Retain track delay/padding metadata; open nothing until PCM arrives |
+| Handle buffer | Skip encoder delay, retain trailing padding, write remaining integer bytes with backpressure |
+| Same-format track | Discard previous track's held padding and retain the existing stream |
+| Different format | Drain the old output, close it, then open the replacement |
+| Position | Initial presentation timestamp plus hardware frames played, bounded by submitted frames |
+| Discontinuity | Reconcile the next presentation timestamp against submitted/trimmed input |
+| Flush / seek | Discard pending PCM and padding, reset counters; initial delay is not reapplied without configure |
+| End of stream | Discard encoder padding, drain hardware, wait for `isDrained` |
+| Volume | Forward multiplier to the output owner; PCM bytes stay unchanged |
+| Speed / silence | Keep default speed and no silence skipping |
 
-### Layout conversion
+`OpenedOutput.format` must keep sample rate, channel count and counter rate equal to the request, with at least its bit precision and slot size. Wider slots are filled with zero low bytes (24-bit in four bytes becomes `00 LL MM HH`). Narrowing and resampling cannot be hidden behind a changed sink layout. An output owner that intentionally uses a converting `PcmOutput` reports the source write layout and exposes its conversion/guarantee separately.
 
-Media3 hands over little-endian PCM: `C.ENCODING_PCM_16BIT` as `i16`, `C.ENCODING_PCM_24BIT` as packed 3-byte samples, `C.ENCODING_PCM_32BIT` as `i32`. The stream wants the slot layout in `StreamFormat.subslotBytes` and `validBits`:
+The sink holds at most one bounded staging buffer plus encoder padding (at most 16 MiB). It does not discard malformed partial frames. It retains a partly accepted input buffer until Media3 retries it and maps DAC failures to Media3 write/initialization exceptions.
 
-- 16-bit into a 2-byte slot, 24-bit packed into a 3-byte slot, and 32-bit into a 4-byte slot are plain copies.
-- 24-bit into a 4-byte slot is the sample shifted left by 8 (low byte zero). 16-bit into a 3-byte or 4-byte slot is shifted left to the top of the slot. Both are lossless.
-- Narrowing (32-bit source into a 24-bit slot) drops bits and is not bit-perfect with respect to the source.
+## Volume and lifetime
 
-Ask for the depth the source has and let `negotiate` choose the alternate setting.
+`DacVolumePlayer` takes a `StateFlow<DacVolume?>`, independently of stream selection. Open a `DacSession` before the first track to expose hardware volume immediately; `DacSessionOutputSource` retains that session while its track streams open and close. The core platform `DacVolumeProvider` remains independent of Media3.
 
-## Outline
+Build the base sample without Media3 using `:sample:assembleDebug`. Build the optional foreground-service example using `:media3-example:assembleDebug`. The library has no service manifest declaration and starts no background work by itself.
 
-<!-- uncompiled -->
+The integration is covered by JVM tests for integer byte preservation, delay/padding across decoder buffers and equal-format tracks, backpressure, seek position, changed-format drain, unplug failures and final drain. Hardware decoding, USB timing and Android session-panel behavior require the acceptance procedure in the guide.
 
-```kotlin
-/** An outline of an AudioSink over a PcmOutput. Not compiled. Not complete. */
-class UsbDacAudioSink(
-    private val session: DacSession,
-    private val openOutput: (StreamRequest) -> PcmOutput,   // DacStream or AndroidManagedOutput
-) : AudioSink {
-    private var output: PcmOutput? = null
-    private var counterRateHz = 0
-    private var anchorUs = C.TIME_UNSET
-    private var drainRequested = false
-    private var staging: ByteBuffer? = null
+## Pinned renderer transitions
 
-    override fun configure(config: AudioSinkConfig) {
-        output?.close()
-        val format = config.format
-        val request = StreamRequest.pcm(format.sampleRate, format.channelCount, bitsOf(format.pcmEncoding))
-        try {
-            output = openOutput(request)
-        } catch (error: DacException) {
-            throw AudioSink.ConfigurationException(error, format)
-        }
-        counterRateHz = format.sampleRate
-        anchorUs = C.TIME_UNSET
-        drainRequested = false
-    }
-
-    override fun handleBuffer(buffer: ByteBuffer, presentationTimeUs: Long, encodedAccessUnitCount: Int): Boolean {
-        val out = output ?: return false
-        if (anchorUs == C.TIME_UNSET) anchorUs = presentationTimeUs
-        // Convert whole frames of `buffer` to the wire layout into `staging`, write, and advance `buffer`
-        // by the source frames that were taken. Return true when nothing remains in `buffer`.
-        return convertAndWrite(out, buffer)
-    }
-
-    override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
-        val out = output ?: return AudioSink.CURRENT_POSITION_NOT_SET
-        if (anchorUs == C.TIME_UNSET) return AudioSink.CURRENT_POSITION_NOT_SET
-        return anchorUs + out.playedFrames * 1_000_000L / counterRateHz
-    }
-
-    override fun play() { output?.play() }
-    override fun pause() { output?.pause() }
-    override fun playToEndOfStream() { drainRequested = true; output?.drain() }
-    override fun isEnded() = drainRequested && output?.isDrained == true
-    override fun hasPendingData() = (output?.latencyFrames ?: 0) > 0
-    override fun flush() { output?.flush(); anchorUs = C.TIME_UNSET; drainRequested = false }
-    override fun reset() { output?.close(); output = null }
-    override fun setVolume(volume: Float) = Unit   // the DAC's hardware volume is the volume
-    // ... the remaining AudioSink methods: format support, listener, parameters, tunneling, attributes.
-}
-```
-
-Two things to watch. First, `configure` and the first `handleBuffer` run on the playback thread; a `negotiate` and `openStream` that take 100 ms or more there delay the first audio, so keep the `DacSession` open between tracks and only reopen the stream when the format changes (gapless playback of equal formats needs no new stream: keep writing). Second, `AudioSink.flush` can be called while `handleBuffer` holds a partly consumed buffer; drop the partial conversion state with it.
+The [official 1.11.1 sources](https://dl.google.com/dl/android/maven2/androidx/media3/media3-exoplayer/1.11.1/media3-exoplayer-1.11.1-sources.jar) show `MediaCodecAudioRenderer.onOutputFormatChanged` copying encoder delay/padding into its raw sink format before `configure`. `MediaCodecRenderer` sets `needToNotifyOutputFormatChangeAfterStreamChange` when the stream changes, so even codec reuse notifies the audio renderer for the next stream. The last previous-stream buffer triggers `onProcessedStreamChange`/`handleDiscontinuity`; the first next-stream buffer gets the new configuration. `setOutputStreamOffsetUs` updates output metadata in DefaultAudioSink; it does not subtract from the sink's renderer-time position. The custom sink likewise returns renderer-time positions, which the renderer maps into its period. Seek calls the sink's `flush` before the next output timestamp anchors position.
