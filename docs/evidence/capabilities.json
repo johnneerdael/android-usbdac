@@ -5,7 +5,9 @@
   "playback": true,
   "schema_version": 1,
   "type_i_formats": [
-    "signed_pcm"
+    "signed_pcm",
+    "unsigned_pcm8",
+    "float32"
   ],
   "uac_versions": [
     1,
