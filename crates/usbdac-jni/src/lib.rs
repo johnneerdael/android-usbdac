@@ -18,6 +18,7 @@ mod capture;
 mod capture_json;
 mod routing;
 mod scarlett;
+mod pioneer;
 mod json;
 mod listener;
 mod registry;

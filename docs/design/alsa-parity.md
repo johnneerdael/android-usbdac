@@ -949,8 +949,46 @@ The AAR SHA-256 is
 `9115ae24dc3336023e3fdc90c1ee3acdf3720da23c7bde054386a622a09262ba`.
 Target DJM hardware acceptance remains pending.
 
-ALSA's DJM routing controls use separate model-specific requests for
-capture sources, capture levels, and playback destinations. ALSA reports
-the values it stores in software. A routing implementation should leave
-the mixer's current routing intact at open and distinguish a successful
-write from an observed hardware setting. [ALSA DJM controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_quirks.c#L4202-L4332)
+### Pioneer DJM hardware routing
+
+The five rate-programmed DJMs, the DJM-250MK2 and the DJM-750MK2
+expose their source-backed routing choices through the existing idle USB
+session. The profile lists capture sources by USB stereo pair and the
+mixer's capture level steps. The DJM-250MK2, DJM-450 and DJM-750MK2 also
+list playback destinations. Each option belongs to one model and one
+control. The DJM-850 has its own labels for the LINE and CD/LINE values,
+and the V10 uses a different capture level scale.
+[ALSA DJM options](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_quirks.c#L3888-L4211)
+
+Rust exposes `Dac::djm_routing_discover` and `Dac::djm_routing_apply`.
+Kotlin exposes the same operations through `session.routing.pioneer`
+from a playback, capture or duplex connection. Close streams before
+using these operations. Opening the session and discovering choices
+preserve the mixer's existing settings.
+
+An explicit edit revalidates the open session, exact device and active
+configuration, vendor transport geometry, and owned interface. The
+streaming interface must still be at alternate zero. A single
+zero-payload device request `0x40/0x03` carries the selected model's
+value and index. A successful call means USB acknowledged the write.
+ALSA's getter reads its software value, so hardware state and route
+rollback remain unavailable through this protocol.
+[ALSA DJM request and getter](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_quirks.c#L4245-L4332)
+
+Hardware acceptance should route a distinguishable input to each USB
+pair and change a playback destination on one supported model. Confirm
+the device receives one request for each edit and retains its prior
+settings on open and discovery. Verify that the driver rejects edits
+while a stream is open.
+
+An independent comparison matched all 311 option labels, indexes and wire
+values to the pinned ALSA table. Rust workspace tests, Android arm64 NDK,
+Kotlin unit tests and the sample build passed. The AAR and sample contain
+identical native libraries with both routing JNI methods on all four
+ABIs. The AAR SHA-256 is
+`4ef77f2c2bda998a50ed6382413803e8e9427e19749b06e0e6e75256cc1fa366`.
+Physical DJM routing acceptance remains pending.
+
+The DJM-A9 has separate PCM and routing entries in ALSA. Verify its USB
+wire cadence before adding it to the supported sessions for this API.
+[ALSA DJM-A9 addition](https://github.com/torvalds/linux/commit/5289d00696396224507ee083f5aee6119569c8d3)

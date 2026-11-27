@@ -35,19 +35,20 @@ public class RoutingException(public val kind: RoutingErrorKind, message: String
     public val controlFailure: RoutingControlFailure?, public val rollbackFailures: List<RoutingRollbackFailure>) : Exception(message)
 
 /**
- * Routing through this session's checked native snapshot, while idle. No vendor request access.
+ * Typed routing through this session's checked native controls while idle.
  * Native serialization excludes playback, capture and clock negotiation; stopping a caller's
  * stream remains explicit. The configured HandBack policy controls route restoration.
  * Call these blocking methods off the main thread. At most eight snapshots are retained.
  */
 public class DacRouting internal constructor(private val dac: Long, private val checkOpen: () -> Unit) {
+    public val pioneer: PioneerDjmRouting = PioneerDjmRouting(dac, checkOpen)
     public val scarlett: ScarlettRouting = ScarlettRouting(dac, checkOpen)
 
     /** Explicit opt-in wakes affected full ADC3 domains temporarily; default never wakes. */
     @JvmOverloads
     public fun discover(powered: Boolean = false): RoutingSnapshot {
         checkOpen()
-        val value = response { if (powered) Native.routingDiscoverPowered(dac) else Native.routingDiscover(dac) }
+        val value = routingResponse { if (powered) Native.routingDiscoverPowered(dac) else Native.routingDiscover(dac) }
         val controls = value.getJSONArray("controls").objects().map {
             RouteControl(parseKey(it.getJSONObject("key")), RouteAccess.valueOf(it.getString("access").uppercase()),
                 it.getJSONArray("sources").let { array -> (0 until array.length()).map(array::getInt) })
@@ -58,7 +59,7 @@ public class DacRouting internal constructor(private val dac: Long, private val 
     @JvmOverloads
     public fun read(snapshot: RoutingSnapshot, key: RouteKey, powered: Boolean = false): RouteValue {
         check(snapshot)
-        return parseValue(response { if (powered) Native.routingReadPowered(dac, snapshot.handle, key.json().toString()) else Native.routingRead(dac, snapshot.handle, key.json().toString()) })
+        return parseValue(routingResponse { if (powered) Native.routingReadPowered(dac, snapshot.handle, key.json().toString()) else Native.routingRead(dac, snapshot.handle, key.json().toString()) })
     }
     /** Preserve verified routing/rollback semantics while temporarily waking ADC3 domains. */
     @JvmOverloads
@@ -66,7 +67,7 @@ public class DacRouting internal constructor(private val dac: Long, private val 
         check(snapshot)
         require(edits.size <= 32) { "at most 32 route edits" }
         val json = JSONArray(edits.map { JSONObject().put("key", it.key.json()).put("expected", it.expected.json()).put("value", it.value.json()) })
-        val result = response { if (powered) Native.routingApplyPowered(dac, snapshot.handle, json.toString()) else Native.routingApply(dac, snapshot.handle, json.toString()) }
+        val result = routingResponse { if (powered) Native.routingApplyPowered(dac, snapshot.handle, json.toString()) else Native.routingApply(dac, snapshot.handle, json.toString()) }
         return RoutingReport(result.getJSONArray("changed").objects().map(::parseKey), result.getJSONArray("unchanged").objects().map(::parseKey))
     }
     private fun check(snapshot: RoutingSnapshot) {
@@ -100,7 +101,7 @@ private fun controlFailure(value: JSONObject): RoutingControlFailure = RoutingCo
     RoutingControlErrorKind.valueOf(value.getString("kind").uppercase()), value.optString("detail").takeIf { it.isNotEmpty() },
     (value.opt("expected") as? Number)?.toInt(), (value.opt("actual") as? Number)?.toInt(),
     value.optJSONObject("expected")?.let(::parseValue), value.optJSONObject("actual")?.let(::parseValue))
-private fun response(call: () -> String): JSONObject = nativeCall {
+internal fun routingResponse(call: () -> String): JSONObject = nativeCall {
     val result = JSONObject(call())
     result.optJSONObject("error")?.let { error ->
         throw RoutingException(RoutingErrorKind.valueOf(error.getString("kind").uppercase()), error.getString("detail"),

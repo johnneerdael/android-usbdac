@@ -41,7 +41,7 @@ fn control_error(error: &RoutingError<String>) -> Value {
         RoutingError::ReadbackMismatch{expected,actual} => json!({"kind":"readback_mismatch","expected":value_json(*expected),"actual":value_json(*actual)}),
     }
 }
-fn failure(error: RoutingSessionError) -> Value {
+pub(super) fn failure(error: RoutingSessionError) -> Value {
     let detail = error.to_string();
     let mut value = match error {
         RoutingSessionError::Session(e) => json!({"kind":"session","session_code":e.code()}),

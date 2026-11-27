@@ -18,6 +18,56 @@ import org.junit.Test
 
 class ModelParsingTest {
     @Test
+    fun pioneerDjmProfilesPreserveSparseChoicesWithoutInferringState() {
+        val owner = PioneerDjmRouting(1L) {}
+        for (model in PioneerDjmModel.entries) {
+            val profile = parsePioneerDjmProfile(owner, JSONObject("""{
+                "model":"${model.wireName}","configuration_id":1,"controls":[
+                    {"key":{"kind":"capture_level"},"options":[{"id":2,"label":"-10 dB"}]},
+                    {"key":{"kind":"capture_source","pair":1},"options":[{"id":7,"label":"CH1 Post Fader"}]},
+                    {"key":{"kind":"playback_destination","pair":5},"options":[{"id":3,"label":"AUX"}]}
+                ]}"""))
+            assertEquals(model, profile.model)
+            assertEquals(1, profile.configurationId)
+            assertEquals(PioneerDjmControlKey.CaptureLevel, profile.controls[0].key)
+            assertEquals(PioneerDjmControlKey.CaptureSource(1), profile.controls[1].key)
+            assertEquals(PioneerDjmControlKey.PlaybackDestination(5), profile.controls[2].key)
+            assertEquals(listOf(PioneerDjmOption(7, "CH1 Post Fader")), profile.controls[1].options)
+        }
+        assertEquals(PioneerDjmRouting::class.java, DacRouting::class.java.getMethod("getPioneer").returnType)
+        assertEquals(PioneerDjmProfile::class.java, PioneerDjmRouting::class.java.getMethod("discover").returnType)
+        assertEquals(Void.TYPE, PioneerDjmRouting::class.java.getMethod("apply", PioneerDjmProfile::class.java,
+            PioneerDjmControlKey::class.java, PioneerDjmOption::class.java).returnType)
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("pioneerDjmDiscover",
+            Long::class.javaPrimitiveType).returnType)
+        assertEquals(String::class.java, dev.usbdac.internal.Native::class.java.getMethod("pioneerDjmApply",
+            Long::class.javaPrimitiveType, String::class.java).returnType)
+    }
+
+    @Test
+    fun pioneerDjmRejectsForeignProfilesAbsentControlsAndUnadvertisedOptionsBeforeNative() {
+        val owner = PioneerDjmRouting(1L) {}
+        val foreign = PioneerDjmRouting(2L) {}
+        val key = PioneerDjmControlKey.CaptureSource(1)
+        val option = PioneerDjmOption(7, "CH1 Post Fader")
+        val profile = PioneerDjmProfile(owner, PioneerDjmModel.DJM_450, 1,
+            listOf(PioneerDjmControl(key, listOf(option))))
+        for (invalid in listOf<() -> Any>(
+            { foreign.apply(profile, key, option) },
+            { owner.apply(profile, PioneerDjmControlKey.CaptureSource(2), option) },
+            { owner.apply(profile, key, PioneerDjmOption(8, "Other")) },
+            { owner.apply(profile, key, option.copy(label = "Invented")) },
+            { PioneerDjmControlKey.CaptureSource(0) },
+            { PioneerDjmControlKey.PlaybackDestination(256) },
+            { PioneerDjmOption(-1, "Invalid") },
+            { parsePioneerDjmKey(JSONObject("""{"kind":"capture_level","pair":0}""")) },
+            { parsePioneerDjmKey(JSONObject("""{"kind":"selector","pair":1}""")) },
+        )) {
+            assertTrue(runCatching { invalid() }.exceptionOrNull() is IllegalArgumentException)
+        }
+    }
+
+    @Test
     fun gen1ReadbackPreservesModelSignedSourcesRawGainAndTypedEntryPoints() {
         for (model in Gen1Model.entries) {
             val v = parseGen1Readback(JSONObject().put("model", model.name.lowercase())

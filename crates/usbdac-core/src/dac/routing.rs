@@ -5,6 +5,30 @@ use crate::routing::{
 use crate::transport::routing_hw;
 
 impl Dac {
+    /// Discover source-backed DJM choices on an exact, idle vendor PCM session.
+    /// Discovery leaves the mixer's routing intact.
+    pub fn djm_routing_discover(
+        &self,
+    ) -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::djm_discover(&self.shared)
+    }
+
+    /// Send one explicitly selected DJM option after fresh model, configuration,
+    /// claim and idle-alternate proof. `option` is a listed zero-based option ID.
+    /// Success confirms USB acknowledgement. The mixer's current routing
+    /// remains unknown through this protocol.
+    pub fn djm_routing_apply(
+        &self,
+        model: crate::pioneer::DjmModel,
+        configuration: u8,
+        key: crate::pioneer::DjmControlKey,
+        option: u8,
+    ) -> Result<(), RoutingSessionError> {
+        self.shared.ensure_open().map_err(RoutingSessionError::Session)?;
+        routing_hw::djm_apply(&self.shared, model, configuration, key, option)
+    }
+
     /// Read source-backed first-generation Focusrite controls using the already
     /// claimed AudioControl interface while idle. No vendor claim or probe write.
     /// Hardware behavior remains physically unvalidated.

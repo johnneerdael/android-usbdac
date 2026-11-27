@@ -1,6 +1,7 @@
-//! Session-bound standard UAC1/UAC2/full ADC3 routing. No vendor commands or extra claims.
+//! Session-bound standard UAC routing and explicitly selected vendor controls.
 
 use super::*;
+use crate::error::OrControl;
 use crate::routing::{
     self, Access, ControlKey, ControlRequest, InputCluster, InvalidRoute, MixerUnit, RouteChange,
     RouteReport, RouteValue, RoutingError, RoutingInventory, RoutingIo, RoutingUnit, SelectorUnit,
@@ -66,6 +67,111 @@ impl std::fmt::Display for RoutingSessionError {
     }
 }
 impl std::error::Error for RoutingSessionError {}
+
+fn djm_usb_error(error: rusb::Error) -> RoutingSessionError {
+    RoutingSessionError::Session(match error {
+        rusb::Error::NoDevice => Error::DeviceLost,
+        _ => Error::Control(error.to_string()),
+    })
+}
+
+/// Called only while the session gate, controls mutex and idle owner are held.
+/// Descriptor proof reuses streaming admission; a USB ID alone authorizes nothing.
+fn djm_route_identity(
+    device: &UsbDevice,
+    idle: &IdleLock,
+    info: &crate::DeviceInfo,
+) -> Result<(crate::pioneer::DjmModel, u8), RoutingSessionError> {
+    let usb = idle.handle.device();
+    let identity = usb.device_descriptor().map_err(djm_usb_error)?;
+    if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id
+        || identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id
+    {
+        return Err(RoutingSessionError::Drift("DJM host and live USB identities differ".into()));
+    }
+    let model = crate::pioneer::DjmModel::from_usb_id(identity.vendor_id(), identity.product_id())
+        .ok_or_else(|| RoutingSessionError::UnsupportedTopology("no supported DJM routing model".into()))?;
+    let configuration = idle.handle.active_configuration().map_err(djm_usb_error)?;
+    let config = usb.active_config_descriptor().map_err(djm_usb_error)?;
+    if config.number() != configuration || info.configuration_id.is_some_and(|id| id != configuration) {
+        return Err(RoutingSessionError::Drift("DJM selected and active configurations differ".into()));
+    }
+    let profile = vendor_pcm::discover(&idle.handle, &config, resolve_device_speed(&usb))
+        .or_control().map_err(RoutingSessionError::Session)?
+        .ok_or_else(|| RoutingSessionError::UnsupportedTopology("DJM routing requires a proven vendor PCM configuration".into()))?;
+    if profile.configuration_number != configuration
+        || !profile.claims_match(&device.claimed_interfaces)
+        || !profile.claims_match(&idle.claimed_interfaces)
+    {
+        return Err(RoutingSessionError::Session(Error::Claim(
+            "DJM routing requires exactly the proven vendor PCM interface claims".into(),
+        )));
+    }
+    if idle.handle.active_configuration().map_err(djm_usb_error)? != configuration {
+        return Err(RoutingSessionError::Drift("DJM active configuration changed during proof".into()));
+    }
+    Ok((model, configuration))
+}
+
+pub(crate) fn djm_discover(shared: &crate::dac::DacShared)
+    -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    shared.ensure_open().map_err(RoutingSessionError::Session)?;
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let idle = IDLE_LOCK.lock();
+    let idle = idle.as_ref().filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| RoutingSessionError::Session(Error::InvalidState("DJM routing requires the idle USB owner".into())))?;
+    let (model, configuration) = djm_route_identity(&device, idle, &shared.info)?;
+    Ok(crate::pioneer::DjmRoutingProfile { model, configuration, controls: model.controls() })
+}
+
+pub(crate) fn djm_apply(
+    shared: &crate::dac::DacShared,
+    model: crate::pioneer::DjmModel,
+    configuration: u8,
+    key: crate::pioneer::DjmControlKey,
+    option: u8,
+) -> Result<(), RoutingSessionError> {
+    let _gate = USB_SESSION_GATE.lock();
+    shared.ensure_open().map_err(RoutingSessionError::Session)?;
+    let _controls = HARDWARE_VOLUME_MUTEX.lock();
+    let device = idle_device()?;
+    let idle = IDLE_LOCK.lock();
+    let idle = idle.as_ref().filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| RoutingSessionError::Session(Error::InvalidState("DJM routing requires the idle USB owner".into())))?;
+    let actual = djm_route_identity(&device, idle, &shared.info)?;
+    if actual != (model, configuration) {
+        return Err(RoutingSessionError::Drift("DJM model or configuration changed; rediscover routing".into()));
+    }
+    let (value, index) = model.request(key, option).ok_or_else(|| {
+        RoutingSessionError::Session(Error::InvalidArgument("unsupported DJM control or option ID".into()))
+    })?;
+    // Every admitted DJM has exactly interface 0; derive the interface set from
+    // fresh streaming proof rather than adding a vendor/Android claim.
+    for interface in idle.claimed_interfaces.iter().copied() {
+        let mut alternate = [0u8];
+        let read = idle.handle.read_control(0x81, 0x0a, 0, u16::from(interface),
+            &mut alternate, Duration::from_millis(500)).map_err(djm_usb_error)?;
+        if read != 1 || alternate[0] != 0 {
+            return Err(RoutingSessionError::Session(Error::InvalidState(
+                "DJM routing requires verified idle alternate zero".into(),
+            )));
+        }
+    }
+    if idle.handle.active_configuration().map_err(djm_usb_error)? != configuration {
+        return Err(RoutingSessionError::Drift("DJM configuration changed before option write".into()));
+    }
+    shared.ensure_open().map_err(RoutingSessionError::Session)?;
+    let written = idle.handle.write_control(0x40, 0x03, value, index, &[],
+        Duration::from_millis(500)).map_err(djm_usb_error)?;
+    if written != 0 {
+        return Err(RoutingSessionError::Session(Error::Control(
+            "DJM option request returned an unexpected payload length".into(),
+        )));
+    }
+    Ok(())
+}
 
 /// Return one unambiguous, exact-model optional vendor claim. This is admission
 /// of an already opted-in host claim, never an instruction to acquire a claim.
