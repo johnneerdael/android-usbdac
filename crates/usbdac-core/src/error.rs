@@ -3,6 +3,16 @@
 use crate::capabilities::AltSetting;
 use std::fmt;
 
+/// Host-side USB admission failure; it does not by itself identify a DAC fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum HostUsbFailureKind {
+    AccessDenied,
+    InUse,
+    DeviceLost,
+    NotSupported,
+    Other,
+}
+
 /// Everything the public API can fail with.
 ///
 /// [`Error::code`] returns a stable machine-readable identifier for each
@@ -18,6 +28,12 @@ pub enum Error {
     /// The file descriptor could not be used, or the interfaces the host
     /// claimed do not match what the library needs to drive the device.
     Claim(String),
+    /// A macOS libusb open, whole-device capture, or interface claim failed.
+    HostUsb {
+        operation: String,
+        kind: HostUsbFailureKind,
+        detail: String,
+    },
     /// The DAC offers no alternate setting that can carry the request.
     /// `offered` lists what it does offer.
     Unsupported {
@@ -72,6 +88,7 @@ impl Error {
             Self::Busy => "busy",
             Self::PlatformUnsupported => "platform_unsupported",
             Self::Claim(_) => "claim",
+            Self::HostUsb { .. } => "host_usb",
             Self::Unsupported { .. } => "unsupported",
             Self::ImplicitFeedbackUnsupported => "implicit_feedback_unsupported",
             Self::ClockUnverified { .. } => "clock_unverified",
@@ -93,6 +110,7 @@ impl Error {
             Self::PlatformUnsupported => {
                 "direct USB output needs Linux usbfs (Android or Linux)".to_string()
             }
+            Self::HostUsb { operation, kind, detail } => format!("{operation}: {kind:?}: {detail}"),
             Self::Claim(m)
             | Self::Transfer(m)
             | Self::Control(m)

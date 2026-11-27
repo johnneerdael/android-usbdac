@@ -3,7 +3,7 @@
 use super::alternate_controls::advertised_controls;
 use super::iso::InterruptTransferSlot;
 use super::uac1_status::{StreamWatch, Uac1Status};
-use super::usbfs::{ClaimedHandle, UsbfsControlTransfer, USBDEVFS_CONTROL};
+use super::usbfs::{source_control, ClaimedHandle, UsbfsControlTransfer};
 use super::{ClockChoice, Direction, Error, TransferType, UsageType};
 use crate::clock_resolution::{ClockHopKind, ClockResolution};
 use crate::descriptors::DescriptorIter;
@@ -1011,19 +1011,18 @@ fn raw_read_control(
     };
     // Use the owning usbfs fd: synchronous control I/O must not become a second
     // consumer of libusb's isochronous completion queue.
-    let result = unsafe { libc::ioctl(claimed.device_fd, USBDEVFS_CONTROL, &transfer) };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
+    let result = source_control(claimed.device_fd, Some(&claimed.handle), &transfer);
+    let result = result.map_err(|error| {
         if matches!(
             error.raw_os_error(),
             Some(libc::ENODEV) | Some(libc::ESHUTDOWN)
         ) {
-            return Err(Error::DeviceLost);
+            return Error::DeviceLost;
         }
-        return Err(Error::Control(format!(
+        Error::Control(format!(
             "Audio status read ({request_type:#04x}, {request:#04x}, {value:#06x}, {index:#06x}): {error}"
-        )));
-    }
+        ))
+    })?;
     if Instant::now() >= deadline {
         return Err(verification_expired());
     }

@@ -5,6 +5,7 @@ use std::{cell::RefCell, collections::HashMap, marker::PhantomData, rc::Rc, sync
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct AttachmentIdentity {
+    backend: u8,
     device: u128,
     inode: u128,
 }
@@ -84,9 +85,31 @@ impl SessionContext {
         // SAFETY: successful fstat initialized the entire stat structure.
         let stat = unsafe { stat.assume_init() };
         let identity = AttachmentIdentity {
+            backend: 0,
             device: stat.st_dev as u128,
             inode: stat.st_ino as u128,
         };
+        Self::reserve_identity(identity)
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reserve_darwin(device: &Device<Context>) -> Result<Arc<Self>, Error> {
+        // Bus, address, and physical port chain identify the live attachment
+        // across separate libusb contexts. Retain the libusb device separately
+        // for all I/O; never reopen by this key.
+        let ports = device
+            .port_numbers()
+            .map_err(|error| Error::Claim(format!("USB port path: {error}")))?;
+        let mut topology = 0u128;
+        for port in ports.iter().copied() {
+            topology = (topology << 8) | u128::from(port);
+        }
+        Self::reserve_identity(AttachmentIdentity {
+            backend: 1,
+            device: (u128::from(device.bus_number()) << 8) | u128::from(device.address()),
+            inode: (topology << 8) | ports.len() as u128,
+        })
+    }
+    fn reserve_identity(identity: AttachmentIdentity) -> Result<Arc<Self>, Error> {
         let mut registry = REGISTRY.lock();
         registry.owners.retain(|_, owner| owner.strong_count() > 0);
         if registry
@@ -110,9 +133,13 @@ impl SessionContext {
         }
     }
     pub(super) fn volume_key(&self) -> Option<String> {
-        self.identity
-            .lock()
-            .map(|id| format!("usbfs:{}:{}", id.device, id.inode))
+        self.identity.lock().map(|id| {
+            if id.backend == 0 {
+                format!("usbfs:{}:{}", id.device, id.inode)
+            } else {
+                format!("darwin:{}", id.device)
+            }
+        })
     }
     /// Consume a remembered-level lease only after successful DAC admission.
     pub(crate) fn admit(&self) {
@@ -127,7 +154,9 @@ impl SessionContext {
         if let Some(identity) = self.identity.lock().take() {
             let mut registry = REGISTRY.lock();
             let remembered = &mut registry.remembered;
-            if self.keep_original.load(Ordering::Acquire) && !self.original_volume.lock().is_empty()
+            if identity.backend == 0
+                && self.keep_original.load(Ordering::Acquire)
+                && !self.original_volume.lock().is_empty()
             {
                 // Keep semantics preserve only original levels, never a live
                 // transport, claims or an unscoped current-device fallback.
@@ -190,6 +219,7 @@ pub(crate) fn await_connection_retirement(fd: RawFd, timeout: Duration) -> Resul
     // SAFETY: successful fstat initialized stat.
     let stat = unsafe { stat.assume_init() };
     let identity = AttachmentIdentity {
+        backend: 0,
         device: stat.st_dev as u128,
         inode: stat.st_ino as u128,
     };
@@ -326,8 +356,8 @@ mod tests {
         ] {
             let _scope = owner.enter();
             let mut state = fake_dac::state(false, Some(fake_dac::control()));
-            state.device.fd = fd;
-            state.device._fd_owner = Arc::new(OwnedUsbFd(fd));
+            state.device.fd = DeviceKey::Usbfs(fd);
+            state.device._fd_owner = Some(Arc::new(OwnedUsbFd(fd)));
             state.device.device_name = Some(format!("fake-{fd}"));
             let key = original_volume_device_key(&state.device);
             owner
@@ -447,7 +477,7 @@ mod tests {
         // Reuse the existing session model. Its -1 FD owner is a safe sentinel;
         // it observes coordinator ownership, not a real libusb handle.
         let state = super::super::session::test_state(None);
-        let fd_owner = Arc::downgrade(&state.device._fd_owner);
+        let fd_owner = Arc::downgrade(state.device._fd_owner.as_ref().expect("usbfs owner"));
         *owner.session.lock() = Some(state);
         let session_guard = {
             let _scope = owner.enter();

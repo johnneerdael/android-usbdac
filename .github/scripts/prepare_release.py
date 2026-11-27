@@ -9,7 +9,9 @@ import subprocess
 STABLE_VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 WORKSPACE_VERSION = re.compile(r'(?m)(^\[workspace\.package\]\n(?:[^\[\n][^\n]*\n)*?^version = ")([^"\n]+)(")')
 GRADLE_VERSION = re.compile(r"(?m)(^VERSION_NAME=)([^\n]+)()")
-LOCK_VERSION = re.compile(r'(?m)(^name = "usbdac-(?:core|jni)"\nversion = ")([^"\n]+)(")')
+LOCK_VERSION = re.compile(r'(?m)(^name = "usbdac-(?:core|jni|validator)"\nversion = ")([^"\n]+)(")')
+WORKER_LOCK_VERSION = re.compile(r'(?m)(^name = "usbdac-(?:core|validator|validator-worker)"\nversion = ")([^"\n]+)(")')
+WORKER_VERSION = re.compile(r'(?m)(^version = ")([^"\n]+)(")')
 VERSION_FILES = {
     Path("Cargo.toml"): (WORKSPACE_VERSION, 1),
     Path("Cargo.lock"): (LOCK_VERSION, 2),
@@ -19,7 +21,7 @@ PACKAGE_PATHS = (
     "Cargo.toml", "Cargo.lock", "LICENSE", "NOTICE", "crates",
     "android/usbdac", "android/usbdac-media3", "android/build.gradle.kts", "android/settings.gradle.kts",
     "android/gradle.properties", "android/gradle/wrapper", "android/gradlew",
-    "android/gradlew.bat",
+    "android/gradlew.bat", "android/validator", "macos/validator",
 )
 
 
@@ -34,9 +36,18 @@ def version_tuple(version):
     return tuple(int(component) for component in match.groups())
 
 
+def version_files(has_validator):
+    files = dict(VERSION_FILES)
+    if has_validator:
+        files[Path("Cargo.lock")] = (LOCK_VERSION, 3)
+        files[Path("macos/validator/worker/Cargo.toml")] = (WORKER_VERSION, 1)
+        files[Path("macos/validator/worker/Cargo.lock")] = (WORKER_LOCK_VERSION, 3)
+    return files
+
+
 def declared_version():
     versions = []
-    for path, (pattern, count) in VERSION_FILES.items():
+    for path, (pattern, count) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         values = [match[2] for match in pattern.finditer(path.read_text())]
         if len(values) != count:
             raise SystemExit(f"Could not read the usbdac version from {path}")
@@ -56,7 +67,7 @@ def stable_tags(*options):
 
 
 def set_version(old, new, last_release):
-    for path, (pattern, _) in VERSION_FILES.items():
+    for path, (pattern, _) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         path.write_text(pattern.sub(lambda match: match[1] + new + match[3], path.read_text()))
 
     # Keep the shipped integration examples in step with the released version.

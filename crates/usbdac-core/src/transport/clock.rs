@@ -1588,7 +1588,7 @@ pub(super) fn strict_implicit_clock(
 // fields. USB_SESSION_GATE / SessionGuard serialize the lifecycle operations.
 #[derive(Clone)]
 pub(super) struct SelectedClockRoute {
-    fd: RawFd,
+    fd: DeviceKey,
     control: u8,
     streaming: u8,
     plan: crate::clock_resolution::ClockPlan,

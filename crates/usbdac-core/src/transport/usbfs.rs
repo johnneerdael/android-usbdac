@@ -4,6 +4,23 @@ use alternate_controls::{
     MAX_VALID_ALTERNATES_REPLY_LEN,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DeviceKey {
+    Usbfs(RawFd),
+    #[cfg(target_os = "macos")]
+    Darwin(usize),
+}
+
+impl DeviceKey {
+    fn usbfs(self) -> Option<RawFd> {
+        match self {
+            Self::Usbfs(fd) => Some(fd),
+            #[cfg(target_os = "macos")]
+            Self::Darwin(_) => None,
+        }
+    }
+}
+
 pub(super) fn badd_snapshot_matches(
     active_id: u8,
     header: &[u8; 9],
@@ -110,10 +127,90 @@ impl Drop for OwnedUsbFd {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(super) struct DarwinOwner {
+    pub(super) handle: Arc<DeviceHandle<Context>>,
+    pub(super) claimed: Vec<u8>,
+    pub(super) captured: bool,
+}
+#[cfg(target_os = "macos")]
+impl Drop for DarwinOwner {
+    fn drop(&mut self) {
+        for &interface in self.claimed.iter().rev() {
+            match self.handle.release_interface(interface) {
+                Ok(()) => log_info!("[USB] host_usb_handback operation=release_interface interface={interface} result=success"),
+                Err(error) => log_error!("[USB] host_usb_handback operation=release_interface interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error)),
+            }
+        }
+        if self.captured {
+            match self.handle.attach_kernel_driver(0) {
+                Ok(()) => log_info!("[USB] host_usb_handback operation=reattach_kernel_driver result=success"),
+                Err(error) => log_error!("[USB] host_usb_handback operation=reattach_kernel_driver result=error kind={:?} detail={error}; reconnect the USB device to restore its system driver", host_usb_failure_kind(error)),
+            }
+        }
+    }
+}
+
+/// Run a control transfer through the actual source. Darwin uses the same
+/// libusb handle that owns the claims and asynchronous transfers.
+pub(super) fn source_control(
+    key: DeviceKey,
+    handle: Option<&DeviceHandle<Context>>,
+    request: &UsbfsControlTransfer,
+) -> std::io::Result<usize> {
+    if let Some(fd) = key.usbfs() {
+        let result = unsafe { libc::ioctl(fd, USBDEVFS_CONTROL, request) };
+        return if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let handle = handle.expect("Darwin handle");
+        let timeout = Duration::from_millis(u64::from(request.timeout_ms));
+        let data = unsafe {
+            std::slice::from_raw_parts_mut(request.data.cast::<u8>(), usize::from(request.length))
+        };
+        let result = if request.request_type & 0x80 != 0 {
+            handle.read_control(
+                request.request_type,
+                request.request,
+                request.value,
+                request.index,
+                data,
+                timeout,
+            )
+        } else {
+            handle.write_control(
+                request.request_type,
+                request.request,
+                request.value,
+                request.index,
+                data,
+                timeout,
+            )
+        };
+        result.map_err(|error| match error {
+            rusb::Error::NoDevice => std::io::Error::from_raw_os_error(libc::ENODEV),
+            _ => std::io::Error::other(error.to_string()),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = handle;
+        unreachable!()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UsbDevice {
-    pub fd: RawFd,
-    pub(super) _fd_owner: Arc<OwnedUsbFd>,
+    pub(super) fd: DeviceKey,
+    #[cfg(target_os = "macos")]
+    pub(super) darwin: Option<Arc<DarwinOwner>>,
+    pub(super) _fd_owner: Option<Arc<OwnedUsbFd>>,
     pub(super) claimed_interfaces: Arc<[u8]>,
     pub vendor_id: u16,
     pub product_id: u16,
@@ -139,14 +236,35 @@ impl UsbDevice {
         }
 
         Ok(Self {
-            fd: duplicated_fd,
-            _fd_owner: Arc::new(OwnedUsbFd(duplicated_fd)),
+            fd: DeviceKey::Usbfs(duplicated_fd),
+            #[cfg(target_os = "macos")]
+            darwin: None,
+            _fd_owner: Some(Arc::new(OwnedUsbFd(duplicated_fd))),
             claimed_interfaces: claimed_interfaces.into(),
             vendor_id,
             product_id,
             product_name,
             device_name,
         })
+    }
+
+    pub(super) fn same_owner(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (&self._fd_owner, &other._fd_owner) {
+            return Arc::ptr_eq(left, right);
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(left), Some(right)) = (&self.darwin, &other.darwin) {
+            return Arc::ptr_eq(left, right);
+        }
+        false
+    }
+
+    pub(super) fn control_handle(&self) -> Option<Arc<DeviceHandle<Context>>> {
+        #[cfg(target_os = "macos")]
+        if let Some(owner) = &self.darwin {
+            return Some(owner.handle.clone());
+        }
+        None
     }
 
     pub(super) fn feature_unit_control(
@@ -205,9 +323,14 @@ impl UsbDevice {
         let length = u16::try_from(data.len()).map_err(std::io::Error::other)?;
         #[cfg(test)]
         {
-            if let Some(result) =
-                super::fake_dac::dispatch(self.fd, request_type, request, value, index, data)
-            {
+            if let Some(result) = super::fake_dac::dispatch(
+                self.fd.usbfs().unwrap(),
+                request_type,
+                request,
+                value,
+                index,
+                data,
+            ) {
                 return result;
             }
         }
@@ -229,8 +352,38 @@ impl UsbDevice {
         };
         // This synchronous ioctl does not reap URBs. A separate libusb control
         // context on the same fd could consume the output context's completions.
-        let result = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &transfer) };
-        let failure = (result < 0).then(std::io::Error::last_os_error);
+        #[cfg(target_os = "macos")]
+        let result = if let Some(owner) = &self.darwin {
+            source_control(self.fd, Some(&owner.handle), &transfer)
+        } else {
+            let n = unsafe {
+                libc::ioctl(
+                    self.fd.usbfs().expect("usbfs source"),
+                    USBDEVFS_CONTROL,
+                    &transfer,
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            let n = unsafe {
+                libc::ioctl(
+                    self.fd.usbfs().expect("usbfs source"),
+                    USBDEVFS_CONTROL,
+                    &transfer,
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        };
         if request_type & 0x60 == USB_TYPE_CLASS {
             let delay = settings().control_delay_us();
             if delay > 0 {
@@ -248,17 +401,16 @@ impl UsbDevice {
                 thread::sleep(delay);
             }
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        Ok(result as usize)
+        result
     }
 }
 
 pub(super) struct IdleLock {
-    pub(super) device_fd: RawFd,
+    #[cfg(target_os = "macos")]
+    owner: Option<Arc<DarwinOwner>>,
+    pub(super) device_fd: DeviceKey,
     pub(super) context: Context,
-    pub(super) handle: DeviceHandle<Context>,
+    pub(super) handle: Arc<DeviceHandle<Context>>,
     pub(super) claimed_interfaces: Arc<[u8]>,
     pub(super) active_interfaces: Mutex<Vec<u8>>,
 }
@@ -267,9 +419,11 @@ pub(super) struct ClaimedHandle {
     // Drop before the libusb handle/context; armed only by exclusive setup.
     pub(super) itf_mode: ItfModeLease,
     pub(super) adc3_power: Adc3PowerLease,
-    pub(super) device_fd: RawFd,
+    #[cfg(target_os = "macos")]
+    owner: Option<Arc<DarwinOwner>>,
+    pub(super) device_fd: DeviceKey,
     pub(super) context: Context,
-    pub(super) handle: DeviceHandle<Context>,
+    pub(super) handle: Arc<DeviceHandle<Context>>,
     pub(super) claimed_interfaces: Arc<[u8]>,
     pub(super) active_interfaces: Mutex<Vec<u8>>,
 }
@@ -321,8 +475,10 @@ pub(super) const USBDEVFS_SETINTERFACE: IoctlRequest =
 impl From<IdleLock> for ClaimedHandle {
     fn from(value: IdleLock) -> Self {
         Self {
-            itf_mode: ItfModeLease::new(value.device_fd),
-            adc3_power: Adc3PowerLease::new(value.device_fd),
+            #[cfg(target_os = "macos")]
+            owner: value.owner,
+            itf_mode: ItfModeLease::new(),
+            adc3_power: Adc3PowerLease::new(value.device_fd, Some(value.handle.clone())),
             device_fd: value.device_fd,
             context: value.context,
             handle: value.handle,
@@ -335,6 +491,8 @@ impl From<IdleLock> for ClaimedHandle {
 impl ClaimedHandle {
     pub(super) fn into_idle_lock(self) -> IdleLock {
         IdleLock {
+            #[cfg(target_os = "macos")]
+            owner: self.owner,
             device_fd: self.device_fd,
             context: self.context,
             handle: self.handle,
@@ -386,9 +544,15 @@ impl ClaimedHandle {
         // Android's fd and our dup share the usbfs claims. libusb's own
         // per-handle claim table does not, so its alt-setting helper refuses
         // these interfaces. Use the same kernel ioctl Android uses instead.
-        let result = unsafe { libc::ioctl(self.device_fd, USBDEVFS_SETINTERFACE, &request) };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        if let Some(fd) = self.device_fd.usbfs() {
+            let result = unsafe { libc::ioctl(fd, USBDEVFS_SETINTERFACE, &request) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        } else {
+            self.handle
+                .set_alternate_setting(interface_number, alternate_setting)
+                .map_err(|error| error.to_string())?;
         }
         let mut active = self.active_interfaces.lock();
         active.retain(|number| *number != interface_number);
@@ -512,15 +676,11 @@ impl ClaimedHandle {
         };
         // Keep class requests on the owning usbfs fd, without another libusb
         // completion consumer or any write to the alternate-setting controls.
-        let result = unsafe { libc::ioctl(self.device_fd, USBDEVFS_CONTROL, &request) };
-        let error = (result < 0).then(std::io::Error::last_os_error);
+        let result = source_control(self.device_fd, Some(&self.handle), &request);
         itf_class_control_delay(&self.handle);
-        if let Some(error) = error {
-            return Err(format!(
-                "USB interface {interface_number} alternate control {value:#06x}: {error}"
-            ));
-        }
-        let length = result as usize;
+        let length = result.map_err(|error| {
+            format!("USB interface {interface_number} alternate control {value:#06x}: {error}")
+        })?;
         if length > response.len() {
             return Err("Alternate control response exceeds requested length".into());
         }
@@ -539,13 +699,42 @@ pub(super) fn open_claimed_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
 }
 
 pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandle, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(owner) = &device.darwin {
+        let handle = owner.handle.clone();
+        let descriptor = handle
+            .device()
+            .device_descriptor()
+            .map_err(|e| e.to_string())?;
+        let version = descriptor.device_version();
+        let revision = (u16::from(version.major() / 10) << 12)
+            | (u16::from(version.major() % 10) << 8)
+            | (u16::from(version.minor()) << 4)
+            | u16::from(version.sub_minor());
+        crate::settings::install_descriptor_identity(
+            descriptor.vendor_id(),
+            descriptor.product_id(),
+            revision,
+        );
+        return Ok(ClaimedHandle {
+            owner: Some(owner.clone()),
+            itf_mode: ItfModeLease::new(),
+            adc3_power: Adc3PowerLease::new(device.fd, Some(handle.clone())),
+            device_fd: device.fd,
+            context: handle.device().context().clone(),
+            handle,
+            claimed_interfaces: Arc::clone(&device.claimed_interfaces),
+            active_interfaces: Mutex::new(Vec::new()),
+        });
+    }
     prepare_direct_usb_libusb();
 
     let context =
         Context::new().map_err(|error| format!("Failed to create libusb context: {}", error))?;
-    let handle = unsafe { context.open_device_with_fd(device.fd) }
+    let handle = unsafe { context.open_device_with_fd(device.fd.usbfs().expect("usbfs source")) }
         .map_err(|error| format!("Failed to wrap USB file descriptor: {}", error))?;
 
+    let handle = Arc::new(handle);
     let descriptor = handle
         .device()
         .device_descriptor()
@@ -561,8 +750,10 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
         revision,
     );
     Ok(ClaimedHandle {
-        itf_mode: ItfModeLease::new(device.fd),
-        adc3_power: Adc3PowerLease::new(device.fd),
+        #[cfg(target_os = "macos")]
+        owner: None,
+        itf_mode: ItfModeLease::new(),
+        adc3_power: Adc3PowerLease::new(device.fd, Some(handle.clone())),
         device_fd: device.fd,
         context,
         handle,
@@ -615,4 +806,207 @@ pub(super) fn cleanup_claimed_handle(
         *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());
     }
     reset_ok
+}
+
+#[cfg(target_os = "macos")]
+fn host_usb_error(operation: impl Into<String>, error: rusb::Error) -> crate::Error {
+    let kind = host_usb_failure_kind(error);
+    crate::Error::HostUsb {
+        operation: operation.into(),
+        kind,
+        detail: error.to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_usb_failure_kind(error: rusb::Error) -> crate::HostUsbFailureKind {
+    match error {
+        rusb::Error::Access => crate::HostUsbFailureKind::AccessDenied,
+        rusb::Error::Busy => crate::HostUsbFailureKind::InUse,
+        rusb::Error::NoDevice => crate::HostUsbFailureKind::DeviceLost,
+        rusb::Error::NotSupported => crate::HostUsbFailureKind::NotSupported,
+        _ => crate::HostUsbFailureKind::Other,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_darwin_device(
+    attachment: &crate::darwin_discovery::Attachment,
+    allow_capture: bool,
+) -> Result<(UsbDevice, crate::DeviceInfo), crate::Error> {
+    let usb = attachment.device();
+    let before = usb.active_config_descriptor().map_err(|error| {
+        crate::Error::Claim(format!("active configuration before claim: {error}"))
+    })?;
+    let expected = before.number();
+    let mut interfaces = Vec::new();
+    for interface in before.interfaces() {
+        if interface.descriptors().any(|alt| {
+            (alt.class_code() == USB_CLASS_AUDIO
+                && matches!(
+                    alt.sub_class_code(),
+                    USB_SUBCLASS_AUDIOCONTROL | USB_SUBCLASS_AUDIOSTREAMING
+                ))
+                || (alt.class_code() == 0xff
+                    && alt.endpoint_descriptors().any(|ep| {
+                        ep.direction() == Direction::Out
+                            && ep.transfer_type() == TransferType::Isochronous
+                    }))
+        }) {
+            interfaces.push(interface.number());
+        }
+    }
+    if interfaces.is_empty() {
+        return Err(crate::Error::Claim(
+            "active configuration has no eligible playback interfaces".into(),
+        ));
+    }
+    let handle = Arc::new(
+        usb.open()
+            .map_err(|error| host_usb_error("open USB attachment", error))?,
+    );
+    let mut owner = DarwinOwner {
+        handle: handle.clone(),
+        claimed: Vec::new(),
+        captured: false,
+    };
+    // Always try the ordinary claims first. Whole-device takeover is only a
+    // recovery path for an explicit opt-in and an ownership/access failure.
+    let claim_failure = interfaces.iter().copied().find_map(|interface| {
+        log_info!("[USB] host_usb_claim phase=ordinary interface={interface} result=attempt");
+        match handle.claim_interface(interface) {
+            Ok(()) => {
+                owner.claimed.push(interface);
+                log_info!("[USB] host_usb_claim phase=ordinary interface={interface} result=success");
+                None
+            }
+            Err(error) => {
+                log_warn!("[USB] host_usb_claim phase=ordinary interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error));
+                Some((interface, error))
+            }
+        }
+    });
+    if let Some((failed_interface, initial_error)) = claim_failure {
+        if !allow_capture || !matches!(initial_error, rusb::Error::Access | rusb::Error::Busy) {
+            return Err(host_usb_error(
+                format!("ordinary claim USB interface {failed_interface}"),
+                initial_error,
+            ));
+        }
+        // Never detach while any successful ordinary claim remains. Keep failed
+        // releases in the owner so Drop will still attempt to return them.
+        let mut rollback_failure = None;
+        for index in (0..owner.claimed.len()).rev() {
+            let interface = owner.claimed[index];
+            log_info!("[USB] host_usb_claim phase=rollback interface={interface} result=attempt");
+            match handle.release_interface(interface) {
+                Ok(()) => {
+                    owner.claimed.remove(index);
+                    log_info!(
+                        "[USB] host_usb_claim phase=rollback interface={interface} result=success"
+                    );
+                }
+                Err(error) => {
+                    log_error!("[USB] host_usb_claim phase=rollback interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error));
+                    if rollback_failure.is_none() {
+                        rollback_failure = Some((interface, error));
+                    }
+                }
+            }
+        }
+        if let Some((interface, error)) = rollback_failure {
+            return Err(crate::Error::HostUsb {
+                operation: format!("rollback USB interface {interface} after ordinary claim {failed_interface} failed"),
+                kind: host_usb_failure_kind(error),
+                detail: format!("rollback: {error}; original claim: {initial_error}"),
+            });
+        }
+        log_info!("[USB] host_usb_claim phase=capture interface={failed_interface} result=attempt scope=whole_device");
+        if let Err(error) = handle.detach_kernel_driver(failed_interface) {
+            log_warn!(
+                "[USB] host_usb_claim phase=capture result=error kind={:?} detail={error}",
+                host_usb_failure_kind(error)
+            );
+            return Err(crate::Error::HostUsb {
+                operation: "whole-device kernel capture (may require root or Apple's device-access entitlement)".into(),
+                kind: host_usb_failure_kind(error),
+                detail: format!("capture: {error}; original claim interface {failed_interface}: {initial_error}"),
+            });
+        }
+        owner.captured = true;
+        log_info!("[USB] host_usb_claim phase=capture result=success scope=whole_device");
+        let after_capture = handle
+            .device()
+            .active_config_descriptor()
+            .map_err(|error| {
+                crate::Error::Claim(format!("active configuration after capture: {error}"))
+            })?;
+        if after_capture.number() != expected {
+            return Err(crate::Error::Claim(format!(
+                "active configuration changed from {expected} to {} during capture",
+                after_capture.number()
+            )));
+        }
+        for &interface in &interfaces {
+            log_info!("[USB] host_usb_claim phase=reclaim interface={interface} result=attempt");
+            match handle.claim_interface(interface) {
+                Ok(()) => {
+                    owner.claimed.push(interface);
+                    log_info!(
+                        "[USB] host_usb_claim phase=reclaim interface={interface} result=success"
+                    );
+                }
+                Err(error) => {
+                    log_warn!("[USB] host_usb_claim phase=reclaim interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error));
+                    return Err(crate::Error::HostUsb { operation: format!("claim USB interface {interface} after capture"), kind: host_usb_failure_kind(error), detail: format!("reclaim: {error}; original claim interface {failed_interface}: {initial_error}") });
+                }
+            }
+        }
+    }
+    let actual = handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|error| {
+            crate::Error::Claim(format!("active configuration after claim: {error}"))
+        })?;
+    if actual.number() != expected {
+        return Err(crate::Error::Claim(format!(
+            "active configuration changed from {expected} to {} during claim",
+            actual.number()
+        )));
+    }
+    let descriptor = handle
+        .device()
+        .device_descriptor()
+        .map_err(|error| crate::Error::Claim(format!("device descriptor after claim: {error}")))?;
+    let product_name = handle
+        .read_product_string_ascii(&descriptor)
+        .unwrap_or_else(|_| {
+            format!(
+                "USB DAC {:04x}:{:04x}",
+                descriptor.vendor_id(),
+                descriptor.product_id()
+            )
+        });
+    let manufacturer = handle.read_manufacturer_string_ascii(&descriptor).ok();
+    let mut info = crate::DeviceInfo::new(
+        descriptor.vendor_id(),
+        descriptor.product_id(),
+        product_name.clone(),
+    )
+    .with_claimed_interfaces(interfaces.clone());
+    info.configuration_id = Some(expected);
+    info.manufacturer_name = manufacturer;
+    let owner = Arc::new(owner);
+    let device = UsbDevice {
+        fd: DeviceKey::Darwin(usb.as_raw() as usize),
+        darwin: Some(owner),
+        _fd_owner: None,
+        claimed_interfaces: interfaces.into(),
+        vendor_id: descriptor.vendor_id(),
+        product_id: descriptor.product_id(),
+        product_name,
+        device_name: None,
+    };
+    Ok((device, info))
 }

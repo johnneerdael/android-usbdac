@@ -348,6 +348,23 @@ public class DacSession private constructor(
         failure?.let { throw it }
     }
 
+    /** USB ownership evidence for the in-repository validator. */
+    @Synchronized
+    public fun validatorClaimEvidenceJson(): String {
+        checkOpen()
+        return JSONObject().put("configuration_id", configurationSelection.selected.id)
+            .put("claimed_interface_ids", org.json.JSONArray(claims.ids))
+            .put("claim_force", true).toString()
+    }
+
+    /** Internal integration point for the in-repository validator. */
+    @Synchronized
+    public fun runValidator(captureDirectory: String): String {
+        checkOpen()
+        check(stream == null && duplex == null) { "validator requires an idle session" }
+        return Native.validatorRun(dac, captureDirectory)
+    }
+
     /** Retire native work after the explicit legacy-open path fails; hand-back is caller-owned. */
     @Synchronized
     internal fun closeForFailedLegacyOpen(isAttached: () -> Boolean): PendingUsbConfigurationRestore {

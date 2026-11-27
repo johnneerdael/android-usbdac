@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/usbdac-core", "crates/usbdac-jni"]
+members = ["crates/usbdac-core", "crates/usbdac-jni", "crates/usbdac-validator"]
 
 [workspace.package]
 version = "0.1.11"

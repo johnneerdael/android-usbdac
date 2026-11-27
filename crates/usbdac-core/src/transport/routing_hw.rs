@@ -871,7 +871,7 @@ fn check_gen1_binding(
     configuration: u8,
     descriptors: &[u8],
 ) -> Result<(), RoutingSessionError> {
-    if !Arc::ptr_eq(&binding.device._fd_owner, &device._fd_owner)
+    if !binding.device.same_owner(device)
         || binding.configuration != configuration
         || binding.descriptors != descriptors
     {
@@ -1114,7 +1114,7 @@ pub(crate) fn fcp_apply(
     let (configuration, descriptors) = active_descriptors(&device)?;
     let mut records = ORIGINAL_FCP.lock();
     if let Some(record) = records.as_ref() {
-        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+        if !record.device.same_owner(&device)
             || record.configuration != configuration
             || record.descriptors != descriptors
             || record.uncertain
@@ -1262,7 +1262,7 @@ fn finish_fcp_hand_back() {
         return;
     };
     let restore = || -> Result<(), RoutingSessionError> {
-        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner) {
+        if !record.device.same_owner(&device) {
             return Err(RoutingSessionError::Drift(
                 "FCP attachment changed before hand-back".into(),
             ));
@@ -1293,7 +1293,7 @@ pub(crate) fn scarlett_mix_apply(
     let (configuration, descriptors) = active_descriptors(&device)?;
     let mut records = ORIGINAL_SCARLETT.lock();
     if let Some(record) = records.as_ref() {
-        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+        if !record.device.same_owner(&device)
             || record.configuration != configuration
             || record.descriptors != descriptors
         {
@@ -1381,7 +1381,7 @@ pub(crate) fn scarlett_mux_apply(
     let (configuration, descriptors) = active_descriptors(&device)?;
     let mut records = ORIGINAL_SCARLETT.lock();
     if let Some(record) = records.as_ref() {
-        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
+        if !record.device.same_owner(&device)
             || record.configuration != configuration
             || record.descriptors != descriptors
         {
@@ -1453,7 +1453,7 @@ fn finish_scarlett_hand_back() {
         return;
     };
     let restore = || -> Result<(), RoutingSessionError> {
-        if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner) {
+        if !record.device.same_owner(&device) {
             return Err(RoutingSessionError::Drift(
                 "Scarlett attachment changed before hand-back".into(),
             ));
@@ -2570,7 +2570,10 @@ fn with_routing_power<T>(
     if !powered {
         return operation();
     }
-    let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(device.fd));
+    let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(
+        device.fd,
+        device.control_handle(),
+    ));
     let lease = &guard.0;
     lease.set_routing_deadline(deadline);
     let result = (|| {
@@ -2788,7 +2791,7 @@ fn verify_descriptor_identity(
     device: &UsbDevice,
     deadline: Instant,
 ) -> Result<(), RoutingSessionError> {
-    if !Arc::ptr_eq(&snapshot.device._fd_owner, &device._fd_owner) {
+    if !snapshot.device.same_owner(device) {
         return Err(RoutingSessionError::Drift(
             "routing snapshot belongs to another attachment".into(),
         ));
@@ -3096,7 +3099,10 @@ fn discover_powered_functions(
                         domains.insert(domain.id, domain);
                     }
                 }
-                let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(device.fd));
+                let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(
+                    device.fd,
+                    device.control_handle(),
+                ));
                 guard.0.set_routing_deadline(deadline);
                 let operation = (|| {
                     for stream in streams {
@@ -3433,9 +3439,10 @@ pub(crate) fn apply_with_power(
                     "configuration changed since the first routing edit".into(),
                 ));
             }
-            if originals.as_ref().is_some_and(|prior| {
-                !Arc::ptr_eq(&prior.snapshot.device._fd_owner, &device._fd_owner)
-            }) {
+            if originals
+                .as_ref()
+                .is_some_and(|prior| !prior.snapshot.device.same_owner(&device))
+            {
                 return Err(RoutingSessionError::Drift(
                     "routing restoration record belongs to another attachment".into(),
                 ));
@@ -3615,7 +3622,7 @@ pub(super) fn finish_routing_hand_back() {
     let deadline = Instant::now() + ROUTING_RECOVERY_BUDGET;
     let recovery = Arc::new(Mutex::new(Some(deadline)));
     let mut restore = || -> Result<RoutingHandBackReport, RoutingSessionError> {
-        if !Arc::ptr_eq(&record.snapshot.device._fd_owner, &device._fd_owner) {
+        if !record.snapshot.device.same_owner(&device) {
             return Err(RoutingSessionError::Drift(
                 "attachment changed before routing hand-back".into(),
             ));
@@ -4497,8 +4504,10 @@ mod gen1_transport_tests {
     }
     fn device() -> UsbDevice {
         UsbDevice {
-            fd: -1,
-            _fd_owner: Arc::new(OwnedUsbFd(-1)),
+            fd: DeviceKey::Usbfs(-1),
+            #[cfg(target_os = "macos")]
+            darwin: None,
+            _fd_owner: Some(Arc::new(OwnedUsbFd(-1))),
             claimed_interfaces: vec![3].into(),
             vendor_id: 0x1235,
             product_id: 0x8012,

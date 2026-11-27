@@ -23,6 +23,8 @@ mod pioneer;
 mod registry;
 mod routing;
 mod scarlett;
+#[cfg(feature = "validator")]
+mod validator;
 
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JByteArray, JByteBuffer, JObject, JString};

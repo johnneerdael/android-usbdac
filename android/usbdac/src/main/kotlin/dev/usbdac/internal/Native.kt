@@ -23,6 +23,11 @@ internal object Native {
         System.loadLibrary("usbdac")
     }
 
+    @JvmStatic external fun validatorBegin(directory: String)
+    @JvmStatic external fun validatorRun(dac: Long, directory: String): String
+    @JvmStatic external fun validatorCancel()
+    @JvmStatic external fun validatorDeviceLost()
+    @JvmStatic external fun validatorFlush()
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 

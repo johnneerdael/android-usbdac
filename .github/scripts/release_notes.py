@@ -6,11 +6,16 @@ import subprocess
 from release_artifact import verify
 
 
-def render(version, source, changes, repository):
+def render(version, source, changes, repository, validator=False):
     lines = ['## Changes', '', *changes, '', '## Files', '']
     for artifact, description in (('usbdac', 'Android library'), ('usbdac-media3', 'optional Media3 integration')):
         lines.append(f'- `{artifact}-{version}.aar`, `-sources.jar`, `.pom`, `.module`: {description}; '
                      f'also published as `dev.usbdac:{artifact}:{version}` on GitHub Packages.')
+    if validator:
+        lines.extend([
+            f'- `usbdac-validator-{version}-android.apk`: Android validator, signed with the CI debug key.',
+            f'- `usbdac-validator-{version}-macos-arm64.zip`: Apple Silicon validator, ad hoc signed and not notarized.',
+        ])
     lines.extend([
         f'- `usbdac-{version}-jniLibs.zip`: native libraries for arm64-v8a, armeabi-v7a, x86_64 and x86.',
         f'- `usbdac-core-{version}.crate`: Rust driver, also available on [crates.io](https://crates.io/crates/usbdac-core/{version}).',
@@ -39,7 +44,7 @@ def main():
         text=True, capture_output=True, check=False)
     revision = f'{previous.stdout.strip()}..{source}' if previous.returncode == 0 else source
     changes = subprocess.check_output(['git', 'log', '--no-merges', '--pretty=- %s (%h)', revision], text=True).splitlines()
-    args.output.write_text(render(version, source, changes, e['GITHUB_REPOSITORY']))
+    args.output.write_text(render(version, source, changes, e['GITHUB_REPOSITORY'], e.get('VALIDATOR') == 'true'))
 
 
 if __name__ == '__main__':
