@@ -2217,7 +2217,21 @@ mod push_stream_tests {
         rig.shared.mark_closed();
         rig.shared.fail(crate::Error::DeviceLost);
 
-        let events = rig.events.wait_for(6);
+        // Error and device notifications may arrive before the final state.
+        // Observe terminal delivery rather than an intermediate callback count.
+        for _ in 0..400 {
+            let terminal = rig
+                .events
+                .0
+                .lock()
+                .iter()
+                .any(|event| matches!(event, DacEvent::StateChanged(StreamState::Failed)));
+            if terminal {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let events = rig.events.0.lock().clone();
         let states: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
