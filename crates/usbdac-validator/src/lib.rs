@@ -720,7 +720,7 @@ impl Capture {
         let feedback = stream.explicit_feedback_diagnostics();
         result.payload_sha256 = Some(format!("{:x}", hash.finalize()));
         let prefix_hex: String = prefix.iter().map(|b| format!("{b:02x}")).collect();
-        result.evidence = json!({"format": format_json(&format), "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed", "cleanup": "pending"});
+        result.evidence = json!({"format": format_json(&format), "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed"});
         if result.error.is_none()
             && stats.bit_perfect
             && stats.payload_verified
@@ -755,6 +755,7 @@ impl Capture {
                 }
             }
         }
+        result.evidence["cleanup"] = result.close_outcome["status"].clone();
         if event_lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
             mark_stop(&mut result, "device_lost", "stream");
         }
