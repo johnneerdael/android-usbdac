@@ -56,7 +56,9 @@ mod linux {
         read(fd, 0x81, 10, 0, 1, &mut value)?;
         Ok(value[0])
     }
-    fn open(path: &str) -> Result<(File, Dac, DacStream, [i16; 2]), Box<dyn std::error::Error>> {
+    type OpenedDac = (File, Dac, DacStream, [i16; 2]);
+
+    fn open(path: &str) -> Result<OpenedDac, Box<dyn std::error::Error>> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let fd = file.as_raw_fd();
         let mut descriptor = [0; 18];

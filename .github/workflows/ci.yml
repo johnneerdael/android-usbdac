@@ -195,7 +195,7 @@ jobs:
       - name: Install virtual USB guest prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes qemu-system-x86 musl-tools cpio libarchive-tools
+          sudo apt-get install --yes qemu-system-x86 musl-tools linux-libc-dev cpio libarchive-tools
           rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build then run the bounded virtual UAC1 acceptance

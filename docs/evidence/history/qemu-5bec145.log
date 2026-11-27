@@ -1,0 +1,86 @@
+SOURCE 5bec145aeeec2b1ff1836096f938b4ad09cb6175; QEMU null audio backend
+CLAIM interface=0 result=0
+CLAIM interface=1 result=0
+GET_INTERFACE result=1 alt=0
+INFO [USB] Original hardware volume of 'QEMU USB Audio': raw=[0, 0]
+INFO [USB] Hardware volume control found: feature_unit=2, interface=0, min=-32767, max=2048, res=136, protocol=Uac1, channels=[1, 2], mute_channel=Some(0)
+ERROR [USB] Start-up volume protection failed, the volume control is unusable: the attenuation could not be verified: wrote [-10327, -10327], the DAC reads [-10377, -10377]
+CAPABILITIES Capabilities { uac_version: V1, link_speed: Full, alt_settings: [AltSetting { interface_number: 1, alt_setting: 1, endpoint_address: 1, format: Pcm, channels: 2, subslot_bytes: 2, valid_bits: 16, rate_ranges: [RateRange { min_hz: 48000, max_hz: 48000, step_hz: 0 }], sample_rates: [48000], sync_type: Synchronous, feedback_endpoint: None, max_packet_bytes: 192, service_interval_us: 1000, uac_version: V1, endpoint_interval: 1, usage: Data, refresh: 0, synch_address: 0, pacing: Some(Synchronous) }], pcm_sample_rates: [48000], pcm_bit_depths: [16], channel_counts: [2], supports_pcm: true, supports_dop: false, dop_max_dsd_bit_rate: None, supports_native_dsd: false, native_dsd_bit_rates: [], has_explicit_feedback: false, volume: None, has_hardware_volume: false, has_mute: false }
+FORMAT StreamFormat { request: StreamRequest { sample_rate: 48000, channels: 2, bit_depth: 16, encoding: Pcm, rate_policy: Exact }, encoding: Pcm, sample_rate: 48000, channels: 2, channel_map: ChannelMap { positions: [FrontLeft, FrontRight] }, valid_bits: 16, subslot_bytes: 2, interface_number: 1, alt_setting: 1, endpoint_address: 1, sync_type: Synchronous, explicit_feedback: false, link_speed: Full, service_interval_us: 1000, pacing: Synchronous, clock: None, native_dsd_signature: None }
+INFO [USB] Hardware volume control found: feature_unit=2, interface=0, min=-32767, max=2048, res=136, protocol=Uac1, channels=[1, 2], mute_channel=Some(0)
+INFO [USB] Start-up volume: original [0.0, 0.0] dB, now [-40.53515625, -40.53515625] dB, limit 0.00 dB
+INFO [USB] Hardware volume initial: -40.54 dB (raw -10377), muted=Some(false)
+INFO [USB] FINAL_STREAM_FORMAT: sample_rate_hz=48000 dac_reported_hz=None clock_verified=true app_bit_depth=16 transport_bit_resolution=16 subslot_bytes=2 channels=2 endpoint=0x01 alt=1 format_tag=0x0001 max_packet_bytes=192
+INFO [USB] Streaming started device='QEMU USB Audio' requested=48000Hz effective=48000Hz endpoint=0x01 interface=1 alt=1 dsd_transport=None
+INFO [USB] Isochronous queue: serviceIntervalUs=1000 packetsPerTransfer=2 slots=8 stableTransfers=128 packetsInFlight=16 transferMs=2.000 busQueueMs=16.000 (target 16ms, slot limit 8, period us PRIME 19200
+PRIME 19200
+PRIME 19200
+None) maxConsecutiveLossyUrbs=3
+EVENT StateChanged(Buffering)
+INFO [USB] Waiting for stream prime: buffered_samples must reach start_threshold_samples=9600 before isochronous submit (the ring fills on to its 24000-sample target while playing)
+INFO [USB] USB stream primed: 28800 samples buffered (target=9600)
+INFO [USB-PCM] wire payload verified: real audio flowing, not a stuck/dead pipeline
+INFO [USB] PCM encoding: 16-bit (subslot 2 bytes) per descriptor
+INFO [USB-BITPERFECT] verified: 16 bit/48000 Hz 2ch pcm direct on "QEMU USB Audio" — no mixer, no resample, no DSP
+EVENT BitPerfectChanged(true)
+EVENT StateChanged(Playing)
+INFO [USB] USB stream stabilized after 128 isochronous transfers (nominal packet timing locked)
+PCM_STATS StreamStats { state: Playing, bit_perfect: true, bit_perfect_blocker: None, software_gain: 1.0, underruns: 0, lost_frames: 0, short_packets: 0, zero_packets: 0, urb_timeouts: 0, completed_transfers: 995, frames_written: 108192, frames_completed: 95520, played_frames: 95520, latency_frames: 12672, latency_ms: 264.0, queued_frames: 11904, buffer_ms: 248, buffer_target_ms: 250, active_target_ms: 250, buffer_capacity_ms: 500, transfer_queue_depth: 8, last_turnaround_us: 15458, max_turnaround_us: 22849, last_submit_gap_us: 10, max_submit_gap_us: 41, worker_gap_over_10ms: 0, worker_gap_over_50ms: 0, max_worker_gap_us: 8552, adaptive_queue_changes: 0, adaptive_queue_slots: 8, adaptive_queue_us: 16000, effective_rate_hz: 47833.951, feedback_active: false, feedback_reports: 0, feedback_timeouts: 0, feedback_errors: 0, feedback_rejected: 0, feedback_age_ms: None, feedback_rate_hz: None, feedback_stale: false, feedback_locked: false, feedback_empty: 0, implicit_fifo_depth: 0, implicit_fifo_high_water: 0, implicit_waits: 0, implicit_empty_bus: 0, implicit_overruns: 0, implicit_in_transfers: 0, implicit_out_of_order: 0, implicit_invalid_packets: 0, implicit_measured_frames: 0, implicit_scheduled_frames: 0, stable: true, clock_verified: true, payload_verified: true, payload_constant_for_ms: None }
+EVENT StateChanged(Paused)
+EVENT StateChanged(Draining)
+EVENT StateChanged(Drained)
+INFO [USB-BITPERFECT] released: 16 bit/48000 Hz 2ch pcm direct on "QEMU USB Audio" — stream inactive
+EVENT BitPerfectChanged(false)
+EVENT StateChanged(Closed)
+INFO [USB] Hardware volume control found: feature_unit=2, interface=0, min=-32767, max=2048, res=136, protocol=Uac1, channels=[1, 2], mute_channel=Some(0)
+INFO [USB] Hardware volume initial: -40.54 dB (raw -10377), muted=Some(false)
+INFO [USB] FINAL_STREAM_FORMAT: sample_rate_hz=48000 dac_reported_hz=None clock_verified=true app_bit_depth=16 transport_bit_resolution=16 subslot_bytes=2 channels=2 endpoint=0x01 alt=1 format_tag=0x0001 max_packet_bytes=192
+INFO [USB] Isochronous queue: serviceIntervalUs=1000 packetsPerTransfer=2 slots=8 stableTransfers=128 packetsInFlight=16 transferMs=2.000 busQueueMs=16.000 (target 16ms, slot limit 8, period us None) maxConsecutiveLossyUrbs=3
+INFO [USB] Streaming started device='QEMU USB Audio' requested=48000Hz effective=48000Hz endpoint=0x01 interface=1 alt=1 dsd_transport=None
+RECONFIGURE_SAME_OWNER_PASS rate=48000 paused=true volume=unchanged
+INFO [USB] Waiting for stream prime: buffered_samples must reach start_threshold_samples=9600 before isochronous submit (the ring fills on to its 24000-sample target while playing)
+EVENT StateChanged(Buffering)
+EVENT StateChanged(Paused)
+EVENT StateChanged(Drained)
+EVENT StateChanged(Closed)
+INFO [USB] Hardware volume control found: feature_unit=2, interface=0, min=-32767, max=2048, res=136, protocol=Uac1, channels=[1, 2], mute_channel=Some(0)
+INFO [USB] Hardware volume initial: -40.54 dB (raw -10377), muted=Some(false)
+INFO [USB] FINAL_STREAM_FORMAT: sample_rate_hz=48000 dac_reported_hz=None clock_verified=true app_bit_depth=16 transport_bit_resolution=16 subslot_bytes=2 channels=2 endpoint=0x01 alt=1 format_tag=0x0001 max_packet_bytes=192
+INFO [USB] Isochronous queue: serviceIntervalUs=1000 packetsPerTransfer=2 slots=8 stableTransfers=128 packetsInFlight=16 transferMs=2.000 busQueueMs=16.000 (target 16ms, slot limit 8, period us None) maxConsecutiveLossyUrbs=3
+INFO [USB] Waiting for stream prime: buffered_samples must reach start_threshold_samples=9600 before isochronous submit (the ring fills on to its 24000-sample target while playing)
+INFO [USB] Streaming started device='QEMU USB Audio' requested=48000Hz effective=48000Hz endpoint=0x01 interface=1 alt=1 dsd_transport=None
+EVENT StateChanged(Buffering)
+EVENT StateChanged(Paused)
+EVENT StateChanged(Buffering)
+INFO [USB] USB stream primed: 28800 samples buffered (target=9600)
+INFO [USB-PCM] wire payload verified: real audio flowing, not a stuck/dead pipeline
+INFO [USB] PCM encoding: 16-bit (subslot 2 bytes) per descriptor
+INFO [USB-BITPERFECT] verified: 16 bit/48000 Hz 2ch pcm direct on "QEMU USB Audio" — no mixer, no resample, no DSP
+EVENT BitPerfectChanged(true)
+EVENT StateChanged(Playing)
+RECONFIGURE_ROLLBACK_PASS rate=48000 cause=unsupported resumed=true
+EVENT StateChanged(Paused)
+INFO [USB-BITPERFECT] released: 16 bit/48000 Hz 2ch pcm direct on "QEMU USB Audio" — stream inactive
+INFO [USB] Restored original hardware volume: raw=[0, 0]
+EVENT BitPerfectChanged(false)
+EVENT StateChanged(Closed)
+RETIRED true
+GET_INTERFACE result=1 alt=0
+VOLUME_RESTORED [0, 0]
+RELEASE interface=1 result=0
+RELEASE interface=0 result=0
+QEMU_PCM_PASS
+SINGLE_PROBE_EXIT=0
+StateChanged(Buffering)
+StateChanged(Buffering)
+BitPerfectChanged(true)
+StateChanged(Playing)
+BitPerfectChanged(true)
+StateChanged(Playing)
+BitPerfectChanged(false)
+StateChanged(Closed)
+BitPerfectChanged(false)
+StateChanged(Closed)
+TWO_DACS_PASS first_frames=95904 second_frames=144480 independent volume/alt-zero/retirement/duplicate protection
+TWO_PROBE_EXIT=0
+[    8.609920] reboot: Power down

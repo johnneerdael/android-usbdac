@@ -8,7 +8,26 @@ output=$(cd "$output" && pwd)
 export USBDAC_PROBE_REVISION
 USBDAC_PROBE_REVISION=$(git rev-parse HEAD)
 export LIBUDEV_NO_PKG_CONFIG=1
-export CC_x86_64_unknown_linux_musl=musl-gcc
+# musl-tools supplies libc headers, not Linux UAPI headers required by libusb.
+# Expose only kernel header trees: adding /usr/include would mix glibc into musl.
+uapi="$output/linux-uapi"
+multiarch=$(gcc -print-multiarch)
+mkdir -p "$uapi"
+for tree in linux asm-generic; do
+  test -d "/usr/include/$tree"
+  ln -sfn "/usr/include/$tree" "$uapi/$tree"
+done
+test -d "/usr/include/$multiarch/asm"
+ln -sfn "/usr/include/$multiarch/asm" "$uapi/asm"
+export USBDAC_LINUX_UAPI="$uapi"
+cat > "$output/musl-gcc-uapi" <<'COMPILER'
+#!/bin/sh
+exec musl-gcc -isystem "$USBDAC_LINUX_UAPI" "$@"
+COMPILER
+chmod +x "$output/musl-gcc-uapi"
+export CC_x86_64_unknown_linux_musl="$output/musl-gcc-uapi"
+# Check the exact compiler/header boundary before starting the native build.
+printf '#include <linux/magic.h>\n#include <asm/types.h>\n' | "$CC_x86_64_unknown_linux_musl" -x c -E - > /dev/null
 cargo build --locked --release -p usbdac-core --example qemu_smoke --example two_dac_smoke --target x86_64-unknown-linux-musl --features libusb1-sys/vendored
 # Versioned release ISO has a publisher SHA-256 file; netboot checksum URLs do not.
 alpine_iso=alpine-virt-3.22.8-x86_64.iso
