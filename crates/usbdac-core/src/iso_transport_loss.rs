@@ -41,7 +41,7 @@ pub(crate) fn lost_frame_budget(ring_rate_hz: u32, budget_ms: u64) -> u64 {
 pub(crate) struct LossLimits {
     /// More than this many lossy URBs in a row is fatal.
     pub max_consecutive_lossy_urbs: u32,
-    /// More than this many lost ring frames since stream start is fatal.
+    /// More than this many lost ring frames in the decaying decision budget is fatal.
     pub max_lost_frames: u64,
 }
 
@@ -49,6 +49,7 @@ pub(crate) struct LossLimits {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UrbLoss {
     pub timed_out: bool,
+    pub transport_failed: bool,
     pub lost_frames: u64,
     pub short_packets: u64,
     pub zero_packets: u64,
@@ -68,11 +69,17 @@ impl UrbLoss {
     ) -> Self {
         Self {
             timed_out,
+            transport_failed: false,
             lost_frames: stats.lost_ring_frames(ring_bytes_per_frame),
             short_packets: stats.short_packets as u64,
             zero_packets: stats.zero_packets as u64,
             held: false,
         }
+    }
+
+    pub(crate) fn with_transport_failure(mut self, failed: bool) -> Self {
+        self.transport_failed = failed;
+        self
     }
 
     /// Mark the URB as having carried held silence rather than audio.
@@ -87,7 +94,7 @@ impl UrbLoss {
     /// consecutive bound is about the transport still consuming, and that holds
     /// whatever the URB carried.
     pub(crate) fn is_lossy(&self) -> bool {
-        self.timed_out || self.lost_frames > 0
+        self.timed_out || self.transport_failed || self.lost_frames > 0
     }
 }
 
@@ -107,7 +114,7 @@ impl fmt::Display for LossLimit {
             ),
             Self::CumulativeLostFrames { lost, limit } => write!(
                 f,
-                "{} audio frames lost since stream start exceeds the limit of {}",
+                "{} audio frames in the recent loss budget exceeds the limit of {}",
                 lost, limit
             ),
         }
@@ -144,6 +151,8 @@ pub(crate) struct LossTracker {
     zero_packets: u64,
     data_urb_timeouts: u64,
     latched: bool,
+    budget_units: u128,
+    budget_updated_ms: u64,
 }
 
 impl LossTracker {
@@ -157,6 +166,8 @@ impl LossTracker {
             zero_packets: 0,
             data_urb_timeouts: 0,
             latched: false,
+            budget_units: 0,
+            budget_updated_ms: 0,
         }
     }
 
@@ -165,7 +176,23 @@ impl LossTracker {
     /// A lossy URB never resets the consecutive counter, whatever else it did:
     /// an all-zero-length completion still reports COMPLETED, and must not
     /// look like a healthy transfer.
+    #[cfg(test)]
     pub(crate) fn record(&mut self, queued_frames: u64, urb: UrbLoss) -> UrbVerdict {
+        self.record_at(queued_frames, urb, 0)
+    }
+
+    pub(crate) fn record_at(
+        &mut self,
+        queued_frames: u64,
+        urb: UrbLoss,
+        now_ms: u64,
+    ) -> UrbVerdict {
+        // Refill one full budget over ten seconds; lifetime accounting never decays.
+        let elapsed = now_ms.saturating_sub(self.budget_updated_ms);
+        self.budget_updated_ms = now_ms;
+        self.budget_units = self
+            .budget_units
+            .saturating_sub(u128::from(self.limits.max_lost_frames) * u128::from(elapsed));
         self.short_packets = self.short_packets.saturating_add(urb.short_packets);
         self.zero_packets = self.zero_packets.saturating_add(urb.zero_packets);
         if urb.timed_out {
@@ -183,6 +210,9 @@ impl LossTracker {
                 newly_latched = !self.latched;
                 self.latched = true;
                 self.lost_frames = self.lost_frames.saturating_add(urb.lost_frames);
+                self.budget_units = self
+                    .budget_units
+                    .saturating_add(u128::from(urb.lost_frames) * 10_000);
             }
         }
 
@@ -198,9 +228,9 @@ impl LossTracker {
                 count: self.consecutive_lossy_urbs,
                 limit: self.limits.max_consecutive_lossy_urbs,
             })
-        } else if self.lost_frames > self.limits.max_lost_frames {
+        } else if self.budget_units > u128::from(self.limits.max_lost_frames) * 10_000 {
             Some(LossLimit::CumulativeLostFrames {
-                lost: self.lost_frames,
+                lost: self.budget_units.div_ceil(10_000).min(u128::from(u64::MAX)) as u64,
                 limit: self.limits.max_lost_frames,
             })
         } else {

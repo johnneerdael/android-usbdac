@@ -385,10 +385,58 @@ impl IsoTransferSlot {
         })
     }
 
-    /// What a timed-out URB cost, from its packet descriptors.
-    pub(super) fn account_timeout(&self, acceptance: PacketAcceptance) -> CompletionStats {
+    /// Validate descriptor geometry before any recovery accounting.
+    fn failed_transfer_geometry(&self) -> Result<(), String> {
         let transfer = unsafe { self.transfer.as_ref() };
-        timed_out_packet_results(transfer, &self.packet_sizes, acceptance)
+        if transfer.num_iso_packets != self.packet_sizes.len() as i32 {
+            return Err("failed transfer packet count changed".into());
+        }
+        let descriptors = unsafe {
+            std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), self.packet_sizes.len())
+        };
+        if descriptors
+            .iter()
+            .zip(&self.packet_sizes)
+            .any(|(packet, requested)| {
+                packet.length as usize != *requested || packet.actual_length as usize > *requested
+            })
+        {
+            return Err("failed transfer packet geometry changed".into());
+        }
+        if descriptors
+            .iter()
+            .any(|packet| packet.status == LIBUSB_TRANSFER_NO_DEVICE)
+        {
+            return Err("USB DAC disconnected".into());
+        }
+        Ok(())
+    }
+
+    /// A timed-out URB retains individually completed packet evidence.
+    pub(super) fn account_timeout(
+        &self,
+        acceptance: PacketAcceptance,
+    ) -> Result<CompletionStats, String> {
+        self.failed_transfer_geometry()?;
+        let transfer = unsafe { self.transfer.as_ref() };
+        Ok(timed_out_packet_results(
+            transfer,
+            &self.packet_sizes,
+            acceptance,
+        ))
+    }
+
+    /// A failed transfer does not establish delivery; charge its full payload.
+    pub(super) fn account_failed(
+        &self,
+        acceptance: PacketAcceptance,
+    ) -> Result<CompletionStats, String> {
+        self.failed_transfer_geometry()?;
+        Ok(account_timed_out_transfer(
+            &self.packet_sizes,
+            &[],
+            acceptance,
+        ))
     }
 
     pub(super) fn mark_completed(&mut self) {
@@ -1174,20 +1222,35 @@ fn inspect_feedback_packets_with_compatibility(
                     ),
                 };
             }
-            // A selected interpretation can become stale after firmware relock.
-            // Drop it and require the ordinary three-completion inference again;
-            // never reinterpret Tenor or bypass the live clock cross-check.
+            // Discard a selected timebase only when this report positively fits
+            // the alternative. An isolated corrupt report must not reset lock.
             if !per_service
                 && compatibility.tenor_nominal_q16.is_none()
                 && counters.infer_service_interval
                 && counters.selected_timebase.is_some()
                 && decoded.is_some_and(|(frames, _)| !scheduler.feedback_rate_is_plausible(frames))
             {
-                counters.selected_timebase = None;
-                counters.service_interval_confirmations = 0;
-                counters.cached_service_interval = false;
-                counters.redetecting = true;
-                decoded = decode_feedback_report_with_scale(bytes, service_us, speed, false);
+                let alternate = decode_feedback_report_with_scale(
+                    bytes,
+                    service_us,
+                    speed,
+                    !inferred_service_interval,
+                )
+                .filter(|(frames, _)| {
+                    scheduler.feedback_rate_is_plausible(*frames)
+                        && frames.ceil() <= max_frames as f64
+                });
+                if alternate.is_some() {
+                    counters.selected_timebase = None;
+                    counters.service_interval_confirmations = 0;
+                    counters.cached_service_interval = false;
+                    counters.redetecting = true;
+                    decoded = if inferred_service_interval {
+                        alternate
+                    } else {
+                        decode_feedback_report_with_scale(bytes, service_us, speed, false)
+                    };
+                }
             }
             // Startup reports cannot select units, acquire lock or renew its deadline.
             // Retain ordinary malformed/empty/failed diagnostics below.
@@ -1275,15 +1338,8 @@ fn inspect_feedback_packets_with_compatibility(
         }
     }
     if counters.selected_timebase.is_none() {
-        if newest.is_some() && counters.redetecting {
-            counters.service_interval_confirmations += 1;
-            if counters.service_interval_confirmations < SERVICE_INTERVAL_CONFIRMATIONS {
-                newest = None;
-            } else {
-                counters.redetecting = false;
-                counters.select_timebase(FeedbackTimebase::Bus, speed, true);
-            }
-        } else if newest.is_some() {
+        if newest.is_some() {
+            counters.redetecting = false;
             // A conforming report always wins, even if an earlier packet in
             // the same completion resembled a different timebase.
             let unit = if per_service && speed == Speed::High && counters.last_report_len == 4 {
@@ -1789,20 +1845,31 @@ mod explicit_feedback_tests {
             );
         }
         assert!(counters.selected_service_interval());
-        // Firmware relocks to ordinary per-microframe reporting.
-        for _ in 0..2 {
-            assert!(select_feedback_report(
-                &q16(6.0),
-                [(0, 4, 4)],
-                &scheduler,
-                1000,
-                Speed::High,
-                64,
-                false,
-                &mut counters
-            )
-            .is_none());
-        }
+        // Corrupt reports do not discard the locked service timebase.
+        assert!(select_feedback_report(
+            &q16(999.0),
+            [(0, 4, 4)],
+            &scheduler,
+            1000,
+            Speed::High,
+            64,
+            false,
+            &mut counters
+        )
+        .is_none());
+        assert!(counters.selected_service_interval());
+        assert!(select_feedback_report(
+            &q16(48.0),
+            [(0, 4, 4)],
+            &scheduler,
+            1000,
+            Speed::High,
+            64,
+            false,
+            &mut counters
+        )
+        .is_some());
+        // A valid standard report proves a change of units immediately.
         assert!(select_feedback_report(
             &q16(6.0),
             [(0, 4, 4)],
@@ -2807,7 +2874,7 @@ mod explicit_feedback_tests {
         let diagnostics = counters.diagnostics.unwrap();
         assert_eq!(diagnostics.timebase, Some("out_service_interval"));
         assert!(diagnostics.inferred_timebase);
-        // A later report with different units is refused.
+        // A later valid standard-unit report is accepted immediately.
         assert!(select_feedback_report(
             &standard,
             [(0, 4, 4)],
@@ -2818,7 +2885,7 @@ mod explicit_feedback_tests {
             false,
             &mut counters
         )
-        .is_none());
+        .is_some());
     }
 
     #[test]

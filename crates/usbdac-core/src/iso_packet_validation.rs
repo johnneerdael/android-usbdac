@@ -94,8 +94,8 @@ pub(crate) struct CompletionStats {
     pub zero_packets: usize,
     pub descriptor_rewrites: usize,
     pub shortfall_frames: u64,
-    /// Submitted bytes the DAC did not take. This is loss: the audio was
-    /// queued behind other URBs and cannot be re-sent.
+    /// Submitted audio not confirmed delivered. Failed requests are charged
+    /// in full because their reported partial byte count is not reliable.
     pub lost_bytes: u64,
 }
 
@@ -136,12 +136,15 @@ pub(crate) fn validate_iso_packet_descriptors(
         if packet.status != LIBUSB_TRANSFER_COMPLETED {
             if matches!(
                 packet.status,
-                LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_TIMED_OUT | LIBUSB_TRANSFER_OVERFLOW
+                LIBUSB_TRANSFER_ERROR
+                    | LIBUSB_TRANSFER_TIMED_OUT
+                    | LIBUSB_TRANSFER_OVERFLOW
+                    | LIBUSB_TRANSFER_STALL
             ) && !acceptance.exact
                 && requested > 0
                 && acceptance.is_frame_aligned(requested)
                 && packet.length as usize == requested
-                && actual == 0
+                && actual <= requested
             {
                 failed_packet_bytes += acceptance.audio_bytes(requested);
                 stats.zero_packets +=
@@ -231,6 +234,7 @@ pub(crate) fn validate_iso_packet_descriptors(
         .sum();
     let actual_audio: usize = descriptors
         .iter()
+        .filter(|packet| packet.status == LIBUSB_TRANSFER_COMPLETED)
         .map(|packet| acceptance.audio_bytes(packet.actual_length as usize))
         .sum();
     stats.lost_bytes = requested_audio

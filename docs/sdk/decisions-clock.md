@@ -129,3 +129,5 @@ valid routes using nominal timing. It carries the `UNSYNCHRONIZED_ASYNC`
 blocker for the entire stream.
 
 **References.** [Linux implicit feedback](references.md#ref-linux-implicit), [UAC 2.0 and USB 2.0 synchronisation types](references.md#ref-usb2), [Mornye README](references.md#ref-mornye-commits).
+
+Source-backed `GET_SAMPLE_RATE` suppresses only the UAC1 endpoint readback, matching its source scope. UAC2/3 clock-source reads remain enabled. An inferred adaptive rate is not clock verification; only actual readback evidence can establish that status.

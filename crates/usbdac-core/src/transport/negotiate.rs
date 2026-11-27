@@ -366,9 +366,9 @@ pub(super) fn negotiate_playback_format(
                 } else {
                     DacMode::AdaptiveStreaming
                 };
-                reported_rate = reported_rate.or(current_rate).or(Some(actual_rate));
-                rate_verified =
-                    current_rate == Some(actual_rate) || reported_rate == Some(actual_rate);
+                rate_verified = (!clock_attempted && current_rate == Some(actual_rate))
+                    || (rate_verified && reported_rate == Some(actual_rate));
+                reported_rate = reported_rate.or(current_rate);
             } else {
                 if uac2_choice_has_multiplier(clock_choice.as_ref()) {
                     return Err(Error::ClockUnverified {

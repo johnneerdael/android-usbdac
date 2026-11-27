@@ -85,7 +85,8 @@ pub struct StreamStats {
     pub software_gain: f32,
     /// Runs of padding because the ring ran dry (counted per transfer).
     pub underruns: u64,
-    /// Frames queued to the DAC that it never took.
+    /// Frames not confirmed delivered. Failed packets are charged in full, so
+    /// this may exceed actual loss when a failed request reports partial bytes.
     pub lost_frames: u64,
     pub short_packets: u64,
     pub zero_packets: u64,
