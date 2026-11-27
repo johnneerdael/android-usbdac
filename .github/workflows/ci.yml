@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      recheck:
+        description: Retry checks at the selected revision
+        type: choice
+        required: true
+        options:
+          - rust-lint
+          - qemu-uac1
+          - rust-lint-and-qemu-uac1
   workflow_call:
     inputs:
       source_sha:
@@ -25,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ inputs.source_sha != '' && github.run_id || github.ref }}
+  group: ci-${{ github.workflow }}-${{ (inputs.source_sha != '' || inputs.recheck != '') && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -37,6 +47,7 @@ env:
 
 jobs:
   rust:
+    if: inputs.recheck != 'qemu-uac1'
     name: Rust tests and Android check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -55,6 +66,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install the NDK
+        if: inputs.recheck == ''
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
@@ -65,14 +77,17 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Verify generated capability and result status
+        if: inputs.recheck == ''
         run: |
           cargo run --quiet --locked -p usbdac-core --example support_manifest > target/shipped-support.json
           python3 -I .github/scripts/generate_evidence.py --check --capabilities target/shipped-support.json
 
       - name: Test (host)
+        if: inputs.recheck == ''
         run: cargo test --workspace --locked
 
       - name: Check (aarch64-linux-android)
+        if: inputs.recheck == ''
         # libusb is compiled from source, so the NDK's clang has to be reachable.
         run: |
           export PATH="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
@@ -81,6 +96,7 @@ jobs:
           cargo check --workspace --locked --target aarch64-linux-android
 
   guide:
+    if: inputs.recheck == ''
     name: Guide code samples
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -95,6 +111,7 @@ jobs:
         run: python3 -I .github/scripts/check_docs_snippets.py
 
   android:
+    if: inputs.recheck == ''
     outputs:
       artifact_id: ${{ steps.release_payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.release_payload.outputs.artifact-digest }}
@@ -214,6 +231,7 @@ jobs:
           retention-days: 7
 
   defensive-fuzz:
+    if: inputs.recheck == ''
     name: Defensive USB parsers (bounded fuzz and Miri)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -243,6 +261,7 @@ jobs:
           retention-days: 7
 
   qemu-usb:
+    if: inputs.recheck != 'rust-lint'
     name: QEMU UAC1 playback, reconfigure and two owners
     # Noble ships QEMU8.2.2 whose UAC1 AC descriptors incorrectly advertise
     # protocol0x04; Resolute ships fixed QEMU10.2.1. Keep strict driver/probe gates.

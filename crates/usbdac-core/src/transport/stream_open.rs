@@ -601,8 +601,8 @@ fn start_stream_inner_with_capture(
                     playback_format.sample_rate,
                     clock_settle_delay_ms,
                 );
-                clock_control_attempted = !multiplied_clock
-                    && !(clock_outcome.clock_ok && !clock_outcome.set_cur_succeeded);
+                clock_control_attempted = !(multiplied_clock
+                    || clock_outcome.clock_ok && !clock_outcome.set_cur_succeeded);
                 clock_control_succeeded = clock_outcome.set_cur_succeeded;
                 reported_sample_rate = clock_outcome.reported_sample_rate;
                 clock_verification_passed = clock_outcome.rate_verified
