@@ -1,0 +1,29 @@
+# Linux USB audio lifecycle fixture
+
+The fixture serves a synthetic USB device on TCP loopback inside a disposable Linux guest. Linux `vhci_hcd` presents the device to the guest through usbfs. The Rust probe opens it through the production usbdac and libusb paths. The guest uses no external network interface or USB passthrough.
+
+## Source grounding
+
+- Linux `f_uac2` supplies a UAC2 gadget function. The kernel's stock `dummy_hcd` rejects isochronous transfers. Stock FunctionFS also rejects the Audio Class interface and endpoint descriptor types in its descriptor parser. The fixture uses USB/IP so that the guest kernel can submit and complete isochronous URBs and the device model can answer exact USB control requests. [Linux UAC2 gadget](https://github.com/torvalds/linux/blob/v6.12/drivers/usb/gadget/function/f_uac2.c), [dummy HCD](https://github.com/torvalds/linux/blob/v6.12/drivers/usb/gadget/udc/dummy_hcd.c), [FunctionFS](https://github.com/torvalds/linux/blob/v6.12/drivers/usb/gadget/function/f_fs.c), [USB/IP protocol](https://docs.kernel.org/usb/usbip_protocol.html).
+- The UAC2 model exposes stereo S16 at 48 and 96 kHz through a synchronous high-speed endpoint with a 125 µs service interval. At 96 kHz that carries up to 48 bytes per interval. Its AudioControl clock source answers frequency CUR and RANGE and clock validity CUR. ALSA's shared UAC2/UAC3 clock code likewise uses a four-byte little-endian frequency CUR and reads the rate back after writing. ALSA can log and continue on a positive mismatch. The fixture exercises usbdac's strict mode, which requires fresh post-alternate evidence before admitting playback. [USB-IF Audio 2.0](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), [pinned ALSA clock code](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/clock.c#L531-L665).
+- USB Audio 3.0 §3.3 requires a legacy UAC1 or UAC2 audio association at configuration descriptor index zero. A streaming device also exposes another configuration with the BADD association. Full UAC3 configurations can appear after the compatibility configuration. BADD uses interface protocol `0x30`, fixed 48 kHz playback, and profile-derived topology. The asynchronous high-speed BADD sink needs explicit feedback. Its 16.16 feedback at 48 kHz expresses six samples per 125 µs bus interval, even when the endpoint's service interval is 1 ms. [USB-IF Audio 3.0 and BADD errata archive](https://www.usb.org/sites/default/files/USB%20Audio%20v3.0_0.zip), [pinned ALSA BADD and UAC3 parsing](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/stream.c).
+
+## Guest requirements
+
+Use an ARM64 Linux guest kernel with `CONFIG_USBIP_CORE` and `CONFIG_USBIP_VHCI_HCD`. Alpine 3.22's aarch64 `linux-lts-6.12.119-r0.apk` has both as modules. Its `linux-virt` kernel lacks USB/IP. The guest init requires BusyBox with mount, ip, insmod, timeout and poweroff applets. The kernel must provide devtmpfs and the PL011 console for the QEMU ARM `virt` machine.
+
+Build the daemon with `rustc --edition 2021` for Linux and the driver probe with `cargo build --locked -p usbdac-core --example usbip_lifecycle`. For a minimal ARM64 initramfs, target `aarch64-unknown-linux-musl` and enable vendored libusb on the probe build. Include the following in the initramfs:
+
+- This directory's `init` as executable `/init`.
+- The static executables `/fixture/usbip_uac` and `/fixture/usbip_lifecycle`.
+- The matching, decompressed `/fixture/usbcore.ko`, `/fixture/usbip-core.ko`, and `/fixture/vhci-hcd.ko` from the guest kernel's package.
+
+Boot QEMU ARM `virt` with that kernel and initramfs, a serial console at `ttyAMA0`, and no NIC or passthrough. Set a host stop deadline before boot. The init logs each test's result, detaches the fixture between cases, reports aggregate status, and powers off. The synthetic device uses `1209:daca` only in this test environment.
+
+Pass `usbip.mode=<case>` on the kernel command line to select one case. The cases include the three UAC2 clock outcomes (`normal`, `bad-cur`, `stale-cur`), `badd`, `full-uac3` powered routing, `full-uac3-clock` direct rate fallback, `reconfigure`, `duplex`, `retire`, and `jni-retire`. The `lifecycle` group runs the capture and both retirement cases.
+
+The BADD and powered full-UAC3 profiles expose D0, D1 and D2 and default to D0, as required by Audio 3.0 §§3.14.5 and 5.2.1.4.4. The probes explicitly enter D2 before opening usbdac. This establishes the sleeping starting state for the wake and hand-back checks. [USB-IF Audio 3.0 errata archive](https://www.usb.org/sites/default/files/USB%20Audio%20v3.0_0.zip).
+
+For `jni-retire`, include a Linux ARM64 musl JRE 17 under `/usr/lib/jvm/java-17-openjdk`, its loader and zlib, and a Linux ARM64 musl build of the production JNI shared library as `/fixture/libusbdac.so`. Build `usbfs_jni_launcher.c` as a static Linux executable under `/fixture`. Place the SDK AAR's `classes.jar` and matching `kotlin-stdlib.jar` there and compile `JniRetirementProbe.java` with `javac --release 17` into `/fixture/jni-classes`. The launcher opens and claims the synthetic device before handing the fd to Java. The fixture releases a held unlink over a separate loopback control socket because Linux's synchronous USBFS discard can hold the device lock while the unlink is pending. The JVM test covers the production JNI and native retirement path. Android's platform USB claim and configuration calls have their own boundary tests.
+
+USB/IP carries real kernel submission, completion and cancellation for the virtual device. The virtual host controller does not supply a real frame-number counter. The acceptance evidence covers control requests, buffer contents, and kernel/libusb lifecycle behavior.

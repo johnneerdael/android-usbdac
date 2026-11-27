@@ -1,0 +1,149 @@
+#!/bin/sh
+# Disposable QEMU guest only: USB/IP stays on loopback and uses vhci port 0.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+daemon_pid=
+attached=0
+failures=0
+
+cleanup() {
+    if [ "$attached" = 1 ]; then
+        if ! printf '0\n' > /sys/devices/platform/vhci_hcd.0/detach; then
+            echo 'USBIP_CLEANUP_FAIL detach'
+            failures=$((failures + 1))
+        fi
+        attached=0
+    fi
+    if [ -n "$daemon_pid" ]; then
+        kill "$daemon_pid" 2>/dev/null || :
+        kill -9 "$daemon_pid" 2>/dev/null || :
+        wait "$daemon_pid" 2>/dev/null || :
+        daemon_pid=
+    fi
+}
+
+finish() {
+    cleanup
+    echo "USBIP_AGGREGATE failures=$failures"
+    /bin/busybox sync
+    exec /bin/busybox poweroff -f
+}
+trap 'failures=$((failures + 1)); finish' INT TERM
+
+/bin/busybox mkdir -p /proc /sys /dev
+if ! /bin/busybox mount -t proc proc /proc || ! /bin/busybox mount -t sysfs sysfs /sys || ! /bin/busybox mount -t devtmpfs devtmpfs /dev; then
+    echo 'USBIP_BOOT_FAIL mounts'
+    failures=$((failures + 1))
+    finish
+fi
+if ! /bin/busybox ip link set lo up; then
+    echo 'USBIP_BOOT_FAIL loopback'
+    failures=$((failures + 1))
+    finish
+fi
+for module in usbcore usbip-core vhci-hcd; do
+    if ! /bin/busybox insmod "/fixture/$module.ko"; then
+        echo "USBIP_BOOT_FAIL module=$module"
+        failures=$((failures + 1))
+        finish
+    fi
+done
+
+run_mode() {
+    mode=$1
+    port=$2
+    echo "USBIP_MODE_START mode=$mode port=$port"
+    daemon_mode=$mode
+    [ "$mode" = jni-retire ] && daemon_mode=retire
+    [ "$mode" = reconfigure ] && daemon_mode=normal
+    /fixture/usbip_uac --mode "$daemon_mode" --port "$port" &
+    daemon_pid=$!
+    /bin/busybox sleep 1
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+        echo "USBIP_MODE_FAIL mode=$mode stage=daemon"
+        return 1
+    fi
+    if ! /bin/busybox timeout 10 /fixture/usbip_uac --attach --port "$port"; then
+        echo "USBIP_MODE_FAIL mode=$mode stage=attach"
+        return 1
+    fi
+    attached=1
+    node=
+    count=0
+    tries=0
+    while [ "$tries" -lt 10 ]; do
+        count=0
+        node=
+        for device in /sys/bus/usb/devices/*; do
+            [ -r "$device/idVendor" ] && [ -r "$device/idProduct" ] || continue
+            IFS= read -r vendor < "$device/idVendor"
+            IFS= read -r product < "$device/idProduct"
+            [ "$vendor:$product" = 1209:daca ] || continue
+            resolved=$(/bin/busybox readlink -f "$device") || continue
+            case "$resolved" in */vhci_hcd.0/*) ;; *) continue ;; esac
+            IFS= read -r bus < "$device/busnum"
+            IFS= read -r dev < "$device/devnum"
+            candidate=$(printf '/dev/bus/usb/%03d/%03d' "$bus" "$dev")
+            [ -c "$candidate" ] || continue
+            count=$((count + 1))
+            node=$candidate
+        done
+        [ "$count" -eq 1 ] && break
+        tries=$((tries + 1))
+        /bin/busybox sleep 1
+    done
+    if [ "$count" -ne 1 ]; then
+        echo "USBIP_MODE_FAIL mode=$mode stage=discovery matches=$count"
+        return 1
+    fi
+    echo "USBIP_MODE_DEVICE mode=$mode path=$node"
+    USBDAC_USBIP_PORT=$port
+    export USBDAC_USBIP_PORT
+    if [ "$mode" = jni-retire ]; then
+        /bin/busybox timeout 45 /fixture/usbfs_jni_launcher "$node" \
+            /usr/lib/jvm/java-17-openjdk/bin/java -Xmx64m \
+            -Djava.library.path=/fixture \
+            -cp /fixture/jni-classes:/fixture/classes.jar:/fixture/kotlin-stdlib.jar \
+            JniRetirementProbe
+    else
+        /bin/busybox timeout 45 /fixture/usbip_lifecycle "$node" "$mode"
+    fi
+    result=$?
+    if [ "$result" -ne 0 ]; then
+        echo "USBIP_MODE_FAIL mode=$mode stage=probe status=$result"
+        return 1
+    fi
+    echo "USBIP_MODE_PASS mode=$mode"
+    return 0
+}
+
+entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex:3245 retire:3246 full-uac3-clock:3248 reconfigure:3249'
+IFS= read -r cmdline < /proc/cmdline
+for arg in $cmdline; do
+    case "$arg" in
+        usbip.mode=normal) entries=normal:3240 ;;
+        usbip.mode=bad-cur) entries=bad-cur:3241 ;;
+        usbip.mode=stale-cur) entries=stale-cur:3242 ;;
+        usbip.mode=badd) entries=badd:3243 ;;
+        usbip.mode=full-uac3) entries=full-uac3:3244 ;;
+        usbip.mode=full-uac3-clock) entries=full-uac3-clock:3248 ;;
+        usbip.mode=reconfigure) entries=reconfigure:3249 ;;
+        usbip.mode=duplex) entries=duplex:3245 ;;
+        usbip.mode=retire) entries=retire:3246 ;;
+        usbip.mode=jni-retire) entries=jni-retire:3247 ;;
+        usbip.mode=lifecycle) entries=duplex:3245\ retire:3246\ jni-retire:3247 ;;
+        usbip.mode=*) echo "USBIP_BOOT_FAIL invalid-mode=$arg"; failures=$((failures + 1)); finish ;;
+    esac
+done
+for entry in $entries; do
+    mode=${entry%:*}
+    port=${entry#*:}
+    if ! run_mode "$mode" "$port"; then
+        failures=$((failures + 1))
+    fi
+    cleanup
+    # Let VHCI finish unregistering port 0 before importing the next fixture.
+    /bin/busybox sleep 1
+done
+finish
