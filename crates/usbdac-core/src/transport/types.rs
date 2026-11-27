@@ -148,7 +148,7 @@ pub(crate) struct CapabilityModel {
     pub(super) link_speed: Option<crate::capabilities::LinkSpeed>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct IsoStreamCandidate {
     pub(super) configuration_number: u8,
     pub(super) interface_number: u8,

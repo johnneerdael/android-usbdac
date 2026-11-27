@@ -28,8 +28,9 @@ public enum class SyncType { ASYNCHRONOUS, ADAPTIVE, SYNCHRONOUS, NONE }
 public data class RateRange(val minHz: Int, val maxHz: Int, val stepHz: Int)
 
 /**
- * One alternate setting of an Audio Streaming interface: a combination of channel count, bit
- * depth and rates the DAC accepts on one endpoint.
+ * One playback configuration on an isochronous OUT alternate.
+ * A UAC3 OUT alternate can have several entries with different implicit-feedback IN
+ * alternates. The rates on each entry apply to the input named by [pacing].
  */
 public data class AltSetting(
     val interfaceNumber: Int,

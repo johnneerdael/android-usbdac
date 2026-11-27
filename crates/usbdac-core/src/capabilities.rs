@@ -176,7 +176,9 @@ pub struct RateRange {
     pub step_hz: u32,
 }
 
-/// One isochronous OUT alternate setting of an AudioStreaming interface.
+/// One playback configuration on an isochronous OUT alternate.
+/// A UAC3 OUT alternate can appear with several implicit-feedback IN
+/// alternates. Each entry's rates apply to the input named by its pacing.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AltSetting {

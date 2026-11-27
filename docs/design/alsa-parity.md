@@ -94,10 +94,6 @@ configuration. Implicit feedback also requires the selected IN
 alternate to support the output wire rate. Each independent duplex
 direction checks its own alternate. The live Valid Alternate Settings
 control provides a further check at activation when advertised.
-When one feedback endpoint offers several IN alternates, the current
-driver retains one compatible IN alternate per playback route. If
-those IN alternates support different rates, negotiation can still
-miss a rate that a different IN alternate would support.
 
 For physical acceptance, use two alternates on one clock with
 different declared ranges. Check that discovery lists the correct
@@ -109,6 +105,27 @@ Rust workspace tests, the Android arm64 target check and the four-ABI
 AAR and sample builds passed. Each ABI has identical native bytes in
 the AAR and sample. The AAR SHA-256 is
 `cec2cea497dd9d665df8b0a44ed367ed1635aa0e3b8713ad59595dd2f59423eb`.
+
+### Matching an implicit feedback alternate to the playback rate
+
+Retain the compatible IN alternates of a single proven UAC3 feedback
+endpoint. Each capability entry carries the rates supported by both
+alternates and identifies the IN alternate in its pacing field. At an
+exact rate, apply the feedback endpoint preference only among pairs
+that support that rate. Require one physical feedback endpoint with
+a shared clock and equal service intervals. Save the selected IN
+alternate with the stream's clock and descriptor proof, and verify
+that exact pair again before opening the stream. [USB-IF ADC3 §§3.11.4.3, 3.14.2 and 4.7.3 via IEC](https://webstore.iec.ch/en/publication/63921), [ALSA feedback format selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L365-L454)
+
+For hardware acceptance, use a UAC3 playback alternate whose implicit
+feedback endpoint has different IN alternates at 48 and 96 kHz.
+Negotiate and open each rate, verify the selected IN alternate, then
+repeat for duplex capture on the same feedback source.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit tests,
+and the four-ABI AAR and sample builds passed. The AAR and sample contain
+identical native libraries for each ABI. The AAR SHA-256 is
+`63c377472bddb2ee39d59eb8e2b57d29041c69a65254e2993341a9db3e7f7260`.
 
 ## Transport integration sequence
 

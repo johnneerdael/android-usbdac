@@ -870,10 +870,8 @@ pub(super) fn build_usb_capability_model(
         }
     }
 
-    for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
-        let ranges = adc3::adc3_wire_ranges(handle, &route).unwrap_or_default();
-        let ranges = adc3_capacity_ranges(&candidate, &ranges);
-        let rates = representative_sample_rates_from_ranges(&ranges);
+    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces) {
+        let rates = candidate.sample_rates;
         supported_sample_rates.extend(rates.iter().copied());
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
@@ -1196,13 +1194,12 @@ pub(super) fn select_stream_candidate(
     }
 
     if playback_format.dsd_transport == DsdTransportMode::None {
-        for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
+        for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces) {
             let format = StreamingInterfaceFormat { format_tag:FORMAT_TAG_PCM,uac2_formats:None,native_dsd:None,
                 channels:candidate.channels,subslot_size:candidate.subslot_size,bit_resolution:candidate.bit_resolution,
                 terminal_link:candidate.terminal_link,is_uac1:false,sample_rate_ranges:vec![] };
             if transport_compatibility_penalty(&format,playback_format) == u32::MAX { continue; }
-            let supported = adc3::adc3_wire_ranges(handle, &route)
-                .map(|ranges| sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate)).unwrap_or(false);
+            let supported = sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate);
             if supported && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
                 playback_format.sample_rate, source.service_interval_us, source.bytes_per_frame))
                 && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {
