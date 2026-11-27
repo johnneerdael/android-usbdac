@@ -423,9 +423,9 @@ pub fn replace_stream(
         .ok_or_else(|| Error::InvalidState("DAC closed before replacement registration".into()))?;
     let previous = u64::try_from(previous).map_err(|_| stale("stream", previous))?;
     let mut streams = STREAMS.lock();
-    if !streams
+    if streams
         .get(&previous)
-        .is_some_and(|(registered, _)| *registered == owner)
+        .is_none_or(|(registered, _)| *registered != owner)
     {
         return Err(Error::InvalidState(
             "old stream closed during reconfiguration".into(),

@@ -81,13 +81,103 @@ fn idle_snapshot(handle: &DeviceHandle<Context>, claimed: &[u8]) -> Result<(u8, 
     Ok((config.number(), interfaces))
 }
 
-// A no-match certificate is based only on successfully parsed UAC2 output
-// descriptors, not the broad SelectError::NoMatch (which also wraps I/O).
-fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
-    if format.pcm_encoding != PcmEncoding::Signed
-        || format.is_dop
-        || format.dsd_transport != DsdTransportMode::None
+// A clean UAC1 exclusion requires complete standard Type-I descriptors. The
+// general transport parser tolerates truncated rate lists, so it cannot alone
+// certify a negative for a later hardware attempt.
+fn uac1_type_i_excludes(extra: &[u8], request: PlaybackFormat) -> Option<bool> {
+    let mut general = None;
+    let mut type_i = None;
+    let mut at = 0;
+    while at < extra.len() {
+        if extra.len() - at < 2 {
+            return None;
+        }
+        let len = usize::from(extra[at]);
+        if len < 2 || len > extra.len() - at {
+            return None;
+        }
+        let d = &extra[at..at + len];
+        if d[1] == USB_DT_CS_INTERFACE {
+            if len < 3 {
+                return None;
+            }
+            match d[2] {
+                1 => {
+                    if general.replace(d).is_some() {
+                        return None;
+                    }
+                }
+                2 => {
+                    if type_i.replace(d).is_some() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        at += len;
+    }
+    let general = general?;
+    let type_i = type_i?;
+    if general.len() != 7
+        || general[3] == 0
+        || type_i.len() < 8
+        || type_i[3] != 1
+        || type_i[4] == 0
+        || !(1..=4).contains(&type_i[5])
+        || type_i[6] == 0
+        || u16::from(type_i[6]) > u16::from(type_i[5]) * 8
     {
+        return None;
+    }
+    let tag = u16::from_le_bytes([general[5], general[6]]);
+    // Unknown/private format tags are never evidence of incompatibility.
+    if !matches!(
+        tag,
+        FORMAT_TAG_PCM | FORMAT_TAG_PCM8 | FORMAT_TAG_IEEE_FLOAT
+    ) || (tag == FORMAT_TAG_PCM8 && (type_i[5] != 1 || type_i[6] != 8))
+        || (tag == FORMAT_TAG_IEEE_FLOAT && (type_i[5] != 4 || type_i[6] != 32))
+    {
+        return None;
+    }
+    let rate = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
+    let count = usize::from(type_i[7]);
+    let rate_supported = if count == 0 {
+        if type_i.len() != 14 {
+            return None;
+        }
+        let min = rate(&type_i[8..11]);
+        let max = rate(&type_i[11..14]);
+        if min == 0 || min > max {
+            return None;
+        }
+        (min..=max).contains(&request.sample_rate)
+    } else {
+        if type_i.len() != 8 + count * 3 {
+            return None;
+        }
+        let mut supported = false;
+        for bytes in type_i[8..].chunks_exact(3) {
+            let value = rate(bytes);
+            if value == 0 {
+                return None;
+            }
+            supported |= value == request.sample_rate;
+        }
+        supported
+    };
+    Some(
+        tag != request.pcm_encoding.format_tag()
+            || u16::from(type_i[4]) != request.channels
+            || type_i[6] != request.bit_depth
+            || !rate_supported,
+    )
+}
+
+// Only immutable, fully described output incompatibility mints a clean refusal;
+// generic SelectError::NoMatch can also represent failed I/O or power changes.
+fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
+    if format.is_dop || format.dsd_transport != DsdTransportMode::None {
         return false;
     }
     let Ok(config) = claimed.handle.device().active_config_descriptor() else {
@@ -104,25 +194,33 @@ fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, spee
         .interfaces()
         .flat_map(|i| i.descriptors())
         .filter(|d| {
-            d.class_code() == 1
-                && d.sub_class_code() == 2
-                && d.setting_number() != 0
+            d.setting_number() != 0
                 && d.endpoint_descriptors()
                     .any(|ep| ep.direction() == Direction::Out)
         })
     {
         seen = true;
-        if alt.protocol_code() != 0x20 {
+        if alt.class_code() != 1 || alt.sub_class_code() != 2 {
             return false;
         }
-        let Some(parsed) = scan::parse_android_streaming_interface_format(&alt) else {
-            return false;
-        };
-        if parsed.channels == format.channels
-            && parsed.bit_resolution == format.bit_depth
-            && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
-        {
-            return false;
+        match alt.protocol_code() {
+            0 => {
+                if uac1_type_i_excludes(alt.extra(), format) != Some(true) {
+                    return false;
+                }
+            }
+            0x20 if format.pcm_encoding == PcmEncoding::Signed => {
+                let Some(parsed) = scan::parse_android_streaming_interface_format(&alt) else {
+                    return false;
+                };
+                if parsed.channels == format.channels
+                    && parsed.bit_resolution == format.bit_depth
+                    && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
     seen
@@ -186,7 +284,7 @@ pub(super) fn negotiate_playback_format(
         {
             clean_descriptor = true;
             return Err(Error::Unsupported {
-                reason: "no UAC2 output descriptor carries the requested PCM shape".into(),
+                reason: "no standard output descriptor carries the requested PCM format".into(),
                 offered: offered_alt_settings(),
             });
         }
@@ -1207,11 +1305,61 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
 
 #[cfg(test)]
 mod evidence_tests {
+    use super::uac1_type_i_excludes;
     use super::{
         adaptive_rate_verified, candidate_rates_from_supported_ranges, negotiation_reported_rate,
         rank_sample_rates, rates_for_format,
     };
     use crate::transport::types::SamplingFrequencySubrange;
+
+    #[test]
+    fn uac1_clean_exclusion_requires_complete_standard_rate_and_encoding() {
+        use crate::transport::types::{DsdTransportMode, PcmEncoding, PlaybackFormat};
+        let descriptor = [
+            7, 0x24, 1, 1, 0, 1, 0, 11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0,
+        ];
+        let request = PlaybackFormat {
+            pcm_encoding: PcmEncoding::Signed,
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0,
+        };
+        assert_eq!(uac1_type_i_excludes(&descriptor, request), Some(true));
+        assert_eq!(
+            uac1_type_i_excludes(
+                &descriptor,
+                PlaybackFormat {
+                    sample_rate: 48_000,
+                    ..request
+                }
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            uac1_type_i_excludes(
+                &descriptor,
+                PlaybackFormat {
+                    pcm_encoding: PcmEncoding::Float32,
+                    bit_depth: 32,
+                    sample_rate: 48_000,
+                    ..request
+                }
+            ),
+            Some(true)
+        );
+        let mut truncated = descriptor.to_vec();
+        truncated[14] = 2;
+        assert_eq!(uac1_type_i_excludes(&truncated, request), None);
+        let mut zero_rate = descriptor;
+        zero_rate[15..18].fill(0);
+        assert_eq!(uac1_type_i_excludes(&zero_rate, request), None);
+        let mut unknown_tag = descriptor;
+        unknown_tag[5] = 0xff;
+        assert_eq!(uac1_type_i_excludes(&unknown_tag, request), None);
+    }
 
     #[test]
     fn adaptive_rates_follow_downsampling_order() {

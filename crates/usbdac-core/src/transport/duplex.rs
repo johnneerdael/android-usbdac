@@ -794,8 +794,8 @@ impl Attachment {
                     "UAC1 duplex rollback preserved an external endpoint frequency".into(),
                 ));
             }
-            for index in 0..transaction.endpoints.len() {
-                if !safe[index] || !transaction.endpoints[index].may_have_changed {
+            for (index, is_safe) in safe.iter_mut().enumerate() {
+                if !*is_safe || !transaction.endpoints[index].may_have_changed {
                     continue;
                 }
                 self.verify_uac1_alternates(claimed, &transaction.playback)?;
@@ -825,12 +825,12 @@ impl Attachment {
                     Ok(current) => current,
                     Err(Error::DeviceLost) => return Err(Error::DeviceLost),
                     Err(_) => {
-                        safe[index] = false;
+                        *is_safe = false;
                         continue;
                     }
                 };
                 if !uac1_endpoint_owned(endpoint, current) {
-                    safe[index] = false;
+                    *is_safe = false;
                     continue;
                 }
                 if current != endpoint.original {
