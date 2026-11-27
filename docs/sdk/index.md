@@ -26,6 +26,7 @@ and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-t
 | See what is proven and what is not | [Evidence and status](evidence.md) |
 | Learn how the code is organised | [Architecture](architecture.md), and [USB audio in a page](usb-audio-primer.md) if the terms are new |
 | Find a setting or an error code | [Controls and configuration](controls.md), [troubleshooting](troubleshooting.md) |
+| Add an in-app report flow for USB playback problems | [Collect a USB playback support report](support-diagnostics.md) |
 
 ## Playback routes
 
@@ -96,9 +97,10 @@ The pages come in six groups, in the navigation order.
 1. [The integration guide](integration.md): what you take on, the ways to integrate, the order of the work.
 2. [The player engine](integration-player.md): what to hand over, the writer, seek, position, processing, DSD.
 3. [App, service and settings](integration-app.md): permission, lifecycle, settings, volume, the status display, failures, testing, release.
-4. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
-5. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
-6. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
+4. [Collect a USB playback support report](support-diagnostics.md) covers the listener flow and Kotlin and Rust export APIs.
+5. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
+6. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
+7. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
 
 **Use.** [Controls and configuration](controls.md) (every option and control, with its default, its effect and its effect on bit-perfect output), [bit-perfect output](bit-perfect.md) (what the flag means, when it turns false, DSD, MQA), [transports](transports.md) (direct USB, the Android-managed output and exclusive AAudio, side by side) and [troubleshooting](troubleshooting.md) (error codes and a checklist for "nothing plays").
 
