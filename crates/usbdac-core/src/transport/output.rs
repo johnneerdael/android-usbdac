@@ -552,13 +552,21 @@ fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounte
 /// exposed or rearmed. Preserve the original typed detach/failure for duplex.
 fn poll_playback_status(status: &mut audio_status::AudioStatus, claimed: &ClaimedHandle,
     shared: &StreamShared) -> Result<(), Error> {
-    status.poll(claimed).map_err(|error| {
-        invalidate_clock_verification();
-        shared.stats.feedback_locked.store(false, Ordering::Release);
-        set_usb_stream_stable(false);
-        shared.note_bit_perfect();
-        error
-    })
+    status.poll(claimed).map_err(|error| invalidate_playback_status(error, shared))
+}
+
+fn invalidate_playback_status(error: Error, shared: &StreamShared) -> Error {
+    invalidate_clock_verification();
+    shared.stats.feedback_locked.store(false, Ordering::Release);
+    set_usb_stream_stable(false);
+    shared.note_bit_perfect();
+    error
+}
+
+fn arm_playback_endpoint(status: &mut audio_status::AudioStatus, claimed: &ClaimedHandle,
+    address: u8, shared: &StreamShared) -> Result<(), Error> {
+    status.arm_endpoint(claimed, address)
+        .map_err(|error| invalidate_playback_status(error, shared))
 }
 
 pub(super) fn run_usb_output_loop(
@@ -886,7 +894,10 @@ pub(super) fn run_usb_output_loop(
         && fatal_error.is_none() && !usb_stop_requested(&stop)) {
         match duplex::InputPool::new(Arc::clone(attachment)) {
             Ok(mut pool) => {
-                if let Err(error) = pool.start(&handle, &stop) {
+                let start = arm_playback_endpoint(&mut audio_status, claimed_handle,
+                    attachment.endpoint.address, &shared)
+                    .and_then(|()| pool.start(&handle, &stop));
+                if let Err(error) = start {
                     device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error);
                 }
                 capture_pool = Some(pool);
@@ -938,7 +949,13 @@ pub(super) fn run_usb_output_loop(
                     log_info!("[USB] Implicit feedback source interface={} alt={} endpoint=0x{:02x} inStride={} outStride={} service={}us packetCapacity={}",
                         source.interface_number, source.alt_setting, source.address, source.bytes_per_frame, bytes_per_frame,
                         source.service_interval_us, source.max_packet_bytes);
-                    if let Err(error) = engine.start(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
+                    if let Err(error) = arm_playback_endpoint(&mut audio_status, claimed_handle,
+                        source.address, &shared) {
+                        device_lost = error == Error::DeviceLost;
+                        fatal_error = Some(error.to_string()); capture_failure = Some(error);
+                    } else if let Err(error) = engine.start(&handle, &runtime_stats, &stop) {
+                        implicit_feedback_fault = true; fatal_error = Some(error);
+                    }
                     while fatal_error.is_none() && !usb_stop_requested(&stop) && !engine.primed() {
                         if let Err(error) = context.handle_events(Some(Duration::from_micros(u64::from(candidate.service_interval_us).min(1000)))) {
                             device_lost = error == rusb::Error::NoDevice;
@@ -1028,6 +1045,13 @@ pub(super) fn run_usb_output_loop(
         }
     }
 
+    if fatal_error.is_none() && !usb_stop_requested(&stop) {
+        if let Err(error) = arm_playback_endpoint(&mut audio_status, claimed_handle,
+            candidate.endpoint_address, &shared) {
+            device_lost = error == Error::DeviceLost;
+            fatal_error = Some(error.to_string()); capture_failure = Some(error);
+        }
+    }
     if fatal_error.is_none() {
         for slot in slots.iter_mut() {
             if slot.in_flight { continue; }

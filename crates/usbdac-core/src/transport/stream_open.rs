@@ -1169,8 +1169,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 let mut target = audio_status::StreamStatusTarget::new(protocol,
                     choice.control_interface, candidate.interface_number, candidate.alt_setting,
                     proven_clock);
+                target.add_data_endpoint(candidate.interface_number, candidate.alt_setting,
+                    candidate.endpoint_address);
                 if let Some(source) = candidate.implicit_feedback {
-                    target.add_streaming_alt(source.interface_number, source.alt_setting);
+                    target.add_data_endpoint(source.interface_number, source.alt_setting, source.address);
                 }
                 targets.push(target);
                 if let (Some(source), Some((_, root_rate))) = (candidate.implicit_feedback, proven_clock) {

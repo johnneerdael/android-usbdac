@@ -3,10 +3,11 @@
 use super::alternate_controls::advertised_controls;
 use super::iso::InterruptTransferSlot;
 use super::usbfs::{ClaimedHandle, UsbfsControlTransfer, USBDEVFS_CONTROL};
-use super::{ClockChoice, Direction, Error, TransferType};
+use super::{ClockChoice, Direction, Error, TransferType, UsageType};
 use crate::clock_resolution::{ClockHopKind, ClockResolution};
+use crate::descriptors::DescriptorIter;
 use libusb1_sys::constants::{LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_NO_DEVICE};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 // ADC3 Appendix A.22 (Table A-22): CUR = 0x01. The interrupt source
@@ -20,6 +21,7 @@ pub(super) struct StreamStatusTarget {
     control: u8,
     streaming: Vec<(u8, u8)>,
     reads: Vec<ExpectedRead>,
+    data_endpoints: Vec<(u8, u8, u8)>,
 }
 
 impl StreamStatusTarget {
@@ -35,6 +37,7 @@ impl StreamStatusTarget {
             control,
             streaming: vec![(interface, alternate)],
             reads: Vec::new(),
+            data_endpoints: Vec::new(),
         };
         if let Some((choice, rate)) = clock.filter(|(choice, _)| {
             choice.resolution == ClockResolution::Resolved && choice.control_interface == control
@@ -84,24 +87,59 @@ impl StreamStatusTarget {
             self.streaming.push((interface, alternate));
         }
     }
+    pub(super) fn add_data_endpoint(&mut self, interface: u8, alternate: u8, address: u8) {
+        self.add_streaming_alt(interface, alternate);
+        if !self
+            .data_endpoints
+            .contains(&(interface, alternate, address))
+        {
+            self.data_endpoints.push((interface, alternate, address));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Recipient {
+    Interface,
+    Endpoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Address {
+    recipient: Recipient,
     interface: u8,
     entity: u8,
     selector: u8,
 }
 
 impl Address {
+    fn request_type(self) -> u8 {
+        match self.recipient {
+            Recipient::Interface => 0xa1,
+            Recipient::Endpoint => 0xa2,
+        }
+    }
+
+    fn index(self) -> u16 {
+        u16::from(self.interface) | (u16::from(self.entity) << 8)
+    }
+
     fn notification(record: &[u8]) -> Option<Self> {
-        // CUR, class-specific interface recipient, master/channel-independent control.
-        if record.len() != 6 || record[0] != 0 || record[1] != CURRENT_ATTRIBUTE || record[2] != 0 {
+        // bInfo bit 1 identifies an endpoint recipient; all other bits must be clear.
+        if record.len() != 6 || record[1] != CURRENT_ATTRIBUTE || record[2] != 0 {
             return None;
         }
+        let (recipient, interface, entity) = match record[0] {
+            0 => (Recipient::Interface, record[4], record[5]),
+            2 if record[5] == 0 && valid_endpoint_address(record[4]) => {
+                (Recipient::Endpoint, record[4], 0)
+            }
+            _ => return None,
+        };
         Some(Self {
-            interface: record[4],
-            entity: record[5],
+            recipient,
+            interface,
+            entity,
             selector: record[3],
         })
     }
@@ -117,6 +155,7 @@ impl ExpectedRead {
     fn new(interface: u8, entity: u8, selector: u8, expected: &[u8]) -> Self {
         Self {
             address: Address {
+                recipient: Recipient::Interface,
                 interface,
                 entity,
                 selector,
@@ -154,10 +193,17 @@ fn add_read(reads: &mut Vec<ExpectedRead>, read: ExpectedRead) -> Result<(), Err
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct EndpointFault {
+    address: Address,
+    armed: bool,
+}
+
 struct EndpointStatus {
     endpoint: u8,
     slot: InterruptTransferSlot,
     reads: Vec<ExpectedRead>,
+    faults: Vec<EndpointFault>,
 }
 
 pub(super) struct AudioStatus {
@@ -190,6 +236,7 @@ impl AudioStatus {
         let mut endpoints = Vec::new();
         let mut owners = HashSet::new();
         let mut addresses = HashSet::new();
+        let mut watched_data = HashSet::new();
         for target in &targets {
             if !owners.insert(target.control)
                 || !claimed.claimed_interfaces.contains(&target.control)
@@ -218,6 +265,8 @@ impl AudioStatus {
                 continue;
             };
             let mut reads = Vec::new();
+            let mut faults = Vec::new();
+            let mut fault_advertisements = HashMap::new();
             for target in targets
                 .iter()
                 .filter(|other| other.control == target.control)
@@ -254,12 +303,69 @@ impl AudioStatus {
                     }
                     let controls = advertised_controls(target.protocol, descriptor.extra())
                         .map_err(Error::Control)?;
+                    for &(_, _, address) in target
+                        .data_endpoints
+                        .iter()
+                        .filter(|&&(i, a, _)| i == interface && a == alternate)
+                    {
+                        if !valid_endpoint_address(address) {
+                            return Err(Error::Control(
+                                "Invalid audio status data endpoint address".into(),
+                            ));
+                        }
+                        let mut matches = descriptor
+                            .endpoint_descriptors()
+                            .filter(|ep| ep.address() == address);
+                        let data = matches.next().ok_or_else(|| {
+                            Error::Control("Audio status data endpoint disappeared".into())
+                        })?;
+                        if matches.next().is_some()
+                            || data.transfer_type() != TransferType::Isochronous
+                            || !matches!(
+                                data.usage_type(),
+                                UsageType::Data | UsageType::FeedbackData
+                            )
+                        {
+                            return Err(Error::Control(
+                                "Invalid audio status data endpoint target".into(),
+                            ));
+                        }
+                        let selectors =
+                            endpoint_fault_controls(target.protocol, data.extra().unwrap_or(&[]))
+                                .map_err(Error::Control)?;
+                        if let Some(previous) =
+                            fault_advertisements.insert(address, selectors.clone())
+                        {
+                            if previous != selectors {
+                                return Err(Error::Control(
+                                    "Contradictory audio endpoint fault advertisements".into(),
+                                ));
+                            }
+                        }
+                        for selector in selectors {
+                            let address = Address {
+                                recipient: Recipient::Endpoint,
+                                interface: address,
+                                entity: 0,
+                                selector,
+                            };
+                            if !faults
+                                .iter()
+                                .any(|fault: &EndpointFault| fault.address == address)
+                            {
+                                faults.push(EndpointFault {
+                                    address,
+                                    armed: false,
+                                });
+                            }
+                        }
+                    }
                     if controls.active {
                         add_read(&mut reads, ExpectedRead::new(interface, 0, 1, &[alternate]))?;
                     }
                 }
             }
-            if reads.is_empty() {
+            if reads.is_empty() && faults.is_empty() {
                 continue;
             }
             if status_endpoints.next().is_some() || endpoint.max_packet_size() < 6 {
@@ -274,12 +380,20 @@ impl AudioStatus {
                     endpoint.address()
                 )));
             }
+            for &address in fault_advertisements.keys() {
+                if !watched_data.insert(address) {
+                    return Err(Error::Control(
+                        "Audio status data endpoint has multiple AudioControl owners".into(),
+                    ));
+                }
+            }
             let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
                 .map_err(Error::Transfer)?;
             endpoints.push(EndpointStatus {
                 endpoint: endpoint.address(),
                 slot,
                 reads,
+                faults,
             });
         }
         // Resolve contradictory targets before arming any endpoint.
@@ -287,6 +401,25 @@ impl AudioStatus {
             endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
         }
         Ok(Self { endpoints })
+    }
+
+    /// Clear pre-stream sticky state immediately before this endpoint's first data submission.
+    pub(super) fn arm_endpoint(
+        &mut self,
+        claimed: &ClaimedHandle,
+        address: u8,
+    ) -> Result<(), Error> {
+        let deadline = Instant::now() + VERIFICATION_BUDGET;
+        for endpoint in &mut self.endpoints {
+            for fault in &mut endpoint.faults {
+                if fault.address.interface == address && !fault.armed {
+                    // Reading clears the sticky flag. A valid old true value is intentionally ignored.
+                    read_fault(claimed, fault.address, deadline)?;
+                    fault.armed = true;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn poll(&mut self, claimed: &ClaimedHandle) -> Result<(), Error> {
@@ -309,6 +442,20 @@ impl AudioStatus {
             let pending = triggered_reads(&endpoint.reads, bytes);
             for index in pending {
                 read_expected(claimed, &endpoint.reads[index], deadline)?;
+            }
+            for index in triggered_faults(&endpoint.faults, bytes) {
+                let fault = &endpoint.faults[index];
+                if read_fault(claimed, fault.address, deadline)? {
+                    let name = if fault.address.selector == 2 {
+                        "overrun"
+                    } else {
+                        "underrun"
+                    };
+                    return Err(Error::Transfer(format!(
+                        "Confirmed audio endpoint {:#04x} {name}",
+                        fault.address.interface
+                    )));
+                }
             }
             endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
         }
@@ -349,6 +496,24 @@ fn read_expected(
     read: &ExpectedRead,
     deadline: Instant,
 ) -> Result<(), Error> {
+    let (result, response) = read_control(claimed, read.address, read.expected.len(), deadline)?;
+    if result as usize != read.expected.len() || response[..read.expected.len()] != read.expected {
+        return Err(Error::Control(format!(
+            "Audio status changed or invalid readback for {:?}: expected {:?}, received {:?}",
+            read.address,
+            read.expected,
+            &response[..(result as usize).min(response.len())]
+        )));
+    }
+    Ok(())
+}
+
+fn read_control(
+    claimed: &ClaimedHandle,
+    address: Address,
+    length: usize,
+    deadline: Instant,
+) -> Result<(usize, Vec<u8>), Error> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
@@ -356,12 +521,12 @@ fn read_expected(
     // usbfs takes integer milliseconds: a positive sub-millisecond remainder
     // must round up instead of becoming an unbounded zero-timeout request.
     let timeout_ms = ((remaining.as_nanos() + 999_999) / 1_000_000) as u32;
-    let mut response = vec![0; read.expected.len()];
+    let mut response = vec![0; length];
     let request = UsbfsControlTransfer {
-        request_type: 0xa1,
+        request_type: address.request_type(),
         request: CURRENT_ATTRIBUTE,
-        value: u16::from(read.address.selector) << 8,
-        index: u16::from(read.address.interface) | (u16::from(read.address.entity) << 8),
+        value: u16::from(address.selector) << 8,
+        index: address.index(),
         length: response.len() as u16,
         timeout_ms,
         data: response.as_mut_ptr().cast(),
@@ -379,21 +544,93 @@ fn read_expected(
         }
         return Err(Error::Control(format!(
             "Audio status read {:?}: {error}",
-            read.address
+            address
         )));
     }
     if Instant::now() >= deadline {
         return Err(verification_expired());
     }
-    if result as usize != read.expected.len() || response[..read.expected.len()] != read.expected {
-        return Err(Error::Control(format!(
-            "Audio status changed or invalid readback for {:?}: expected {:?}, received {:?}",
-            read.address,
-            read.expected,
-            &response[..(result as usize).min(response.len())]
-        )));
+    response.truncate((result as usize).min(response.len()));
+    Ok((result as usize, response))
+}
+
+fn parse_fault(response: &[u8]) -> Result<bool, Error> {
+    match response {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(Error::Control(
+            "Audio endpoint fault CUR must be exactly one byte containing 0 or 1".into(),
+        )),
     }
-    Ok(())
+}
+
+fn read_fault(claimed: &ClaimedHandle, address: Address, deadline: Instant) -> Result<bool, Error> {
+    let (length, response) = read_control(claimed, address, 1, deadline)?;
+    if length != 1 {
+        return Err(Error::Control(
+            "Invalid audio endpoint fault CUR length".into(),
+        ));
+    }
+    parse_fault(&response)
+}
+
+fn valid_endpoint_address(address: u8) -> bool {
+    address & 0x70 == 0 && address & 0x0f != 0
+}
+
+fn triggered_faults(faults: &[EndpointFault], packet: &[u8]) -> Vec<usize> {
+    if !faults.iter().any(|fault| fault.armed) {
+        return Vec::new();
+    }
+    if packet.len() % 6 != 0 {
+        return Vec::new();
+    }
+    let addresses: HashSet<_> = packet
+        .chunks_exact(6)
+        .filter_map(Address::notification)
+        .collect();
+    faults
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fault)| {
+            (fault.armed && addresses.contains(&fault.address)).then_some(index)
+        })
+        .collect()
+}
+
+/// EP_GENERAL: fault selectors 2 and 3 occupy the second and third two-bit fields.
+fn endpoint_fault_controls(protocol: u8, extra: &[u8]) -> Result<Vec<u8>, String> {
+    let length = match protocol {
+        0x20 => 8,
+        0x30 => 10,
+        _ => return Ok(Vec::new()),
+    };
+    let mut controls = None;
+    for descriptor in DescriptorIter::new(extra) {
+        if descriptor.len() != length || descriptor[1] != 0x25 || descriptor[2] != 1 {
+            continue;
+        }
+        let bitmap = if protocol == 0x20 {
+            u32::from(descriptor[4])
+        } else {
+            u32::from_le_bytes(descriptor[3..7].try_into().unwrap())
+        };
+        let mut selectors = Vec::new();
+        for selector in [2, 3] {
+            match (bitmap >> (2 * (selector - 1))) & 3 {
+                0 => {}
+                1 => selectors.push(selector as u8),
+                _ => return Err("Audio endpoint fault control must be absent or read-only".into()),
+            }
+        }
+        if let Some(previous) = &controls {
+            if previous != &selectors {
+                return Err("Contradictory standard EP_GENERAL fault advertisements".into());
+            }
+        }
+        controls = Some(selectors);
+    }
+    Ok(controls.unwrap_or_default())
 }
 
 fn verification_expired() -> Error {
@@ -404,6 +641,107 @@ fn verification_expired() -> Error {
 mod tests {
     use super::*;
     use crate::clock_resolution::{ClockHop, ClockHopKind};
+
+    fn general_endpoint(protocol: u8, bitmap: u32) -> Vec<u8> {
+        let mut descriptor = vec![0; if protocol == 0x20 { 8 } else { 10 }];
+        descriptor[0] = descriptor.len() as u8;
+        descriptor[1] = 0x25;
+        descriptor[2] = 1;
+        if protocol == 0x20 {
+            descriptor[4] = bitmap as u8;
+        } else {
+            descriptor[3..7].copy_from_slice(&bitmap.to_le_bytes());
+        }
+        descriptor
+    }
+
+    #[test]
+    fn endpoint_fault_advertisements_are_exact_and_read_only() {
+        for protocol in [0x20, 0x30] {
+            for (bitmap, selectors) in [(0, vec![]), (4, vec![2]), (16, vec![3]), (20, vec![2, 3])]
+            {
+                assert_eq!(
+                    endpoint_fault_controls(protocol, &general_endpoint(protocol, bitmap)).unwrap(),
+                    selectors
+                );
+            }
+            for bitmap in [8, 12, 32, 48] {
+                assert!(
+                    endpoint_fault_controls(protocol, &general_endpoint(protocol, bitmap)).is_err()
+                );
+            }
+            assert!(endpoint_fault_controls(protocol, &[]).unwrap().is_empty());
+            let mut private = general_endpoint(protocol, 20);
+            private.push(0);
+            private[0] += 1;
+            assert!(endpoint_fault_controls(protocol, &private)
+                .unwrap()
+                .is_empty());
+            let mut duplicate = general_endpoint(protocol, 20);
+            duplicate.extend(general_endpoint(protocol, 20));
+            assert_eq!(
+                endpoint_fault_controls(protocol, &duplicate).unwrap(),
+                vec![2, 3]
+            );
+            duplicate.extend(general_endpoint(protocol, 4));
+            assert!(endpoint_fault_controls(protocol, &duplicate).is_err());
+            let mut no_faults = general_endpoint(protocol, 0);
+            no_faults.extend(general_endpoint(protocol, 0));
+            assert!(endpoint_fault_controls(protocol, &no_faults)
+                .unwrap()
+                .is_empty());
+        }
+        // ADC3 places bmControls at offset 3, not UAC2's offset 4.
+        let mut adc3 = general_endpoint(0x30, 20);
+        adc3[4] = 0xff;
+        assert_eq!(endpoint_fault_controls(0x30, &adc3).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn endpoint_notifications_are_scoped_armed_and_deduplicated() {
+        for ep in [1, 0x81] {
+            let address = Address {
+                recipient: Recipient::Endpoint,
+                interface: ep,
+                entity: 0,
+                selector: 2,
+            };
+            let mut faults = vec![EndpointFault {
+                address,
+                armed: false,
+            }];
+            let record = [2, 1, 0, 2, ep, 0];
+            assert!(triggered_faults(&faults, &record).is_empty());
+            faults[0].armed = true;
+            assert_eq!(triggered_faults(&faults, &record.repeat(2)), vec![0]);
+            assert_eq!(address.request_type(), 0xa2);
+            assert_eq!(address.index(), u16::from(ep));
+            for unrelated in [
+                [0, 1, 0, 2, ep, 0],
+                [3, 1, 0, 2, ep, 0],
+                [2, 2, 0, 2, ep, 0],
+                [2, 1, 1, 2, ep, 0],
+                [2, 1, 0, 3, ep, 0],
+                [2, 1, 0, 2, 0, ep],
+                [2, 1, 0, 2, ep ^ 0x80, 0],
+                [2, 1, 0, 2, 0, 0],
+            ] {
+                assert!(triggered_faults(&faults, &unrelated).is_empty());
+            }
+            let mut malformed = record.to_vec();
+            malformed.push(0);
+            assert!(triggered_faults(&faults, &malformed).is_empty());
+        }
+    }
+
+    #[test]
+    fn fault_cur_requires_one_boolean_byte() {
+        assert!(!parse_fault(&[0]).unwrap());
+        assert!(parse_fault(&[1]).unwrap());
+        for response in [vec![], vec![2], vec![255], vec![0, 1]] {
+            assert!(matches!(parse_fault(&response), Err(Error::Control(_))));
+        }
+    }
 
     #[test]
     fn wire_filter_and_burst_reads_are_scoped_and_deduplicated() {
@@ -477,6 +815,9 @@ mod tests {
         let mut target = StreamStatusTarget::new(0x20, 1, 3, 2, None);
         target.add_streaming_alt(4, 1);
         target.add_streaming_alt(4, 1);
+        target.add_data_endpoint(4, 1, 0x81);
+        target.add_data_endpoint(4, 1, 0x81);
         assert_eq!(target.streaming, vec![(3, 2), (4, 1)]);
+        assert_eq!(target.data_endpoints, vec![(4, 1, 0x81)]);
     }
 }

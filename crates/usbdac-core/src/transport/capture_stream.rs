@@ -699,8 +699,10 @@ pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
     };
     // Optional monitoring never turns an inconclusive extra snapshot into a
     // new startup gate. The completed configuration owns initial verification.
-    Ok(Some(audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
-        endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)))))
+    let mut target = audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
+        endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)));
+    target.add_data_endpoint(endpoint.interface, endpoint.alternate, endpoint.address);
+    Ok(Some(target))
 }
 
 pub(super) fn configure_capture_endpoint_guarded(
@@ -1664,6 +1666,8 @@ fn run_capture(
     let CaptureTransferBatch { slots, companion, feedforward, .. } = &mut batch;
     if let Some(pool) = companion.as_mut() { pool.start(&owner.claimed().handle, stop)?; }
     if let Some(pool) = feedforward.as_mut() { pool.start(&owner.claimed().handle, stop)?; }
+    if usb_stop_requested(stop) { return Ok(()); }
+    audio_status.arm_endpoint(owner.claimed(), endpoint.address)?;
     for (index, slot) in slots.iter_mut().enumerate() {
         if usb_stop_requested(stop) {
             return Ok(());

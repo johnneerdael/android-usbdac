@@ -169,6 +169,31 @@ the four-ABI AAR and sample builds passed. The AAR and sample contain
 identical native libraries for each ABI. The AAR SHA-256 is
 `a091546bd145b265945816580358c1b3941f8baf3245ab099b6c0ee8c466c5aa`.
 
+### Device-reported endpoint overrun and underrun
+
+When a selected UAC2 or full UAC3 data endpoint advertises a
+read-only overrun or underrun control and its AudioControl status
+endpoint is watched, read the control once before the first data
+submission to clear any older flag. Then handle matching endpoint
+notifications on the existing USB event worker. Read the named
+control by endpoint address. A zero reply leaves the stream running.
+A confirmed fault reports a stream error, stops affected playback or
+capture, and clears playback's bit-perfect verdict. The one-bit
+response establishes that a fault occurred and gives no frame count.
+[USB-IF UAC2 §§5.2.6.4.2–3 and 6.1](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[USB-IF ADC3 §§5.2.2.2.2–3 and 6.1](https://amatriz.net/PDFs/Audio30.pdf)
+
+For hardware acceptance, capture a notification for the selected OUT
+or IN data endpoint and its exact one-byte readback. Confirm that a
+stale flag cleared during startup and a zero readback allow streaming,
+and that a confirmed running fault stops it. Repeat with a shared
+implicit feedback input and an independent duplex input.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `e83ed8e4b8f294635bb8837ae48d0ea280f1bde3c8eca3d4a2c26a582b5c9613`.
+
 ### Endpoint clock-lock delay at stream start
 
 Use the selected UAC1, UAC2, or full UAC3 data endpoint's declared lock
