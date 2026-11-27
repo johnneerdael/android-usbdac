@@ -678,6 +678,10 @@ pub fn parse_cluster(data: &[u8], expected: ClusterHeader) -> Result<Cluster, De
                 if common {
                     common = false;
                     common_done = true;
+                } else if at == 7 && !common_done && !block_open {
+                    // A single leading End may represent an empty Common Block.
+                    // The final count and identity checks still require every channel.
+                    common_done = true;
                 } else {
                     channels.push(current.take().ok_or_else(|| {
                         invalid("channel has no information or ambisonic segment")

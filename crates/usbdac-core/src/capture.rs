@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn multichannel_vectors_keep_all_wire_bytes_across_packet_batches() {
-        for (bits, subslot) in [(16, 2), (24, 3), (24, 4), (32, 4)] {
+        for (bits, subslot) in [(8, 1), (12, 2), (16, 2), (20, 3), (24, 3), (24, 4), (32, 4)] {
             let mut queue = CaptureBuffer::new(format(bits, subslot, 6), 8).unwrap();
             let frame_bytes = queue.format().bytes_per_frame();
             // Every channel, padding byte, and frame has distinct input bytes.

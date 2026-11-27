@@ -205,9 +205,26 @@ fn adc3_pcm_encoding(header: &wire::AsHeader, capture: bool) -> Option<PcmEncodi
     ) {
         return None;
     }
+    // Capture exposes raw signed PCM bytes with valid bits left-justified in
+    // the complete subslot. Keep playback's narrower supported format policy.
+    let signed_capture = capture
+        && (1..=4).contains(&header.subslot_size)
+        && header.bit_resolution > 0
+        && header.bit_resolution <= header.subslot_size * 8;
+    // Signed 8-bit PCM and unsigned PCM8 have identical geometry but different
+    // sample interpretation; an advertised choice alone does not select one.
+    if signed_capture
+        && header.formats & 3 == 3
+        && header.subslot_size == 1
+        && header.bit_resolution == 8
+    {
+        return None;
+    }
     if header.formats & 1 != 0
-        && matches!(header.subslot_size, 2..=4)
-        && matches!(header.bit_resolution, 16 | 24 | 32)
+        && (signed_capture
+            || (!capture
+                && matches!(header.subslot_size, 2..=4)
+                && matches!(header.bit_resolution, 16 | 24 | 32)))
     {
         return Some(PcmEncoding::Signed);
     }
@@ -5032,6 +5049,38 @@ mod tests {
             auxiliary_protocols: 0,
             control_size: 0,
         }
+    }
+
+    #[test]
+    fn standard_capture_pcm_admits_only_proven_signed_geometry() {
+        let mut h = format_control_route(0).header.unwrap();
+        h.formats = 1;
+        for (slot, bits) in [(1, 8), (2, 12), (3, 20), (4, 24)] {
+            h.subslot_size = slot;
+            h.bit_resolution = bits;
+            assert_eq!(adc3_pcm_encoding(&h, true), Some(PcmEncoding::Signed));
+            assert!(adc3_standard_encoding(&h, true).is_ok());
+        }
+        for (slot, bits) in [(0, 8), (1, 0), (2, 17), (8, 64)] {
+            h.subslot_size = slot;
+            h.bit_resolution = bits;
+            assert_eq!(adc3_pcm_encoding(&h, true), None);
+        }
+        h.subslot_size = 1;
+        h.bit_resolution = 8;
+        for formats in [2, 3, 4, 1 << 6] {
+            h.formats = formats;
+            assert!(adc3_standard_encoding(&h, true).is_err());
+        }
+        h.formats = 1;
+        assert_eq!(adc3_pcm_encoding(&h, false), None);
+        h.subslot_size = 2;
+        h.bit_resolution = 12;
+        assert_eq!(adc3_pcm_encoding(&h, false), None);
+        h.subslot_size = 4;
+        h.bit_resolution = 32;
+        h.formats = 5;
+        assert_eq!(adc3_pcm_encoding(&h, true), None);
     }
 
     #[test]
