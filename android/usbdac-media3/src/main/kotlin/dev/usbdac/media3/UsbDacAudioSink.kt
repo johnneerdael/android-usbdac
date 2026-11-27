@@ -16,6 +16,11 @@ import dev.usbdac.StreamEncoding
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/** The output was lost after Media3 submitted audio. Seek the decoder before retrying. */
+class OutputRecoveryRequiredException(val failure: DacException) : Exception(
+    "Output failed; queued audio may be lost. Seek to a confirmed playback position before resuming.", failure
+)
+
 // region sink-layout
 /**
  * How Media3's PCM maps onto what the output wants. Media3 hands over little-endian PCM in 1, 2, 3 or 4
@@ -170,7 +175,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
 
         out.failure?.let { failure ->
             // The DAC went away or the stream failed. While playing that is an error; while paused, wait for the
-            // listener's next play, which opens a new output.
+            // host's seek/flush, which discards the failed output and rebases the decoder.
             if (playing) throw writeFailure(failure)
             return false
         }
@@ -258,7 +263,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     }
 
     private fun writeFailure(error: DacException): AudioSink.WriteException =
-        AudioSink.WriteException(error.code.ordinal, wanted?.format ?: Format.Builder().build(), false).also { it.initCause(error) }
+        AudioSink.WriteException(error.code.ordinal, wanted?.format ?: Format.Builder().build(), false).also { it.initCause(OutputRecoveryRequiredException(error)) }
     // endregion
 
     // region sink-switch
@@ -270,7 +275,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     private fun applyPendingConfiguration(): Boolean {
         val next = wanted ?: return true
         val out = active ?: return true // handleBuffer opens one
-        // A failed output is not replaced here: handleBuffer reports it, and the listener's play opens a new one.
+        // A failed output is retained until a seek/flush so queued audio cannot be silently skipped.
         if (out.failure != null || sameFormat(out.request, next.request)) return true
         if (!drainingForSwitch) {
             out.output.drain()
@@ -281,6 +286,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             throw AudioSink.InitializationException("USB reconfiguration failed: ${error.detail}", 0, next.format, false, error)
         }
         if (replacement != null) {
+            outputs.onRecoveryPosition(null, null)
             active = replacement.opened
             layout = outputLayout(replacement.opened, replacement.opened.request, next.format)
             drainingForSwitch = false
@@ -295,6 +301,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             if (playing) replacement.opened.output.play() else replacement.opened.output.pause()
             return true
         }
+        outputs.onRecoveryPosition(null, null)
         closeActive()
         startMediaTimeUsNeedsInit = true
         submittedFrames = 0
@@ -350,7 +357,9 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (startMediaTimeUsNeedsInit) return AudioSink.CURRENT_POSITION_NOT_SET
         // What the DAC has played since the last flush, never more than what was written.
         val playedUs = out.output.playedFrames * 1_000_000L / frames.counterRateHz
-        return startMediaTimeUs + minOf(playedUs, durationUs(submittedFrames, frames.rateHz))
+        return (startMediaTimeUs + minOf(playedUs, durationUs(submittedFrames, frames.rateHz))).also {
+            if (out.failure == null) outputs.onRecoveryPosition(out, it)
+        }
     }
 
     private fun durationUs(frames: Long, rateHz: Int): Long = frames * 1_000_000L / rateHz
@@ -367,8 +376,9 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     override fun play() {
         playing = true
         val out = active ?: return
-        // Play after a failure is the listener's decision to try again: the next buffer opens a new output.
-        if (out.failure != null) closeActive() else out.output.play()
+        // Keep the failed output and its position until the host seeks and flushes. Reopening here
+        // loses queued PCM that Media3 has already consumed and silently advances the decoder.
+        if (out.failure == null) out.output.play()
     }
 
     override fun pause() {
@@ -379,7 +389,8 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     override fun playToEndOfStream() {
         if (endOfStream) return
         val out = active
-        if (out != null && out.failure == null) {
+        if (out != null) {
+            out.failure?.let { throw writeFailure(it) }
             try {
                 out.output.drain()
             } catch (error: DacException) {
@@ -391,10 +402,11 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
 
     override fun isEnded(): Boolean {
         val out = active ?: return true
-        return endOfStream && (out.failure != null || out.output.isDrained)
+        return endOfStream && out.failure == null && out.output.isDrained
     }
 
     override fun flush() {
+        outputs.onRecoveryPosition(null, null)
         startMediaTimeUsNeedsInit = true
         startMediaTimeUsNeedsSync = false
         submittedFrames = 0

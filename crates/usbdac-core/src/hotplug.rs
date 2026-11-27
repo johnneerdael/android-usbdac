@@ -109,6 +109,57 @@ impl HotplugHub {
         broadcast(&mut state, HotplugEvent::Attached(attachment.clone()));
         attachment
     }
+    /// Reconcile a complete, authoritative host snapshot after events may have been missed.
+    /// Serialize snapshot collection and event delivery in the host. A device which disappeared
+    /// and returned at the same key entirely between snapshots cannot be distinguished here.
+    /// Existing keys with the same VID/PID keep their IDs; missing or changed identities are detached.
+    pub fn reconcile(&self, devices: Vec<(String, DeviceInfo, UsbPermission)>) {
+        let mut state = self.state.lock();
+        let mut observed = BTreeMap::new();
+        for (key, info, permission) in devices {
+            observed.insert(key, (info, permission));
+        }
+        let missing: Vec<_> = state
+            .attached
+            .keys()
+            .filter(|key| !observed.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in missing {
+            let attachment = state.attached.remove(&key).expect("attachment under lock");
+            broadcast(&mut state, HotplugEvent::Detached(attachment));
+        }
+        for (key, (info, permission)) in observed {
+            let replaced = state.attached.get(&key).is_some_and(|existing| {
+                existing.info.vendor_id != info.vendor_id
+                    || existing.info.product_id != info.product_id
+            });
+            if replaced {
+                let attachment = state.attached.remove(&key).expect("attachment under lock");
+                broadcast(&mut state, HotplugEvent::Detached(attachment));
+            }
+            if let Some(existing) = state.attached.get_mut(&key) {
+                if existing.permission != permission {
+                    existing.permission = permission;
+                    let event = HotplugEvent::PermissionChanged(existing.clone());
+                    broadcast(&mut state, event);
+                }
+            } else {
+                state.next_id = state
+                    .next_id
+                    .checked_add(1)
+                    .expect("USB attachment ID exhausted");
+                let attachment = UsbAttachment {
+                    id: state.next_id,
+                    host_key: key.clone(),
+                    info,
+                    permission,
+                };
+                state.attached.insert(key, attachment.clone());
+                broadcast(&mut state, HotplugEvent::Attached(attachment));
+            }
+        }
+    }
     /// Reject delayed results for an unplugged device, including a reused path.
     pub fn permission_changed(&self, id: u64, permission: UsbPermission) -> bool {
         let mut state = self.state.lock();

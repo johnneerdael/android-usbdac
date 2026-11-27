@@ -146,9 +146,16 @@ class UsbDacAudioSinkTest {
         sink.pause()
         assertFalse(sink.handleBuffer(buffer, 2_267, 1)) // paused: wait, do not fail
 
-        sink.play() // the listener presses play
+        val positionBeforeFailure = sink.getCurrentPositionUs(false)
+        sink.play()
+        assertFalse(source.opened[0].closed)
+        val error = assertThrows(AudioSink.WriteException::class.java) { sink.handleBuffer(buffer, 2_267, 1) }
+        assertTrue(error.cause is OutputRecoveryRequiredException)
+        assertEquals(positionBeforeFailure, sink.getCurrentPositionUs(false))
+        assertEquals(1, source.opened.size)
+        sink.flush() // host seeks the decoder to its saved audible position
         assertTrue(source.opened[0].closed)
-        assertTrue(sink.handleBuffer(buffer, 2_267, 1))
+        assertTrue(sink.handleBuffer(audio(100, 4), positionBeforeFailure, 1))
         assertEquals(2, source.opened.size)
     }
 

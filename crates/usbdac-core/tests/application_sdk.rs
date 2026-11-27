@@ -37,6 +37,72 @@ fn reused_path_cannot_accept_a_stale_permission_result_or_detach() {
 }
 
 #[test]
+fn authoritative_snapshot_removes_missed_detach_and_rejects_old_permission() {
+    let hub = HotplugHub::new();
+    let events = hub.subscribe();
+    events.try_recv().unwrap();
+    let old = hub.attached("old", DeviceInfo::new(1, 2, "old"), UsbPermission::Required);
+    let kept = hub.attached(
+        "kept",
+        DeviceInfo::new(3, 4, "kept"),
+        UsbPermission::Required,
+    );
+    events.try_recv().unwrap();
+    events.try_recv().unwrap();
+    hub.reconcile(vec![(
+        "kept".into(),
+        kept.info.clone(),
+        UsbPermission::Granted,
+    )]);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::Detached(old.clone())
+    );
+    let mut updated = kept.clone();
+    updated.permission = UsbPermission::Granted;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::PermissionChanged(updated.clone())
+    );
+    assert_eq!(hub.snapshot(), vec![updated]);
+    assert!(!hub.permission_changed(old.id, UsbPermission::Granted));
+    hub.reconcile(vec![(
+        "old".into(),
+        old.info.clone(),
+        UsbPermission::Required,
+    )]);
+    assert_ne!(hub.snapshot()[0].id, old.id);
+}
+
+#[test]
+fn snapshot_changed_usb_identity_invalidates_old_permission() {
+    let hub = HotplugHub::new();
+    let old = hub.attached(
+        "port",
+        DeviceInfo::new(1, 2, "old"),
+        UsbPermission::Required,
+    );
+    let events = hub.subscribe();
+    events.try_recv().unwrap();
+    hub.reconcile(vec![(
+        "port".into(),
+        DeviceInfo::new(3, 4, "new"),
+        UsbPermission::Required,
+    )]);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::Detached(old.clone())
+    );
+    let replacement = hub.snapshot().pop().unwrap();
+    assert_ne!(old.id, replacement.id);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::Attached(replacement)
+    );
+    assert!(!hub.permission_changed(old.id, UsbPermission::Granted));
+}
+
+#[test]
 fn subscriber_overflow_replaces_old_hints_with_atomic_snapshot() {
     let hub = HotplugHub::new();
     let events = hub.subscribe();

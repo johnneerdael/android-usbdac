@@ -4,7 +4,7 @@ mod routing;
 
 use crate::capabilities::{Capabilities, DeviceInfo};
 use crate::config::{CloseVolume, DacConfig, HandBack};
-use crate::error::{Error, OrControl, Result};
+use crate::error::{Error, Result};
 use crate::events::{DacListener, EventHub, EventSink};
 use crate::format::{StreamFormat, StreamRequest};
 use crate::settings::{self, Settings};
@@ -483,11 +483,6 @@ impl Dac {
                 Error::InvalidArgument("drain timeout overflows monotonic clock".into())
             })?;
         let volume_route = transport::api::volume_route_signature();
-        let volume_before = if volume_route.is_some() {
-            Some(transport::volume_hw::read_volume_state().or_control()?)
-        } else {
-            None
-        };
         current.drain()?;
         current.play()?;
         while !current.is_drained() {
@@ -534,18 +529,6 @@ impl Dac {
                 drop(opened);
                 return Err(Error::Control(
                     "reconfiguration changed the hardware volume route; rollback required".into(),
-                ));
-            }
-            let volume_after = if volume_route.is_some() {
-                Some(transport::volume_hw::read_volume_state().or_control()?)
-            } else {
-                None
-            };
-            if volume_after != volume_before {
-                drop(opened);
-                return Err(Error::Control(
-                    "hardware volume changed during reconfiguration; preservation not proved"
-                        .into(),
                 ));
             }
             Ok(opened)
