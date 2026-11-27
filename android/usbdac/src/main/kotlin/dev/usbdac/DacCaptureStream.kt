@@ -69,13 +69,15 @@ public data class CaptureStats(
     /** Lower-bound device position; unknown transport loss cannot be inferred from IN capacity. */
     val devicePositionFrames: Long,
     val error: DacException?,
-    /** Valid received frames dropped while a duplex reader held the capture buffer. */
+    /** Compatibility counter for frames dropped due to reader contention; duplex handoff no longer causes such drops. */
     val contentionFrames: Long = 0,
+    /** Valid frames withheld during startup or rate proof. */
+    val proofSuppressedFrames: Long = 0,
 )
 
 /**
  * Direct USB PCM input. Read whole interleaved frames in [format]; slow readers lose
- * the oldest buffered frames and can inspect [CaptureStats.overrunFrames]. No conversion occurs.
+ * frames and can inspect [CaptureStats.overrunFrames]. Standalone capture drops oldest frames; duplex drops newly arriving frames when its owned buffer pool is full. No conversion occurs.
  * Close off the main thread. In a duplex pair, closing this direction also closes playback.
  */
 public class DacCaptureStream internal constructor(

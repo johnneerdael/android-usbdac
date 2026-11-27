@@ -78,7 +78,7 @@ fn implicit_out_queue_failure(
     geometry: &IsoQueueGeometry,
 ) -> Option<&'static str> {
     if active_slots == 0 {
-        return Some("implicit feedback observed an empty OUT bus queue");
+        return Some("implicit_xrun: empty OUT bus queue");
     }
     let coverage = pending_submissions
         .map(|at| {
@@ -89,7 +89,7 @@ fn implicit_out_queue_failure(
     if now.saturating_duration_since(last_valid) > Duration::from_micros(geometry.queued_us())
         && coverage <= Duration::from_micros(u64::from(geometry.service_interval_us))
     {
-        return Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)");
+        return Some("implicit_xrun: OUT continuity deadline expired");
     }
     None
 }
@@ -1268,7 +1268,8 @@ pub(super) fn run_usb_output_loop(
                         if fatal_error.is_none() && !usb_stop_requested(&stop) {
                             if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
                                 implicit_feedback_fault = true;
-                                fatal_error = Some(error);
+                                device_lost = error == implicit::ImplicitFault::Removed;
+                                fatal_error = Some(error.to_string());
                             }
                         }
                     }
@@ -1350,8 +1351,9 @@ pub(super) fn run_usb_output_loop(
             if let Some(engine) = implicit.as_mut() {
                 engine.running = true;
                 if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
+                    device_lost = error == implicit::ImplicitFault::Removed;
                     implicit_feedback_fault = true;
-                    fatal_error = Some(error);
+                    fatal_error = Some(error.to_string());
                     break;
                 }
                 let Some(pattern) = engine.take_pattern(&runtime_stats) else {
@@ -1556,11 +1558,12 @@ pub(super) fn run_usb_output_loop(
         }
         if let Some(engine) = implicit.as_mut() {
             if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
-                device_lost = error.contains("disconnected");
+                device_lost = error == implicit::ImplicitFault::Removed;
                 implicit_feedback_fault = true;
-                fatal_error = Some(error);
+                fatal_error = Some(error.to_string());
                 break;
             }
+            shared.note_bit_perfect();
         }
         if let Some(transfers) = feedback_transfers.as_mut() {
             let result = pump_feedback_transfers(
@@ -2581,7 +2584,7 @@ mod implicit_out_coverage_tests {
         );
         assert_eq!(
             failure,
-            Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)")
+            Some("implicit_xrun: OUT continuity deadline expired")
         );
         // The old post-refill check would see this fresh timestamp and miss it.
         assert_eq!(
@@ -2602,7 +2605,7 @@ mod implicit_out_coverage_tests {
         let now = Instant::now();
         assert_eq!(
             implicit_out_queue_failure(now, now, 0, std::iter::empty(), &geometry),
-            Some("implicit feedback observed an empty OUT bus queue")
+            Some("implicit_xrun: empty OUT bus queue")
         );
     }
 

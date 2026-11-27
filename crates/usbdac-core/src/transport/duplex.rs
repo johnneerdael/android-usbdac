@@ -1,14 +1,14 @@
 //! A capture attachment to the playback worker, never a second USB event owner.
 use super::capture_stream::{CaptureEndpoint, CaptureHandle};
 use super::*;
-use crate::capture::{CaptureBuffer, CapturePacket, CaptureRequest};
+use crate::capture::{CapturePacket, CaptureRequest};
 use crate::error::OrControl;
 use std::collections::VecDeque;
 
 pub(super) struct Attachment {
     pub(super) endpoint: CaptureEndpoint,
     pub(super) shared_implicit: bool,
-    buffer: Arc<Mutex<CaptureBuffer>>,
+    owned: Arc<capture_stream::CaptureSpsc>,
     error: Arc<Mutex<Option<Error>>>,
     retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
@@ -385,9 +385,8 @@ fn prepare_endpoint(
         )
         .or_control()?
     };
-    let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
+    let mut attachment = Attachment::new(endpoint, shared, capacity)
         .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
-    let mut attachment = Attachment::new(endpoint, shared, buffer);
     attachment.lock_delay = delay;
     attachment.capacity = capacity;
     Ok(attachment)
@@ -490,22 +489,26 @@ impl Attachment {
     pub(super) fn new(
         endpoint: CaptureEndpoint,
         shared_implicit: bool,
-        buffer: CaptureBuffer,
-    ) -> Self {
-        Self {
+        capacity: usize,
+    ) -> Result<Self, crate::capture::CaptureError> {
+        let owned = Arc::new(capture_stream::CaptureSpsc::new(
+            capacity,
+            endpoint.format.bytes_per_frame(),
+        )?);
+        Ok(Self {
             endpoint,
             shared_implicit,
-            buffer: Arc::new(Mutex::new(buffer)),
+            deferred: owned.deferred.clone(),
+            owned,
             error: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(capture_stream::DeferredCapture::default()),
             original_rate: Mutex::new(None),
             uac1_rate: Mutex::new(None),
             rate_uncertain: AtomicBool::new(false),
             retry_endpoints: Vec::new(),
-            capacity: 0,
+            capacity,
             lock_delay: None,
-        }
+        })
     }
     fn verify_uac1_pair(
         &self,
@@ -991,13 +994,12 @@ impl Attachment {
     pub(super) fn reader(&self, stop: Arc<AtomicBool>) -> CaptureHandle {
         CaptureHandle {
             endpoint: self.endpoint.clone(),
-            buffer: self.buffer.clone(),
+            presentation: capture_stream::CapturePresentation::Duplex(self.owned.clone()),
             error: self.error.clone(),
             stop,
             worker: None,
             paired: true,
             retired: Some(self.retired.clone()),
-            deferred: Some(self.deferred.clone()),
         }
     }
     pub(super) fn ingest(
@@ -1006,49 +1008,73 @@ impl Attachment {
         status: i32,
         scratch: &mut [CapturePacket],
     ) -> Result<(), Error> {
-        let result = if let Some(mut buffer) = self.buffer.try_lock() {
-            self.deferred.merge_into(&mut buffer);
-            capture_stream::ingest_slot(slot, status, &mut buffer, scratch)
-        } else {
-            // No payload is retained while presentation owns the queue. Inspect
-            // the same descriptors and count only valid full frames as a host
-            // drop; empty/malformed/failed packets remain separate telemetry.
-            let mut stats = crate::capture::CaptureStats::default();
-            let result = match capture_stream::inspect_slot(slot, status, scratch) {
-                Ok((data, detached)) => {
-                    let result = stats
-                        .record_completion(
-                            data.len(),
-                            &slot.packet_sizes,
-                            scratch,
-                            true,
-                            0,
-                            self.endpoint.format.bytes_per_frame(),
-                        )
-                        .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
-                    stats.contention_frames = stats.captured_frames;
-                    if detached {
-                        Err(Error::DeviceLost)
-                    } else {
-                        result
+        let mut stats = crate::capture::CaptureStats::default();
+        let result = match capture_stream::inspect_slot(slot, status, scratch) {
+            Ok((data, detached)) => {
+                let classification = stats
+                    .record_completion(
+                        data.len(),
+                        &slot.packet_sizes,
+                        scratch,
+                        true,
+                        0,
+                        self.endpoint.format.bytes_per_frame(),
+                    )
+                    .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
+                // Publish classified frame totals before the ring's release store
+                // can make any payload visible to a concurrent reader.
+                self.deferred.record(stats);
+                stats = Default::default();
+                if classification.is_ok() {
+                    let frame_bytes = self.endpoint.format.bytes_per_frame();
+                    let mut offset = 0;
+                    for (length, packet) in slot.packet_sizes.iter().zip(scratch.iter()) {
+                        if packet.succeeded
+                            && packet.actual_bytes <= *length
+                            && packet.actual_bytes % frame_bytes == 0
+                        {
+                            let frames = packet.actual_bytes / frame_bytes;
+                            // Terminal admission is not an overrun.
+                            if let Ok(accepted) = self
+                                .owned
+                                .push_packet(&data[offset..offset + packet.actual_bytes])
+                            {
+                                stats.overrun_frames = stats
+                                    .overrun_frames
+                                    .saturating_add((frames - accepted) as u64);
+                            }
+                        }
+                        offset += length;
                     }
                 }
-                Err(error) => {
-                    if status == LIBUSB_TRANSFER_COMPLETED {
-                        stats.malformed_completions = 1;
-                    } else {
-                        stats.failed_transfers = 1;
-                    }
-                    Err(error)
+                if detached {
+                    Err(Error::DeviceLost)
+                } else {
+                    classification
                 }
-            };
-            self.deferred.record(stats);
-            result
+            }
+            Err(error) => {
+                if status == LIBUSB_TRANSFER_COMPLETED {
+                    stats.malformed_completions = 1;
+                } else {
+                    stats.failed_transfers = 1;
+                }
+                Err(error)
+            }
         };
+        self.deferred.record(stats);
         if let Err(error) = &result {
             *self.error.lock() = Some(error.clone());
         }
         result
+    }
+    /// A qualified recoverable whole-transfer gap has no trustworthy payload
+    /// or independently known lost-frame count. Do not latch attachment failure.
+    pub(super) fn note_recoverable_transfer_failure(&self) {
+        self.deferred.record(crate::capture::CaptureStats {
+            failed_transfers: 1,
+            ..Default::default()
+        });
     }
     fn discard_before_timing(
         &self,
@@ -1084,6 +1110,7 @@ impl Attachment {
                 Err(error)
             }
         };
+        stats.proof_suppressed_frames = stats.captured_frames;
         self.deferred.record(stats);
         if let Err(error) = &result {
             *self.error.lock() = Some(error.clone());
@@ -1212,9 +1239,6 @@ impl Attachment {
             *self.error.lock() = Some(error);
         }
         self.deferred.finish(failed);
-        if let Some(mut buffer) = self.buffer.try_lock() {
-            self.deferred.merge_into(&mut buffer);
-        }
     }
 }
 impl Drop for Attachment {

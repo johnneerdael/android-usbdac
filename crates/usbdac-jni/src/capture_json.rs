@@ -182,6 +182,7 @@ pub fn stats(stream: &DacCaptureStream) -> Value {
         "available_frames": stream.available_frames(), "captured_frames": stats.captured_frames,
         "delivered_frames": stats.delivered_frames, "overrun_frames": stats.overrun_frames,
         "contention_frames": stats.contention_frames,
+        "proof_suppressed_frames": stats.proof_suppressed_frames,
         "empty_packets": stats.empty_packets, "short_packets": stats.short_packets,
         "failed_packets": stats.failed_packets, "malformed_packets": stats.malformed_packets,
         "malformed_completions": stats.malformed_completions, "failed_transfers": stats.failed_transfers,

@@ -1914,6 +1914,7 @@ pub(crate) struct DeferredCapture {
     delivered_frames: AtomicU64,
     overrun_frames: AtomicU64,
     contention_frames: AtomicU64,
+    proof_suppressed_frames: AtomicU64,
     empty_packets: AtomicU64,
     short_packets: AtomicU64,
     failed_packets: AtomicU64,
@@ -1935,6 +1936,8 @@ impl DeferredCapture {
             .fetch_add(stats.overrun_frames, Ordering::Relaxed);
         self.contention_frames
             .fetch_add(stats.contention_frames, Ordering::Relaxed);
+        self.proof_suppressed_frames
+            .fetch_add(stats.proof_suppressed_frames, Ordering::Relaxed);
         self.empty_packets
             .fetch_add(stats.empty_packets, Ordering::Relaxed);
         self.short_packets
@@ -1957,14 +1960,14 @@ impl DeferredCapture {
     pub(super) fn is_finished(&self) -> bool {
         self.terminal.load(Ordering::Acquire) != 0
     }
-    pub(super) fn merge_into(&self, buffer: &mut CaptureBuffer) {
-        let terminal = self.terminal.load(Ordering::Acquire);
-        buffer.merge_stats(crate::capture::CaptureStats {
+    fn take_delta(&self) -> crate::capture::CaptureStats {
+        crate::capture::CaptureStats {
             reordered_completions: self.reordered_completions.swap(0, Ordering::Relaxed),
             captured_frames: self.captured_frames.swap(0, Ordering::Relaxed),
             delivered_frames: self.delivered_frames.swap(0, Ordering::Relaxed),
             overrun_frames: self.overrun_frames.swap(0, Ordering::Relaxed),
             contention_frames: self.contention_frames.swap(0, Ordering::Relaxed),
+            proof_suppressed_frames: self.proof_suppressed_frames.swap(0, Ordering::Relaxed),
             empty_packets: self.empty_packets.swap(0, Ordering::Relaxed),
             short_packets: self.short_packets.swap(0, Ordering::Relaxed),
             failed_packets: self.failed_packets.swap(0, Ordering::Relaxed),
@@ -1972,40 +1975,197 @@ impl DeferredCapture {
             malformed_completions: self.malformed_completions.swap(0, Ordering::Relaxed),
             failed_transfers: self.failed_transfers.swap(0, Ordering::Relaxed),
             missing_frames: self.missing_frames.swap(0, Ordering::Relaxed),
-        });
-        match terminal {
-            2 => buffer.fail(),
-            1 if buffer.state() == crate::capture::CaptureState::Active => buffer.stop(),
-            _ => {}
+        }
+    }
+    fn state(&self) -> crate::capture::CaptureState {
+        match self.terminal.load(Ordering::Acquire) {
+            2 => crate::capture::CaptureState::Failed,
+            1 => crate::capture::CaptureState::Stopped,
+            _ => crate::capture::CaptureState::Active,
         }
     }
 }
 
+/// One USB-worker producer and serialized consumers. Cursor publication also
+/// transfers ownership of the corresponding atomic bytes between them.
+pub(crate) struct CaptureSpsc {
+    bytes: Box<[std::sync::atomic::AtomicU8]>,
+    frame_bytes: usize,
+    capacity: usize,
+    period: usize,
+    write_seq: std::sync::atomic::AtomicUsize,
+    read_seq: std::sync::atomic::AtomicUsize,
+    pub(super) consumer: Mutex<crate::capture::CaptureStats>,
+    pub(super) deferred: Arc<DeferredCapture>,
+}
+impl CaptureSpsc {
+    pub(super) fn new(
+        capacity: usize,
+        frame_bytes: usize,
+    ) -> Result<Self, crate::capture::CaptureError> {
+        use crate::capture::CaptureError;
+        let period = capacity
+            .checked_mul(2)
+            .filter(|_| capacity != 0)
+            .ok_or(CaptureError::InvalidCapacity)?;
+        let size = capacity
+            .checked_mul(frame_bytes)
+            .filter(|size| *size != 0)
+            .ok_or(CaptureError::InvalidCapacity)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| CaptureError::AllocationFailed)?;
+        bytes.resize_with(size, || std::sync::atomic::AtomicU8::new(0));
+        Ok(Self {
+            bytes: bytes.into_boxed_slice(),
+            frame_bytes,
+            capacity,
+            period,
+            write_seq: std::sync::atomic::AtomicUsize::new(0),
+            read_seq: std::sync::atomic::AtomicUsize::new(0),
+            consumer: Mutex::new(Default::default()),
+            deferred: Arc::new(DeferredCapture::default()),
+        })
+    }
+    fn distance(&self, write: usize, read: usize) -> usize {
+        if write >= read {
+            write - read
+        } else {
+            self.period - read + write
+        }
+    }
+    fn advance(&self, seq: usize, frames: usize) -> usize {
+        let remaining = self.period - seq;
+        if frames >= remaining {
+            frames - remaining
+        } else {
+            seq + frames
+        }
+    }
+    fn active(&self) -> Result<(), crate::capture::CaptureError> {
+        use crate::capture::{CaptureError, CaptureState};
+        match self.deferred.state() {
+            CaptureState::Active => Ok(()),
+            CaptureState::Stopped => Err(CaptureError::Stopped),
+            CaptureState::Failed => Err(CaptureError::Failed),
+        }
+    }
+    // Sole producer is the USB worker; only complete, classified frames enter.
+    pub(super) fn push_packet(&self, data: &[u8]) -> Result<usize, crate::capture::CaptureError> {
+        self.active()?;
+        if data.len() % self.frame_bytes != 0 {
+            return Err(crate::capture::CaptureError::PartialFrame);
+        }
+        let write = self.write_seq.load(Ordering::Relaxed);
+        let read = self.read_seq.load(Ordering::Acquire);
+        let occupied = self.distance(write, read);
+        debug_assert!(occupied <= self.capacity);
+        let accepted = (data.len() / self.frame_bytes).min(self.capacity - occupied);
+        let start = (write % self.capacity) * self.frame_bytes;
+        let bytes = &data[..accepted * self.frame_bytes];
+        let first = bytes.len().min(self.bytes.len() - start);
+        for (slot, byte) in self.bytes[start..start + first]
+            .iter()
+            .chain(self.bytes[..bytes.len() - first].iter())
+            .zip(bytes)
+        {
+            slot.store(*byte, Ordering::Relaxed);
+        }
+        self.write_seq
+            .store(self.advance(write, accepted), Ordering::Release);
+        Ok(accepted)
+    }
+    fn read(&self, dst: &mut [u8]) -> Result<usize, crate::capture::CaptureError> {
+        let mut stats = self.consumer.lock();
+        self.active()?;
+        if dst.len() % self.frame_bytes != 0 {
+            return Err(crate::capture::CaptureError::PartialFrame);
+        }
+        let read = self.read_seq.load(Ordering::Relaxed);
+        let write = self.write_seq.load(Ordering::Acquire);
+        let available = self.distance(write, read);
+        debug_assert!(available <= self.capacity);
+        let frames = available.min(dst.len() / self.frame_bytes);
+        let start = (read % self.capacity) * self.frame_bytes;
+        let bytes = &mut dst[..frames * self.frame_bytes];
+        let first = bytes.len().min(self.bytes.len() - start);
+        let remaining = bytes.len() - first;
+        for (byte, slot) in bytes.iter_mut().zip(
+            self.bytes[start..start + first]
+                .iter()
+                .chain(self.bytes[..remaining].iter()),
+        ) {
+            *byte = slot.load(Ordering::Relaxed);
+        }
+        self.read_seq
+            .store(self.advance(read, frames), Ordering::Release);
+        stats.delivered_frames = stats.delivered_frames.saturating_add(frames as u64);
+        Ok(frames)
+    }
+    fn available_frames(&self) -> usize {
+        let _guard = self.consumer.lock();
+        self.distance(
+            self.write_seq.load(Ordering::Acquire),
+            self.read_seq.load(Ordering::Relaxed),
+        )
+    }
+    fn stats(&self) -> crate::capture::CaptureStats {
+        let mut stats = self.consumer.lock();
+        stats.merge(self.deferred.take_delta());
+        *stats
+    }
+}
+
+pub(crate) enum CapturePresentation {
+    Standalone(Arc<Mutex<CaptureBuffer>>),
+    Duplex(Arc<CaptureSpsc>),
+}
 pub(crate) struct CaptureHandle {
     pub(crate) endpoint: CaptureEndpoint,
-    pub(crate) buffer: Arc<Mutex<CaptureBuffer>>,
+    pub(crate) presentation: CapturePresentation,
     pub(crate) error: Arc<Mutex<Option<Error>>>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) worker: Option<JoinHandle<()>>,
     pub(crate) paired: bool,
     pub(crate) retired: Option<Arc<AtomicBool>>,
-    pub(crate) deferred: Option<Arc<DeferredCapture>>,
 }
 impl CaptureHandle {
-    pub(crate) fn lock_buffer(&self) -> parking_lot::MutexGuard<'_, CaptureBuffer> {
-        let mut buffer = self.buffer.lock();
-        if let Some(deferred) = &self.deferred {
-            deferred.merge_into(&mut buffer);
+    pub(crate) fn available_frames(&self) -> usize {
+        match &self.presentation {
+            CapturePresentation::Standalone(buffer) => buffer.lock().available_frames(),
+            CapturePresentation::Duplex(ring) => ring.available_frames(),
         }
-        buffer
+    }
+    pub(crate) fn read(&self, dst: &mut [u8]) -> Result<usize, crate::capture::CaptureError> {
+        match &self.presentation {
+            CapturePresentation::Standalone(buffer) => buffer.lock().read(dst),
+            CapturePresentation::Duplex(ring) => ring.read(dst),
+        }
+    }
+    pub(crate) fn stats(&self) -> crate::capture::CaptureStats {
+        match &self.presentation {
+            CapturePresentation::Standalone(buffer) => buffer.lock().stats(),
+            CapturePresentation::Duplex(ring) => ring.stats(),
+        }
+    }
+    pub(crate) fn state(&self) -> crate::capture::CaptureState {
+        match &self.presentation {
+            CapturePresentation::Standalone(buffer) => buffer.lock().state(),
+            CapturePresentation::Duplex(ring) => ring.deferred.state(),
+        }
     }
     pub(crate) fn stop(&mut self) -> Result<(), Error> {
         self.stop.store(true, Ordering::Release);
-        let mut buffer = self.lock_buffer();
-        if buffer.state() == crate::capture::CaptureState::Active {
-            buffer.stop();
+        match &self.presentation {
+            CapturePresentation::Standalone(buffer) => {
+                let mut buffer = buffer.lock();
+                if buffer.state() == crate::capture::CaptureState::Active {
+                    buffer.stop();
+                }
+            }
+            CapturePresentation::Duplex(ring) => ring.deferred.finish(false),
         }
-        drop(buffer);
         if let Some(worker) = self.worker.take() {
             let deadline = Instant::now() + Duration::from_secs(3);
             while !worker.is_finished() && Instant::now() < deadline {
@@ -2237,13 +2397,12 @@ pub(crate) fn open_capture(
         .map_err(|e| Error::Transfer(format!("cannot start capture worker: {e}")))?;
     let mut handle = CaptureHandle {
         endpoint,
-        buffer,
+        presentation: CapturePresentation::Standalone(buffer),
         error,
         stop,
         worker: Some(worker),
         paired: false,
         retired: None,
-        deferred: None,
     };
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(handle),
@@ -2340,21 +2499,26 @@ pub(super) fn discard_unprimed_capture(
     status: i32,
     scratch: &mut [CapturePacket],
     frame_bytes: usize,
-) -> Result<(), Error> {
-    let (data, detached) = inspect_slot(slot, status, scratch)?;
-    if detached {
-        return Err(Error::DeviceLost);
-    }
-    crate::capture::CaptureStats::default()
-        .record_completion(
-            data.len(),
-            &slot.packet_sizes,
-            scratch,
-            true,
-            0,
-            frame_bytes,
-        )
-        .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")))
+) -> (crate::capture::CaptureStats, Result<(), Error>) {
+    let mut stats = crate::capture::CaptureStats::default();
+    let result = (|| {
+        let (data, detached) = inspect_slot(slot, status, scratch)?;
+        if detached {
+            return Err(Error::DeviceLost);
+        }
+        stats
+            .record_completion(
+                data.len(),
+                &slot.packet_sizes,
+                scratch,
+                true,
+                0,
+                frame_bytes,
+            )
+            .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")))
+    })();
+    stats.proof_suppressed_frames = stats.captured_frames;
+    (stats, result)
 }
 
 /// Consume a complete startup URB without publishing its payload, including
@@ -2408,9 +2572,8 @@ pub(super) fn discard_lock_delay_capture(
         u64::from(service_us).saturating_mul(scratch.len() as u64),
         stats.captured_frames,
     );
-    // Pre-lock payload never entered the capture queue. Retain packet/error
-    // telemetry without presenting it as captured or reader-contention audio.
-    stats.captured_frames = 0;
+    // Pre-lock payload contributes to device position but is not presented.
+    stats.proof_suppressed_frames = stats.captured_frames;
     (stats, result)
 }
 
@@ -3242,14 +3405,17 @@ fn run_capture(
             } else if capture_allowed && host_allowed {
                 ingest_slot(&slots[index], status, &mut queue, &mut scratch)
             } else {
-                discard_unprimed_capture(
+                let (stats, result) = discard_unprimed_capture(
                     &slots[index],
                     status,
                     &mut scratch,
                     endpoint.format.bytes_per_frame(),
-                )
+                );
+                queue.merge_stats(stats);
+                result
             };
             let captured_input = capture_allowed
+                && host_allowed
                 && !lock_pending
                 && captured_before.is_some_and(|before| queue.stats().captured_frames > before);
             drop(queue);
@@ -4617,7 +4783,8 @@ mod tests {
         );
         result.unwrap();
         assert_eq!(stats.short_packets, 1);
-        assert_eq!(stats.captured_frames, 0);
+        assert_eq!(stats.captured_frames, 1);
+        assert_eq!(stats.proof_suppressed_frames, 1);
         assert!(gate.pending());
         unsafe {
             (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3;
@@ -4659,7 +4826,8 @@ mod tests {
         );
         result.unwrap();
         assert!(!gate.pending());
-        assert_eq!(stats.captured_frames, 0); // Satisfying URB is discarded too.
+        assert_eq!(stats.captured_frames, 2); // Satisfying URB is suppressed too.
+        assert_eq!(stats.proof_suppressed_frames, 2);
     }
 
     #[test]
@@ -4894,13 +5062,58 @@ mod tests {
         assert_eq!(buffer.stats().overrun_frames, 0);
     }
     #[test]
-    fn duplex_reader_contention_drops_only_valid_frames_without_blocking_completion_or_finish() {
+    fn duplex_ring_exact_capacity_and_sequence_wrap() {
+        for capacity in [1, 3, 5] {
+            let ring = CaptureSpsc::new(capacity, 1).unwrap();
+            for cycle in 0..8u8 {
+                let input: Vec<u8> = (0..capacity + 1).map(|i| cycle * 10 + i as u8).collect();
+                assert_eq!(ring.push_packet(&input), Ok(capacity));
+                assert_eq!(ring.available_frames(), capacity);
+                assert_eq!(ring.push_packet(&[200]), Ok(0));
+                let mut first = [0];
+                assert_eq!(ring.read(&mut first), Ok(1));
+                assert_eq!(first[0], input[0]);
+                assert_eq!(ring.push_packet(&[201]), Ok(1));
+                let mut rest = vec![0; capacity];
+                assert_eq!(ring.read(&mut rest), Ok(capacity));
+                assert_eq!(&rest[..capacity - 1], &input[1..capacity]);
+                assert_eq!(rest[capacity - 1], 201);
+            }
+            ring.deferred.finish(true);
+            assert_eq!(
+                ring.read(&mut [0]),
+                Err(crate::capture::CaptureError::Failed)
+            );
+        }
+    }
+
+    #[test]
+    fn duplex_ring_unpublished_read_keeps_owned_frames_until_release() {
+        let ring = CaptureSpsc::new(3, 1).unwrap();
+        ring.bytes[0].store(99, Ordering::Relaxed);
+        assert_eq!(ring.available_frames(), 0); // Bytes alone are not published.
+        assert_eq!(ring.push_packet(&[1, 2]), Ok(2));
+        // Model the consumer paused after copying one byte but before publishing.
+        let guard = ring.consumer.lock();
+        let copied = ring.bytes[0].load(Ordering::Relaxed);
+        assert_eq!(ring.push_packet(&[3, 4]), Ok(1));
+        assert_eq!(copied, 1);
+        assert_eq!(ring.bytes[0].load(Ordering::Relaxed), 1);
+        ring.read_seq.store(1, Ordering::Release);
+        drop(guard);
+        assert_eq!(ring.push_packet(&[4, 5]), Ok(1));
+        let mut output = [0; 3];
+        assert_eq!(ring.read(&mut output), Ok(3));
+        assert_eq!(output, [2, 3, 4]);
+    }
+
+    #[test]
+    fn duplex_reader_contention_preserves_capacity_without_blocking_completion_or_finish() {
         for shared_implicit in [false, true] {
             let endpoint = capture_candidates(&configuration(0), 1, Speed::Full, 48_000)
                 .unwrap()
                 .remove(0);
-            let buffer = CaptureBuffer::new(endpoint.format.clone(), 1).unwrap();
-            let attachment = duplex::Attachment::new(endpoint, shared_implicit, buffer);
+            let attachment = duplex::Attachment::new(endpoint, shared_implicit, 1).unwrap();
             let mut reader = attachment.reader(Arc::new(AtomicBool::new(false)));
             let retirement = attachment.retirement_guard();
             let mut slot = completed_slot(0, &[1; 12]); // stereo 24-bit: two frames
@@ -4912,11 +5125,14 @@ mod tests {
             attachment
                 .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
                 .unwrap();
-            assert_eq!(reader.lock_buffer().read(&mut [0; 6]), Ok(1));
+            assert_eq!(reader.read(&mut [0; 6]), Ok(1));
 
             // Deliberately retain the reader lock on this thread. Any blocking
             // worker append or finish would deadlock here, before OUT resumes.
-            let held = reader.buffer.lock();
+            let CapturePresentation::Duplex(ring) = &reader.presentation else {
+                unreachable!()
+            };
+            let held = ring.consumer.lock();
             attachment
                 .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
                 .unwrap();
@@ -4962,12 +5178,11 @@ mod tests {
             assert!(reader.retired.as_ref().unwrap().load(Ordering::Acquire));
             drop(held);
 
-            let buffer = reader.lock_buffer();
-            let stats = buffer.stats();
+            let stats = reader.stats();
             assert_eq!(stats.captured_frames, 5);
             assert_eq!(stats.delivered_frames, 1);
-            assert_eq!(stats.overrun_frames, 1);
-            assert_eq!(stats.contention_frames, 3);
+            assert_eq!(stats.overrun_frames, 3);
+            assert_eq!(stats.contention_frames, 0);
             assert_eq!(stats.empty_packets, 1);
             assert_eq!(stats.short_packets, 1);
             assert_eq!(stats.malformed_packets, 1);
@@ -4980,12 +5195,11 @@ mod tests {
             assert_eq!(
                 stats.captured_frames,
                 stats.delivered_frames
-                    + buffer.available_frames() as u64
+                    + reader.available_frames() as u64
                     + stats.overrun_frames
                     + stats.contention_frames
             );
-            assert_eq!(buffer.state(), CaptureState::Failed);
-            drop(buffer);
+            assert_eq!(reader.state(), CaptureState::Failed);
             assert_eq!(reader.error.lock().clone(), Some(Error::DeviceLost));
             reader.stop().unwrap();
         }

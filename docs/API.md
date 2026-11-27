@@ -591,8 +591,11 @@ capture.available_frames() / stats() / state() / last_error() / close()
 - `CaptureStats` keeps the causes of missing input apart: `missing_frames` and the
   failed, short, empty and malformed packet counters describe the bus,
   `overrun_frames` is audio dropped because the reader was too slow,
-  `contention_frames` is audio dropped while a duplex reader held the buffer, and
-  `device_position_frames()` is a lower bound of the device's position.
+  `proof_suppressed_frames` counts valid frames withheld during startup and rate proof,
+  and `device_position_frames()` includes those frames as a lower bound from configuration.
+  The presentation timeline begins after the suppressed region. Standalone capture drops
+  oldest queued frames on overflow; duplex drops newly arriving frames when its bounded
+  owned-frame pool is full. `contention_frames` is retained for compatibility.
   `CaptureState` is `Active`, `Stopped` or `Failed`.
 - In duplex, one USB worker runs both directions. Closing either direction stops
   both. Two directions on one clock must use the same rate; directions on separately

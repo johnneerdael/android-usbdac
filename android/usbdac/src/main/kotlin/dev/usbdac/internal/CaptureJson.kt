@@ -102,5 +102,5 @@ internal fun parseCaptureStats(json: String): CaptureStats {
         o.getLong("empty_packets"), o.getLong("short_packets"), o.getLong("failed_packets"),
         o.getLong("malformed_packets"), o.getLong("malformed_completions"), o.getLong("failed_transfers"),
         o.getLong("missing_frames"), o.getLong("reordered_completions"), o.getLong("device_position_frames"), error,
-        o.optLong("contention_frames", 0L))
+        o.optLong("contention_frames", 0L), o.optLong("proof_suppressed_frames", 0L))
 }

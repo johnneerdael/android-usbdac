@@ -2,6 +2,79 @@
 use super::*;
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitObservation {
+    Complete {
+        frames: u64,
+        empty_slots: usize,
+    },
+    MissingTiming {
+        bad_packets: usize,
+        valid_frames: u64,
+    },
+    EmptyCompletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ImplicitFault {
+    Removed,
+    Geometry,
+    FifoOverrun,
+    TimingBudgetExhausted,
+    TimingUntrusted,
+    TimingStale,
+    CadenceMismatch,
+    Transport(String),
+}
+impl std::fmt::Display for ImplicitFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Removed => write!(f, "USB DAC disconnected (implicit feedback)"),
+            Self::Geometry => write!(f, "implicit_xrun: invalid transfer geometry"),
+            Self::FifoOverrun => write!(f, "implicit_xrun: timing FIFO overrun"),
+            Self::TimingBudgetExhausted => {
+                write!(f, "implicit_xrun: timing recovery budget exhausted")
+            }
+            Self::TimingUntrusted => write!(
+                f,
+                "implicit_xrun: missing timing before cadence qualification"
+            ),
+            Self::TimingStale => {
+                write!(f, "implicit_xrun: timing requalification deadline expired")
+            }
+            Self::CadenceMismatch => write!(f, "implicit_xrun: cadence outside negotiated window"),
+            Self::Transport(error) => write!(f, "implicit feedback: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimingHealth {
+    Priming,
+    Trusted,
+    Recovering { since: Instant },
+}
+impl TimingHealth {
+    fn missing(self, completed_at: Instant, running: bool) -> Result<Self, ImplicitFault> {
+        match self {
+            Self::Priming if running => Err(ImplicitFault::TimingUntrusted),
+            Self::Priming => Ok(Self::Priming),
+            Self::Trusted => Ok(Self::Recovering {
+                since: completed_at,
+            }),
+            Self::Recovering { .. } => Err(ImplicitFault::TimingBudgetExhausted),
+        }
+    }
+    fn check_deadline(self, now: Instant, budget: Duration) -> Result<(), ImplicitFault> {
+        if let Self::Recovering { since } = self {
+            if now.saturating_duration_since(since) > budget {
+                return Err(ImplicitFault::TimingStale);
+            }
+        }
+        Ok(())
+    }
+}
+
 struct PatternFifo {
     storage: Vec<Vec<usize>>,
     read: usize,
@@ -116,6 +189,7 @@ pub(super) fn capture_pattern(
     Ok(!empty)
 }
 
+#[cfg(test)]
 fn known_empty_implicit_completion(
     slot: &IsoTransferSlot,
     status: i32,
@@ -161,70 +235,100 @@ fn inspect_implicit_pattern(
     slot: &IsoTransferSlot,
     status: i32,
     source: &ImplicitFeedbackSource,
+    rate: u32,
     out_stride: usize,
     max_out: usize,
     packets: &mut [crate::capture::CapturePacket],
     pattern: &mut [usize],
-) -> Result<bool, String> {
-    // Removal metadata takes priority over other transfer failures. Only read
-    // the descriptor allocation when its count matches the owned schedule.
+) -> Result<ImplicitObservation, ImplicitFault> {
     let transfer = unsafe { slot.transfer.as_ref() };
-    if transfer.num_iso_packets == packets.len() as i32 {
-        let descriptors =
-            unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), packets.len()) };
-        if descriptors
-            .iter()
-            .any(|packet| packet.status == LIBUSB_TRANSFER_NO_DEVICE)
-        {
-            return Err("USB DAC disconnected (implicit feedback)".into());
-        }
+    let data = unsafe { &*slot.user_data };
+    if status == LIBUSB_TRANSFER_NO_DEVICE {
+        return Err(ImplicitFault::Removed);
     }
-    let (data, detached) =
-        capture_stream::inspect_slot(slot, status, packets).map_err(|error| {
-            if error == Error::DeviceLost {
-                "USB DAC disconnected (implicit feedback)".into()
-            } else {
-                error.to_string()
-            }
-        })?;
-    if detached {
-        return Err("USB DAC disconnected (implicit feedback)".into());
+    if transfer.num_iso_packets != packets.len() as i32
+        || packets.len() != pattern.len()
+        || slot.packet_sizes.len() != packets.len()
+        || source.bytes_per_frame == 0
+        || out_stride == 0
+        || slot.submitted_endpoint != source.address
+        || transfer.endpoint != slot.submitted_endpoint
+        || transfer.length < 0
+        || transfer.length as usize != slot.submitted_bytes
+        || slot.submitted_bytes != data.buffer.len()
+        || transfer.buffer != data.buffer.as_ptr().cast_mut()
+    {
+        return Err(ImplicitFault::Geometry);
     }
-    if slot.submitted_endpoint != source.address || slot.packet_sizes.len() != packets.len() {
-        return Err("implicit capture source geometry changed".into());
+    let descriptors =
+        unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), packets.len()) };
+    if descriptors
+        .iter()
+        .any(|packet| packet.status == LIBUSB_TRANSFER_NO_DEVICE)
+    {
+        return Err(ImplicitFault::Removed);
     }
     let mut span = 0usize;
-    for (packet, &submitted) in packets.iter().zip(&slot.packet_sizes) {
-        if submitted != source.max_packet_bytes || packet.requested_bytes != submitted {
-            return Err("implicit capture packet geometry changed".into());
+    let mut bad_packets = 0usize;
+    let mut valid_frames = 0u64;
+    let mut empty_slots = 0usize;
+    for (index, (descriptor, &submitted)) in descriptors.iter().zip(&slot.packet_sizes).enumerate()
+    {
+        let requested = descriptor.length as usize;
+        let actual = descriptor.actual_length as usize;
+        if submitted != source.max_packet_bytes || requested != submitted || actual > requested {
+            return Err(ImplicitFault::Geometry);
         }
-        span = span
-            .checked_add(submitted)
-            .ok_or("implicit capture packet span overflow")?;
-        if span > data.len() {
-            return Err("implicit capture packet exceeds submitted buffer".into());
+        span = span.checked_add(submitted).ok_or(ImplicitFault::Geometry)?;
+        if span > data.buffer.len() {
+            return Err(ImplicitFault::Geometry);
         }
+        let succeeded =
+            status == LIBUSB_TRANSFER_COMPLETED && descriptor.status == LIBUSB_TRANSFER_COMPLETED;
+        packets[index] = crate::capture::CapturePacket {
+            requested_bytes: requested,
+            actual_bytes: actual,
+            succeeded,
+        };
+        if !succeeded || actual % source.bytes_per_frame != 0 {
+            bad_packets += 1;
+            continue;
+        }
+        let frames = actual / source.bytes_per_frame;
+        let bytes = frames
+            .checked_mul(out_stride)
+            .ok_or(ImplicitFault::Geometry)?;
+        if bytes > max_out {
+            return Err(ImplicitFault::Geometry);
+        }
+        pattern[index] = bytes;
+        valid_frames = valid_frames.saturating_add(frames as u64);
+        empty_slots += usize::from(actual == 0);
     }
     if span != slot.submitted_bytes {
-        return Err("implicit capture packet span changed".into());
+        return Err(ImplicitFault::Geometry);
     }
-    capture_pattern(
-        packets.iter().map(|packet| {
-            (
-                if packet.succeeded {
-                    LIBUSB_TRANSFER_COMPLETED
-                } else {
-                    LIBUSB_TRANSFER_ERROR
-                },
-                packet.actual_bytes,
-                packet.requested_bytes,
-            )
-        }),
-        source.bytes_per_frame,
-        out_stride,
-        max_out,
-        pattern,
-    )
+    if bad_packets != 0 {
+        return Ok(ImplicitObservation::MissingTiming {
+            bad_packets,
+            valid_frames,
+        });
+    }
+    if empty_slots == packets.len() {
+        return Ok(ImplicitObservation::EmptyCompletion);
+    }
+    // Type I permits floor/ceiling slots, with +/- one only for an integral
+    // average. Zero is therefore possible through exactly one frame/service.
+    if empty_slots > 0 && u64::from(rate) * u64::from(source.service_interval_us) > 1_000_000 {
+        return Ok(ImplicitObservation::MissingTiming {
+            bad_packets: empty_slots,
+            valid_frames,
+        });
+    }
+    Ok(ImplicitObservation::Complete {
+        frames: valid_frames,
+        empty_slots,
+    })
 }
 
 fn rate_window_valid(frames: u64, service_us: u64, rate: u32) -> bool {
@@ -293,6 +397,8 @@ pub(super) struct ImplicitFeedback {
     window_frames: u64,
     window_us: u64,
     bad_windows: u8,
+    timing_health: TimingHealth,
+    recovery_budget: Duration,
     prime_count: usize,
     prime_target: usize,
     pub(super) running: bool,
@@ -334,6 +440,8 @@ impl ImplicitFeedback {
             window_frames: 0,
             window_us: 0,
             bad_windows: 0,
+            timing_health: TimingHealth::Priming,
+            recovery_budget: Duration::from_micros(100_000u64.saturating_add(geometry.queued_us())),
             prime_count: 0,
             prime_target: geometry.transfer_slots,
             running: false,
@@ -393,7 +501,9 @@ impl ImplicitFeedback {
         handle: &DeviceHandle<Context>,
         stats: &RuntimeStats,
         stop: &AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<(), ImplicitFault> {
+        self.timing_health
+            .check_deadline(Instant::now(), self.recovery_budget)?;
         if let Some(&head) = self.order.front() {
             for &index in self.order.iter().skip(1) {
                 if !self.slots[head].completion_ready()
@@ -460,26 +570,15 @@ impl ImplicitFeedback {
                 &self.slots[index],
                 status,
                 &self.source,
+                self.rate,
                 self.out_stride,
                 self.max_out,
                 &mut self.capture_scratch,
                 &mut self.scratch,
             );
-            let result = if result.is_err()
-                && settings().has(crate::Quirk::ImplicitSilenceOnEmpty)
-                && known_empty_implicit_completion(
-                    &self.slots[index],
-                    status,
-                    &self.source,
-                    &mut self.capture_scratch,
-                ) {
-                Ok(false)
-            } else {
-                result
-            };
             // Failed transfers contain no presentable payload. Completed URBs
             // must pass the entire timing contract first, including packet gaps.
-            let capture_result = if result.is_ok() || status != LIBUSB_TRANSFER_COMPLETED {
+            let capture_result = if status == LIBUSB_TRANSFER_COMPLETED && result.is_ok() {
                 self.capture
                     .as_ref()
                     .map(|capture| {
@@ -490,18 +589,17 @@ impl ImplicitFeedback {
                 Ok(None)
             };
             match result {
-                Ok(true) => {
+                Ok(ImplicitObservation::Complete { frames, .. }) => {
                     self.measured_silence.observed(&self.scratch);
                     let last_report_ms = record_valid_completion(
                         &mut self.last_valid,
                         completed_at,
                         stats.started_at,
                     );
-                    let frames = self.scratch.iter().sum::<usize>() / self.out_stride;
                     stats.feedback_reports.fetch_add(1, Ordering::Relaxed);
                     stats
                         .implicit_measured_frames
-                        .fetch_add(frames as u64, Ordering::Relaxed);
+                        .fetch_add(frames, Ordering::Relaxed);
                     stats
                         .feedback_last_report_ms
                         .store(last_report_ms, Ordering::Relaxed);
@@ -512,12 +610,9 @@ impl ImplicitFeedback {
                     {
                         let service_us =
                             self.scratch.len() as u64 * u64::from(self.source.service_interval_us);
-                        let verdict = proof.observe(frames as u64, service_us);
+                        let verdict = proof.observe(frames, service_us);
                         if verdict == Some(false) {
-                            return Err(
-                                "programmed vendor PCM cadence does not match requested rate"
-                                    .into(),
-                            );
+                            return Err(ImplicitFault::CadenceMismatch);
                         }
                         if verdict == Some(true) {
                             self.startup_rate_proved = true;
@@ -527,18 +622,26 @@ impl ImplicitFeedback {
                     } else {
                         if let Err(error) = self.fifo.push(&self.scratch) {
                             stats.implicit_overruns.fetch_add(1, Ordering::Relaxed);
-                            return Err(error);
+                            let _ = error;
+                            return Err(ImplicitFault::FifoOverrun);
                         }
                         self.prime_count = (self.prime_count + 1).min(self.prime_target);
                     }
-                    self.window_frames += frames as u64;
+                    self.window_frames += frames;
                     self.window_us +=
                         self.scratch.len() as u64 * u64::from(self.source.service_interval_us);
                     if self.window_us >= 100_000 {
                         let valid =
                             rate_window_valid(self.window_frames, self.window_us, self.rate);
                         self.bad_windows = if valid { 0 } else { self.bad_windows + 1 };
-                        let previous = stats.feedback_locked.swap(valid, Ordering::AcqRel);
+                        if valid && (self.startup_rate_proof.is_none() || self.startup_rate_proved)
+                        {
+                            self.timing_health = TimingHealth::Trusted;
+                        }
+                        let previous = stats.feedback_locked.swap(
+                            valid && self.timing_health == TimingHealth::Trusted,
+                            Ordering::AcqRel,
+                        );
                         if previous != valid {
                             if let Some(trace) = &stats.feedback_trace {
                                 trace.record(crate::FeedbackTraceEvent::Lock {
@@ -554,11 +657,11 @@ impl ImplicitFeedback {
                         self.window_frames = 0;
                         self.window_us = 0;
                         if self.bad_windows >= 2 {
-                            return Err("implicit feedback rate outside negotiated window".into());
+                            return Err(ImplicitFault::CadenceMismatch);
                         }
                     }
                 }
-                Ok(false) => {
+                Ok(ImplicitObservation::EmptyCompletion) => {
                     stats.feedback_empty.fetch_add(1, Ordering::Relaxed);
                     if self.running {
                         if let Some(pattern) = self.measured_silence.take(
@@ -566,8 +669,15 @@ impl ImplicitFeedback {
                             self.running,
                             stats.feedback_locked.load(Ordering::Acquire),
                         ) {
-                            self.fifo.push_silence(&pattern)?;
+                            self.fifo
+                                .push_silence(&pattern)
+                                .map_err(|_| ImplicitFault::FifoOverrun)?;
                             stats.feedback_locked.store(false, Ordering::Release);
+                            self.window_frames = 0;
+                            self.window_us = 0;
+                            self.timing_health = TimingHealth::Recovering {
+                                since: completed_at,
+                            };
                             if let Some(trace) = &stats.feedback_trace {
                                 trace.record(crate::FeedbackTraceEvent::Lock {
                                     locked: false,
@@ -576,7 +686,7 @@ impl ImplicitFeedback {
                             }
                             log_warn!("[USB] Empty implicit completion: one measured-cadence wire-silence pattern; source health lease unchanged");
                         } else {
-                            return Err("empty implicit feedback pattern while running (no bounded proven silence available)".into());
+                            return Err(ImplicitFault::Transport("empty implicit feedback pattern while running (no bounded proven silence available)".into()));
                         }
                     } else {
                         self.prime_count = 0;
@@ -598,32 +708,60 @@ impl ImplicitFeedback {
                         }
                     }
                 }
-                Err(error) => {
+                Ok(ImplicitObservation::MissingTiming {
+                    bad_packets,
+                    valid_frames,
+                }) => {
+                    if status != LIBUSB_TRANSFER_COMPLETED {
+                        if let Some(capture) = &self.capture {
+                            capture.note_recoverable_transfer_failure();
+                        }
+                    }
                     stats
                         .implicit_invalid_packets
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(bad_packets as u64, Ordering::Relaxed);
                     stats.feedback_rejected.fetch_add(1, Ordering::Relaxed);
-                    return Err(if matches!(&capture_result, Err(Error::DeviceLost)) {
-                        "USB DAC disconnected (duplex implicit capture)".into()
+                    log_warn!(
+                        "implicit_timing_gap: bad_packets={} valid_frames={}",
+                        bad_packets,
+                        valid_frames
+                    );
+                    self.window_frames = 0;
+                    self.window_us = 0;
+                    let previous_health = self.timing_health;
+                    if self.running && previous_health == TimingHealth::Priming {
+                        stats.feedback_locked.store(false, Ordering::Release);
+                    }
+                    self.timing_health = previous_health.missing(completed_at, self.running)?;
+                    if previous_health == TimingHealth::Priming {
+                        self.fifo.clear();
+                        self.prime_count = 0;
+                        if let Some(proof) = self.startup_rate_proof.as_mut() {
+                            proof.reset();
+                            self.startup_rate_proved = false;
+                        }
                     } else {
-                        error
-                    });
+                        stats.feedback_locked.store(false, Ordering::Release);
+                    }
                 }
+                Err(error) => return Err(error),
             }
             capture_result.map_err(|error| {
                 if error == Error::DeviceLost {
-                    "USB DAC disconnected (duplex implicit capture)".into()
+                    ImplicitFault::Removed
                 } else {
-                    error.to_string()
+                    ImplicitFault::Transport(error.to_string())
                 }
             })?;
             if !usb_stop_requested(stop) {
-                self.slots[index].submit_capture(
-                    handle,
-                    self.source.address,
-                    self.source.max_packet_bytes,
-                    stats.feedback_trace.as_deref(),
-                )?;
+                self.slots[index]
+                    .submit_capture(
+                        handle,
+                        self.source.address,
+                        self.source.max_packet_bytes,
+                        stats.feedback_trace.as_deref(),
+                    )
+                    .map_err(ImplicitFault::Transport)?;
                 self.order.push_back(index);
             }
         }
@@ -634,7 +772,7 @@ impl ImplicitFeedback {
             .implicit_fifo_high_water
             .fetch_max(self.fifo.depth, Ordering::Relaxed);
         if !self.running && self.started.elapsed() >= self.startup_budget {
-            return Err("implicit feedback startup deadline expired".into());
+            return Err(ImplicitFault::Transport("startup deadline expired".into()));
         }
         Ok(())
     }
@@ -696,7 +834,18 @@ mod tests {
             actual_bytes: 0,
             succeeded: false,
         }; 2];
-        inspect_implicit_pattern(slot, status, source, 8, 24, &mut packets, &mut [0; 2])
+        inspect_implicit_pattern(
+            slot,
+            status,
+            source,
+            48_000,
+            8,
+            24,
+            &mut packets,
+            &mut [0; 2],
+        )
+        .map(|result| matches!(result, ImplicitObservation::Complete { .. }))
+        .map_err(|error| error.to_string())
     }
     #[test]
     fn implicit_source_admission_uses_immutable_submission_geometry() {
@@ -751,6 +900,128 @@ mod tests {
             .unwrap_err()
             .contains("disconnected"));
     }
+    #[test]
+    fn timing_gap_preserves_real_fifo_and_requires_new_qualification() {
+        let now = Instant::now();
+        let mut fifo = PatternFifo::new(2, 2);
+        assert_eq!(
+            TimingHealth::Priming.missing(now, false),
+            Ok(TimingHealth::Priming)
+        );
+        assert_eq!(
+            TimingHealth::Priming.missing(now, true),
+            Err(ImplicitFault::TimingUntrusted)
+        );
+        fifo.push(&[8, 16]).unwrap();
+        let health = TimingHealth::Trusted.missing(now, true).unwrap();
+        assert_eq!(fifo.depth, 1);
+        assert_eq!(
+            health.missing(now, true),
+            Err(ImplicitFault::TimingBudgetExhausted)
+        );
+        assert_eq!(
+            health.check_deadline(now + Duration::from_millis(121), Duration::from_millis(120)),
+            Err(ImplicitFault::TimingStale)
+        );
+        fifo.push(&[16, 8]).unwrap();
+        assert!(fifo.push(&[24, 0]).is_err());
+        assert_eq!(fifo.pop(), Some(vec![8, 16]));
+        assert_eq!(fifo.pop(), Some(vec![16, 8]));
+        assert_eq!(fifo.pop(), None);
+        // Only the caller's completed, valid cadence window promotes to Trusted.
+        assert!(TimingHealth::Trusted.missing(now, true).is_ok());
+    }
+
+    #[test]
+    fn failed_timing_packet_preserves_valid_sibling_without_a_schedule() {
+        let (source, mut slot) = source_slot();
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).status =
+                LIBUSB_TRANSFER_ERROR;
+        }
+        let mut packets = [crate::capture::CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }; 2];
+        let mut pattern = [99; 2];
+        assert_eq!(
+            inspect_implicit_pattern(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                &source,
+                48_000,
+                8,
+                24,
+                &mut packets,
+                &mut pattern
+            ),
+            Ok(ImplicitObservation::MissingTiming {
+                bad_packets: 1,
+                valid_frames: 2
+            })
+        );
+        assert!(packets[0].succeeded);
+        assert!(!packets[1].succeeded);
+        assert_eq!(pattern[1], 99);
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).status =
+                LIBUSB_TRANSFER_COMPLETED;
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).actual_length = 0;
+        }
+        assert_eq!(
+            inspect_implicit_pattern(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                &source,
+                48_000,
+                8,
+                24,
+                &mut packets,
+                &mut pattern
+            ),
+            Ok(ImplicitObservation::MissingTiming {
+                bad_packets: 1,
+                valid_frames: 2
+            })
+        );
+        assert_eq!(packets[0].actual_bytes, 8);
+        assert!(packets[1].succeeded);
+        assert_eq!(
+            inspect_implicit_pattern(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                &source,
+                1000,
+                8,
+                24,
+                &mut packets,
+                &mut pattern
+            ),
+            Ok(ImplicitObservation::Complete {
+                frames: 2,
+                empty_slots: 1
+            })
+        );
+        assert_eq!(pattern, [16, 0]);
+        assert_eq!(
+            inspect_implicit_pattern(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                &source,
+                1001,
+                8,
+                24,
+                &mut packets,
+                &mut pattern
+            ),
+            Ok(ImplicitObservation::MissingTiming {
+                bad_packets: 1,
+                valid_frames: 2
+            })
+        );
+    }
+
     #[test]
     fn delayed_callbacks_preserve_observed_freshness_and_monotonicity() {
         let started_at = Instant::now();
