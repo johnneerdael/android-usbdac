@@ -450,6 +450,7 @@ impl Dac {
                 closed: AtomicBool::new(false),
                 control_guard: Mutex::new(()),
                 stream: Mutex::new(None),
+                reconfigure: Mutex::new(None),
                 last_feedback_stream: Mutex::new(None),
             }),
         })
