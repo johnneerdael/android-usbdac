@@ -308,6 +308,7 @@ mod tests {
         let a = run(8192);
         let b = run(18);
         assert_eq!(a, b);
+        assert_eq!(a, run(3));
         assert_eq!(a.len(), 512 * 8); // 4096 input byte-frames, DSD64 -> 44.1 kHz
     }
     #[test]

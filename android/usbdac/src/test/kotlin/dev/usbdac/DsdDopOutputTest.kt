@@ -4,6 +4,9 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DsdDopOutputTest {
+    @Test(expected = IllegalArgumentException::class) fun refusesUnconfirmedDop() {
+        DsdDopOutput(RecordingOutput(), 2, 3, false)
+    }
     @Test fun packsChronologicalBytesAndAlternatesMarkers() {
         val target = RecordingOutput()
         val output = DsdDopOutput(target, 2, 3, true)
