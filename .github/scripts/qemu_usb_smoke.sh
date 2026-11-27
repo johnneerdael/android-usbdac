@@ -5,6 +5,21 @@ root=$(git rev-parse --show-toplevel)
 output=${1:-"$root/target/qemu-usb-smoke"}
 mkdir -p "$output"
 output=$(cd "$output" && pwd)
+# QEMU8.2.2 mislabels UAC1 AudioControl as protocol0x04; this was fixed
+# upstream before10.1. Pin the CI runner family and fail before guest launch
+# if the installed emulator predates that descriptor correction.
+# https://github.com/qemu/qemu/blob/v8.2.2/hw/usb/dev-audio.c
+# https://github.com/qemu/qemu/blob/v10.2.1/hw/usb/dev-audio.c
+qemu-system-x86_64 --version | tee "$output/qemu-version.txt"
+python3 - "$output/qemu-version.txt" <<'VERSION'
+from pathlib import Path
+import re
+import sys
+text = Path(sys.argv[1]).read_text()
+version = re.search(r"^QEMU emulator version (\d+)\.(\d+)(?:\.(\d+))?", text)
+if version is None or tuple(map(int, version.group(1, 2))) < (10, 1):
+    raise SystemExit("QEMU10.1+ with corrected UAC1 descriptors is required; DAC safety gates remain enabled")
+VERSION
 export USBDAC_PROBE_REVISION
 USBDAC_PROBE_REVISION=$(git rev-parse HEAD)
 export LIBUDEV_NO_PKG_CONFIG=1

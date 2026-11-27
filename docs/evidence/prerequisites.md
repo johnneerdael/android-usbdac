@@ -42,3 +42,16 @@ limit. Guest probe limits are 12 and 15 seconds; the guest powers off after
 both. Keep implementation and research outside this owned runtime window.
 A launch is authorized only after the final integrated native code compiles;
 the script's presence is not a virtual pass record.
+
+The QEMU CI job uses the explicit `ubuntu-26.04` runner and logs/checks the
+installed emulator version before boot (QEMU10.1 or newer required). Canonical's
+Resolute archive provides QEMU10.2.1; the failed Noble run installed
+`1:8.2.2+ds-0ubuntu1.18`. Upstream's
+[8.2.2 USB audio descriptors](https://github.com/qemu/qemu/blob/v8.2.2/hw/usb/dev-audio.c)
+set AudioControl protocol `0x04` despite declaring UAC1. The
+[10.2.1 descriptors](https://github.com/qemu/qemu/blob/v10.2.1/hw/usb/dev-audio.c)
+omit that field, leaving the correct zero protocol. The old virtual-device
+layout is consistent with the strict topology/volume refusal. The same bounded
+guest boot and acceptance probes remain in place. The driver retains strict
+descriptor, volume, claim and reconfiguration checks. This pass is virtual
+hardware evidence.

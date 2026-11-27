@@ -186,7 +186,11 @@ jobs:
 
   qemu-usb:
     name: QEMU UAC1 playback, reconfigure and two owners
-    runs-on: ubuntu-24.04
+    # Noble ships QEMU8.2.2 whose UAC1 AC descriptors incorrectly advertise
+    # protocol0x04; Resolute ships fixed QEMU10.2.1. Keep strict driver/probe gates.
+    # https://github.com/qemu/qemu/blob/v8.2.2/hw/usb/dev-audio.c
+    # https://github.com/qemu/qemu/blob/v10.2.1/hw/usb/dev-audio.c
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -207,5 +211,6 @@ jobs:
           path: |
             target/qemu-usb-smoke/acceptance.log
             target/qemu-usb-smoke/acceptance-window.txt
+            target/qemu-usb-smoke/qemu-version.txt
             target/qemu-usb-smoke/SHA256SUMS
           retention-days: 7
