@@ -124,7 +124,8 @@ impl Settings {
             && !multiplied
             && !dsd
             && !self.has(Quirk::RequireVerifiedRate)
-            && (self.skip_clock_validation()
+            && (!self.config.require_verified_rate
+                || self.skip_clock_validation()
                 || (is_uac1 && self.has(Quirk::SkipSampleRateReadback))
                 || self.config.clock_readback_policy
                     == crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet)
@@ -419,6 +420,20 @@ mod clock_readback_policy_tests {
             ));
         }
         settings.config.clock_readback_policy = crate::config::ClockReadbackPolicy::RequireVerified;
+        settings.config.require_verified_rate = false;
+        assert!(settings.allow_unusable_clock_readback(false, true, true, None, false, false));
+        assert!(!settings.allow_unusable_clock_readback(false, false, true, None, false, false));
+        assert!(!settings.allow_unusable_clock_readback(
+            false,
+            true,
+            true,
+            Some(44_100),
+            false,
+            false
+        ));
+        assert!(!settings.allow_unusable_clock_readback(false, true, true, None, true, false));
+        assert!(!settings.allow_unusable_clock_readback(false, true, true, None, false, true));
+        settings.config.require_verified_rate = true;
         settings.quirks.push(Quirk::SkipSampleRateReadback);
         assert!(settings.allow_unusable_clock_readback(true, true, true, None, false, false));
         assert!(!settings.allow_unusable_clock_readback(false, true, true, None, false, false));

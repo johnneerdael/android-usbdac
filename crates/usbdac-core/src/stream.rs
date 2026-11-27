@@ -173,6 +173,7 @@ pub(crate) struct StreamInner {
     format: StreamFormat,
     usb_handle_identity: usize,
     closed: AtomicBool,
+    retirement_guard: Mutex<()>,
 }
 
 impl StreamInner {
@@ -188,6 +189,7 @@ impl StreamInner {
             handle: Mutex::new(Some(handle)),
             format,
             closed: AtomicBool::new(false),
+            retirement_guard: Mutex::new(()),
         })
     }
 
@@ -202,6 +204,11 @@ impl StreamInner {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
+        let _guard = self.retirement_guard.lock();
+        self.close_locked()
+    }
+
+    fn close_locked(&self) -> Result<()> {
         let _scope = self.dac.context.enter();
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -319,6 +326,23 @@ impl DacStream {
         Ok(self.inner.usb_handle_identity)
     }
 
+    pub(crate) fn is_current(&self, owner: &Arc<DacShared>) -> bool {
+        owner
+            .stream
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|stream| Arc::ptr_eq(&stream, &self.inner))
+    }
+
+    pub(crate) fn lock_retirement(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.retirement_guard.lock()
+    }
+
+    pub(crate) fn retire_for_reconfigure_locked(&self) -> Result<()> {
+        self.inner.close_locked()
+    }
+
     pub(crate) fn retire_for_reconfigure(&self) -> Result<()> {
         self.inner.close()
     }
@@ -367,6 +391,7 @@ impl DacStream {
     /// Resumes after [`pause`](Self::pause). A new stream plays by itself once
     /// the ring holds the start threshold; this is only needed after a pause.
     pub fn play(&self) -> Result<()> {
+        let _retirement = self.inner.retirement_guard.lock();
         let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().set_paused(false);
@@ -380,6 +405,7 @@ impl DacStream {
     /// by default, at every service interval) still plays out first; the ring
     /// resumes exactly where it was.
     pub fn pause(&self) -> Result<()> {
+        let _retirement = self.inner.retirement_guard.lock();
         let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().set_paused(true);
@@ -401,6 +427,7 @@ impl DacStream {
     /// ([`DacConfig::bus_queue_ms`](crate::DacConfig::bus_queue_ms), 16 ms by
     /// default) and is not counted as played.
     pub fn flush(&self) -> Result<()> {
+        let _retirement = self.inner.retirement_guard.lock();
         let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().flush();
@@ -413,6 +440,7 @@ impl DacStream {
     /// tail is not an underrun. Further writes fail until
     /// [`flush`](Self::flush).
     pub fn drain(&self) -> Result<()> {
+        let _retirement = self.inner.retirement_guard.lock();
         let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().drain();

@@ -2744,6 +2744,7 @@ fn validate_adc3_clock(
 /// are restored in reverse acquisition order only after transfer retirement.
 pub(super) struct Adc3PowerLease {
     fd: RawFd,
+    routing_deadline: Mutex<Option<Instant>>,
     pending: Mutex<Vec<(u8, u8, u8)>>,
     clock: Mutex<Option<(Adc3Route, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
 }
@@ -2751,9 +2752,45 @@ impl Adc3PowerLease {
     pub(super) fn new(fd: RawFd) -> Self {
         Self {
             fd,
+            routing_deadline: Mutex::new(None),
             pending: Mutex::new(vec![]),
             clock: Mutex::new(None),
         }
+    }
+    pub(super) fn set_routing_deadline(&self, deadline: Instant) {
+        *self.routing_deadline.lock() = Some(deadline);
+    }
+    fn routing_timeout(&self) -> Result<u32, String> {
+        let deadline = *self.routing_deadline.lock();
+        let Some(deadline) = deadline else {
+            return Ok(1000);
+        };
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        if remaining.is_zero() {
+            return Err("ADC3 routing deadline expired".into());
+        }
+        Ok(remaining
+            .as_millis()
+            .saturating_add(if remaining.subsec_nanos() % 1_000_000 != 0 {
+                1
+            } else {
+                0
+            })
+            .clamp(1, 1000) as u32)
+    }
+    fn routing_delay(&self, delay: Duration) -> Result<(), String> {
+        let deadline = *self.routing_deadline.lock();
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < delay {
+                thread::sleep(remaining);
+                return Err("ADC3 routing deadline during recovery delay".into());
+            }
+        }
+        thread::sleep(delay);
+        Ok(())
     }
     fn control(&self, input: bool, ac: u8, id: u8, state: &mut [u8; 1]) -> Result<(), String> {
         let request = UsbfsControlTransfer {
@@ -2762,12 +2799,12 @@ impl Adc3PowerLease {
             value: 0x0200,
             index: u16::from(ac) | (u16::from(id) << 8),
             length: 1,
-            timeout_ms: 1000,
+            timeout_ms: self.routing_timeout()?,
             data: state.as_mut_ptr().cast(),
         };
         let n = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &request) };
         let failure = (n < 0).then(std::io::Error::last_os_error);
-        class_control_delay();
+        self.routing_delay(Duration::from_micros(settings().control_delay_us()))?;
         if n != 1 {
             return Err(if let Some(error) = failure {
                 error.to_string()
@@ -2825,7 +2862,7 @@ impl Adc3PowerLease {
             value: 0,
             index: u16::from(interface),
             length: 1,
-            timeout_ms: 1000,
+            timeout_ms: self.routing_timeout()?,
             data: alternate.as_mut_ptr().cast(),
         };
         let n = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &request) };
@@ -3043,7 +3080,9 @@ impl PowerIo for PowerUsb<'_> {
         self.0.control(false, ac, id, &mut [state])
     }
     fn delay(&mut self, micros: u32) {
-        thread::sleep(Duration::from_micros(u64::from(micros)));
+        let _ = self
+            .0
+            .routing_delay(Duration::from_micros(u64::from(micros)));
     }
 }
 fn acquire_domain(

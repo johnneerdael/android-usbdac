@@ -64,6 +64,46 @@ impl UsbDevice {
         index: u16,
         data: &mut [u8],
     ) -> std::io::Result<usize> {
+        self.feature_unit_control_inner(
+            request_type,
+            request,
+            value,
+            index,
+            data,
+            Duration::from_secs(1),
+            false,
+        )
+    }
+
+    pub(super) fn feature_unit_control_timed(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout: Duration,
+    ) -> std::io::Result<usize> {
+        self.feature_unit_control_inner(request_type, request, value, index, data, timeout, true)
+    }
+
+    fn feature_unit_control_inner(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout: Duration,
+        bounded_delay: bool,
+    ) -> std::io::Result<usize> {
+        let started = std::time::Instant::now();
+        if timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "routing deadline expired",
+            ));
+        }
         if !self.claimed_interfaces.contains(&(index as u8)) {
             return Err(std::io::Error::other(
                 "AudioControl interface is not claimed",
@@ -84,7 +124,14 @@ impl UsbDevice {
             value,
             index,
             length,
-            timeout_ms: 1000,
+            timeout_ms: timeout
+                .as_millis()
+                .saturating_add(if timeout.subsec_nanos() % 1_000_000 != 0 {
+                    1
+                } else {
+                    0
+                })
+                .clamp(1, u32::MAX as u128) as u32,
             data: data.as_mut_ptr().cast(),
         };
         // This synchronous ioctl does not reap URBs. A separate libusb control
@@ -94,7 +141,18 @@ impl UsbDevice {
         if request_type & 0x60 == USB_TYPE_CLASS {
             let delay = settings().control_delay_us();
             if delay > 0 {
-                thread::sleep(Duration::from_micros(delay));
+                let delay = Duration::from_micros(delay);
+                if bounded_delay {
+                    let left = timeout.saturating_sub(started.elapsed());
+                    if left < delay {
+                        thread::sleep(left);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "routing deadline during control delay",
+                        ));
+                    }
+                }
+                thread::sleep(delay);
             }
         }
         if let Some(error) = failure {

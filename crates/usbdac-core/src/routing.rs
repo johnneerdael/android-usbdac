@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 
 pub use crate::transport::routing_hw::{
-    RouteEdit, RoutingHandBackOutcome, RoutingHandBackReport, RoutingSessionError, RoutingSnapshot,
+    RouteEdit, RoutingDiagnostic, RoutingHandBackOutcome, RoutingHandBackReport,
+    RoutingSessionError, RoutingSnapshot,
 };
 
 /// AudioControl interface and entity identity, scoped to the active configuration.
@@ -669,6 +670,7 @@ pub trait RoutingIo {
     type Error;
     fn read(&mut self, request: ControlRequest, data: &mut [u8]) -> Result<usize, Self::Error>;
     fn write(&mut self, request: ControlRequest, data: &[u8]) -> Result<usize, Self::Error>;
+    fn begin_recovery(&mut self) {}
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -816,6 +818,7 @@ pub(crate) fn apply_routes_traced<I: RoutingIo>(
         attempted_values.push((change.key, *original, change.value));
         if let Err(cause) = write_verified(io, *control, change.value) {
             let mut failure = error(Some(i), cause);
+            io.begin_recovery();
             for &j in attempted.iter().rev() {
                 if let Err(e) = write_verified(io, controls[j], originals[j]) {
                     failure.rollback_failures.push((changes[j].key, e));

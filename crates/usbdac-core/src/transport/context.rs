@@ -221,6 +221,9 @@ impl<T> ScopedMutex<T> {
     pub(super) fn lock(&self) -> ArcMutexGuard<RawMutex, T> {
         (self.0)(&current()).lock_arc()
     }
+    pub(super) fn try_lock_for(&self, timeout: Duration) -> Option<ArcMutexGuard<RawMutex, T>> {
+        (self.0)(&current()).try_lock_arc_for(timeout)
+    }
     pub(super) fn try_lock(&self) -> Option<ArcMutexGuard<RawMutex, T>> {
         (self.0)(&current()).try_lock_arc()
     }

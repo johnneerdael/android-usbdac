@@ -4742,7 +4742,9 @@ mod tests {
     fn publish(slot: &IsoTransferSlot) {
         unsafe {
             let user_data = &*slot.user_data;
+            user_data.completion.reset();
             *user_data.completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
+            user_data.completion.publish_for_test();
         }
     }
 

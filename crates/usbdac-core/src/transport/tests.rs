@@ -2042,11 +2042,13 @@ mod push_stream_tests {
             !slot.completion_ready(),
             "libusb has not handed it back yet"
         );
+        unsafe { &(*slot.user_data).completion }.reset();
         unsafe { &(*slot.user_data).completion }
             .status
             .lock()
             .unwrap()
             .replace(LIBUSB_TRANSFER_CANCELLED);
+        unsafe { &(*slot.user_data).completion }.publish_for_test();
         assert!(slot.completion_ready());
         assert_eq!(
             slot.take_completion().map(|(status, _, _)| status),

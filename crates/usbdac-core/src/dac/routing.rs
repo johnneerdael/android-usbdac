@@ -12,6 +12,14 @@ impl Dac {
     pub fn djm_routing_discover(
         &self,
     ) -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::djm_discover(&self.shared)
     }
@@ -29,6 +37,14 @@ impl Dac {
         key: crate::pioneer::DjmControlKey,
         option: u8,
     ) -> Result<(), RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::djm_apply(&self.shared, model, configuration, key, option)
     }
@@ -39,6 +55,14 @@ impl Dac {
     /// claimed AudioControl interface while idle. No vendor claim or probe write.
     /// Hardware behavior remains physically unvalidated.
     pub fn scarlett_gen1_read(&self) -> Result<crate::scarlett::Gen1Readback, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_gen1_read()
     }
@@ -53,6 +77,14 @@ impl Dac {
         expected: &crate::scarlett::Gen1Readback,
         edits: &[crate::scarlett::Gen1Edit],
     ) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_gen1_apply(expected, edits)
     }
@@ -64,6 +96,14 @@ impl Dac {
     pub fn scarlett_routing_capability(
         &self,
     ) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_discover()
     }
@@ -77,6 +117,14 @@ impl Dac {
     pub fn scarlett_routing_read(
         &self,
     ) -> Result<crate::scarlett::RoutingReadback, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_read()
     }
@@ -87,6 +135,14 @@ impl Dac {
     /// Requires idle ownership and an explicit exact-model vendor-interface claim.
     /// Does not send persistent configuration commands.
     pub fn fcp_routing_read(&self) -> Result<crate::scarlett::FcpReadback, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::fcp_read()
     }
@@ -103,6 +159,14 @@ impl Dac {
         routes: &[crate::scarlett::FcpRouteEdit],
         mixes: &[crate::scarlett::FcpMixEdit],
     ) -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::fcp_apply(expected, routes, mixes)
     }
@@ -119,6 +183,14 @@ impl Dac {
         &self,
         edit: &crate::scarlett::MixRowEdit,
     ) -> Result<crate::scarlett::MixWriteReport, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_mix_apply(edit)
     }
@@ -128,6 +200,14 @@ impl Dac {
     /// Probe optional per-bank support and read every raw bank including padding.
     /// An unsupported response never enables writes; legacy reads remain usable.
     pub fn scarlett_mux_read(&self) -> Result<crate::scarlett::MuxSnapshot, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_mux_read()
     }
@@ -142,6 +222,14 @@ impl Dac {
         &self,
         edit: &crate::scarlett::MuxEdit,
     ) -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_mux_apply(edit)
     }
@@ -150,6 +238,14 @@ impl Dac {
     /// AudioControl interfaces in the active configuration. No vendor protocol
     /// is inferred. Requires an idle DAC, including no open capture stream.
     pub fn routing_discover(&self) -> Result<RoutingSnapshot, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::discover()
     }
@@ -158,6 +254,14 @@ impl Dac {
     /// idle functions. Restore checked original power after discovery, including
     /// failures. The snapshot does not retain a power lease.
     pub fn routing_discover_powered(&self) -> Result<RoutingSnapshot, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::discover_with_power(true)
     }
@@ -169,6 +273,14 @@ impl Dac {
         snapshot: &RoutingSnapshot,
         key: ControlKey,
     ) -> Result<RouteValue, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::read_with_power(snapshot, key, true)
     }
@@ -181,6 +293,14 @@ impl Dac {
         snapshot: &RoutingSnapshot,
         edits: &[RouteEdit],
     ) -> Result<RouteReport, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::apply_with_power(snapshot, edits, true)
     }
@@ -192,6 +312,14 @@ impl Dac {
         snapshot: &RoutingSnapshot,
         key: ControlKey,
     ) -> Result<RouteValue, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::read(snapshot, key)
     }
@@ -206,6 +334,14 @@ impl Dac {
         snapshot: &RoutingSnapshot,
         edits: &[RouteEdit],
     ) -> Result<RouteReport, RoutingSessionError> {
+        let _control = self
+            .shared
+            .control_guard
+            .try_lock()
+            .ok_or(RoutingSessionError::Session(crate::Error::Busy))?;
+        self.shared
+            .reject_reconfigure()
+            .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::apply(snapshot, edits)
     }

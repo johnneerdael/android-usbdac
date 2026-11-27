@@ -46,6 +46,7 @@ pub struct RoutingSnapshot {
     inventory: RoutingInventory,
     selectors: Vec<RouteChange>,
     hc_clusters: BTreeMap<(u8, u16), RoutingCluster>,
+    diagnostics: Vec<RoutingDiagnostic>,
     hand_back_report: Arc<Mutex<Option<RoutingHandBackReport>>>,
 }
 
@@ -53,6 +54,9 @@ impl RoutingSnapshot {
     /// None until final retirement completes; remains available after close.
     pub fn hand_back_report(&self) -> Option<RoutingHandBackReport> {
         self.hand_back_report.lock().clone()
+    }
+    pub fn diagnostics(&self) -> &[RoutingDiagnostic] {
+        &self.diagnostics
     }
     pub fn configuration(&self) -> u8 {
         self.configuration
@@ -65,6 +69,14 @@ impl RoutingSnapshot {
     }
 }
 
+/// A routing unit or function omitted because its addressing cannot be proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingDiagnostic {
+    pub interface: u8,
+    pub entity_id: Option<u8>,
+    pub detail: String,
+}
+
 /// Outcome for one control when the session relinquishes routing ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingHandBackOutcome {
@@ -74,6 +86,7 @@ pub enum RoutingHandBackOutcome {
     Unreadable(String),
     IdentityOrTopologyChanged(String),
     RestoreUncertain(String),
+    DeadlineExpired,
     Disabled,
 }
 
@@ -1477,7 +1490,21 @@ fn finish_scarlett_hand_back() {
     }
 }
 
+const ROUTING_OPERATION_BUDGET: Duration = Duration::from_secs(4);
+const ROUTING_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
+fn remaining(deadline: Instant) -> Result<Duration, RoutingSessionError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(RoutingSessionError::Session(Error::Control(
+            "routing deadline expired".into(),
+        )));
+    }
+    Ok(left.min(Duration::from_secs(1)))
+}
+
 struct UsbRoutingIo<'a> {
+    deadline: Instant,
+    recovery: Arc<Mutex<Option<Instant>>>,
     device: &'a UsbDevice,
     descriptors: &'a [u8],
 }
@@ -1539,8 +1566,9 @@ fn validate_protocol_request(
 
 impl UsbRoutingIo<'_> {
     fn validate(&self, request: ControlRequest, input: bool, length: usize) -> Result<(), String> {
-        let interfaces = routing_interfaces(self.descriptors, &self.device.claimed_interfaces)
-            .map_err(|e| e.to_string())?;
+        let interfaces =
+            routing_interfaces_unambiguous(self.descriptors, &self.device.claimed_interfaces)
+                .map_err(|e| e.to_string())?;
         let protocol = interfaces
             .get(&(request.index as u8))
             .ok_or("routing interface is not claimed")?
@@ -1554,19 +1582,40 @@ impl RoutingIo for UsbRoutingIo<'_> {
     fn read(&mut self, r: ControlRequest, bytes: &mut [u8]) -> Result<usize, String> {
         self.validate(r, true, bytes.len())?;
         self.device
-            .feature_unit_control(r.request_type, r.request, r.value, r.index, bytes)
+            .feature_unit_control_timed(
+                r.request_type,
+                r.request,
+                r.value,
+                r.index,
+                bytes,
+                remaining(self.deadline).map_err(|e| e.to_string())?,
+            )
             .map_err(|e| e.to_string())
     }
     fn write(&mut self, r: ControlRequest, bytes: &[u8]) -> Result<usize, String> {
         self.validate(r, false, bytes.len())?;
         let mut data = bytes.to_vec();
         self.device
-            .feature_unit_control(r.request_type, r.request, r.value, r.index, &mut data)
+            .feature_unit_control_timed(
+                r.request_type,
+                r.request,
+                r.value,
+                r.index,
+                &mut data,
+                remaining(self.deadline).map_err(|e| e.to_string())?,
+            )
             .map_err(|e| e.to_string())
+    }
+    fn begin_recovery(&mut self) {
+        let mut recovery = self.recovery.lock();
+        self.deadline = *recovery.get_or_insert_with(|| Instant::now() + ROUTING_RECOVERY_BUDGET);
     }
 }
 
 fn idle_device() -> Result<UsbDevice, RoutingSessionError> {
+    idle_device_until(None)
+}
+fn idle_device_until(deadline: Option<Instant>) -> Result<UsbDevice, RoutingSessionError> {
     if USB_SESSION_CLEAR_PENDING.load(Ordering::SeqCst) {
         return Err(RoutingSessionError::Session(Error::InvalidState(
             "the DAC is being closed".into(),
@@ -1577,7 +1626,16 @@ fn idle_device() -> Result<UsbDevice, RoutingSessionError> {
             "close all streams before routing controls".into(),
         )));
     }
-    let state = SESSION_STATE.lock();
+    let state = match deadline {
+        Some(deadline) => SESSION_STATE
+            .try_lock_for(remaining(deadline)?)
+            .ok_or_else(|| {
+                RoutingSessionError::Session(Error::Control(
+                    "routing deadline waiting for session state".into(),
+                ))
+            })?,
+        None => SESSION_STATE.lock(),
+    };
     let state = state.as_ref().ok_or_else(|| {
         RoutingSessionError::Session(Error::InvalidState("no DAC is open".into()))
     })?;
@@ -1590,7 +1648,22 @@ fn idle_device() -> Result<UsbDevice, RoutingSessionError> {
 }
 
 fn active_descriptors(device: &UsbDevice) -> Result<(u8, Vec<u8>), RoutingSessionError> {
-    let idle = IDLE_LOCK.lock();
+    active_descriptors_until(device, None)
+}
+fn active_descriptors_until(
+    device: &UsbDevice,
+    deadline: Option<Instant>,
+) -> Result<(u8, Vec<u8>), RoutingSessionError> {
+    let idle = match deadline {
+        Some(deadline) => IDLE_LOCK
+            .try_lock_for(remaining(deadline)?)
+            .ok_or_else(|| {
+                RoutingSessionError::Session(Error::Control(
+                    "routing deadline waiting for idle owner".into(),
+                ))
+            })?,
+        None => IDLE_LOCK.lock(),
+    };
     let idle = idle
         .as_ref()
         .filter(|idle| idle.device_fd == device.fd)
@@ -1599,6 +1672,70 @@ fn active_descriptors(device: &UsbDevice) -> Result<(u8, Vec<u8>), RoutingSessio
                 "routing requires the idle USB owner".into(),
             ))
         })?;
+    if let Some(deadline) = deadline {
+        let identity = idle
+            .handle
+            .device()
+            .device_descriptor()
+            .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+        if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
+            return Err(RoutingSessionError::Drift(
+                "routing device identity changed".into(),
+            ));
+        }
+        let read_config = |value: u16, bytes: &mut [u8]| -> Result<usize, RoutingSessionError> {
+            idle.handle
+                .read_control(0x80, 6, value, 0, bytes, remaining(deadline)?)
+                .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))
+        };
+        let read_active = || -> Result<u8, RoutingSessionError> {
+            let mut number = [0];
+            let n = idle
+                .handle
+                .read_control(0x80, 8, 0, 0, &mut number, remaining(deadline)?)
+                .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
+            if n != 1 {
+                return Err(RoutingSessionError::Session(Error::Control(
+                    "short GET_CONFIGURATION".into(),
+                )));
+            }
+            Ok(number[0])
+        };
+        let active = read_active()?;
+        for index in 0..identity.num_configurations() {
+            let mut header = [0u8; 9];
+            if read_config(0x0200 | u16::from(index), &mut header)? != header.len() {
+                continue;
+            }
+            if header[0] != 9 || header[1] != 2 {
+                return Err(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ));
+            }
+            if header[5] != active {
+                continue;
+            }
+            let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
+            if length < header.len() {
+                return Err(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ));
+            }
+            let mut raw = vec![0; length];
+            if read_config(0x0200 | u16::from(index), &mut raw)? != length
+                || raw[..header.len()] != header
+                || read_active()? != active
+            {
+                return Err(RoutingSessionError::Drift(
+                    "active configuration changed during discovery".into(),
+                ));
+            }
+            return Ok((active, raw));
+        }
+        return Err(RoutingSessionError::Drift(
+            "active configuration descriptor unavailable".into(),
+        ));
+    }
     let identity = idle
         .handle
         .device()
@@ -1679,6 +1816,7 @@ fn query_routing_cluster(
     handle: &DeviceHandle<Context>,
     interface: u8,
     id: u16,
+    deadline: Instant,
 ) -> Result<RoutingCluster, RoutingSessionError> {
     use crate::descriptors::uac3;
     let fail = |e: String| RoutingSessionError::UnsupportedTopology(e);
@@ -1690,7 +1828,7 @@ fn query_routing_cluster(
             id,
             u16::from(interface),
             &mut prefix,
-            Duration::from_secs(1),
+            remaining(deadline)?,
         )
         .map_err(|e| fail(e.to_string()))?;
     let header =
@@ -1703,7 +1841,7 @@ fn query_routing_cluster(
             id,
             u16::from(interface),
             &mut content,
-            Duration::from_secs(1),
+            remaining(deadline)?,
         )
         .map_err(|e| fail(e.to_string()))?;
     let parsed = uac3::parse_cluster(&content[..n], header).map_err(|e| fail(e.to_string()))?;
@@ -1717,6 +1855,7 @@ struct Cluster {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterIdentity {
+    Unknown,
     Explicit { locations: u32, names: u8 },
     Adc3(Vec<u8>),
 }
@@ -1840,12 +1979,20 @@ fn resolve_cluster_cached(
                 return Ok(output);
             }
             parse_selector(interface, bytes, protocol)?;
-            if clusters.is_empty() || clusters.iter().any(|c| c != &clusters[0]) {
+            if clusters.is_empty() || clusters.iter().any(|c| c.channels != clusters[0].channels) {
                 return Err(RoutingSessionError::UnsupportedTopology(
-                    "selector input channel clusters differ or are empty".into(),
+                    "selector input widths differ or are empty".into(),
                 ));
             }
-            return Ok(clusters.remove(0));
+            let first = clusters.remove(0);
+            return Ok(if clusters.iter().all(|c| c.identity == first.identity) {
+                first
+            } else {
+                Cluster {
+                    channels: first.channels,
+                    identity: ClusterIdentity::Unknown,
+                }
+            });
         }
         if bytes[2] == feature_subtype && bytes.len() >= 6 {
             let cluster =
@@ -1910,6 +2057,23 @@ fn routing_interfaces<'a>(
     raw: &'a [u8],
     claims: &[u8],
 ) -> Result<BTreeMap<u8, (u8, Vec<&'a [u8]>)>, RoutingSessionError> {
+    let (interfaces, diagnostics) = routing_interfaces_with_diagnostics(raw, claims)?;
+    if !diagnostics.is_empty() {
+        return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
+    }
+    Ok(interfaces)
+}
+fn routing_interfaces_unambiguous<'a>(
+    raw: &'a [u8],
+    claims: &[u8],
+) -> Result<BTreeMap<u8, (u8, Vec<&'a [u8]>)>, RoutingSessionError> {
+    Ok(routing_interfaces_with_diagnostics(raw, claims)?.0)
+}
+
+fn routing_interfaces_with_diagnostics<'a>(
+    raw: &'a [u8],
+    claims: &[u8],
+) -> Result<(BTreeMap<u8, (u8, Vec<&'a [u8]>)>, Vec<RoutingDiagnostic>), RoutingSessionError> {
     if raw.len() < 9
         || raw[0] != 9
         || raw[1] != 2
@@ -1920,6 +2084,7 @@ fn routing_interfaces<'a>(
         ));
     }
     let mut interfaces = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
     let mut current = None;
     for bytes in framed(raw)? {
         if bytes[1] == 4 {
@@ -1935,11 +2100,16 @@ fn routing_interfaces<'a>(
                 && [0, 0x20, 0x30].contains(&bytes[7])
                 && claims.contains(&bytes[2])
             {
+                if ambiguous.contains(&bytes[2]) {
+                    continue;
+                }
                 if interfaces
                     .insert(bytes[2], (bytes[7], Vec::new()))
                     .is_some()
                 {
-                    return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
+                    interfaces.remove(&bytes[2]);
+                    ambiguous.insert(bytes[2]);
+                    continue;
                 }
                 current = Some(bytes[2]);
             }
@@ -1949,7 +2119,15 @@ fn routing_interfaces<'a>(
             }
         }
     }
-    Ok(interfaces)
+    let diagnostics = ambiguous
+        .into_iter()
+        .map(|interface| RoutingDiagnostic {
+            interface,
+            entity_id: None,
+            detail: "ambiguous AudioControl function".into(),
+        })
+        .collect();
+    Ok((interfaces, diagnostics))
 }
 
 #[cfg(test)]
@@ -1959,6 +2137,7 @@ fn inventory_from_config(
 ) -> Result<RoutingInventory, RoutingSessionError> {
     inventory_with_clusters(raw, claims, &BTreeMap::new())
 }
+#[cfg(test)]
 fn inventory_with_clusters(
     raw: &[u8],
     claims: &[u8],
@@ -2067,9 +2246,157 @@ fn inventory_with_clusters(
     Ok(inventory)
 }
 
+fn inventory_partial(
+    raw: &[u8],
+    claims: &[u8],
+    hc: &BTreeMap<(u8, u16), RoutingCluster>,
+) -> Result<(RoutingInventory, Vec<RoutingDiagnostic>), RoutingSessionError> {
+    let mut inventory = RoutingInventory::default();
+    let mut diagnostics = Vec::new();
+    for (interface, (protocol, descriptors)) in routing_interfaces_unambiguous(raw, claims)? {
+        let function = (|| -> Result<(), RoutingSessionError> {
+            let mut nodes = BTreeMap::new();
+            let mut header = None;
+            for &bytes in &descriptors {
+                if bytes.len() < 4 {
+                    return Err(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ));
+                }
+                if bytes[2] == 1 {
+                    if header.replace(bytes).is_some() {
+                        return Err(RoutingSessionError::Invalid(
+                            InvalidRoute::MalformedDescriptor,
+                        ));
+                    }
+                } else if bytes[3] == 0 || nodes.insert(bytes[3], bytes).is_some() {
+                    return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
+                }
+            }
+            let header = header.ok_or(RoutingSessionError::Invalid(
+                InvalidRoute::MalformedDescriptor,
+            ))?;
+            let total = match protocol {
+                0 if header.len() >= 8
+                    && header[3..5] == [0, 1]
+                    && header.len() == 8 + usize::from(header[7]) =>
+                {
+                    u16::from_le_bytes([header[5], header[6]])
+                }
+                0x20 if header.len() == 9 && header[3..5] == [0, 2] => {
+                    u16::from_le_bytes([header[6], header[7]])
+                }
+                0x30 => {
+                    crate::descriptors::uac3::parse_ac_header(header)
+                        .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?
+                        .total_length
+                }
+                _ => {
+                    return Err(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ))
+                }
+            };
+            if usize::from(total) != descriptors.iter().map(|d| d.len()).sum::<usize>() {
+                return Err(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ));
+            }
+            let mut cache = BTreeMap::new();
+            for &bytes in nodes.values() {
+                let mixer = if protocol == 0x30 { 5 } else { 4 };
+                let selector = if protocol == 0x30 { 6 } else { 5 };
+                if bytes[2] != mixer && bytes[2] != selector {
+                    continue;
+                }
+                let unit = (|| -> Result<RoutingUnit, RoutingSessionError> {
+                    if bytes[2] == selector {
+                        return Ok(RoutingUnit::Selector(parse_selector(
+                            interface, bytes, protocol,
+                        )?));
+                    }
+                    let output = resolve_cluster_cached(
+                        bytes[3],
+                        &nodes,
+                        &mut Vec::new(),
+                        &mut cache,
+                        protocol,
+                        interface,
+                        hc,
+                    )?;
+                    let unit = if bytes[2] == selector {
+                        RoutingUnit::Selector(parse_selector(interface, bytes, protocol)?)
+                    } else {
+                        let count = usize::from(bytes[4]);
+                        let inputs = bytes[5..5 + count]
+                            .iter()
+                            .map(|&source_id| {
+                                Ok(InputCluster {
+                                    source_id,
+                                    channels: resolve_cluster_cached(
+                                        source_id,
+                                        &nodes,
+                                        &mut Vec::new(),
+                                        &mut cache,
+                                        protocol,
+                                        interface,
+                                        hc,
+                                    )?
+                                    .channels,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, RoutingSessionError>>()?;
+                        RoutingUnit::Mixer(parse_mixer(
+                            interface,
+                            bytes,
+                            &inputs,
+                            protocol,
+                            output.channels,
+                        )?)
+                    };
+                    Ok(unit)
+                })();
+                match unit {
+                    Ok(unit) => inventory
+                        .insert(unit)
+                        .map_err(RoutingSessionError::Invalid)?,
+                    Err(error) => diagnostics.push(RoutingDiagnostic {
+                        interface,
+                        entity_id: Some(bytes[3]),
+                        detail: error.to_string(),
+                    }),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = function {
+            diagnostics.push(RoutingDiagnostic {
+                interface,
+                entity_id: None,
+                detail: error.to_string(),
+            });
+        }
+    }
+    Ok((inventory, diagnostics))
+}
+
 /// Descriptor-only scope proof shared by no-wake discovery and explicit wake.
+#[cfg(test)]
 fn adc3_routing_scope(
     descriptors: &[&[u8]],
+) -> Result<
+    (
+        Vec<crate::descriptors::uac3::PowerDomain>,
+        std::collections::BTreeSet<u8>,
+    ),
+    RoutingSessionError,
+> {
+    adc3_routing_scope_for(descriptors, None)
+}
+
+fn adc3_routing_scope_for(
+    descriptors: &[&[u8]],
+    root: Option<u8>,
 ) -> Result<
     (
         Vec<crate::descriptors::uac3::PowerDomain>,
@@ -2102,7 +2429,7 @@ fn adc3_routing_scope(
     let mut affected = std::collections::BTreeSet::new();
     let mut pending: Vec<_> = nodes
         .values()
-        .filter(|b| matches!(b[2], 5 | 6))
+        .filter(|b| matches!(b[2], 5 | 6) && root.map_or(true, |id| b[3] == id))
         .map(|b| b[3])
         .collect();
     while let Some(id) = pending.pop() {
@@ -2223,6 +2550,9 @@ fn with_routing_power<T>(
     device: &UsbDevice,
     raw: &[u8],
     powered: bool,
+    deadline: Instant,
+    recovery: &Arc<Mutex<Option<Instant>>>,
+    keys: Option<&[ControlKey]>,
     operation: impl FnOnce() -> Result<T, RoutingSessionError>,
 ) -> Result<T, RoutingSessionError> {
     if !powered {
@@ -2230,15 +2560,48 @@ fn with_routing_power<T>(
     }
     let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(device.fd));
     let lease = &guard.0;
+    lease.set_routing_deadline(deadline);
     let result = (|| {
         let mut scopes = Vec::new();
         for (interface, (protocol, descriptors)) in
-            routing_interfaces(raw, &device.claimed_interfaces)?
+            routing_interfaces_unambiguous(raw, &device.claimed_interfaces)?
         {
             if protocol != 0x30 {
                 continue;
             }
-            let (domains, _) = adc3_routing_scope(&descriptors)?;
+            let roots: Vec<_> = descriptors
+                .iter()
+                .filter(|d| d.len() >= 4 && matches!(d[2], 5 | 6))
+                .map(|d| d[3])
+                .filter(|id| {
+                    keys.map_or(true, |keys| {
+                        keys.iter().any(|key| match key {
+                            ControlKey::Selector(entity)
+                            | ControlKey::Crosspoint { entity, .. } => {
+                                entity.interface == interface && entity.id == *id
+                            }
+                        })
+                    })
+                })
+                .collect();
+            let mut domains = Vec::new();
+            for root in roots {
+                match adc3_routing_scope_for(&descriptors, Some(root)) {
+                    Ok((found, _)) => {
+                        for domain in found {
+                            if !domains.iter().any(
+                                |existing: &crate::descriptors::uac3::PowerDomain| {
+                                    existing.id == domain.id
+                                },
+                            ) {
+                                domains.push(domain);
+                            }
+                        }
+                    }
+                    Err(error) if keys.is_some() => return Err(error),
+                    Err(_) => continue,
+                }
+            }
             if domains.is_empty() {
                 continue;
             }
@@ -2260,6 +2623,10 @@ fn with_routing_power<T>(
         }
         operation()
     })();
+    let recovery_deadline = *recovery
+        .lock()
+        .get_or_insert_with(|| Instant::now() + ROUTING_RECOVERY_BUDGET);
+    lease.set_routing_deadline(recovery_deadline);
     finish_routing_power(result, lease.restore_checked())
 }
 
@@ -2281,9 +2648,17 @@ fn finish_routing_power<T>(
 fn routing_clusters(
     device: &UsbDevice,
     raw: &[u8],
-) -> Result<BTreeMap<(u8, u16), RoutingCluster>, RoutingSessionError> {
-    let interfaces = routing_interfaces(raw, &device.claimed_interfaces)?;
-    let idle = IDLE_LOCK.lock();
+    deadline: Instant,
+    filter: Option<&[ControlKey]>,
+) -> Result<(BTreeMap<(u8, u16), RoutingCluster>, Vec<RoutingDiagnostic>), RoutingSessionError> {
+    let interfaces = routing_interfaces_unambiguous(raw, &device.claimed_interfaces)?;
+    let idle = IDLE_LOCK
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for idle owner".into(),
+            ))
+        })?;
     let idle = idle
         .as_ref()
         .filter(|i| i.device_fd == device.fd)
@@ -2291,76 +2666,110 @@ fn routing_clusters(
             RoutingSessionError::Session(Error::InvalidState("routing lost idle owner".into()))
         })?;
     let mut clusters = BTreeMap::new();
+    let mut diagnostics = Vec::new();
     for (interface, (protocol, descriptors)) in interfaces {
         if protocol != 0x30 {
             continue;
         }
-        let (domains, affected) = adc3_routing_scope(&descriptors)?;
-        // Prove D0 only for domains containing exposed units or their sources.
-        for id in domains.iter().map(|d| d.id) {
-            let mut state = [0xff];
-            let n = idle
-                .handle
-                .read_control(
-                    0xa1,
-                    1,
-                    0x0200,
-                    (u16::from(id) << 8) | u16::from(interface),
-                    &mut state,
-                    Duration::from_secs(1),
-                )
-                .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
-            if n != 1 || state[0] != 0 {
-                return Err(RoutingSessionError::UnsupportedTopology("ADC3 routing requires already-D0 entity domains; waking requires an owned power lease".into()));
-            }
-        }
-        for bytes in descriptors {
-            if bytes.len() < 4 || !affected.contains(&bytes[3]) {
+        let roots: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.len() >= 4 && matches!(d[2], 5 | 6))
+            .map(|d| d[3])
+            .collect();
+        for root in roots {
+            if filter.is_some_and(|keys| {
+                !keys.iter().any(|key| match key {
+                    ControlKey::Selector(entity) | ControlKey::Crosspoint { entity, .. } => {
+                        entity.interface == interface && entity.id == root
+                    }
+                })
+            }) {
                 continue;
             }
-            let id = match bytes.get(2) {
-                Some(2) => Some(
-                    crate::descriptors::uac3::parse_input_terminal(bytes)
-                        .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?
-                        .cluster_id,
-                ),
-                Some(5) => {
-                    let pins = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
-                        InvalidRoute::MalformedDescriptor,
-                    ))?);
-                    let pair =
-                        bytes
-                            .get(5 + pins..7 + pins)
-                            .ok_or(RoutingSessionError::Invalid(
-                                InvalidRoute::MalformedDescriptor,
-                            ))?;
-                    Some(u16::from_le_bytes([pair[0], pair[1]]))
-                }
-                _ => None,
-            };
-            if let Some(id) = id {
-                if let std::collections::btree_map::Entry::Vacant(e) =
-                    clusters.entry((interface, id))
-                {
-                    let cluster = query_routing_cluster(&idle.handle, interface, id)?;
-                    e.insert(cluster);
-                }
+            let result =
+                (|| -> Result<BTreeMap<(u8, u16), RoutingCluster>, RoutingSessionError> {
+                    let mut local = BTreeMap::new();
+                    let (domains, affected) = adc3_routing_scope_for(&descriptors, Some(root))?;
+                    // Prove D0 only for domains containing exposed units or their sources.
+                    for id in domains.iter().map(|d| d.id) {
+                        let mut state = [0xff];
+                        let n = idle
+                            .handle
+                            .read_control(
+                                0xa1,
+                                1,
+                                0x0200,
+                                (u16::from(id) << 8) | u16::from(interface),
+                                &mut state,
+                                remaining(deadline)?,
+                            )
+                            .map_err(|e| {
+                                RoutingSessionError::Session(Error::Control(e.to_string()))
+                            })?;
+                        if n != 1 || state[0] != 0 {
+                            return Err(RoutingSessionError::UnsupportedTopology("ADC3 routing requires already-D0 entity domains; waking requires an owned power lease".into()));
+                        }
+                    }
+                    for bytes in &descriptors {
+                        if bytes.len() < 4 || !affected.contains(&bytes[3]) {
+                            continue;
+                        }
+                        let id = match bytes.get(2) {
+                            Some(2) => Some(
+                                crate::descriptors::uac3::parse_input_terminal(bytes)
+                                    .map_err(|e| {
+                                        RoutingSessionError::UnsupportedTopology(e.to_string())
+                                    })?
+                                    .cluster_id,
+                            ),
+                            Some(5) => {
+                                let pins = usize::from(*bytes.get(4).ok_or(
+                                    RoutingSessionError::Invalid(InvalidRoute::MalformedDescriptor),
+                                )?);
+                                let pair = bytes.get(5 + pins..7 + pins).ok_or(
+                                    RoutingSessionError::Invalid(InvalidRoute::MalformedDescriptor),
+                                )?;
+                                Some(u16::from_le_bytes([pair[0], pair[1]]))
+                            }
+                            _ => None,
+                        };
+                        if let Some(id) = id {
+                            if let std::collections::btree_map::Entry::Vacant(e) =
+                                local.entry((interface, id))
+                            {
+                                let cluster =
+                                    query_routing_cluster(&idle.handle, interface, id, deadline)?;
+                                e.insert(cluster);
+                            }
+                        }
+                    }
+                    Ok(local)
+                })();
+            match result {
+                Ok(local) => clusters.extend(local),
+                Err(error) => diagnostics.push(RoutingDiagnostic {
+                    interface,
+                    entity_id: Some(root),
+                    detail: error.to_string(),
+                }),
             }
         }
     }
-    Ok(clusters)
+    Ok((clusters, diagnostics))
 }
 
 fn verify_descriptor_identity(
     snapshot: &RoutingSnapshot,
     device: &UsbDevice,
+    deadline: Instant,
 ) -> Result<(), RoutingSessionError> {
     if !Arc::ptr_eq(&snapshot.device._fd_owner, &device._fd_owner) {
         return Err(RoutingSessionError::Drift(
             "routing snapshot belongs to another attachment".into(),
         ));
     }
-    let (configuration, descriptors) = active_descriptors(device)?;
+    let (configuration, descriptors) = active_descriptors_until(device, Some(deadline))?;
+    remaining(deadline)?;
     if configuration != snapshot.configuration || descriptors != snapshot.descriptors {
         return Err(RoutingSessionError::Drift(
             "configuration or descriptors changed; rediscover routing".into(),
@@ -2368,21 +2777,167 @@ fn verify_descriptor_identity(
     }
     Ok(())
 }
+fn selector_dependencies(
+    snapshot: &RoutingSnapshot,
+    key: ControlKey,
+) -> Result<Vec<RouteChange>, RoutingSessionError> {
+    let entity = match key {
+        ControlKey::Selector(_) => return Ok(Vec::new()),
+        ControlKey::Crosspoint { entity, .. } => entity,
+    };
+    let interfaces =
+        routing_interfaces_unambiguous(&snapshot.descriptors, &snapshot.device.claimed_interfaces)?;
+    let (protocol, descriptors) = interfaces
+        .get(&entity.interface)
+        .ok_or_else(|| RoutingSessionError::Drift("routing function disappeared".into()))?;
+    let nodes: BTreeMap<_, _> = descriptors
+        .iter()
+        .filter(|d| d.len() >= 4 && d[2] != 1)
+        .map(|d| (d[3], *d))
+        .collect();
+    let mut pending = vec![entity.id];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut dependencies = Vec::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let bytes = nodes
+            .get(&id)
+            .ok_or_else(|| RoutingSessionError::Drift("routing source unavailable".into()))?;
+        let mixer = if *protocol == 0x30 { 5 } else { 4 };
+        let selector = if *protocol == 0x30 { 6 } else { 5 };
+        let feature = if *protocol == 0x30 { 7 } else { 6 };
+        if bytes[2] == selector {
+            let selector_key = ControlKey::Selector(routing::Entity {
+                interface: entity.interface,
+                id,
+            });
+            let expected = snapshot
+                .selectors
+                .iter()
+                .find(|v| v.key == selector_key)
+                .ok_or_else(|| {
+                    RoutingSessionError::Drift(format!("selector {id} is unavailable"))
+                })?;
+            dependencies.push(*expected);
+        }
+        if bytes[2] == selector || bytes[2] == mixer {
+            let count = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                InvalidRoute::MalformedDescriptor,
+            ))?);
+            pending.extend_from_slice(bytes.get(5..5 + count).ok_or(
+                RoutingSessionError::Invalid(InvalidRoute::MalformedDescriptor),
+            )?);
+        } else if bytes[2] == feature {
+            pending.push(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                InvalidRoute::MalformedDescriptor,
+            ))?);
+        }
+    }
+    dependencies.sort_by_key(|v| v.key);
+    Ok(dependencies)
+}
+
+fn cluster_dependencies(
+    snapshot: &RoutingSnapshot,
+    key: ControlKey,
+) -> Result<Vec<(u8, u16)>, RoutingSessionError> {
+    let entity = match key {
+        ControlKey::Selector(entity) | ControlKey::Crosspoint { entity, .. } => entity,
+    };
+    let interfaces =
+        routing_interfaces_unambiguous(&snapshot.descriptors, &snapshot.device.claimed_interfaces)?;
+    let Some((protocol, descriptors)) = interfaces.get(&entity.interface) else {
+        return Err(RoutingSessionError::Drift(
+            "routing function disappeared".into(),
+        ));
+    };
+    if *protocol != 0x30 {
+        return Ok(Vec::new());
+    }
+    let (_, affected) = adc3_routing_scope_for(descriptors, Some(entity.id))?;
+    let mut ids = Vec::new();
+    for bytes in descriptors
+        .iter()
+        .filter(|b| b.len() >= 4 && affected.contains(&b[3]))
+    {
+        let id = match bytes[2] {
+            2 => Some(
+                crate::descriptors::uac3::parse_input_terminal(bytes)
+                    .map_err(|e| RoutingSessionError::UnsupportedTopology(e.to_string()))?
+                    .cluster_id,
+            ),
+            5 => {
+                let count = usize::from(*bytes.get(4).ok_or(RoutingSessionError::Invalid(
+                    InvalidRoute::MalformedDescriptor,
+                ))?);
+                let pair = bytes
+                    .get(5 + count..7 + count)
+                    .ok_or(RoutingSessionError::Invalid(
+                        InvalidRoute::MalformedDescriptor,
+                    ))?;
+                Some(u16::from_le_bytes([pair[0], pair[1]]))
+            }
+            _ => None,
+        };
+        if let Some(id) = id {
+            ids.push((entity.interface, id));
+        }
+    }
+    Ok(ids)
+}
+
+// Compare the full captured HC content, not just the channel count used to
+// establish address offsets. Both edits and hand-back use this same proof.
+fn cluster_content_matches(
+    current: &BTreeMap<(u8, u16), RoutingCluster>,
+    saved: &BTreeMap<(u8, u16), RoutingCluster>,
+    dependencies: &[(u8, u16)],
+) -> bool {
+    dependencies
+        .iter()
+        .all(|id| current.contains_key(id) && current.get(id) == saved.get(id))
+}
+
 fn verify_snapshot(
     snapshot: &RoutingSnapshot,
     device: &UsbDevice,
+    deadline: Instant,
+    recovery: &Arc<Mutex<Option<Instant>>>,
+    keys: &[ControlKey],
 ) -> Result<(), RoutingSessionError> {
-    verify_descriptor_identity(snapshot, device)?;
-    if routing_clusters(device, &snapshot.descriptors)? != snapshot.hc_clusters {
-        return Err(RoutingSessionError::Drift(
-            "ADC3 HC Clusters changed; rediscover routing".into(),
-        ));
+    verify_descriptor_identity(snapshot, device, deadline)?;
+    let (clusters, failures) =
+        routing_clusters(device, &snapshot.descriptors, deadline, Some(keys))?;
+    for &key in keys {
+        let entity = match key {
+            ControlKey::Selector(e) | ControlKey::Crosspoint { entity: e, .. } => e,
+        };
+        if failures.iter().any(|failure| {
+            failure.interface == entity.interface
+                && failure.entity_id.map_or(true, |id| id == entity.id)
+        }) || !cluster_content_matches(
+            &clusters,
+            &snapshot.hc_clusters,
+            &cluster_dependencies(snapshot, key)?,
+        ) {
+            return Err(RoutingSessionError::Drift(
+                "ADC3 HC Clusters changed or unavailable for this control".into(),
+            ));
+        }
     }
     let mut io = UsbRoutingIo {
+        deadline,
+        recovery: recovery.clone(),
         device,
         descriptors: &snapshot.descriptors,
     };
-    verify_values(&snapshot.inventory, &mut io, &snapshot.selectors)
+    for &key in keys {
+        let expected = selector_dependencies(snapshot, key)?;
+        verify_values(&snapshot.inventory, &mut io, &expected)?;
+    }
+    Ok(())
 }
 
 fn verify_values<I: RoutingIo<Error = String>>(
@@ -2411,42 +2966,78 @@ pub(crate) fn discover() -> Result<RoutingSnapshot, RoutingSessionError> {
     discover_with_power(false)
 }
 pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, RoutingSessionError> {
-    let _gate = USB_SESSION_GATE.lock();
-    let _controls = HARDWARE_VOLUME_MUTEX.lock();
-    let device = idle_device()?;
-    let (configuration, descriptors) = active_descriptors(&device)?;
-    with_routing_power(&device, &descriptors, powered, || {
-        let hc_clusters = routing_clusters(&device, &descriptors)?;
-        let inventory =
-            inventory_with_clusters(&descriptors, &device.claimed_interfaces, &hc_clusters)?;
-        let mut selectors = Vec::new();
-        let mut io = UsbRoutingIo {
-            device: &device,
-            descriptors: &descriptors,
-        };
-        for unit in inventory.units() {
-            if let RoutingUnit::Selector(selector) = unit {
-                if selector.access() != Access::Absent {
-                    let key = ControlKey::Selector(selector.entity());
-                    let value = inventory
-                        .control(key)
-                        .map_err(RoutingSessionError::Invalid)?
-                        .read_current(&mut io)
-                        .map_err(RoutingSessionError::Control)?;
-                    selectors.push(RouteChange { key, value });
+    let deadline = Instant::now() + ROUTING_OPERATION_BUDGET;
+    let recovery = Arc::new(Mutex::new(None));
+    let _gate = USB_SESSION_GATE
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for session gate".into(),
+            ))
+        })?;
+    let _controls = HARDWARE_VOLUME_MUTEX
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for control gate".into(),
+            ))
+        })?;
+    let device = idle_device_until(Some(deadline))?;
+    let (configuration, descriptors) = active_descriptors_until(&device, Some(deadline))?;
+    with_routing_power(
+        &device,
+        &descriptors,
+        powered,
+        deadline,
+        &recovery,
+        None,
+        || {
+            let (_, mut diagnostics) =
+                routing_interfaces_with_diagnostics(&descriptors, &device.claimed_interfaces)?;
+            let (hc_clusters, cluster_diagnostics) =
+                routing_clusters(&device, &descriptors, deadline, None)?;
+            diagnostics.extend(cluster_diagnostics);
+            let (inventory, inventory_diagnostics) =
+                inventory_partial(&descriptors, &device.claimed_interfaces, &hc_clusters)?;
+            diagnostics.extend(inventory_diagnostics);
+            let mut selectors = Vec::new();
+            let mut io = UsbRoutingIo {
+                deadline,
+                recovery: recovery.clone(),
+                device: &device,
+                descriptors: &descriptors,
+            };
+            for unit in inventory.units() {
+                if let RoutingUnit::Selector(selector) = unit {
+                    if selector.access() != Access::Absent {
+                        let key = ControlKey::Selector(selector.entity());
+                        match inventory
+                            .control(key)
+                            .map_err(RoutingSessionError::Invalid)?
+                            .read_current(&mut io)
+                        {
+                            Ok(value) => selectors.push(RouteChange { key, value }),
+                            Err(error) => diagnostics.push(RoutingDiagnostic {
+                                interface: selector.entity().interface,
+                                entity_id: Some(selector.entity().id),
+                                detail: format!("selector CUR unavailable: {error:?}"),
+                            }),
+                        }
+                    }
                 }
             }
-        }
-        Ok(RoutingSnapshot {
-            device: device.clone(),
-            configuration,
-            descriptors: descriptors.clone(),
-            inventory,
-            selectors,
-            hc_clusters,
-            hand_back_report: context::current().routing_report.clone(),
-        })
-    })
+            Ok(RoutingSnapshot {
+                device: device.clone(),
+                configuration,
+                descriptors: descriptors.clone(),
+                inventory,
+                selectors,
+                hc_clusters,
+                diagnostics,
+                hand_back_report: context::current().routing_report.clone(),
+            })
+        },
+    )
 }
 
 pub(crate) fn read(
@@ -2460,22 +3051,46 @@ pub(crate) fn read_with_power(
     key: ControlKey,
     powered: bool,
 ) -> Result<RouteValue, RoutingSessionError> {
-    let _gate = USB_SESSION_GATE.lock();
-    let _controls = HARDWARE_VOLUME_MUTEX.lock();
-    let device = idle_device()?;
-    verify_descriptor_identity(snapshot, &device)?;
-    with_routing_power(&device, &snapshot.descriptors, powered, || {
-        verify_snapshot(snapshot, &device)?;
-        snapshot
-            .inventory
-            .control(key)
-            .map_err(RoutingSessionError::Invalid)?
-            .read_current(&mut UsbRoutingIo {
-                device: &device,
-                descriptors: &snapshot.descriptors,
-            })
-            .map_err(RoutingSessionError::Control)
-    })
+    let deadline = Instant::now() + ROUTING_OPERATION_BUDGET;
+    let recovery = Arc::new(Mutex::new(None));
+    let _gate = USB_SESSION_GATE
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for session gate".into(),
+            ))
+        })?;
+    let _controls = HARDWARE_VOLUME_MUTEX
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for control gate".into(),
+            ))
+        })?;
+    let device = idle_device_until(Some(deadline))?;
+    verify_descriptor_identity(snapshot, &device, deadline)?;
+    with_routing_power(
+        &device,
+        &snapshot.descriptors,
+        powered,
+        deadline,
+        &recovery,
+        Some(&[key]),
+        || {
+            verify_snapshot(snapshot, &device, deadline, &recovery, &[key])?;
+            snapshot
+                .inventory
+                .control(key)
+                .map_err(RoutingSessionError::Invalid)?
+                .read_current(&mut UsbRoutingIo {
+                    deadline,
+                    recovery: recovery.clone(),
+                    device: &device,
+                    descriptors: &snapshot.descriptors,
+                })
+                .map_err(RoutingSessionError::Control)
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -2552,140 +3167,174 @@ pub(crate) fn apply_with_power(
     edits: &[RouteEdit],
     powered: bool,
 ) -> Result<RouteReport, RoutingSessionError> {
-    let _gate = USB_SESSION_GATE.lock();
-    let _controls = HARDWARE_VOLUME_MUTEX.lock();
-    let device = idle_device()?;
-    verify_descriptor_identity(snapshot, &device)?;
-    with_routing_power(&device, &snapshot.descriptors, powered, || {
-        verify_snapshot(snapshot, &device)?;
-        if edits.len() > MAX_ROUTE_CHANGES {
-            return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
-        }
-        let mut originals = ORIGINAL_ROUTING.lock();
-        if originals.as_ref().is_some_and(|prior| {
-            prior.snapshot.configuration != snapshot.configuration
-                || prior.snapshot.descriptors != snapshot.descriptors
-        }) {
-            return Err(RoutingSessionError::Drift(
-                "configuration changed since the first routing edit".into(),
-            ));
-        }
-        if originals
-            .as_ref()
-            .is_some_and(|prior| !Arc::ptr_eq(&prior.snapshot.device._fd_owner, &device._fd_owner))
-        {
-            return Err(RoutingSessionError::Drift(
-                "routing restoration record belongs to another attachment".into(),
-            ));
-        }
-        let old_count = originals.as_ref().map_or(0, |prior| prior.values.len());
-        let new_count = edits
-            .iter()
-            .map(|edit| edit.key)
-            .collect::<std::collections::BTreeSet<_>>()
-            .iter()
-            .filter(|key| {
-                !originals
-                    .as_ref()
-                    .is_some_and(|r| r.values.contains_key(*key))
-            })
-            .count();
-        if old_count + new_count > MAX_RECORDED_ROUTES {
-            return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
-        }
-        if let Some(prior) = originals.as_ref() {
-            for edit in edits {
-                if matches!(edit.key, ControlKey::Crosspoint { .. })
-                    && prior
-                        .values
-                        .get(&edit.key)
-                        .is_some_and(|entry| entry.selectors != snapshot.selectors)
-                {
-                    return Err(RoutingSessionError::Drift(
-                        "mixer mapping changed since its first edit".into(),
-                    ));
-                }
+    let deadline = Instant::now() + ROUTING_OPERATION_BUDGET;
+    let recovery = Arc::new(Mutex::new(None));
+    let _gate = USB_SESSION_GATE
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for session gate".into(),
+            ))
+        })?;
+    let _controls = HARDWARE_VOLUME_MUTEX
+        .try_lock_for(remaining(deadline)?)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::Control(
+                "routing deadline waiting for control gate".into(),
+            ))
+        })?;
+    let device = idle_device_until(Some(deadline))?;
+    verify_descriptor_identity(snapshot, &device, deadline)?;
+    with_routing_power(
+        &device,
+        &snapshot.descriptors,
+        powered,
+        deadline,
+        &recovery,
+        Some(&edits.iter().map(|edit| edit.key).collect::<Vec<_>>()),
+        || {
+            verify_snapshot(
+                snapshot,
+                &device,
+                deadline,
+                &recovery,
+                &edits.iter().map(|edit| edit.key).collect::<Vec<_>>(),
+            )?;
+            if edits.len() > MAX_ROUTE_CHANGES {
+                return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
             }
-        }
-        let expected = edits
-            .iter()
-            .map(|e| RouteChange {
-                key: e.key,
-                value: e.expected,
-            })
-            .collect::<Vec<_>>();
-        let changes = edits
-            .iter()
-            .map(|e| RouteChange {
-                key: e.key,
-                value: e.value,
-            })
-            .collect::<Vec<_>>();
-        let mut io = UsbRoutingIo {
-            device: &device,
-            descriptors: &snapshot.descriptors,
-        };
-        verify_values(&snapshot.inventory, &mut io, &expected)?;
-        if let Some(recorded) = originals.as_mut() {
-            for edit in edits {
-                if let Some(entry) = recorded.values.get_mut(&edit.key) {
-                    if edit.expected != entry.original && !entry.ownership.owns(edit.expected) {
-                        entry.forfeited = true;
-                        entry.ownership = Ownership::None;
+            let mut originals = ORIGINAL_ROUTING.lock();
+            if originals.as_ref().is_some_and(|prior| {
+                prior.snapshot.configuration != snapshot.configuration
+                    || prior.snapshot.descriptors != snapshot.descriptors
+            }) {
+                return Err(RoutingSessionError::Drift(
+                    "configuration changed since the first routing edit".into(),
+                ));
+            }
+            if originals.as_ref().is_some_and(|prior| {
+                !Arc::ptr_eq(&prior.snapshot.device._fd_owner, &device._fd_owner)
+            }) {
+                return Err(RoutingSessionError::Drift(
+                    "routing restoration record belongs to another attachment".into(),
+                ));
+            }
+            let old_count = originals.as_ref().map_or(0, |prior| prior.values.len());
+            let new_count = edits
+                .iter()
+                .map(|edit| edit.key)
+                .collect::<std::collections::BTreeSet<_>>()
+                .iter()
+                .filter(|key| {
+                    !originals
+                        .as_ref()
+                        .is_some_and(|r| r.values.contains_key(*key))
+                })
+                .count();
+            if old_count + new_count > MAX_RECORDED_ROUTES {
+                return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
+            }
+            if let Some(prior) = originals.as_ref() {
+                for edit in edits {
+                    if matches!(edit.key, ControlKey::Crosspoint { .. })
+                        && prior.values.get(&edit.key).is_some_and(|entry| {
+                            entry.selectors
+                                != selector_dependencies(snapshot, edit.key).unwrap_or_default()
+                        })
+                    {
+                        return Err(RoutingSessionError::Drift(
+                            "mixer mapping changed since its first edit".into(),
+                        ));
                     }
                 }
             }
-        }
-        let mut attempted = Vec::new();
-        let result =
-            routing::apply_routes_traced(&snapshot.inventory, &mut io, &changes, &mut attempted);
-        for (key, before, target) in attempted {
-            let rollback_failed = match &result {
-                Ok(_) => false,
-                Err(failure) => failure
-                    .rollback_failures
-                    .iter()
-                    .any(|(failed, _)| *failed == key),
+            let expected = edits
+                .iter()
+                .map(|e| RouteChange {
+                    key: e.key,
+                    value: e.expected,
+                })
+                .collect::<Vec<_>>();
+            let changes = edits
+                .iter()
+                .map(|e| RouteChange {
+                    key: e.key,
+                    value: e.value,
+                })
+                .collect::<Vec<_>>();
+            let mut io = UsbRoutingIo {
+                deadline,
+                recovery: recovery.clone(),
+                device: &device,
+                descriptors: &snapshot.descriptors,
             };
-            let success = result.is_ok();
-            // A new, fully rolled-back edit creates no outstanding ownership.
-            if !success
-                && !rollback_failed
-                && !originals
-                    .as_ref()
-                    .is_some_and(|r| r.values.contains_key(&key))
-            {
-                continue;
-            }
-            let recorded = originals.get_or_insert_with(|| RecordedRouting {
-                snapshot: snapshot.clone(),
-                values: BTreeMap::new(),
-                powered,
-            });
-            recorded.powered |= powered;
-            let entry = recorded.values.entry(key).or_insert_with(|| RecordedRoute {
-                original: before,
-                ownership: Ownership::None,
-                selectors: snapshot.selectors.clone(),
-                forfeited: false,
-            });
-            entry.record_attempt(before, target, success, rollback_failed);
-        }
-        match result {
-            Ok(report) => {
-                if !report.changed.is_empty() {
-                    invalidate_route_caches();
+            verify_values(&snapshot.inventory, &mut io, &expected)?;
+            if let Some(recorded) = originals.as_mut() {
+                for edit in edits {
+                    if let Some(entry) = recorded.values.get_mut(&edit.key) {
+                        if edit.expected != entry.original && !entry.ownership.owns(edit.expected) {
+                            entry.forfeited = true;
+                            entry.ownership = Ownership::None;
+                        }
+                    }
                 }
-                Ok(report)
             }
-            Err(failure) => {
-                if !failure.rollback_failures.is_empty() {
-                    invalidate_route_caches();
+            let mut attempted = Vec::new();
+            let result = routing::apply_routes_traced(
+                &snapshot.inventory,
+                &mut io,
+                &changes,
+                &mut attempted,
+            );
+            for (key, before, target) in attempted {
+                let rollback_failed = match &result {
+                    Ok(_) => false,
+                    Err(failure) => failure
+                        .rollback_failures
+                        .iter()
+                        .any(|(failed, _)| *failed == key),
+                };
+                let success = result.is_ok();
+                // A new, fully rolled-back edit creates no outstanding ownership.
+                if !success
+                    && !rollback_failed
+                    && !originals
+                        .as_ref()
+                        .is_some_and(|r| r.values.contains_key(&key))
+                {
+                    continue;
                 }
-                Err(RoutingSessionError::Transaction(failure))
+                let recorded = originals.get_or_insert_with(|| RecordedRouting {
+                    snapshot: snapshot.clone(),
+                    values: BTreeMap::new(),
+                    powered,
+                });
+                recorded.powered |= powered;
+                let dependencies = selector_dependencies(snapshot, key)?;
+                let entry = recorded.values.entry(key).or_insert_with(|| RecordedRoute {
+                    original: before,
+                    ownership: Ownership::None,
+                    selectors: dependencies,
+                    forfeited: false,
+                });
+                entry.record_attempt(before, target, success, rollback_failed);
             }
-        }
-    })
+            match result {
+                Ok(report) => {
+                    if !report.changed.is_empty() {
+                        invalidate_route_caches();
+                    }
+                    Ok(report)
+                }
+                Err(failure) => {
+                    if !failure.rollback_failures.is_empty() {
+                        invalidate_route_caches();
+                    }
+                    Err(RoutingSessionError::Transaction(failure))
+                }
+            }
+        },
+    )
 }
 
 fn invalidate_route_caches() {
@@ -2742,49 +3391,123 @@ pub(super) fn finish_routing_hand_back() {
         *sink.lock() = Some(report);
         return;
     };
+    let deadline = Instant::now() + ROUTING_RECOVERY_BUDGET;
+    let recovery = Arc::new(Mutex::new(Some(deadline)));
     let mut restore = || -> Result<RoutingHandBackReport, RoutingSessionError> {
         if !Arc::ptr_eq(&record.snapshot.device._fd_owner, &device._fd_owner) {
             return Err(RoutingSessionError::Drift(
                 "attachment changed before routing hand-back".into(),
             ));
         }
-        let (number, raw) = active_descriptors(&device)?;
+        let (number, raw) = active_descriptors_until(&device, Some(deadline))?;
         if number != record.snapshot.configuration || raw != record.snapshot.descriptors {
             return Err(RoutingSessionError::Drift(
                 "configuration changed before routing hand-back".into(),
             ));
         }
-        with_routing_power(&device, &raw, record.powered, || {
-            let clusters_ok = routing_clusters(&device, &raw)
-                .is_ok_and(|clusters| clusters == record.snapshot.hc_clusters);
-            let mut io = UsbRoutingIo {
-                device: &device,
-                descriptors: &record.snapshot.descriptors,
-            };
-            let mut entries: Vec<_> = record.values.iter().collect();
-            // Selectors are independent addressable controls; mixer mappings must
-            // be checked against the selector state at their own first edit.
-            entries.sort_by_key(|(key, _)| matches!(key, ControlKey::Selector(_)));
-            let mut controls = Vec::with_capacity(entries.len());
-            for (&key, saved) in entries {
-                let outcome = if matches!(key, ControlKey::Crosspoint { .. })
-                    && (!clusters_ok
-                        || verify_values(&record.snapshot.inventory, &mut io, &saved.selectors)
-                            .is_err())
-                {
-                    RoutingHandBackOutcome::IdentityOrTopologyChanged(
-                        "selector or cluster mapping changed or unreadable".into(),
-                    )
-                } else {
-                    restore_recorded_control(&record.snapshot.inventory, &mut io, key, saved)
+        with_routing_power(
+            &device,
+            &raw,
+            record.powered,
+            deadline,
+            &recovery,
+            Some(&record.values.keys().copied().collect::<Vec<_>>()),
+            || {
+                let cluster_result = routing_clusters(
+                    &device,
+                    &raw,
+                    deadline,
+                    Some(&record.values.keys().copied().collect::<Vec<_>>()),
+                );
+                let mut io = UsbRoutingIo {
+                    deadline,
+                    recovery: recovery.clone(),
+                    device: &device,
+                    descriptors: &record.snapshot.descriptors,
                 };
-                controls.push((key, outcome));
-            }
-            report = RoutingHandBackReport {
-                controls: controls.clone(),
-            };
-            Ok(RoutingHandBackReport { controls })
-        })
+                let mut entries: Vec<_> = record.values.iter().collect();
+                // Selectors are independent addressable controls; mixer mappings must
+                // be checked against the selector state at their own first edit.
+                entries.sort_by_key(|(key, _)| matches!(key, ControlKey::Selector(_)));
+                let mut controls = Vec::with_capacity(entries.len());
+                let mut restored_selectors = std::collections::BTreeSet::new();
+                let mut deferred = Vec::new();
+                for (&key, saved) in entries {
+                    let entity = match key {
+                        ControlKey::Selector(e) | ControlKey::Crosspoint { entity: e, .. } => e,
+                    };
+                    let clusters_ok = cluster_result.as_ref().is_ok_and(|(clusters, failures)| {
+                        !failures.iter().any(|failure| {
+                            failure.interface == entity.interface
+                                && failure.entity_id.map_or(true, |id| id == entity.id)
+                        }) && cluster_dependencies(&record.snapshot, key).is_ok_and(|ids| {
+                            cluster_content_matches(clusters, &record.snapshot.hc_clusters, &ids)
+                        })
+                    });
+                    let mut outcome = if remaining(deadline).is_err() {
+                        RoutingHandBackOutcome::DeadlineExpired
+                    } else if matches!(key, ControlKey::Crosspoint { .. })
+                        && (!clusters_ok
+                            || verify_values(&record.snapshot.inventory, &mut io, &saved.selectors)
+                                .is_err())
+                    {
+                        RoutingHandBackOutcome::IdentityOrTopologyChanged(
+                            "selector or cluster mapping changed or unreadable".into(),
+                        )
+                    } else {
+                        restore_recorded_control(&record.snapshot.inventory, &mut io, key, saved)
+                    };
+                    if remaining(deadline).is_err()
+                        && matches!(
+                            outcome,
+                            RoutingHandBackOutcome::Unreadable(_)
+                                | RoutingHandBackOutcome::RestoreUncertain(_)
+                        )
+                    {
+                        outcome = RoutingHandBackOutcome::DeadlineExpired;
+                    }
+                    if matches!(key, ControlKey::Crosspoint { .. })
+                        && matches!(
+                            outcome,
+                            RoutingHandBackOutcome::IdentityOrTopologyChanged(_)
+                        )
+                        && clusters_ok
+                    {
+                        deferred.push((controls.len(), key, saved));
+                    }
+                    if matches!(key, ControlKey::Selector(_))
+                        && outcome == RoutingHandBackOutcome::Restored
+                    {
+                        restored_selectors.insert(key);
+                    }
+                    controls.push((key, outcome));
+                }
+                for (index, key, saved) in deferred {
+                    if remaining(deadline).is_err() {
+                        controls[index].1 = RoutingHandBackOutcome::DeadlineExpired;
+                        continue;
+                    }
+                    if saved
+                        .selectors
+                        .iter()
+                        .any(|dependency| restored_selectors.contains(&dependency.key))
+                        && verify_values(&record.snapshot.inventory, &mut io, &saved.selectors)
+                            .is_ok()
+                    {
+                        controls[index].1 = restore_recorded_control(
+                            &record.snapshot.inventory,
+                            &mut io,
+                            key,
+                            saved,
+                        );
+                    }
+                }
+                report = RoutingHandBackReport {
+                    controls: controls.clone(),
+                };
+                Ok(RoutingHandBackReport { controls })
+            },
+        )
     };
     match restore() {
         Ok(result) => report = result,
@@ -3014,6 +3737,67 @@ mod tests {
     }
 
     #[test]
+    fn partial_inventory_keeps_independent_selector_when_mixer_width_is_unknown() {
+        let mixer = vec![16, 0x24, 4, 9, 2, 99, 7, 2, 0, 0, 0, 0, 0, 0xff, 0, 0];
+        let raw = configuration(
+            &[terminal(1, 2, 3), terminal(2, 2, 3), selector(), mixer],
+            0x20,
+        );
+        let (inventory, diagnostics) = inventory_partial(&raw, &[3], &BTreeMap::new()).unwrap();
+        assert!(inventory
+            .control(ControlKey::Selector(Entity {
+                interface: 3,
+                id: 7
+            }))
+            .is_ok());
+        assert!(inventory
+            .control(ControlKey::Crosspoint {
+                entity: Entity {
+                    interface: 3,
+                    id: 9
+                },
+                input_pin: 2,
+                input_channel: 1,
+                output_channel: 1
+            })
+            .is_err());
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.interface == 3 && d.entity_id == Some(9)));
+    }
+
+    #[test]
+    fn equal_width_selector_with_distinct_spatial_labels_keeps_mixer_indices() {
+        let mixer = vec![16, 0x24, 4, 9, 2, 1, 7, 2, 0, 0, 0, 0, 0, 0xff, 0, 0];
+        let raw = configuration(
+            &[terminal(1, 2, 3), terminal(2, 2, 12), selector(), mixer],
+            0x20,
+        );
+        let (inventory, diagnostics) = inventory_partial(&raw, &[3], &BTreeMap::new()).unwrap();
+        assert!(diagnostics.is_empty());
+        let point = inventory
+            .control(ControlKey::Crosspoint {
+                entity: Entity {
+                    interface: 3,
+                    id: 9,
+                },
+                input_pin: 2,
+                input_channel: 1,
+                output_channel: 1,
+            })
+            .unwrap();
+        assert_eq!(point.current_request().unwrap().value, 0x0104);
+    }
+
+    #[test]
+    fn deadline_never_returns_a_timeout_after_expiry() {
+        assert!(remaining(Instant::now() - Duration::from_millis(1)).is_err());
+        assert!(
+            remaining(Instant::now() + Duration::from_secs(10)).unwrap() <= Duration::from_secs(1)
+        );
+    }
+
+    #[test]
     fn unclaimed_unknown_and_mismatched_protocols_never_expose_controls() {
         let entities = [terminal(1, 2, 3), terminal(2, 2, 3), selector()];
         assert_eq!(
@@ -3063,17 +3847,20 @@ mod tests {
     }
 
     #[test]
-    fn selector_cluster_identity_requires_count_positions_and_names() {
-        for other in [terminal(2, 1, 1), terminal(2, 2, 12), {
+    fn selector_cluster_retains_width_without_claiming_spatial_identity() {
+        let different_width =
+            configuration(&[terminal(1, 2, 3), terminal(2, 1, 1), selector()], 0x20);
+        assert!(matches!(
+            inventory_from_config(&different_width, &[3]),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
+        for other in [terminal(2, 2, 12), {
             let mut terminal = terminal(2, 2, 3);
             terminal[13] = 5;
             terminal
         }] {
             let raw = configuration(&[terminal(1, 2, 3), other, selector()], 0x20);
-            assert!(matches!(
-                inventory_from_config(&raw, &[3]),
-                Err(RoutingSessionError::UnsupportedTopology(_))
-            ));
+            assert!(inventory_from_config(&raw, &[3]).is_ok());
         }
     }
 
@@ -3187,9 +3974,19 @@ mod tests {
         }
         let inventory = inventory_with_clusters(&raw, &[3], &hc).unwrap();
         assert_eq!(inventory.units().count(), 2);
-        // Equal content with distinct IDs is legal; same count but changed content is not.
+        // Equal widths preserve addressing despite distinct spatial labels.
+        // A prior snapshot must still reject the changed HC content for both
+        // apply and hand-back, which share cluster_content_matches.
+        let saved = hc.clone();
+        let dependencies = [(3, 1), (3, 2), (3, 3)];
+        assert!(cluster_content_matches(&hc, &saved, &dependencies));
         hc.get_mut(&(3, 2)).unwrap().content[7] = 1;
-        assert!(inventory_with_clusters(&raw, &[3], &hc).is_err());
+        let changed = inventory_with_clusters(&raw, &[3], &hc).unwrap();
+        assert_eq!(changed, inventory);
+        assert!(!cluster_content_matches(&hc, &saved, &dependencies));
+        assert!(cluster_content_matches(&hc, &saved, &[(3, 1), (3, 3)]));
+        hc.remove(&(3, 2));
+        assert!(!cluster_content_matches(&hc, &saved, &dependencies));
         hc.clear();
         assert_eq!(
             inventory_with_clusters(&raw, &[4], &hc)
