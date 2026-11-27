@@ -140,7 +140,9 @@ pub fn next_step(error: &Error) -> Next {
         Error::Claim(_) => Next::AskListener(
             "the system keeps the DAC: replug it and check that nothing else holds it",
         ),
-        Error::Busy => Next::FixTheHost("another Dac is open in this process: close it first"),
+        Error::Busy => Next::FixTheHost(
+            "this DAC already has an owner, or a reconfigure is running: close it or retry",
+        ),
         Error::Unsupported { .. } => {
             Next::OtherOutput("the DAC has no alternate setting for this format")
         }
