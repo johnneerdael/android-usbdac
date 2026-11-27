@@ -149,6 +149,7 @@ mod audio_status;
 mod clock;
 mod encode;
 mod endpoint_geometry;
+mod endpoint_lock;
 mod iso;
 mod negotiate;
 mod native_dsd;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::OrControl;
 
 /// Keep alternate ownership with the handle, including spawn failure and
 /// unwinding. Declared before the transfer pools so their Drops retire USB
@@ -1296,6 +1297,22 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         }
     };
 
+    // Resolve only the selected standard endpoint after its exact alternate
+    // has been established. Vendor routes and asynchronous pacing keep their
+    // separate bootstrap/feedback contracts.
+    let lock_delay = if vendor_profile.is_none()
+        && matches!(candidate.sync_type, SyncType::Synchronous | SyncType::Adaptive) {
+        match endpoint_lock::selected_delay(&claimed_handle, candidate.interface_number,
+            candidate.alt_setting, candidate.endpoint_address,
+            playback_format.dsd_transport != DsdTransportMode::Native).or_control() {
+            Ok(delay) => delay,
+            Err(error) => {
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                return Err(error);
+            }
+        }
+    } else { None };
+
     set_last_error(None);
     set_direct_mode_refusal_reason(None);
     let unsynchronized_async =
@@ -1360,7 +1377,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz, status_targets);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz, status_targets, lock_delay);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);

@@ -2,6 +2,7 @@
 //! this pool rather than opening a second owner of the same endpoint.
 use super::*;
 use crate::capture::{CaptureBuffer, CaptureFormat, CapturePacket, CaptureRequest, ChannelMap};
+use crate::error::OrControl;
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1263,6 +1264,38 @@ pub(super) fn discard_unprimed_capture(slot: &IsoTransferSlot, status: i32,
         .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")))
 }
 
+/// Consume a complete startup URB without publishing its payload, including
+/// the URB that satisfies the endpoint's declared lock promise. A failed or
+/// malformed service interval breaks the contiguous proof without changing
+/// capture's existing packet classification or typed detach behavior.
+pub(super) fn discard_lock_delay_capture(slot: &IsoTransferSlot, status: i32,
+    scratch: &mut [CapturePacket], frame_bytes: usize, service_us: u32,
+    timing_allowed: bool, gate: &mut endpoint_lock::LockDelayGate,
+) -> (crate::capture::CaptureStats, Result<(), Error>) {
+    let mut stats = crate::capture::CaptureStats::default();
+    let result = match inspect_slot(slot, status, scratch) {
+        Ok((data, detached)) => {
+            let result = stats.record_completion(data.len(), &slot.packet_sizes, scratch,
+                true, 0, frame_bytes)
+                .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")));
+            if detached { Err(Error::DeviceLost) } else { result }
+        }
+        Err(error) => {
+            if status == LIBUSB_TRANSFER_COMPLETED { stats.malformed_completions = 1; }
+            else { stats.failed_transfers = 1; }
+            Err(error)
+        }
+    };
+    let accepted = timing_allowed && result.is_ok() && stats.failed_packets == 0
+        && stats.malformed_packets == 0 && stats.malformed_completions == 0;
+    gate.observe(accepted, u64::from(service_us).saturating_mul(scratch.len() as u64),
+        stats.captured_frames);
+    // Pre-lock payload never entered the capture queue. Retain packet/error
+    // telemetry without presenting it as captured or reader-contention audio.
+    stats.captured_frames = 0;
+    (stats, result)
+}
+
 fn oldest_ready_capture(order: &VecDeque<usize>, slots: &[IsoTransferSlot]) -> Option<usize> {
     order
         .front()
@@ -1567,6 +1600,11 @@ fn run_capture(
     stop: &AtomicBool,
     ready: &std::sync::mpsc::SyncSender<Result<(), Error>>,
 ) -> Result<(), Error> {
+    let delay = if endpoint.vendor_pcm.is_some() { None } else {
+        endpoint_lock::selected_delay(owner.claimed(), endpoint.interface,
+            endpoint.alternate, endpoint.address, true).or_control()?
+    };
+    let mut lock_delay = endpoint_lock::LockDelayGate::new(delay);
     let targets: Vec<_> = status_target(owner.claimed(), endpoint)?.into_iter().collect();
     // Declared after the owner and before data transfers: all failure/unwind
     // paths retire the status request before resetting an alternate or handle.
@@ -1686,12 +1724,21 @@ fn run_capture(
             let capture_allowed = vendor_allowed && feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
                 && companion.as_ref().map_or(true, |pool| pool.accepts_capture(completed));
             let captured_before = companion.as_ref().map(|_| queue.stats().captured_frames);
-            let result = if capture_allowed {
+            let lock_pending = lock_delay.pending();
+            let result = if lock_pending {
+                let timing_allowed = capture_allowed && slots[index].submitted_at.is_some_and(|submitted|
+                    feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(submitted))
+                    && companion.as_ref().map_or(true, |pool| pool.accepts_capture(submitted)));
+                let (stats, result) = discard_lock_delay_capture(&slots[index], status, &mut scratch,
+                    endpoint.format.bytes_per_frame(), endpoint.service_us, timing_allowed, &mut lock_delay);
+                queue.merge_stats(stats);
+                result
+            } else if capture_allowed {
                 ingest_slot(&slots[index], status, &mut queue, &mut scratch)
             } else {
                 discard_unprimed_capture(&slots[index], status, &mut scratch, endpoint.format.bytes_per_frame())
             };
-            let captured_input = capture_allowed && captured_before
+            let captured_input = capture_allowed && !lock_pending && captured_before
                 .is_some_and(|before| queue.stats().captured_frames > before);
             drop(queue);
             slots[index].mark_completed();
@@ -2149,6 +2196,57 @@ mod tests {
             descriptor.status = LIBUSB_TRANSFER_COMPLETED;
         }
         slot
+    }
+
+    #[test]
+    fn capture_lock_delay_counts_short_whole_frames_and_resets_on_malformed_packets() {
+        let mut slot = completed_slot(0, &[0; 8]);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut gate = endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::PcmSampleFrames(3)));
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 4; }
+        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate);
+        result.unwrap();
+        assert_eq!(stats.short_packets, 1);
+        assert_eq!(stats.captured_frames, 0);
+        assert!(gate.pending());
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
+        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate);
+        result.unwrap();
+        assert_eq!(stats.malformed_packets, 1);
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 8; }
+        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        assert!(gate.pending()); // Two frames after the malformed interval.
+        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate);
+        result.unwrap();
+        assert!(!gate.pending());
+        assert_eq!(stats.captured_frames, 0); // Satisfying URB is discarded too.
+    }
+
+    #[test]
+    fn capture_lock_delay_requires_timing_and_preserves_packet_detach() {
+        let mut slot = completed_slot(0, &[0; 8]);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut gate = endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::Milliseconds(2)));
+        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, false, &mut gate).1.unwrap();
+        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        assert!(gate.pending());
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
+        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate);
+        assert!(matches!(result, Err(Error::DeviceLost)));
+        assert_eq!(stats.failed_packets, 1);
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_COMPLETED; }
+        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        assert!(gate.pending());
     }
 
     fn publish(slot: &IsoTransferSlot) {

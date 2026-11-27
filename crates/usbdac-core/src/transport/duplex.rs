@@ -1,6 +1,7 @@
 //! A capture attachment to the playback worker, never a second USB event owner.
 use super::*;
 use crate::capture::{CaptureBuffer, CapturePacket, CaptureRequest};
+use crate::error::OrControl;
 use super::capture_stream::{CaptureEndpoint, CaptureHandle};
 use std::collections::VecDeque;
 
@@ -12,6 +13,7 @@ pub(super) struct Attachment {
     retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
+    lock_delay: Option<endpoint_lock::LockDelay>,
 }
 
 /// Equality of rates is insufficient to establish independent clock ownership.
@@ -144,12 +146,21 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
                 capture_stream::capture_queue_bytes(endpoint.packet_bytes, geometry)?;
             }
             validate_clocks(claimed, playback, expected, &endpoint)?;
+            let delay = if shared || endpoint.vendor_pcm.is_some() { None } else {
+                endpoint_lock::selected_delay(claimed, endpoint.interface, endpoint.alternate,
+                    endpoint.address, true).or_control()?
+            };
             let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
                 .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
-            Ok((shared, buffer))
+            Ok((shared, buffer, delay))
         })();
         match pair {
-            Ok((shared_implicit, buffer)) => return Ok(Arc::new(Attachment::new(endpoint, shared_implicit, buffer))),
+            Ok((shared_implicit, buffer, delay)) => {
+                let mut attachment = Attachment::new(endpoint, shared_implicit, buffer);
+                attachment.lock_delay = delay;
+                return Ok(Arc::new(attachment));
+            },
+            Err(Error::DeviceLost) => return Err(Error::DeviceLost),
             Err(error) => refusal = Some(error),
         }
     }
@@ -160,7 +171,7 @@ impl Attachment {
     pub(super) fn new(endpoint: CaptureEndpoint, shared_implicit: bool, buffer: CaptureBuffer) -> Self {
         Self { endpoint, shared_implicit, buffer: Arc::new(Mutex::new(buffer)),
             error: Arc::new(Mutex::new(None)), retired: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None) }
+            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None), lock_delay: None }
     }
     pub(super) fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         expected: &crate::StreamFormat) -> Result<(), Error> {
@@ -413,6 +424,7 @@ pub(super) struct InputPool {
     order: VecDeque<usize>,
     reordered: Vec<bool>,
     scratch: Vec<CapturePacket>,
+    lock_delay: endpoint_lock::LockDelayGate,
 }
 impl InputPool {
     pub(super) fn new(attachment: Arc<Attachment>) -> Result<Self, String> {
@@ -427,7 +439,8 @@ impl InputPool {
         let feedforward = capture_stream::FeedforwardPool::for_endpoint(&attachment.endpoint)?;
         let implicit_feedforward = attachment.endpoint.adc3_route.as_ref()
             .is_some_and(|route| route.implicit_feedforward).then(ImplicitFeedforwardHealth::new);
-        Ok(Self { slots, feedforward, implicit_feedforward, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
+        let lock_delay = endpoint_lock::LockDelayGate::new(attachment.lock_delay);
+        Ok(Self { slots, feedforward, implicit_feedforward, lock_delay, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots], scratch: vec![CapturePacket {
                 requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
     }
@@ -474,8 +487,19 @@ impl InputPool {
             if usb_stop_requested(stop) { break; }
             let Some((status, completed, _)) = self.slots[index].take_completion() else { break; };
             self.order.pop_front(); self.reordered[index] = false;
-            let result = if self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
-                && self.implicit_feedforward.as_ref().map_or(true, |health| health.accepts(completed)) {
+            let timing_allowed = self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
+                && self.implicit_feedforward.as_ref().map_or(true, |health| health.accepts(completed));
+            let result = if self.lock_delay.pending() {
+                let whole_urb_allowed = timing_allowed && self.slots[index].submitted_at.is_some_and(|submitted|
+                    self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(submitted))
+                    && self.implicit_feedforward.as_ref().map_or(true, |health| health.accepts(submitted)));
+                let (stats, result) = capture_stream::discard_lock_delay_capture(&self.slots[index], status,
+                    &mut self.scratch, self.attachment.endpoint.format.bytes_per_frame(),
+                    self.attachment.endpoint.service_us, whole_urb_allowed, &mut self.lock_delay);
+                self.attachment.deferred.record(stats);
+                if let Err(error) = &result { *self.attachment.error.lock() = Some(error.clone()); }
+                result
+            } else if timing_allowed {
                 self.attachment.ingest(&self.slots[index], status, &mut self.scratch)
             } else {
                 self.attachment.discard_before_timing(&self.slots[index], status, &mut self.scratch)

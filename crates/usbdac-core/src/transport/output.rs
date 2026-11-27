@@ -53,6 +53,7 @@ fn implicit_out_queue_failure(
     None
 }
 
+#[cfg(test)]
 pub(super) fn prepare_iso_transfer_payload(
     scheduler: &mut IsoPacketScheduler,
     pcm_buffer: &Arc<Mutex<PcmRing>>,
@@ -64,6 +65,26 @@ pub(super) fn prepare_iso_transfer_payload(
     dsd_transport: DsdTransportMode,
     dsd_big_endian: bool,
     dsd_bit_reverse: bool,
+) -> Result<Option<IsoTransferPayload>, String> {
+    prepare_iso_transfer_payload_held(scheduler, pcm_buffer, runtime_stats, candidate,
+        slot_bytes, channels, bytes_per_frame, dsd_transport, dsd_big_endian,
+        dsd_bit_reverse, false)
+}
+
+/// Build startup lock silence through the normal transport encoder, retaining
+/// application samples and the existing volume, audit and flush accounting.
+fn prepare_iso_transfer_payload_held(
+    scheduler: &mut IsoPacketScheduler,
+    pcm_buffer: &Arc<Mutex<PcmRing>>,
+    runtime_stats: &RuntimeStats,
+    candidate: &IsoStreamCandidate,
+    slot_bytes: usize,
+    channels: usize,
+    bytes_per_frame: usize,
+    dsd_transport: DsdTransportMode,
+    dsd_big_endian: bool,
+    dsd_bit_reverse: bool,
+    force_held: bool,
 ) -> Result<Option<IsoTransferPayload>, String> {
     let paused = runtime_stats.paused.load(Ordering::Acquire);
     let draining = runtime_stats.draining.load(Ordering::Acquire);
@@ -114,7 +135,7 @@ pub(super) fn prepare_iso_transfer_payload(
         } else {
             total_samples.max(runtime_stats.start_threshold_samples)
         };
-        let held = paused || guard.awaiting_refill(refill_samples);
+        let held = force_held || paused || guard.awaiting_refill(refill_samples);
         let (underrun, held, music_samples) = if held {
             guard.fill_wire_silence(&mut packet_samples, dsd_transport);
             (false, true, 0)
@@ -386,13 +407,14 @@ pub(super) fn submit_next_transfer(
     playback_format: PlaybackFormat,
     dsd_big_endian: bool,
     dsd_bit_reverse: bool,
+    force_held: bool,
     logged_transfer_preview: &mut bool,
     logged_usb_encode_format: &mut bool,
     underrun_count: &mut u64,
     shared: &StreamShared,
     was_underrun: &mut bool,
 ) -> Result<bool, String> {
-    let payload = match prepare_iso_transfer_payload(
+    let payload = match prepare_iso_transfer_payload_held(
         scheduler,
         pcm_buffer,
         runtime_stats,
@@ -403,6 +425,7 @@ pub(super) fn submit_next_transfer(
         playback_format.dsd_transport,
         dsd_big_endian,
         dsd_bit_reverse,
+        force_held,
     ) {
         Ok(Some(payload)) => payload,
         Ok(None) => return Ok(false),
@@ -547,7 +570,9 @@ pub(super) fn run_usb_output_loop(
     capture: Option<Arc<duplex::Attachment>>,
     post_alt_readback_hz: Option<u32>,
     status_targets: Vec<audio_status::StreamStatusTarget>,
+    lock_delay: Option<endpoint_lock::LockDelay>,
 ) {
+    let mut lock_gate = endpoint_lock::LockDelayGate::new(lock_delay);
     let pcm_buffer = Arc::clone(&shared.ring);
     let runtime_stats = Arc::clone(&shared.stats);
     let claimed_handle = usb_owner.claimed();
@@ -619,6 +644,10 @@ pub(super) fn run_usb_output_loop(
         geometry,
     );
     let transfer_slot_count = geometry.transfer_slots;
+    // Only declared startup delays need ordered retirement. Reuse this storage
+    // until the one-shot proof completes; ordinary streams allocate nothing.
+    let mut lock_retirement_order = lock_gate.pending()
+        .then(|| Vec::<usize>::with_capacity(transfer_slot_count));
     // One-shot: prove whether the sink links a feedback endpoint at all. If this
     // dump shows a FeedbackData IN endpoint that descriptor parsing missed, the
     // discovery path is wrong; if it shows none, host-side feedback is
@@ -1011,7 +1040,7 @@ pub(super) fn run_usb_output_loop(
                 let Some(pattern) = engine.take_pattern(&runtime_stats) else { implicit_feedback_fault = true; fatal_error = Some("implicit prime lost its complete pattern".into()); break; };
                 scheduler.set_packet_pattern(pattern);
             }
-            let payload = match prepare_iso_transfer_payload(
+            let payload = match prepare_iso_transfer_payload_held(
                 &mut scheduler,
                 &pcm_buffer,
                 &runtime_stats,
@@ -1022,6 +1051,7 @@ pub(super) fn run_usb_output_loop(
                 playback_format.dsd_transport,
                 dsd_big_endian,
                 dsd_bit_reverse,
+                lock_gate.pending(),
             ) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => continue,
@@ -1080,6 +1110,9 @@ pub(super) fn run_usb_output_loop(
     if let Some(engine) = implicit.as_mut() { engine.running = active_slots > 0; }
     while fatal_error.is_none() && !usb_stop_requested(&stop) {
         if active_slots == 0 && implicit.is_none() { break; }
+        // Retire and refill the whole event batch with the startup decision
+        // taken once, so lock proof cannot start application data mid-batch.
+        let batch_lock_pending = lock_gate.pending();
 
         if let Err(error) = context.handle_events(Some(if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
@@ -1209,7 +1242,22 @@ pub(super) fn run_usb_output_loop(
         }
 
         let mut latest_playback_completion = None;
-        for slot in slots.iter_mut() {
+        let retirement_count = if batch_lock_pending {
+            let order = lock_retirement_order.as_mut().expect("pending lock has retirement storage");
+            order.clear();
+            order.extend(slots.iter().enumerate().filter(|(_, slot)| slot.in_flight)
+                .map(|(index, _)| index));
+            order.sort_unstable_by_key(|&index| slots[index].submitted_at);
+            order.len()
+        } else { slots.len() };
+        for position in 0..retirement_count {
+            let index = if batch_lock_pending {
+                lock_retirement_order.as_ref().expect("pending lock has retirement storage")[position]
+            } else { position };
+            let slot = &mut slots[index];
+            // Do not prove contiguous startup silence beyond an older URB
+            // whose outcome is still unknown, including a possible loss.
+            if batch_lock_pending && !slot.completion_ready() { break; }
             if bootstrap[slot.slot_index] {
                 match retire_bootstrap(slot, acceptance) {
                     Ok(true) => {
@@ -1236,6 +1284,7 @@ pub(super) fn run_usb_output_loop(
             // slot is free again; refill it (wire silence until the ring has
             // refilled) like any other.
             if classify_completion(status, slot.cancelled_for_flush) == Completion::CancelledByFlush {
+                if lock_gate.pending() { lock_gate.observe(false, 0, 0); }
                 runtime_stats
                     .flush_cancelled_transfers
                     .fetch_add(1, Ordering::Relaxed);
@@ -1255,6 +1304,7 @@ pub(super) fn run_usb_output_loop(
                         playback_format,
                         dsd_big_endian,
                         dsd_bit_reverse,
+                        batch_lock_pending,
                         &mut logged_transfer_preview,
                         &mut logged_usb_encode_format,
                         &mut underrun_count,
@@ -1332,6 +1382,19 @@ pub(super) fn run_usb_output_loop(
                     break;
                 }
             };
+
+            if lock_gate.pending() {
+                let accepted = completed_held && status == LIBUSB_TRANSFER_COMPLETED
+                    && completion_stats == CompletionStats::default()
+                    && !slot.packet_sizes.is_empty()
+                    && slot.packet_sizes.iter().any(|&bytes| bytes > 0)
+                    && slot.packet_sizes.iter().all(|bytes| bytes % bytes_per_frame == 0);
+                let service_us = (slot.packet_sizes.len() as u64)
+                    .saturating_mul(u64::from(candidate.service_interval_us));
+                let sample_frames = slot.packet_sizes.iter()
+                    .map(|bytes| (bytes / bytes_per_frame) as u64).sum();
+                lock_gate.observe(accepted, service_us, sample_frames);
+            }
 
             if capture_uses_implicit_feedforward && qualifies_implicit_feedforward_completion(
                 status, &completion_stats, &slot.packet_sizes, bytes_per_frame, queued_frame_count,
@@ -1479,6 +1542,7 @@ pub(super) fn run_usb_output_loop(
                     playback_format,
                     dsd_big_endian,
                     dsd_bit_reverse,
+                    batch_lock_pending,
                     &mut logged_transfer_preview,
                     &mut logged_usb_encode_format,
                     &mut underrun_count,
@@ -1553,7 +1617,7 @@ pub(super) fn run_usb_output_loop(
 
             if successful_transfers >= geometry.stable_transfers {
                 // A stream that has lost audio never asserts stability again.
-                if !completed_underrun && !loss_tracker.is_latched() && ((implicit.is_none() && feedback_slot.is_none()) || runtime_stats.feedback_locked.load(Ordering::Acquire)) {
+                if !batch_lock_pending && !lock_gate.pending() && !completed_underrun && !loss_tracker.is_latched() && ((implicit.is_none() && feedback_slot.is_none()) || runtime_stats.feedback_locked.load(Ordering::Acquire)) {
                     set_usb_stream_stable(true);
                     if !logged_usb_stabilized {
                         if feedback_slot.is_none() && implicit.is_none() {
@@ -1612,7 +1676,7 @@ pub(super) fn run_usb_output_loop(
                     scheduler.set_packet_pattern(pattern);
                     match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
                         &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
-                        dsd_bit_reverse, &mut logged_transfer_preview, &mut logged_usb_encode_format,
+                        dsd_bit_reverse, batch_lock_pending, &mut logged_transfer_preview, &mut logged_usb_encode_format,
                         &mut underrun_count, &shared, &mut was_underrun) {
                         Ok(true) => {
                             active_slots += 1;

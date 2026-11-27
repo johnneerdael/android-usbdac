@@ -97,6 +97,31 @@ the four-ABI AAR and sample builds passed. The AAR and sample contain
 identical native libraries for each ABI. The AAR SHA-256 is
 `a091546bd145b265945816580358c1b3941f8baf3245ab099b6c0ee8c466c5aa`.
 
+### Endpoint clock-lock delay at stream start
+
+Use the selected UAC1, UAC2, or full UAC3 data endpoint's declared lock
+delay for synchronous and adaptive streams. Interpret milliseconds in
+successful USB service intervals and decoded PCM samples as whole
+sample frames. Playback primes the endpoint with silence in its wire
+format while keeping application audio queued. Capture retires the
+initial IN transfers without delivering their payload, and waits for
+its existing feedforward timing proof before counting the lock delay.
+[USB-IF UAC1 §4.6.1.2](https://www.usb.org/sites/default/files/audio10.pdf),
+[USB-IF UAC2 §4.10.1.2](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[USB-IF ADC3 §4.8.1.2 via IEC](https://webstore.iec.ch/en/publication/63921)
+
+Honor sample-based delays for PCM and its DoP carrier, and
+millisecond-based delays for supported wire encodings. Whole-transfer
+accounting may extend the warm-up beyond the minimum in the descriptor.
+For hardware acceptance, record the first silent OUT intervals and
+the first non-silent payload on a device with a nonzero lock delay.
+Repeat for capture and duplex with a distinguishable input signal.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `58db622e5667fd815c70297eb7c2f10f83f537b2faef8a5ac40d2c6f27865129`.
+
 ## Channel layout and hardware routing
 
 Expose descriptor channel labels alongside count and preserve wire order in capture and playback. Distinguish spatial positions from unnamed channels. Treat unsupported conversion requests as typed failures. Model class selectors and mixer crosspoints as typed nodes and writable edges. Probe control readability and writability before exposing them, use protocol-specific CUR/RANGE encodings, verify writes and roll back partially applied route sets where supported. Device topology and vendor routing are distinct capabilities. Start vendor integration with known device/firmware identities and read-only route discovery, then implement verified changes for supported models. ALSA's Scarlett Gen 2–4 families encode generation/model differences, hardware ports, mixer/mux data and control transactions. Plan per-family implementations with exact evidence rather than forwarding arbitrary messages through the public API. [ALSA USB mixer](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c), [ALSA Scarlett controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c)
