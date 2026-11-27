@@ -1576,12 +1576,12 @@ pub(super) fn validate_transport_against_playback_format(
     playback_format: PlaybackFormat,
 ) -> Result<(), String> {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    if candidate.format_tag != FORMAT_TAG_PCM
-        && !(is_native_dsd && candidate.format_tag == FORMAT_TAG_DSD)
-    {
+    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM };
+    if candidate.format_tag != required_format {
         return Err(format!(
-            "USB direct requires PCM transport, got {}",
-            format_tag_label(candidate.format_tag)
+            "USB direct requires {} transport, got {}",
+            format_tag_label(required_format),
+            format_tag_label(candidate.format_tag),
         ));
     }
     if candidate.channels != playback_format.channels {
