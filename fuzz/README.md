@@ -9,8 +9,10 @@ crash artifacts for repair. A bounded clean run is evidence for that corpus and
 revision, not a proof that arbitrary device data is safe.
 
 The manually dispatched `Extended defensive USB fuzz evidence` workflow offers
-10, 60 or 180 minute ASan runs. It records the source revision, compiler, full
-fuzzer output and SHA-256 corpus/artifact inventory. Dispatch it on the release
+10, 60 or 180 minute ASan runs. It records the source revision, compiler, sanitized
+diagnostic signatures/source locations/numeric metrics and, on success, a SHA-256
+corpus inventory. Generated input bytes, raw fuzzer output, crash samples and
+failed-run corpora are never published by these workflows. Dispatch it on the release
 candidate revision for longer evidence; availability of the workflow is not a
 claim that it has completed. Its hard per-input limit remains 4096 bytes and
 10 seconds; the normal PR gate remains a bounded 60 second run.

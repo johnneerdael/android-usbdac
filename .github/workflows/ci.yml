@@ -171,7 +171,7 @@ jobs:
           cargo install cargo-fuzz --locked
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Exercise untrusted parser and control replies (ASan)
-        run: cargo fuzz run defensive_parsers -- -max_total_time=60 -max_len=4096 -timeout=10
+        run: python3 -I .github/scripts/run_defensive_fuzz.py --seconds 60 --log target/defensive-fuzz-sanitized/report.jsonl
       - name: Check pure loss accounting and ring memory under Miri
         run: |
           cargo miri setup
@@ -181,7 +181,7 @@ jobs:
         if: failure()
         with:
           name: defensive-parser-artifacts
-          path: fuzz/artifacts
+          path: target/defensive-fuzz-sanitized/report.jsonl
           retention-days: 7
 
   qemu-usb:

@@ -1,12 +1,12 @@
 use super::constants::USB_DT_INTERFACE_ASSOCIATION;
-use super::helpers::require_len;
+use super::helpers::descriptor_bytes;
 use super::types::Iad;
 use super::validation::validate_iad;
 use crate::descriptors::error::DescriptorError;
 
 pub fn parse_iad_internal(data: &[u8]) -> Result<Iad, DescriptorError> {
     const IAD_LEN: usize = 8;
-    require_len(data, IAD_LEN)?;
+    let data = descriptor_bytes(data, IAD_LEN)?;
     if data[1] != USB_DT_INTERFACE_ASSOCIATION {
         return Err(DescriptorError::Invalid("not an IAD".to_string()));
     }
