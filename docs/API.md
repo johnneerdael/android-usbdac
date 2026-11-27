@@ -8,7 +8,7 @@ The [release validation scope](sdk/evidence.md#release-validation-scope) disting
 software coverage, QEMU enumeration and physical streaming evidence.
 
 Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core) to use
-the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.11`,
+the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.12`,
 then follow the lifecycle below to open the device and stream decoded audio.
 The [Rust API reference](https://docs.rs/usbdac-core)
 covers individual types and methods.

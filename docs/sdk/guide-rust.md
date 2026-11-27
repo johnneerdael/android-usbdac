@@ -36,7 +36,7 @@ The library is a push design. It owns a ring and one USB output thread. You writ
 **Do.** Add the crate.
 
 ```sh
-cargo add usbdac-core@0.1.11
+cargo add usbdac-core@0.1.12
 ```
 
 The crate has no Cargo features. It needs Rust 1.76 or later. Its dependencies are `libc`, `libusb1-sys`, `rusb`, `log`, `parking_lot`, `once_cell`, `crossbeam-channel`, `serde`, `serde_json`, `base64` and `flate2`. The libusb sources are compiled with your build, so you need a C compiler for the target.
