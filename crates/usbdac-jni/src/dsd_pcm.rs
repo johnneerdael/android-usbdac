@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
 use usbdac_core::{
-    convert::{ConvertError, PcmFormat, SampleFormat},
+    convert::{ConvertError, ConvertOptions, Narrowing, PcmFormat, Quality, SampleFormat},
     dsd_pcm::DsdPcmConverter,
 };
 
@@ -64,6 +64,10 @@ pub fn create<'l>(
     target_channels: i32,
     bits: i32,
     slot: i32,
+    quality: i32,
+    narrowing: i32,
+    headroom: f64,
+    seed: i64,
 ) -> i64 {
     run(&mut env, |_| {
         let rate = u32::try_from(rate).map_err(|_| bad("invalid rate"))?;
@@ -79,10 +83,28 @@ pub fn create<'l>(
                 u8::try_from(slot).map_err(|_| bad("invalid slot"))?,
             )?
         };
-        let c = DsdPcmConverter::new(
+        let mut options = ConvertOptions {
+            quality: match quality {
+                0 => Quality::High,
+                1 => Quality::Fast,
+                _ => return Err(bad("invalid quality")),
+            },
+            narrowing: match narrowing {
+                0 => Narrowing::TpdfDither,
+                1 => Narrowing::Truncate,
+                _ => return Err(bad("invalid narrowing")),
+            },
+            headroom_db: headroom,
+            ..ConvertOptions::default()
+        };
+        if seed >= 0 {
+            options.dither_seed = seed as u64;
+        }
+        let c = DsdPcmConverter::with_options(
             rate,
             channels,
             PcmFormat::new(target_rate, target_channels, sample),
+            &options,
         )?;
         let id = crate::registry::next_id();
         CONVERTERS.lock().insert(id, Arc::new(Mutex::new(c)));
@@ -155,5 +177,12 @@ pub fn close<'l>(mut env: EnvUnowned<'l>, _: JObject<'l>, id: i64) {
 pub fn delay<'l>(mut env: EnvUnowned<'l>, _: JObject<'l>, id: i64) -> i32 {
     run(&mut env, |_| {
         Ok(get(id)?.lock().delay_byte_frames().min(i32::MAX as usize) as i32)
+    })
+}
+
+#[jni_mangle("dev.usbdac.internal.DsdPcmNative")]
+pub fn clipped<'l>(mut env: EnvUnowned<'l>, _: JObject<'l>, id: i64) -> i64 {
+    run(&mut env, |_| {
+        Ok(get(id)?.lock().clipped_samples().min(i64::MAX as u64) as i64)
     })
 }

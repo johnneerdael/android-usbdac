@@ -17,13 +17,23 @@ public class DsdPcmOutput(
     private val targetRate: Int,
     private val targetChannels: Int,
     private val targetLayout: PcmLayout,
+    options: ConversionOptions = ConversionOptions(),
 ) : PcmOutput {
     private val lock = Any()
-    private val handle = nativeCall { DsdPcmNative.create(dsdBitRate, channels, targetRate, targetChannels, targetLayout.bits, targetLayout.slotBytes) }
+    private val handle = run {
+        require(options.sourceLayout == null) { "PCM source layout is not valid for native DSD" }
+        require(options.ditherSeed == null || options.ditherSeed >= 0) { "dither seed must not be negative" }
+        nativeCall { DsdPcmNative.create(dsdBitRate, channels, targetRate, targetChannels, targetLayout.bits, targetLayout.slotBytes,
+            if (options.quality == ResampleQuality.HIGH) 0 else 1,
+            if (options.narrowing == NarrowingMode.TPDF_DITHER) 0 else 1,
+            options.headroomDb, options.ditherSeed ?: -1) }
+    }
     init {
         try { if (target is DacStream) target.setHostProcessing(true) }
         catch (error: Throwable) { nativeCall { DsdPcmNative.close(handle) }; throw error }
     }
+    /** Number of samples saturated by PCM quantization since open or flush. */
+    public val clippedSamples: Long get() = synchronized(lock) { if (closed) 0 else nativeCall { DsdPcmNative.clipped(handle) } }
     /** Algorithmic filter latency, in source byte-frames; this is not a position offset. */
     public val filterDelayByteFrames: Int = nativeCall { DsdPcmNative.delay(handle) }
     private val pending = ByteBuffer.allocateDirect(64 * 1024).apply { limit(0) }
@@ -41,7 +51,7 @@ public class DsdPcmOutput(
             if (!draining) return
             if (!tailDone) {
                 pending.clear()
-                val n = nativeCall { DsdPcmNative.finish(handle, pending, 0, pending.capacity()) }
+                val n = try { nativeCall { DsdPcmNative.finish(handle, pending, 0, pending.capacity()) } } catch (error: Throwable) { pending.limit(0); throw error }
                 if (n == 0) { pending.limit(0); tailDone = true } else { pending.position(0); pending.limit(n) }
                 continue
             }
@@ -58,7 +68,7 @@ public class DsdPcmOutput(
                 stage.clear(); val n = minOf(buffer.remaining(), stage.capacity()); stage.put(buffer.duplicate().apply { limit(position() + n) }); stage.flip(); stage
             }
             pending.clear()
-            val result = nativeCall { DsdPcmNative.process(handle, input, input.position(), input.remaining(), pending, 0, pending.capacity()) }
+            val result = try { nativeCall { DsdPcmNative.process(handle, input, input.position(), input.remaining(), pending, 0, pending.capacity()) } } catch (error: Throwable) { pending.limit(0); throw error }
             val used = (result ushr 32).toInt(); val made = result.toInt()
             buffer.position(buffer.position() + used); total += used; consumedFrames += used / channels
             pending.position(0); pending.limit(made); pump()

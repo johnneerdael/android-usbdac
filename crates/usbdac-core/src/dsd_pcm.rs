@@ -32,17 +32,36 @@ pub struct DsdPcmConverter {
     output_rate: u32,
     output_frame_bytes: usize,
     tail_scratch: Vec<u8>,
+    first_stage_gain: f64,
 }
 
 impl DsdPcmConverter {
     pub fn new(bit_rate: u32, channels: u16, target: PcmFormat) -> Result<Self, ConvertError> {
+        Self::with_options(bit_rate, channels, target, &ConvertOptions::default())
+    }
+    pub fn with_options(
+        bit_rate: u32,
+        channels: u16,
+        target: PcmFormat,
+        options: &ConvertOptions,
+    ) -> Result<Self, ConvertError> {
+        if options.source_sample.is_some() {
+            return Err(ConvertError::InvalidArgument(
+                "PCM source layout is not valid for native DSD".into(),
+            ));
+        }
         if !matches!(bit_rate, 2_822_400 | 5_644_800 | 11_289_600) || !(1..=8).contains(&channels) {
             return Err(ConvertError::Unsupported(
                 "native DSD supports DSD64/128/256 and 1 to 8 channels".into(),
             ));
         }
         let source = PcmFormat::new(bit_rate / 16, channels, SampleFormat::Float32);
-        let plan = ConversionPlan::pcm(source, target, &ConvertOptions::default())?;
+        let plan = ConversionPlan::pcm(source, target, options)?;
+        let first_stage_gain = if plan.resamples() {
+            1.0
+        } else {
+            10f64.powf(options.headroom_db / 20.0)
+        };
         let pcm = Converter::new(&plan)?;
         let tail_scratch = vec![0; pcm.min_output_bytes()];
         let mut coefficients = [0.0; TAPS];
@@ -88,6 +107,7 @@ impl DsdPcmConverter {
             output_rate: target.sample_rate,
             output_frame_bytes: target.bytes_per_frame(),
             tail_scratch,
+            first_stage_gain,
         })
     }
     pub fn min_output_bytes(&self) -> usize {
@@ -95,6 +115,9 @@ impl DsdPcmConverter {
     }
     pub fn kind(&self) -> crate::convert::ConversionKind {
         crate::convert::ConversionKind::Lossy
+    }
+    pub fn clipped_samples(&self) -> u64 {
+        self.pcm.clipped_samples()
     }
     pub fn delay_byte_frames(&self) -> usize {
         2 * DELAY + self.pcm.delay_frames() * 2
@@ -116,7 +139,7 @@ impl DsdPcmConverter {
                 .map(|i| self.table[i][channel[(self.head + HISTORY - i) % HISTORY] as usize])
                 .sum();
             self.pending
-                .extend_from_slice(&(sample as f32).to_le_bytes());
+                .extend_from_slice(&((sample * self.first_stage_gain) as f32).to_le_bytes());
         }
     }
     fn emit_pending(&mut self, output: &mut [u8]) -> Result<Processed, ConvertError> {
@@ -366,5 +389,113 @@ mod tests {
             let expected = (137u64 * u64::from(target)).div_ceil(2_822_400 / 8) as usize;
             assert_eq!(produced, expected * 4, "target {target}");
         }
+    }
+    #[test]
+    fn full_chain_preserves_audio_tone_and_suppresses_out_of_band_tone() {
+        fn level(freq: f64, measured_freq: f64) -> f64 {
+            let mut bits = Vec::new();
+            let mut acc = 0.0;
+            let mut byte = 0u8;
+            for n in 0..131_072 {
+                let signal =
+                    0.5 * (2.0 * std::f64::consts::PI * freq * n as f64 / 2_822_400.0).sin();
+                acc += signal;
+                let high = acc >= 0.0;
+                acc -= if high { 1.0 } else { -1.0 };
+                byte = (byte << 1) | u8::from(high);
+                if n % 8 == 7 {
+                    bits.push(byte);
+                    byte = 0;
+                }
+            }
+            let mut c = DsdPcmConverter::new(
+                2_822_400,
+                1,
+                PcmFormat::new(44_100, 1, SampleFormat::Float32),
+            )
+            .unwrap();
+            let mut audio = Vec::new();
+            let mut i = 0;
+            let mut out = [0u8; 4096];
+            while i < bits.len() {
+                let done = c.process(&bits[i..], &mut out).unwrap();
+                assert!(done.consumed > 0 || done.produced > 0);
+                i += done.consumed;
+                audio.extend_from_slice(&out[..done.produced]);
+            }
+            loop {
+                let n = c.finish(&mut out).unwrap();
+                audio.extend_from_slice(&out[..n]);
+                if n == 0 {
+                    break;
+                }
+            }
+            let samples: Vec<f64> = audio
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes(x.try_into().unwrap()) as f64)
+                .collect();
+            let mut re = 0.0;
+            let mut im = 0.0;
+            let body = &samples[128..samples.len() - 128];
+            for (n, value) in body.iter().enumerate() {
+                let phase = 2.0 * std::f64::consts::PI * measured_freq * n as f64 / 44_100.0;
+                re += value * phase.cos();
+                im += value * phase.sin();
+            }
+            2.0 * re.hypot(im) / body.len() as f64
+        }
+        let in_band = level(1_378.125, 1_378.125);
+        let alias = level(30_000.0, 14_100.0);
+        assert!(
+            (0.47..0.53).contains(&in_band),
+            "in-band amplitude {in_band}"
+        );
+        assert!(alias < 0.002, "aliased amplitude {alias}");
+    }
+    #[test]
+    fn headroom_is_applied_once_with_and_without_pcm_resampling() {
+        fn amplitude(rate: u32, db: f64) -> f64 {
+            let options = ConvertOptions {
+                headroom_db: db,
+                ..ConvertOptions::default()
+            };
+            let mut c = DsdPcmConverter::with_options(
+                2_822_400,
+                1,
+                PcmFormat::new(rate, 1, SampleFormat::Float32),
+                &options,
+            )
+            .unwrap();
+            let input = [0xff; 8192];
+            let mut out = vec![0; 128 * 1024];
+            let done = c.process(&input, &mut out).unwrap();
+            assert_eq!(done.consumed, input.len());
+            let samples: Vec<f32> = out[..done.produced]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            samples[samples.len() / 2] as f64
+        }
+        let gain = 10f64.powf(-6.0 / 20.0);
+        for rate in [44_100, 176_400] {
+            let unity = amplitude(rate, 0.0);
+            let reduced = amplitude(rate, -6.0);
+            assert!(
+                (reduced / unity - gain).abs() < 0.001,
+                "rate {rate}: {}",
+                reduced / unity
+            );
+        }
+        let options = ConvertOptions {
+            source_sample: Some(SampleFormat::I16),
+            ..ConvertOptions::default()
+        };
+        assert!(DsdPcmConverter::with_options(
+            2_822_400,
+            1,
+            PcmFormat::new(44_100, 1, SampleFormat::Float32),
+            &options
+        )
+        .is_err());
     }
 }

@@ -25,7 +25,17 @@ class DsdDopOutputTest {
         assertEquals(2, source.remaining())
         assertEquals(0, output.writableBytes)
         target.room = 8
-        assertEquals(0, output.write(source))
+        assertEquals(2, output.write(source))
         assertEquals(listOf(0,3,1,5,0,4,2,5), target.received.map { it.toInt() and 255 })
     }
+    @Test fun oneByteFrameSurvivesDisjointWritesAndIncompleteEosFails() {
+        val target = RecordingOutput()
+        val output = DsdDopOutput(target, 2, 3, true)
+        assertEquals(2, output.write(heapOf(1, 2)))
+        assertThrows(IllegalStateException::class.java) { output.drain() }
+        assertEquals(2, output.write(heapOf(3, 4)))
+        assertEquals(listOf(3,1,5,4,2,5), target.received.map { it.toInt() and 255 })
+        output.drain()
+    }
+
 }
