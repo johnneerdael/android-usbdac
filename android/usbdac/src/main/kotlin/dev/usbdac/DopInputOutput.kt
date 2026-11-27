@@ -46,9 +46,8 @@ public class DopInputOutput(
         val frames = minOf(submittedFrames, pending.capacity() / nativePair)
         val pad = slotBytes - 3
         var next = expected
-        var acceptedNext = expected
-        // Validate every complete submitted frame before consuming any of them.
-        for (frame in 0 until submittedFrames) {
+        // Validate only the bounded batch that can be accepted in this call.
+        for (frame in 0 until frames) {
             val p = start + frame * carrierFrame
             val marker = buffer.get(p + pad + 2).toInt() and 255
             if (marker != 0x05 && marker != 0xfa) invalid("invalid DoP marker")
@@ -59,7 +58,6 @@ public class DopInputOutput(
                 if (pad != 0 && buffer.get(at).toInt() != 0) invalid("DoP padding must be zero")
             }
             next = marker xor 0xff
-            if (frame + 1 == frames) acceptedNext = next
         }
         pending.clear()
         for (frame in 0 until frames) {
@@ -68,7 +66,7 @@ public class DopInputOutput(
             for (ch in 0 until channels) pending.put(buffer.get(p + ch * slotBytes + pad))
         }
         buffer.position(start + frames * carrierFrame)
-        expected = acceptedNext
+        expected = next
         pending.flip()
         pump()
         buffer.position() - start
@@ -90,6 +88,12 @@ public class DopInputOutput(
     override fun pause(): Unit = synchronized(lock) {
         check(!closed)
         target.pause()
+    }
+
+    /** Start a new input marker sequence without discarding already accepted downstream data. */
+    public fun resetInputMarkerPhase(): Unit = synchronized(lock) {
+        check(!closed && !draining)
+        expected = null
     }
 
     override fun flush(): Unit = synchronized(lock) {

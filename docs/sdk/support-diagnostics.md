@@ -262,13 +262,10 @@ session, and that capture turns off when the attempt ends.
 
 Stream statistics expose output-worker checkpoint intervals over 10 and 50 ms
 and the longest one in microseconds, all excluding time spent in the libusb
-event pump (`workerGapOver10ms`, `workerGapOver50ms`, `maxWorkerGapUs`). The
+event pump and synchronous flush cancellation (`workerGapOver10ms`, `workerGapOver50ms`, `maxWorkerGapUs`). The
 longest interval including the pump is `maxWorkerLoopGapUs`, the longest pump
 call is `maxEventPumpElapsedUs`, and the largest pump overrun beyond its
-requested timeout is `maxEventPumpTimeoutOverrunUs`. These are lifetime maxima
-and counts, with no timestamps; a pump call that returns at once because a
-completion is already pending shows no overrun, so a late wake-up then appears
-only in the interval maxima.
+requested timeout is `maxEventPumpTimeoutOverrunUs`. `maxCallbackRetirementUs` records the maximum time from callback publication to worker retirement; `callbackRetirementOver10ms` counts callbacks delayed over 10 ms, and `callbackRetirementLossOver10ms` counts those that also reported lost audio. These measure callback-to-worker delay, not kernel completion-to-callback latency. The counters and maxima have no timestamps.
 Adaptive queue changes, active slot count and active queue time complete the
 set. These distinguish a late host worker from packet failures; they do not
 infer an OEM cause from a device name. Opt-in explicit feedback reports include accepted

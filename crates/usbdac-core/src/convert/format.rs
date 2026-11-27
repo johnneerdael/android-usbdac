@@ -173,9 +173,9 @@ pub struct ConvertOptions {
     pub narrowing: Narrowing,
     /// Used for sample-rate conversion.
     pub quality: Quality,
-    /// Gain in dB (zero or negative) applied after sample-rate conversion, to keep the overshoot
-    /// of a resampled full-scale signal from clipping. `0.0` leaves the gain at exactly unity at
-    /// DC. The default is -3.5 dB; 0.0 requests unity.
+    /// Gain in dB (zero or negative) applied after sample-rate conversion to reduce clipping
+    /// from overshoot. The default -3.5 dB does not prevent clipping for every signal.
+    /// Monitor integer saturation; float output can exceed full scale. `0.0` requests unity.
     pub headroom_db: f64,
     /// Seed of the dither's pseudo-random generator: the same seed gives the same output.
     pub dither_seed: u64,

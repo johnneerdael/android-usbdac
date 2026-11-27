@@ -101,7 +101,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 /// Modified Bessel function of the first kind, order 0, by its power series.
-fn bessel_i0(x: f64) -> f64 {
+pub(crate) fn bessel_i0(x: f64) -> f64 {
     let quarter = x * x / 4.0;
     let mut term = 1.0;
     let mut sum = 1.0;
@@ -115,7 +115,7 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-fn kaiser_beta(attenuation_db: f64) -> f64 {
+pub(crate) fn kaiser_beta(attenuation_db: f64) -> f64 {
     if attenuation_db > 50.0 {
         0.1102 * (attenuation_db - 8.7)
     } else if attenuation_db >= 21.0 {

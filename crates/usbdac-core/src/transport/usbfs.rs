@@ -36,27 +36,49 @@ pub(super) fn badd_snapshot_matches(
         && raw == snapshot
 }
 
-/// A bounded read-only witness on a duplicate of the caller's still-owned fd.
-/// It creates no Dac/session, makes no claim and sends only standard reads.
+/// Return the witnessed BADD capability, or unknown (zero) if unavailable or busy.
 pub fn badd_descriptor_witness(fd: RawFd, active_id: u8, snapshot: &[u8]) -> u8 {
+    try_badd_descriptor_witness(fd, active_id, snapshot).unwrap_or(0)
+}
+
+/// A bounded read-only witness, reserved against native session ownership.
+/// On Linux and Android, libusb wraps the fd only to cache descriptors and
+/// query speed; witness controls use synchronous usbfs ioctl, never an event
+/// pump or asynchronous URB. Descriptor caching may change the file offset.
+pub fn try_badd_descriptor_witness(
+    fd: RawFd,
+    active_id: u8,
+    snapshot: &[u8],
+) -> Result<u8, crate::Error> {
+    let _reservation = super::context::SessionContext::reserve(fd)?;
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Ok(0);
+    }
     if fd < 0 || active_id == 0 || snapshot.len() < 9 || snapshot.len() > 16384 {
-        return 0;
+        return Ok(0);
     }
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {
-        return 0;
+        return Ok(0);
     }
     let owned = OwnedUsbFd(duplicated);
     let result = (|| -> Option<u8> {
         let context = Context::new().ok()?;
         let handle = unsafe { context.open_device_with_fd(owned.0) }.ok()?;
-        let mut active = [0u8; 1];
-        let get_active = |data: &mut [u8]| {
-            handle
-                .read_control(0x80, 0x08, 0, 0, data, Duration::from_millis(500))
-                .ok()
-                == Some(1)
+        let read_control = |request: u8, value: u16, buf: &mut [u8]| {
+            let transfer = UsbfsControlTransfer {
+                request_type: 0x80,
+                request,
+                value,
+                index: 0,
+                length: u16::try_from(buf.len()).ok()?,
+                timeout_ms: 500,
+                data: buf.as_mut_ptr().cast(),
+            };
+            source_control(DeviceKey::Usbfs(owned.0), None, &transfer).ok()
         };
+        let mut active = [0u8; 1];
+        let get_active = |data: &mut [u8]| read_control(0x08, 0, data) == Some(1);
         if !get_active(&mut active) || active[0] != active_id {
             return None;
         }
@@ -75,18 +97,7 @@ pub fn badd_descriptor_witness(fd: RawFd, active_id: u8, snapshot: &[u8]) -> u8 
             }
         }
         let index = index?;
-        let read = |buf: &mut [u8]| {
-            handle
-                .read_control(
-                    0x80,
-                    0x06,
-                    0x0200 | u16::from(index),
-                    0,
-                    buf,
-                    Duration::from_millis(500),
-                )
-                .ok()
-        };
+        let read = |buf: &mut [u8]| read_control(0x06, 0x0200 | u16::from(index), buf);
         let mut header = [0u8; 9];
         if read(&mut header) != Some(9)
             || header[0] != 9
@@ -111,7 +122,7 @@ pub fn badd_descriptor_witness(fd: RawFd, active_id: u8, snapshot: &[u8]) -> u8 
         }
         Some(proved)
     })();
-    result.unwrap_or(0)
+    Ok(result.unwrap_or(0))
 }
 
 #[derive(Debug)]
@@ -413,6 +424,8 @@ pub(super) struct IdleLock {
     pub(super) handle: Arc<DeviceHandle<Context>>,
     pub(super) claimed_interfaces: Arc<[u8]>,
     pub(super) active_interfaces: Mutex<Vec<u8>>,
+    // Keep the wrapped descriptor alive until after the libusb handle drops.
+    pub(super) fd_owner: Option<Arc<OwnedUsbFd>>,
 }
 
 pub(super) struct ClaimedHandle {
@@ -426,6 +439,8 @@ pub(super) struct ClaimedHandle {
     pub(super) handle: Arc<DeviceHandle<Context>>,
     pub(super) claimed_interfaces: Arc<[u8]>,
     pub(super) active_interfaces: Mutex<Vec<u8>>,
+    // Keep the wrapped descriptor alive until after the libusb handle drops.
+    pub(super) fd_owner: Option<Arc<OwnedUsbFd>>,
 }
 
 // linux/usbdevice_fs.h; use libc's architecture-specific ioctl encoding.
@@ -478,17 +493,44 @@ impl From<IdleLock> for ClaimedHandle {
             #[cfg(target_os = "macos")]
             owner: value.owner,
             itf_mode: ItfModeLease::new(),
-            adc3_power: Adc3PowerLease::new(value.device_fd, Some(value.handle.clone())),
+            adc3_power: Adc3PowerLease::new(
+                value.device_fd,
+                Some(value.handle.clone()),
+                value.fd_owner.clone(),
+            ),
             device_fd: value.device_fd,
             context: value.context,
             handle: value.handle,
             claimed_interfaces: value.claimed_interfaces,
             active_interfaces: value.active_interfaces,
+            fd_owner: value.fd_owner,
         }
     }
 }
 
+/// Owns the libusb handle and its wrapped descriptor for every native transfer.
+/// Field order closes the handle before the descriptor.
+pub(super) struct TransferOwner {
+    handle: Arc<DeviceHandle<Context>>,
+    _fd_owner: Option<Arc<OwnedUsbFd>>,
+    #[cfg(target_os = "macos")]
+    _darwin_owner: Option<Arc<DarwinOwner>>,
+}
+impl TransferOwner {
+    pub(super) fn matches(&self, handle: &DeviceHandle<Context>) -> bool {
+        self.handle.as_raw() == handle.as_raw()
+    }
+}
+
 impl ClaimedHandle {
+    pub(super) fn transfer_owner(&self) -> Arc<TransferOwner> {
+        Arc::new(TransferOwner {
+            handle: self.handle.clone(),
+            _fd_owner: self.fd_owner.clone(),
+            #[cfg(target_os = "macos")]
+            _darwin_owner: self.owner.clone(),
+        })
+    }
     pub(super) fn into_idle_lock(self) -> IdleLock {
         IdleLock {
             #[cfg(target_os = "macos")]
@@ -498,6 +540,7 @@ impl ClaimedHandle {
             handle: self.handle,
             claimed_interfaces: self.claimed_interfaces,
             active_interfaces: self.active_interfaces,
+            fd_owner: self.fd_owner,
         }
     }
 
@@ -719,12 +762,17 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
         return Ok(ClaimedHandle {
             owner: Some(owner.clone()),
             itf_mode: ItfModeLease::new(),
-            adc3_power: Adc3PowerLease::new(device.fd, Some(handle.clone())),
+            adc3_power: Adc3PowerLease::new(
+                device.fd,
+                Some(handle.clone()),
+                device._fd_owner.clone(),
+            ),
             device_fd: device.fd,
             context: handle.device().context().clone(),
             handle,
             claimed_interfaces: Arc::clone(&device.claimed_interfaces),
             active_interfaces: Mutex::new(Vec::new()),
+            fd_owner: device._fd_owner.clone(),
         });
     }
     prepare_direct_usb_libusb();
@@ -753,12 +801,13 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
         #[cfg(target_os = "macos")]
         owner: None,
         itf_mode: ItfModeLease::new(),
-        adc3_power: Adc3PowerLease::new(device.fd, Some(handle.clone())),
+        adc3_power: Adc3PowerLease::new(device.fd, Some(handle.clone()), device._fd_owner.clone()),
         device_fd: device.fd,
         context,
         handle,
         claimed_interfaces: Arc::clone(&device.claimed_interfaces),
         active_interfaces: Mutex::new(Vec::new()),
+        fd_owner: device._fd_owner.clone(),
     })
 }
 

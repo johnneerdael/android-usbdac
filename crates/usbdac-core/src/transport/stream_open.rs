@@ -15,6 +15,25 @@ pub(super) fn active_rate_evidence(
     }
 }
 
+// Called only after SET_INTERFACE. The fresh read starts a new evidence epoch;
+// the caller must not supply the pre-alternate CUR as evidence.
+fn post_alt_rate_evidence(
+    requested: u32,
+    retry_allowed: bool,
+    read: impl FnOnce() -> Option<u32>,
+    retry: impl FnOnce() -> (Option<u32>, bool),
+) -> (Option<u32>, bool, bool) {
+    let mut reported = read().filter(|rate| *rate > 0);
+    let mut mismatch = reported.is_some_and(|rate| rate != requested);
+    if mismatch && retry_allowed {
+        let (retry_read, retry_verified) = retry();
+        (reported, mismatch) =
+            active_rate_evidence(requested, reported, retry_read, retry_verified);
+    }
+    let verified = !mismatch && reported == Some(requested);
+    (reported, mismatch, verified)
+}
+
 /// Keep alternate ownership with the handle, including spawn failure and
 /// unwinding. Declared before the transfer pools so their Drops retire USB
 /// callbacks before this owner resets interfaces or releases the handle.
@@ -1179,33 +1198,27 @@ fn start_stream_inner_with_capture(
             && !multiplied_clock
             && playback_format.dsd_transport == DsdTransportMode::None;
         if !skip {
-            let read = get_wire_frequency(&claimed_handle.handle, clock, uac2_choice)
-                .ok()
-                .filter(|rate| *rate > 0);
-            reported_sample_rate = read;
-            post_alt_mismatch = read.is_some_and(|rate| rate != playback_format.sample_rate);
-            if post_alt_mismatch
-                && !multiplied_clock
-                && matches!(state.dac_mode, DacMode::FullControl)
-            {
-                let retry = apply_wire_frequency(
-                    &claimed_handle.handle,
-                    clock,
-                    uac2_choice,
-                    playback_format.sample_rate,
-                    clock_settle_delay_ms,
-                );
-                clock_control_attempted = true;
-                clock_control_succeeded = retry.set_cur_succeeded;
-                (reported_sample_rate, post_alt_mismatch) = active_rate_evidence(
-                    playback_format.sample_rate,
-                    reported_sample_rate,
-                    retry.reported_sample_rate,
-                    retry.rate_verified,
-                );
-            }
-            clock_verification_passed =
-                !post_alt_mismatch && reported_sample_rate == Some(playback_format.sample_rate);
+            (
+                reported_sample_rate,
+                post_alt_mismatch,
+                clock_verification_passed,
+            ) = post_alt_rate_evidence(
+                playback_format.sample_rate,
+                !multiplied_clock && matches!(state.dac_mode, DacMode::FullControl),
+                || get_wire_frequency(&claimed_handle.handle, clock, uac2_choice).ok(),
+                || {
+                    let retry = apply_wire_frequency(
+                        &claimed_handle.handle,
+                        clock,
+                        uac2_choice,
+                        playback_format.sample_rate,
+                        clock_settle_delay_ms,
+                    );
+                    clock_control_attempted = true;
+                    clock_control_succeeded = retry.set_cur_succeeded;
+                    (retry.reported_sample_rate, retry.rate_verified)
+                },
+            );
             if clock_verification_passed {
                 post_alt_readback_hz = reported_sample_rate;
             }
@@ -1836,4 +1849,44 @@ pub(super) fn offered_alt_settings() -> Vec<crate::capabilities::AltSetting> {
         .and_then(|state| state.capability_model.as_ref())
         .map(|model| model.alt_settings.clone())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod post_alt_tests {
+    use super::post_alt_rate_evidence;
+
+    #[test]
+    fn active_epoch_requires_a_fresh_cur_and_retries_only_a_mismatch() {
+        let stale_pre_alt = Some(48_000);
+        let mut reads = 0;
+        let failed = post_alt_rate_evidence(
+            48_000,
+            true,
+            || {
+                reads += 1;
+                None
+            },
+            || panic!("no retry on unreadable CUR"),
+        );
+        assert_eq!(stale_pre_alt, Some(48_000));
+        assert_eq!(failed, (None, false, false));
+        assert_eq!(reads, 1);
+        assert_eq!(
+            post_alt_rate_evidence(
+                48_000,
+                true,
+                || Some(48_000),
+                || panic!("no retry on exact CUR")
+            ),
+            (Some(48_000), false, true)
+        );
+        assert_eq!(
+            post_alt_rate_evidence(48_000, true, || Some(44_100), || (None, false)),
+            (Some(44_100), true, false)
+        );
+        assert_eq!(
+            post_alt_rate_evidence(48_000, true, || Some(44_100), || (Some(48_000), true)),
+            (Some(48_000), false, true)
+        );
+    }
 }

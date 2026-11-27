@@ -75,26 +75,15 @@ internal fun reconfigurationCandidates(alts: List<AltSetting>, request: StreamRe
 
 /** Conservative descriptor-only check; no clock programming or stream open occurs. */
 internal fun directSessionSupport(alts: List<AltSetting>, request: StreamRequest, allowWidening: Boolean): OutputSupport {
-    val expected = when (request.encoding) {
-        StreamEncoding.PCM -> AltFormat.PCM
-        StreamEncoding.PCM_U8 -> AltFormat.PCM_U8
-        StreamEncoding.PCM_FLOAT32 -> AltFormat.PCM_FLOAT32
+    when (request.encoding) {
+        StreamEncoding.PCM, StreamEncoding.PCM_U8, StreamEncoding.PCM_FLOAT32 -> Unit
         else -> return OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "unsupported source encoding")
     }
     val candidates = alts.filter { alt ->
-        val rateSupported = request.sampleRate in alt.sampleRates || alt.rateRanges.any { range ->
-            request.sampleRate in range.minHz..range.maxHz &&
-                if (range.stepHz > 0) (request.sampleRate.toLong() - range.minHz) % range.stepHz == 0L
-                else range.stepHz == 0 && range.minHz == range.maxHz
-        }
-        val framesPerInterval = (request.sampleRate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
-        val slotValid = alt.subslotBytes in 1..4 && alt.validBits > 0 && alt.validBits <= alt.subslotBytes * 8
-        val exact = alt.validBits == request.bitDepth
-        val widened = request.encoding == StreamEncoding.PCM && allowWidening && alt.validBits > request.bitDepth
-        alt.format == expected && alt.channels == request.channels && alt.pacing != null &&
-            request.sampleRate > 0 && rateSupported && slotValid && alt.subslotBytes >= request.bitDepth / 8 &&
-            alt.serviceIntervalUs > 0 && alt.maxPacketBytes > 0 &&
-            framesPerInterval * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && (exact || widened)
+        val exact = pcmAlternateSupports(alt, request)
+        val widened = allowWidening && request.encoding == StreamEncoding.PCM &&
+            alt.validBits > request.bitDepth && pcmAlternateSupports(alt, request.copy(bitDepth = alt.validBits))
+        exact || widened
     }
     val alt = candidates.minByOrNull { it.validBits } ?:
         return OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no matching cached alternate")

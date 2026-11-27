@@ -30,7 +30,7 @@
 mod converter;
 mod format;
 mod plan;
-mod resample;
+pub(crate) mod resample;
 mod samples;
 
 #[cfg(test)]

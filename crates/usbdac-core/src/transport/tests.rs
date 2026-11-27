@@ -85,6 +85,75 @@ mod dsd_bitperfect_tests {
     }
 
     #[test]
+    fn source_dsd_bytes_normalize_to_standard_adc3_wire_words() {
+        // Raw channel-block sample bytes, not parsed DSF files. A host deblocks
+        // them and reverses each byte only for DSF's 1-bit field.
+        let dsf_field_1: [[u8; 16]; 2] = [
+            [
+                0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x69, 0x3c, 0xa5, 0x5a, 0x87, 0xe0,
+                0x4b, 0xd2,
+            ],
+            [
+                0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x96, 0xc3, 0x5a, 0xa5, 0xe1, 0x07,
+                0xd2, 0x4b,
+            ],
+        ];
+        let dsf_field_8: [[u8; 16]; 2] = [
+            [
+                0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, 0x96, 0x3c, 0xa5, 0x5a, 0xe1, 0x07,
+                0xd2, 0x4b,
+            ],
+            [
+                0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x69, 0xc3, 0x5a, 0xa5, 0x87, 0xe0,
+                0x4b, 0xd2,
+            ],
+        ];
+        // Raw DSDIFF audio payload is already byte-interleaved, MSB first.
+        let dsdiff: [i32; 32] = [
+            0x80, 0x01, 0x40, 0x02, 0x20, 0x04, 0x10, 0x08, 0x08, 0x10, 0x04, 0x20, 0x02, 0x40,
+            0x01, 0x80, 0x96, 0x69, 0x3c, 0xc3, 0xa5, 0x5a, 0x5a, 0xa5, 0xe1, 0x87, 0x07, 0xe0,
+            0xd2, 0x4b, 0x4b, 0xd2,
+        ];
+        let normalize_dsf = |blocks: [[u8; 16]; 2], reverse: bool| {
+            let mut input = [0i32; 32];
+            for frame in 0..16 {
+                for channel in 0..2 {
+                    let byte = blocks[channel][frame];
+                    input[frame * 2 + channel] =
+                        i32::from(if reverse { byte.reverse_bits() } else { byte });
+                }
+            }
+            input
+        };
+        for input in [
+            normalize_dsf(dsf_field_1, true),
+            normalize_dsf(dsf_field_8, false),
+            dsdiff,
+        ] {
+            let mut out = [0u8; 32];
+            encode_usb_pcm_slots(
+                &input,
+                &mut out,
+                8,
+                64,
+                DsdTransportMode::Native,
+                2,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x80, 0x40, 0x20, 0x10, 0x08,
+                    0x04, 0x02, 0x01, 0x4b, 0xd2, 0x07, 0xe1, 0x5a, 0xa5, 0x3c, 0x96, 0xd2, 0x4b,
+                    0xe0, 0x87, 0xa5, 0x5a, 0xc3, 0x69,
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn native_dsd_bit_reverse_flips_each_byte() {
         let mut out = [0u8; 8];
         encode_usb_pcm_slots(
@@ -953,7 +1022,8 @@ mod pcm_ring_hold_tests {
         slot.queued_music_frames = 96;
         slot.queued_epoch = 3;
         slot.in_flight = true;
-
+        slot.publish_completion_for_test();
+        assert!(slot.take_completion().is_some());
         slot.mark_completed();
 
         assert_eq!(slot.queued_frame_count, 0);
@@ -1068,10 +1138,16 @@ mod pcm_ring_hold_tests {
         assert!((stats.output_latency_ms() - (2_496.0 * 1_000.0 / 48_000.0)).abs() < 1e-9);
 
         // A transfer that has completed is no longer in flight.
+        slots[0].publish_completion_for_test();
+        assert!(slots[0].take_completion().is_some());
         slots[0].mark_completed();
         publish_inflight_music(&slots, &stats);
         assert_eq!(stats.inflight_music_frames.load(Ordering::Relaxed), 0);
         assert_eq!(stats.output_latency_frames(), 2_400);
+        // The other two in-flight markers model submissions only, not native URBs.
+        for slot in &mut slots[1..] {
+            slot.in_flight = false;
+        }
     }
 }
 
@@ -1441,6 +1517,74 @@ mod push_stream_tests {
         assert_eq!(fresh.epoch, payload.epoch + 1);
         assert_eq!(&fresh.transfer_buffer[..16], &[0x02; 16]);
         assert!(fresh.transfer_buffer[16..].iter().all(|byte| *byte == 0x69));
+    }
+
+    #[test]
+    fn separated_implicit_gaps_rearm_with_silence_then_resume_source_in_order() {
+        let mut rig = Rig::pcm(2, 16);
+        let source: Vec<u8> = (0..96).collect();
+        rig.shared.write_bytes(&source).unwrap();
+        let before = rig.shared.ring.lock().len_samples();
+        let mut queued = vec![(); 4];
+        implicit::separated_gap_patterns_for_test(|pattern, held| {
+            assert!(held);
+            queued.pop().unwrap(); // one completed OUT slot
+            let expected: usize = pattern.iter().sum();
+            rig.scheduler.set_packet_pattern(pattern);
+            let payload = output::prepare_implicit_refill_for_test(
+                &mut rig.scheduler,
+                &rig.shared.ring,
+                &rig.shared.stats,
+                &rig.candidate,
+                held,
+            );
+            assert_eq!(payload.transfer_buffer.len(), expected);
+            assert!(payload.held && !payload.underrun);
+            assert_eq!(payload.music_frames, 0);
+            assert!(payload.transfer_buffer.iter().all(|byte| *byte == 0));
+            queued.push(()); // the production refill payload rearms that slot
+            assert_eq!(queued.len(), 4);
+            assert_eq!(rig.shared.ring.lock().len_samples(), before);
+        });
+        rig.scheduler.set_packet_pattern(vec![24, 24]);
+        let resumed = rig.prepare();
+        assert_eq!(resumed.music_frames, 12);
+        assert_eq!(resumed.transfer_buffer, source[..48]);
+        assert_eq!(rig.shared.ring.lock().len_samples(), before - 24);
+    }
+
+    #[test]
+    fn dop_usb_payload_keeps_phase_across_odd_join_underflow_and_clear() {
+        let mut rig = Rig::new(3, 24, 2, DsdTransportMode::DoP);
+        let frame_a = [0x22, 0x11, 0xee, 0x44, 0x33, 0xee];
+        let frame_b = [0x66, 0x55, 0xee, 0x88, 0x77, 0xee];
+        rig.shared.write_bytes(&frame_a).unwrap();
+        rig.shared.write_bytes(&frame_b).unwrap(); // odd-frame track join
+        rig.scheduler.set_packet_pattern(vec![18]); // two music frames, then one underrun
+        let first = rig.prepare();
+        assert!(first.underrun);
+        assert_eq!(first.music_frames, 2);
+        assert_eq!(
+            first.transfer_buffer,
+            [
+                0x22, 0x11, 0x05, 0x44, 0x33, 0x05, 0x66, 0x55, 0xfa, 0x88, 0x77, 0xfa, 0x69, 0x69,
+                0x05, 0x69, 0x69, 0x05
+            ]
+        );
+        rig.shared.ring.lock().clear();
+        rig.scheduler.set_packet_pattern(vec![6]);
+        let held = rig.prepare();
+        assert!(held.held);
+        assert_eq!(held.transfer_buffer, [0x69, 0x69, 0xfa, 0x69, 0x69, 0xfa]);
+        rig.shared.write_bytes(&frame_a).unwrap();
+        rig.shared.drain(); // permit the short post-clear tail
+        rig.scheduler.set_packet_pattern(vec![6]);
+        let resumed = rig.prepare();
+        assert_eq!(resumed.music_frames, 1);
+        assert_eq!(
+            resumed.transfer_buffer,
+            [0x22, 0x11, 0x05, 0x44, 0x33, 0x05]
+        );
     }
 
     #[test]

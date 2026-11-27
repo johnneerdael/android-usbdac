@@ -119,14 +119,17 @@ pub(crate) struct DacShared {
     pub(crate) config: DacConfig,
     closed: AtomicBool,
     pub(crate) control_guard: Mutex<()>,
+    close_volume: Mutex<Option<CloseVolume>>,
     pub(crate) stream: Mutex<Option<Weak<StreamInner>>>,
     reconfigure: Mutex<Option<Arc<()>>>,
+    reconfigure_unusable: AtomicBool,
     last_feedback_stream: Mutex<Option<(StreamFormat, Arc<transport::RuntimeStats>)>>,
 }
 
 struct ReconfigureReservation<'a> {
     shared: &'a DacShared,
     token: Arc<()>,
+    terminal_on_drop: bool,
 }
 
 impl Drop for ReconfigureReservation<'_> {
@@ -137,13 +140,23 @@ impl Drop for ReconfigureReservation<'_> {
             .is_some_and(|token| Arc::ptr_eq(token, &self.token))
         {
             *reservation = None;
+            if self.terminal_on_drop && !self.shared.closed.load(Ordering::Acquire) {
+                self.shared
+                    .reconfigure_unusable
+                    .store(true, Ordering::Release);
+            }
         }
     }
 }
 
 impl DacShared {
     pub(crate) fn reject_reconfigure(&self) -> Result<()> {
-        if self.reconfigure.lock().is_some() {
+        let reservation = self.reconfigure.lock();
+        if self.reconfigure_unusable.load(Ordering::Acquire) {
+            Err(Error::ReconfigureUnusable(
+                "explicit close required after failed reconfiguration".into(),
+            ))
+        } else if reservation.is_some() {
             Err(Error::Busy)
         } else {
             Ok(())
@@ -197,7 +210,7 @@ impl DacShared {
         let action = if self.events.device_lost() {
             transport::api::ORIGINAL_VOLUME_ACTION_FORGET
         } else {
-            match volume {
+            match volume.or_else(|| self.close_volume.lock().take()) {
                 Some(CloseVolume::Restore) => transport::api::ORIGINAL_VOLUME_ACTION_RESTORE,
                 Some(CloseVolume::Keep) => transport::api::ORIGINAL_VOLUME_ACTION_KEEP,
                 Some(CloseVolume::Forget) => transport::api::ORIGINAL_VOLUME_ACTION_FORGET,
@@ -330,8 +343,10 @@ impl Dac {
                 config,
                 closed: AtomicBool::new(false),
                 control_guard: Mutex::new(()),
+                close_volume: Mutex::new(None),
                 stream: Mutex::new(None),
                 reconfigure: Mutex::new(None),
+                reconfigure_unusable: AtomicBool::new(false),
                 last_feedback_stream: Mutex::new(None),
             }),
         })
@@ -449,8 +464,10 @@ impl Dac {
                 config,
                 closed: AtomicBool::new(false),
                 control_guard: Mutex::new(()),
+                close_volume: Mutex::new(None),
                 stream: Mutex::new(None),
                 reconfigure: Mutex::new(None),
+                reconfigure_unusable: AtomicBool::new(false),
                 last_feedback_stream: Mutex::new(None),
             }),
         })
@@ -501,8 +518,10 @@ impl Dac {
                 config,
                 closed: AtomicBool::new(false),
                 control_guard: Mutex::new(()),
+                close_volume: Mutex::new(None),
                 stream: Mutex::new(None),
                 reconfigure: Mutex::new(None),
+                reconfigure_unusable: AtomicBool::new(false),
                 last_feedback_stream: Mutex::new(None),
             }),
         })
@@ -619,6 +638,7 @@ impl Dac {
     /// an implicit physical reopen. No volume initialization/hand-back occurs. Success or rollback
     /// returns a paused replacement with zero-based counters; supply/reseek PCM and explicitly play.
     /// A rollback failure returns `ReconfigureUnusable` and requires closing the DAC.
+    /// While draining, routing and negotiation return `Busy`; volume remains available.
     pub fn reconfigure_stream(
         &self,
         current: &DacStream,
@@ -656,9 +676,10 @@ impl Dac {
         }
         let token = Arc::new(());
         *self.shared.reconfigure.lock() = Some(Arc::clone(&token));
-        let reservation = ReconfigureReservation {
+        let mut reservation = ReconfigureReservation {
             shared: &self.shared,
             token,
+            terminal_on_drop: false,
         };
         let previous = current.format().request;
         let deadline = std::time::Instant::now()
@@ -674,6 +695,7 @@ impl Dac {
         drop(control);
         while !current.is_drained() {
             if self.shared.events.device_lost() || self.shared.closed.load(Ordering::Acquire) {
+                reservation.terminal_on_drop = true;
                 return Err(Error::ReconfigureUnusable(
                     "DAC closed or detached during drain".into(),
                 ));
@@ -682,6 +704,7 @@ impl Dac {
                 current.state(),
                 crate::StreamState::Failed | crate::StreamState::Closed
             ) {
+                reservation.terminal_on_drop = true;
                 return Err(Error::ReconfigureUnusable("original stream failed during drain; retained stream remains available for explicit close".into()));
             }
             if std::time::Instant::now() >= deadline {
@@ -689,6 +712,7 @@ impl Dac {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        reservation.terminal_on_drop = true;
         let _control = self.shared.control_guard.lock();
         self.shared.ensure_open()?;
         let retirement = current.lock_retirement();
@@ -784,6 +808,7 @@ impl Dac {
             };
         let (stream, rollback_cause) =
             reconfigure_candidates_or_restore(requests, &previous, &mut attempt)?;
+        reservation.terminal_on_drop = false;
         Ok(StreamReconfiguration {
             stream,
             rollback_cause,
@@ -854,6 +879,35 @@ impl Dac {
     /// listener gets those events too.
     pub fn set_listener(&self, listener: Option<Arc<dyn DacListener>>) {
         self.shared.events.set_dac_listener(listener);
+    }
+
+    /// Select the routing hand-back policy independently of volume hand-back.
+    /// The policy remains attached to this owner if USB retirement is delayed.
+    pub fn set_routing_hand_back(&self, hand_back: HandBack) -> Result<()> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.ensure_open()?;
+        self.store_routing_hand_back(hand_back);
+        Ok(())
+    }
+
+    fn store_routing_hand_back(&self, hand_back: HandBack) {
+        self.shared.context.routing_hand_back.store(
+            match hand_back {
+                HandBack::Keep => 1,
+                HandBack::RestoreOriginal => 2,
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// Set host close policies that remain effective when the last owner drops later.
+    #[doc(hidden)]
+    pub fn set_close_hand_back(&self, volume: CloseVolume, routing: HandBack) -> Result<()> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.ensure_open()?;
+        *self.shared.close_volume.lock() = Some(volume);
+        self.store_routing_hand_back(routing);
+        Ok(())
     }
 
     /// Closes the DAC: stops the stream if one is open, hands the volume back
@@ -985,8 +1039,10 @@ mod tests {
                 config,
                 closed: AtomicBool::new(false),
                 control_guard: Mutex::new(()),
+                close_volume: Mutex::new(None),
                 stream: Mutex::new(None),
                 reconfigure: Mutex::new(None),
+                reconfigure_unusable: AtomicBool::new(false),
                 last_feedback_stream: Mutex::new(None),
             }),
         }
@@ -1001,6 +1057,33 @@ mod tests {
         crate::transport::volume_hw::write_volume_db(-40.0).unwrap();
         assert_ne!(fake.raw(), vec![ORIGINAL_RAW; 2]);
         fake
+    }
+
+    #[test]
+    fn host_close_override_is_used_on_drop() {
+        use crate::transport::fake_dac::ORIGINAL_RAW;
+        let fake = lowered_with_a_record();
+        let dac = fake_dac_handle(DacConfig {
+            hand_back: HandBack::Keep,
+            ..DacConfig::default()
+        });
+        dac.set_close_hand_back(CloseVolume::Restore, HandBack::Keep)
+            .unwrap();
+        drop(dac);
+        assert_eq!(fake.raw(), vec![ORIGINAL_RAW; 2]);
+        assert!(!fake.original_recorded());
+    }
+
+    #[test]
+    fn explicit_close_with_overrides_host_close_policy() {
+        let fake = lowered_with_a_record();
+        let lowered = fake.raw();
+        let dac = fake_dac_handle(DacConfig::default());
+        dac.set_close_hand_back(CloseVolume::Restore, HandBack::Keep)
+            .unwrap();
+        dac.close_with(CloseVolume::Keep).unwrap();
+        assert_eq!(fake.raw(), lowered);
+        assert!(fake.original_recorded());
     }
 
     #[test]
@@ -1174,8 +1257,10 @@ mod tests {
             config: DacConfig::default(),
             closed: AtomicBool::new(false),
             control_guard: Mutex::new(()),
+            close_volume: Mutex::new(None),
             stream: Mutex::new(None),
             reconfigure: Mutex::new(None),
+            reconfigure_unusable: AtomicBool::new(false),
             last_feedback_stream: Mutex::new(None),
         });
         let volume = VolumeControl::new(shared.clone());
@@ -1281,6 +1366,7 @@ mod tests {
         let reservation = ReconfigureReservation {
             shared: &dac.shared,
             token,
+            terminal_on_drop: false,
         };
         drop(control);
         std::thread::scope(|scope| {
@@ -1307,10 +1393,35 @@ mod tests {
         let reservation = ReconfigureReservation {
             shared: &dac.shared,
             token,
+            terminal_on_drop: false,
         };
         assert!(matches!(dac.shared.reject_reconfigure(), Err(Error::Busy)));
         drop(reservation);
         assert!(dac.shared.reject_reconfigure().is_ok());
+        dac.close().unwrap();
+        drop(fake);
+    }
+
+    #[test]
+    fn terminal_reconfigure_reservation_fences_until_close() {
+        let fake = transport::fake_dac::Registered::new(false, true);
+        let dac = fake_dac_handle(DacConfig::default());
+        let token = Arc::new(());
+        *dac.shared.reconfigure.lock() = Some(token.clone());
+        let reservation = ReconfigureReservation {
+            shared: &dac.shared,
+            token,
+            terminal_on_drop: true,
+        };
+        drop(reservation);
+        assert!(matches!(
+            dac.shared.reject_reconfigure(),
+            Err(Error::ReconfigureUnusable(_))
+        ));
+        assert!(matches!(
+            dac.negotiate(&StreamRequest::pcm(48_000, 2, 16)),
+            Err(Error::ReconfigureUnusable(_))
+        ));
         dac.close().unwrap();
         drop(fake);
     }

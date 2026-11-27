@@ -171,7 +171,9 @@ pub struct DacConfig {
     pub async_fallback_policy: AsyncFallbackPolicy,
     /// Permit the unverified clock tier only after an acknowledged SET.
     pub clock_readback_policy: ClockReadbackPolicy,
-    /// Adapt active URB count to loss, bounded by 64 ms and 255 packets.
+    /// Adapt active URB count by up to two slots per loss batch and shrink one
+    /// slot after a quiet period, bounded by 64 ms and 255 packets.
+    /// Default geometry reaches at most 30 ms at 125 µs intervals, 32 ms otherwise.
     pub adaptive_queue: bool,
     /// Disable explicit and implicit feedback for diagnosis. Default `false`.
     /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.

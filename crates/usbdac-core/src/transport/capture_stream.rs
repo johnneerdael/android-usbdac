@@ -2772,9 +2772,14 @@ impl FeedforwardPool {
     }
     pub(super) fn start(
         &mut self,
-        handle: &DeviceHandle<Context>,
+        claimed: &ClaimedHandle,
         stop: &AtomicBool,
     ) -> Result<(), Error> {
+        let owner = claimed.transfer_owner();
+        for slot in &mut self.slots {
+            slot.retain_owner(owner.clone());
+        }
+        let handle = &claimed.handle;
         for index in 0..self.slots.len() {
             if usb_stop_requested(stop) {
                 break;
@@ -2993,7 +2998,12 @@ impl NominalCapturePool {
                 }
             })
     }
-    fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+    fn start(&mut self, claimed: &ClaimedHandle, stop: &AtomicBool) -> Result<(), Error> {
+        let owner = claimed.transfer_owner();
+        for slot in &mut self.slots {
+            slot.retain_owner(owner.clone());
+        }
+        let handle = &claimed.handle;
         for index in 0..self.slots.len() {
             if usb_stop_requested(stop) {
                 break;
@@ -3269,19 +3279,21 @@ fn run_capture(
         ..
     } = &mut batch;
     if let Some(pool) = companion.as_mut() {
-        pool.start(&owner.claimed().handle, stop)?;
+        pool.start(owner.claimed(), stop)?;
     }
     if let Some(pool) = feedforward.as_mut() {
-        pool.start(&owner.claimed().handle, stop)?;
+        pool.start(owner.claimed(), stop)?;
     }
     if usb_stop_requested(stop) {
         return Ok(());
     }
     audio_status.arm_endpoint(owner.claimed(), endpoint.address)?;
+    let transfer_owner = owner.claimed().transfer_owner();
     for (index, slot) in slots.iter_mut().enumerate() {
         if usb_stop_requested(stop) {
             return Ok(());
         }
+        slot.retain_owner(transfer_owner.clone());
         slot.submit_capture(
             &owner.claimed().handle,
             endpoint.address,

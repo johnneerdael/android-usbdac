@@ -168,14 +168,36 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     let Some(model) = model else {
         return negotiate_impl(request, None, true);
     };
-    let mut rates = negotiate::rates_for_format(&model, requested);
+    let rates = negotiate::rates_for_format(&model, requested);
+    let mut batch = negotiate::RetryBaseline::new(owner);
+    let mut format = negotiate_ranked(
+        request,
+        rates,
+        owner,
+        retained_usb_handle_identity,
+        |candidate| negotiate_attempt(candidate, &mut batch, owner),
+    )?;
+    format.request = *request;
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.requested_playback_format = Some(requested);
+    }
+    Ok(format)
+}
+
+// Shared by the real retained-owner entry and its serialized callback probe.
+// Each callback represents a complete attempt including mandatory restoration.
+fn negotiate_ranked<T>(
+    request: &StreamRequest,
+    mut rates: Vec<u32>,
+    owner: usize,
+    mut current_owner: impl FnMut() -> Option<usize>,
+    mut attempt: impl FnMut(&StreamRequest) -> Result<T, AttemptFailure>,
+) -> Result<T, Error> {
     rates.push(request.sample_rate);
     negotiate::rank_sample_rates(&mut rates, request.sample_rate);
-    let mut batch = negotiate::RetryBaseline::new(owner);
     let mut initial_error = None;
     let started = Instant::now();
     for (attempts, rate) in rates.into_iter().enumerate() {
-        // Never interrupt an in-flight attempt or its mandatory restoration.
         if !ranked_attempt_available(attempts, started.elapsed()) {
             return Err(Error::Unsupported {
                 reason: format!("ranked rate attempt limit reached after {attempts} candidates; first refusal: {}",
@@ -183,16 +205,22 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
                 offered: offered_alt_settings(),
             });
         }
+        if current_owner() != Some(owner) {
+            return Err(Error::InvalidState(
+                "retained USB owner changed between candidates".into(),
+            ));
+        }
         let mut candidate = *request;
         candidate.sample_rate = rate;
         candidate.rate_policy = RatePolicy::Exact;
-        match negotiate_attempt(&candidate, &mut batch, owner) {
-            Ok(mut format) => {
-                format.request = *request;
-                if let Some(state) = SESSION_STATE.lock().as_mut() {
-                    state.requested_playback_format = Some(requested);
+        match attempt(&candidate) {
+            Ok(result) => {
+                if current_owner() != Some(owner) {
+                    return Err(Error::InvalidState(
+                        "retained USB owner changed during candidate".into(),
+                    ));
                 }
-                return Ok(format);
+                return Ok(result);
             }
             Err(failure) => {
                 if failure.clean.is_some_and(|proof| proof.belongs_to(owner)) {
@@ -788,9 +816,228 @@ pub(crate) fn await_usb_retirement(timeout: Duration) -> bool {
     wait_for_session_stop(timeout) && !super::session::session_registered()
 }
 
+/// Exercise the production PCM shape, rate and packet predicates against a synthetic alternate.
+/// Values: request rate/channels/depth/format, alternate channels/depth/slot/format,
+/// interval/capacity/pacing, discrete-rate flag, range min/max/step. Format: 0 signed, 1 u8, 2 float.
+#[doc(hidden)]
+pub fn pcm_admission_probe(v: &[u32]) -> bool {
+    if v.len() != 15
+        || v[0] == 0
+        || v[1] == 0
+        || v[1] > 32
+        || v[4] > u16::MAX as u32
+        || v[2] > u8::MAX as u32
+        || v[5] > u8::MAX as u32
+        || v[6] == 0
+        || v[6] > 4
+        || v[5] == 0
+        || v[5] > v[6] * 8
+        || v[8] == 0
+        || v[9] == 0
+        || v[10] == 0
+        || (v[3] == 1 && (v[2] != 8 || v[6] != 1))
+        || (v[3] == 2 && (v[2] != 32 || v[6] != 4))
+    {
+        return false;
+    }
+    let encoding = match v[3] {
+        0 => PcmEncoding::Signed,
+        1 => PcmEncoding::Unsigned8,
+        2 => PcmEncoding::Float32,
+        _ => return false,
+    };
+    let tag = match v[7] {
+        0 => FORMAT_TAG_PCM,
+        1 => FORMAT_TAG_PCM8,
+        2 => FORMAT_TAG_IEEE_FLOAT,
+        _ => return false,
+    };
+    let format = PlaybackFormat {
+        pcm_encoding: encoding,
+        sample_rate: v[0],
+        bit_depth: v[2] as u8,
+        channels: v[1] as u16,
+        is_dop: false,
+        dsd_transport: DsdTransportMode::None,
+        dsd_bit_rate: 0,
+    };
+    let candidate = IsoStreamCandidate {
+        configuration_number: 1,
+        interface_number: 1,
+        alt_setting: 1,
+        endpoint_address: 1,
+        endpoint_interval: 1,
+        service_interval_us: v[8],
+        usb_speed: Speed::High,
+        max_packet_bytes: v[9] as usize,
+        sync_type: SyncType::Adaptive,
+        usage_type: UsageType::Data,
+        format_tag: tag,
+        uac2_formats: None,
+        native_dsd: None,
+        channels: v[4] as u16,
+        subslot_size: v[6] as u8,
+        bit_resolution: v[5] as u8,
+        sample_rates: vec![],
+        refresh: 0,
+        synch_address: 0,
+        feedback_endpoint: None,
+        implicit_feedback: None,
+        terminal_link: None,
+        is_uac1: false,
+    };
+    let range = SamplingFrequencySubrange {
+        min: v[12],
+        max: v[13],
+        res: v[14],
+    };
+    validate_transport_against_playback_format(&candidate, format).is_ok()
+        && (v[11] != 0 || sampling_frequency_ranges_support_rate(&[range], v[0]))
+        && candidate.max_packet_bytes
+            >= required_max_packet_bytes(v[0], v[8], v[4] as usize * v[6] as usize)
+}
+
 #[cfg(test)]
 mod dsd_summary_tests {
     use super::*;
+
+    // Serialized coordinator probe: this exercises the production retry loop,
+    // not libusb, a physical device, or the separate QEMU acceptance gate.
+    #[test]
+    fn retained_owner_ranked_callback_probe() {
+        use std::cell::{Cell, RefCell};
+        let owner = 0x1234;
+        let unavailable = || Error::Unsupported {
+            reason: "rate excluded".into(),
+            offered: vec![],
+        };
+        for (requested, supported, expected) in [
+            (192_000, vec![48_000, 96_000], 96_000),
+            (44_100, vec![48_000], 48_000),
+        ] {
+            let request =
+                StreamRequest::pcm(requested, 2, 16).with_rate_policy(RatePolicy::NearestSupported);
+            let calls = RefCell::new(Vec::new());
+            let result = negotiate_ranked(
+                &request,
+                supported.clone(),
+                owner,
+                || Some(owner),
+                |candidate| {
+                    assert_eq!(candidate.rate_policy, RatePolicy::Exact);
+                    calls.borrow_mut().push(candidate.sample_rate);
+                    if supported.contains(&candidate.sample_rate) {
+                        Ok((candidate.sample_rate, owner)) // clock result belongs to retained owner
+                    } else {
+                        Err(AttemptFailure {
+                            error: unavailable(),
+                            clean: Some(CleanIdle { owner }),
+                        })
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(result, (expected, owner));
+            assert_eq!(*calls.borrow(), vec![requested, expected]);
+        }
+
+        let request =
+            StreamRequest::pcm(192_000, 2, 16).with_rate_policy(RatePolicy::NearestSupported);
+        let calls = Cell::new(0);
+        let wrong_proof = negotiate_ranked::<()>(
+            &request,
+            vec![96_000],
+            owner,
+            || Some(owner),
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(AttemptFailure {
+                    error: unavailable(),
+                    clean: Some(CleanIdle { owner: owner + 1 }),
+                })
+            },
+        );
+        assert!(matches!(wrong_proof, Err(Error::Unsupported { .. })));
+        assert_eq!(calls.get(), 1);
+
+        // An ordinary mismatch without a certificate, uncertain restoration,
+        // failed claim and disconnect must all terminate without a retry.
+        for error in [
+            unavailable(),
+            Error::Transfer("restore uncertain".into()),
+            Error::Claim("claim".into()),
+            Error::DeviceLost,
+        ] {
+            let calls = Cell::new(0);
+            let result = negotiate_ranked::<()>(
+                &request,
+                vec![96_000],
+                owner,
+                || Some(owner),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Err(AttemptFailure {
+                        error: error.clone(),
+                        clean: None,
+                    })
+                },
+            );
+            assert_eq!(result, Err(error));
+            assert_eq!(calls.get(), 1);
+        }
+
+        let reads = Cell::new(0);
+        let calls = Cell::new(0);
+        let result = negotiate_ranked::<()>(
+            &request,
+            vec![96_000],
+            owner,
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n == 0 {
+                    Some(owner)
+                } else {
+                    Some(owner + 1)
+                }
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(AttemptFailure {
+                    error: unavailable(),
+                    clean: Some(CleanIdle { owner }),
+                })
+            },
+        );
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+        assert_eq!(calls.get(), 1);
+
+        let result = negotiate_ranked::<()>(
+            &request,
+            vec![96_000],
+            owner,
+            || Some(owner + 1),
+            |_| unreachable!(),
+        );
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+        let reads = Cell::new(0);
+        let result = negotiate_ranked(
+            &request,
+            vec![96_000],
+            owner,
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                if n == 0 {
+                    Some(owner)
+                } else {
+                    None
+                }
+            },
+            |_| Ok((96_000, owner)),
+        );
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+    }
 
     #[test]
     fn ranked_pcm_entry_rejects_unbounded_duplicate_and_non_exact_requests() {

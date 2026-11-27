@@ -1001,6 +1001,48 @@ mod tests {
     }
 
     #[test]
+    fn phase_reversal_can_clip_with_default_headroom() {
+        for quality in [super::super::Quality::High, super::super::Quality::Fast] {
+            let input: Vec<u8> = (0..8192)
+                .flat_map(|n| {
+                    let phase = 2.0 * std::f64::consts::PI * 19_000.0 * n as f64 / 44_100.0;
+                    let sign = if (n / 256) % 2 == 0 { 1.0 } else { -1.0 };
+                    ((phase.sin().signum() * sign * 32767.0) as i16).to_le_bytes()
+                })
+                .collect();
+            let source = fmt(44_100, 1, SampleFormat::I16);
+            let options = ConvertOptions {
+                quality,
+                narrowing: Narrowing::Truncate,
+                ..ConvertOptions::default()
+            };
+            let mut floating = converter(source, fmt(48_000, 1, SampleFormat::Float32), options);
+            let floats = convert_all(&mut floating, &input, 4096, 8192);
+            let peak = floats
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()).abs())
+                .fold(0.0f32, f32::max);
+            let mut integer = converter(source, fmt(48_000, 1, SampleFormat::I16), options);
+            let ints = convert_all(&mut integer, &input, 4096, 8192);
+            println!(
+                "{quality:?} phase reversal peak {peak}, clips {}",
+                integer.clipped_samples()
+            );
+            assert!(peak > 1.0 && integer.clipped_samples() > 0);
+            for (f, i) in floats.chunks_exact(4).zip(ints.chunks_exact(2)) {
+                let f = f32::from_le_bytes(f.try_into().unwrap());
+                let i = i16::from_le_bytes(i.try_into().unwrap());
+                if f > 1.0 {
+                    assert_eq!(i, i16::MAX);
+                }
+                if f < -1.0 {
+                    assert_eq!(i, i16::MIN);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_full_scale_sine_is_not_clipped_with_a_float_or_a_truncating_16_bit_target() {
         // Within the passband the filter's ripple is about 3e-6, less than one 16-bit step at full scale.
         for hz in [100.0, 1_000.0, 10_000.0, 19_000.0] {

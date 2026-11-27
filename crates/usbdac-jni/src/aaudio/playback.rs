@@ -24,9 +24,11 @@
 //! reported is made monotonic between flushes.
 
 use super::logic::{AaudioError, OpenRequest};
-use super::ring::SpscRing;
+use super::ring::{self, Consumer, SpscRing};
 use parking_lot::Mutex;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The largest ring the output will allocate.
 pub const MAX_RING_BYTES: usize = 64 * 1024 * 1024;
@@ -59,16 +61,46 @@ pub enum State {
     Failed = 6,
 }
 
-#[derive(Default)]
 struct Producer {
+    ring: ring::Producer,
     /// Frames accepted since the stream opened.
     written: u64,
     /// `written` at the last flush.
     written_at_flush: u64,
 }
 
+// The callback never waits: a concurrent invocation emits silence instead.
+struct CallbackConsumer {
+    active: AtomicBool,
+    consumer: UnsafeCell<Consumer>,
+}
+// SAFETY: access to the sole consumer is guarded by `active`; release/acquire
+// also orders access between successive callbacks.
+unsafe impl Sync for CallbackConsumer {}
+impl CallbackConsumer {
+    fn with<R>(&self, f: impl FnOnce(&mut Consumer) -> R) -> Option<R> {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _release = Release(&self.active);
+        // SAFETY: the atomic guard grants exclusive access until `_release` drops.
+        Some(f(unsafe { &mut *self.consumer.get() }))
+    }
+}
+
 pub struct Playback {
-    ring: SpscRing,
+    ring: Arc<SpscRing>,
+    callback: CallbackConsumer,
     frame_bytes: usize,
     target_frames: u64,
     start_frames: u64,
@@ -113,12 +145,21 @@ impl Playback {
                     MAX_RING_BYTES >> 20
                 ))
             })?;
+        let (ring, producer, consumer) = ring::split(capacity_bytes);
         Ok(Self {
-            ring: SpscRing::new(capacity_bytes),
+            ring,
+            callback: CallbackConsumer {
+                active: AtomicBool::new(false),
+                consumer: UnsafeCell::new(consumer),
+            },
             frame_bytes,
             target_frames: request.frames_for_ms(request.buffer_target_ms).max(1),
             start_frames: request.frames_for_ms(request.start_threshold_ms).max(1),
-            producer: Mutex::new(Producer::default()),
+            producer: Mutex::new(Producer {
+                ring: producer,
+                written: 0,
+                written_at_flush: 0,
+            }),
             paused: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -144,6 +185,15 @@ impl Playback {
 
     /// Fills `out` (whole frames) for the device. Real-time: no lock, no allocation.
     pub fn render(&self, out: &mut [u8]) -> Callback {
+        self.callback
+            .with(|consumer| self.render_inner(consumer, out))
+            .unwrap_or_else(|| {
+                out.fill(0);
+                Callback::Continue
+            })
+    }
+
+    fn render_inner(&self, consumer: &mut Consumer, out: &mut [u8]) -> Callback {
         let frame_bytes = self.frame_bytes;
         let whole = out.len() / frame_bytes * frame_bytes;
         let (out, tail) = out.split_at_mut(whole);
@@ -152,7 +202,7 @@ impl Playback {
         // A flush the host asked for since the last callback.
         let requested = self.flush_requested.load(Ordering::Acquire);
         if requested != self.flush_applied.load(Ordering::Relaxed) {
-            self.ring.apply_discard();
+            consumer.apply_discard();
             self.flush_mark
                 .store(self.music.load(Ordering::Relaxed), Ordering::Relaxed);
             self.playing.store(false, Ordering::Relaxed);
@@ -181,7 +231,7 @@ impl Playback {
 
         let mut music = 0u64;
         if self.playing.load(Ordering::Relaxed) {
-            let taken = self.ring.read(out);
+            let taken = consumer.read(out);
             music = (taken / frame_bytes) as u64;
             out[taken..].fill(0);
             if taken < out.len() && !draining {
@@ -215,7 +265,7 @@ impl Playback {
         let mut producer = self.producer.lock();
         let free = self.ring.free() / self.frame_bytes * self.frame_bytes;
         let take = whole.min(free);
-        let taken = self.ring.write(&bytes[..take]);
+        let taken = producer.ring.write(&bytes[..take]);
         producer.written += (taken / self.frame_bytes) as u64;
         Ok(taken)
     }
@@ -263,7 +313,7 @@ impl Playback {
     /// still plays, and is not counted.
     pub fn flush(&self) {
         let mut producer = self.producer.lock();
-        self.ring.request_discard_all();
+        producer.ring.request_discard_all();
         producer.written_at_flush = producer.written;
         self.draining.store(false, Ordering::Release);
         self.reported.store(0, Ordering::Relaxed);

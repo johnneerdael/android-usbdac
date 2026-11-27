@@ -53,20 +53,32 @@ class DopInputOutputTest {
         assertEquals(listOf(1,2,3,4,5,6,7,8), target.received.map { it.toInt() and 255 })
     }
 
-    @Test fun malformedFrameBeyondFirstBatchDoesNotConsumeInputOrAdvancePhase() {
+    @Test fun markerResetPreservesPendingAudioAcrossOddTrackJoin() {
+        val target = RecordingOutput().apply { room = 0 }
+        val output = DopInputOutput(target, 2, 3)
+        assertEquals(6, output.write(heapOf(3, 1, 5, 4, 2, 5)))
+        output.resetInputMarkerPhase()
+        target.room = 8
+        assertEquals(6, output.write(heapOf(7, 5, 5, 8, 6, 5)))
+        assertEquals(listOf(1, 2, 3, 4, 5, 6, 7, 8), target.received.map { it.toInt() and 255 })
+    }
+
+    @Test fun malformedFrameBeyondFirstBatchDoesNotBlockEarlierFrames() {
         val target = RecordingOutput()
         val output = DopInputOutput(target, 2, 3)
-        val input = java.nio.ByteBuffer.allocate(100_000)
-        repeat(16_000) { frame ->
+        val input = java.nio.ByteBuffer.allocate(110_000)
+        repeat(17_000) { frame ->
             val marker = if (frame % 2 == 0) 5 else 0xfa
             input.put(3).put(1).put(marker.toByte()).put(4).put(2).put(marker.toByte())
         }
         input.put(3).put(1).put(0).put(4).put(2).put(0)
         input.flip()
+        assertTrue(output.write(input) > 0)
+        val accepted = input.position()
         val error = assertThrows(DacException::class.java) { output.write(input) }
         assertEquals(DacErrorCode.INVALID_ARGUMENT, error.code)
-        assertEquals(0, input.position())
-        assertTrue(target.received.isEmpty())
+        assertEquals(accepted, input.position())
+        output.resetInputMarkerPhase()
         assertEquals(6, output.write(heapOf(3, 1, 5, 4, 2, 5)))
     }
 

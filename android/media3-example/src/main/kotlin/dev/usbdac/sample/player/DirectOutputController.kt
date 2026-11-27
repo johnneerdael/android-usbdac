@@ -39,7 +39,7 @@ class DirectOutputController(
     private val lock = Any()
     private val selectors = MutableStateFlow(OutputSelector(context, settings.toPolicy()))
     @Volatile
-    private var supportSnapshot = selectors.value.managedPcmFallbackSnapshot()
+    private var supportSnapshot = selectors.value.pcmSupportSnapshot()
     private var current: OpenedOutput? = null
     private var watching: Job? = null
     private var multiplier = 1f
@@ -73,24 +73,25 @@ class DirectOutputController(
     fun apply(settings: DirectOutputSettings) {
         val selector = OutputSelector(context, settings.toPolicy())
         selectors.value = selector
-        supportSnapshot = selector.managedPcmFallbackSnapshot()
+        supportSnapshot = selector.pcmSupportSnapshot()
         lookAgain = true
     }
 
     /** Call when [changes] fires. */
     fun onChanged() {
-        supportSnapshot = selectors.value.managedPcmFallbackSnapshot()
+        selectors.value.invalidatePcmSupport()
+        supportSnapshot = selectors.value.pcmSupportSnapshot()
         lookAgain = true
     }
 
     override fun takeLookAgain(): Boolean = lookAgain.also { lookAgain = false }
 
-    override fun formatSupport(request: StreamRequest): OutputSupport =
-        if (supportSnapshot.supports(request)) {
-            // The selector can choose a direct converter before this managed fallback.
-            OutputSupport(OutputFormatSupport.WITH_TRANSCODING, request, null,
-                "managed PCM fallback is available; a higher-priority route may process samples")
-        } else OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no cached compatible fallback")
+    override fun formatSupport(request: StreamRequest): OutputSupport = when (supportSnapshot.support(request)) {
+        OutputSelector.PcmSupport.DIRECT -> OutputSupport(OutputFormatSupport.DIRECT, request, request, "cached USB alternate")
+        OutputSelector.PcmSupport.WITH_PROCESSING -> OutputSupport(OutputFormatSupport.WITH_TRANSCODING, request)
+        OutputSelector.PcmSupport.UNKNOWN -> OutputSupport(OutputFormatSupport.UNKNOWN, request)
+        OutputSelector.PcmSupport.UNSUPPORTED -> OutputSupport(OutputFormatSupport.UNSUPPORTED, request)
+    }
     // endregion
 
     // region controller-open
@@ -98,6 +99,7 @@ class DirectOutputController(
         check(current == null) { "close the output in use before opening another" }
         lookAgain = false
         val selected = selectors.value.open(request)
+        supportSnapshot = selectors.value.pcmSupportSnapshot()
         val opened = OpenedOutput(selected, selected.format, request, selected)
         current = opened
         mutableSelected.value = selected
@@ -117,6 +119,9 @@ class DirectOutputController(
             ?.launchIn(scope)
         opened
     }
+
+    override fun canRecover(error: DacException): Boolean =
+        error.code == DacErrorCode.DEVICE_LOST || error.code == DacErrorCode.TRANSFER
 
     override fun close(output: OpenedOutput) = synchronized(lock) {
         watching?.cancel()

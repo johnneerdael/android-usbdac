@@ -1006,7 +1006,11 @@ numbers in the two bytes of `wValue`. Query programmable crosspoint
 limits through separate GET_MIN, GET_MAX and GET_RES responses before
 writing. A Selector Unit uses a zero `wValue` and a one-byte current
 pin. UAC2 and full ADC3 instead address a mixer by its control selector
-and zero-based MCN, with a RANGE response for limits. ADC3 mixer layouts
+and zero-based MCN (`0x0100 | MCN`), with a RANGE response for limits
+(UAC2 §5.2.5.5 and §4.7.2.6; UAC3 §5.2.1.7 and §4.5.2.5).
+ALSA uses a different encoding in its mixer implementation; changing this
+wire encoding requires a trace from the exact firmware establishing the
+necessary device-specific behavior. ADC3 mixer layouts
 use a High Capability output cluster, a programmable crosspoint bitmap,
 32-bit unit controls and a 16-bit string ID; its Selector Unit also has
 32-bit access flags. Apply the existing verified snapshot transaction

@@ -541,8 +541,9 @@ impl AudioStatus {
                     continue;
                 }
                 addresses.insert(endpoint.address());
-                let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
+                let mut slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
                     .map_err(Error::Transfer)?;
+                slot.retain_owner(claimed.transfer_owner());
                 endpoints.push(EndpointStatus {
                     control: target.control,
                     disabled: false,
@@ -680,8 +681,9 @@ impl AudioStatus {
                     ));
                 }
             }
-            let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
+            let mut slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
                 .map_err(Error::Transfer)?;
+            slot.retain_owner(claimed.transfer_owner());
             endpoints.push(EndpointStatus {
                 control: target.control,
                 disabled: false,

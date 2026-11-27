@@ -45,6 +45,7 @@ internal object Native {
     @JvmStatic external fun captureRead(capture: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     @JvmStatic external fun captureClose(capture: Long)
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
+    @JvmStatic external fun dacSetCloseHandBack(dac: Long, restoreVolume: Boolean, restoreRouting: Boolean)
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean
     @JvmStatic external fun dacRetirementToken(dac: Long): Long

@@ -415,3 +415,7 @@ cd android
 ```
 
 The native libraries are build output (`usbdac/src/main/jniLibs`, ignored by git). An AAR built with `-Pusbdac.abis` or `-Pusbdac.skipNative=true` lacks ABIs or the library altogether: do not publish it.
+
+## Migrating 0.1.10 callers
+
+`OutputPolicy.allowConversion` defaults to `true`; set it to `false` to disallow lossy PCM conversion; lossless widening remains separately enabled by default and can be disabled with `allowWidening = false`. DoP-to-PCM requires both conversion and the separate `allowDopPcmConversion` opt-in, which defaults to `false`. Review application policy explicitly when upgrading. Kotlin `OutputSelector.PcmSupport` includes `UNKNOWN`: handle it as permission to attempt opening, not a guarantee of direct support. Custom Media3 `OutputSource` implementations that do not override `formatSupport` return an unknown verdict that permits an open attempt.

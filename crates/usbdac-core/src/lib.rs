@@ -60,12 +60,14 @@ mod format;
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod hotplug;
-/// Read-only, same-fd BADD fixed-rate proof used by Android preclaim fallback.
 #[doc(hidden)]
-pub use transport::badd_descriptor_witness;
+pub use transport::api::pcm_admission_probe;
 /// Shared rate ordering used by the automatic selector and USB negotiation.
 #[doc(hidden)]
 pub use transport::negotiate::rank_sample_rates;
+/// Read-only, same-fd BADD fixed-rate proof used by Android preclaim fallback.
+#[doc(hidden)]
+pub use transport::{badd_descriptor_witness, try_badd_descriptor_witness};
 
 mod iso_packet_scheduler;
 mod iso_packet_validation;

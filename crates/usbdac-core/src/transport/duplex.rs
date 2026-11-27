@@ -508,6 +508,19 @@ fn independent_direct_clocks(
         && input.control_interface != output.control_interface
 }
 
+// All route-shape conditions and the two resolved direct clocks must hold.
+fn independent_capture_admission(
+    route_conditions: [bool; 7],
+    input: Option<&ClockChoice>,
+    output: Option<&ClockChoice>,
+    capture_control: u8,
+) -> bool {
+    route_conditions.into_iter().all(|condition| condition)
+        && input.zip(output).is_some_and(|(input, output)| {
+            independent_direct_clocks(input, output, capture_control)
+        })
+}
+
 impl Attachment {
     pub(super) fn new(
         endpoint: CaptureEndpoint,
@@ -1018,20 +1031,20 @@ impl Attachment {
         // Restrict the first independent admission to separately owned AC
         // functions with direct, fully resolved roots and no timing companion.
         let input = input_clock(claimed, &self.endpoint);
-        let independent = !self.shared_implicit
-            && playback.implicit_feedback.is_none()
-            && !playback.is_uac1
-            && self.endpoint.protocol == 0x20
-            && self.endpoint.vendor_pcm.is_none()
-            && self.endpoint.adc3_route.is_none()
-            && self.endpoint.feedforward().is_none()
-            && self.endpoint.interface != playback.interface_number
-            && input
-                .as_ref()
-                .zip(expected.clock.as_ref())
-                .is_some_and(|(input, output)| {
-                    independent_direct_clocks(input, output, self.endpoint.control)
-                });
+        let independent = independent_capture_admission(
+            [
+                !self.shared_implicit,
+                playback.implicit_feedback.is_none(),
+                !playback.is_uac1,
+                self.endpoint.protocol == 0x20,
+                self.endpoint.vendor_pcm.is_none() && self.endpoint.adc3_route.is_none(),
+                self.endpoint.feedforward().is_none(),
+                self.endpoint.interface != playback.interface_number,
+            ],
+            input.as_ref(),
+            expected.clock.as_ref(),
+            self.endpoint.control,
+        );
         self.independent.store(independent, Ordering::Release);
         Ok(true)
     }
@@ -1459,11 +1472,16 @@ impl InputPool {
     }
     pub(super) fn start(
         &mut self,
-        handle: &DeviceHandle<Context>,
+        claimed: &ClaimedHandle,
         stop: &AtomicBool,
     ) -> Result<(), Error> {
+        let owner = claimed.transfer_owner();
+        for slot in &mut self.slots {
+            slot.retain_owner(owner.clone());
+        }
+        let handle = &claimed.handle;
         if let Some(pool) = self.feedforward.as_mut() {
-            pool.start(handle, stop)?;
+            pool.start(claimed, stop)?;
         }
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if usb_stop_requested(stop) {
@@ -1824,6 +1842,28 @@ mod tests {
                 kind: ClockHopKind::Source,
             },
         ];
+        assert!(independent_capture_admission(
+            [true; 7],
+            Some(&input),
+            Some(&output),
+            2
+        ));
+        for index in 0..7 {
+            let mut conditions = [true; 7];
+            conditions[index] = false;
+            assert!(!independent_capture_admission(
+                conditions,
+                Some(&input),
+                Some(&output),
+                2
+            ));
+        }
+        assert!(!independent_capture_admission(
+            [true; 7],
+            None,
+            Some(&output),
+            2
+        ));
         assert!(independent_direct_clocks(&input, &output, 2));
         assert!(!independent_direct_clocks(&input, &output, 3));
         output.control_interface = 2;

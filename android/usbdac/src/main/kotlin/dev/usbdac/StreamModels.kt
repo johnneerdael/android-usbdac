@@ -221,11 +221,11 @@ public data class DacStreamStats(
     val implicitInvalidPackets: Long = 0,
     val implicitMeasuredFrames: Long = 0,
     val implicitScheduledFrames: Long = 0,
-    /** Checkpoint intervals excluding event-pump time, longer than 10 ms. */
+    /** Checkpoint intervals excluding event-pump and synchronous flush-cancellation time, longer than 10 ms. */
     val workerGapOver10ms: Long = 0,
-    /** Checkpoint intervals excluding event-pump time, longer than 50 ms. */
+    /** Checkpoint intervals excluding event-pump and synchronous flush-cancellation time, longer than 50 ms. */
     val workerGapOver50ms: Long = 0,
-    /** Longest checkpoint interval excluding event-pump time, in microseconds. */
+    /** Longest checkpoint interval excluding event-pump and synchronous flush-cancellation time, in microseconds. */
     val maxWorkerGapUs: Long = 0,
     /** Adaptive USB queue depth changes since the stream started. */
     val adaptiveQueueChanges: Long = 0,
@@ -239,4 +239,10 @@ public data class DacStreamStats(
     val maxEventPumpElapsedUs: Long = 0,
     /** Largest event-pump elapsed time beyond its requested timeout, in microseconds. */
     val maxEventPumpTimeoutOverrunUs: Long = 0,
+    /** Maximum time from libusb callback to worker retirement; excludes kernel completion latency. */
+    val maxCallbackRetirementUs: Long = 0,
+    /** Playback callbacks retired more than 10 ms after publication. */
+    val callbackRetirementOver10ms: Long = 0,
+    /** Delayed callbacks that also reported lost audio frames. */
+    val callbackRetirementLossOver10ms: Long = 0,
 )

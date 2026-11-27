@@ -434,6 +434,18 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
         ),
         ("max_worker_gap_us".into(), json!(stats.max_worker_gap_us)),
         (
+            "max_callback_retirement_us".into(),
+            json!(stats.max_callback_retirement_us),
+        ),
+        (
+            "callback_retirement_over_10ms".into(),
+            json!(stats.callback_retirement_over_10ms),
+        ),
+        (
+            "callback_retirement_loss_over_10ms".into(),
+            json!(stats.callback_retirement_loss_over_10ms),
+        ),
+        (
             "max_worker_loop_gap_us".into(),
             json!(stats.max_worker_loop_gap_us),
         ),

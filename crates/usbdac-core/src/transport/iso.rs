@@ -100,7 +100,9 @@ pub(super) struct IsoTransferSlot {
     pub(super) queued_epoch: u64,
     pub(super) submitted_at: Option<Instant>,
     pub(super) in_flight: bool,
+    retirement_pending: bool,
     retirement_context: Option<Context>,
+    retirement_owner: Option<Arc<TransferOwner>>,
     /// The flush asked libusb to cancel this transfer. Cleared when it comes
     /// back, whatever its status: a transfer that finished first is still
     /// accounted as played.
@@ -162,18 +164,57 @@ pub(super) struct IsoTransferPayload {
     pub(super) epoch: u64,
 }
 
+/// Validate the complete descriptor schedule before exposing it to libusb.
+fn validate_submission_geometry(packet_sizes: &[usize], buffer_len: usize) -> Result<(), String> {
+    if packet_sizes.len() > i32::MAX as usize || buffer_len > i32::MAX as usize {
+        return Err("isochronous request exceeds libusb limits".into());
+    }
+    let total = packet_sizes
+        .iter()
+        .try_fold(0usize, |sum, &size| {
+            if size > u32::MAX as usize {
+                return None;
+            }
+            sum.checked_add(size)
+        })
+        .ok_or("invalid isochronous packet length or sum")?;
+    if total != buffer_len {
+        return Err("isochronous packet lengths do not match transfer buffer".into());
+    }
+    Ok(())
+}
+
 impl IsoTransferSlot {
+    pub(super) fn retain_owner(&mut self, owner: Arc<TransferOwner>) {
+        assert!(!self.in_flight && !self.retirement_pending);
+        self.retirement_owner = Some(owner);
+    }
+    fn require_owner(&self, handle: &DeviceHandle<Context>) -> Result<(), String> {
+        if self
+            .retirement_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(handle))
+        {
+            Ok(())
+        } else {
+            Err("transfer has no matching native owner".into())
+        }
+    }
     pub(super) fn new(
         slot_index: usize,
         packet_count: usize,
         buffer_capacity: usize,
     ) -> Result<Self, String> {
+        if packet_count > i32::MAX as usize || buffer_capacity > i32::MAX as usize {
+            return Err("invalid isochronous slot geometry".into());
+        }
         let completion = Arc::new(IsoTransferCompletion::new());
         let user_data = Box::new(IsoTransferUserData {
             completion,
             buffer: vec![0u8; buffer_capacity.max(1)],
         });
         let user_data_ptr = Box::into_raw(user_data);
+        // SAFETY: packet_count fits libusb's signed count; allocation is freed in Drop.
         let transfer = unsafe { libusb_alloc_transfer(packet_count as i32) };
 
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
@@ -198,7 +239,9 @@ impl IsoTransferSlot {
             queued_epoch: 0,
             submitted_at: None,
             in_flight: false,
+            retirement_pending: false,
             retirement_context: None,
+            retirement_owner: None,
             cancelled_for_flush: false,
         })
     }
@@ -219,8 +262,8 @@ impl IsoTransferSlot {
         mut payload: IsoTransferPayload,
         timeout_ms: u32,
     ) -> Result<(), String> {
-        if self.in_flight {
-            return Err("isochronous transfer slot already has a transfer in flight".to_string());
+        if self.in_flight || self.retirement_pending {
+            return Err("isochronous transfer slot is not retired".to_string());
         }
 
         if payload.packet_sizes.len() != self.packet_sizes.len() {
@@ -236,7 +279,11 @@ impl IsoTransferSlot {
         if endpoint & 0x80 == 0 && settings().source_has(crate::Quirk::TxLengthPrefix) {
             add_tx_length_prefix(&mut payload)?;
         }
+        validate_submission_geometry(&payload.packet_sizes, payload.transfer_buffer.len())?;
+        self.require_owner(handle)?;
         self.retirement_context = Some(handle.context().clone());
+        // SAFETY: this idle slot owns its transfer and buffer; the matching owner retains
+        // the handle and fd until the callback returns ownership, including during unwind.
         unsafe {
             let user_data = &mut *self.user_data;
             if payload.transfer_buffer.len() > user_data.buffer.len() {
@@ -309,8 +356,8 @@ impl IsoTransferSlot {
         packet_bytes: usize,
         trace: Option<&crate::feedback_diagnostics::FeedbackRecorder>,
     ) -> Result<(), String> {
-        if self.in_flight {
-            return Err("capture slot already submitted".into());
+        if self.in_flight || self.retirement_pending {
+            return Err("capture slot is not retired".into());
         }
         if endpoint & 0x80 == 0
             || packet_bytes == 0
@@ -319,7 +366,10 @@ impl IsoTransferSlot {
         {
             return Err("invalid capture request geometry".into());
         }
+        self.require_owner(handle)?;
         self.retirement_context = Some(handle.context().clone());
+        // SAFETY: the slot is idle and exclusively owns the native transfer and buffer;
+        // the retained matching owner outlives all libusb access.
         unsafe {
             let data = &mut *self.user_data;
             data.completion.reset();
@@ -378,6 +428,15 @@ impl IsoTransferSlot {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn publish_completion_for_test(&mut self) {
+        // SAFETY: test slot owns the allocated user data, and no native transfer was submitted.
+        let completion = unsafe { &(*self.user_data).completion };
+        completion.reset();
+        *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
+        completion.publish_for_test();
+    }
+
     pub(super) fn take_completion(&mut self) -> Option<(i32, Instant, usize)> {
         let completion = unsafe { &(*self.user_data).completion };
         if !completion.is_published() {
@@ -385,7 +444,11 @@ impl IsoTransferSlot {
         }
         // Retire native ownership before any consumer bookkeeping can unwind.
         self.in_flight = false;
-        completion.take()
+        let result = completion.take();
+        if result.is_some() {
+            self.retirement_pending = true;
+        }
+        result
     }
 
     pub(super) fn turnaround_us(&self, completed_at: Instant) -> Option<u64> {
@@ -472,12 +535,16 @@ impl IsoTransferSlot {
     }
 
     pub(super) fn mark_completed(&mut self) {
+        // A stale retirement must never erase a newly submitted generation.
+        if self.in_flight || !self.retirement_pending {
+            return;
+        }
+        self.retirement_pending = false;
         self.queued_frame_count = 0;
         self.queued_underrun = false;
         self.queued_held = false;
         self.queued_music_frames = 0;
         self.submitted_at = None;
-        self.in_flight = false;
         self.cancelled_for_flush = false;
     }
 
@@ -513,6 +580,12 @@ impl Drop for IsoTransferSlot {
         if self.in_flight {
             // Also protects unwinding: the handle/FD owner outlives the slots.
             self.cancel();
+            if self.retirement_context.is_none() {
+                if let Some(owner) = self.retirement_owner.take() {
+                    std::mem::forget(owner);
+                }
+                return; // Keep native transfer and callback buffer alive too.
+            }
             if let Some(context) = self.retirement_context.clone() {
                 let mut warned = false;
                 while self.in_flight {
@@ -555,12 +628,19 @@ impl InterruptTransferSlot {
         })
     }
 
+    pub(super) fn retain_owner(&mut self, owner: Arc<TransferOwner>) {
+        self.slot.retain_owner(owner);
+    }
+
     pub(super) fn submit(
         &mut self,
         handle: &DeviceHandle<Context>,
         endpoint: u8,
     ) -> Result<(), Error> {
-        if self.slot.in_flight {
+        self.slot
+            .require_owner(handle)
+            .map_err(Error::InvalidState)?;
+        if self.slot.in_flight || self.slot.retirement_pending {
             return Err(Error::InvalidState(
                 "interrupt transfer already in flight".into(),
             ));
@@ -721,9 +801,14 @@ impl FeedbackTransfers {
 
     pub(super) fn start(
         &mut self,
-        handle: &DeviceHandle<Context>,
+        claimed: &ClaimedHandle,
         counters: &mut FeedbackCounters,
     ) -> Result<(), FeedbackFault> {
+        let owner = claimed.transfer_owner();
+        for slot in &mut self.slots {
+            slot.retirement_owner = Some(owner.clone());
+        }
+        let handle = &claimed.handle;
         for index in 0..self.slots.len() {
             self.submit(index, handle, counters, index == 0)?;
         }
@@ -788,7 +873,9 @@ pub(super) struct FeedbackTransferSlot {
     pub(super) packet_bytes: usize,
     pub(super) timeout_ms: u32,
     pub(super) in_flight: bool,
+    retirement_pending: bool,
     retirement_context: Option<Context>,
+    retirement_owner: Option<Arc<TransferOwner>>,
     pub(super) submit_no_device: bool,
     pub(super) last_submit_status: Option<i32>,
     retry_at: Instant,
@@ -797,6 +884,16 @@ pub(super) struct FeedbackTransferSlot {
 impl FeedbackTransferSlot {
     fn new(endpoint: FeedbackEndpoint, packet_count: usize) -> Result<Self, String> {
         let packet_bytes = endpoint.max_packet_bytes.max(4);
+        let buffer_len = packet_bytes
+            .checked_mul(packet_count)
+            .ok_or("feedback size overflow")?;
+        if packet_count == 0
+            || packet_count > i32::MAX as usize
+            || packet_bytes > u32::MAX as usize
+            || buffer_len > i32::MAX as usize
+        {
+            return Err("invalid feedback request geometry".into());
+        }
 
         let poll_window_ms =
             ((packet_count as u64).saturating_mul(endpoint.service_interval_us as u64) / 1_000)
@@ -806,9 +903,10 @@ impl FeedbackTransferSlot {
         let completion = Arc::new(IsoTransferCompletion::new());
         let user_data = Box::new(IsoTransferUserData {
             completion,
-            buffer: vec![0u8; packet_bytes.saturating_mul(packet_count).max(4)],
+            buffer: vec![0u8; buffer_len.max(4)],
         });
         let user_data_ptr = Box::into_raw(user_data);
+        // SAFETY: packet_count fits libusb's signed count; allocation is freed in Drop.
         let transfer = unsafe { libusb_alloc_transfer(packet_count as i32) };
 
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
@@ -827,6 +925,8 @@ impl FeedbackTransferSlot {
             timeout_ms,
             in_flight: false,
             retirement_context: None,
+            retirement_owner: None,
+            retirement_pending: false,
             submit_no_device: false,
             last_submit_status: None,
             retry_at: Instant::now(),
@@ -835,11 +935,20 @@ impl FeedbackTransferSlot {
 
     pub(super) fn submit(&mut self, handle: &DeviceHandle<Context>) -> Result<(), String> {
         self.last_submit_status = None;
-        if self.in_flight {
-            return Err("feedback transfer slot already in flight".to_string());
+        if self.in_flight || self.retirement_pending {
+            return Err("feedback transfer slot is not retired".to_string());
         }
 
+        if !self
+            .retirement_owner
+            .as_ref()
+            .is_some_and(|owner| owner.matches(handle))
+        {
+            return Err("feedback transfer has no matching native owner".into());
+        }
         self.retirement_context = Some(handle.context().clone());
+        // SAFETY: this idle slot owns its transfer and buffer; the matching owner retains
+        // the handle and fd until the callback returns ownership, including during unwind.
         unsafe {
             let user_data = &mut *self.user_data;
             user_data.completion.reset();
@@ -915,7 +1024,11 @@ impl FeedbackTransferSlot {
             return None;
         }
         self.in_flight = false;
-        completion.take()
+        let result = completion.take();
+        if result.is_some() {
+            self.retirement_pending = true;
+        }
+        result
     }
 
     fn newest_valid_report(
@@ -979,7 +1092,9 @@ impl FeedbackTransferSlot {
     }
 
     pub(super) fn mark_completed(&mut self) {
-        self.in_flight = false;
+        if !self.in_flight {
+            self.retirement_pending = false;
+        }
     }
 
     pub(super) fn cancel(&mut self) {
@@ -993,6 +1108,12 @@ impl Drop for FeedbackTransferSlot {
     fn drop(&mut self) {
         if self.in_flight {
             self.cancel();
+            if self.retirement_context.is_none() {
+                if let Some(owner) = self.retirement_owner.take() {
+                    std::mem::forget(owner);
+                }
+                return; // Keep native transfer and callback buffer alive too.
+            }
             if let Some(context) = self.retirement_context.clone() {
                 let mut warned = false;
                 while self.in_flight {
@@ -1758,6 +1879,8 @@ pub(super) extern "system" fn iso_transfer_callback(transfer: *mut libusb_transf
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
             return;
         };
+        // SAFETY: libusb invokes this only for a submitted transfer. Its slot retains
+        // both the transfer and user_data until the return publication below.
         let user_data_ptr = unsafe { transfer.as_ref().user_data as *mut IsoTransferUserData };
         let Some(user_data) = std::ptr::NonNull::new(user_data_ptr) else {
             return;
@@ -2641,6 +2764,72 @@ mod explicit_feedback_tests {
             transfers.record_submission(1, Err("detached".into()), &mut counters, false),
             Err(FeedbackFault::DeviceLost)
         ));
+    }
+
+    #[test]
+    fn submitted_geometry_rejects_mismatches_and_unrepresentable_lengths() {
+        assert!(validate_submission_geometry(&[4, 0, 8], 12).is_ok());
+        assert!(validate_submission_geometry(&[4, 8], 11).is_err());
+        assert!(validate_submission_geometry(&[4, 8], 13).is_err());
+        assert!(validate_submission_geometry(&[usize::MAX, 1], 0).is_err());
+        assert!(
+            validate_submission_geometry(&[i32::MAX as usize + 1], i32::MAX as usize + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn stale_retirement_does_not_clear_a_live_slot() {
+        let mut slot = IsoTransferSlot::new(0, 1, 4).unwrap();
+        slot.in_flight = true;
+        slot.queued_frame_count = 7;
+        slot.mark_completed();
+        assert!(slot.in_flight);
+        assert_eq!(slot.queued_frame_count, 7);
+        // No actual transfer was submitted in this pure state test.
+        slot.in_flight = false;
+    }
+
+    #[test]
+    fn timeout_rejects_mutated_requested_geometry_but_accounts_actual_lengths() {
+        let mut slot = IsoTransferSlot::new(0, 2, 16).unwrap();
+        slot.packet_sizes.copy_from_slice(&[8, 8]);
+        // SAFETY: the slot allocated exactly two packet descriptors and no URB is submitted.
+        unsafe {
+            slot.transfer.as_mut().num_iso_packets = 2;
+        }
+        let descriptors = unsafe {
+            std::slice::from_raw_parts_mut(slot.transfer.as_mut().iso_packet_desc.as_mut_ptr(), 2)
+        };
+        for packet in descriptors.iter_mut() {
+            packet.length = 8;
+            packet.actual_length = 8;
+            packet.status = LIBUSB_TRANSFER_COMPLETED;
+        }
+        assert_eq!(
+            slot.account_timeout(PacketAcceptance::exact())
+                .unwrap()
+                .lost_bytes,
+            0
+        );
+        descriptors[0].actual_length = 4;
+        // A short timed-out packet is not credited as delivered, even in part.
+        assert_eq!(
+            slot.account_timeout(PacketAcceptance::exact())
+                .unwrap()
+                .lost_bytes,
+            8
+        );
+        descriptors[0].length = 4;
+        assert!(slot.account_timeout(PacketAcceptance::exact()).is_err());
+        descriptors[0].length = 8;
+        descriptors[0].actual_length = 9;
+        assert!(slot.account_timeout(PacketAcceptance::exact()).is_err());
+        descriptors[0].actual_length = 8;
+        descriptors[1].status = LIBUSB_TRANSFER_NO_DEVICE;
+        assert!(slot
+            .account_timeout(PacketAcceptance::exact())
+            .unwrap_err()
+            .contains("disconnected"));
     }
 
     #[test]

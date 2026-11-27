@@ -169,12 +169,12 @@ Failed packets and transfers are charged conservatively: bytes reported by a fai
 | Cold start: DAC plugged in, app launched, direct output chosen | The stream starts, the indicator reaches `Verified` after real audio, the level is at or below -40 dB |
 | 44.1, 48, 96 kHz and the highest rate the DAC offers, 16 and 24 bit | No clock refusal, no timeouts, `format.clock` and `pacing` as expected |
 | Rate change between tracks | The output reopens, a gap of about 100 ms or more, the right rate on the DAC |
-| Gapless in one format | The output stays open, `playedFrames` keeps counting and no underrun is reported at the boundary. Listen for a gap or a click and record what you hear |
+| Gapless in one format | The output stays open, `playedFrames` keeps counting and no underrun is reported at the boundary. Measure gap and transient on the target device |
 | Pause, resume, seek while playing and while paused | Observe acoustic response, queued audio and whether the DAC remains locked on silence |
 | Skip tracks quickly | No stale audio, no stuck state |
 | A long pause (over 30 s) with `DacIdleRelease` | The stream closes, the session stays, play reopens it |
 | Unplug during playback, then replug | Pause with a message, no sound on the speaker, play opens the DAC again |
-| Volume: slider, keys, keys with the screen off, the knob on the DAC | The level follows the control and the dB shown is right. The library writes each level to the DAC's control without a ramp, so record whether a step is audible |
+| Volume: slider, keys, keys with the screen off, the knob on the DAC | The level follows the control and the dB shown is right. The library writes each level without a ramp; measure any transient on the target device |
 | Close the app, then play from another app | The DAC is back at its original level and Android plays through it |
 | A DAC with no volume control | `VOLUME_UNAVAILABLE`, then the fixed-level path after the listener agrees |
 | Bluetooth connected | The selector chooses standard output, not direct USB |

@@ -293,8 +293,8 @@ public class DacSession private constructor(
      * audio driver is asked to take the DAC again), and closes the USB connection. Blocks for
      * about 100 ms. Safe to call again. Do not call it from a collector of [events].
      *
-     * The volume is restored after the stream has stopped, so a level louder than the current one
-     * is never heard.
+     * When restoration is requested, native cleanup restores the volume after USB transfers
+     * retire and before Android's interface claims are released. This may happen after close returns.
      *
      * @throws DacException if the native library fails to close. USB ownership remains held until
      *   all native transfers retire, then Android receives the interfaces.
@@ -313,15 +313,21 @@ public class DacSession private constructor(
                     .onSuccess { closedFeedbackTrace = it }
                     .onFailure { logWarning("exporting the feedback trace failed", it) }
             }
-            if (handBack == HandBack.RESTORE_ORIGINAL && mutableState.value != DacState.LOST) {
-                runCatching { volume?.handBack() }.onFailure { logWarning("restoring the volume failed", it) }
-            }
             volume?.close()
             volumeExecutor.shutdown()
             try {
-                nativeCall { Native.dacClose(dac) }
+                nativeCall { Native.dacSetCloseHandBack(
+                    dac,
+                    volume != null && mutableState.value != DacState.LOST && handBack == HandBack.RESTORE_ORIGINAL,
+                    handBack == HandBack.RESTORE_ORIGINAL,
+                ) }
             } catch (error: DacException) {
                 failure = error
+            }
+            try {
+                nativeCall { Native.dacClose(dac) }
+            } catch (error: DacException) {
+                if (failure == null) failure = error else failure?.addSuppressed(error)
             }
         } finally {
             fun releaseHostOwnership() {

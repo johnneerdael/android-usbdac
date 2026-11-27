@@ -37,6 +37,84 @@ private fun OutputDecision.rejected(kind: OutputKind): Rejection =
 
 class OutputSelectorTest {
     @Test
+    fun cachedPcmSupportDistinguishesUnknownDirectManagedAndAttachmentChanges() {
+        val platform = FakePlatform()
+        val selector = selector(platform, OutputPolicy(allowConversion = false))
+        val request = StreamRequest.pcm(352_800, 2, 24)
+        assertEquals(OutputSelector.PcmSupport.UNSUPPORTED, selector.pcmSupportSnapshot().support(request))
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 3, 24, emptyList(), listOf(352_800),
+            SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        link.capabilities = fakeCapabilities().copy(altSettings = listOf(alt))
+        assertEquals(OutputSelector.PcmSupport.UNKNOWN, selector.pcmSupportSnapshot().support(request))
+        val prepared = selector.prepareUsb(dac)
+        val saved = selector.pcmSupportSnapshot()
+        assertEquals(OutputSelector.PcmSupport.DIRECT, saved.support(request))
+        assertEquals(OutputSelector.PcmSupport.WITH_PROCESSING, saved.support(request.copy(bitDepth = 16)))
+        prepared.close()
+        selector.invalidatePcmSupport()
+        assertEquals(OutputSelector.PcmSupport.UNKNOWN, selector.pcmSupportSnapshot().support(request))
+        assertEquals(OutputSelector.PcmSupport.DIRECT, saved.support(request))
+        platform.dacs = emptyList()
+        assertEquals(OutputSelector.PcmSupport.WITH_PROCESSING, selector.pcmSupportSnapshot().support(StreamRequest.pcm(48_000, 2, 16)))
+    }
+
+    @Test
+    fun knownUnsupportedFirstDacDoesNotHideLaterDirectDac() {
+        val platform = FakePlatform()
+        val first = fakeDac(deviceName = "/dev/first")
+        val second = fakeDac(deviceName = "/dev/second")
+        val link1 = platform.attach(first)
+        val link2 = platform.attach(second)
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 3, 24, emptyList(), listOf(48_000),
+            SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        link1.capabilities = fakeCapabilities().copy(altSettings = listOf(alt))
+        link2.capabilities = fakeCapabilities().copy(altSettings = listOf(alt.copy(sampleRates = listOf(352_800))))
+        val selector = selector(platform, OutputPolicy(allowConversion = false))
+        selector.prepareUsb(first).close()
+        selector.prepareUsb(second).close()
+        assertEquals(OutputSelector.PcmSupport.DIRECT, selector.pcmSupportSnapshot().support(StreamRequest.pcm(352_800, 2, 24)))
+    }
+
+    @Test
+    fun cachedPcmSupportHonorsDirectPolicyAndDecoderLimits() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 3, 24, emptyList(), listOf(352_800),
+            SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        link.capabilities = fakeCapabilities().copy(altSettings = listOf(alt))
+        val limited = selector(platform, OutputPolicy(force = OutputKind.DIRECT_USB, allowConversion = false,
+            downstreamLimits = DownstreamLimits(192_000, setOf(16, 24))))
+        val prepared = limited.prepareUsb(dac)
+        assertEquals(OutputSelector.PcmSupport.UNSUPPORTED, limited.pcmSupportSnapshot().support(StreamRequest.pcm(352_800, 2, 24)))
+        prepared.close()
+        val disabled = selector(platform, OutputPolicy(allowDirectUsb = false))
+        assertEquals(OutputSelector.PcmSupport.UNSUPPORTED, disabled.pcmSupportSnapshot().support(StreamRequest.pcm(352_800, 2, 24)))
+        assertEquals(OutputSelector.PcmSupport.WITH_PROCESSING, disabled.pcmSupportSnapshot().support(StreamRequest.pcm(48_000, 2, 16)))
+        assertEquals(OutputSelector.PcmSupport.WITH_PROCESSING, disabled.pcmSupportSnapshot().support(StreamRequest.pcm(4_000, 2, 16)))
+    }
+
+    @Test
+    fun pcmAlternateAdmissionChecksRatesPacketDepthChannelsAndPacing() {
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 3, 24, listOf(RateRange(48_000, 96_000, 48_000)), emptyList(),
+            SyncType.ASYNCHRONOUS, 0x81, 72, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        val request = StreamRequest.pcm(96_000, 2, 24)
+        assertTrue(pcmAlternateSupports(alt, request))
+        assertFalse(pcmAlternateSupports(alt.copy(maxPacketBytes = 71), request))
+        assertFalse(pcmAlternateSupports(alt.copy(pacing = null), request))
+        assertFalse(pcmAlternateSupports(alt, request.copy(sampleRate = 72_000)))
+        assertFalse(pcmAlternateSupports(alt, request.copy(channels = 1)))
+        assertFalse(pcmAlternateSupports(alt, request.copy(bitDepth = 16)))
+        assertFalse(pcmAlternateSupports(alt.copy(rateRanges = listOf(RateRange(48_000, 96_000, 0))), request))
+        assertFalse(pcmAlternateSupports(alt.copy(format = AltFormat.PCM_U8, validBits = 8, subslotBytes = 2), StreamRequest.pcmU8(96_000, 2)))
+        assertFalse(pcmAlternateSupports(alt.copy(format = AltFormat.PCM_FLOAT32, validBits = 32, subslotBytes = 3), StreamRequest.pcmFloat32(96_000, 2)))
+        assertFalse(pcmAlternateSupports(alt.copy(channels = Int.MAX_VALUE, subslotBytes = 4, validBits = 32,
+            serviceIntervalUs = Int.MAX_VALUE, maxPacketBytes = Int.MAX_VALUE), request.copy(channels = Int.MAX_VALUE, bitDepth = 32)))
+    }
+
+    @Test
     fun pcmCandidatesArePlannedOnceBeforeNativeCoordinator() {
         val fake = FakePlatform()
         val dac = fakeDac()
@@ -452,6 +530,15 @@ class OutputSelectorTest {
     }
 
     @Test
+    fun managedDsdPreviewPrefersSupportedPlatformPrecision() {
+        val request = StreamRequest.dsdNative(2_822_400, 2)
+        val old = FakePlatform().apply { apiLevel = 30 }
+        val modern = FakePlatform().apply { apiLevel = 31 }
+        assertTrue(selector(old, OutputPolicy(force = OutputKind.ANDROID_STANDARD)).select(request).processing!!.description.contains("16-bit PCM"))
+        assertTrue(selector(modern, OutputPolicy(force = OutputKind.ANDROID_STANDARD)).select(request).processing!!.description.contains("24-bit PCM"))
+    }
+
+    @Test
     fun android_dsd_pcm_preview_covers_mixer_and_aaudio_targets() {
         val source = StreamRequest.dsdNative(2_822_400, 2)
         val mixer = FakePlatform().apply { route = listOf(USB_ROUTE) }
@@ -467,7 +554,8 @@ class OutputSelectorTest {
         assertEquals(Guarantee.NONE, audioDecision.guarantee)
         assertNull(audioDecision.wireFormat)
         assertEquals(source, audioDecision.source)
-        assertTrue(audio.offers.single().closed)
+        assertTrue(audio.offers.isNotEmpty())
+        assertTrue(audio.offers.all { it.closed })
     }
 
     @Test

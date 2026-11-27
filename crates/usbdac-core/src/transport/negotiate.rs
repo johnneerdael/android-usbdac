@@ -174,6 +174,154 @@ fn uac1_type_i_excludes(extra: &[u8], request: PlaybackFormat) -> Option<bool> {
     )
 }
 
+// A successful, read-only RANGE exclusion on a single direct UAC2 path.
+// Selectors and multipliers remain terminal because another reachable path
+// may admit the requested rate, or the route could change while probing.
+struct LiveRateExclusion;
+fn direct_uac2_rate_exclusion(
+    claimed: &ClaimedHandle,
+    interface: u8,
+    terminal: Option<u8>,
+    rate: u32,
+) -> Option<LiveRateExclusion> {
+    let device = claimed.handle.device();
+    let (control, graph) = owning_clock_graph(&device, &claimed.handle, interface)?;
+    if !claimed.claimed_interfaces.contains(&control) {
+        return None;
+    }
+    let terminal = terminal?;
+    let plans = graph
+        .enumerate_plans(terminal, |id| {
+            get_clock_selector_pin(&claimed.handle, control, id)
+        })
+        .ok()?;
+    if plans.len() != 1
+        || plans[0].path.len() != 1
+        || !plans[0].selectors.is_empty()
+        || !matches!(plans[0].source_controls & 3, 1 | 3)
+    {
+        return None;
+    }
+    let config = device.active_config_descriptor().ok()?;
+    let raw = read_active_configuration_bytes_checked(&claimed.handle, &config).ok()?;
+    let mut offset = 0;
+    while offset < raw.len() {
+        if raw.len() - offset < 2 {
+            return None;
+        }
+        let len = usize::from(raw[offset]);
+        if len < 2 || len > raw.len() - offset {
+            return None;
+        }
+        offset += len;
+    }
+    let ac = audio_control_descriptors_from_config(&raw, control);
+    if !complete_uac2_direct_clock(&ac, terminal, plans[0].source_id) {
+        return None;
+    }
+    let choice = graph.choice_for_plan(control, terminal, &plans[0]);
+    if choice.resolution != crate::clock_resolution::ClockResolution::Resolved {
+        return None;
+    }
+    let ranges = get_sampling_frequency_ranges(&claimed.handle, control, choice.source_id).ok()?;
+    if !complete_live_range_excludes(&ranges, rate) {
+        return None;
+    }
+    Some(LiveRateExclusion)
+}
+
+// Only complete, unambiguous raw RANGE replies can certify absence.
+fn complete_live_range_excludes(ranges: &[SamplingFrequencySubrange], rate: u32) -> bool {
+    !ranges.is_empty()
+        && !ranges.iter().any(|range| {
+            range.min == 0 || range.max < range.min || (range.max > range.min && range.res == 0)
+        })
+        && !sampling_frequency_ranges_support_rate(ranges, rate)
+}
+
+fn complete_uac2_direct_clock(bytes: &[u8], terminal: u8, source: u8) -> bool {
+    let (mut at, mut terminal_seen, mut source_seen) = (0, false, false);
+    while at < bytes.len() {
+        if bytes.len() - at < 3 {
+            return false;
+        }
+        let len = usize::from(bytes[at]);
+        if len < 3 || len > bytes.len() - at {
+            return false;
+        }
+        let d = &bytes[at..at + len];
+        if d[1] == USB_DT_CS_INTERFACE && len >= 4 {
+            if d[3] == terminal && matches!(d[2], 2 | 3) {
+                if terminal_seen || !matches!((d[2], len), (2, 17) | (3, 12)) {
+                    return false;
+                }
+                let link = if d[2] == 2 { d[7] } else { d[8] };
+                if link != source {
+                    return false;
+                }
+                terminal_seen = true;
+            }
+            if d[3] == source && d[2] == 10 {
+                if source_seen || len != 8 {
+                    return false;
+                }
+                source_seen = true;
+            }
+        }
+        at += len;
+    }
+    terminal_seen && source_seen
+}
+
+// The general parser accepts private and truncated descriptors. Do not use it
+// as negative evidence unless the complete standard Type I pair is present.
+fn complete_uac2_type_i(extra: &[u8]) -> bool {
+    let mut at = 0;
+    let (mut general, mut format) = (false, false);
+    while at < extra.len() {
+        if extra.len() - at < 2 {
+            return false;
+        }
+        let len = usize::from(extra[at]);
+        if len < 2 || len > extra.len() - at {
+            return false;
+        }
+        let d = &extra[at..at + len];
+        if d[1] == USB_DT_CS_INTERFACE {
+            if len < 3 {
+                return false;
+            }
+            match d[2] {
+                1 => {
+                    if general || len != 16 || d[3] == 0 || d[5] != 1 || d[10] == 0 {
+                        return false;
+                    }
+                    let bits = u32::from_le_bytes([d[6], d[7], d[8], d[9]]);
+                    if bits == 0 || bits & !0x7 != 0 {
+                        return false;
+                    }
+                    general = true;
+                }
+                2 => {
+                    if format
+                        || len != 6
+                        || d[3] != 1
+                        || !(1..=4).contains(&d[4])
+                        || d[5] == 0
+                        || d[5] > d[4] * 8
+                    {
+                        return false;
+                    }
+                    format = true;
+                }
+                _ => return false,
+            }
+        }
+        at += len;
+    }
+    general && format
+}
+
 // Only immutable, fully described output incompatibility mints a clean refusal;
 // generic SelectError::NoMatch can also represent failed I/O or power changes.
 fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
@@ -210,13 +358,28 @@ fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, spee
                 }
             }
             0x20 if format.pcm_encoding == PcmEncoding::Signed => {
+                if !complete_uac2_type_i(alt.extra()) {
+                    return false;
+                }
                 let Some(parsed) = scan::parse_android_streaming_interface_format(&alt) else {
                     return false;
                 };
                 if parsed.channels == format.channels
                     && parsed.bit_resolution == format.bit_depth
                     && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
+                    && direct_uac2_rate_exclusion(
+                        claimed,
+                        alt.interface_number(),
+                        parsed.terminal_link,
+                        format.sample_rate,
+                    )
+                    .is_none()
                 {
+                    return false;
+                }
+            }
+            0x30 if format.pcm_encoding == PcmEncoding::Signed => {
+                if !adc3::adc3_direct_rate_excludes(claimed, &config, &alt, speed, format) {
                     return false;
                 }
             }
@@ -1359,6 +1522,53 @@ mod evidence_tests {
         let mut unknown_tag = descriptor;
         unknown_tag[5] = 0xff;
         assert_eq!(uac1_type_i_excludes(&unknown_tag, request), None);
+    }
+
+    #[test]
+    fn uac2_exclusion_requires_complete_standard_type_i() {
+        let descriptor = [
+            16, 0x24, 1, 1, 0, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0x24, 2, 1, 2, 16,
+        ];
+        assert!(super::complete_uac2_type_i(&descriptor));
+        assert!(!super::complete_uac2_type_i(&descriptor[..21]));
+        let mut private = descriptor;
+        private[9] = 0x80;
+        assert!(!super::complete_uac2_type_i(&private));
+        let mut bad_format = descriptor;
+        bad_format[21] = 24;
+        assert!(!super::complete_uac2_type_i(&bad_format));
+    }
+
+    #[test]
+    fn complete_direct_uac2_route_requires_successful_unambiguous_range_exclusion() {
+        let stream = [
+            16, 0x24, 1, 1, 0, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 6, 0x24, 2, 1, 2, 16,
+        ];
+        let control = [
+            17, 0x24, 2, 1, 1, 1, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0x24, 10, 5, 0, 1, 0, 0,
+        ];
+        let mut range = vec![2, 0];
+        for rate in [48_000u32, 96_000] {
+            range.extend_from_slice(&rate.to_le_bytes());
+            range.extend_from_slice(&rate.to_le_bytes());
+            range.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(super::complete_uac2_type_i(&stream));
+        assert!(super::complete_uac2_direct_clock(&control, 1, 5));
+        let parsed = super::parse_sampling_frequency_ranges(&range).unwrap();
+        assert!(super::complete_live_range_excludes(&parsed, 192_000));
+        assert!(!super::complete_live_range_excludes(&parsed, 96_000));
+        assert!(super::parse_sampling_frequency_ranges(&range[..range.len() - 1]).is_err());
+        assert!(!super::complete_live_range_excludes(&[], 192_000));
+        let ambiguous = [SamplingFrequencySubrange {
+            min: 48_000,
+            max: 96_000,
+            res: 0,
+        }];
+        assert!(!super::complete_live_range_excludes(&ambiguous, 192_000));
+        let mut bad_link = control;
+        bad_link[7] = 6;
+        assert!(!super::complete_uac2_direct_clock(&bad_link, 1, 5));
     }
 
     #[test]

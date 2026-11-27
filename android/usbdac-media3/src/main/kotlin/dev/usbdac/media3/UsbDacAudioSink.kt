@@ -98,7 +98,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         return when (outputs.formatSupport(request).support) {
             OutputFormatSupport.UNSUPPORTED -> AudioSink.SINK_FORMAT_UNSUPPORTED
             OutputFormatSupport.DIRECT -> AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
-            OutputFormatSupport.WITH_TRANSCODING -> AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+            OutputFormatSupport.WITH_TRANSCODING, OutputFormatSupport.UNKNOWN -> AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
         }
     }
 
@@ -269,8 +269,21 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         return !buffer.hasRemaining()
     }
 
-    private fun writeFailure(error: DacException): AudioSink.WriteException =
-        AudioSink.WriteException(error.code.ordinal, activeFormat ?: wanted?.format ?: Format.Builder().build(), false).also { it.initCause(OutputRecoveryRequiredException(error)) }
+    private fun writeFailure(error: DacException): AudioSink.WriteException {
+        val format = activeFormat ?: wanted?.format ?: Format.Builder().build()
+        var recoverable = outputs.canRecover(error)
+        if (recoverable) {
+            try {
+                closeActive()
+            } catch (closeError: Throwable) {
+                error.addSuppressed(closeError)
+                recoverable = false
+            }
+        }
+        return AudioSink.WriteException(error.code.ordinal, format, recoverable).also {
+            it.initCause(OutputRecoveryRequiredException(error))
+        }
+    }
     // endregion
 
     // region sink-switch

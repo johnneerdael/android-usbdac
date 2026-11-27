@@ -54,6 +54,108 @@ class RealCoreRankingTest {
             assertTrue(nativeCalls > 0)
         }
     }
+    @Test fun pcmDescriptorAdmissionMatchesRealCoreShapeRateAndPacketPredicates() {
+        val base = AltSetting(1, 1, 1, AltFormat.PCM, 2, 3, 24, listOf(RateRange(48_000, 96_000, 48_000)), emptyList(),
+            SyncType.ASYNCHRONOUS, 0x81, 72, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        val request = StreamRequest.pcm(96_000, 2, 24)
+        val cases = listOf(
+            base to request,
+            base.copy(maxPacketBytes = 71) to request,
+            base.copy(pacing = null) to request,
+            base to request.copy(channels = 1),
+            base to request.copy(bitDepth = 16),
+            base to request.copy(sampleRate = 72_000),
+            base.copy(rateRanges = listOf(RateRange(48_000, 96_000, 0))) to request,
+            base.copy(format = AltFormat.PCM_FLOAT32) to request,
+        )
+        for ((alt, source) in cases) {
+            val range = alt.rateRanges.single()
+            val fmt = when (alt.format) { AltFormat.PCM -> 0; AltFormat.PCM_U8 -> 1; AltFormat.PCM_FLOAT32 -> 2; else -> 3 }
+            val values = listOf(source.sampleRate, source.channels, source.bitDepth, 0, alt.channels, alt.validBits,
+                alt.subslotBytes, fmt, alt.serviceIntervalUs, alt.maxPacketBytes, if (alt.pacing != null) 1 else 0,
+                if (source.sampleRate in alt.sampleRates) 1 else 0, range.minHz, range.maxHz, range.stepHz)
+            val core = NativeRateRanking.pcmAdmission(org.json.JSONArray(values).toString()).toBooleanStrict()
+            assertEquals("$alt / $source", core, pcmAlternateSupports(alt, source))
+        }
+    }
+
+    @Test fun paddedPcmRejectionLeavesDirectAndHeapWritesRetryable() {
+        assumeTrue("host converter gate requires USBDAC_TEST_DSD_PCM=1 and java.library.path",
+            System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        fun newOutput(): Pair<ConvertingOutput, RecordingOutput> {
+            val target = RecordingOutput()
+            val plan = ConversionPlan.between(StreamRequest.pcm(48_000, 1, 16), fakeFormat(48_000, 16, 2, 1),
+                ConversionOptions(sourceLayout = PcmLayout.PCM_16_IN_32))
+            return ConvertingOutput(target, PcmConverter.create(plan)) to target
+        }
+        for (direct in listOf(false, true)) {
+            val (output, target) = newOutput()
+            val (reference, expected) = newOutput()
+            try {
+                val input = if (direct) ByteBuffer.allocateDirect(4) else ByteBuffer.allocate(4)
+                input.put(byteArrayOf(1, 0, 0x34, 0x12)).flip()
+                val beforeLatency = output.latencyFrames
+                val error = org.junit.Assert.assertThrows(DacException::class.java) { output.write(input) }
+                assertEquals(DacErrorCode.INVALID_ARGUMENT, error.code)
+                assertEquals(0, input.position())
+                assertTrue(target.received.isEmpty())
+                assertEquals(beforeLatency, output.latencyFrames)
+                input.put(0, 0)
+                assertEquals(4, output.write(input))
+                assertEquals(4, reference.write(ByteBuffer.wrap(byteArrayOf(0, 0, 0x34, 0x12))))
+                assertEquals(expected.received, target.received)
+            } finally { output.close(); reference.close() }
+        }
+    }
+
+    @Test fun androidDsdFallsBackWhenPreferredManagedPrecisionCannotOpen() {
+        assumeTrue("host converter gate requires USBDAC_TEST_DSD_PCM=1 and java.library.path",
+            System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val fake = FakePlatform().apply { apiLevel = 31 }
+        val attempts = mutableListOf<Int>()
+        val platform = object : OutputPlatform by fake {
+            override fun openManaged(request: StreamRequest, route: OutputRoute?): PcmOutput {
+                attempts += request.bitDepth
+                if (request.bitDepth == 24) throw DacException(DacErrorCode.UNSUPPORTED, "rejected 24-bit format")
+                return fake.openManaged(request, route)
+            }
+        }
+        val output = OutputSelector(platform, OutputPolicy(force = OutputKind.ANDROID_STANDARD))
+            .open(StreamRequest.dsdNative(2_822_400, 2))
+        try {
+            assertEquals(listOf(24, 32), attempts)
+            assertTrue(output.decision.processing!!.description.contains("32-bit PCM"))
+        } finally { output.close() }
+    }
+
+    @Test fun dsdTailSurvivesPartialTargetWrites() {
+        assumeTrue("host converter gate requires USBDAC_TEST_DSD_PCM=1 and java.library.path",
+            System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        fun render(partial: Boolean): List<Byte> {
+            val target = RecordingOutput()
+            val output = DsdPcmOutput(target, 2_822_400, 2, 176_400, 2, PcmLayout.PCM_16)
+            try {
+                val input = ByteBuffer.allocateDirect(8192 * 2).apply { repeat(capacity()) { put(0x69.toByte()) }; flip() }
+                while (input.hasRemaining()) {
+                    target.room = if (partial) 4 else Int.MAX_VALUE
+                    output.write(input)
+                }
+                target.room = if (partial) 4 else Int.MAX_VALUE
+                output.drain()
+                target.drained = true
+                var polls = 0
+                while (!output.isDrained) {
+                    target.room = if (partial) 4 else Int.MAX_VALUE
+                    check(++polls < 10_000)
+                }
+                assertEquals(8192 / 2 * 2 * 2, target.received.size)
+                assertEquals(1, target.calls.count { it == "drain" })
+                return target.received.toList()
+            } finally { output.close() }
+        }
+        assertEquals(render(false), render(true))
+    }
+
     @Test fun androidStandardDsdAndDopUseRealConverterAndPreserveSourceCounters() {
         assumeTrue("opt in with USBDAC_TEST_DSD_PCM=1 and put the host library directory on java.library.path",
             System.getenv("USBDAC_TEST_DSD_PCM") == "1")
@@ -67,6 +169,7 @@ class RealCoreRankingTest {
                 assertEquals(Guarantee.NONE, output.decision.guarantee)
                 assertEquals(request, output.decision.source)
                 assertNull(output.decision.wireFormat)
+                assertEquals(dop, output.resetDopInputMarkerPhase())
                 assertEquals(if (dop) StreamEncoding.DOP else StreamEncoding.DSD_NATIVE, output.format.encoding)
                 assertEquals(if (dop) 176_400 else 352_800, output.format.counterRateHz)
                 assertEquals(if (dop) 6 else 2, output.format.bytesPerFrame)
@@ -94,7 +197,7 @@ class RealCoreRankingTest {
                 output.drain()
                 val target = fake.managed.single().first
                 assertTrue(target.calls.contains("drain"))
-                assertEquals(byteFrames / 2 * 2 * 2, target.received.size)
+                assertEquals(byteFrames / 2 * 2 * 3, target.received.size)
                 target.played = (byteFrames / 2).toLong()
                 target.drained = true
                 assertTrue(output.isDrained)

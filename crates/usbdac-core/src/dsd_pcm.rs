@@ -2,7 +2,7 @@
 //! bytes with the oldest bit in bit 7, as accepted by `DacStream::write`.
 //! This converter is always lossy; DoP carrier words are not accepted.
 //!
-//! A 512-tap Blackman-windowed low-pass decimates the one-bit stream by 16,
+//! A 704-tap Kaiser-windowed low-pass decimates the one-bit stream by 16,
 //! followed by the library's high-quality rational PCM resampler. The first
 //! stage is evaluated with byte lookup tables, so no processing allocation is
 //! required. The bounded input rates are DSD64, DSD128 and DSD256.
@@ -10,9 +10,9 @@ use crate::convert::{
     ConversionPlan, ConvertError, ConvertOptions, Converter, PcmFormat, Processed, SampleFormat,
 };
 
-const TAPS: usize = 512;
+const TAPS: usize = 704;
 const HISTORY: usize = TAPS / 8;
-const DELAY: usize = 16;
+const DELAY: usize = TAPS / 32;
 
 pub struct DsdPcmConverter {
     channels: usize,
@@ -69,12 +69,17 @@ impl DsdPcmConverter {
         let mut coefficients = [0.0; TAPS];
         // Transition band is 0.020..0.03125 cycles/bit (the decimated Nyquist).
         let cutoff = (0.020 + 0.03125) / 2.0;
+        let beta = crate::convert::resample::kaiser_beta(120.0);
+        let denominator = crate::convert::resample::bessel_i0(beta);
         let mut sum = 0.0;
         for (i, c) in coefficients.iter_mut().enumerate() {
             let x = i as f64 - (TAPS as f64 - 1.0) / 2.0;
             let sinc = (2.0 * std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x);
-            let phase = 2.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64;
-            *c = sinc * (0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos());
+            let position = 2.0 * i as f64 / (TAPS - 1) as f64 - 1.0;
+            let window = crate::convert::resample::bessel_i0(
+                beta * (1.0 - position * position).max(0.0).sqrt(),
+            ) / denominator;
+            *c = sinc * window;
             sum += *c;
         }
         for c in &mut coefficients {
@@ -316,11 +321,22 @@ mod tests {
             }
             re.hypot(im)
         };
-        assert!((response(0.01) - 1.0).abs() < 0.001);
-        for i in 0..200 {
-            let f = 0.03125 + i as f64 * (0.5 - 0.03125) / 199.0;
-            assert!(response(f) < 0.001, "f={f} response={}", response(f));
+        let mut ripple = 0.0f64;
+        for i in 0..=512 {
+            let f = 0.020 * i as f64 / 512.0;
+            ripple = ripple.max((response(f) - 1.0).abs());
         }
+        let mut stop = 0.0f64;
+        for i in 0..=8192 {
+            let f = 0.03125 + i as f64 * (0.5 - 0.03125) / 8192.0;
+            stop = stop.max(response(f));
+        }
+        println!(
+            "production taps: ripple {ripple:e}, stop {:.3} dB",
+            20.0 * stop.log10()
+        );
+        assert!(ripple < 0.00001, "ripple {ripple}");
+        assert!(stop < 0.000002, "stop {stop}");
     }
     fn run(chunks: usize) -> Vec<u8> {
         let mut c = converter();
@@ -374,7 +390,7 @@ mod tests {
     #[test]
     fn channel_histories_are_independent_and_msb_is_oldest() {
         let mut c = converter();
-        for _ in 0..64 {
+        for _ in 0..HISTORY {
             c.push_frame(&[0xff, 0x00]);
         }
         c.skipped = DELAY;
@@ -515,6 +531,51 @@ mod tests {
         );
         assert!(alias < 0.002, "aliased amplitude {alias}");
     }
+    #[test]
+    fn production_chain_preserves_half_modulation_across_rates_and_qualities() {
+        for source in [2_822_400, 5_644_800, 11_289_600] {
+            for target in [44_100, source / 16, 768_000] {
+                for quality in [crate::convert::Quality::High, crate::convert::Quality::Fast] {
+                    let options = ConvertOptions {
+                        quality,
+                        headroom_db: 0.0,
+                        ..ConvertOptions::default()
+                    };
+                    let mut c = DsdPcmConverter::with_options(
+                        source,
+                        1,
+                        PcmFormat::new(target, 1, SampleFormat::Float32),
+                        &options,
+                    )
+                    .unwrap();
+                    let input = [0xee; 8192]; // 75% ones: +0.5 modulation
+                    let mut out = vec![0u8; 512 * 1024];
+                    let done = c.process(&input, &mut out).unwrap();
+                    assert_eq!(done.consumed, input.len());
+                    let mut n = done.produced;
+                    loop {
+                        let produced = c.finish(&mut out[n..]).unwrap();
+                        n += produced;
+                        if produced == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        n / 4,
+                        (input.len() as u64 * target as u64).div_ceil(source as u64 / 8) as usize
+                    );
+                    let middle = (n / 4) / 2;
+                    let value =
+                        f32::from_le_bytes(out[middle * 4..middle * 4 + 4].try_into().unwrap());
+                    assert!(
+                        (value - 0.5).abs() < 0.0001,
+                        "{source} {target} {quality:?}: {value}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn headroom_is_applied_once_with_and_without_pcm_resampling() {
         fn amplitude(rate: u32, db: f64) -> f64 {

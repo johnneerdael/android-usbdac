@@ -13,10 +13,12 @@
 //! producer cannot reuse the dropped bytes (the callback may be reading them), which costs at
 //! most one callback period of room after a flush.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-pub struct SpscRing {
+pub(super) struct SpscRing {
     slots: Box<[UnsafeCell<u8>]>,
     /// Total bytes the consumer has taken (or skipped).
     head: AtomicU64,
@@ -70,7 +72,7 @@ impl SpscRing {
     }
 
     /// Producer: copies as much of `data` as fits and returns the count.
-    pub fn write(&self, data: &[u8]) -> usize {
+    fn write(&self, data: &[u8]) -> usize {
         let capacity = self.capacity();
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
@@ -93,13 +95,13 @@ impl SpscRing {
     }
 
     /// Producer: asks the consumer to drop everything published so far.
-    pub fn request_discard_all(&self) {
+    fn request_discard_all(&self) {
         self.discard
             .store(self.tail.load(Ordering::Acquire), Ordering::Release);
     }
 
     /// Consumer: carries out a pending flush. Returns whether anything was skipped.
-    pub fn apply_discard(&self) -> bool {
+    fn apply_discard(&self) -> bool {
         let target = self.discard.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Relaxed);
         if target > head {
@@ -111,7 +113,7 @@ impl SpscRing {
     }
 
     /// Consumer: copies up to `out.len()` bytes and returns the count.
-    pub fn read(&self, out: &mut [u8]) -> usize {
+    fn read(&self, out: &mut [u8]) -> usize {
         let capacity = self.capacity();
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
@@ -133,17 +135,58 @@ impl SpscRing {
     }
 }
 
+/// Unique producer and consumer handles. Neither endpoint is Sync, and mutating
+/// the ring requires a mutable endpoint, preventing safe concurrent reuse.
+pub(super) struct Producer {
+    ring: Arc<SpscRing>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+pub(super) struct Consumer {
+    ring: Arc<SpscRing>,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+pub(super) fn split(capacity: usize) -> (Arc<SpscRing>, Producer, Consumer) {
+    let ring = Arc::new(SpscRing::new(capacity));
+    (
+        ring.clone(),
+        Producer {
+            ring: ring.clone(),
+            _not_sync: PhantomData,
+        },
+        Consumer {
+            ring,
+            _not_sync: PhantomData,
+        },
+    )
+}
+impl Producer {
+    pub(super) fn write(&mut self, data: &[u8]) -> usize {
+        self.ring.write(data)
+    }
+    pub(super) fn request_discard_all(&mut self) {
+        self.ring.request_discard_all()
+    }
+}
+impl Consumer {
+    pub(super) fn read(&mut self, out: &mut [u8]) -> usize {
+        self.ring.read(out)
+    }
+    pub(super) fn apply_discard(&mut self) -> bool {
+        self.ring.apply_discard()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn bytes_come_out_in_order() {
-        let ring = SpscRing::new(8);
-        assert_eq!(ring.write(&[1, 2, 3, 4, 5]), 5);
+        let (ring, mut producer, mut consumer) = split(8);
+        assert_eq!(producer.write(&[1, 2, 3, 4, 5]), 5);
         let mut out = [0u8; 3];
-        assert_eq!(ring.read(&mut out), 3);
+        assert_eq!(consumer.read(&mut out), 3);
         assert_eq!(out, [1, 2, 3]);
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.free(), 6);
@@ -151,65 +194,64 @@ mod tests {
 
     #[test]
     fn a_full_ring_takes_nothing_more() {
-        let ring = SpscRing::new(4);
-        assert_eq!(ring.write(&[1, 2, 3, 4, 5, 6]), 4);
-        assert_eq!(ring.write(&[9]), 0);
+        let (ring, mut producer, mut consumer) = split(4);
+        assert_eq!(producer.write(&[1, 2, 3, 4, 5, 6]), 4);
+        assert_eq!(producer.write(&[9]), 0);
         assert_eq!(ring.free(), 0);
         let mut out = [0u8; 8];
-        assert_eq!(ring.read(&mut out), 4);
+        assert_eq!(consumer.read(&mut out), 4);
         assert_eq!(&out[..4], &[1, 2, 3, 4]);
-        assert_eq!(ring.read(&mut out), 0);
+        assert_eq!(consumer.read(&mut out), 0);
     }
 
     #[test]
     fn the_ring_wraps_around() {
-        let ring = SpscRing::new(5);
+        let (_ring, mut producer, mut consumer) = split(5);
         let mut out = [0u8; 5];
         for round in 0..20u8 {
             let data = [round, round + 1, round + 2, round + 3];
-            assert_eq!(ring.write(&data), 4);
-            assert_eq!(ring.read(&mut out[..4]), 4);
+            assert_eq!(producer.write(&data), 4);
+            assert_eq!(consumer.read(&mut out[..4]), 4);
             assert_eq!(&out[..4], &data);
         }
     }
 
     #[test]
     fn a_discard_is_applied_by_the_consumer_only() {
-        let ring = SpscRing::new(16);
-        ring.write(&[1, 2, 3, 4, 5, 6]);
-        ring.request_discard_all();
+        let (ring, mut producer, mut consumer) = split(16);
+        producer.write(&[1, 2, 3, 4, 5, 6]);
+        producer.request_discard_all();
         // The bytes still occupy the ring until the consumer lets go of them.
         assert_eq!(ring.len(), 6);
         assert_eq!(ring.len_after_flush(), 0);
         assert_eq!(ring.free(), 10);
-        assert!(ring.apply_discard());
+        assert!(consumer.apply_discard());
         assert_eq!(ring.len(), 0);
-        assert!(!ring.apply_discard());
-        ring.write(&[7, 8]);
+        assert!(!consumer.apply_discard());
+        producer.write(&[7, 8]);
         let mut out = [0u8; 8];
-        assert_eq!(ring.read(&mut out), 2);
+        assert_eq!(consumer.read(&mut out), 2);
         assert_eq!(&out[..2], &[7, 8]);
     }
 
     #[test]
     fn bytes_written_after_a_discard_request_survive_it() {
-        let ring = SpscRing::new(16);
-        ring.write(&[1, 2, 3]);
-        ring.request_discard_all();
-        ring.write(&[4, 5]);
+        let (ring, mut producer, mut consumer) = split(16);
+        producer.write(&[1, 2, 3]);
+        producer.request_discard_all();
+        producer.write(&[4, 5]);
         assert_eq!(ring.len_after_flush(), 2);
-        ring.apply_discard();
+        consumer.apply_discard();
         let mut out = [0u8; 8];
-        assert_eq!(ring.read(&mut out), 2);
+        assert_eq!(consumer.read(&mut out), 2);
         assert_eq!(&out[..2], &[4, 5]);
     }
 
     #[test]
     fn a_producer_and_a_consumer_on_two_threads_lose_and_reorder_nothing() {
         const TOTAL: usize = 2_000_000;
-        let ring = Arc::new(SpscRing::new(4099));
-        let producer = {
-            let ring = ring.clone();
+        let (ring, mut producer, mut consumer) = split(4099);
+        let producer_thread = {
             std::thread::spawn(move || {
                 let mut sent = 0usize;
                 let mut chunk = [0u8; 700];
@@ -218,7 +260,7 @@ mod tests {
                     for (i, byte) in chunk[..n].iter_mut().enumerate() {
                         *byte = ((sent + i) % 251) as u8;
                     }
-                    let taken = ring.write(&chunk[..n]);
+                    let taken = producer.write(&chunk[..n]);
                     sent += taken;
                     if taken == 0 {
                         std::thread::yield_now();
@@ -230,7 +272,7 @@ mod tests {
         let mut received = 0usize;
         let mut out = [0u8; 513];
         while received < TOTAL {
-            let n = ring.read(&mut out);
+            let n = consumer.read(&mut out);
             for (i, byte) in out[..n].iter().enumerate() {
                 assert_eq!(*byte, ((received + i) % 251) as u8, "byte {}", received + i);
             }
@@ -239,7 +281,7 @@ mod tests {
                 std::thread::yield_now();
             }
         }
-        producer.join().unwrap();
+        producer_thread.join().unwrap();
         assert_eq!(ring.len(), 0);
     }
 }

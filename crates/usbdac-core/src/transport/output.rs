@@ -71,8 +71,15 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-fn worker_gap_us(total: Duration, pump: Duration) -> (u64, u64) {
-    (duration_us(total), duration_us(total.saturating_sub(pump)))
+fn worker_gap_us(total: Duration, pump: Duration, intentional: Duration) -> (u64, u64) {
+    (
+        duration_us(total),
+        duration_us(total.saturating_sub(pump).saturating_sub(intentional)),
+    )
+}
+
+fn callback_retirement_is_late(age_us: u64) -> bool {
+    age_us > 10_000
 }
 
 fn worker_gap_thresholds(gap_us: u64) -> (bool, bool) {
@@ -132,6 +139,31 @@ pub(super) fn prepare_iso_transfer_payload(
         dsd_bit_reverse,
         false,
     )
+}
+
+#[cfg(test)]
+pub(super) fn prepare_implicit_refill_for_test(
+    scheduler: &mut IsoPacketScheduler,
+    pcm_buffer: &Arc<Mutex<PcmRing>>,
+    runtime_stats: &RuntimeStats,
+    candidate: &IsoStreamCandidate,
+    held: bool,
+) -> IsoTransferPayload {
+    prepare_iso_transfer_payload_held(
+        scheduler,
+        pcm_buffer,
+        runtime_stats,
+        candidate,
+        2,
+        2,
+        4,
+        DsdTransportMode::None,
+        false,
+        false,
+        held,
+    )
+    .unwrap()
+    .unwrap()
 }
 
 /// Build startup lock silence through the normal transport encoder, retaining
@@ -1071,7 +1103,10 @@ pub(super) fn run_usb_output_loop(
             scheduler.packets_per_transfer(),
             transfer_buffer_capacity,
         ) {
-            Ok(slot) => slots.push(slot),
+            Ok(mut slot) => {
+                slot.retain_owner(claimed_handle.transfer_owner());
+                slots.push(slot);
+            }
             Err(error) => {
                 fatal_error = Some(format!(
                     "USB direct failed to allocate transfer slot: {}",
@@ -1126,7 +1161,7 @@ pub(super) fn run_usb_output_loop(
                     attachment.endpoint.address,
                     &shared,
                 )
-                .and_then(|()| pool.start(handle, &stop));
+                .and_then(|()| pool.start(claimed_handle, &stop));
                 if let Err(error) = start {
                     device_lost = error == Error::DeviceLost;
                     fatal_error = Some(error.to_string());
@@ -1217,7 +1252,7 @@ pub(super) fn run_usb_output_loop(
                         device_lost = error == Error::DeviceLost;
                         fatal_error = Some(error.to_string());
                         capture_failure = Some(error);
-                    } else if let Err(error) = engine.start(handle, &runtime_stats, &stop) {
+                    } else if let Err(error) = engine.start(claimed_handle, &runtime_stats, &stop) {
                         implicit_feedback_fault = true;
                         fatal_error = Some(error);
                     }
@@ -1328,7 +1363,7 @@ pub(super) fn run_usb_output_loop(
         .as_mut()
         .filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop))
     {
-        match transfers.start(handle, &mut feedback_counters) {
+        match transfers.start(claimed_handle, &mut feedback_counters) {
             Ok(()) => {
                 let slot = &transfers.slots[0];
                 let endpoint = slot.endpoint;
@@ -1499,6 +1534,7 @@ pub(super) fn run_usb_output_loop(
         } else {
             Duration::from_millis(50)
         };
+        let mut intentional_wait = Duration::ZERO;
         let event_wait_started = Instant::now();
         let event_result = context.handle_events(Some(event_timeout));
         let event_wait_duration = event_wait_started.elapsed();
@@ -1567,6 +1603,7 @@ pub(super) fn run_usb_output_loop(
                 } else {
                     cancel_stale_transfers_for_flush(context, &mut slots, flush_epoch)
                 };
+                intentional_wait += started.elapsed();
                 // Synchronous flush retirement can pump another event batch.
                 if usb_stop_requested(&stop) {
                     break;
@@ -1708,6 +1745,7 @@ pub(super) fn run_usb_output_loop(
         let (loop_gap_us, gap_us) = worker_gap_us(
             now.saturating_duration_since(previous_worker_at),
             event_wait_duration,
+            intentional_wait,
         );
         previous_worker_at = now;
         runtime_stats
@@ -1798,6 +1836,17 @@ pub(super) fn run_usb_output_loop(
             let Some((status, completed_at, _actual_length)) = slot.take_completion() else {
                 continue;
             };
+
+            // This timestamp is set in the libusb callback, not by the kernel.
+            let callback_age_us = duration_us(completed_at.elapsed());
+            runtime_stats
+                .max_callback_retirement_us
+                .fetch_max(callback_age_us, Ordering::Relaxed);
+            if callback_retirement_is_late(callback_age_us) {
+                runtime_stats
+                    .callback_retirement_over_10ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             if slot.cancelled_for_flush
                 && out_flush_deadline.is_some_and(|deadline| completed_at >= deadline)
@@ -1958,6 +2007,11 @@ pub(super) fn run_usb_output_loop(
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
                 .with_held(completed_held)
                 .with_transport_failure(transfer_failed);
+            if urb_loss.lost_frames > 0 && callback_retirement_is_late(callback_age_us) {
+                runtime_stats
+                    .callback_retirement_loss_over_10ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             if urb_loss.lost_frames > 0 {
                 batch_lossy_completions = batch_lossy_completions.saturating_add(1);
             }
@@ -2640,14 +2694,32 @@ mod implicit_out_coverage_tests {
     #[test]
     fn worker_timing_includes_pump_once_and_saturates() {
         assert_eq!(
-            worker_gap_us(Duration::from_millis(70), Duration::from_millis(50)),
+            worker_gap_us(
+                Duration::from_millis(70),
+                Duration::from_millis(50),
+                Duration::ZERO
+            ),
             (70_000, 20_000)
         );
         assert_eq!(
-            worker_gap_us(Duration::from_millis(10), Duration::from_millis(50)),
+            worker_gap_us(
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+                Duration::ZERO
+            ),
             (10_000, 0)
         );
         assert_eq!(duration_us(Duration::from_secs(u64::MAX)), u64::MAX);
+        assert_eq!(
+            worker_gap_us(
+                Duration::from_millis(1100),
+                Duration::from_millis(50),
+                Duration::from_millis(1000)
+            ),
+            (1_100_000, 50_000)
+        );
+        assert!(!callback_retirement_is_late(10_000));
+        assert!(callback_retirement_is_late(10_001));
         assert_eq!(worker_gap_thresholds(10_000), (false, false));
         assert_eq!(worker_gap_thresholds(10_001), (true, false));
         assert_eq!(worker_gap_thresholds(50_000), (true, false));

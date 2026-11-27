@@ -1950,6 +1950,72 @@ fn adc3_alternate_pairs(
     ))
 }
 
+// Read-only exclusion only for a fully parsed unpowered, direct ADC3 route.
+// Empty pair sets and alternative/powered paths remain unknown.
+pub(super) fn adc3_direct_rate_excludes(
+    claimed: &ClaimedHandle,
+    config: &ConfigDescriptor,
+    alt: &rusb::InterfaceDescriptor,
+    speed: Speed,
+    requested: PlaybackFormat,
+) -> bool {
+    if !claimed.claimed_interfaces.contains(&alt.interface_number()) {
+        return false;
+    }
+    let Ok(pairs) = adc3_alternate_pairs(config, &claimed.handle, alt, speed, false, None) else {
+        return false;
+    };
+    if pairs.len() != 1 {
+        return false;
+    }
+    let (candidate, route, _) = &pairs[0];
+    if route.profile != wire::FunctionProfile::Full
+        || !route.domains.is_empty()
+        || route.implicit.is_some()
+        || route.plan.is_some()
+        || !claimed.claimed_interfaces.contains(&route.control)
+    {
+        return false;
+    }
+    let Some(choice) = &route.choice else {
+        return false;
+    };
+    if choice.resolution != ClockResolution::Resolved
+        || choice
+            .path
+            .iter()
+            .any(|hop| !matches!(hop.kind, ClockHopKind::Terminal | ClockHopKind::Source))
+    {
+        return false;
+    }
+    let Some(source) = &route.clock else {
+        return false;
+    };
+    let Ok(raw) = get_sampling_frequency_ranges(&claimed.handle, route.control, source.id) else {
+        return false;
+    };
+    if raw.is_empty()
+        || raw
+            .iter()
+            .any(|r| r.min == 0 || r.max < r.min || (r.max > r.min && r.res == 0))
+    {
+        return false;
+    }
+    if verify_adc3_rate_route(&claimed.handle, route).is_err() {
+        return false;
+    }
+    let Ok(ranges) = adc3_route_ranges(route, &raw) else {
+        return false;
+    };
+    if verify_adc3_rate_route(&claimed.handle, route).is_err() {
+        return false;
+    }
+    if ranges.is_empty() {
+        return false;
+    }
+    !adc3_candidate_matches_ranges(candidate, &ranges, requested)
+}
+
 fn adc3_expand_implicit_pairs(
     candidate: &IsoStreamCandidate,
     route: &Adc3Route,
@@ -3062,15 +3128,22 @@ pub(super) struct Adc3PowerLease {
     routing_deadline: Mutex<Option<Instant>>,
     pending: Mutex<Vec<(u8, u8, u8)>>,
     clock: Mutex<Option<(Adc3Route, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
+    // Outlives the handle and control operations performed during Drop.
+    _fd_owner: Option<Arc<OwnedUsbFd>>,
 }
 impl Adc3PowerLease {
-    pub(super) fn new(fd: DeviceKey, handle: Option<Arc<DeviceHandle<Context>>>) -> Self {
+    pub(super) fn new(
+        fd: DeviceKey,
+        handle: Option<Arc<DeviceHandle<Context>>>,
+        fd_owner: Option<Arc<OwnedUsbFd>>,
+    ) -> Self {
         Self {
             fd,
             handle,
             routing_deadline: Mutex::new(None),
             pending: Mutex::new(vec![]),
             clock: Mutex::new(None),
+            _fd_owner: fd_owner,
         }
     }
     pub(super) fn set_routing_deadline(&self, deadline: Instant) {
@@ -4464,6 +4537,27 @@ pub(super) fn adc3_badd_volume_topology(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn badd_witness_rejects_registered_owner_and_duplicate_fd() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+        let owner = super::super::context::SessionContext::reserve(fd).unwrap();
+        let duplicate = unsafe { libc::dup(fd) };
+        assert!(duplicate >= 0);
+        assert!(matches!(
+            super::super::usbfs::try_badd_descriptor_witness(fd, 1, &[0; 9]),
+            Err(crate::Error::Busy)
+        ));
+        assert!(matches!(
+            super::super::usbfs::try_badd_descriptor_witness(duplicate, 1, &[0; 9]),
+            Err(crate::Error::Busy)
+        ));
+        unsafe {
+            libc::close(duplicate);
+        }
+        drop(owner);
+    }
     use super::*;
 
     #[test]

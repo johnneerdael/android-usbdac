@@ -64,3 +64,11 @@ val exactOnly = OutputPolicy(
 ```
 
 With both flags off, a request the DAC cannot run exactly is passed to the next output, or fails with `UNSUPPORTED` when it is forced. For direct `PcmConverter` or `ConvertingOutput` use, pass `ConversionOptions(headroomDb = 0.0)` to keep unity gain; in Rust, set `ConvertOptions::headroom_db` to `0.0`.
+
+## Unreleased follow-up
+
+The current development version changes the published 0.1.11 behavior described above. Custom `OutputSource.formatSupport` implementations now default to `UNKNOWN`, allowing an open attempt; the sink reports it as supported with transcoding rather than promising direct output. The sample controller consults cached USB capabilities first, including rates above 192 kHz, before a managed fallback. Capability queries remain side-effect-free.
+
+For Android DSD-to-PCM fallback, API 31 and later try 24-bit and 32-bit integer targets before 16-bit when the route supports them; exclusive AAudio with `floatSamples` uses float. Older Android versions retain 16-bit integer targets. These are candidate preferences, not a promise that any particular output accepts them.
+
+Media3 write recovery is opt-in through `OutputSource.canRecover` for a typed failure and requires successful output closure. Sources unable to recreate the output keep the default nonrecoverable behavior. Downstream limits still require a suitable bound exclusive AAudio route for Android output; the selector may bypass limits for a direct DAC only when an explicit binding establishes a distinct route.

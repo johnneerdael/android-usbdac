@@ -22,7 +22,7 @@ class OpenedOutput(
 class OutputReconfiguration(val opened: OpenedOutput, val rollbackCause: DacException? = null)
 
 /** Result from a cached, side-effect-free output capability snapshot. */
-enum class OutputFormatSupport { UNSUPPORTED, DIRECT, WITH_TRANSCODING }
+enum class OutputFormatSupport { UNSUPPORTED, DIRECT, WITH_TRANSCODING, UNKNOWN }
 
 /** The accepted producer format and, when known, the resulting target format. */
 data class OutputSupport(
@@ -41,18 +41,22 @@ interface OutputSource {
      * Whether the sink should accept [request], answered from cached capabilities only. Do not open,
      * negotiate, or probe here. [UsbDacAudioSink.getFormatSupport] asks it for every raw PCM format.
      *
-     * The default answers [OutputFormatSupport.UNSUPPORTED] for every request. A source written for
+     * The default answers [OutputFormatSupport.UNKNOWN] for every request. A source written for
      * 0.1.10 that implements only [open], [close], [takeLookAgain] and [setVolumeMultiplier] still
-     * compiles, but the sink then rejects every format and nothing plays. Override this method.
+     * compiles, and unknown formats remain eligible for an open attempt. Override this method to
+     * report known support.
      */
     fun formatSupport(request: StreamRequest): OutputSupport =
-        OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no capability snapshot")
+        OutputSupport(OutputFormatSupport.UNKNOWN, request, reason = "no capability snapshot")
 
     /** Opens the best output for [request]. Blocks for 100 ms or more: the sink calls it off the main thread. */
     fun open(request: StreamRequest): OpenedOutput
 
     /** Optional transactional format change after drain; null retains the close/open fallback. */
     fun reconfigure(output: OpenedOutput, request: StreamRequest): OutputReconfiguration? = null
+
+    /** Whether this source can recreate an output after this typed failure and a decoder seek. */
+    fun canRecover(error: DacException): Boolean = false
 
     /** Closes [output] and everything opened for it. Blocks. */
     fun close(output: OpenedOutput)

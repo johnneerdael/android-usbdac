@@ -117,10 +117,16 @@ pub struct StreamStats {
     pub max_turnaround_us: u64,
     pub last_submit_gap_us: u64,
     pub max_submit_gap_us: u64,
-    /// Checkpoint gaps excluding the most recent event-pump elapsed time.
+    /// Checkpoint gaps excluding event-pump and synchronous flush-cancellation time.
     pub worker_gap_over_10ms: u64,
     pub worker_gap_over_50ms: u64,
     pub max_worker_gap_us: u64,
+    /// Callback publication to worker retirement, not kernel completion latency.
+    pub max_callback_retirement_us: u64,
+    /// Retired playback callbacks older than 10 ms.
+    pub callback_retirement_over_10ms: u64,
+    /// Such callbacks whose transfer also reports lost audio frames.
+    pub callback_retirement_loss_over_10ms: u64,
     /// Longest checkpoint-to-checkpoint interval, including the event pump.
     pub max_worker_loop_gap_us: u64,
     /// Longest time inside the event pump, including callbacks and scheduling.
@@ -606,6 +612,11 @@ impl DacStream {
             worker_gap_over_10ms: stats.worker_gap_over_10ms.load(Relaxed),
             worker_gap_over_50ms: stats.worker_gap_over_50ms.load(Relaxed),
             max_worker_gap_us: stats.max_worker_gap_us.load(Relaxed),
+            max_callback_retirement_us: stats.max_callback_retirement_us.load(Relaxed),
+            callback_retirement_over_10ms: stats.callback_retirement_over_10ms.load(Relaxed),
+            callback_retirement_loss_over_10ms: stats
+                .callback_retirement_loss_over_10ms
+                .load(Relaxed),
             max_worker_loop_gap_us: stats.max_worker_loop_gap_us.load(Relaxed),
             max_event_pump_elapsed_us: stats.max_event_pump_elapsed_us.load(Relaxed),
             max_event_pump_timeout_overrun_us: stats

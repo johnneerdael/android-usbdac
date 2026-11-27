@@ -187,3 +187,5 @@ The usbdac commits behind the decisions, such as [`eada7d7`](https://github.com/
 - **The UAC 2.0 RAW_DATA format does not say what the data is.** [The formats document](#ref-uac2-formats) defines it as uninterpreted PCM-like slots, so legacy native DSD layouts are cited through the Linux quirks; standard UAC3 DSD is cited through `Frmts30.pdf` above.
 - **USB 2.0 section 4.7 does not make streams on one device independent in failure.** It describes pipes in general; whether one direction survives a fault in the other is usbdac's own rule.
 - A third-party mirror of Alan Stern's `snd-usb-audio` URB rework, cited in Flick PR #400, redirected to a sign-in page and was not used.
+
+The UAC1 §4.3.2.3 source spans pp. 40–41. The 2019 UAC3 errata numbers PCM Format as §2.3.1.7.1, p. 13. The DSF source is Version 1.01; BS.1770-5 inter-sample figures appear in Attachment 1 to Annex 2, p. 20.

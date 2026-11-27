@@ -670,7 +670,18 @@ pub trait RoutingIo {
     type Error;
     fn read(&mut self, request: ControlRequest, data: &mut [u8]) -> Result<usize, Self::Error>;
     fn write(&mut self, request: ControlRequest, data: &[u8]) -> Result<usize, Self::Error>;
+    /// Admit the full set of changed controls before the first SET.
+    fn admit_plan(&mut self, _changed: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Reserve enough time for a complete SET and its verifying read.
+    fn admit_write(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
     fn begin_recovery(&mut self) {}
+    fn begin_recovery_for(&mut self, _attempted: usize) {
+        self.begin_recovery();
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -805,8 +816,15 @@ pub(crate) fn apply_routes_traced<I: RoutingIo>(
         }
         originals.push(original);
     }
+    let changed = changes
+        .iter()
+        .zip(&originals)
+        .filter(|(change, original)| change.value != **original)
+        .count();
+    io.admit_plan(changed)
+        .map_err(|cause| error(None, RoutingError::Io(cause)))?;
     let mut report = RouteReport::default();
-    let mut attempted = Vec::new();
+    let mut attempted: Vec<usize> = Vec::new();
     for (i, ((control, change), original)) in
         controls.iter().zip(changes).zip(&originals).enumerate()
     {
@@ -814,11 +832,23 @@ pub(crate) fn apply_routes_traced<I: RoutingIo>(
             report.unchanged.push(change.key);
             continue;
         }
+        if let Err(cause) = io.admit_write() {
+            let mut failure = error(Some(i), RoutingError::Io(cause));
+            if !attempted.is_empty() {
+                io.begin_recovery_for(attempted.len());
+                for &j in attempted.iter().rev() {
+                    if let Err(e) = write_verified(io, controls[j], originals[j]) {
+                        failure.rollback_failures.push((changes[j].key, e));
+                    }
+                }
+            }
+            return Err(failure);
+        }
         attempted.push(i);
         attempted_values.push((change.key, *original, change.value));
         if let Err(cause) = write_verified(io, *control, change.value) {
             let mut failure = error(Some(i), cause);
-            io.begin_recovery();
+            io.begin_recovery_for(attempted.len());
             for &j in attempted.iter().rev() {
                 if let Err(e) = write_verified(io, controls[j], originals[j]) {
                     failure.rollback_failures.push((changes[j].key, e));
@@ -1290,6 +1320,92 @@ mod tests {
         assert_eq!(report.changed, vec![select(8, 2).key]);
         assert_eq!(io.writes.len(), 1);
         assert_eq!(io.reads.len(), 3); // two originals and verified write
+    }
+
+    #[test]
+    fn rejected_plan_does_not_write_any_control() {
+        struct PlanProbe(MockIo);
+        impl RoutingIo for PlanProbe {
+            type Error = &'static str;
+            fn read(
+                &mut self,
+                request: ControlRequest,
+                data: &mut [u8],
+            ) -> Result<usize, Self::Error> {
+                self.0.read(request, data)
+            }
+            fn write(
+                &mut self,
+                request: ControlRequest,
+                data: &[u8],
+            ) -> Result<usize, Self::Error> {
+                self.0.write(request, data)
+            }
+            fn admit_plan(&mut self, changed: usize) -> Result<(), Self::Error> {
+                assert_eq!(changed, 2);
+                Err("plan deadline")
+            }
+        }
+        let mut io = PlanProbe(MockIo::selectors());
+        let result =
+            apply_routes(&inventory(), &mut io, &[select(7, 2), select(8, 2)]).unwrap_err();
+        assert_eq!(result.cause, RoutingError::Io("plan deadline"));
+        assert!(io.0.writes.is_empty());
+    }
+
+    #[test]
+    fn admission_failure_restores_previous_writes_and_preserves_cause() {
+        struct AdmissionProbe {
+            inner: MockIo,
+            admitted: usize,
+            recovered: usize,
+        }
+        impl RoutingIo for AdmissionProbe {
+            type Error = &'static str;
+            fn read(
+                &mut self,
+                request: ControlRequest,
+                data: &mut [u8],
+            ) -> Result<usize, Self::Error> {
+                self.inner.read(request, data)
+            }
+            fn write(
+                &mut self,
+                request: ControlRequest,
+                data: &[u8],
+            ) -> Result<usize, Self::Error> {
+                self.inner.write(request, data)
+            }
+            fn admit_write(&mut self) -> Result<(), Self::Error> {
+                self.admitted += 1;
+                if self.admitted == 2 {
+                    Err("deadline")
+                } else {
+                    Ok(())
+                }
+            }
+            fn begin_recovery_for(&mut self, attempted: usize) {
+                self.recovered = attempted;
+            }
+        }
+        let mut io = AdmissionProbe {
+            inner: MockIo::selectors(),
+            admitted: 0,
+            recovered: 0,
+        };
+        let failure =
+            apply_routes(&inventory(), &mut io, &[select(7, 2), select(8, 2)]).unwrap_err();
+        assert_eq!(failure.cause, RoutingError::Io("deadline"));
+        assert!(failure.rollback_failures.is_empty());
+        assert_eq!(io.recovered, 1);
+        assert_eq!(
+            io.inner
+                .writes
+                .iter()
+                .map(|(r, b)| (r.index, b[0]))
+                .collect::<Vec<_>>(),
+            vec![(0x0703, 2), (0x0703, 1)]
+        );
     }
 
     #[test]

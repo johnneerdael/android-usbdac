@@ -41,6 +41,7 @@ pub(crate) struct SessionContext {
     pub(super) gen1: Arc<Mutex<Option<routing_hw::RecordedGen1>>>,
     pub(super) fcp: Arc<Mutex<Option<routing_hw::RecordedFcp>>>,
     pub(super) routing: Arc<Mutex<Option<routing_hw::RecordedRouting>>>,
+    pub(crate) routing_hand_back: AtomicU32,
     pub(super) routing_report: Arc<Mutex<Option<routing_hw::RoutingHandBackReport>>>,
 }
 impl SessionContext {
@@ -74,6 +75,7 @@ impl SessionContext {
             gen1: Arc::new(Mutex::new(None)),
             fcp: Arc::new(Mutex::new(None)),
             routing: Arc::new(Mutex::new(None)),
+            routing_hand_back: AtomicU32::new(0),
             routing_report: Arc::new(Mutex::new(None)),
         })
     }
@@ -464,6 +466,33 @@ mod tests {
         assert!(REGISTRY.lock().remembered.is_empty());
         reopened.keep_original(false);
         reopened.release();
+    }
+
+    #[test]
+    fn volume_restore_waits_for_worker_retirement() {
+        use super::super::api::{close_device, ORIGINAL_VOLUME_ACTION_RESTORE};
+        use super::super::fake_dac::{Registered, ORIGINAL_RAW};
+        let fake = Registered::new(false, true);
+        fake.set_levels(ORIGINAL_RAW, ORIGINAL_RAW);
+        fake.record_original();
+        super::super::volume_hw::write_volume_db(-40.0).unwrap();
+        let lowered = fake.raw();
+        let writes = fake.dac.lock().unwrap().volume_writes.len();
+        let guard = {
+            let _gate = USB_SESSION_GATE.lock();
+            SessionGuard::start_locked()
+        };
+        assert!(!close_device(
+            ORIGINAL_VOLUME_ACTION_RESTORE,
+            Duration::ZERO
+        ));
+        assert_eq!(fake.raw(), lowered);
+        assert_eq!(fake.dac.lock().unwrap().volume_writes.len(), writes);
+        assert!(fake.original_recorded());
+        drop(guard);
+        assert_eq!(fake.raw(), vec![ORIGINAL_RAW; 2]);
+        assert_eq!(fake.dac.lock().unwrap().volume_writes.len(), writes + 2);
+        assert!(!fake.original_recorded());
     }
 
     #[test]

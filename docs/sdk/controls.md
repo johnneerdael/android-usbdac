@@ -175,6 +175,7 @@ reports. Check `pacing` to identify an implicit route.
 | `feedbackStale` | The timing source has gone stale. For explicit feedback, the last good rate is held only during the bounded recovery window |
 | `maxWorkerGapUs`, 10/50 ms worker-gap counters | Observed work gaps outside the event pump |
 | `maxWorkerLoopGapUs`, `maxEventPumpElapsedUs`, `maxEventPumpTimeoutOverrunUs` | Maximum observed loop elapsed time, event-pump duration, and pump time beyond its requested wait. None alone attributes a delay to OS scheduling |
+| `maxCallbackRetirementUs`, `callbackRetirementOver10ms`, `callbackRetirementLossOver10ms` | Maximum callback-to-worker retirement time, number delayed over 10 ms, and delayed callbacks that also reported audio loss. These exclude kernel completion-to-callback latency |
 | `implicitFifoDepth`, `implicitWaits`, `implicitInvalidPackets` | Whether IN patterns are ready for each playback transfer, how often playback waits for them, and whether IN packets failed validation |
 
 See [feedback troubleshooting](troubleshooting.md#feedback-lock-and-dropouts)
@@ -353,7 +354,7 @@ These are separate from playback and from `OutputSelector`, which chooses playba
 
 `RoutingSnapshot.diagnostics` records excluded functions or entities as `RoutingDiagnostic(audioControlInterface, entityId, detail)`, so an unrelated usable control can still be listed. After close, read `DacSession.routingHandBack` (also `session.routing.handBack`). It is `NotClosed`, `Pending`, `NoRecordedChanges`, `Complete(report)` or `Unavailable(reason)`; `Pending` may continue after close returns while native work retires, and `Unavailable` is not success. A completed report has `controls` containing each `key`, `outcome`, optional `detail` and `rawOutcome`. Outcomes distinguish `RESTORED`, `ALREADY_ORIGINAL`, `EXTERNALLY_CHANGED`, `UNREADABLE`, `IDENTITY_OR_TOPOLOGY_CHANGED`, `RESTORE_UNCERTAIN`, `DEADLINE_EXPIRED`, `DISABLED` and `UNKNOWN`. These describe software-observed hand-back, not physical signal-path verification.
 
-Routing edits are explicit; starting a stream does not silently apply them. The Rust routing snapshot retains a `hand_back_report()` after close with per-control restoration, drift, unreadable or uncertain outcomes. Vendor routing entry points remain disabled and fail unsupported. Any future admitted vendor edit is a live routing change without issuing a settings-save command; persistence across replug or power cycle requires separate exact-firmware evidence.
+Routing edits are explicit; starting a stream does not silently apply them. After a changed edit or an uncertain rollback, negotiate the playback format again before opening a stream. No-op edits preserve the existing negotiation. While a reconfiguration drains, routing and negotiation return `Busy`; volume operations remain available. The Rust routing snapshot retains a `hand_back_report()` after close with per-control restoration, drift, unreadable or uncertain outcomes. Vendor routing entry points remain disabled and fail unsupported. The dormant DJM protocol can acknowledge a command without independently verifying the resulting route. Any future admitted vendor edit is a live routing change without issuing a settings-save command; persistence across replug or power cycle requires separate exact-firmware evidence.
 
 ## Library-level
 

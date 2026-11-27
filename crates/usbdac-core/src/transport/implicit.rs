@@ -150,6 +150,47 @@ impl MeasuredSilence {
     }
 }
 
+// Synthetic nominal cadence advances on every source packet. Its phase is a
+// continuous local timeline, not a claim about the device's accumulator.
+struct GapCadence {
+    increment: u64,
+    remainder: u64,
+    stride: usize,
+    max_out: usize,
+}
+impl GapCadence {
+    fn new(rate: u32, interval_us: u32, stride: usize, max_out: usize) -> Self {
+        Self {
+            increment: u64::from(rate) * u64::from(interval_us),
+            remainder: 0,
+            stride,
+            max_out,
+        }
+    }
+    fn advance(&mut self, packets: usize, emit: bool) -> Option<Vec<usize>> {
+        if self.increment == 0 || self.stride == 0 {
+            return None;
+        }
+        let mut remainder = self.remainder;
+        let mut result = Vec::with_capacity(if emit { packets } else { 0 });
+        for _ in 0..packets {
+            let total = remainder.checked_add(self.increment)?;
+            remainder = total % 1_000_000;
+            let bytes = usize::try_from(total / 1_000_000)
+                .ok()?
+                .checked_mul(self.stride)?;
+            if emit && bytes > self.max_out {
+                return None;
+            }
+            if emit {
+                result.push(bytes);
+            }
+        }
+        self.remainder = remainder;
+        Some(result)
+    }
+}
+
 pub(super) fn capture_pattern(
     packets: impl Iterator<Item = (i32, usize, usize)>,
     in_stride: usize,
@@ -387,6 +428,7 @@ pub(super) struct ImplicitFeedback {
     order: VecDeque<usize>,
     fifo: PatternFifo,
     measured_silence: MeasuredSilence,
+    gap_cadence: GapCadence,
     scratch: Vec<usize>,
     source: ImplicitFeedbackSource,
     out_stride: usize,
@@ -430,6 +472,7 @@ impl ImplicitFeedback {
             order: VecDeque::with_capacity(geometry.transfer_slots),
             fifo: PatternFifo::new(2 * geometry.transfer_slots, geometry.packets_per_transfer),
             measured_silence: MeasuredSilence::default(),
+            gap_cadence: GapCadence::new(rate, source.service_interval_us, out_stride, max_out),
             scratch: vec![0; geometry.packets_per_transfer],
             source,
             out_stride,
@@ -476,10 +519,15 @@ impl ImplicitFeedback {
     }
     pub(super) fn start(
         &mut self,
-        handle: &DeviceHandle<Context>,
+        claimed: &ClaimedHandle,
         stats: &RuntimeStats,
         stop: &AtomicBool,
     ) -> Result<(), String> {
+        let owner = claimed.transfer_owner();
+        for slot in &mut self.slots {
+            slot.retain_owner(owner.clone());
+        }
+        let handle = &claimed.handle;
         self.started = Instant::now();
         self.last_valid = self.started;
         for (index, slot) in self.slots.iter_mut().enumerate() {
@@ -591,6 +639,9 @@ impl ImplicitFeedback {
             match result {
                 Ok(ImplicitObservation::Complete { frames, .. }) => {
                     self.measured_silence.observed(&self.scratch);
+                    self.gap_cadence
+                        .advance(self.scratch.len(), false)
+                        .ok_or(ImplicitFault::Geometry)?;
                     let last_report_ms = record_valid_completion(
                         &mut self.last_valid,
                         completed_at,
@@ -662,6 +713,9 @@ impl ImplicitFeedback {
                     }
                 }
                 Ok(ImplicitObservation::EmptyCompletion) => {
+                    self.gap_cadence
+                        .advance(self.scratch.len(), false)
+                        .ok_or(ImplicitFault::Geometry)?;
                     stats.feedback_empty.fetch_add(1, Ordering::Relaxed);
                     if self.running {
                         if let Some(pattern) = self.measured_silence.take(
@@ -734,6 +788,9 @@ impl ImplicitFeedback {
                     }
                     self.timing_health = previous_health.missing(completed_at, self.running)?;
                     if previous_health == TimingHealth::Priming {
+                        self.gap_cadence
+                            .advance(self.scratch.len(), false)
+                            .ok_or(ImplicitFault::Geometry)?;
                         self.fifo.clear();
                         self.prime_count = 0;
                         if let Some(proof) = self.startup_rate_proof.as_mut() {
@@ -741,6 +798,13 @@ impl ImplicitFeedback {
                             self.startup_rate_proved = false;
                         }
                     } else {
+                        let pattern = self
+                            .gap_cadence
+                            .advance(self.scratch.len(), true)
+                            .ok_or(ImplicitFault::TimingUntrusted)?;
+                        self.fifo
+                            .push_silence(&pattern)
+                            .map_err(|_| ImplicitFault::FifoOverrun)?;
                         stats.feedback_locked.store(false, Ordering::Release);
                     }
                 }
@@ -1180,8 +1244,59 @@ mod tests {
     }
 }
 
+/// Exercise the production cadence and FIFO without a libusb device.
+#[cfg(test)]
+pub(super) fn separated_gap_patterns_for_test(mut consume: impl FnMut(Vec<usize>, bool)) {
+    let mut cadence = GapCadence::new(48_000, 125, 4, 24);
+    let mut fifo = PatternFifo::new(4, 2);
+    let mut health = TimingHealth::Trusted;
+    let now = Instant::now();
+    for _ in 0..3 {
+        health = health.missing(now, true).unwrap();
+        assert!(matches!(health, TimingHealth::Recovering { .. }));
+        let gap = cadence.advance(2, true).unwrap();
+        fifo.push_silence(&gap).unwrap();
+        let pattern = fifo.pop().unwrap();
+        consume(pattern, fifo.last_pop_silence);
+        assert_eq!(fifo.depth, 0);
+        health = TimingHealth::Trusted; // valid timing requalifies before the next gap
+    }
+    let _ = health;
+}
+
 #[cfg(test)]
 mod measured_silence_tests {
+    #[test]
+    fn separated_gaps_keep_fifo_slots_and_fractional_synthetic_phase() {
+        use super::*;
+        let mut cadence = GapCadence::new(44_100, 125, 4, 24);
+        let mut fifo = PatternFifo::new(4, 3);
+        let mut total = 0;
+        let mut health = TimingHealth::Trusted;
+        let now = Instant::now();
+        for gap in 0..80 {
+            health = health.missing(now, true).unwrap();
+            let pattern = cadence.advance(3, true).unwrap();
+            total += pattern.iter().sum::<usize>() / 4;
+            fifo.push_silence(&pattern).unwrap();
+            assert_eq!(fifo.depth, 1);
+            assert_eq!(fifo.pop().unwrap(), pattern);
+            assert!(fifo.last_pop_silence);
+            assert_eq!(fifo.depth, 0);
+            if gap == 0 {
+                assert_eq!(
+                    health.missing(now, true),
+                    Err(ImplicitFault::TimingBudgetExhausted)
+                );
+            }
+            health = TimingHealth::Trusted; // a valid window requalified the source
+        }
+        assert_eq!(total, 1323);
+        assert!(GapCadence::new(44_100, 125, 4, 19)
+            .advance(1, true)
+            .is_none());
+    }
+
     use super::*;
     #[test]
     fn silence_requires_previous_proof_and_is_bounded_to_one_pattern() {

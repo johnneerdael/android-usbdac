@@ -150,6 +150,27 @@ pub fn rank<'l>(
     })
 }
 
+/// Compare synthetic PCM descriptor admission with the production core predicates.
+#[jni_mangle("dev.usbdac.internal.NativeRateRanking")]
+pub fn pcm_admission<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    values: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let values: Vec<u32> = serde_json::from_str(&string_of(env, &values)?)
+            .map_err(|_| Failure::Bad("invalid PCM admission input".into()))?;
+        Ok(JString::from_str(
+            env,
+            if usbdac_core::pcm_admission_probe(&values) {
+                "true"
+            } else {
+                "false"
+            },
+        )?)
+    })
+}
+
 // ---- library --------------------------------------------------------------
 
 /// The library version, `"<major>.<minor>.<patch>"`.
@@ -180,11 +201,9 @@ pub fn badd_descriptor_witness<'l>(
         let mut bytes = vec![0i8; len];
         snapshot.get_region(env, 0, &mut bytes)?;
         let raw: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
-        Ok(i32::from(usbdac_core::badd_descriptor_witness(
-            fd,
-            active_id as u8,
-            &raw,
-        )))
+        Ok(i32::from(
+            usbdac_core::try_badd_descriptor_witness(fd, active_id as u8, &raw).unwrap_or(0),
+        ))
     })
 }
 
@@ -344,6 +363,31 @@ pub fn dac_await_connection_retirement<'l>(
     run(&mut env, |_env| {
         Dac::await_connection_retirement(fd, std::time::Duration::from_millis(500))
             .map_err(Into::into)
+    })
+}
+
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_set_close_hand_back<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    restore_volume: bool,
+    restore_routing: bool,
+) {
+    run(&mut env, |_env| {
+        registry::dac(dac)?.dac.set_close_hand_back(
+            if restore_volume {
+                usbdac_core::CloseVolume::Restore
+            } else {
+                usbdac_core::CloseVolume::Keep
+            },
+            if restore_routing {
+                usbdac_core::HandBack::RestoreOriginal
+            } else {
+                usbdac_core::HandBack::Keep
+            },
+        )?;
+        Ok(())
     })
 }
 

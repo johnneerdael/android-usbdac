@@ -41,6 +41,15 @@ class UsbDacAudioSinkTest {
         UsbDacAudioSink(source).also { it.configure(AudioSink.AudioSinkConfig.Builder(pcm(bits)).build()) }
 
     @Test
+    fun legacySourceHasProvisionalSupportWithoutDirectFloatClaim() {
+        val sink = UsbDacAudioSink(FakeOutputSource())
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, sink.getFormatSupport(pcm(16)))
+        val floatFormat = pcm(16).buildUpon().setPcmEncoding(C.ENCODING_PCM_FLOAT).build()
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, sink.getFormatSupport(floatFormat))
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(pcm(16, channels = 3)))
+    }
+
+    @Test
     fun widensTwentyFourBitsIntoAFourByteSlotWithTheLowByteZero() {
         val target = ByteBuffer.allocate(8)
         val source = ByteBuffer.wrap(byteArrayOf(0x11, 0x22, 0x33, 0x44, 0x55, 0x66))
@@ -161,6 +170,25 @@ class UsbDacAudioSinkTest {
     }
 
     @Test
+    fun recreatableSourceClosesFailedOutputBeforeRecoverableErrorAndSeek() {
+        val fake = FakeOutputSource()
+        val source = object : OutputSource by fake {
+            override fun canRecover(error: DacException) = error.code == DacErrorCode.DEVICE_LOST
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.play()
+        sink.handleBuffer(audio(10, 4), 0, 1)
+        fake.failure(0, DacException(DacErrorCode.DEVICE_LOST, "unplugged"))
+        val error = assertThrows(AudioSink.WriteException::class.java) { sink.handleBuffer(audio(10, 4), 227, 1) }
+        assertTrue(error.isRecoverable)
+        assertTrue(fake.opened[0].closed)
+        sink.flush()
+        assertTrue(sink.handleBuffer(audio(10, 4), 1_000_000, 1))
+        assertEquals(2, fake.opened.size)
+    }
+
+    @Test
     fun aFailureWhilePlayingIsAWriteException() {
         val source = FakeOutputSource()
         val sink = configured(source)
@@ -211,7 +239,7 @@ class UsbDacAudioSinkTest {
         assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, sink.getFormatSupport(pcm(24)))
         support = OutputFormatSupport.UNSUPPORTED
         assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(float))
-        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, UsbDacAudioSink(fake).getFormatSupport(pcm(16)))
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, UsbDacAudioSink(fake).getFormatSupport(pcm(16)))
         assertEquals(3, queries)
         assertTrue(fake.opened.isEmpty())
     }

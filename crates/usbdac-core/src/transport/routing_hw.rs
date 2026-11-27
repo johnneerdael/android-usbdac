@@ -1050,11 +1050,19 @@ pub(crate) fn scarlett_gen1_apply(
     Ok(report)
 }
 
+fn restore_routing_on_close() -> bool {
+    match context::current().routing_hand_back.load(Ordering::Acquire) {
+        1 => false,
+        2 => true,
+        _ => settings().config.hand_back == crate::HandBack::RestoreOriginal,
+    }
+}
+
 fn finish_gen1_hand_back() {
     let Some(record) = ORIGINAL_GEN1.lock().take() else {
         return;
     };
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+    if !restore_routing_on_close() {
         return;
     }
     let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
@@ -1252,7 +1260,7 @@ fn finish_fcp_hand_back() {
     let Some(record) = ORIGINAL_FCP.lock().take() else {
         return;
     };
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+    if !restore_routing_on_close() {
         return;
     }
     if record.uncertain {
@@ -1446,7 +1454,7 @@ fn finish_scarlett_hand_back() {
     let Some(record) = ORIGINAL_SCARLETT.lock().take() else {
         return;
     };
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+    if !restore_routing_on_close() {
         return;
     }
     let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
@@ -1492,6 +1500,31 @@ fn finish_scarlett_hand_back() {
 
 const ROUTING_OPERATION_BUDGET: Duration = Duration::from_secs(4);
 const ROUTING_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
+fn admit_routing_plan(
+    deadline: Instant,
+    now: Instant,
+    observed: Duration,
+    changed: usize,
+) -> Result<(), String> {
+    let cost = observed.max(Duration::from_millis(1));
+    let estimate = cost.saturating_mul((changed as u32).saturating_mul(4));
+    if deadline.saturating_duration_since(now) < estimate {
+        return Err("routing plan exceeds remaining deadline".into());
+    }
+    Ok(())
+}
+
+fn admit_routing_write(deadline: Instant, now: Instant) -> Result<(), String> {
+    if deadline.saturating_duration_since(now) < Duration::from_secs(2) {
+        return Err("routing deadline cannot accommodate SET and readback".into());
+    }
+    Ok(())
+}
+
+fn routing_recovery_budget(attempted: usize) -> Duration {
+    ROUTING_RECOVERY_BUDGET + Duration::from_secs(2 * attempted as u64)
+}
+
 fn remaining(deadline: Instant) -> Result<Duration, RoutingSessionError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -1507,6 +1540,7 @@ struct UsbRoutingIo<'a> {
     recovery: Arc<Mutex<Option<Instant>>>,
     device: &'a UsbDevice,
     descriptors: &'a [u8],
+    max_observed: Duration,
 }
 
 /// Enforce the small set of setup packets this adapter is allowed to issue.
@@ -1581,7 +1615,9 @@ impl RoutingIo for UsbRoutingIo<'_> {
     type Error = String;
     fn read(&mut self, r: ControlRequest, bytes: &mut [u8]) -> Result<usize, String> {
         self.validate(r, true, bytes.len())?;
-        self.device
+        let started = Instant::now();
+        let result = self
+            .device
             .feature_unit_control_timed(
                 r.request_type,
                 r.request,
@@ -1590,12 +1626,16 @@ impl RoutingIo for UsbRoutingIo<'_> {
                 bytes,
                 remaining(self.deadline).map_err(|e| e.to_string())?,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        self.max_observed = self.max_observed.max(started.elapsed());
+        result
     }
     fn write(&mut self, r: ControlRequest, bytes: &[u8]) -> Result<usize, String> {
         self.validate(r, false, bytes.len())?;
         let mut data = bytes.to_vec();
-        self.device
+        let started = Instant::now();
+        let result = self
+            .device
             .feature_unit_control_timed(
                 r.request_type,
                 r.request,
@@ -1604,11 +1644,27 @@ impl RoutingIo for UsbRoutingIo<'_> {
                 &mut data,
                 remaining(self.deadline).map_err(|e| e.to_string())?,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        self.max_observed = self.max_observed.max(started.elapsed());
+        result
     }
-    fn begin_recovery(&mut self) {
+    fn admit_plan(&mut self, changed: usize) -> Result<(), String> {
+        // Estimate all remaining SET/readback pairs using the slowest measured
+        // preflight transfer, doubled for variance. The strict per-SET guard
+        // below remains authoritative if a later command is slower.
+        admit_routing_plan(self.deadline, Instant::now(), self.max_observed, changed)
+    }
+    fn admit_write(&mut self) -> Result<(), String> {
+        // Reserve time for both the SET and its verification read.
+        admit_routing_write(self.deadline, Instant::now())
+    }
+    fn begin_recovery_for(&mut self, attempted: usize) {
         let mut recovery = self.recovery.lock();
-        self.deadline = *recovery.get_or_insert_with(|| Instant::now() + ROUTING_RECOVERY_BUDGET);
+        // Each attempted SET may have changed the device, including a failed
+        // transfer. Reserve a SET and readback timeout for every such control,
+        // plus the existing allowance for power hand-back.
+        let budget = routing_recovery_budget(attempted);
+        self.deadline = *recovery.get_or_insert_with(|| Instant::now() + budget);
     }
 }
 
@@ -2336,9 +2392,7 @@ fn inventory_partial_for(
                         interface,
                         hc,
                     )?;
-                    let unit = if bytes[2] == selector {
-                        RoutingUnit::Selector(parse_selector(interface, bytes, protocol)?)
-                    } else {
+                    let unit = {
                         let count = usize::from(bytes[4]);
                         let inputs = bytes[5..5 + count]
                             .iter()
@@ -2505,16 +2559,19 @@ fn routing_power_interfaces(
     if owners.len() != 1 {
         return Err(fail());
     }
-    let owner = owners[0];
-    if owner[2] != control
-        || owner[3] == 0
-        || owner[4..7] != [1, 0, 0x30]
-        || u16::from(owner[2]) + u16::from(owner[3]) > 256
+    let iad = crate::descriptors::parse_iad(owners[0]).map_err(|_| fail())?;
+    if iad.b_first_interface != control
+        || !matches!(
+            crate::descriptors::uac3::function_profile(&iad, 0x30),
+            Ok(crate::descriptors::uac3::FunctionProfile::Full)
+        )
     {
         return Err(fail());
     }
     let mut streams = Vec::new();
-    for interface in u16::from(owner[2])..u16::from(owner[2]) + u16::from(owner[3]) {
+    for interface in u16::from(iad.b_first_interface)
+        ..u16::from(iad.b_first_interface) + u16::from(iad.b_interface_count)
+    {
         let interface = interface as u8;
         if descriptors
             .iter()
@@ -2573,6 +2630,7 @@ fn with_routing_power<T>(
     let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(
         device.fd,
         device.control_handle(),
+        device._fd_owner.clone(),
     ));
     let lease = &guard.0;
     lease.set_routing_deadline(deadline);
@@ -2960,6 +3018,7 @@ fn verify_snapshot(
         recovery: recovery.clone(),
         device,
         descriptors: &snapshot.descriptors,
+        max_observed: Duration::ZERO,
     };
     for &key in keys {
         let expected = selector_dependencies(snapshot, key)?;
@@ -3015,6 +3074,7 @@ fn collect_discovery_function(
         recovery: recovery.clone(),
         device,
         descriptors: raw,
+        max_observed: Duration::ZERO,
     };
     for unit in inventory.units() {
         if let RoutingUnit::Selector(selector) = unit {
@@ -3102,6 +3162,7 @@ fn discover_powered_functions(
                 let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(
                     device.fd,
                     device.control_handle(),
+                    device._fd_owner.clone(),
                 ));
                 guard.0.set_routing_deadline(deadline);
                 let operation = (|| {
@@ -3233,6 +3294,7 @@ pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, Rout
                 recovery: recovery.clone(),
                 device: &device,
                 descriptors: &descriptors,
+                max_observed: Duration::ZERO,
             };
             for unit in inventory.units() {
                 if let RoutingUnit::Selector(selector) = unit {
@@ -3314,6 +3376,7 @@ pub(crate) fn read_with_power(
                     recovery: recovery.clone(),
                     device: &device,
                     descriptors: &snapshot.descriptors,
+                    max_observed: Duration::ZERO,
                 })
                 .map_err(RoutingSessionError::Control)
         },
@@ -3394,6 +3457,24 @@ pub(crate) fn apply_with_power(
     edits: &[RouteEdit],
     powered: bool,
 ) -> Result<RouteReport, RoutingSessionError> {
+    // Validate the complete request and dependency metadata before power or writes.
+    if edits.len() > MAX_ROUTE_CHANGES {
+        return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
+    }
+    let mut dependencies = BTreeMap::new();
+    for edit in edits {
+        if dependencies.contains_key(&edit.key) {
+            return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateChange));
+        }
+        let control = snapshot
+            .inventory
+            .control(edit.key)
+            .map_err(RoutingSessionError::Invalid)?;
+        control
+            .write_request(edit.value)
+            .map_err(RoutingSessionError::Invalid)?;
+        dependencies.insert(edit.key, selector_dependencies(snapshot, edit.key)?);
+    }
     let deadline = Instant::now() + ROUTING_OPERATION_BUDGET;
     let recovery = Arc::new(Mutex::new(None));
     let _gate = USB_SESSION_GATE
@@ -3465,10 +3546,10 @@ pub(crate) fn apply_with_power(
             if let Some(prior) = originals.as_ref() {
                 for edit in edits {
                     if matches!(edit.key, ControlKey::Crosspoint { .. })
-                        && prior.values.get(&edit.key).is_some_and(|entry| {
-                            entry.selectors
-                                != selector_dependencies(snapshot, edit.key).unwrap_or_default()
-                        })
+                        && prior
+                            .values
+                            .get(&edit.key)
+                            .is_some_and(|entry| entry.selectors != dependencies[&edit.key])
                     {
                         return Err(RoutingSessionError::Drift(
                             "mixer mapping changed since its first edit".into(),
@@ -3495,6 +3576,7 @@ pub(crate) fn apply_with_power(
                 recovery: recovery.clone(),
                 device: &device,
                 descriptors: &snapshot.descriptors,
+                max_observed: Duration::ZERO,
             };
             verify_values(&snapshot.inventory, &mut io, &expected)?;
             if let Some(recorded) = originals.as_mut() {
@@ -3538,31 +3620,37 @@ pub(crate) fn apply_with_power(
                     powered,
                 });
                 recorded.powered |= powered;
-                let dependencies = selector_dependencies(snapshot, key)?;
+                let selectors = dependencies[&key].clone();
                 let entry = recorded.values.entry(key).or_insert_with(|| RecordedRoute {
                     original: before,
                     ownership: Ownership::None,
-                    selectors: dependencies,
+                    selectors,
                     forfeited: false,
                 });
                 entry.record_attempt(before, target, success, rollback_failed);
             }
-            match result {
-                Ok(report) => {
-                    if !report.changed.is_empty() {
-                        invalidate_route_caches();
-                    }
-                    Ok(report)
-                }
-                Err(failure) => {
-                    if !failure.rollback_failures.is_empty() {
-                        invalidate_route_caches();
-                    }
-                    Err(RoutingSessionError::Transaction(failure))
-                }
-            }
+            finish_route_transaction(result)
         },
     )
+}
+
+fn finish_route_transaction(
+    result: Result<RouteReport, TransactionError<String>>,
+) -> Result<RouteReport, RoutingSessionError> {
+    match result {
+        Ok(report) => {
+            if !report.changed.is_empty() {
+                invalidate_route_caches();
+            }
+            Ok(report)
+        }
+        Err(failure) => {
+            if !failure.rollback_failures.is_empty() {
+                invalidate_route_caches();
+            }
+            Err(RoutingSessionError::Transaction(failure))
+        }
+    }
 }
 
 fn invalidate_route_caches() {
@@ -3605,7 +3693,7 @@ pub(super) fn finish_routing_hand_back() {
             })
             .collect();
     };
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+    if !restore_routing_on_close() {
         report.controls = record
             .values
             .keys()
@@ -3619,7 +3707,16 @@ pub(super) fn finish_routing_hand_back() {
         *sink.lock() = Some(report);
         return;
     };
-    let deadline = Instant::now() + ROUTING_RECOVERY_BUDGET;
+    // Each entry can require a current read, SET and verification, with a
+    // second pass after selector restoration. Each dependency may also be
+    // read on both passes. All individual transfers have a one-second cap.
+    let transfer_allowance: u64 = record
+        .values
+        .values()
+        .map(|saved| 6u64.saturating_add(2 * saved.selectors.len() as u64))
+        .sum();
+    let deadline =
+        Instant::now() + ROUTING_RECOVERY_BUDGET + Duration::from_secs(transfer_allowance);
     let recovery = Arc::new(Mutex::new(Some(deadline)));
     let mut restore = || -> Result<RoutingHandBackReport, RoutingSessionError> {
         if !record.snapshot.device.same_owner(&device) {
@@ -3652,6 +3749,7 @@ pub(super) fn finish_routing_hand_back() {
                     recovery: recovery.clone(),
                     device: &device,
                     descriptors: &record.snapshot.descriptors,
+                    max_observed: Duration::ZERO,
                 };
                 let mut entries: Vec<_> = record.values.iter().collect();
                 // Selectors are independent addressable controls; mixer mappings must
@@ -3786,6 +3884,165 @@ where
 mod tests {
     use super::*;
     use crate::routing::Entity;
+
+    #[test]
+    fn route_transaction_outcomes_invalidate_only_when_hardware_may_change() {
+        let owner = context::SessionContext::unregistered();
+        let _scope = owner.enter();
+        let _session = session::TestSession::install();
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 8,
+        });
+        let (playback, requested) = {
+            let guard = SESSION_STATE.lock();
+            let state = guard.as_ref().unwrap();
+            (state.playback_format, state.requested_playback_format)
+        };
+        for (changed, failed, uncertain) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            install_volume_control(Some(fake_dac::control()));
+            {
+                let mut guard = SESSION_STATE.lock();
+                let state = guard.as_mut().unwrap();
+                // Restore the known initialized session values after invalidation.
+                state.playback_format = playback;
+                state.requested_playback_format = requested;
+                state.clock_verification_passed = true;
+            }
+            let result = if failed {
+                Err(TransactionError {
+                    failed_change: Some(2),
+                    cause: RoutingError::Io("set timeout".into()),
+                    rollback_failures: if uncertain {
+                        vec![(key, RoutingError::Io("rollback timeout".into()))]
+                    } else {
+                        vec![]
+                    },
+                })
+            } else {
+                Ok(RouteReport {
+                    changed: if changed { vec![key] } else { vec![] },
+                    unchanged: if changed { vec![] } else { vec![key] },
+                })
+            };
+            match finish_route_transaction(result) {
+                Ok(report) => {
+                    assert!(!failed);
+                    assert_eq!(report.changed, if changed { vec![key] } else { vec![] });
+                    assert_eq!(report.unchanged, if changed { vec![] } else { vec![key] });
+                }
+                Err(RoutingSessionError::Transaction(error)) => {
+                    assert!(failed);
+                    assert_eq!(error.failed_change, Some(2));
+                    assert_eq!(error.cause, RoutingError::Io("set timeout".into()));
+                    assert_eq!(
+                        error.rollback_failures,
+                        if uncertain {
+                            vec![(key, RoutingError::Io("rollback timeout".into()))]
+                        } else {
+                            vec![]
+                        }
+                    );
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+            let guard = SESSION_STATE.lock();
+            let state = guard.as_ref().unwrap();
+            let invalidated = changed || uncertain;
+            assert_eq!(state.playback_format.is_none(), invalidated);
+            assert_eq!(state.requested_playback_format.is_none(), invalidated);
+            assert_eq!(!state.clock_verification_passed, invalidated);
+            assert_eq!(state.hardware_volume_control.is_none(), invalidated);
+        }
+    }
+
+    #[test]
+    fn routing_budget_admission_and_recovery_are_bounded() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(4);
+        assert!(
+            admit_routing_plan(deadline, now, Duration::from_millis(100), MAX_ROUTE_CHANGES)
+                .is_err()
+        );
+        assert!(
+            admit_routing_plan(deadline, now, Duration::from_millis(10), MAX_ROUTE_CHANGES).is_ok()
+        );
+        assert!(admit_routing_write(deadline, deadline - Duration::from_secs(2)).is_ok());
+        assert!(admit_routing_write(deadline, deadline - Duration::from_millis(1999)).is_err());
+        assert_eq!(routing_recovery_budget(0), Duration::from_secs(2));
+        assert_eq!(routing_recovery_budget(1), Duration::from_secs(4));
+        assert_eq!(
+            routing_recovery_budget(MAX_ROUTE_CHANGES),
+            Duration::from_secs(66)
+        );
+    }
+
+    #[test]
+    fn route_cache_invalidation_clears_format_and_volume_for_renegotiation() {
+        let owner = context::SessionContext::unregistered();
+        let _scope = owner.enter();
+        let _session = session::TestSession::install();
+        install_volume_control(Some(fake_dac::control()));
+        {
+            let guard = SESSION_STATE.lock();
+            let state = guard.as_ref().unwrap();
+            assert!(state.playback_format.is_some());
+            assert!(state.requested_playback_format.is_some());
+            assert!(state.clock_verification_passed);
+            assert!(state.hardware_volume_control.is_some());
+        }
+        invalidate_route_caches();
+        let guard = SESSION_STATE.lock();
+        let state = guard.as_ref().unwrap();
+        assert!(state.playback_format.is_none());
+        assert!(state.requested_playback_format.is_none());
+        assert!(!state.clock_verification_passed);
+        assert!(state.hardware_volume_control.is_none());
+        assert!(state
+            .hardware_volume_error
+            .as_deref()
+            .unwrap()
+            .contains("negotiate"));
+    }
+
+    #[test]
+    fn routing_hand_back_override_is_owner_scoped_and_outlives_scope() {
+        let first = context::SessionContext::unregistered();
+        let second = context::SessionContext::unregistered();
+        {
+            let _scope = first.enter();
+            assert!(restore_routing_on_close());
+            first.routing_hand_back.store(1, Ordering::Release);
+            assert!(!restore_routing_on_close());
+        }
+        {
+            let _scope = second.enter();
+            let config = crate::DacConfig {
+                hand_back: crate::HandBack::Keep,
+                ..Default::default()
+            };
+            crate::settings::install(crate::settings::Settings::for_device(
+                config,
+                &crate::DeviceInfo::new(1, 2, "test"),
+            ));
+            assert!(!restore_routing_on_close());
+            second.routing_hand_back.store(2, Ordering::Release);
+            assert!(restore_routing_on_close());
+        }
+        {
+            let _scope = first.enter();
+            assert!(!restore_routing_on_close());
+            first.routing_hand_back.store(2, Ordering::Release);
+            assert!(restore_routing_on_close());
+        }
+        let _scope = second.enter();
+        assert!(restore_routing_on_close());
+    }
 
     #[test]
     fn shared_release_refuses_vendor_reads_before_usb_session_access() {
@@ -3943,7 +4200,7 @@ mod tests {
     #[test]
     fn powered_scope_requires_complete_claims_unique_iad_and_full_protocol() {
         let mut raw = vec![9, 2, 0, 0, 3, 1, 0, 0x80, 50];
-        raw.extend([8, 11, 3, 3, 1, 0, 0x30, 0]);
+        raw.extend([8, 11, 3, 3, 1, 1, 0x30, 0]);
         raw.extend([9, 4, 3, 0, 0, 1, 1, 0x30, 0]);
         raw.extend([9, 4, 4, 0, 0, 1, 2, 0x30, 0]);
         raw.extend([9, 4, 5, 0, 0, 1, 2, 0x30, 0]);
@@ -3953,8 +4210,11 @@ mod tests {
         );
         assert!(routing_power_interfaces(&raw, &[3, 4], 3).is_err());
         assert!(routing_power_interfaces(&raw, &[3, 4, 5], 4).is_err());
+        let mut reserved = raw.clone();
+        reserved[14] = 0;
+        assert!(routing_power_interfaces(&reserved, &[3, 4, 5], 3).is_err());
         let mut badd = raw.clone();
-        badd[15] = 0x20;
+        badd[14] = 0x20;
         assert!(routing_power_interfaces(&badd, &[3, 4, 5], 3).is_err());
         raw.extend([8, 11, 4, 2, 1, 0, 0x30, 0]);
         assert!(routing_power_interfaces(&raw, &[3, 4, 5], 3).is_err());

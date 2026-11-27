@@ -1830,10 +1830,13 @@ converter.clipped_samples() / delay_byte_frames() / min_output_bytes()
 - Input is the native DSD layout of section 4: chronological bytes, oldest bit
   in bit 7, channels interleaved. DSD64, DSD128 and DSD256 with one to eight
   channels.
-- A 512-tap Blackman-windowed low-pass decimates the one-bit stream by 16, then
+- A 704-tap Kaiser-windowed low-pass decimates the one-bit stream by 16, then
   the resampler of 14.4 (`ConvertOptions::quality`, `High` by default) reaches
-  the target rate. No stopband
-  specification is published for the first stage.
+  the target rate. Its first-stage transition spans 0.020–0.03125 cycles per
+  DSD bit. A production-coefficient test bounds passband ripple and stopband
+  response; a separate full-chain tone test covers DSD64 to 44.1 kHz. These
+  software measurements do not establish a universal alias or audible-noise
+  guarantee. See [DSD conversion](sdk/decisions-dsd-conversion.md).
 - Amplitude: a one bit is +1 and a zero bit -1, and the filter has unity gain at
   DC, so ±1.0 is 100 % modulation. A 50 % modulated signal comes out at
   -6.02 dBFS before headroom. `headroom_db` (default -3.5 dB) is applied once,
