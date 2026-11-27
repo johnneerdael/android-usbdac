@@ -120,6 +120,27 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `f01066bee4a35bb7932929e379f2b5ed5f89e3a20a3be9c91503332169740b78`.
 
+### UAC2 standalone capture alternate selection
+
+After verifying the requested input rate, read the selected
+AudioStreaming interface's live availability bitmap. A clean clear
+bit permits another matching alternate on the same claimed interface
+and terminal after the previous clock transaction has been restored.
+Abort on a malformed reply, request error, or uncertain restoration.
+[USB-IF UAC2 §5.2.6.1.2](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf)
+
+Keep the accepted candidate's resolved route and raw source frequency
+through activation. Verify both before changing the alternate, and
+verify the route and rate again before submitting IN transfers. For
+hardware acceptance, force a clean rejection of the preferred
+alternate, record the selector and frequency hand-back, and verify
+the replacement delivers the requested PCM format.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `8ea3d569d29d111e096dd0b727e091107a8d857e8dc81707c411528ccf4063c5`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a

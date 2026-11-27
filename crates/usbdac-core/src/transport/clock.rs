@@ -1445,6 +1445,11 @@ pub(super) struct CaptureClockRoute {
     frequency: CaptureFrequency,
     choice: ClockChoice,
 }
+impl CaptureClockRoute {
+    pub(super) fn expected_active_source(&self) -> (&ClockChoice, u32) {
+        (&self.choice, self.frequency.target)
+    }
+}
 #[derive(Clone, Copy)]
 struct CaptureFrequency { source: u8, original: u32, target: u32 }
 trait CaptureFrequencyIo {
@@ -1551,12 +1556,32 @@ fn restore_capture_transaction(
     plan.restore(io).map_err(|error| error.to_string())
 }
 
+fn finish_capture_clock_admission(
+    available: Result<bool, String>,
+    saved: &mut Option<CaptureClockRoute>,
+    restore: impl FnOnce(&CaptureClockRoute) -> Result<(), String>,
+) -> Result<bool, String> {
+    if matches!(available, Ok(true)) {
+        return saved.as_ref().map(|_| true).ok_or_else(|| "missing selected capture clock snapshot".into());
+    }
+    let restored = saved.as_ref().ok_or_else(|| "missing capture clock hand-back snapshot".to_string())
+        .and_then(restore);
+    if restored.is_ok() { *saved = None; }
+    match (available, restored) {
+        (Ok(false), Ok(())) => Ok(false),
+        (Err(error), Ok(())) => Err(format!("{error}; capture clock route restored")),
+        (Err(error), Err(restore_error)) => Err(format!("{error}; capture clock restoration uncertain: {restore_error}")),
+        (Ok(false), Err(restore_error)) => Err(format!("capture alternate unavailable; capture clock restoration uncertain: {restore_error}")),
+        (Ok(true), _) => unreachable!(),
+    }
+}
+
 /// Prefer the current exact route, then bounded writable alternatives. The
 /// caller retains even an uncertain transaction until capture ownership ends.
 pub(super) fn select_capture_clock_route(
-    claimed: &ClaimedHandle, streaming: u8, terminal: u8, control: u8, rate: u32,
+    claimed: &ClaimedHandle, streaming: u8, alternate: u8, terminal: u8, control: u8, rate: u32,
     saved: &mut Option<CaptureClockRoute>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let device = claimed.handle.device();
     let (owner, graph) = owning_clock_graph(&device, &claimed.handle, streaming)
         .ok_or("capture clock fallback requires a unique active UAC2 function")?;
@@ -1595,7 +1620,13 @@ pub(super) fn select_capture_clock_route(
                 if resolved.clock_id != plan.source_id || resolved.path != plan.path {
                     return Err("capture clock route changed after selection".into());
                 }
-                return Ok(());
+                // A valid bitmap rejection belongs to this AS alternate, not
+                // to clock-plan search. Hand back before the caller tries its
+                // next alternate, without forcing another selector route.
+                return finish_capture_clock_admission(
+                    claimed.alternate_is_available(streaming, alternate), saved,
+                    |route| restore_capture_clock_route(claimed, route),
+                );
             }
             Err(error) => {
                 // ClockPlan has already rolled its attempted pins back. Restore
@@ -1818,6 +1849,57 @@ mod capture_clock_transaction_tests {
     }
     fn frequency() -> CaptureFrequency {
         CaptureFrequency { source: 9, original: 44_100, target: 48_000 }
+    }
+    fn route() -> CaptureClockRoute {
+        CaptureClockRoute { control: 0, streaming: 1, plan: plan(), frequency: frequency(),
+            choice: ClockChoice { control_interface: 0, source_id: 9, path: vec![],
+                resolution: crate::clock_resolution::ClockResolution::Resolved } }
+    }
+    #[test]
+    fn available_capture_alternate_keeps_selected_clock_snapshot() {
+        let mut saved = Some(route());
+        assert_eq!(finish_capture_clock_admission(Ok(true), &mut saved, |_| {
+            panic!("available alternate must keep its selected clock")
+        }), Ok(true));
+        let (choice, source_rate) = saved.as_ref().unwrap().expected_active_source();
+        assert_eq!((choice.source_id, source_rate), (9, 48_000));
+    }
+    #[test]
+    fn unavailable_capture_alternate_restores_before_returning_false() {
+        let mut saved = Some(route());
+        let mut io = Io { pin: 2, rate: 48_000, writes: vec![] };
+        assert_eq!(finish_capture_clock_admission(Ok(false), &mut saved, |route| {
+            restore_capture_transaction(&mut io, &route.plan, route.frequency)
+        }), Ok(false));
+        assert!(saved.is_none());
+        assert_eq!(io.writes, ["rate", "pin"]);
+        assert_eq!((io.pin, io.rate), (1, 44_100));
+    }
+    #[test]
+    fn capture_alternate_control_failure_restores_and_preserves_error() {
+        let mut saved = Some(route());
+        let mut io = Io { pin: 2, rate: 48_000, writes: vec![] };
+        let error = finish_capture_clock_admission(Err("malformed alternate bitmap".into()), &mut saved, |route| {
+            restore_capture_transaction(&mut io, &route.plan, route.frequency)
+        }).unwrap_err();
+        assert!(error.contains("malformed alternate bitmap"));
+        assert!(saved.is_none());
+        assert_eq!((io.pin, io.rate), (1, 44_100));
+    }
+    #[test]
+    fn failed_capture_admission_hand_back_retains_snapshot_and_device_loss() {
+        for available in [Ok(false), Err("No such device".into())] {
+            let mut saved = Some(route());
+            let device_lost = available.is_err();
+            let mut io = Io { pin: 3, rate: 48_000, writes: vec![] };
+            let error = finish_capture_clock_admission(available, &mut saved, |route| {
+                restore_capture_transaction(&mut io, &route.plan, route.frequency)
+            }).unwrap_err();
+            assert!(saved.is_some());
+            assert!(io.writes.is_empty());
+            assert!(error.contains("restoration uncertain"));
+            assert_eq!(crate::error::is_device_gone(&error), device_lost);
+        }
     }
     #[test]
     fn exact_current_route_needs_no_mutation_but_alternatives_do() {

@@ -703,13 +703,6 @@ pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
         endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)))))
 }
 
-pub(super) fn configure_capture_endpoint(
-    claimed: &ClaimedHandle,
-    candidate: &CaptureEndpoint,
-) -> Result<(), Error> {
-    configure_capture_endpoint_guarded(claimed, candidate, None)
-}
-
 pub(super) fn configure_capture_endpoint_guarded(
     claimed: &ClaimedHandle,
     candidate: &CaptureEndpoint,
@@ -1124,8 +1117,8 @@ pub(crate) fn open_capture(
             candidate.address,
         )
     });
-    let current = candidates.into_iter().next();
-    let endpoint = if vendor_profile.is_some() || current.as_ref().is_some_and(|candidate| candidate.protocol != 0x30) {
+    let current = candidates.first().cloned();
+    let mut endpoint = if vendor_profile.is_some() || current.as_ref().is_some_and(|candidate| candidate.protocol != 0x30) {
         current
     } else {
         adc3::select_standalone_adc3_capture(owner.claimed(), &config, request)
@@ -1134,26 +1127,52 @@ pub(crate) fn open_capture(
             .transpose().map_err(Error::Control)?
     }.ok_or_else(|| Error::Unsupported {
         reason: "no claimed standard PCM IN alternate matches the exact capture rate, width and channel map".into(), offered: vec![] })?;
-    let buffer = Arc::new(Mutex::new(
-        CaptureBuffer::new(endpoint.format.clone(), capacity_frames)
-            .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?,
-    ));
-    let geometry = IsoQueueGeometry::for_stream(
-        endpoint.service_us,
-        settings().config.bus_queue_ms,
-        settings().config.transfers_in_flight,
-    );
-    capture_queue_bytes(endpoint.packet_bytes, geometry)?;
-    if endpoint.protocol == 0x20 {
-        let mut route = None;
-        let result = clock::select_capture_clock_route(
-            owner.claimed(), endpoint.interface, endpoint.terminal, endpoint.control,
-            endpoint.format.sample_rate(), &mut route,
+    // Live UAC2 alternate validity may reject the preferred descriptor match.
+    // Keep retries inside that same capture route; never switch function,
+    // terminal, interface or protocol because its first alternate is invalid.
+    let standard_uac2 = endpoint.protocol == 0x20
+        && endpoint.vendor_pcm.is_none() && endpoint.adc3_route.is_none();
+    let input = (endpoint.configuration, endpoint.interface, endpoint.control, endpoint.terminal);
+    let mut siblings = candidates.into_iter().skip(1).filter(move |candidate| {
+        standard_uac2 && candidate.protocol == 0x20
+            && candidate.vendor_pcm.is_none() && candidate.adc3_route.is_none()
+            && (candidate.configuration, candidate.interface, candidate.control, candidate.terminal) == input
+    });
+    let (buffer, geometry) = loop {
+        // Reject invalid capacity/transfer geometry before touching clocks.
+        let buffer = Arc::new(Mutex::new(
+            CaptureBuffer::new(endpoint.format.clone(), capacity_frames)
+                .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?,
+        ));
+        let geometry = IsoQueueGeometry::for_stream(
+            endpoint.service_us,
+            settings().config.bus_queue_ms,
+            settings().config.transfers_in_flight,
         );
-        owner.clock_route = route;
-        result.map_err(Error::Control)?;
-    }
-    configure_capture_endpoint(owner.claimed(), &endpoint)?;
+        capture_queue_bytes(endpoint.packet_bytes, geometry)?;
+        if standard_uac2 {
+            let mut route = None;
+            let result = clock::select_capture_clock_route(
+                owner.claimed(), endpoint.interface, endpoint.alternate,
+                endpoint.terminal, endpoint.control,
+                endpoint.format.sample_rate(), &mut route,
+            );
+            // Preserve the owning rollback lease even when selection aborts.
+            owner.clock_route = route;
+            if !result.or_control()? {
+                // False promises successful hand-back and no saved lease.
+                // Every other failure aborts without trying another route.
+                endpoint = siblings.next().ok_or_else(|| Error::Unsupported {
+                    reason: "no matching UAC2 PCM IN alternate is currently available at the verified capture rate".into(),
+                    offered: vec![],
+                })?;
+                continue;
+            }
+        }
+        break (buffer, geometry);
+    };
+    configure_capture_endpoint_guarded(owner.claimed(), &endpoint,
+        owner.clock_route.as_ref().map(|route| route.expected_active_source()))?;
     let error = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let worker_buffer = buffer.clone();
