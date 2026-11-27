@@ -881,6 +881,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // GET_CUR after switching to the streaming alt setting and if the
     // rate is wrong, try one more SET_CUR + verify cycle.
     // Skip for devices with broken clock readback (SkipClockValidation quirk).
+    let mut post_alt_readback_hz = None;
     if let Some(clock) = clock {
         let skip_clock_validation = settings().skip_clock_validation();
         if skip_clock_validation && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
@@ -903,6 +904,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                         // multiplier after activation must not be silently repaired.
                         reported_sample_rate = Some(post_alt_rate);
                         clock_verification_passed = post_alt_rate == playback_format.sample_rate;
+                        if clock_verification_passed {
+                            // get_wire_frequency verifies the active multiplier
+                            // route and converts the live source CUR to wire Hz.
+                            post_alt_readback_hz = Some(post_alt_rate);
+                        }
                         set_clock_verification(clock_control_attempted, clock_control_succeeded,
                             clock_verification_passed, reported_sample_rate);
                     } else if post_alt_rate != playback_format.sample_rate {
@@ -922,6 +928,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                         reported_sample_rate = retry.reported_sample_rate;
                         clock_verification_passed = retry.rate_verified
                             && retry.reported_sample_rate == Some(playback_format.sample_rate);
+                        if clock_verification_passed {
+                            post_alt_readback_hz = retry.reported_sample_rate;
+                        }
                         set_clock_verification(
                             clock_control_attempted,
                             clock_control_succeeded,
@@ -954,10 +963,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                                 playback_format.sample_rate, clock.clock_id,
                             );
                         }
-                    } else if multiplied_clock || playback_format.dsd_transport != DsdTransportMode::None {
-                        reported_sample_rate = Some(post_alt_rate);
-                        clock_verification_passed = true;
-                        set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
+                    } else {
+                        post_alt_readback_hz = Some(post_alt_rate);
+                        if playback_format.dsd_transport != DsdTransportMode::None {
+                            reported_sample_rate = Some(post_alt_rate);
+                            clock_verification_passed = true;
+                            set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
+                        }
                     }
                 }
                 Err(error) => {
@@ -973,6 +985,20 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 }
             }
         } // end of else (not skip_clock_validation)
+    } else if let Some(route) = adc3_route.as_ref() {
+        // A Full ADC3 route exposes a real source CUR. Reuse the activation
+        // verifier, which performs no writes and checks the live source rate,
+        // multiplier ratio, selector route and validity after SET_INTERFACE.
+        // BADD's descriptor-defined fixed rate is not independent readback.
+        if route.clock.is_some() && candidate.sync_type == SyncType::Asynchronous
+            && candidate.feedback_endpoint.is_some() && candidate.usb_speed == Speed::High
+            && candidate.service_interval_us > 125
+        {
+            match verify_adc3_capture_activation(&claimed_handle.handle, route, playback_format.sample_rate) {
+                Ok(()) => post_alt_readback_hz = Some(playback_format.sample_rate),
+                Err(error) => log_warn!("[USB] ADC3 post-alt clock readback unavailable for feedback inference: {}", error),
+            }
+        }
     } else if candidate.is_uac1 && playback_format.dsd_transport != DsdTransportMode::None {
         reported_sample_rate = get_uac1_sampling_frequency(
             &claimed_handle.handle, candidate.interface_number, candidate.endpoint_address,
@@ -1146,6 +1172,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     playback_format.sample_rate,
                 );
                 if !valid {
+                    post_alt_readback_hz = None;
                     dev_eprintln!(
                         "[clock-diag] DAC reports Clock Valid=false at {}Hz on clock {} — PLL has not locked to the DoP carrier; periodic dropouts are expected until it locks or accepts another rate",
                         playback_format.sample_rate,
@@ -1199,7 +1226,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         config.buffer_target_ms as usize,
         config.start_threshold_ms as usize,
         config.processing_buffer_target_ms as usize,
-    ));
+    ).with_feedback_trace(config.capture_feedback_trace));
     runtime_stats.implicit_feedback.store(candidate.implicit_feedback.is_some(), Ordering::Release);
     runtime_stats.feedback_required.store(candidate.implicit_feedback.is_some()
         || (candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_some()), Ordering::Release);
@@ -1242,7 +1269,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);

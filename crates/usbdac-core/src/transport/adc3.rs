@@ -1068,6 +1068,7 @@ fn adc3_alternate_overlay(
     };
     route.pcm = (channels, subslot, bits);
     let mut candidate = IsoStreamCandidate {
+        configuration_number: config.number(),
         interface_number: alt.interface_number(),
         alt_setting: alt.setting_number(),
         endpoint_address: ep.address(),
@@ -2468,6 +2469,7 @@ mod tests {
     }
     fn pcm_candidate() -> IsoStreamCandidate {
         IsoStreamCandidate {
+            configuration_number: 1,
             interface_number: 5, alt_setting: 1, endpoint_address: 1, endpoint_interval: 4,
             service_interval_us: 1000, usb_speed: Speed::High, max_packet_bytes: 768,
             sync_type: SyncType::Asynchronous, usage_type: UsageType::Data, format_tag: FORMAT_TAG_PCM,

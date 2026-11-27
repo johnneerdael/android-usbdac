@@ -738,17 +738,16 @@ The values below are the first report from each mode.
 | DSD256 | 352,800 Hz | `0a 37 58 00` | 705,719.971 Hz | 352,859.985 Hz |
 | 16-bit PCM | 44,100 Hz | `16 09 0b 00` | 88,283.936 Hz | 44,141.968 Hz |
 
-All four alternates report the same endpoint geometry. Bind the
-timebase to `c502:0072` with `bcdDevice=0xffff`, configuration 1, UAC2
-interface 1, the PCM and RAW_DATA alternates, and the exact high-speed
-OUT and feedback pipe. Continue to check the decoded rate and the
-fractional packet ceiling. Maintain the normal startup and stale-report
-deadlines. The live 361-byte descriptor has SHA-256
+All four alternates report the same endpoint geometry. The initial
+device-specific rule matched `c502:0072` with `bcdDevice=0xffff`,
+configuration 1, UAC2 interface 1, the PCM and RAW_DATA alternates, and
+the exact high-speed OUT and feedback pipe. The live 361-byte descriptor
+has SHA-256
 `65839151d497e59fe99b76a27855f84ce22d237cd198f522c035da14d3f21a0f`.
 [USB 2.0 §5.12.4.2](https://www.usb.org/document-library/usb-20-specification),
 [ALSA feedback unit correction](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L1824-L1898)
 
-The production Android AAR passed one bounded session on the OnePlus
+The initial parity Android AAR passed one bounded session on the OnePlus
 host with the attached AP80 Pro-X. The session played balanced native
 DSD data through alternate 4, then switched to PCM at 44.1 kHz on
 alternates 2, 1 and 3. Each leg had live feedback lock, zero rejected
@@ -769,6 +768,33 @@ reported `PAYLOAD_UNVERIFIED`. The probe checked USB transport and PCM
 hand-back. Rust workspace tests, Android arm64 NDK and the four-ABI
 AAR and sample builds passed. The AAR SHA-256 is
 `3693c3ea6b7de6b523902060f433cc0ad22ded4d4fb057084d683f92ad095e8f`.
+
+#### Universal detection on the parity build
+
+After integrating `main`, the Kotlin SDK repeated the DSD-to-PCM run
+with automatic timing detection. Each exported trace recorded a verified
+post-alt clock readback and applied `out_service_interval` without a
+timebase override. The first DSD stream and each PCM alternate needed
+three matching completions. DSD128 and DSD256 reused the session's timing
+hint after one fresh completion each on alternate 4. The final PCM32
+trace was still available after session close.
+
+| Mode | Last feedback | Completed media frames | Timebase |
+| --- | --- | --- | --- |
+| DSD64 | 88,259.888 Hz | 528,752 | Inferred |
+| DSD128 | 176,455.933 Hz | 1,057,272 | Reused |
+| DSD256 | 352,859.985 Hz | 2,111,436 | Reused |
+| 16-bit PCM | 44,144.897 Hz | 66,111 | Inferred |
+| 24-bit PCM | 44,141.968 Hz | 66,118 | Inferred |
+| 32-bit PCM | 44,141.968 Hz | 66,206 | Inferred |
+
+All six legs reported bit-perfect USB transport with locked feedback,
+zero rejected reports, zero underruns and zero lost frames. The PCM
+payload varied by one least-significant bit in each direction. The
+probe preserved the existing volume. Rust tests, Android arm64 NDK,
+Kotlin unit tests, and the four-ABI AAR and sample builds passed.
+The combined AAR SHA-256 is
+`d606224b29df133ee266678fad783449ae5ba5b69ef3dfc2645fb4dbb7b8a836`.
 
 ### Fixed-rate Pioneer USB mixers
 

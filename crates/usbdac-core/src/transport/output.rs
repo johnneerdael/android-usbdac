@@ -488,6 +488,20 @@ pub(super) fn publish_feedback_counters(stats: &RuntimeStats, counters: &Feedbac
     }
 }
 
+fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounters, final_snapshot: bool) {
+    let Some(mut diagnostics) = counters.diagnostics else { return };
+    if final_snapshot {
+        diagnostics.accepted_reports = counters.reports;
+        *stats.explicit_feedback_diagnostics.lock() = Some(diagnostics);
+    } else if counters.diagnostics_dirty {
+        if let Some(mut snapshot) = stats.explicit_feedback_diagnostics.try_lock() {
+            diagnostics.accepted_reports = counters.reports;
+            *snapshot = Some(diagnostics);
+            counters.diagnostics_dirty = false;
+        }
+    }
+}
+
 pub(super) fn run_usb_output_loop(
     usb_owner: StreamUsbOwner,
     candidate: IsoStreamCandidate,
@@ -495,6 +509,7 @@ pub(super) fn run_usb_output_loop(
     shared: Arc<StreamShared>,
     stop: Arc<AtomicBool>,
     capture: Option<Arc<duplex::Attachment>>,
+    post_alt_readback_hz: Option<u32>,
 ) {
     let pcm_buffer = Arc::clone(&shared.ring);
     let runtime_stats = Arc::clone(&shared.stats);
@@ -558,19 +573,11 @@ pub(super) fn run_usb_output_loop(
     let feedback_endpoint = candidate.feedback_endpoint;
     let mut feedback_slot = None;
     let mut feedback_start_error = None;
-    let mut feedback_per_service = settings().has(crate::Quirk::ExplicitFeedbackPerServiceInterval);
+    let feedback_per_service = settings().has(crate::Quirk::ExplicitFeedbackPerServiceInterval);
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
             let device = handle.device();
             let compatibility = device.device_descriptor().map(|descriptor| {
-                if (descriptor.vendor_id(), descriptor.product_id()) == (0xc502, 0x0072)
-                    && descriptor.device_version() == rusb::Version::from_bcd(0xffff) {
-                    let configuration = device.active_config_descriptor().map(|config| config.number()).unwrap_or(0);
-                    feedback_per_service |= ap80_feedback_per_service(
-                        descriptor.vendor_id(), descriptor.product_id(), descriptor.device_version(),
-                        configuration, &candidate,
-                    );
-                }
                 FeedbackCompatibility::for_device(
                     descriptor.vendor_id(),
                     descriptor.product_id(),
@@ -612,9 +619,54 @@ pub(super) fn run_usb_output_loop(
     let mut logged_usb_stabilized = false;
     let mut underrun_count = 0u64;
     let mut feedback_counters = FeedbackCounters::default();
+    feedback_counters.trace = runtime_stats.feedback_trace.clone();
+    feedback_counters.infer_service_interval = post_alt_readback_hz == Some(playback_format.sample_rate);
     let mut feedback_stale_warned = false;
     let feedback_health = feedback_endpoint.filter(|_| candidate.sync_type == SyncType::Asynchronous).map(|endpoint| ExplicitFeedbackHealth::new(
         endpoint.service_interval_us, candidate.is_uac1.then_some(endpoint.refresh)));
+    let mut feedback_route = feedback_endpoint
+        .filter(|_| feedback_health.is_some()
+            && !feedback_per_service
+            && feedback_counters.infer_service_interval
+            && candidate.usb_speed == Speed::High
+            && candidate.service_interval_us > 125)
+        .map(|endpoint| FeedbackTimebaseRoute::new(&candidate, endpoint));
+    if let Some(route) = feedback_route {
+        feedback_counters.cached_service_interval = state.service_interval_feedback_routes.lock().contains(&route);
+    }
+    if let Some(endpoint) = feedback_endpoint.filter(|_| feedback_health.is_some()) {
+        feedback_counters.diagnostics = Some(crate::ExplicitFeedbackDiagnostics {
+            endpoint: endpoint.address,
+            transfer_type: transfer_type_label(endpoint.transfer_type),
+            link_speed: match candidate.usb_speed {
+                Speed::Low => "low",
+                Speed::Full => "full",
+                Speed::High => "high",
+                Speed::Super => "super",
+                Speed::SuperPlus => "super_plus",
+                _ => "unknown",
+            },
+            interface_number: candidate.interface_number,
+            alt_setting: candidate.alt_setting,
+            out_endpoint: candidate.endpoint_address,
+            nominal_rate_hz: playback_format.sample_rate,
+            post_alt_readback_hz,
+            out_service_interval_us: candidate.service_interval_us,
+            out_max_packet_bytes: candidate.max_packet_bytes,
+            out_bytes_per_frame: bytes_per_frame,
+            feedback_interval: endpoint.interval,
+            feedback_refresh: endpoint.refresh,
+            feedback_service_interval_us: endpoint.service_interval_us,
+            feedback_max_packet_bytes: endpoint.max_packet_bytes,
+            requested_packet_bytes: feedback_slot.as_ref().map_or(0, |slot| slot.packet_bytes),
+            packets_per_transfer: feedback_slot.as_ref().map_or(0, |slot| slot.packet_count),
+            transfer_timeout_ms: feedback_slot.as_ref().map_or(0, |slot| slot.timeout_ms),
+            per_service_interval_quirk: feedback_per_service,
+            ..Default::default()
+        });
+        feedback_counters.diagnostics_dirty = true;
+        publish_feedback_evidence(&runtime_stats, &mut feedback_counters, false);
+    }
     let mut min_active_slots = transfer_slot_count;
     // The flush epoch the bus was last checked against (see the cancel below).
     let mut handled_flush_epoch = runtime_stats.flush_epoch.load(Ordering::Acquire);
@@ -766,6 +818,16 @@ pub(super) fn run_usb_output_loop(
     let mut implicit = None;
     if fatal_error.is_none() && !usb_stop_requested(&stop) {
         if let Some(source) = candidate.implicit_feedback {
+            if let Some(trace) = &runtime_stats.feedback_trace {
+                trace.record(crate::FeedbackTraceEvent::ImplicitSource {
+                    interface_number: source.interface_number,
+                    alt_setting: source.alt_setting,
+                    endpoint: source.address,
+                    service_interval_us: source.service_interval_us,
+                    max_packet_bytes: source.max_packet_bytes,
+                    bytes_per_frame: source.bytes_per_frame,
+                });
+            }
             match ImplicitFeedback::new(source, geometry, bytes_per_frame, candidate.max_packet_bytes, playback_format.sample_rate) {
                 Ok(mut engine) => {
                     if !playback_first {
@@ -774,7 +836,7 @@ pub(super) fn run_usb_output_loop(
                     log_info!("[USB] Implicit feedback source interface={} alt={} endpoint=0x{:02x} inStride={} outStride={} service={}us packetCapacity={}",
                         source.interface_number, source.alt_setting, source.address, source.bytes_per_frame, bytes_per_frame,
                         source.service_interval_us, source.max_packet_bytes);
-                    if let Err(error) = engine.start(&handle, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
+                    if let Err(error) = engine.start(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
                     while fatal_error.is_none() && !usb_stop_requested(&stop) && !engine.primed() {
                         if let Err(error) = context.handle_events(Some(Duration::from_micros(u64::from(candidate.service_interval_us).min(1000)))) {
                             device_lost = error == rusb::Error::NoDevice;
@@ -819,7 +881,9 @@ pub(super) fn run_usb_output_loop(
     }
     if let Some(slot) = feedback_slot.as_mut().filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop)) {
         let endpoint = slot.endpoint;
-        match slot.submit(&handle) {
+        let submission = slot.submit(&handle);
+        feedback_counters.record_submit(slot.last_submit_status);
+        match submission {
             Ok(()) => {
                 log_info!(
                     "[USB] Feedback endpoint 0x{:02x} {} interval={} service={}us maxPacket={} pollPackets={} timeout={}ms (asynchronous, nonblocking)",
@@ -1004,7 +1068,20 @@ pub(super) fn run_usb_output_loop(
                 feedback_health.expect("selected explicit pipe has health deadlines"),
                 stream_started_at,
             );
+            // Commit the hint only once live timing has accepted a timely
+            // report. A conforming report removes an older alternate hint.
+            if feedback_counters.reports != 0 {
+                if let Some(route) = feedback_route.take() {
+                    let mut routes = state.service_interval_feedback_routes.lock();
+                    if feedback_counters.selected_service_interval() {
+                        routes.insert(route);
+                    } else {
+                        routes.remove(&route);
+                    }
+                }
+            }
             publish_feedback_counters(&runtime_stats, &feedback_counters);
+            publish_feedback_evidence(&runtime_stats, &mut feedback_counters, false);
             if let Err(error) = result {
                 explicit_feedback_fault = true;
                 match error {
@@ -1015,8 +1092,13 @@ pub(super) fn run_usb_output_loop(
             }
             if let Some(health) = feedback_health {
                 let (locked, stale, terminal) = health.state(Instant::now(), stream_started_at, feedback_counters.last_report_at);
-                runtime_stats.feedback_locked.store(locked, Ordering::Release);
-                runtime_stats.feedback_stale.store(stale, Ordering::Release);
+                let old_lock = runtime_stats.feedback_locked.swap(locked, Ordering::AcqRel);
+                let old_stale = runtime_stats.feedback_stale.swap(stale, Ordering::AcqRel);
+                if old_lock != locked || old_stale != stale {
+                    if let Some(trace) = &runtime_stats.feedback_trace {
+                        trace.record(crate::FeedbackTraceEvent::Lock { locked, stale });
+                    }
+                }
                 if !locked { set_usb_stream_stable(false); }
                 if stale && !feedback_stale_warned {
                     shared.events.emit_stream(crate::events::DacEvent::FeedbackStale);
@@ -1481,6 +1563,17 @@ pub(super) fn run_usb_output_loop(
         shared.note_bit_perfect();
     }
 
+    publish_feedback_evidence(&runtime_stats, &mut feedback_counters, true);
+    // Preserve diagnostic context in the shared duplex failure as well as the
+    // output error log. Classify only after the final evidence is attached.
+    if explicit_feedback_fault && !device_lost {
+        if let (Some(error), Some(diagnostics)) = (
+            fatal_error.as_mut(),
+            *runtime_stats.explicit_feedback_diagnostics.lock(),
+        ) {
+            error.push_str(&format!(" | {diagnostics}"));
+        }
+    }
     let failure = classify_stream_failure(fatal_error.as_deref(), device_lost,
         capture_failure.or_else(|| capture.as_ref().and_then(|attachment| attachment.failure())));
     device_lost = matches!(&failure, Some(Error::DeviceLost));
@@ -1500,6 +1593,9 @@ pub(super) fn run_usb_output_loop(
             runtime_stats.feedback_stale.store(true, Ordering::Release);
             runtime_stats.feedback_errors.fetch_add(1, Ordering::Relaxed);
             shared.events.emit_stream(crate::events::DacEvent::FeedbackStale);
+        }
+        if let Some(trace) = &runtime_stats.feedback_trace {
+            trace.fail(&error);
         }
         set_usb_stream_stable(false);
         set_last_error(Some(error.clone()));

@@ -60,6 +60,7 @@ internal object Native {
     @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
     @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun dacCapabilities(dac: Long): String
+    @JvmStatic external fun dacFeedbackTrace(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)
 

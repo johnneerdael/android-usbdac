@@ -435,7 +435,7 @@ impl InputPool {
         if let Some(pool) = self.feedforward.as_mut() { pool.start(handle, stop)?; }
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if usb_stop_requested(stop) { break; }
-            slot.submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes)
+            slot.submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes, None)
                 .map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost } else { Error::Transfer(e) })?;
             self.order.push_back(index);
         }
@@ -483,7 +483,7 @@ impl InputPool {
             self.slots[index].mark_completed();
             result?;
             if !usb_stop_requested(stop) {
-                self.slots[index].submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes)
+                self.slots[index].submit_capture(handle, self.attachment.endpoint.address, self.attachment.endpoint.packet_bytes, None)
                     .map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost } else { Error::Transfer(e) })?;
                 self.order.push_back(index);
             }

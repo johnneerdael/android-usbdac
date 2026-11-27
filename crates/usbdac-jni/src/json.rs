@@ -7,7 +7,8 @@
 use serde_json::{json, Value};
 use usbdac_core::{
     AltFormat, AltSetting, Capabilities, ClockChoice, ClockHop, ClockHopKind, DacConfig, DacEvent,
-    DeviceInfo, Encoding, Error, HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride, RatePolicy,
+    DeviceInfo, Encoding, Error, ExplicitFeedbackPacket, FeedbackTrace, FeedbackTraceEvent,
+    HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride, RatePolicy,
     StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest, StreamStats, SyncKind,
     UacVersion, VolumeRange, VolumeState,
 };
@@ -195,6 +196,103 @@ pub fn stream_format(format_id: u64, format: &StreamFormat) -> Value {
         "rate_differs_from_request": format.rate_differs_from_request(),
         "pacing": pacing(format.pacing),
         "clock": format.clock.as_ref().map(clock_choice),
+    })
+}
+
+fn explicit_feedback_packet(packet: &ExplicitFeedbackPacket) -> Value {
+    json!({
+        "outcome": packet.outcome.code(),
+        "transfer_status": packet.transfer_status,
+        "packet_status": packet.packet_status,
+        "requested_bytes": packet.requested_bytes,
+        "actual_bytes": packet.actual_bytes,
+        "raw_bytes": packet.raw_bytes(),
+        "frames_per_out_service": packet.frames_per_out_service,
+        "decoded_rate_hz": packet.decoded_rate_hz,
+    })
+}
+
+pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
+    let explicit = trace.explicit.as_ref().map(|diag| json!({
+        "endpoint": diag.endpoint,
+        "type": diag.transfer_type,
+        "link_speed": diag.link_speed,
+        "interface_number": diag.interface_number,
+        "alt_setting": diag.alt_setting,
+        "out_endpoint": diag.out_endpoint,
+        "out_service_interval_us": diag.out_service_interval_us,
+        "out_max_packet_bytes": diag.out_max_packet_bytes,
+        "out_bytes_per_frame": diag.out_bytes_per_frame,
+        "nominal_rate_hz": diag.nominal_rate_hz,
+        "feedback_interval": diag.feedback_interval,
+        "feedback_refresh": diag.feedback_refresh,
+        "feedback_service_interval_us": diag.feedback_service_interval_us,
+        "feedback_max_packet_bytes": diag.feedback_max_packet_bytes,
+        "requested_packet_bytes": diag.requested_packet_bytes,
+        "packets_per_transfer": diag.packets_per_transfer,
+        "transfer_timeout_ms": diag.transfer_timeout_ms,
+        "per_service_interval_quirk": diag.per_service_interval_quirk,
+        "post_alt_readback_hz": diag.post_alt_readback_hz,
+        "timebase": diag.timebase,
+        "inferred_timebase": diag.inferred_timebase,
+        "reused_timebase": diag.reused_timebase,
+        "successful_submissions": diag.successful_submissions,
+        "submit_failures": diag.submit_failures,
+        "last_submit_error": diag.last_submit_error,
+        "transfer_status_counts": diag.transfer_status_counts,
+        "packet_status_counts": diag.packet_status_counts,
+        "accepted_reports": diag.accepted_reports,
+        "packet_samples": diag.packet_samples().map(explicit_feedback_packet).collect::<Vec<_>>(),
+    }));
+    let entries: Vec<_> = trace.entries.iter().map(|entry| {
+        let mut value = match &entry.event {
+            FeedbackTraceEvent::Submit { slot, status } => json!({
+                "event": "submit", "slot": slot, "status": status,
+            }),
+            FeedbackTraceEvent::Completion { slot, status, actual_bytes } => json!({
+                "event": "completion", "slot": slot, "status": status, "actual_bytes": actual_bytes,
+            }),
+            FeedbackTraceEvent::ExplicitPacket { index, sample } => {
+                let mut packet = explicit_feedback_packet(sample);
+                packet["event"] = json!("explicit_packet");
+                packet["index"] = json!(index);
+                packet
+            }
+            FeedbackTraceEvent::ImplicitSource {
+                interface_number, alt_setting, endpoint, service_interval_us, max_packet_bytes, bytes_per_frame,
+            } => json!({
+                "event": "implicit_source", "interface_number": interface_number,
+                "alt_setting": alt_setting, "endpoint": endpoint, "service_interval_us": service_interval_us,
+                "max_packet_bytes": max_packet_bytes, "bytes_per_frame": bytes_per_frame,
+            }),
+            FeedbackTraceEvent::ImplicitPacket { index, status, requested_bytes, actual_bytes } => json!({
+                "event": "implicit_packet", "index": index, "status": status,
+                "requested_bytes": requested_bytes, "actual_bytes": actual_bytes,
+            }),
+            FeedbackTraceEvent::Lock { locked, stale } => json!({
+                "event": "lock", "locked": locked, "stale": stale,
+            }),
+            FeedbackTraceEvent::Timebase { unit, inferred } => json!({
+                "event": "timebase", "unit": unit, "inferred": inferred,
+            }),
+            _ => json!({ "event": "unknown" }),
+        };
+        value["elapsed_us"] = json!(entry.elapsed_us);
+        value
+    }).collect();
+    json!({
+        "schema_version": 1,
+        "driver_version": env!("CARGO_PKG_VERSION"),
+        "usb": {
+            "vendor_id": info.vendor_id, "product_id": info.product_id,
+            "configuration_id": info.configuration_id, "claimed_interfaces": info.claimed_interfaces,
+            "unavailable_feedback_interfaces": info.unavailable_feedback_interfaces,
+        },
+        "format": stream_format(0, &trace.format),
+        "explicit": explicit,
+        "entries": entries,
+        "dropped_entries": trace.dropped_entries,
+        "failure": trace.failure,
     })
 }
 
@@ -534,6 +632,9 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     config.padded_24bit = boolean(map, "padded_24bit")?;
     if let Some(value) = boolean(map, "disable_feedback")? {
         config.disable_feedback = value;
+    }
+    if let Some(value) = boolean(map, "capture_feedback_trace")? {
+        config.capture_feedback_trace = value;
     }
     if let Some(value) = boolean(map, "allow_unsynchronized_async")? {
         config.allow_unsynchronized_async = value;

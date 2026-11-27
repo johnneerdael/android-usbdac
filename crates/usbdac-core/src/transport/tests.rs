@@ -544,6 +544,7 @@ mod pcm_ring_hold_tests {
 
     pub(super) fn pcm_candidate() -> IsoStreamCandidate {
         IsoStreamCandidate {
+            configuration_number: 1,
             interface_number: 1,
             alt_setting: 1,
             endpoint_address: 0x01,
@@ -567,6 +568,27 @@ mod pcm_ring_hold_tests {
             terminal_link: None,
             is_uac1: false,
         }
+    }
+
+    #[test]
+    fn feedback_timebase_hint_is_scoped_to_the_session_and_usb_route() {
+        let mut candidate = pcm_candidate();
+        let feedback = FeedbackEndpoint {
+            refresh: 0,
+            address: 0x81,
+            transfer_type: TransferType::Isochronous,
+            interval: 4,
+            service_interval_us: 1_000,
+            max_packet_bytes: 4,
+        };
+        let route = FeedbackTimebaseRoute::new(&candidate, feedback);
+        let session = test_state(None);
+        session.service_interval_feedback_routes.lock().insert(route);
+        assert!(session.clone().service_interval_feedback_routes.lock().contains(&route));
+        assert!(!test_state(None).service_interval_feedback_routes.lock().contains(&route));
+        candidate.alt_setting += 1;
+        let other_alt = FeedbackTimebaseRoute::new(&candidate, feedback);
+        assert!(!session.service_interval_feedback_routes.lock().contains(&other_alt));
     }
 
     fn prepare(

@@ -153,6 +153,7 @@ dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD by
 | `quirks` | empty | `QuirkOverride { vendor_id, product_id, name_contains, quirks: Vec<Quirk> }`, added to the built-in table. |
 | `allow_unsynchronized_async` | `false` | Allow an otherwise valid asynchronous endpoint without usable feedback to stream at the nominal rate. |
 | `disable_feedback` | `false` | Disable both feedback modes for this session. The asynchronous nominal option still applies. |
+| `capture_feedback_trace` | `false` | Enable the bounded USB feedback support capture for streams opened by this session. |
 | `realtime_priority` | `true` | `SCHED_FIFO` (nice -16 fallback) for the output thread. Android only. |
 | `hand_back` | `RestoreOriginal` | `RestoreOriginal`: write the DAC's original volume back on close. `Keep`: leave it, and remember the original for the next `open` in this process. |
 | `startup_volume` | `Attenuate { max_db: -40.0 }` | What `open` does with the hardware volume before any stream can start: `Attenuate { max_db }` lowers every channel to `min(its level, max_db)`, `Keep` leaves it. See section 8. |
@@ -481,12 +482,49 @@ live lock and emits `FeedbackStale`. Playback can hold the last valid rate
 until a timely report restores lock or the stream fails with `Error::Transfer`.
 [Timing thresholds](https://johnneerdael.github.io/android-usbdac/decisions-clock.html#feedback)
 
-With evidence that a high-speed device sends four-byte feedback in frames per
-OUT service interval, add `Quirk::ExplicitFeedbackPerServiceInterval` through a
-VID/PID-scoped `QuirkOverride`. Configure the override only for a device whose
-report bytes and OUT interval confirm these units. The [Linux UAC2 gadget
-implementation](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/function/u_audio.c#L100-L147)
+For four-byte high-speed reports, the driver first tests the USB microframe
+interpretation. If it is outside the nominal-rate tolerance and post-alt
+`GET_CUR` independently confirmed the clock, the driver can test the OUT
+service interval. Three separate completions must support that interpretation
+and fit the OUT packet capacity. The driver remembers learned units for the
+same USB route while the DAC session stays open. A later stream still checks
+its clock and validates a fresh report. A valid standard report takes
+precedence, and feedback lock starts fresh on every stream. The feedback
+poll interval defines when to read a report.
+
+`Quirk::ExplicitFeedbackPerServiceInterval` can force the alternate units
+when a trace establishes them and clock readback is unavailable. Scope the
+override to the affected VID/PID. The [Linux UAC2 gadget implementation](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/function/u_audio.c#L100-L147)
 illustrates the alternate units.
+
+### USB feedback support capture
+
+`DacStream::explicit_feedback_diagnostics()` returns the selected endpoint,
+poll geometry, libusb status counts, accepted report count and the latest
+sample per outcome. Without opt-in, the snapshot excludes raw packet bytes.
+
+Enable `DacConfig::capture_feedback_trace` before opening a session.
+`Dac::feedback_trace()` returns the last stream's format, explicit summary,
+timestamped observations and terminal failure, even after that stream is
+closed. The trace keeps the first 128 and most recent 2,048 observations.
+It counts observations discarded due to retention or concurrent export.
+Explicit raw bytes are capped at eight per packet. PCM, DSD and implicit
+input payloads are excluded. Copy the report before closing the DAC or
+opening another stream.
+
+The Android SDK method `DacSession.feedbackTraceJson()` calls
+`dacFeedbackTrace` and retains a final report on that object after close.
+The JSON object has `schema_version`, `driver_version`, `usb`, `format`,
+`explicit`, `entries`, `dropped_entries` and `failure`. Each entry has an
+`event` name and `elapsed_us` relative to stream creation. For completions
+and packet metadata, libusb status values are 0 completed, 1 error, 2 timed
+out, 3 cancelled, 4 stall, 5 no device and 6 overflow. The summary's status
+array uses index 7 for unknown or unreported values. Submit entries contain
+the return code from `libusb_submit_transfer`. `explicit` is null for other
+pacing modes. The `timebase` event and summary identify the selected units
+and whether the driver inferred them. The summary's `reused_timebase` field
+indicates reuse from the open DAC session. Before a captured stream opens, `dacFeedbackTrace` returns JSON
+`null`.
 
 ### Descriptor parsing
 

@@ -270,6 +270,17 @@ pub fn dac_capabilities<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i
     })
 }
 
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_feedback_trace<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> JString<'l> {
+    run(&mut env, |env| {
+        let entry = registry::dac(dac)?;
+        let trace = entry.dac.feedback_trace()
+            .map(|trace| json::feedback_trace(&trace, entry.dac.info()))
+            .unwrap_or(serde_json::Value::Null);
+        java_string(env, &trace)
+    })
+}
+
 /// Negotiates the wire format for `requestJson`. The result carries a
 /// `format_id` to pass to `streamOpen`.
 #[jni_mangle("dev.usbdac.internal.Native")]

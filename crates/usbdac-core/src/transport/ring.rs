@@ -2,7 +2,7 @@ use super::*;
 use crate::ring_target::{live_depth, RingTargets};
 
 /// Counters and control flags shared between the API, the output thread and
-/// the ring. Everything is an atomic: no lock is held while reading them.
+/// the ring. Feedback evidence has its own lock, separate from the hot counters.
 #[derive(Debug)]
 pub(crate) struct RuntimeStats {
     pub(crate) sample_rate: u32,
@@ -65,6 +65,8 @@ pub(crate) struct RuntimeStats {
     pub(crate) feedback_required: AtomicBool,
     pub(crate) implicit_feedback: AtomicBool,
     pub(crate) feedback_empty: AtomicU64,
+    pub(crate) explicit_feedback_diagnostics: Mutex<Option<crate::ExplicitFeedbackDiagnostics>>,
+    pub(crate) feedback_trace: Option<Arc<crate::feedback_diagnostics::FeedbackRecorder>>,
     pub(crate) implicit_fifo_depth: AtomicUsize,
     pub(crate) implicit_fifo_high_water: AtomicUsize,
     pub(crate) implicit_waits: AtomicU64,
@@ -188,6 +190,8 @@ impl RuntimeStats {
             feedback_required: AtomicBool::new(false),
             implicit_feedback: AtomicBool::new(false),
             feedback_empty: AtomicU64::new(0),
+            explicit_feedback_diagnostics: Mutex::new(None),
+            feedback_trace: None,
             implicit_fifo_depth: AtomicUsize::new(0),
             implicit_fifo_high_water: AtomicUsize::new(0),
             implicit_waits: AtomicU64::new(0),
@@ -212,6 +216,13 @@ impl RuntimeStats {
             raw_bitstream: AtomicBool::new(false),
             host_processing: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_feedback_trace(mut self, capture: bool) -> Self {
+        if capture {
+            self.feedback_trace = Some(Arc::new(crate::feedback_diagnostics::FeedbackRecorder::new(self.started_at)));
+        }
+        self
     }
 
     pub(crate) fn transport_loss_latched(&self) -> bool {

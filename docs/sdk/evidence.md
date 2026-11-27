@@ -4,7 +4,11 @@ This page collects the data points that the [design decisions](decisions.md) res
 
 ## Hardware status {#hardware-status}
 
-usbdac has been run on **one phone and one DAC**: a OnePlus 15 (CPH2747, Android 16) with an iBasso DC04U. The Rust driver played PCM on that pair inside a build of Flick that runs on this library. Everything below the first row is covered only by tests that run without a DAC, or has not been run at all.
+Direct USB PCM has been tested on a OnePlus 15 (CPH2747, Android 16) with an
+iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the
+SDK sample using main's universal feedback detection. The parity build
+with main integrated passed native DSD64, DSD128 and DSD256 followed by
+16-, 24- and 32-bit PCM on the AP80 Pro-X using the same detection.
 
 | Area | Status | Source |
 |---|---|---|
@@ -12,18 +16,47 @@ usbdac has been run on **one phone and one DAC**: a OnePlus 15 (CPH2747, Android
 | 16 packets x 8 transfers (the default at 125 us) | The geometry sweep and benchmark runs played cleanly at 44.1 kHz, judged from the app log. The listening checks (cold start, five minutes without a dropout, 48 and 96 kHz, pause, seek, unplug and replug, 192 to 384 kHz at up to 32-bit) were made on the earlier 8 x 16 build and "have not been repeated" on 16 x 8 | Flick PR #400 |
 | Loss tolerance and exact loss accounting | Fault injection on the OnePlus 15 and DC04U with a test-only build, on 8 x 16. Not repeated on 16 x 8. What loss sounds like was not judged | Flick PR #406 |
 | Full-speed (1 ms interval) DACs | Not tested | Flick PR #400 |
-| DSD and DoP, native and over PCM | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
+| Native DSD | DSD64, DSD128 and DSD256 reported bit-perfect transport on OnePlus 15 / AP80 Pro-X using universal feedback calibration | [AP80 Pro-X parity evidence](../design/alsa-parity.md#universal-detection-on-the-parity-build) |
+| DoP | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
 | Clock selectors and multipliers, range check | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
-| Explicit feedback changes in 0.1.1 | Host tests for report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
+| Explicit feedback | Universal detection verified with direct PCM and native DSD on the AP80 Pro-X. Host tests cover report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
 | UAC2 implicit feedback in 0.1.1 | Host tests for source pairing, packet sizing and ordering, and Android claim planning and diagnostics. Hardware validation pending | [decision 8](decisions-clock.md#implicit-feedback) |
 | Hardware volume, start-up attenuation, hand-back, volume keys, system panel, idle release | Host tests only | [decisions 9 to 12](decisions-volume.md) |
-| The Kotlin SDK and the sample app | Not run on a phone. CI builds them for four ABIs | [index](index.md#status) |
+| Kotlin SDK and sample app, direct USB PCM | Verified at 44.1 kHz / 16 bit on the OnePlus 15 and AP80 Pro-X | [AP80 Pro-X feedback units](#ap80-pro-x-feedback-units) |
 | Android-managed output (Android 14 bit-perfect mixer request) | Host tests only | [transports](transports.md) |
 | AAudio exclusive output on a player with an internal DAC | Host tests only. No digital audio player tried | [automatic output](automatic-output.md#what-is-not-verified) |
 | `OutputSelector` | Host tests against a fake device. Nothing on hardware | [automatic output](automatic-output.md#what-is-not-verified) |
-| Other phones and DACs | None tried | |
+| Other phones and DACs | Hardware validation pending | |
 
 **Reporting a problem.** Set the native log level (`UsbDac.setLogLevel`) and send the logcat of the tag `usbdac`, with the Android version, the phone, the DAC, and the source format. [Troubleshooting](troubleshooting.md) has the error codes.
+
+### AP80 Pro-X feedback units
+
+On a OnePlus 15, the Hidizs AP80 Pro-X (`c502:0072`) opened UAC2 interface 1,
+alternate setting 2, at 44.1 kHz with 16-bit stereo PCM. The clock readback
+matched. Playback used endpoint `0x01` at a 250 µs service interval. The
+four-byte feedback endpoint `0x81` was polled every 1 ms.
+
+The failing capture recorded 62 successful feedback transfers and zero
+accepted reports before the deadline. One observed report was
+`46 09 0b 00`, or about 11.0362 frames in 16.16 format. Per high-speed USB
+microframe that means about 88,289.8 Hz. Per OUT service interval it means
+about 44,144.9 Hz. The latter fits both the confirmed clock's rate window and
+the OUT packet capacity. The captured bytes are a regression vector for
+[startup timebase detection](decisions-clock.md#feedback).
+
+With the detection change, the SDK sample inferred OUT service interval
+units after three matching completions on the same phone and DAC. It
+reported verified direct playback at 44.1 kHz / 16 bit and reached 2,133,448
+played frames (48.4 s) with zero underruns and lost frames. The sample
+exported the opted-in report after stopping the stream.
+
+The Kotlin SDK later repeated the run on the parity AAR with main
+integrated. DSD64 learned the timebase, DSD128 and DSD256 reused it after
+fresh validation, and each PCM alternate learned its own timing. All six
+modes reported bit-perfect USB transport with zero underruns and lost
+frames. The final trace remained available after session close.
+[Parity AAR acceptance](../design/alsa-parity.md#universal-detection-on-the-parity-build)
 
 ## The geometry sweep {#the-geometry-sweep}
 

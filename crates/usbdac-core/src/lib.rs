@@ -48,6 +48,7 @@ mod dac;
 mod endpoint;
 mod error;
 mod events;
+mod feedback_diagnostics;
 mod format;
 mod flush_cancel;
 mod iso_packet_scheduler;
@@ -77,6 +78,10 @@ pub use dac::Dac;
 pub use capture::{CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition, DacCaptureStream};
 pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};
+pub use feedback_diagnostics::{
+    ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket,
+    FeedbackTrace, FeedbackTraceEntry, FeedbackTraceEvent,
+};
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use quirk::Quirk;
 pub use stream::{BitPerfectBlocker, DacStream, StreamStats};

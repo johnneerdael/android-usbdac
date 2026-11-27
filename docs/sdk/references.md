@@ -43,7 +43,11 @@ These are the mainline `snd-usb-audio` sources. They show what a mature driver d
 
 ### Feedback handling {#ref-linux-endpoint}
 
-[`sound/usb/endpoint.c`](https://github.com/torvalds/linux/blob/master/sound/usb/endpoint.c). In `snd_usb_handle_sync_urb` the comment reads "Full speed devices report feedback values in 10.14 format as samples per frame, high speed devices in 16.16 format as samples per microframe". The driver range-checks the value, detects the format, and stores it (`ep->freqm = f`) without averaging. Used in [decision 7](decisions-clock.md#feedback).
+[`sound/usb/endpoint.c`](https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/4c7d8eb9a79ae5400eac19c4f6f0815bff674452/sound/usb/endpoint.c#1852).
+`snd_usb_handle_sync_urb` describes the standard full-speed and high-speed
+units, then infers a power-of-two shift by comparing the first usable report
+with the nominal rate. It applies the shift to subsequent reports and
+range-checks the result before storing it. Used in [decision 7](decisions-clock.md#feedback).
 
 ### Clock walk {#ref-linux-clock}
 

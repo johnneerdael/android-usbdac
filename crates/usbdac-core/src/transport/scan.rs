@@ -909,7 +909,7 @@ pub(super) fn select_stream_candidate(
             || playback_format.channels != profile.output.channels {
             return Err(SelectError::NoMatch("vendor PCM requires its exact fixed-rate native channel format".into()));
         }
-        return Ok(profile.candidate());
+        return Ok(profile.candidate(config_descriptor.number()));
     }
     let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed);
     let mut refused_unsynchronized = false;
@@ -1147,6 +1147,7 @@ pub(super) fn select_stream_candidate(
                 }
 
                 candidates.push(IsoStreamCandidate {
+                    configuration_number: config_descriptor.number(),
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
                     endpoint_address: endpoint.address(),

@@ -82,6 +82,35 @@ pub(super) struct SessionState {
     /// What the start-up volume step did, for the route it ran on.
     pub(super) startup_volume: Option<StartupVolumeStatus>,
     pub(super) runtime_stats: Option<Arc<RuntimeStats>>,
+    /// Routes that have supplied timely reports in OUT service interval units.
+    pub(super) service_interval_feedback_routes: Arc<Mutex<HashSet<FeedbackTimebaseRoute>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct FeedbackTimebaseRoute {
+    configuration: u8,
+    interface: u8,
+    alternate: u8,
+    out_endpoint: u8,
+    out_interval_us: u32,
+    in_endpoint: u8,
+    in_interval_us: u32,
+    in_isochronous: bool,
+}
+
+impl FeedbackTimebaseRoute {
+    pub(super) fn new(candidate: &IsoStreamCandidate, feedback: FeedbackEndpoint) -> Self {
+        Self {
+            configuration: candidate.configuration_number,
+            interface: candidate.interface_number,
+            alternate: candidate.alt_setting,
+            out_endpoint: candidate.endpoint_address,
+            out_interval_us: candidate.service_interval_us,
+            in_endpoint: feedback.address,
+            in_interval_us: feedback.service_interval_us,
+            in_isochronous: feedback.transfer_type == TransferType::Isochronous,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +150,7 @@ pub(crate) struct CapabilityModel {
 
 #[derive(Debug)]
 pub(super) struct IsoStreamCandidate {
+    pub(super) configuration_number: u8,
     pub(super) interface_number: u8,
     pub(super) alt_setting: u8,
     pub(super) endpoint_address: u8,

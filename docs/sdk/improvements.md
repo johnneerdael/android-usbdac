@@ -6,7 +6,7 @@ Each entry says what changed, then what that means **in plain terms**.
 
 Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used. Each change has a longer entry in [the design decisions](decisions.md), with what each of the three drivers does, the evidence and the public references.
 
-Every item is covered by automated tests. Hardware testing has only begun: direct USB has played on one phone and one DAC. See [the status](index.md#status).
+Every item is covered by automated tests. Direct USB PCM has played on a OnePlus 15 with two DACs. [Hardware status](evidence.md#hardware-status)
 
 ## Sound that does not drop out
 
@@ -164,7 +164,7 @@ A Kotlin API for Android, a sample app that the guide's code is taken from, auto
 
 - **One DAC at a time** per app.
 - **Playback only**, for USB Audio Class 1 and 2 devices.
-- **Only lightly tested on hardware.** One phone and one DAC so far, through a build of Flick that runs on this library.
+- **Limited hardware coverage.** PCM has played through Flick on the iBasso DC04U and through the SDK sample on the AP80 Pro-X. [Hardware status](evidence.md#hardware-status)
 
 ## Where it came from
 

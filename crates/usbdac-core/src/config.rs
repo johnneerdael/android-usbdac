@@ -130,6 +130,9 @@ pub struct DacConfig {
     /// Disable explicit and implicit feedback for diagnosis. Default `false`.
     /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.
     pub disable_feedback: bool,
+    /// Retain a bounded USB feedback support trace, including raw explicit
+    /// feedback bytes. Ask the listener to enable it before opening a session.
+    pub capture_feedback_trace: bool,
     /// Ask for `SCHED_FIFO` (nice -16 as a fallback) on the output thread.
     /// Android only; ignored elsewhere. Default `true`.
     pub realtime_priority: bool,
@@ -180,6 +183,7 @@ impl Default for DacConfig {
             quirks: Vec::new(),
             allow_unsynchronized_async: false,
             disable_feedback: false,
+            capture_feedback_trace: false,
             realtime_priority: true,
             hand_back: HandBack::default(),
             bus_queue_ms: DEFAULT_BUS_QUEUE_MS,

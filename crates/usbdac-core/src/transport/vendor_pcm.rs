@@ -181,8 +181,8 @@ impl VendorPcm {
         claimed.len() == expected.len() && expected.iter().all(|id| claimed.contains(id))
     }
 
-    pub(super) fn candidate(self) -> IsoStreamCandidate {
-        IsoStreamCandidate { interface_number: self.interface_number, alt_setting: self.alt_setting,
+    pub(super) fn candidate(self, configuration_number: u8) -> IsoStreamCandidate {
+        IsoStreamCandidate { configuration_number, interface_number: self.interface_number, alt_setting: self.alt_setting,
             endpoint_address: self.output.address, endpoint_interval: self.output.interval,
             service_interval_us: self.output.service_us, usb_speed: self.speed, max_packet_bytes: self.output.max_packet_bytes,
             sync_type: SyncType::Asynchronous, usage_type: UsageType::Data, format_tag: FORMAT_TAG_PCM,
@@ -199,12 +199,15 @@ pub(super) fn for_candidate(handle: &DeviceHandle<Context>, candidate: &IsoStrea
     let device = handle.device();
     let config = device.active_config_descriptor().map_err(|e| e.to_string())?;
     let Some(profile) = discover(handle, &config, resolve_device_speed(&device))? else { return Ok(None); };
+    if config.number() != candidate.configuration_number {
+        return Err("vendor PCM active configuration changed since descriptor proof".into());
+    }
     validate_candidate(profile, candidate)?;
     Ok(Some(profile))
 }
 
 fn validate_candidate(profile: VendorPcm, candidate: &IsoStreamCandidate) -> Result<(), String> {
-    let expected = profile.candidate();
+    let expected = profile.candidate(candidate.configuration_number);
     if candidate.interface_number != expected.interface_number || candidate.alt_setting != expected.alt_setting
         || candidate.endpoint_address != expected.endpoint_address || candidate.endpoint_interval != expected.endpoint_interval
         || candidate.service_interval_us != expected.service_interval_us || candidate.usb_speed != expected.usb_speed
@@ -263,14 +266,14 @@ mod tests {
             assert_eq!(p.input_carries_pcm, carries_pcm);
             assert!(!p.requires_output_for_capture);
             assert_eq!(p.claimed_interfaces(), vec![0]);
-            let c = p.candidate();
+            let c = p.candidate(1);
             assert_eq!((c.subslot_size, c.bit_resolution, c.sample_rates.as_slice()), (width, width * 8, &[44_100][..]));
             let feedback = c.implicit_feedback.as_ref().unwrap();
             // RB keeps the dummy IN pipe as pacing, even without input PCM.
             assert_eq!((feedback.address, feedback.bytes_per_frame), (input, usize::from(inputs) * usize::from(width)));
             assert!(validate_candidate(p, &c).is_ok());
             for mutation in 0..5 {
-                let mut c = p.candidate();
+                let mut c = p.candidate(1);
                 match mutation {
                     0 => c.sample_rates = vec![48_000],
                     1 => c.subslot_size = if width == 4 { 3 } else { 4 },
@@ -374,13 +377,13 @@ mod tests {
             for mismatch in [&[0][..], &[1][..], &[0, 0][..], &[1, 1][..], &[0, 1, 2][..], &[0, 1, 1][..]] {
                 assert!(!p.claims_match(mismatch));
             }
-            let c = p.candidate();
+            let c = p.candidate(1);
             assert_eq!((c.subslot_size, c.bit_resolution), (4, 32));
             assert_eq!(c.implicit_feedback.as_ref().unwrap().interface_number, 1);
             assert_eq!(c.implicit_feedback.as_ref().unwrap().bytes_per_frame, usize::from(inputs) * 4);
             assert!(validate_candidate(p, &c).is_ok());
             for mutation in 0..4 {
-                let mut c = p.candidate();
+                let mut c = p.candidate(1);
                 match mutation {
                     0 => c.subslot_size = 3,
                     1 => c.bit_resolution = 24,
@@ -487,7 +490,7 @@ mod tests {
             assert!(!p.claims_match(&[0, 1]));
             assert!(!p.requires_output_for_capture);
             assert!(p.input_carries_pcm);
-            let c = p.candidate();
+            let c = p.candidate(1);
             assert!(validate_candidate(p, &c).is_ok());
             assert_eq!(c.implicit_feedback.unwrap().bytes_per_frame, usize::from(inputs) * 3);
         }
@@ -539,7 +542,7 @@ mod tests {
     fn fresh_candidate_requires_exact_format_and_feedback() {
         let p = prove(0x2b73, 0x1b, Speed::High, &geometry(10,12)).unwrap().unwrap();
         for mutation in 0..7 {
-            let mut c = p.candidate();
+            let mut c = p.candidate(1);
             match mutation {
                 0 => c.channels = 2,
                 1 => c.subslot_size = 4,

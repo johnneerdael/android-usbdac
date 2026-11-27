@@ -1481,6 +1481,7 @@ fn run_capture(
             &owner.claimed().handle,
             endpoint.address,
             endpoint.packet_bytes,
+            None,
         )
         .map_err(|e| {
             if crate::error::is_device_gone(&e) {
@@ -1562,6 +1563,7 @@ fn run_capture(
                         &owner.claimed().handle,
                         endpoint.address,
                         endpoint.packet_bytes,
+                        None,
                     )
                     .map_err(|e| {
                         if crate::error::is_device_gone(&e) {

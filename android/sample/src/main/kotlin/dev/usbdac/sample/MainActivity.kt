@@ -1,6 +1,8 @@
 package dev.usbdac.sample
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.View
@@ -69,6 +71,8 @@ class MainActivity : Activity() {
     private var waitingForPermission: DacDeviceInfo? = null // a DAC the selector would use directly if it were allowed
     private var other: PcmOutput? = null // the output of the automatic, managed or AAudio choice, while one is playing
     private var otherPaused = false
+    // Accessed on io, alongside stream and session teardown.
+    private var lastFeedbackReport: String? = null
     private var streamJobs = mutableListOf<Job>()
     private val events = ArrayDeque<String>()
 
@@ -84,6 +88,7 @@ class MainActivity : Activity() {
     private lateinit var volumeBar: SeekBar
     private lateinit var muteBox: CheckBox
     private lateinit var fixedVolumeBox: CheckBox
+    private lateinit var feedbackTraceBox: CheckBox
     private lateinit var statusText: TextView
     private lateinit var eventsText: TextView
 
@@ -102,6 +107,7 @@ class MainActivity : Activity() {
         volumeBar = findViewById(R.id.volumeBar)
         muteBox = findViewById(R.id.muteBox)
         fixedVolumeBox = findViewById(R.id.fixedVolumeBox)
+        feedbackTraceBox = findViewById(R.id.feedbackTraceBox)
         statusText = findViewById(R.id.statusText)
         eventsText = findViewById(R.id.eventsText)
 
@@ -116,6 +122,7 @@ class MainActivity : Activity() {
             other?.flush()
         }
         click(R.id.stopButton) { stopStream() }
+        click(R.id.copyFeedbackTraceButton) { copyFeedbackTrace() }
 
         // Automatic lets the selector choose; the rest are the outputs behind the same PcmOutput
         // interface, chosen by hand. The two direct ones need a DAC session of their own.
@@ -147,6 +154,13 @@ class MainActivity : Activity() {
         muteBox.setOnCheckedChangeListener { box, checked -> if (box.isPressed) session?.volume?.setMute(checked) }
         // Allowing a fixed volume is part of the session's configuration, so changing it reopens the DAC.
         fixedVolumeBox.setOnCheckedChangeListener { box, _ -> if (box.isPressed) { reopen(); refreshDecision() } }
+        feedbackTraceBox.setOnCheckedChangeListener { box, checked ->
+            if (box.isPressed) {
+                UsbDac.setLogLevel(if (checked) 3 else 2)
+                reopen()
+                refreshDecision()
+            }
+        }
 
         // Plugging and unplugging: refresh the list.
         UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
@@ -203,7 +217,10 @@ class MainActivity : Activity() {
      * with the checkbox, and the DAC is opened again.
      */
     private fun openDevice(dac: DacDeviceInfo) {
-        val config = DacConfig(requireHardwareVolume = !fixedVolumeBox.isChecked)
+        val config = DacConfig(
+            requireHardwareVolume = !fixedVolumeBox.isChecked,
+            captureFeedbackTrace = feedbackTraceBox.isChecked,
+        )
         // UsbDac.open() blocks while it claims interfaces and scans descriptors.
         io.execute {
             try {
@@ -230,7 +247,12 @@ class MainActivity : Activity() {
         showFormats()
 
         opened.events.onEach { log(it.toString()) }.launchIn(scope)
-        opened.state.onEach { if (it == DacState.LOST) { log("the DAC was unplugged"); closeSession() } }.launchIn(scope)
+        opened.state.onEach {
+            if (it == DacState.LOST && session === opened) {
+                log("the DAC was unplugged")
+                closeSession()
+            }
+        }.launchIn(scope)
 
         val volume = opened.volume
         // What the library did to the DAC's level before any stream could start.
@@ -253,15 +275,27 @@ class MainActivity : Activity() {
 
     private fun closeSession() {
         val closing = session ?: return
+        if ((other as? SelectedOutput)?.session === closing) {
+            stopOther()
+            return
+        }
+        clearDacSession()
         stopStream()
+        // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
+        io.execute {
+            runCatching { closing.close() }
+            retainFeedbackReport(closing)
+            runOnUiThread { log("session closed") }
+        }
+    }
+
+    private fun clearDacSession() {
         session = null
         capabilitiesText.text = ""
         volumeBar.isEnabled = false
         muteBox.isEnabled = false
         volumeText.text = "DAC volume: none"
         startupText.text = ""
-        // close() stops the stream, restores the DAC volume, and gives the DAC back to Android.
-        io.execute { runCatching { closing.close() }; runOnUiThread { log("session closed") } }
     }
 
     // ---- playback ----
@@ -377,7 +411,8 @@ class MainActivity : Activity() {
 
     /** The selector for what the two boxes say; the same one is kept while they do not change. */
     private fun selector(): OutputSelector {
-        val policy = automaticPolicy(takeOverBox.isChecked, convertBox.isChecked, fixedVolumeBox.isChecked)
+        val base = automaticPolicy(takeOverBox.isChecked, convertBox.isChecked, fixedVolumeBox.isChecked)
+        val policy = base.copy(dacConfig = base.dacConfig.copy(captureFeedbackTrace = feedbackTraceBox.isChecked))
         return automatic?.takeIf { it.policy == policy } ?: OutputSelector(this, policy).also { automatic = it }
     }
 
@@ -423,6 +458,7 @@ class MainActivity : Activity() {
 
     private fun stopOther() {
         val closing = other ?: return
+        val closingSession = (closing as? SelectedOutput)?.session
         other = null
         streamJobs.forEach { it.cancel() }
         streamJobs.clear()
@@ -431,9 +467,10 @@ class MainActivity : Activity() {
         io.execute {
             writer?.stop()
             runCatching { closing.close() }
+            closingSession?.let(::retainFeedbackReport)
         }
         // The output closed its DAC session too; clear what the volume controls were showing.
-        if (closing is SelectedOutput && closing.session != null) closeSession()
+        if (closingSession != null && session === closingSession) clearDacSession()
     }
 
     private fun describeOther(output: PcmOutput): String = buildString {
@@ -481,6 +518,30 @@ class MainActivity : Activity() {
                     ) +
                     describeFormat(current.format)
             }.getOrDefault("")
+        }
+    }
+
+    private fun retainFeedbackReport(closedSession: DacSession) {
+        runCatching { closedSession.feedbackTraceJson() }
+            .getOrNull()
+            ?.let { lastFeedbackReport = it }
+    }
+
+    private fun copyFeedbackTrace() {
+        val active = session ?: (other as? SelectedOutput)?.session
+        io.execute {
+            val result = runCatching { active?.feedbackTraceJson() ?: lastFeedbackReport }
+            runOnUiThread {
+                result.onSuccess { report ->
+                    if (report == null) {
+                        log("enable USB feedback capture and play once before exporting")
+                    } else {
+                        getSystemService(ClipboardManager::class.java)
+                            .setPrimaryClip(ClipData.newPlainText("USB feedback report", report))
+                        log("feedback report copied")
+                    }
+                }.onFailure { log("feedback export failed: ${it.message}") }
+            }
         }
     }
 
