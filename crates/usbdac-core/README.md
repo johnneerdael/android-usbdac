@@ -1,4 +1,8 @@
+<p align="center"><img src="https://raw.githubusercontent.com/johnneerdael/android-usbdac/main/branding/marketing/usbdac-readme-dark.png" alt="usbdac. Direct USB audio. Clear evidence." width="100%"></p>
+
 # usbdac-core
+
+[Rust guide](https://johnneerdael.github.io/android-usbdac/guide-rust.html) · [API on docs.rs](https://docs.rs/usbdac-core) · [Evidence and status](https://johnneerdael.github.io/android-usbdac/evidence.html) · [Source](https://github.com/johnneerdael/android-usbdac)
 
 Drive a USB DAC directly from a Rust audio application on Android or Linux.
 `usbdac-core` handles USB Audio Class 1.0, 2.0 and 3.0 playback over usbfs so your

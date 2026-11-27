@@ -1,0 +1,142 @@
+<!-- The landing section of index.html. build_site.py replaces @@VERSION@@, @@MARK@@ and @@REPOSITORY@@. -->
+<div class="home">
+  <section class="hero" aria-labelledby="hero-title">
+    <div>
+      <p class="eyebrow">USB audio · Rust core · Android SDK</p>
+      <h1 id="hero-title">Direct USB audio. <span>Clear evidence.</span></h1>
+      <p class="lead">Bring direct DAC playback to your app. usbdac sends PCM, DoP or native DSD straight to the DAC over USB, follows the device clock, drives its hardware volume and tells you whether the stream is bit-perfect, with the reason when it is not.</p>
+      <div class="cta">
+        <a class="btn primary" href="getting-started.html">Read the quickstart
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+        <a class="btn" href="@@REPOSITORY@@/releases/latest">Get the builds</a>
+      </div>
+      <p class="meta-line">Open source under MIT · <code>dev.usbdac:usbdac:@@VERSION@@</code> · <code>usbdac-core @@VERSION@@</code></p>
+    </div>
+    <aside class="path-card" aria-label="The direct path">
+      <header><span>The direct path</span><span>Per stream</span></header>
+      <div class="figure">
+        @@MARK@@
+        <div class="flow" aria-label="Your app, then usbdac, then the USB DAC">
+          <span class="node">Your app</span><span class="wire"></span><span class="node on">usbdac</span><span class="wire"></span><span class="node">USB DAC</span>
+        </div>
+      </div>
+      <dl class="facts">
+        <div><dt>PCM · DoP · native DSD</dt><dd><span class="chip info">Device dependent</span></dd></div>
+        <div><dt>Clock and pacing</dt><dd>Verified and reported</dd></div>
+        <div><dt>Hardware volume</dt><dd>Written, then read back</dd></div>
+        <div><dt>Stream integrity</dt><dd>Bit-perfect, or the reason</dd></div>
+      </dl>
+    </aside>
+  </section>
+
+  <div class="section-head">
+    <div><p class="eyebrow">Start here</p><h2>Pick your path.</h2></div>
+    <p>Each guide starts with working code and links down into the protocol detail when you need it.</p>
+  </div>
+  <div class="cards">
+    <a class="card" href="guide-kotlin.html">
+      <p class="eyebrow">Android · Kotlin</p>
+      <h3>Add it to your player.</h3>
+      <p>One <code>OutputSelector</code> call picks direct USB, Android-managed or AAudio exclusive output and tells you what it got and why.</p>
+      <div class="foot"><code>dev.usbdac:usbdac</code><span class="arrow" aria-hidden="true">→</span></div>
+    </a>
+    <a class="card" href="guide-rust.html">
+      <p class="eyebrow">Rust core</p>
+      <h3>Drive the DAC yourself.</h3>
+      <p>Hand the driver an open usbfs descriptor. It reads the descriptors, sets the clock, paces the stream and audits the payload.</p>
+      <div class="foot"><code>usbdac-core</code><span class="arrow" aria-hidden="true">→</span></div>
+    </a>
+    <a class="card" href="media3.html">
+      <p class="eyebrow">Media3</p>
+      <h3>Plug into ExoPlayer.</h3>
+      <p>An <code>AudioSink</code> for Media3 players, with the same output choice and bit-perfect reporting underneath.</p>
+      <div class="foot"><code>dev.usbdac:usbdac-media3</code><span class="arrow" aria-hidden="true">→</span></div>
+    </a>
+    <a class="card" href="decisions.html">
+      <p class="eyebrow">Design decisions</p>
+      <h3>Know why it behaves this way.</h3>
+      <p>Buffering, clocks, volume and reporting, each compared with what Flick, Mornye and BitChord do, with the evidence.</p>
+      <div class="foot"><span class="links"><span>Decisions at a glance</span></span><span class="arrow" aria-hidden="true">→</span></div>
+    </a>
+  </div>
+
+  <div class="section-head">
+    <div><p class="eyebrow">Quick answers</p><h2>Find it in one click.</h2></div>
+  </div>
+  <div class="cards">
+    <div class="card">
+      <h3>Choosing an output</h3>
+      <div class="links">
+        <a href="index.html#which-transport-to-use">Which transport to use</a>
+        <a href="automatic-output.html">Automatic output</a>
+        <a href="transports.html">Transports</a>
+        <a href="bit-perfect.html">What bit-perfect means here</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>When something goes wrong</h3>
+      <div class="links">
+        <a href="troubleshooting.html">Troubleshooting and error codes</a>
+        <a href="support-diagnostics.html">Collect a support report</a>
+        <a href="controls.html">Controls and configuration</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Will my DAC work?</h3>
+      <div class="links">
+        <a href="evidence.html#hardware-status">Hardware status</a>
+        <a href="status.html">Capability and result ledger</a>
+        <a href="source-backed-quirks.html">Source-backed device compatibility</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Under the hood</h3>
+      <div class="links">
+        <a href="usb-audio-primer.html">USB audio in a page</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="native-api.html">Native API and JNI contract</a>
+        <a href="migration.html">Upgrading from 0.1.10</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-head">
+    <div><p class="eyebrow">Evidence</p><h2>Measured on real hardware.</h2></div>
+    <p>The Android validator ran its exact-format playback matrix on four DACs with a OnePlus 15 on 27 November 2026.</p>
+  </div>
+  <div class="proof">
+    <div class="stat"><strong>132 of 132</strong><span>exact-format playback cases passed USB delivery bit-perfect</span></div>
+    <div class="stat"><strong>768 kHz</strong><span>highest PCM rate delivered, on the iBasso DC04U and the SMSL</span></div>
+    <div class="stat"><strong>DSD512</strong><span>native DSD, under the source-backed quirk policy</span></div>
+    <div class="stat"><strong>0</strong><span>underruns, lost frames, short packets or transfer timeouts</span></div>
+  </div>
+  <div class="table-scroll" style="overflow-x:auto;margin-top:16px">
+    <table class="devices">
+      <thead><tr><th>DAC</th><th class="hide-sm">VID:PID</th><th>Result</th><th>PCM</th><th class="hide-sm">Native DSD</th></tr></thead>
+      <tbody>
+        <tr><td>iBasso DC04U</td><td class="hide-sm"><code>0661:0883</code></td><td><span class="chip ok">44 of 44 passed</span></td><td>44.1 to 768 kHz</td><td class="hide-sm">DSD64 to DSD512</td></tr>
+        <tr><td>SMSL USB AUDIO</td><td class="hide-sm"><code>152a:85dd</code></td><td><span class="chip ok">34 of 34 passed</span></td><td>44.1 to 768 kHz</td><td class="hide-sm">DSD64 to DSD512</td></tr>
+        <tr><td>Hidizs AP80 Pro-X</td><td class="hide-sm"><code>c502:0072</code></td><td><span class="chip ok">34 of 34 passed</span></td><td>32 to 384 kHz</td><td class="hide-sm">DSD64 to DSD256</td></tr>
+        <tr><td>Schiit Unison Modius E</td><td class="hide-sm"><code>30be:101a</code></td><td><span class="chip ok">20 of 20 passed</span></td><td>44.1 to 192 kHz</td><td class="hide-sm"><span class="chip muted">Not admitted</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="fineprint">These are USB transport results as the host sees them. No analog output was observed, and the DoP rows prove the carrier only: decoder lock was not observed. Native DSD on the DC04U and SMSL came from a source-backed rule that the default policy does not apply. <a href="evidence.html#hardware-status">Read the hardware status</a> · <a href="evidence.html#release-validation-scope">what each release checks</a>.</p>
+
+  <section class="validator-band" aria-labelledby="validator-title">
+    <div>
+      <p class="eyebrow">Validators</p>
+      <h2 id="validator-title">Test your own DAC.</h2>
+      <p>The validator apps run the exact-format playback matrix on one attached DAC and save a report ZIP with device details, test outcomes and debug logs. Every release includes both, built from the same commit as the library.</p>
+      <div class="cta">
+        <a class="btn primary" href="@@REPOSITORY@@/releases/latest">Download a validator</a>
+        <a class="btn" href="@@REPOSITORY@@/blob/main/docs/design/dac-validator.md">How the validator works</a>
+      </div>
+    </div>
+    <div class="platforms">
+      <div class="platform"><img src="assets/icon-192.png" alt="" width="56" height="56"><div><strong>Android validator</strong><span>Android 8.0+ with USB host · APK signed with the CI debug key</span></div></div>
+      <div class="platform"><img src="assets/icon-192.png" alt="" width="56" height="56"><div><strong>macOS validator</strong><span>Apple Silicon, macOS 12+ · ad hoc signed, not notarized</span></div></div>
+    </div>
+  </section>
+</div>
+<div class="docs-divider"><hr></div>
