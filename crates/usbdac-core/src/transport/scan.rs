@@ -1820,7 +1820,8 @@ mod ap80_raw_data_tests {
 
     #[test]
     fn ap80_advertises_verified_native_modes_from_the_shared_clock() {
-        let clock = [SamplingFrequencySubrange { min: 44_100, max: 384_000, res: 0 }];
+        let clock = [44_100, 88_200, 176_400, 352_800, 384_000].map(|rate|
+            SamplingFrequencySubrange { min: rate, max: rate, res: 0 });
         let rates = ap80_native_dsd_clock_rates(&clock);
         assert_eq!(rates.iter().map(|r| r.min).collect::<Vec<_>>(), [88_200, 176_400, 352_800]);
     }
