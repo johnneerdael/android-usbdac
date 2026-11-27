@@ -643,9 +643,26 @@ fn poll_playback_status(
     claimed: &ClaimedHandle,
     shared: &StreamShared,
 ) -> Result<(), Error> {
-    status
-        .poll(claimed)
-        .map_err(|error| invalidate_playback_status(error, shared))
+    let result = status.poll(claimed);
+    let degraded = status.is_degraded();
+    if shared
+        .stats
+        .status_monitor_degraded
+        .swap(degraded, Ordering::AcqRel)
+        != degraded
+    {
+        if degraded {
+            set_usb_stream_stable(false);
+        }
+        shared.note_bit_perfect();
+    }
+    result.map_err(|error| {
+        if error != Error::DeviceLost && status.capture_fault_control().is_some() {
+            error
+        } else {
+            invalidate_playback_status(error, shared)
+        }
+    })
 }
 
 fn invalidate_playback_status(error: Error, shared: &StreamShared) -> Error {
@@ -1464,7 +1481,9 @@ pub(super) fn run_usb_output_loop(
         let batch_lock_pending = lock_gate.pending();
 
         let event_wait_started = Instant::now();
-        if let Err(error) = context.handle_events(Some(if implicit.is_some() {
+        if let Err(error) = context.handle_events(Some(if audio_status.is_revalidating() {
+            Duration::from_millis(1)
+        } else if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
         } else {
             Duration::from_millis(50)
@@ -1479,10 +1498,26 @@ pub(super) fn run_usb_output_loop(
             break;
         }
         if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
-            device_lost = error == Error::DeviceLost;
-            fatal_error = Some(error.to_string());
-            capture_failure = Some(error);
-            break;
+            let isolated = audio_status
+                .capture_fault_control()
+                .and_then(|control| {
+                    capture_pool.as_mut().map(|pool| {
+                        if pool.isolate_status_failure(control, error.clone()) {
+                            audio_status.disable_capture_control(control);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if !isolated {
+                device_lost = error == Error::DeviceLost;
+                invalidate_playback_status(error.clone(), &shared);
+                fatal_error = Some(error.to_string());
+                capture_failure = Some(error);
+                break;
+            }
         }
         // A flush since the last look: cut what is still queued of the old
         // position. Only transfers filled before the flush are touched; their
@@ -1549,11 +1584,21 @@ pub(super) fn run_usb_output_loop(
             .as_mut()
             .filter(|pool| !pool.uses_implicit_feedforward())
         {
-            if let Err(error) = pool.pump(handle, &stop) {
-                device_lost = error == Error::DeviceLost;
-                fatal_error = Some(error.to_string());
-                capture_failure = Some(error);
-                break;
+            let result = if pool.is_retiring() {
+                pool.poll_retirement()
+            } else {
+                pool.pump(handle, &stop)
+            };
+            if let Err(error) = result {
+                if !pool.is_retiring() && pool.isolate_failure(error.clone()) {
+                    audio_status.disable_capture_control(pool.capture_control());
+                    log_warn!("[USB] Independent capture failed; retiring its transfers while playback continues: {}", error);
+                } else {
+                    device_lost = error == Error::DeviceLost;
+                    fatal_error = Some(error.to_string());
+                    capture_failure = Some(error);
+                    break;
+                }
             }
         }
         if let Some(engine) = implicit.as_mut() {

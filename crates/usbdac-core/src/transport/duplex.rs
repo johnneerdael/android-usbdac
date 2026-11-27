@@ -2,6 +2,7 @@
 use super::capture_stream::{CaptureEndpoint, CaptureHandle};
 use super::*;
 use crate::capture::{CapturePacket, CaptureRequest};
+use crate::clock_resolution::ClockResolution;
 use crate::error::OrControl;
 use std::collections::VecDeque;
 
@@ -11,6 +12,9 @@ pub(super) struct Attachment {
     owned: Arc<capture_stream::CaptureSpsc>,
     error: Arc<Mutex<Option<Error>>>,
     retired: Arc<AtomicBool>,
+    independent: AtomicBool,
+    isolated_failure: Arc<AtomicBool>,
+    capture_retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
     uac1_rate: Mutex<Option<Uac1DuplexRate>>,
@@ -485,6 +489,25 @@ pub(super) fn configure_with_retry(
     }
 }
 
+fn independent_direct_clocks(
+    input: &ClockChoice,
+    output: &ClockChoice,
+    capture_control: u8,
+) -> bool {
+    use crate::clock_resolution::ClockHopKind;
+    let direct = |choice: &ClockChoice| {
+        choice.resolution == ClockResolution::Resolved
+            && matches!(choice.path.as_slice(), [terminal, source]
+                if matches!(terminal.kind, ClockHopKind::Terminal)
+                    && matches!(source.kind, ClockHopKind::Source)
+                    && source.id == choice.source_id)
+    };
+    direct(input)
+        && direct(output)
+        && input.control_interface == capture_control
+        && input.control_interface != output.control_interface
+}
+
 impl Attachment {
     pub(super) fn new(
         endpoint: CaptureEndpoint,
@@ -502,6 +525,9 @@ impl Attachment {
             owned,
             error: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
+            independent: AtomicBool::new(false),
+            isolated_failure: Arc::new(AtomicBool::new(false)),
+            capture_retired: Arc::new(AtomicBool::new(false)),
             original_rate: Mutex::new(None),
             uac1_rate: Mutex::new(None),
             rate_uncertain: AtomicBool::new(false),
@@ -989,6 +1015,24 @@ impl Attachment {
             ));
         }
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
+        // Restrict the first independent admission to separately owned AC
+        // functions with direct, fully resolved roots and no timing companion.
+        let input = input_clock(claimed, &self.endpoint);
+        let independent = !self.shared_implicit
+            && playback.implicit_feedback.is_none()
+            && !playback.is_uac1
+            && self.endpoint.protocol == 0x20
+            && self.endpoint.vendor_pcm.is_none()
+            && self.endpoint.adc3_route.is_none()
+            && self.endpoint.feedforward().is_none()
+            && self.endpoint.interface != playback.interface_number
+            && input
+                .as_ref()
+                .zip(expected.clock.as_ref())
+                .is_some_and(|(input, output)| {
+                    independent_direct_clocks(input, output, self.endpoint.control)
+                });
+        self.independent.store(independent, Ordering::Release);
         Ok(true)
     }
     pub(super) fn reader(&self, stop: Arc<AtomicBool>) -> CaptureHandle {
@@ -1000,6 +1044,8 @@ impl Attachment {
             worker: None,
             paired: true,
             retired: Some(self.retired.clone()),
+            isolated_failure: Some(self.isolated_failure.clone()),
+            capture_retired: Some(self.capture_retired.clone()),
         }
     }
     pub(super) fn ingest(
@@ -1357,6 +1403,9 @@ pub(super) struct InputPool {
     reordered: Vec<bool>,
     scratch: Vec<CapturePacket>,
     lock_delay: endpoint_lock::LockDelayGate,
+    local_transfer_failure: bool,
+    retiring_since: Option<Instant>,
+    retired: bool,
 }
 impl InputPool {
     pub(super) fn new(attachment: Arc<Attachment>) -> Result<Self, String> {
@@ -1392,6 +1441,9 @@ impl InputPool {
             implicit_feedforward,
             rate_proof,
             lock_delay,
+            local_transfer_failure: false,
+            retiring_since: None,
+            retired: false,
             attachment,
             order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots],
@@ -1455,6 +1507,71 @@ impl InputPool {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn test_allow_isolation(&self) {
+        self.attachment.independent.store(true, Ordering::Release);
+    }
+    pub(super) fn isolate_failure(&mut self, error: Error) -> bool {
+        self.begin_isolation(error, self.local_transfer_failure)
+    }
+    pub(super) fn isolate_status_failure(&mut self, control: u8, error: Error) -> bool {
+        self.begin_isolation(error, control == self.attachment.endpoint.control)
+    }
+    fn begin_isolation(&mut self, error: Error, capture_local: bool) -> bool {
+        if self.is_retiring()
+            || !capture_local
+            || error == Error::DeviceLost
+            || !self.attachment.independent.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.attachment
+            .isolated_failure
+            .store(true, Ordering::Release);
+        self.attachment.finish(Some(error));
+        self.retiring_since = Some(Instant::now());
+        self.cancel();
+        true
+    }
+    pub(super) fn capture_control(&self) -> u8 {
+        self.attachment.endpoint.control
+    }
+    pub(super) fn is_retiring(&self) -> bool {
+        self.retiring_since.is_some() || self.retired
+    }
+    pub(super) fn poll_retirement(&mut self) -> Result<(), Error> {
+        let Some(since) = self.retiring_since else {
+            return Ok(());
+        };
+        for slot in &mut self.slots {
+            if slot.in_flight && slot.take_completion().is_some() {
+                slot.mark_completed();
+            }
+        }
+        if let Some(pool) = self.feedforward.as_mut() {
+            for slot in &mut pool.slots {
+                if slot.in_flight && slot.take_completion().is_some() {
+                    slot.mark_completed();
+                }
+            }
+        }
+        let feedforward_done = self
+            .feedforward
+            .as_ref()
+            .map_or(true, |pool| pool.slots.iter().all(|slot| !slot.in_flight));
+        if self.slots.iter().all(|slot| !slot.in_flight) && feedforward_done {
+            self.retired = true;
+            self.retiring_since = None;
+            self.attachment
+                .capture_retired
+                .store(true, Ordering::Release);
+        } else if since.elapsed() >= Duration::from_secs(3) {
+            return Err(Error::Transfer(
+                "capture cancellation retirement deadline expired".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn cancel(&mut self) {
         for slot in &mut self.slots {
             slot.cancel();
@@ -1469,13 +1586,20 @@ impl InputPool {
         if let Some(pool) = self.feedforward.as_mut() {
             pool.drain(context);
         }
+        if self.attachment.isolated_failure.load(Ordering::Acquire) {
+            self.retired = true;
+            self.retiring_since = None;
+            self.attachment
+                .capture_retired
+                .store(true, Ordering::Release);
+        }
     }
     pub(super) fn pump(
         &mut self,
         handle: &DeviceHandle<Context>,
         stop: &AtomicBool,
     ) -> Result<(), Error> {
-        if usb_stop_requested(stop) {
+        if self.is_retiring() || usb_stop_requested(stop) {
             return Ok(());
         }
         if let Some(pool) = self.feedforward.as_mut() {
@@ -1504,6 +1628,22 @@ impl InputPool {
             };
             self.order.pop_front();
             self.reordered[index] = false;
+            self.local_transfer_failure = false;
+            if status != LIBUSB_TRANSFER_COMPLETED && status != LIBUSB_TRANSFER_NO_DEVICE {
+                if let Ok((_, false)) = capture_stream::inspect_slot(
+                    &self.slots[index],
+                    LIBUSB_TRANSFER_COMPLETED,
+                    &mut self.scratch,
+                ) {
+                    self.local_transfer_failure = self
+                        .scratch
+                        .iter()
+                        .zip(&self.slots[index].packet_sizes)
+                        .all(|(packet, &size)| {
+                            packet.requested_bytes == size && packet.actual_bytes <= size
+                        });
+                }
+            }
             let timing_allowed = self.feedforward.as_ref().map_or(true, |pool| {
                 pool.accepts_capture_transfer(completed, self.slots[index].submitted_at)
             }) && self
@@ -1658,6 +1798,39 @@ mod tests {
             path: vec![],
             resolution: ClockResolution::Resolved,
         }
+    }
+    #[test]
+    fn isolation_requires_separate_resolved_direct_control_functions() {
+        use crate::clock_resolution::{ClockHop, ClockHopKind};
+        let mut input = clock(2, 4);
+        input.path = vec![
+            ClockHop {
+                id: 7,
+                kind: ClockHopKind::Terminal,
+            },
+            ClockHop {
+                id: 4,
+                kind: ClockHopKind::Source,
+            },
+        ];
+        let mut output = clock(1, 5);
+        output.path = vec![
+            ClockHop {
+                id: 8,
+                kind: ClockHopKind::Terminal,
+            },
+            ClockHop {
+                id: 5,
+                kind: ClockHopKind::Source,
+            },
+        ];
+        assert!(independent_direct_clocks(&input, &output, 2));
+        assert!(!independent_direct_clocks(&input, &output, 3));
+        output.control_interface = 2;
+        assert!(!independent_direct_clocks(&input, &output, 2));
+        output.control_interface = 1;
+        output.resolution = ClockResolution::FallbackFirstSource;
+        assert!(!independent_direct_clocks(&input, &output, 2));
     }
     #[test]
     fn implicit_feedforward_drops_capture_until_accepted_playback_timing() {

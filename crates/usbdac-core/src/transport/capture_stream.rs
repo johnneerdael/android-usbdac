@@ -2129,6 +2129,8 @@ pub(crate) struct CaptureHandle {
     pub(crate) worker: Option<JoinHandle<()>>,
     pub(crate) paired: bool,
     pub(crate) retired: Option<Arc<AtomicBool>>,
+    pub(crate) isolated_failure: Option<Arc<AtomicBool>>,
+    pub(crate) capture_retired: Option<Arc<AtomicBool>>,
 }
 impl CaptureHandle {
     pub(crate) fn available_frames(&self) -> usize {
@@ -2156,6 +2158,27 @@ impl CaptureHandle {
         }
     }
     pub(crate) fn stop(&mut self) -> Result<(), Error> {
+        if self
+            .isolated_failure
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            let retired = self
+                .capture_retired
+                .as_ref()
+                .expect("isolated capture retirement signal");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !retired.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            return if retired.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(Error::Transfer(
+                    "USB capture is still retiring; retain host claims and FD".into(),
+                ))
+            };
+        }
         self.stop.store(true, Ordering::Release);
         match &self.presentation {
             CapturePresentation::Standalone(buffer) => {
@@ -2403,6 +2426,8 @@ pub(crate) fn open_capture(
         worker: Some(worker),
         paired: false,
         retired: None,
+        isolated_failure: None,
+        capture_retired: None,
     };
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(handle),
@@ -3289,7 +3314,13 @@ fn run_capture(
         owner
             .claimed()
             .context
-            .handle_events(Some(Duration::from_millis(10)))
+            .handle_events(Some(Duration::from_millis(
+                if audio_status.is_revalidating() {
+                    1
+                } else {
+                    10
+                },
+            )))
             .map_err(|e| {
                 if e == rusb::Error::NoDevice {
                     Error::DeviceLost
@@ -3646,6 +3677,50 @@ mod tests {
         profile.input.max_packet_bytes = 128 * 16;
         vendor_capture_endpoint(1, profile, 48_000).unwrap()
     }
+    #[test]
+    fn isolated_capture_waits_for_each_callback_without_stopping_pair() {
+        let endpoint = programmed_capture_endpoint();
+        let attachment = Arc::new(duplex::Attachment::new(endpoint, false, 32).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = attachment.reader(stop.clone());
+        let mut pool = duplex::InputPool::new(attachment.clone()).unwrap();
+        pool.test_allow_isolation();
+        assert!(pool.slots.len() >= 2);
+        assert!(pool.isolate_status_failure(
+            reader.endpoint.control,
+            Error::Transfer("capture fault".into())
+        ));
+        // These slots simulate callbacks already outstanding when cancellation
+        // was requested; no native transfer was submitted by this test.
+        for slot in &mut pool.slots[..2] {
+            slot.in_flight = true;
+            unsafe { &(*slot.user_data).completion }.reset();
+        }
+        let completion = unsafe { &(*pool.slots[0].user_data).completion };
+        *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_CANCELLED);
+        completion.publish_for_test();
+        pool.poll_retirement().unwrap();
+        assert!(!reader
+            .capture_retired
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Acquire));
+        assert!(!reader.retired.as_ref().unwrap().load(Ordering::Acquire));
+        assert!(!stop.load(Ordering::Acquire));
+        let completion = unsafe { &(*pool.slots[1].user_data).completion };
+        *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_CANCELLED);
+        completion.publish_for_test();
+        pool.poll_retirement().unwrap();
+        assert!(reader
+            .capture_retired
+            .as_ref()
+            .unwrap()
+            .load(Ordering::Acquire));
+        assert!(!reader.retired.as_ref().unwrap().load(Ordering::Acquire));
+        reader.stop().unwrap();
+        assert!(!stop.load(Ordering::Acquire));
+    }
+
     #[test]
     fn programmed_capture_uses_requested_rate_without_a_companion() {
         let endpoint = programmed_capture_endpoint();
