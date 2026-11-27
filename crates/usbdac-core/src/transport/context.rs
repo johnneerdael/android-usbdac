@@ -420,16 +420,45 @@ mod tests {
             .unwrap();
         let owner = SessionContext::reserve(file.as_raw_fd()).unwrap();
         owner.admit();
-        owner.active.store(true, Ordering::SeqCst);
-        assert!(!owner.retired(Duration::ZERO));
+        // Reuse the existing session model. Its -1 FD owner is a safe sentinel;
+        // it observes coordinator ownership, not a real libusb handle.
+        let state = super::super::session::test_state(None);
+        let fd_owner = Arc::downgrade(&state.device._fd_owner);
+        *owner.session.lock() = Some(state);
+        let session_guard = {
+            let _scope = owner.enter();
+            let _gate = USB_SESSION_GATE.lock();
+            SessionGuard::start_locked()
+        };
+        {
+            let _scope = owner.enter();
+            clear_device();
+            assert!(USB_SESSION_CLEAR_PENDING.load(Ordering::SeqCst));
+            assert!(USB_STOP_REQUESTED.load(Ordering::SeqCst));
+            assert!(!wait_for_session_stop(Duration::ZERO));
+            assert!(session_registered());
+        }
+        assert!(!await_connection_retirement(file.as_raw_fd(), Duration::ZERO).unwrap());
+        assert!(fd_owner.upgrade().is_some());
         assert!(matches!(
             SessionContext::reserve(file.as_raw_fd()),
             Err(Error::Busy)
         ));
-        owner.active.store(false, Ordering::SeqCst);
-        owner.release();
+
+        // The session guard is held by the worker until the return/retirement
+        // boundary. Its drop performs the actual pending-clear coordination.
+        drop(session_guard);
         assert!(owner.retired(Duration::ZERO));
+        assert!(await_connection_retirement(file.as_raw_fd(), Duration::ZERO).unwrap());
+        assert!(owner.session.lock().is_none());
+        assert!(fd_owner.upgrade().is_none());
         let replacement = SessionContext::reserve(file.as_raw_fd()).unwrap();
+        // Repeated cleanup of the old owner must not release its replacement.
+        owner.release();
+        assert!(matches!(
+            SessionContext::reserve(file.as_raw_fd()),
+            Err(Error::Busy)
+        ));
         replacement.release();
     }
 

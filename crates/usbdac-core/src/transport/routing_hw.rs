@@ -2251,9 +2251,21 @@ fn inventory_partial(
     claims: &[u8],
     hc: &BTreeMap<(u8, u16), RoutingCluster>,
 ) -> Result<(RoutingInventory, Vec<RoutingDiagnostic>), RoutingSessionError> {
+    inventory_partial_for(raw, claims, hc, None)
+}
+
+fn inventory_partial_for(
+    raw: &[u8],
+    claims: &[u8],
+    hc: &BTreeMap<(u8, u16), RoutingCluster>,
+    only_interface: Option<u8>,
+) -> Result<(RoutingInventory, Vec<RoutingDiagnostic>), RoutingSessionError> {
     let mut inventory = RoutingInventory::default();
     let mut diagnostics = Vec::new();
     for (interface, (protocol, descriptors)) in routing_interfaces_unambiguous(raw, claims)? {
+        if only_interface.is_some_and(|id| id != interface) {
+            continue;
+        }
         let function = (|| -> Result<(), RoutingSessionError> {
             let mut nodes = BTreeMap::new();
             let mut header = None;
@@ -2651,6 +2663,16 @@ fn routing_clusters(
     deadline: Instant,
     filter: Option<&[ControlKey]>,
 ) -> Result<(BTreeMap<(u8, u16), RoutingCluster>, Vec<RoutingDiagnostic>), RoutingSessionError> {
+    routing_clusters_for(device, raw, deadline, filter, None)
+}
+
+fn routing_clusters_for(
+    device: &UsbDevice,
+    raw: &[u8],
+    deadline: Instant,
+    filter: Option<&[ControlKey]>,
+    only_interface: Option<u8>,
+) -> Result<(BTreeMap<(u8, u16), RoutingCluster>, Vec<RoutingDiagnostic>), RoutingSessionError> {
     let interfaces = routing_interfaces_unambiguous(raw, &device.claimed_interfaces)?;
     let idle = IDLE_LOCK
         .try_lock_for(remaining(deadline)?)
@@ -2668,6 +2690,9 @@ fn routing_clusters(
     let mut clusters = BTreeMap::new();
     let mut diagnostics = Vec::new();
     for (interface, (protocol, descriptors)) in interfaces {
+        if only_interface.is_some_and(|id| id != interface) {
+            continue;
+        }
         if protocol != 0x30 {
             continue;
         }
@@ -2962,6 +2987,181 @@ fn verify_values<I: RoutingIo<Error = String>>(
     Ok(())
 }
 
+struct DiscoveredFunction {
+    inventory: RoutingInventory,
+    clusters: BTreeMap<(u8, u16), RoutingCluster>,
+    selectors: Vec<RouteChange>,
+    diagnostics: Vec<RoutingDiagnostic>,
+}
+
+fn collect_discovery_function(
+    device: &UsbDevice,
+    raw: &[u8],
+    interface: u8,
+    deadline: Instant,
+    recovery: &Arc<Mutex<Option<Instant>>>,
+) -> Result<DiscoveredFunction, RoutingSessionError> {
+    let (clusters, mut diagnostics) =
+        routing_clusters_for(device, raw, deadline, None, Some(interface))?;
+    let (inventory, unit_diagnostics) =
+        inventory_partial_for(raw, &device.claimed_interfaces, &clusters, Some(interface))?;
+    diagnostics.extend(unit_diagnostics);
+    let mut selectors = Vec::new();
+    let mut io = UsbRoutingIo {
+        deadline,
+        recovery: recovery.clone(),
+        device,
+        descriptors: raw,
+    };
+    for unit in inventory.units() {
+        if let RoutingUnit::Selector(selector) = unit {
+            if selector.access() != Access::Absent {
+                let key = ControlKey::Selector(selector.entity());
+                match inventory
+                    .control(key)
+                    .map_err(RoutingSessionError::Invalid)?
+                    .read_current(&mut io)
+                {
+                    Ok(value) => selectors.push(RouteChange { key, value }),
+                    Err(error) => diagnostics.push(RoutingDiagnostic {
+                        interface,
+                        entity_id: Some(selector.entity().id),
+                        detail: format!("selector CUR unavailable: {error:?}"),
+                    }),
+                }
+            }
+        }
+    }
+    Ok(DiscoveredFunction {
+        inventory,
+        clusters,
+        selectors,
+        diagnostics,
+    })
+}
+
+// The runner never invokes a later function after an uncertain hand-back.
+fn discovery_scopes<T>(
+    interfaces: impl IntoIterator<Item = u8>,
+    mut run: impl FnMut(u8) -> Result<T, RoutingSessionError>,
+) -> Result<(Vec<T>, Vec<RoutingDiagnostic>), RoutingSessionError> {
+    let mut completed = Vec::new();
+    let mut diagnostics = Vec::new();
+    for interface in interfaces {
+        match run(interface) {
+            Ok(value) => completed.push(value),
+            Err(error @ RoutingSessionError::PowerRestore { .. })
+            | Err(error @ RoutingSessionError::Drift(_))
+            | Err(error @ RoutingSessionError::Session(Error::DeviceLost)) => return Err(error),
+            Err(error) => diagnostics.push(RoutingDiagnostic {
+                interface,
+                entity_id: None,
+                detail: error.to_string(),
+            }),
+        }
+    }
+    Ok((completed, diagnostics))
+}
+
+fn discover_powered_functions(
+    device: &UsbDevice,
+    raw: &[u8],
+    deadline: Instant,
+    recovery_deadline: Instant,
+) -> Result<DiscoveredFunction, RoutingSessionError> {
+    let (interfaces, mut diagnostics) =
+        routing_interfaces_with_diagnostics(raw, &device.claimed_interfaces)?;
+    let recovery = Arc::new(Mutex::new(Some(recovery_deadline)));
+    let (completed, scope_diagnostics) =
+        discovery_scopes(interfaces.keys().copied(), |interface| {
+            remaining(deadline)?;
+            let (protocol, descriptors) = interfaces
+                .get(&interface)
+                .expect("scope indexed under lock");
+            let collect =
+                || collect_discovery_function(device, raw, interface, deadline, &recovery);
+            let result = if *protocol != 0x30 {
+                collect()
+            } else {
+                // Prove all function ownership and domain membership before waking.
+                let streams = routing_power_interfaces(raw, &device.claimed_interfaces, interface)?;
+                let mut domains = BTreeMap::new();
+                for root in descriptors
+                    .iter()
+                    .filter(|d| d.len() >= 4 && matches!(d[2], 5 | 6))
+                    .map(|d| d[3])
+                {
+                    let (found, _) = adc3_routing_scope_for(descriptors, Some(root))?;
+                    for domain in found {
+                        domains.insert(domain.id, domain);
+                    }
+                }
+                let guard = RoutingPowerLease(super::adc3::Adc3PowerLease::new(device.fd));
+                guard.0.set_routing_deadline(deadline);
+                let operation = (|| {
+                    for stream in streams {
+                        guard
+                            .0
+                            .verify_idle(stream)
+                            .map_err(|e| RoutingSessionError::Session(Error::Control(e)))?;
+                    }
+                    for domain in domains.values() {
+                        guard
+                            .0
+                            .acquire(interface, domain)
+                            .map_err(|e| RoutingSessionError::Session(Error::Control(e)))?;
+                    }
+                    collect()
+                })();
+                guard.0.set_routing_deadline(recovery_deadline);
+                finish_routing_power(operation, guard.0.restore_checked())
+            };
+            if matches!(&result, Err(RoutingSessionError::PowerRestore { .. })) {
+                return result;
+            }
+            // A recoverable local failure is only isolated while this remains the
+            // same attachment and configuration. Expiry prevents further USB I/O.
+            if remaining(deadline).is_ok() {
+                let (number, observed) =
+                    active_descriptors_until(device, Some(deadline)).map_err(|error| {
+                        RoutingSessionError::Drift(format!(
+                            "cannot reprove attachment after powered discovery scope: {error}"
+                        ))
+                    })?;
+                if observed != raw || number != raw[5] {
+                    return Err(RoutingSessionError::Drift(
+                        "attachment or configuration changed during powered discovery".into(),
+                    ));
+                }
+            }
+            result
+        })?;
+    diagnostics.extend(scope_diagnostics);
+    let mut inventory = RoutingInventory::default();
+    let mut clusters = BTreeMap::new();
+    let mut selectors = Vec::new();
+    for function in completed {
+        for unit in function.inventory.units() {
+            inventory
+                .insert(unit.clone())
+                .map_err(RoutingSessionError::Invalid)?;
+        }
+        for (key, cluster) in function.clusters {
+            if clusters.insert(key, cluster).is_some() {
+                return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateEntity));
+            }
+        }
+        selectors.extend(function.selectors);
+        diagnostics.extend(function.diagnostics);
+    }
+    Ok(DiscoveredFunction {
+        inventory,
+        clusters,
+        selectors,
+        diagnostics,
+    })
+}
+
 pub(crate) fn discover() -> Result<RoutingSnapshot, RoutingSessionError> {
     discover_with_power(false)
 }
@@ -2984,6 +3184,27 @@ pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, Rout
         })?;
     let device = idle_device_until(Some(deadline))?;
     let (configuration, descriptors) = active_descriptors_until(&device, Some(deadline))?;
+    if powered {
+        let recovery_deadline = deadline
+            .checked_add(ROUTING_RECOVERY_BUDGET)
+            .ok_or_else(|| {
+                RoutingSessionError::Session(Error::Control(
+                    "routing recovery deadline overflow".into(),
+                ))
+            })?;
+        let result =
+            discover_powered_functions(&device, &descriptors, deadline, recovery_deadline)?;
+        return Ok(RoutingSnapshot {
+            device,
+            configuration,
+            descriptors,
+            inventory: result.inventory,
+            selectors: result.selectors,
+            hc_clusters: result.clusters,
+            diagnostics: result.diagnostics,
+            hand_back_report: context::current().routing_report.clone(),
+        });
+    }
     with_routing_power(
         &device,
         &descriptors,
@@ -3587,6 +3808,52 @@ mod tests {
             scarlett_mux_read(),
             Err(RoutingSessionError::UnsupportedTopology(_))
         ));
+    }
+
+    #[test]
+    fn discovery_scope_runner_continues_only_after_checked_recovery() {
+        let mut events = Vec::new();
+        let (scopes, diagnostics) = discovery_scopes([1, 2, 3], |id| {
+            events.push(format!("wake:{id}"));
+            events.push(format!("restore:{id}"));
+            if id == 2 {
+                finish_routing_power(
+                    Err(RoutingSessionError::Session(Error::Control(
+                        "wake failed".into(),
+                    ))),
+                    Ok(()),
+                )
+            } else {
+                finish_routing_power(Ok(id), Ok(()))
+            }
+        })
+        .unwrap();
+        assert_eq!(scopes, vec![1, 3]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            events,
+            [
+                "wake:1",
+                "restore:1",
+                "wake:2",
+                "restore:2",
+                "wake:3",
+                "restore:3"
+            ]
+        );
+        let mut attempted = Vec::new();
+        let error = discovery_scopes([1, 2], |id| -> Result<(), RoutingSessionError> {
+            attempted.push(id);
+            finish_routing_power(
+                Err(RoutingSessionError::Session(Error::Control(
+                    "wake failed".into(),
+                ))),
+                Err("unreadable".into()),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(error, RoutingSessionError::PowerRestore { .. }));
+        assert_eq!(attempted, [1]);
     }
 
     #[test]

@@ -4850,6 +4850,7 @@ mod tests {
         states: std::collections::HashMap<(u8, u8), u8>,
         events: Vec<String>,
         fail: Option<u8>,
+        fail_after_write: bool,
     }
     impl PowerIo for PowerMock {
         fn read(&mut self, ac: u8, id: u8) -> Result<u8, String> {
@@ -4859,6 +4860,9 @@ mod tests {
         fn write(&mut self, ac: u8, id: u8, state: u8) -> Result<(), String> {
             self.events.push(format!("write:{ac}:{id}:{state}"));
             if state == 0 && self.fail == Some(id) {
+                if self.fail_after_write {
+                    self.states.insert((ac, id), state);
+                }
                 return Err("wake failed".into());
             }
             self.states.insert((ac, id), state);
@@ -4887,6 +4891,51 @@ mod tests {
         assert_eq!(io.states[&(4, 11)], 2);
         assert!(!io.events.iter().any(|e| e.starts_with("write:4:10:")));
     }
+    #[test]
+    fn checked_scopes_reprove_d0_and_keep_equal_domain_ids_per_interface_separate() {
+        let mut io = PowerMock::default();
+        io.states.insert((4, 10), 0);
+        io.states.insert((5, 10), 2);
+        let mut first = Vec::new();
+        acquire_domain(&mut io, &mut first, 4, &domain(10)).unwrap();
+        acquire_domain(&mut io, &mut first, 4, &domain(10)).unwrap();
+        restore_domains_checked(&mut io, first).unwrap();
+        let mut second = Vec::new();
+        acquire_domain(&mut io, &mut second, 5, &domain(10)).unwrap();
+        restore_domains_checked(&mut io, second).unwrap();
+        assert_eq!(io.states[&(4, 10)], 0);
+        assert_eq!(io.states[&(5, 10)], 2);
+        assert_eq!(io.events.iter().filter(|e| *e == "read:4:10").count(), 3);
+        assert!(!io.events.iter().any(|e| e.starts_with("write:4:10:")));
+        let restored_first = io.events.iter().rposition(|e| e == "read:4:10").unwrap();
+        let started_second = io.events.iter().position(|e| e == "read:5:10").unwrap();
+        assert!(restored_first < started_second);
+    }
+
+    #[test]
+    fn lost_wake_ack_uses_checked_journal_to_restore_exact_prior_state() {
+        let mut io = PowerMock::default();
+        io.states.insert((4, 10), 1);
+        io.states.insert((4, 11), 2);
+        io.fail = Some(11);
+        io.fail_after_write = true;
+        let mut pending = Vec::new();
+        acquire_domain(&mut io, &mut pending, 4, &domain(10)).unwrap();
+        assert!(acquire_domain(&mut io, &mut pending, 4, &domain(11)).is_err());
+        assert_eq!(io.states[&(4, 11)], 0);
+        restore_domains_checked(&mut io, pending).unwrap();
+        assert_eq!(io.states[&(4, 10)], 1);
+        assert_eq!(io.states[&(4, 11)], 2);
+        assert!(io
+            .events
+            .windows(3)
+            .any(|e| e == ["read:4:11", "write:4:11:2", "read:4:11"]));
+        assert!(io
+            .events
+            .windows(3)
+            .any(|e| e == ["read:4:10", "write:4:10:1", "read:4:10"]));
+    }
+
     #[test]
     fn capture_alternative_graph_uses_output_terminal_clock_and_writable_pins() {
         let mut bytes = vec![19, 0x24, 3, 6, 1, 1, 0, 4, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
