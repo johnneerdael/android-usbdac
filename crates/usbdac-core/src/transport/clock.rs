@@ -693,7 +693,7 @@ fn valid_uac1_rate(rate: u32) -> bool {
     (1..=0x7f_ffff).contains(&rate)
 }
 
-fn decode_uac1_rate(data: [u8; 3], transferred: usize) -> Result<u32, String> {
+pub(super) fn decode_uac1_rate(data: [u8; 3], transferred: usize) -> Result<u32, String> {
     if transferred != 3 {
         return Err(format!(
             "UAC1 GET_CUR returned {transferred} bytes, expected 3"

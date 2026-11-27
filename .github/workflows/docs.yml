@@ -9,6 +9,7 @@ on:
     paths:
       - "docs/**"
       - "android/usbdac/**"
+      - "android/usbdac-media3/**"
       - ".github/workflows/docs.yml"
       - ".github/scripts/build_site.py"
   release:
@@ -60,7 +61,7 @@ jobs:
       # Dokka reads the Kotlin sources; the Rust build is not needed for that.
       - name: Generate the API reference
         working-directory: android
-        run: ./gradlew :usbdac:dokkaGeneratePublicationHtml -Pusbdac.skipNative=true --console=plain
+        run: ./gradlew :usbdac:dokkaGeneratePublicationHtml :usbdac-media3:dokkaGeneratePublicationHtml -Pusbdac.skipNative=true --console=plain
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -73,6 +74,7 @@ jobs:
             --guide docs/sdk \
             --native-api docs/API.md \
             --dokka android/usbdac/build/dokka/html \
+            --media3-dokka android/usbdac-media3/build/dokka/html \
             --output _site
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

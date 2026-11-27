@@ -204,6 +204,14 @@ pub(crate) fn fuzz_transport_bytes(data: &[u8]) {
             let _ = iso::decode_feedback_report(data, interval, speed);
         }
     }
+    for protocol in [0x00, 0x20, 0x30] {
+        let _ = scan::parse_streaming_extra(protocol, data);
+    }
+    let mut rate = [0; 3];
+    let length = data.len().min(rate.len());
+    rate[..length].copy_from_slice(&data[..length]);
+    let _ = clock::decode_uac1_rate(rate, length);
+    let _ = crate::volume_control::parse_uac2_volume_ranges(data);
     let _ = clock::parse_sampling_frequency_ranges(data);
     let _ = adc3::functions(data);
 }

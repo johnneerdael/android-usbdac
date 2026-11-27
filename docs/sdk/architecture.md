@@ -1,6 +1,6 @@
 # Architecture
 
-This page explains how usbdac is built: the layers, what each module of the Rust core is for, what happens to a sample between `write` and the DAC, which threads exist, and how a stream moves through its states. It describes `v0.1.5`. The reasons for the choices are on the [design decisions](decisions.md) pages, and the user-level descriptions are in the [guide](index.md); this page is the map between them.
+This page explains how usbdac is built: the layers, what each module of the Rust core is for, what happens to a sample between `write` and the DAC, which threads exist, and how a stream moves through its states. The [status ledger](status.md) records the current implementation and validation inventory. The reasons for the choices are on the [design decisions](decisions.md) pages, and the user-level descriptions are in the [guide](index.md); this page is the map between them.
 
 ## The layers
 
@@ -49,7 +49,7 @@ The core talks to the DAC through usbfs, so it works on Android and Linux. On an
 | Packet arithmetic | `iso_packet_scheduler.rs`, `iso_packet_validation.rs` | How many frames go in each packet (exact over a long time, following feedback); which completed packet sizes are legal |
 | Accounting | `iso_transport_loss.rs`, `output_position.rs`, `payload_audit_latch.rs`, `flush_cancel.rs` | Lost audio, played music frames and latency, the grace on the payload audit, which transfers a flush cancels |
 | Volume | `volume_control.rs`, `transport/volume_hw.rs`, `transport/usbfs.rs` | Find the Feature Unit, quantise levels, attenuate at open, write and read back, hand back; control transfers on the descriptor |
-| Per device | `quirk.rs`, `settings.rs`, `transport/native_dsd.rs` | The built-in quirk table (two entries), the settings the transport reads, and the native DSD layout rules. The vendor PCM, vendor routing (`pioneer.rs`, `scarlett.rs`) and device-specific feedback code is in the tree and switched off in 0.1.5 |
+| Per device | `quirk.rs`, `settings.rs`, `transport/native_dsd.rs` | The built-in quirks, opt-in source-backed quirk table, transport settings, and native DSD layout rules. The vendor PCM, vendor routing (`pioneer.rs`, `scarlett.rs`) and device-specific feedback code is in the tree and switched off in 0.1.5 |
 | Conversion | `convert/` | The opt-in resampler, bit-depth and channel conversion, planning and classification. The stream never calls it |
 | Support | `priority.rs`, `transport/fake_dac.rs` | Real-time scheduling for the output thread; a fake DAC that answers control requests so the transport can be tested on a host |
 

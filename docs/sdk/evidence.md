@@ -8,7 +8,7 @@ The [generated status ledger](status.md) is checked against the compiled shipped
 
 Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 17) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
 
-The usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. Code added after those commits has host tests only, and no physical result has been recorded on a 0.1.5 build.
+The usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. Code added after those commits has host tests only, and no physical result for later releases is recorded here.
 
 | Area | Status | Source |
 |---|---|---|
@@ -90,7 +90,7 @@ delivery, clock changes and the transition on this device.
 
 ## Release validation scope {#release-validation-scope}
 
-Version 0.1.5 carries the shared USB Audio implementation: UAC1, UAC2 and UAC3 (BADD and full ADC3) playback, PCM capture and duplex, channel layouts, clock selection and restoration, standard routing, explicit and implicit feedback, and native DSD and DoP capability handling. The
+The shared USB Audio implementation includes: UAC1, UAC2 and UAC3 (BADD and full ADC3) playback, PCM capture and duplex, channel layouts, clock selection and restoration, standard routing, explicit and implicit feedback, and native DSD and DoP capability handling. The
 [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md) records software checks
 and their artifacts by implementation batch. These include Rust protocol,
 control and packet tests, Kotlin tests, Android target checks and four-ABI

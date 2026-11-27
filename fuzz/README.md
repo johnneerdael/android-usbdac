@@ -16,3 +16,5 @@ failed-run corpora are never published by these workflows. Dispatch it on the re
 candidate revision for longer evidence; availability of the workflow is not a
 claim that it has completed. Its hard per-input limit remains 4096 bytes and
 10 seconds; the normal PR gate remains a bounded 60 second run.
+
+The adapter exercises streaming descriptors for UAC1/2/3, UAC1 rate replies, UAC2 volume ranges, and Scarlett reply and mux parsing in addition to descriptor and feedback parsers. These are pure bounded parsing paths; no hardware writes occur.

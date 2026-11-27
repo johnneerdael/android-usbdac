@@ -6,7 +6,8 @@ and Dokka's HTML output is copied under api/. The result is a plain static site:
 links only, no JavaScript of its own, so it works under any Pages base path.
 
     python build_site.py --guide docs/sdk --native-api docs/API.md \
-        --dokka android/usbdac/build/dokka/html --output _site
+        --dokka android/usbdac/build/dokka/html \
+        --media3-dokka android/usbdac-media3/build/dokka/html --output _site
 
 Pages can set explicit anchors with `{#id}` after a heading (the attr_list extension); the
 decision pages and the reference list use that so links to them stay stable.
@@ -165,7 +166,8 @@ def nav_html(current: str, headings) -> str:
                 out.append('<div class="page-toc">')
                 out.extend(f'<a href="#{anchor}">{html.escape(text)}</a>' for anchor, text in headings)
                 out.append("</div>")
-    out.append('<a href="api/index.html">API reference (Dokka)</a>')
+    out.append('<a href="api/index.html">Core API reference (Dokka)</a>')
+    out.append('<a href="media3-api/index.html">Media3 API reference (Dokka)</a>')
     return "\n".join(out)
 
 
@@ -174,11 +176,16 @@ def main() -> int:
     parser.add_argument("--guide", required=True, type=pathlib.Path, help="directory with the guide's Markdown files")
     parser.add_argument("--native-api", required=True, type=pathlib.Path, help="docs/API.md")
     parser.add_argument("--dokka", required=True, type=pathlib.Path, help="Dokka's HTML output directory")
+    parser.add_argument("--media3-dokka", required=True, type=pathlib.Path, help="Media3 Dokka HTML output directory")
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
 
     if not (args.dokka / "index.html").is_file():
         print(f"no Dokka output at {args.dokka}", file=sys.stderr)
+        return 1
+
+    if not (args.media3_dokka / "index.html").is_file():
+        print(f"no Media3 Dokka output at {args.media3_dokka}", file=sys.stderr)
         return 1
 
     pages = {f"{name}.md": name for name, _ in GUIDE_PAGES}
@@ -207,6 +214,7 @@ def main() -> int:
     for filename in SOURCE_DATA_FILES:
         shutil.copyfile(args.guide.parent / filename, args.output / filename)
     shutil.copytree(args.dokka, args.output / "api")
+    shutil.copytree(args.media3_dokka, args.output / "media3-api")
     (args.output / ".nojekyll").write_text("", encoding="utf-8")
     print(f"site written to {args.output} ({len(sources)} pages and the API reference)")
     return 0
