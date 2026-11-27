@@ -86,8 +86,8 @@ pub use capture::{
 };
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
 pub use config::{
-    AsyncFallbackPolicy, ClockReadbackPolicy, CloseVolume, DacConfig, HandBack, QuirkOverride,
-    StartupVolume, UsbQueueProfile,
+    AsyncFallbackPolicy, ClockReadbackPolicy, CloseVolume, DacConfig, FeedbackSmoothing, HandBack,
+    QuirkOverride, StartupVolume, UsbQueueProfile,
 };
 pub use dac::{Dac, StreamReconfiguration, UsbRetirement};
 pub use error::{Error, Result};

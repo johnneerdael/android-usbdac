@@ -159,6 +159,7 @@ Capture, duplex and routing have their own entry points; they are listed under
 | `dsd_subslot` | `None` | Legacy native DSD subslot size (1, 2, 4). `None`: the device quirk, else the descriptor. Standard UAC3 DSD uses 8 bytes. |
 | `padded_24bit` | `None` | Prefer the 4-byte subslot for 24-bit PCM. `None`: the device quirk, else off. |
 | `quirks` | empty | `QuirkOverride { vendor_id, product_id, name_contains, quirks: Vec<Quirk> }`, added to the built-in table. |
+| `feedback_smoothing` | `FeedbackSmoothing::Direct` | Explicit feedback uses each accepted selected fractional report directly. `FeedbackSmoothing::Ewma` retains the legacy alpha-0.2 filter; implicit cadence is unaffected. JSON: `"direct"` or `"ewma"`. |
 | `allow_unsynchronized_async` | `false` | Allow an otherwise valid asynchronous endpoint without usable feedback to stream at the nominal rate. |
 | `disable_feedback` | `false` | Disable both feedback modes for this session. The asynchronous nominal option still applies. |
 | `capture_feedback_trace` | `false` | Enable the bounded USB feedback support capture for streams opened by this session. |

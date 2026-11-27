@@ -60,6 +60,7 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 | `adaptiveQueue` | `Boolean` | `true` | Adapt the USB queue within native bounds after measured worker stalls | Changes transport buffering, not sample values |
 | `allowUnsynchronizedAsync` | `Boolean` | `false` | Permit an otherwise valid asynchronous route without usable feedback to play at the nominal rate. The host and DAC clocks can drift apart | Never bit-perfect while in use (blocker `UNSYNCHRONIZED_ASYNC`) |
 | `disableFeedback` | `Boolean` | `false` | Disable explicit and implicit feedback for this session. An asynchronous route still needs an applicable nominal-timing policy | The same blocker applies if the route uses nominal asynchronous timing |
+| `feedbackSmoothing` | `FeedbackSmoothing` | `DIRECT` | Explicit feedback uses each accepted selected report directly. `EWMA` preserves the legacy filter with alpha 0.2. Implicit vectors and nominal pacing are unaffected | None; the same timing validation and bit-perfect conditions apply |
 | `captureFeedbackTrace` | `Boolean` | `false` | Retain a bounded USB feedback support report for the most recent stream. Export it with `DacSession.feedbackTraceJson()` | None |
 
 ### Quirks

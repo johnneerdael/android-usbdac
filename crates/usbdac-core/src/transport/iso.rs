@@ -1016,7 +1016,7 @@ impl FeedbackCounters {
 }
 
 /// Scan requested packet spans, never a shortened/concatenated actual-length prefix.
-/// Validate all candidates before selecting one; update the EWMA only once per transfer.
+/// Validate all candidates before selecting one; commit the selected timing rate only once per transfer.
 #[cfg(test)]
 fn select_feedback_report(
     buffer: &[u8],
@@ -1431,6 +1431,13 @@ pub(super) fn pump_feedback_transfers(
                         ));
                     }
                     if scheduler.update_feedback_frames_per_packet(frames) {
+                        if let Some(trace) = &counters.trace {
+                            if let Some(event) =
+                                applied_feedback_trace(scheduler, frames, data_service_interval_us)
+                            {
+                                trace.record(event);
+                            }
+                        }
                         counters.reports = counters.reports.saturating_add(1);
                         // Completion callbacks can run out of order. Never
                         // regress the last-report timestamp in that case.
@@ -1518,6 +1525,24 @@ impl ExplicitFeedbackHealth {
             age >= self.terminal,
         )
     }
+}
+
+/// Record the applied fractional scheduler rate separately from the selected report.
+fn applied_feedback_trace(
+    scheduler: &IsoPacketScheduler,
+    reported: f64,
+    service_us: u32,
+) -> Option<crate::FeedbackTraceEvent> {
+    if service_us == 0 {
+        return None;
+    }
+    let applied = scheduler.applied_feedback_frames_per_packet()?;
+    Some(crate::FeedbackTraceEvent::ExplicitFeedbackRate {
+        smoothing: scheduler.explicit_feedback_smoothing(),
+        reported_frames_per_out_service: reported,
+        applied_frames_per_out_service: applied,
+        applied_rate_hz: applied * 1_000_000.0 / f64::from(service_us),
+    })
 }
 
 /// Decode UAC feedback into frames per data-endpoint service interval.
@@ -2346,7 +2371,7 @@ mod explicit_feedback_tests {
         assert_eq!(counters.empty_polls, 1);
         assert_eq!(counters.errors, 1);
         assert_eq!(counters.malformed, 2);
-        assert_eq!(counters.reports, 0); // scanning never commits the EWMA
+        assert_eq!(counters.reports, 0); // scanning never commits packet timing
         bytes.extend_from_slice(&later);
         let packets = [
             (0, 4, 4),
@@ -3219,5 +3244,41 @@ mod source_wire_owner_policy_tests {
         }
         assert_eq!(data_packet_prefix_bytes(), 4);
         assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
+    }
+}
+
+#[cfg(test)]
+mod feedback_smoothing_trace_tests {
+    use super::*;
+    #[test]
+    fn support_trace_distinguishes_accepted_report_and_actual_scheduler_rate() {
+        for policy in [
+            crate::FeedbackSmoothing::Direct,
+            crate::FeedbackSmoothing::Ewma,
+        ] {
+            let mut scheduler =
+                IsoPacketScheduler::new(48_000, 4, 125).with_explicit_feedback_smoothing(policy);
+            assert!(scheduler.update_feedback_frames_per_packet(6.0));
+            assert!(scheduler.update_feedback_frames_per_packet(9.0));
+            let crate::FeedbackTraceEvent::ExplicitFeedbackRate {
+                smoothing,
+                reported_frames_per_out_service,
+                applied_frames_per_out_service,
+                applied_rate_hz,
+            } = applied_feedback_trace(&scheduler, 9.0, 125).unwrap()
+            else {
+                panic!("scheduler rate observation expected");
+            };
+            assert_eq!(smoothing, policy);
+            assert_eq!(reported_frames_per_out_service, 9.0);
+            let expected = if policy == crate::FeedbackSmoothing::Direct {
+                9.0
+            } else {
+                6.6
+            };
+            assert!((applied_frames_per_out_service - expected).abs() < 1e-12);
+            assert!((applied_rate_hz - expected * 8000.0).abs() < 1e-8);
+            assert!(applied_feedback_trace(&scheduler, 9.0, 0).is_none());
+        }
     }
 }

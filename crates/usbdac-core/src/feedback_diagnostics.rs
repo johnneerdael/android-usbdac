@@ -146,7 +146,8 @@ pub struct ExplicitFeedbackDiagnostics {
     pub rate_min_frames: f64,
     pub rate_max_frames: f64,
     pub rate_mean_frames: f64,
-    /// Population variance; EWMA remains 0.2. No audible smoothing tradeoff is inferred.
+    /// Population variance before the configured timing policy. No audible
+    /// smoothing tradeoff is inferred.
     pub rate_variance_frames: f64,
     pub empty_polls: u64,
     pub rejected_reports: u64,
@@ -234,6 +235,18 @@ pub enum FeedbackTraceEvent {
     Timebase {
         unit: &'static str,
         inferred: bool,
+    },
+    /// Selected policy, retained before the first explicit report arrives.
+    ExplicitFeedbackPolicy {
+        smoothing: crate::FeedbackSmoothing,
+    },
+    /// The validated selected report and the actual fractional scheduling rate.
+    /// Raw feedback statistics remain independent of the configured filter.
+    ExplicitFeedbackRate {
+        smoothing: crate::FeedbackSmoothing,
+        reported_frames_per_out_service: f64,
+        applied_frames_per_out_service: f64,
+        applied_rate_hz: f64,
     },
     CompatibilityFallback {
         tier: crate::CompatibilityFallbackTier,

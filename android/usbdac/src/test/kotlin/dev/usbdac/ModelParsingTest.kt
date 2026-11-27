@@ -670,4 +670,15 @@ class ModelParsingTest {
         assertEquals(quirks.size, encoded.length())
     }
 
+    @Test
+    fun explicitFeedbackSmoothingDefaultsToDirectAndKeepsLegacyWireOptIn() {
+        assertEquals(FeedbackSmoothing.DIRECT, DacConfig().feedbackSmoothing)
+        assertEquals("direct", JSONObject(DacConfig().toNativeJson()).getString("feedback_smoothing"))
+        val legacy = DacConfig(feedbackSmoothing = FeedbackSmoothing.EWMA)
+        assertEquals("ewma", JSONObject(legacy.toNativeJson()).getString("feedback_smoothing"))
+        val tuned = legacy.withUsbQueueProfile(UsbQueueProfile.LOW_CPU)
+        assertEquals(FeedbackSmoothing.EWMA, tuned.feedbackSmoothing)
+        assertEquals("ewma", JSONObject(tuned.toNativeJson()).getString("feedback_smoothing"))
+    }
+
 }

@@ -19,6 +19,25 @@ pub enum ClockReadbackPolicy {
     AllowUnusableAfterSuccessfulSet,
 }
 
+/// How validated explicit feedback reports change packet timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeedbackSmoothing {
+    /// Apply each accepted report directly, without averaging or rate rounding.
+    #[default]
+    Direct,
+    /// Legacy filter: first report directly, then old + 0.2 * (report - old).
+    Ewma,
+}
+
+impl FeedbackSmoothing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Ewma => "ewma",
+        }
+    }
+}
+
 use crate::error::{Error, Result};
 use crate::iso_packet_scheduler::{DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT};
 use crate::quirk::Quirk;
@@ -157,6 +176,9 @@ pub struct DacConfig {
     /// Disable explicit and implicit feedback for diagnosis. Default `false`.
     /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.
     pub disable_feedback: bool,
+    /// Explicit feedback timing policy. Direct by default; implicit cadence
+    /// vectors and nominal pacing are unaffected. Applied when a stream opens.
+    pub feedback_smoothing: FeedbackSmoothing,
     /// Retain a bounded USB feedback support trace, including raw explicit
     /// feedback bytes. Ask the listener to enable it before opening a session.
     pub capture_feedback_trace: bool,
@@ -220,6 +242,7 @@ impl Default for DacConfig {
             clock_readback_policy: ClockReadbackPolicy::default(),
             adaptive_queue: true,
             disable_feedback: false,
+            feedback_smoothing: FeedbackSmoothing::Direct,
             capture_feedback_trace: false,
             realtime_priority: true,
             hand_back: HandBack::default(),
@@ -317,6 +340,7 @@ mod tests {
         assert_eq!(config.processing_buffer_target_ms, 100);
         assert!(config.require_verified_rate);
         assert!(config.realtime_priority);
+        assert_eq!(config.feedback_smoothing, FeedbackSmoothing::Direct);
         assert!(!config.allow_unsynchronized_async);
         assert_eq!(config.hand_back, HandBack::RestoreOriginal);
         assert_eq!(config.bus_queue_ms, 16);
