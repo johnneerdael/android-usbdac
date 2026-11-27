@@ -70,7 +70,8 @@ pub(super) fn negotiate_playback_format(
             match select_owned_stream_candidate(&claimed_handle, requested_format, speed) {
                 Ok(candidate) => (candidate, requested_format),
                 Err(first) => {
-                    if rate_policy != crate::RatePolicy::NearestSupported
+                    if !matches!(first, SelectError::NoMatch(_))
+                        || rate_policy != crate::RatePolicy::NearestSupported
                         || requested_format.dsd_transport == DsdTransportMode::Native
                         || requested_format.is_dop
                     {
@@ -89,11 +90,13 @@ pub(super) fn negotiate_playback_format(
                             sample_rate: rate,
                             ..requested_format
                         };
-                        if let Ok(candidate) =
-                            select_owned_stream_candidate(&claimed_handle, target, speed)
-                        {
-                            replacement = Some((candidate, target));
-                            break;
+                        match select_owned_stream_candidate(&claimed_handle, target, speed) {
+                            Ok(candidate) => {
+                                replacement = Some((candidate, target));
+                                break;
+                            }
+                            Err(SelectError::NoMatch(_)) => continue,
+                            Err(error) => return Err(error.into_error(offered_alt_settings())),
                         }
                     }
                     replacement.ok_or_else(|| first.into_error(offered_alt_settings()))?
@@ -782,6 +785,9 @@ pub(super) fn candidate_rates_from_supported_ranges(
     let preferred = preferred_adaptive_sample_rates(requested_sample_rate);
 
     for range in ranges {
+        if range.min > range.max {
+            continue;
+        }
         if range.res == 0 || range.min == range.max {
             candidates.push(range.min);
             continue;
@@ -798,6 +804,22 @@ pub(super) fn candidate_rates_from_supported_ranges(
             }
         }
 
+        let family_unit = match rate_family(requested_sample_rate) {
+            1 => 11_025,
+            2 => 8_000,
+            _ => 0,
+        };
+        if family_unit != 0 {
+            let mut rate =
+                range.max.min(requested_sample_rate.saturating_sub(1)) / family_unit * family_unit;
+            while rate >= range.min && rate > 0 {
+                if sampling_frequency_ranges_support_rate(std::slice::from_ref(range), rate) {
+                    candidates.push(rate);
+                    break;
+                }
+                rate = rate.saturating_sub(family_unit);
+            }
+        }
         let steps = requested_sample_rate.saturating_sub(range.min) / range.res;
         for index in [steps, steps.saturating_add(1)] {
             if let Some(rate) = range.min.checked_add(index.saturating_mul(range.res)) {
@@ -807,8 +829,9 @@ pub(super) fn candidate_rates_from_supported_ranges(
             }
         }
         candidates.push(range.min);
-        if range.max != range.min {
-            candidates.push(range.max);
+        let last = range.min + ((range.max - range.min) / range.res) * range.res;
+        if last != range.min {
+            candidates.push(last);
         }
     }
 
@@ -975,6 +998,20 @@ mod evidence_tests {
         let mut rates = candidate_rates_from_supported_ranges(&ranges, 192_000);
         rank_sample_rates(&mut rates, 192_000);
         assert_eq!(rates[0], 96_000);
+    }
+
+    #[test]
+    fn stepped_range_includes_aligned_ceiling_and_highest_family_rate() {
+        let ranges = [SamplingFrequencySubrange {
+            min: 8_000,
+            max: 95_777,
+            res: 1000,
+        }];
+        let mut rates = candidate_rates_from_supported_ranges(&ranges, 192_000);
+        rank_sample_rates(&mut rates, 192_000);
+        assert_eq!(rates[0], 64_000); // highest exact divisor beats non-divisor 95 kHz
+        assert!(rates.contains(&95_000));
+        assert!(rates.contains(&88_000)); // highest in-range 8 kHz-family cadence
     }
 
     #[test]
