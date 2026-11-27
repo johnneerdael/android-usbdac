@@ -104,7 +104,7 @@ public data class DownstreamLimits(
  * @property allowConversion Let the direct output convert (resample, widen or narrow) a request the
  *   DAC cannot run as it is, with the library's own converter. The decision then carries the
  *   [ConversionPlan], and the guarantee drops to [Guarantee.NONE] unless every sample value is kept
- *   (a widening). `false`: only lossless widening is allowed, and only while [allowWidening] is on.
+ *   (a widening). `false`: only explicitly enabled lossless widening is allowed.
  * @property dacConfig The session configuration for [OutputKind.DIRECT_USB]. With
  *   [DacConfig.requireHardwareVolume] on (the default) a DAC without a usable hardware volume is
  *   rejected ([RejectionReason.NO_HARDWARE_VOLUME]); turn it off to accept a fixed level.
@@ -120,8 +120,7 @@ public data class OutputPolicy @JvmOverloads constructor(
     val aaudioConfig: AAudioConfig = AAudioConfig(),
     /** Permit same-rate, same-channel integer widening only, with a lossless conversion plan. */
     val allowWidening: Boolean = true,
-    /** Final decoder limits, or null when no downstream PCM constraint is configured. With limits, every
-     * Android output is refused except exclusive AAudio on the route bound by [downstreamBinding]. */
+    /** Final decoder limits, or null when no downstream PCM constraint is configured. */
     val downstreamLimits: DownstreamLimits? = null,
     /** Confirmation of the final decoder's DoP marker support, independent of USB carrier support. */
     val dopSupport: DopSupport = DopSupport.UNCONFIRMED,
@@ -194,7 +193,7 @@ public enum class RejectionReason {
     /** The output cannot carry this request: DSD on a mixer, a rate or depth the DAC does not run, a channel count. */
     REQUEST_NOT_SUPPORTED,
 
-    /** The requested asynchronous endpoint has no explicit feedback endpoint and no compatible implicit feedback source. */
+    /** The DAC paces an asynchronous endpoint with implicit feedback, which the library does not support. */
     IMPLICIT_FEEDBACK,
 
     /** The DAC has no usable hardware volume and [DacConfig.requireHardwareVolume] is on. */

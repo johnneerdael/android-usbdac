@@ -305,10 +305,9 @@ public data class ConvertResult(
 )
 
 /**
- * Converts audio from a plan's source format to its target format, a chunk at a time. A [DacStream]
- * never converts anything; a converter sits in front of an output (see [ConvertingOutput]) or is used
- * on its own. [OutputSelector] puts one in front of its direct USB output when [OutputPolicy.allowConversion] or
- * [OutputPolicy.allowWidening] (both on by default) admits a plan.
+ * Converts audio from a plan's source format to its target format, a chunk at a time. Opt-in: the
+ * direct USB path never converts anything, and a converter sits in front of an output (see
+ * [ConvertingOutput]) or is used on its own.
  *
  * Every conversion but [ConversionKind.NONE] and [ConversionKind.BIT_EXACT] changes the audio; see
  * [ConversionPlan.description]. Nothing is allocated per chunk.

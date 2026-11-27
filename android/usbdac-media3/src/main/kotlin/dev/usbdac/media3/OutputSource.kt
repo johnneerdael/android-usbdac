@@ -38,12 +38,8 @@ data class OutputSupport(
  */
 interface OutputSource {
     /**
-     * Whether the sink should accept [request], answered from cached capabilities only. Do not open,
-     * negotiate, or probe here. [UsbDacAudioSink.getFormatSupport] asks it for every raw PCM format.
-     *
-     * The default answers [OutputFormatSupport.UNSUPPORTED] for every request. A source written for
-     * 0.1.10 that implements only [open], [close], [takeLookAgain] and [setVolumeMultiplier] still
-     * compiles, but the sink then rejects every format and nothing plays. Override this method.
+     * Consult cached capabilities only. Do not open, negotiate, or probe here. Custom sources must
+     * override this method to opt in; unknown sources are conservatively unsupported.
      */
     fun formatSupport(request: StreamRequest): OutputSupport =
         OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no capability snapshot")

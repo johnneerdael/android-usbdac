@@ -202,8 +202,6 @@ public class DacSession private constructor(
      * the decoder for its actual [DacStream.format], supply PCM, then play. A timeout throws
      * [DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT] while [current] remains open/draining (no hidden flush).
      * [DacErrorCode.RECONFIGURE_UNUSABLE] requires closing this session. Duplex is refused.
-     * While it runs, including the drain, [negotiate] and [routing] calls on this session fail with
-     * [DacErrorCode.BUSY] instead of waiting; [openStream] waits for it to return.
      */
     public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration =
         reconfigureCandidates(current, listOf(request), drainTimeoutMs)

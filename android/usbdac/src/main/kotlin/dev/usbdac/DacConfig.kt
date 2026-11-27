@@ -190,10 +190,7 @@ public data class DacConfig @JvmOverloads constructor(
      */
     val startThresholdMs: Int = 100,
 
-    /**
-     * The recommended ring depth while software gain is not 1.0 or [DacStream.setHostProcessing] is
-     * on, so changes are heard sooner. PCM only. Default 100 ms.
-     */
+    /** The recommended ring depth while software gain is not 1.0, so changes are heard sooner. Default 100 ms. */
     val processingBufferTargetMs: Int = 100,
 
     /**
@@ -294,12 +291,7 @@ public data class DacConfig @JvmOverloads constructor(
     /** An unverified clock remains reported unverified when the compatibility policy allows it. */
     val clockReadbackPolicy: ClockReadbackPolicy = ClockReadbackPolicy.REQUIRE_VERIFIED,
 
-    /**
-     * Add two transfers to the USB queue after a completion that lost frames, up to 16 transfers
-     * (at most 64 ms and 255 packets in flight), and remove one after 30 s without loss. Applies only
-     * with the default [busQueueMs], [transfersInFlight] and [transferPeriodUs], and not with
-     * implicit feedback. Default `true`.
-     */
+    /** Adapt USB queue depth within the native bounds after measured worker stalls. */
     val adaptiveQueue: Boolean = true,
 
     /** Device-specific transport rules; source-backed rules require this explicit opt-in. */

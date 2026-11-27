@@ -33,15 +33,6 @@ cargo add usbdac-core@0.1.11
 
 Your app supplies the decoded audio. Optional PCM conversion helpers handle
 sample rate, bit depth and mono-to-stereo when your source format needs to change.
-The stream itself never converts: `StreamRequest` defaults to `RatePolicy::Exact`,
-and `RatePolicy::NearestSupported` returns a different rate for the host to
-resample to.
-
-`Dac::open` needs a Linux or Android usbfs file descriptor. On macOS,
-`Dac::open_darwin` opens a libusb attachment from `darwin_discovery`, as the
-Apple Silicon validator does; no macOS hardware result is recorded yet. Other
-hosts compile and run the logic tests, and opening a DAC there returns
-`Error::PlatformUnsupported`.
 Each physical attachment has one owner; distinct attachments can be owned independently.
 Direct USB PCM and native DSD have limited device-specific physical evidence. Test your target devices
 and formats before relying on it in production.
@@ -66,5 +57,5 @@ dropping their future.
 application boundary as real playback. It supports deterministic signed PCM, unsigned 8-bit and float32 queue
 progress, pause/drain/flush, injected loss, and unplug without hardware; it is
 not a protocol emulator or a bit-perfect hardware verification claim. See the
-[Rust SDK guide](https://johnneerdael.github.io/android-usbdac/guide-rust.html) for
+[Rust SDK guide](https://johnneerdael.github.io/android-usbdac/sdk/guide-rust/) for
 examples and platform/permission ownership.
