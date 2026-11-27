@@ -930,7 +930,7 @@ pub(super) fn run_usb_output_loop(
             }
             if let Some(engine) = implicit.as_mut() {
                 engine.running = true;
-                if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { fatal_error = Some(error); break; }
+                if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); break; }
                 let Some(pattern) = engine.take_pattern(&runtime_stats) else { implicit_feedback_fault = true; fatal_error = Some("implicit prime lost its complete pattern".into()); break; };
                 scheduler.set_packet_pattern(pattern);
             }
@@ -1025,8 +1025,7 @@ pub(super) fn run_usb_output_loop(
                     || capture_uses_implicit_feedforward {
                     let targets = flush_cancel_targets(flush_epoch, slots.iter().map(|slot| (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)));
                     for &index in &targets { slots[index].cancel_for_flush(); }
-                    if (feedback_slot.is_some() || capture_uses_implicit_feedforward)
-                        && !targets.is_empty() {
+                    if !targets.is_empty() {
                         out_flush_deadline.get_or_insert(started + FLUSH_CANCEL_TIMEOUT);
                     }
                     Ok(targets.len())
@@ -1590,19 +1589,21 @@ pub(super) fn run_usb_output_loop(
         attachment.finish(failure.clone());
     }
     if let Some(error) = fatal_error {
-        runtime_stats.feedback_locked.store(false, Ordering::Release);
+        let was_locked = runtime_stats.feedback_locked.swap(false, Ordering::AcqRel);
         if feedback_health.is_some() { publish_feedback_counters(&runtime_stats, &feedback_counters); }
-        if explicit_feedback_fault && !device_lost {
-            runtime_stats.feedback_stale.store(true, Ordering::Release);
+        if (explicit_feedback_fault || implicit_feedback_fault) && !device_lost {
+            let was_stale = runtime_stats.feedback_stale.swap(true, Ordering::AcqRel);
+            if was_locked || !was_stale {
+                if let Some(trace) = &runtime_stats.feedback_trace {
+                    trace.record(crate::FeedbackTraceEvent::Lock { locked: false, stale: true });
+                }
+            }
             if !feedback_stale_warned { shared.events.emit_stream(crate::events::DacEvent::FeedbackStale); }
             shared.note_bit_perfect();
         }
         if implicit_feedback_fault && !device_lost {
             if programmed_vendor_rate { set_clock_verification(true, true, false, None); }
-            runtime_stats.feedback_locked.store(false, Ordering::Release);
-            runtime_stats.feedback_stale.store(true, Ordering::Release);
             runtime_stats.feedback_errors.fetch_add(1, Ordering::Relaxed);
-            shared.events.emit_stream(crate::events::DacEvent::FeedbackStale);
         }
         if let Some(trace) = &runtime_stats.feedback_trace {
             trace.fail(&error);

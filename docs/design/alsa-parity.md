@@ -4,6 +4,22 @@ Baseline `de8010bb427e3cc9184c2acc6cb084dcfc3ee719` (usbdac 0.1.1). Compare USB-
 
 ## Work and acceptance order
 
+Finish the shared USB Audio work before adding more device-specific
+compatibility. Use the following order for the remaining work.
+
+1. Verify shared explicit and implicit feedback, including startup,
+   packet capacity, delayed completions, flush, detach and diagnostics.
+2. Audit standard clock and routing controls, capture, duplex and
+   channel layout across UAC1, UAC2 and UAC3. Verify readback, alternate
+   changes and restoration on failures.
+3. Verify full UAC3 and BADD transport, including configuration and
+   power-domain hand-back. Resolve optional burst admission against
+   descriptor or hardware evidence.
+4. Check the shared native DSD and DoP wire paths and PCM hand-back.
+   Use the physical acceptance matrix for each supported class behavior.
+5. Resume model-specific formats, clock commands, routing and firmware
+   rules after the shared work is validated.
+
 | Area | usbdac 0.1.1 | Implementation target | Acceptance evidence |
 |---|---|---|---|
 | Native DSD | Native and DoP packetization exist. Discovery truncates UAC2 format bits to 16 and applies current byte/bit order quirks globally. | Exact built-in device and firmware rules, endpoint-local native layouts, raw Type I detection, and typed known-device mode transitions. Preserve independently usable PCM and DoP alternatives. | Compare format negotiation and emitted wire bytes across DSD word and URB boundaries. Verify matching and nonmatching revisions, hardware mode transitions and PCM restoration. |
@@ -279,6 +295,21 @@ contention separately from device packet loss. Detach classification
 works even when the buffer is unavailable. The contention regression
 holds the reader lock during completion and verifies deferred accounting
 and retirement. JNI and Kotlin expose the resulting contention counter.
+
+### Shared implicit feedback completion
+
+Measure feedback age from the newest valid USB callback timestamp.
+Process packet patterns in submission order and keep the freshness
+timestamp monotonic across reordered callbacks. Apply the existing
+asynchronous cancellation deadline to implicit-only flushes. A terminal
+feedback error clears the lock and records the stale transition in the
+support trace.
+
+Rust tests, the Android arm64 NDK check, Kotlin unit tests, and the
+four-ABI AAR and sample builds passed. The AAR SHA-256 is
+`604219168244a82a1b8464e84c03bf853b67b102eb2e671bd736988ccc131f8e`.
+Live validation of delayed implicit callbacks and flush still requires
+an implicit-feedback device.
 
 ### SuperSpeed capacity evidence
 

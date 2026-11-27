@@ -54,6 +54,13 @@ fn rate_window_valid(frames: u64, service_us: u64, rate: u32) -> bool {
     (frames as f64 - expected).abs() <= expected * 0.02 + 1.0
 }
 
+fn record_valid_completion(last_valid: &mut Instant, completed_at: Instant, started_at: Instant) -> u64 {
+    // Submission order can differ from callback order. Preserve the newest
+    // observed completion without making delayed callbacks fresh at pump time.
+    *last_valid = (*last_valid).max(completed_at);
+    last_valid.saturating_duration_since(started_at).as_millis() as u64
+}
+
 /// Count USB service intervals, never callback elapsed time, for a contiguous
 /// whole-frame vendor clock proof. Callers reset on every empty/failed pattern.
 pub(super) struct VendorRateWindow {
@@ -185,11 +192,11 @@ impl ImplicitFeedback {
             self.slots[index].mark_completed();
             match result {
                 Ok(true) => {
-                    self.last_valid = Instant::now();
+                    let last_report_ms = record_valid_completion(&mut self.last_valid, completed_at, stats.started_at);
                     let frames = self.scratch.iter().sum::<usize>() / self.out_stride;
                     stats.feedback_reports.fetch_add(1, Ordering::Relaxed);
                     stats.implicit_measured_frames.fetch_add(frames as u64, Ordering::Relaxed);
-                    stats.feedback_last_report_ms.store(stats.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    stats.feedback_last_report_ms.store(last_report_ms, Ordering::Relaxed);
                     if let Some(proof) = self.startup_rate_proof.as_mut().filter(|_| !self.startup_rate_proved) {
                         let service_us = self.scratch.len() as u64 * u64::from(self.source.service_interval_us);
                         let verdict = proof.observe(frames as u64, service_us);
@@ -272,6 +279,19 @@ impl ImplicitFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn delayed_callbacks_preserve_observed_freshness_and_monotonicity() {
+        let started_at = Instant::now();
+        let mut last_valid = started_at;
+        let completed_at = started_at + Duration::from_millis(25);
+        let pumped_at = started_at + Duration::from_millis(250);
+        assert_eq!(record_valid_completion(&mut last_valid, completed_at, started_at), 25);
+        assert_eq!(pumped_at.duration_since(last_valid), Duration::from_millis(225));
+        assert_eq!(record_valid_completion(&mut last_valid, started_at + Duration::from_millis(10), started_at), 25);
+        assert_eq!(last_valid, completed_at);
+        assert_eq!(record_valid_completion(&mut last_valid, started_at + Duration::from_millis(40), started_at), 40);
+        assert_eq!(record_valid_completion(&mut last_valid, completed_at, pumped_at), 0);
+        assert_eq!(last_valid, started_at + Duration::from_millis(40));
+    }
     #[test] fn vendor_rate_proof_requires_contiguous_service_time() {
         let mut window = VendorRateWindow::new(96_000);
         assert_eq!(window.observe(9_504, 99_000), None);
