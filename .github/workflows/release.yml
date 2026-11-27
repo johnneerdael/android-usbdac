@@ -12,6 +12,10 @@ on:
         description: Version to build and publish, such as 0.1.0
         required: true
         type: string
+      failed_run_id:
+        description: Retry packaging from a verified failed automatic release run
+        required: false
+        type: string
       skip_package:
         description: Skip both Android Maven uploads if GitHub Packages already has this version
         required: false
@@ -38,9 +42,11 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      actions: read
     outputs:
       version: ${{ steps.source.outputs.version }}
       commit: ${{ steps.source.outputs.commit }}
+      recovered: ${{ steps.source.outputs.recovered }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,8 +57,13 @@ jobs:
         id: source
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+          FAILED_RUN_ID: ${{ inputs.failed_run_id }}
+          SKIP_PACKAGE: ${{ inputs.skip_package }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          if [ -n "$FAILED_RUN_ID" ]; then
+            python3 .github/scripts/recover_release.py --failed-run-id "$FAILED_RUN_ID" --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = push ]; then
             python3 .github/scripts/prepare_release.py --run-id "$GITHUB_RUN_ID" --source "$GITHUB_SHA" --output "$GITHUB_OUTPUT"
           else
             python3 .github/scripts/prepare_release.py --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
@@ -60,7 +71,7 @@ jobs:
 
   release-gates:
     needs: prepare
-    if: needs.prepare.outputs.version != ''
+    if: needs.prepare.outputs.version != '' && needs.prepare.outputs.recovered != 'true'
     uses: ./.github/workflows/ci.yml
     with:
       source_sha: ${{ needs.prepare.outputs.commit }}
@@ -70,7 +81,7 @@ jobs:
   package:
     name: Build, test and publish the package
     needs: [prepare, release-gates]
-    if: needs.prepare.outputs.version != ''
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.version != '' && (needs.release-gates.result == 'success' || (needs.prepare.outputs.recovered == 'true' && needs.release-gates.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -286,6 +297,7 @@ jobs:
   release:
     name: Create the GitHub Release
     needs: [prepare, package]
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.package.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
