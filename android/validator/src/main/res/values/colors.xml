@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Window colors before Compose draws, so launch never flashes the wrong canvas. -->
+    <color name="usbdac_canvas">#F2F5FA</color>
+</resources>

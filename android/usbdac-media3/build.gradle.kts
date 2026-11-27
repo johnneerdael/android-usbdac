@@ -108,3 +108,13 @@ publishing {
         }
     }
 }
+
+dokka {
+    // The usbdac brand on the API reference: logo, fonts and colours (docs/site/dokka).
+    pluginsConfiguration.html {
+        val site = rootProject.projectDir.resolve("../docs/site/dokka")
+        customStyleSheets.from(site.resolve("usbdac-dokka.css"))
+        customAssets.from(site.resolve("logo-icon.svg"), rootProject.projectDir.resolve("../branding/fonts/Manrope.woff"))
+        footerMessage.set("usbdac · Direct USB audio. Clear evidence. · MIT licensed")
+    }
+}

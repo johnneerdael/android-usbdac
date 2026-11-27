@@ -1,0 +1,20 @@
+/* usbdac brand on Dokka's HTML output (Duplex 1.0; branding/tokens/usbdac.css).
+   Dokka copies custom assets to images/, so the font is served from there. */
+@font-face { font-family: Manrope; src: url(../images/Manrope.woff) format("woff"); font-weight: 200 800; font-display: swap; }
+:root {
+  --default-font-family: Manrope, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --color-key-blue: #2367C9;
+  --color-key-blue-hover: #1358B7;
+  --color-key-blue-50: rgba(35, 103, 201, .5);
+  --dokka-logo-height: 30px;
+  --dokka-logo-width: 30px;
+}
+:root.theme-dark {
+  --color-key-blue: #78B5FF;
+  --color-key-blue-hover: #A3CDFF;
+  --color-key-blue-50: rgba(120, 181, 255, .5);
+}
+body, .navigation, .sidebar, .main-content { font-family: var(--default-font-family); }
+.navigation { background-color: #11151C; border-bottom: 1px solid #2B3646; }
+.library-name--link, .library-name--link:hover { color: #F3F5F7; font-weight: 750; letter-spacing: -.02em; }
+.theme-dark, .theme-dark body { --background-color: #11151C; }

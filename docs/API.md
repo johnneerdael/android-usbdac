@@ -8,7 +8,7 @@ The [release validation scope](sdk/evidence.md#release-validation-scope) disting
 software coverage, QEMU enumeration and physical streaming evidence.
 
 Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core) to use
-the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.13`,
+the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.14`,
 then follow the lifecycle below to open the device and stream decoded audio.
 The [Rust API reference](https://docs.rs/usbdac-core)
 covers individual types and methods.
@@ -580,7 +580,7 @@ the endpoint. It uses the newest valid report in each batch. Empty or rejected
 reports do not extend the feedback deadline. A stale explicit source clears
 live lock and emits `FeedbackStale`. Playback can hold the last valid rate
 until a timely report restores lock or the stream fails with `Error::Transfer`.
-[Timing thresholds](https://johnneerdael.github.io/android-usbdac/decisions-clock.html#feedback)
+[Timing thresholds](https://johnneerdael.github.io/usbdac/decisions-clock.html#feedback)
 
 For four-byte high-speed reports, the driver first tests the USB microframe
 interpretation. If it is outside the nominal-rate tolerance and post-alt
