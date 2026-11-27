@@ -173,7 +173,7 @@ and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
 
 ## Minimal Rust example
 
-Add the core crate with `cargo add usbdac-core@0.1.4`. The example logs
+Add the core crate with `cargo add usbdac-core@0.1.5`. The example logs
 through the `log` crate.
 
 ```rust

@@ -39,7 +39,7 @@ For support captures, use the [USB playback report guide](support-diagnostics.md
 
 ## Status
 
-This guide covers usbdac 0.1.4.
+This guide covers usbdac 0.1.5.
 
 - **Software coverage is recorded by revision.** Rust and Kotlin tests cover protocol and control behavior without a DAC; Android checks and builds cover the library and sample for four processor types. See the [release validation scope](evidence.md#release-validation-scope) for the limits of those checks and QEMU enumeration.
 - **Hardware testing is still limited.** The parity build passed native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit direct USB PCM on the OnePlus 15 and AP80 Pro-X using universal feedback calibration. The iBasso DC04U also played PCM in Flick. Broader device coverage, DoP, implicit feedback, Android-managed output and AAudio still need hardware validation. [Hardware status](evidence.md#hardware-status)
