@@ -11,11 +11,14 @@ opened and what it could verify.
 - Add `usbdac-core` with Cargo for Rust apps on Android or Linux that manage
   USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
 
-**New in 0.1.1.** Direct USB can follow supported UAC2 implicit feedback
-routes. Explicit feedback now ignores invalid reports within a poll batch,
-checks packet capacity, and reports loss of lock before a persistent outage
-ends playback. See [what changed](improvements.md#usb-playback-follows-the-dacs-clock)
-and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-the-pacing).
+The shared USB Audio implementation now includes UAC3 and BADD, PCM capture
+and duplex, channel layouts, verified clock selection and restoration,
+standard routing controls and guarded device-specific controls. Native DSD
+uses standard UAC3 packing or a resolved legacy layout; DoP capability reports
+a feasible PCM carrier. See the [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md),
+[release validation scope](evidence.md#release-validation-scope) and
+[device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
+For support captures, use the [USB playback report guide](support-diagnostics.md).
 
 ## Where to start
 
@@ -26,6 +29,7 @@ and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-t
 | See what is proven and what is not | [Evidence and status](evidence.md) |
 | Learn how the code is organised | [Architecture](architecture.md), and [USB audio in a page](usb-audio-primer.md) if the terms are new |
 | Find a setting or an error code | [Controls and configuration](controls.md), [troubleshooting](troubleshooting.md) |
+| Add an in-app report flow for USB playback problems | [Collect a USB playback support report](support-diagnostics.md) |
 
 ## Playback routes
 
@@ -35,9 +39,9 @@ and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-t
 
 ## Status
 
-This guide covers usbdac 0.1.1.
+This guide covers usbdac 0.1.3.
 
-- **Automated checks pass.** Rust and Kotlin tests cover the feedback changes without a DAC. CI builds the library and sample app for four processor types. [Evidence and status](evidence.md) records hardware coverage.
+- **Software coverage is recorded by revision.** Rust and Kotlin tests cover protocol and control behavior without a DAC; Android checks and builds cover the library and sample for four processor types. See the [release validation scope](evidence.md#release-validation-scope) for the limits of those checks and QEMU enumeration.
 - **Hardware testing is still limited.** The parity build passed native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit direct USB PCM on the OnePlus 15 and AP80 Pro-X using universal feedback calibration. The iBasso DC04U also played PCM in Flick. Broader device coverage, DoP, implicit feedback, Android-managed output and AAudio still need hardware validation. [Hardware status](evidence.md#hardware-status)
 
 ## Which transport to use
@@ -61,7 +65,7 @@ Most apps do not need to choose. `OutputSelector` looks at the attached DAC, the
 | Type | What it is for |
 |---|---|
 | `UsbDac` | Finds attached DACs, asks for USB permission, watches hot-plugging, opens a `DacSession` |
-| `DacSession` | An open DAC: capabilities, negotiation, `DacStream`, `DacVolume`, state and events |
+| `DacSession` | An open DAC: capabilities, playback and duplex negotiation, capture, routing controls, `DacVolume`, state and events |
 | `DacStream` | The direct output: `write`, `play`, `pause`, `flush`, `drain`, position, latency, statistics, bit-perfect state |
 | `DacVolume` | The hardware volume: level in dB or on a 0..1 curve, steps, mute, hand-back |
 | `OutputSelector`, `OutputPolicy`, `OutputDecision`, `SelectedOutput` | Automatic output: looks at the device, chooses one of the outputs below, and returns it ready with the reason, the guarantee and the alternatives it rejected. `changes` says when to look again |
@@ -77,7 +81,7 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 ## Requirements
 
 - Android 8.0 (API 26) or later. The library is built with Kotlin 2.4 at language level 2.2, and its only dependency is `kotlinx-coroutines-core`.
-- Direct USB needs USB host support on the device and a DAC that implements the USB Audio Class 1.0 or 2.0 (not 3.0). Playback only.
+- Direct USB needs USB host support on the device and a compatible USB Audio Class 1.0, 2.0 or 3.0 device. Capture and duplex use explicit input APIs and claims; `OutputSelector` selects PCM playback outputs.
 - `libusbdac.so` is built for arm64-v8a, armeabi-v7a, x86_64 and x86 (about 1.9 MB uncompressed for arm64-v8a). The arm64-v8a build links only against the system's `liblog`, `libdl`, `libm` and `libc` (AAudio is opened at run time with `dlopen`, so there is no link-time dependency on `libaaudio`), and its segments are aligned for 16 KB pages.
 - One open `DacSession` per process in this version.
 
@@ -96,9 +100,10 @@ The pages come in six groups, in the navigation order.
 1. [The integration guide](integration.md): what you take on, the ways to integrate, the order of the work.
 2. [The player engine](integration-player.md): what to hand over, the writer, seek, position, processing, DSD.
 3. [App, service and settings](integration-app.md): permission, lifecycle, settings, volume, the status display, failures, testing, release.
-4. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
-5. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
-6. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
+4. [Collect a USB playback support report](support-diagnostics.md) covers the listener flow and Kotlin and Rust export APIs.
+5. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
+6. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, and when to look again.
+7. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
 
 **Use.** [Controls and configuration](controls.md) (every option and control, with its default, its effect and its effect on bit-perfect output), [bit-perfect output](bit-perfect.md) (what the flag means, when it turns false, DSD, MQA), [transports](transports.md) (direct USB, the Android-managed output and exclusive AAudio, side by side) and [troubleshooting](troubleshooting.md) (error codes and a checklist for "nothing plays").
 

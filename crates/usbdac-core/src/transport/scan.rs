@@ -763,6 +763,7 @@ pub(super) fn build_usb_capability_model(
     let mut standard_grid_cache = std::collections::HashMap::<
         (u8, Option<u8>), Option<(ClockChoice, Vec<SamplingFrequencySubrange>)>,
     >::new();
+    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
     let mut effective_speed = speed;
 
     for interface in config_descriptor.interfaces() {
@@ -777,6 +778,9 @@ pub(super) fn build_usb_capability_model(
             else {
                 continue;
             };
+            let ap80_dsd = matches_ap80_raw_dsd(
+                usb_id, config_descriptor.number(), &descriptor, &stream_format,
+            );
             stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             let standard_grid = descriptor.protocol_code() == 0x20
@@ -810,6 +814,11 @@ pub(super) fn build_usb_capability_model(
                     )
                 })
                 .clone() };
+            let sample_rate_ranges = if ap80_dsd {
+                ap80_native_dsd_clock_rates(&sample_rate_ranges)
+            } else {
+                sample_rate_ranges
+            };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
             let speed = if speed == Speed::Unknown {
@@ -1156,6 +1165,7 @@ pub(super) fn select_stream_candidates(
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
+    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
     for interface in config_descriptor.interfaces() {
@@ -1170,6 +1180,9 @@ pub(super) fn select_stream_candidates(
                 Some(format) => format,
                 None => continue,
             };
+            let ap80_dsd = matches_ap80_raw_dsd(
+                usb_id, config_descriptor.number(), &descriptor, &stream_format,
+            );
             stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             apply_playback_designs_dop(&mut stream_format, playback_format, playback_designs_dop);
@@ -1200,6 +1213,11 @@ pub(super) fn select_stream_candidates(
                     )
                 })
                 .clone();
+            let sample_rate_ranges = if ap80_dsd {
+                ap80_native_dsd_clock_rates(&sample_rate_ranges)
+            } else {
+                sample_rate_ranges
+            };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
             let Some(effective_sample_rate) = native_wire_rate(playback_format, stream_format.subslot_size) else { continue; };
@@ -2006,6 +2024,58 @@ pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
     }
 }
 
+const UAC2_RAW_DATA: u32 = 1 << 31;
+
+fn ap80_native_dsd_clock_rates(ranges: &[SamplingFrequencySubrange]) -> Vec<SamplingFrequencySubrange> {
+    // DSD64, DSD128 and DSD256 in 32-bit words. The shared clock also
+    // lists PCM rates, which are not native DSD modes on this player.
+    [88_200, 176_400, 352_800]
+        .into_iter()
+        .filter(|rate| ranges.is_empty() || sampling_frequency_ranges_support_rate(ranges, *rate))
+        .map(|rate| SamplingFrequencySubrange { min: rate, max: rate, res: 0 })
+        .collect()
+}
+
+fn is_ap80_raw_dsd(
+    usb_id: Option<(u16, u16)>,
+    route: (u8, u8, u8),
+    format: &StreamingInterfaceFormat,
+) -> bool {
+    usb_id == Some((0xc502, 0x0072))
+        && route == (1, 1, 4)
+        && format.uac2_formats == Some(UAC2_RAW_DATA)
+        && format.channels == 2
+        && format.subslot_size == 4
+        && format.bit_resolution == 32
+}
+
+// This is the AP80 Pro-X layout confirmed by the ALSA parity run.
+// Limit the measured clock subset to the proven device, route and OUT geometry.
+// Native eligibility, word width and byte order remain profile-resolver policy.
+fn matches_ap80_raw_dsd(
+    usb_id: Option<(u16, u16)>,
+    configuration: u8,
+    descriptor: &rusb::InterfaceDescriptor,
+    format: &StreamingInterfaceFormat,
+) -> bool {
+    if !is_ap80_raw_dsd(
+        usb_id,
+        (configuration, descriptor.interface_number(), descriptor.setting_number()),
+        format,
+    ) {
+        return false;
+    }
+    let mut outputs = descriptor.endpoint_descriptors()
+        .filter(|endpoint| endpoint.direction() == Direction::Out);
+    let proven_out = outputs.next().is_some_and(|endpoint|
+        endpoint.address() == 0x01
+            && endpoint.transfer_type() == TransferType::Isochronous
+            && endpoint.usage_type() == UsageType::Data
+            && endpoint.interval() == 2
+            && endpoint.max_packet_size() == 1024);
+    proven_out && outputs.next().is_none()
+}
+
 pub(super) fn parse_android_streaming_interface_format(
     descriptor: &rusb::InterfaceDescriptor,
 ) -> Option<StreamingInterfaceFormat> {
@@ -2171,11 +2241,13 @@ pub(super) fn validate_transport_against_playback_format(
     playback_format: PlaybackFormat,
 ) -> Result<(), String> {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
+    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM };
     if if is_native_dsd { candidate.native_dsd.is_none() }
         else { candidate.format_tag != FORMAT_TAG_PCM } {
         return Err(format!(
-            "USB direct requires PCM transport, got {}",
-            format_tag_label(candidate.format_tag)
+            "USB direct requires {} transport, got {}",
+            format_tag_label(required_format),
+            format_tag_label(candidate.format_tag),
         ));
     }
     if candidate.channels != playback_format.channels {
@@ -2662,4 +2734,34 @@ mod standard_capacity_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod ap80_raw_data_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_uac2_raw_data_without_reclassifying_other_devices_or_pcm() {
+        let mut extra = [16, 0x24, 1, 2, 0, 1, 0, 0, 0, 0x80, 2, 3, 0, 0, 0, 0,
+                         6, 0x24, 2, 1, 4, 32];
+        let raw = parse_streaming_extra(0x20, &extra).unwrap();
+        assert_eq!(raw.uac2_formats, Some(0x8000_0000));
+        assert_eq!(alt_format(raw.format_tag), AltFormat::Other);
+        assert!(is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &raw));
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0073)), (1, 1, 4), &raw));
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 3), &raw));
+        extra[6] = 1;
+        extra[9] = 0;
+        let pcm = parse_streaming_extra(0x20, &extra).unwrap();
+        assert_eq!(alt_format(pcm.format_tag), AltFormat::Pcm);
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &pcm));
+    }
+
+    #[test]
+    fn ap80_advertises_verified_native_modes_from_the_shared_clock() {
+        let clock = [44_100, 88_200, 176_400, 352_800, 384_000].map(|rate|
+            SamplingFrequencySubrange { min: rate, max: rate, res: 0 });
+        let rates = ap80_native_dsd_clock_rates(&clock);
+        assert_eq!(rates.iter().map(|r| r.min).collect::<Vec<_>>(), [88_200, 176_400, 352_800]);
+    }
 }

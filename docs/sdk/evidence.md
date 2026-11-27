@@ -16,7 +16,7 @@ with main integrated passed native DSD64, DSD128 and DSD256 followed by
 | 16 packets x 8 transfers (the default at 125 us) | The geometry sweep and benchmark runs played cleanly at 44.1 kHz, judged from the app log. The listening checks (cold start, five minutes without a dropout, 48 and 96 kHz, pause, seek, unplug and replug, 192 to 384 kHz at up to 32-bit) were made on the earlier 8 x 16 build and "have not been repeated" on 16 x 8 | Flick PR #400 |
 | Loss tolerance and exact loss accounting | Fault injection on the OnePlus 15 and DC04U with a test-only build, on 8 x 16. Not repeated on 16 x 8. What loss sounds like was not judged | Flick PR #406 |
 | Full-speed (1 ms interval) DACs | Not tested | Flick PR #400 |
-| Native DSD | DSD64, DSD128 and DSD256 reported bit-perfect transport on OnePlus 15 / AP80 Pro-X using universal feedback calibration | [AP80 Pro-X parity evidence](../design/alsa-parity.md#universal-detection-on-the-parity-build) |
+| Native DSD | DSD64, DSD128 and DSD256 reported bit-perfect transport on OnePlus 15 / AP80 Pro-X using universal feedback calibration, followed by PCM | [AP80 native DSD transition](#ap80-native-dsd-transition) |
 | DoP | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
 | Clock selectors and multipliers, range check | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
 | Explicit feedback | Universal detection verified with direct PCM and native DSD on the AP80 Pro-X. Host tests cover report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
@@ -56,7 +56,58 @@ integrated. DSD64 learned the timebase, DSD128 and DSD256 reused it after
 fresh validation, and each PCM alternate learned its own timing. All six
 modes reported bit-perfect USB transport with zero underruns and lost
 frames. The final trace remained available after session close.
-[Parity AAR acceptance](../design/alsa-parity.md#universal-detection-on-the-parity-build)
+[Parity AAR acceptance](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#universal-detection-on-the-parity-build)
+
+### AP80 Pro-X native DSD transition {#ap80-native-dsd-transition}
+
+The AP80 Pro-X advertises UAC2 Type I RAW_DATA on configuration 1, interface
+1, alternate setting 4. Its documented native layout uses four-byte,
+big-endian words, with no bit reversal. The driver preserves the full USB
+format bitmap and recognizes this layout for the measured device and
+endpoint. Native requests require a DSD alternate. [Hidizs specifications](https://www.hidizs.net/pages/ap80pro-x-specifications)
+
+The SDK ran these legs in order on the OnePlus 15 in one DAC session. Each
+leg verified its clock and feedback, reached the driver's bit-perfect
+verdict, and finished with zero lost frames and underruns.
+
+| Mode | Alternate setting | Wire rate | Feedback units |
+|---|---|---|---|
+| DSD64 | 4 | 88,200 Hz | Inferred from live feedback |
+| DSD128 | 4 | 176,400 Hz | Reused and validated |
+| DSD256 | 4 | 352,800 Hz | Reused and validated |
+| 16-bit PCM | 2 | 44,100 Hz | Inferred for the PCM alternate |
+
+The later parity AAR acceptance also covered 24- and 32-bit PCM. The linked
+[parity ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#universal-detection-on-the-parity-build)
+records that sequence separately.
+
+The probe used balanced DSD data and low-level PCM. This validates USB
+delivery, clock changes and the transition on this device.
+
+## Release validation scope {#release-validation-scope}
+
+The parity additions cover UAC3 and BADD, capture and duplex, channel
+layouts, clock selection and restoration, standard routing, guarded
+vendor controls, and native DSD and DoP capability handling. The
+[implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md) records software checks
+and their artifacts by implementation batch. These include Rust protocol,
+control and packet tests, Kotlin tests, Android target checks and four-ABI
+AAR and sample builds. Those earlier results apply to their recorded
+revisions; the merged release must pass its required build and test gates.
+
+QEMU 10.1.3 exposed its virtual USB Audio Interface to an Alpine arm64
+Linux guest on an emulated xHCI bus. The guest enumerated the full-speed
+UAC1 device and read its 48 kHz stereo 16-bit PCM OUT descriptors. Its
+image lacked the ALSA USB audio module, so this establishes enumeration
+only. It does not establish isochronous streaming or Android USB ownership.
+
+This release preparation adds no physical streaming hardware checks.
+The OnePlus 15 / AP80 Pro-X and Flick results above remain historical
+hardware evidence. New UAC3/BADD streaming, capture and duplex, routing
+controls, vendor mode changes and broader device compatibility still need
+physical acceptance. Use the
+[device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md)
+to choose that follow-up work.
 
 ## The geometry sweep {#the-geometry-sweep}
 

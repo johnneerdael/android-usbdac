@@ -115,6 +115,9 @@ fun indicatorText(state: BitPerfectState, engineUntouched: Boolean): String = wh
 
 ## Failures and fallback {#failures-and-fallback}
 
+Offer an in-app capture so listeners can report the first failing attempt,
+including what happened before fallback. [Collect a USB playback support report](support-diagnostics.md)
+
 Every failure is a `DacException` with a typed `code`; [troubleshooting](troubleshooting.md#error-codes) has the full table. What matters for an integration is what the app does about each kind. A rule for each, as a starting point:
 
 | Failure | When | What the app does |

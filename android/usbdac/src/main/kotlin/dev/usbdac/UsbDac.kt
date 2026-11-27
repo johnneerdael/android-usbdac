@@ -201,7 +201,7 @@ public object UsbDac {
      * applies microphone privacy and device permission policy. Declare/request RECORD_AUDIO when
      * the app's other microphone APIs or its platform policy require it; this raw USB path adds no
      * blanket microphone permission gate and requests no permissions automatically.
-     * Pass an advertised [configurationId] to select it explicitly before claims; null keeps
+     * Pass an advertised `configurationId` to select it explicitly before claims; null keeps
      * the active configuration. Selection and restoration require GET_CONFIGURATION readback.
      * Native descriptor preflight claims only supported PCM IN interfaces and their owning
      * AudioControl interfaces in the active configuration. Call off the main thread.
@@ -295,7 +295,7 @@ public object UsbDac {
     }
 
     /**
-     * Opens [device] for direct output. An explicit [configurationId] selects only that
+     * Opens [device] for direct output. An explicit `configurationId` selects only that
      * advertised configuration and restores the original after native retirement on close.
      * Null preserves the active configuration and existing claim behavior.
      *

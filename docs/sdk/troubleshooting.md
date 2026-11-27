@@ -56,26 +56,11 @@ reacquires timing. See [all feedback counters](controls.md#diagnostics-the-clock
 
 ### Collect a feedback support report
 
-This setting is available in development builds with the feedback trace API.
-
-Offer a support toggle that opens a new USB session with
-`DacConfig(captureFeedbackTrace = true)`. If you use `OutputSelector`, pass
-that configuration through `OutputPolicy.dacConfig`. Ask the listener to
-reproduce once and export `DacSession.feedbackTraceJson()`. The report stays
-available after the stream fails or closes. A closed session object retains
-its final report.
+For an in-app capture toggle, a listener flow and export examples in Kotlin
+and Rust, see [collect a USB playback support report](support-diagnostics.md).
 The sample app has **Capture USB feedback for support** and **Copy feedback
-report** controls. It keeps the most recent captured report available after
-Stop or USB disconnect.
-
-The export includes the selected format and clock route, USB IDs and claims,
-endpoint geometry, submission errors, libusb transfer and packet statuses,
-and timestamped packet lengths. Explicit reports include up to eight raw
-bytes per observation, the decoded rate, the selected timebase and any rejection reason. Implicit
-feedback records packet metadata only. The capture retains the beginning
-and the most recent observations, and counts discarded entries. It stays
-in memory until the app exports it. Explicit feedback failures also carry a
-short summary. Include the Android version and DAC firmware when sending a report.
+report** controls. It keeps the latest report available after Stop or
+disconnect.
 
 ## Wrong pitch, or no sound at one sample rate
 

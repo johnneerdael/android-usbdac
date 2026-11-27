@@ -5,11 +5,14 @@ DoP or native DSD to the DAC through USB, bypassing Android's mixer on the
 direct path. Your app can control the DAC's hardware volume and show whether
 the stream is bit-perfect, with the reason when verification fails.
 
-**USB feedback in 0.1.1.** Direct USB supports implicit feedback on compatible
-UAC2 devices and handles intermittent explicit feedback with a bounded recovery
-window. Read [how USB pacing works](docs/sdk/decisions-clock.md#feedback) or check
-your stream's [pacing and feedback lock](docs/sdk/controls.md#diagnostics-the-clock-and-the-pacing).
-For support sessions, see [collecting a USB feedback report](docs/sdk/troubleshooting.md#collect-a-feedback-support-report).
+The shared USB Audio implementation includes UAC3 and BADD, PCM capture and
+duplex, channel layouts, verified clock selection and restoration, standard
+routing controls and guarded device-specific controls. Native DSD uses a
+standard UAC3 layout or a resolved legacy profile. DoP capability describes
+a feasible PCM carrier; marker decoding still needs device evidence.
+Read the [implementation ledger](docs/design/alsa-parity.md) and
+[release validation scope](docs/sdk/evidence.md#release-validation-scope).
+For in-app support captures, see [collecting a USB playback support report](docs/sdk/support-diagnostics.md).
 
 | Integrating with | Start here |
 |---|---|
@@ -35,7 +38,7 @@ technically, and in plain terms. In short:
 
 | Area | What usbdac adds | In plain terms |
 |---|---|---|
-| Clock handling | Follows clock selectors and multipliers to the clock in use | No wrong pitch or silence on DACs with more than one clock |
+| Clock handling | Resolves selectors and multipliers, verifies rates, and restores owned changes | A compatible alternate clock can serve a rate the current clock cannot |
 | USB feedback | Uses the newest valid explicit rate report and supports compatible UAC2 implicit feedback | Playback can follow the device clock through a dedicated rate endpoint or a matching input stream |
 | Transfer queue | Always 16 ms on the bus, never 256 packets | Avoids a stall seen on real hardware; controls feel equally quick on every DAC |
 | Fault handling | Recovers from timed-out transfers and counts lost audio exactly | A brief USB hiccup no longer stops the music |
@@ -47,6 +50,8 @@ technically, and in plain terms. In short:
 | Power | Stream released after a long pause | Less battery used while paused |
 | Honesty | Bit-perfect flag with a named reason when false; chosen clock and pacing reported | An indicator that goes out when the sound is compromised, and says why |
 | Outputs | Direct USB, Android-managed, and AAudio exclusive behind one interface | One integration serves phones with dongles and players with built-in DACs |
+| Capture and duplex | Explicit PCM input APIs, shared endpoint ownership, channel layouts and separate loss/overrun reporting | Record input alone or alongside playback without stalling USB pacing |
+| Hardware routing | Session-bound standard controls and guarded exact-model vendor operations, with readback and rollback | Expose the controls the device can prove it supports |
 | Output choice | An `OutputSelector` that detects the DAC, permission, route and what the platform grants, and returns one ready output with the reason and the guarantee | The app asks for the best way to play and is told what it got and why |
 | Conversion | Optional resampling, bit-depth and mono-to-stereo, always labelled | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
 | Packaging | Rust core, Kotlin API, sample app, tests, published builds | A dependency and a few dozen lines instead of writing a USB driver |
@@ -55,9 +60,13 @@ Several of these came from studying how two other open-source players, Mornye
 and BitChord, behave with the same DACs. No code from either was used.
 
 **Status: 0.1.** Direct USB PCM has played on a OnePlus 15 with an iBasso DC04U
-in Flick and with a Hidizs AP80 Pro-X in a development build of the SDK sample.
+in Flick and with a Hidizs AP80 Pro-X in the SDK sample. The AP80 Pro-X also
+verified native DSD64 through DSD256 and the transition back to PCM.
 See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
-formats and paths.
+formats and paths. Release preparation uses software validation and QEMU
+USB enumeration; it adds no physical streaming checks. Broader hardware
+acceptance and additional models are tracked in
+[device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
 
 ## Layout
 
@@ -77,8 +86,9 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 ## What it does
 
 - Formats: PCM 16/24/32-bit in the subslot size the DAC advertises, DoP
-  (carrier up to what the DAC runs), native DSD (DSD_U8/U16/U32, byte order and
-  bit order per device).
+  (carrier up to what the DAC runs), native DSD (legacy 1-, 2- or 4-byte
+  profiles and standard 8-byte UAC3 words). Legacy byte and bit order are
+  resolved per alternate, device and applicable firmware.
 - Output: a ring buffer (250 ms target, 500 ms capacity by default) feeds eight
   isochronous transfers in flight, 16 ms queued on the bus at every service
   interval and for every encoding, never 256 packets. Explicit rate reports and
@@ -116,8 +126,24 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 - One open DAC per process in v0.1 (`Error::Busy` for a second one).
 - Linux/Android usbfs only. On other hosts everything compiles and the logic
   tests run, but `Dac::open` returns `Error::PlatformUnsupported`.
-- Playback only; UAC 1.0/2.0; no UAC 3.0.
+- UAC 1.0/2.0/3.0 playback and PCM capture, including BADD profiles.
+  Capture and duplex require explicit input APIs and USB claims.
+- Standard routing and supported vendor controls depend on the active
+  topology and verified device capabilities. Additional devices need
+  evidence-backed compatibility work.
 - The host owns USB permission, `claimInterface` and the file descriptor.
+
+## Releases
+
+Library changes merged to `main` start the Release workflow. It advances the
+patch version, builds and tests a versioned commit, publishes the Rust crate
+and Android AAR, and creates the GitHub Release with its downloads. A merge
+that declares a higher version can select the next minor or major release.
+Documentation-only changes deploy through the Docs workflow.
+
+Use **Actions → Release → Run workflow** to build an explicit version, or
+rerun the original Actions run to retry an automatic release from its
+reserved commit.
 
 ## Build
 
@@ -147,7 +173,7 @@ and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
 
 ## Minimal Rust example
 
-Add the core crate with `cargo add usbdac-core@0.1.1`. The example logs
+Add the core crate with `cargo add usbdac-core@0.1.3`. The example logs
 through the `log` crate.
 
 ```rust

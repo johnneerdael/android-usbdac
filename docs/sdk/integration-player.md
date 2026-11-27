@@ -118,6 +118,8 @@ With live processing, a shallower ring makes changes audible sooner. The Rust AP
 
 ## DSD sources {#dsd-sources}
 
+Native DSD64 through DSD256 and the transition to PCM were verified on the AP80 Pro-X. [Hardware evidence](evidence.md#ap80-native-dsd-transition)
+
 The DSD input and wire-layout rules are in [bit-perfect output](bit-perfect.md#dsd). For the engine: DSF stores bits least significant first and DFF most significant first, so bit-reverse DSF bytes before writing; DoP wants 16 DSD bits per sample in the slot layout with the marker byte left for the library to overwrite; native DSD wants one byte per channel in stream order; the position counters count bytes, so `counterRateHz` is the bit rate over 8; and no gain, no conversion and no equaliser can touch the stream. Use `capabilities.supportsDop` to identify a feasible PCM carrier, then establish that the device decodes DoP markers. `supportsNativeDsd` covers standard UAC3 DSD and supported legacy layouts. Standard UAC3 packing is fixed; retain per-DAC overrides for legacy native DSD, because a wrong legacy byte order sounds like noise and the library cannot detect it.
 
 ## Events the engine should react to

@@ -3,10 +3,12 @@
 This document describes the public Rust API of `usbdac-core`, the JNI contract
 of `libusbdac.so`, the JSON schemas and event codes that contract uses, the
 sample layouts, the threading rules and the conditions for bit-perfect output.
-Direct USB PCM has played through Flick on one phone and DAC combination.
+For tested PCM and native DSD formats, see [hardware status](sdk/evidence.md#hardware-status).
+The [release validation scope](sdk/evidence.md#release-validation-scope) distinguishes
+software coverage, QEMU enumeration and physical streaming evidence.
 
 Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core) to use
-the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.1`,
+the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.3`,
 then follow the lifecycle below to open the device and stream decoded audio.
 The [Rust API reference](https://docs.rs/usbdac-core)
 covers individual types and methods.
@@ -220,7 +222,9 @@ completed transfers for every geometry, and a stream is stopped after about
 6 ms of consecutive lossy transfers (never fewer than three), whatever their
 size. For an isochronous explicit endpoint, the polling batch targets a window
 of `min(16 ms, bus_queue_ms)`, rounded down to whole intervals and clamped to
-one to 32 packets. The log line
+one to 32 packets. When the window fits two batches, the driver splits it
+between two transfers so the endpoint can keep polling while the worker
+processes the previous completion. The log line
 `[USB] Isochronous queue:` states the resulting geometry.
 
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,
@@ -525,6 +529,9 @@ pacing modes. The `timebase` event and summary identify the selected units
 and whether the driver inferred them. The summary's `reused_timebase` field
 indicates reuse from the open DAC session. Before a captured stream opens, `dacFeedbackTrace` returns JSON
 `null`.
+
+For an in-app capture flow and Kotlin and Rust export examples, see
+[collect a USB playback support report](sdk/support-diagnostics.md).
 
 ### Descriptor parsing
 
@@ -1073,11 +1080,15 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
   other hosts the crate builds and its logic is unit-tested, but `Dac::open`
   returns `PlatformUnsupported`.
 - UAC 1.0, 2.0 and 3.0 playback include PCM and native DSD; standard
-  UAC3 DSD has a fixed 8-byte transport word. See the current capture API
-  for capture support; there is no mixer.
-- Not run on hardware as a standalone library. The transport is the code that
-  ran in Flick; the layers around it (handle API, push ring, events, JNI) have
-  only been exercised by host tests.
+  UAC3 DSD has a fixed 8-byte transport word. PCM capture and duplex use
+  explicit input APIs and claims. Standard routing and supported vendor
+  controls require verified topology and device capabilities. See the
+  [integration surface](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#reference-integration-surface).
+- Direct PCM and legacy native DSD have limited physical coverage on the
+  OnePlus 15 / AP80 Pro-X, with additional PCM evidence from Flick. New
+  parity paths remain subject to the documented physical acceptance cases;
+  software coverage and virtual enumeration do not establish streaming on
+  additional hardware. See [evidence and status](sdk/evidence.md).
 - The AAudio output (section 13) is not part of the Rust API of `usbdac-core`; it
   lives in the JNI crate, is Android only, and has never opened a stream on a
   device.

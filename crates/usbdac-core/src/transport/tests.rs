@@ -609,6 +609,36 @@ mod pcm_ring_hold_tests {
         assert!(!session.service_interval_feedback_routes.lock().contains(&other_alt));
     }
 
+    #[test]
+    fn native_dsd_cannot_negotiate_or_open_a_pcm_alternate() {
+        let mut candidate = pcm_candidate();
+        candidate.subslot_size = 4;
+        candidate.bit_resolution = 32;
+        let requested = PlaybackFormat {
+            sample_rate: 88_200,
+            bit_depth: 1,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::Native,
+            dsd_bit_rate: 2_822_400,
+        };
+        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), u32::MAX);
+        assert!(validate_transport_against_playback_format(&candidate, requested).is_err());
+        candidate.format_tag = FORMAT_TAG_DSD;
+        candidate.bit_resolution = 1;
+        // A format tag alone cannot authorize native wire packing.
+        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), u32::MAX);
+        assert!(validate_transport_against_playback_format(&candidate, requested).is_err());
+        candidate.native_dsd = Some(native_dsd::NativeDsdProfile {
+            word_bytes: 4,
+            big_endian: false,
+            bit_reverse: false,
+            origin: native_dsd::NativeDsdOrigin::HostPolicy,
+        });
+        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), 0);
+        assert!(validate_transport_against_playback_format(&candidate, requested).is_ok());
+    }
+
     fn prepare(
         ring: &Arc<Mutex<PcmRing>>,
         stats: &RuntimeStats,

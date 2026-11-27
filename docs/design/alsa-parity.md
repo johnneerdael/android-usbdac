@@ -34,6 +34,15 @@ for the affected release paths unless a suitable virtual device
 can exercise them end to end. [QEMU USB emulation](https://www.qemu.org/docs/master/system/devices/usb.html),
 [Linux `dummy_hcd` transfer handling](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/udc/dummy_hcd.c#L1854-L1869)
 
+The integration against main at `b516d75` retains continuous explicit
+isochronous feedback and the transient second-poll retry, along with
+the parity branch's exact packet validation and bounded feedback
+health. The merged Rust workspace, Android arm64 target check, Kotlin
+tests, release AAR and sample builds, and SDK site build and local
+link checks passed. The AAR and sample contain matching native
+libraries for all four ABIs. The local pre-release AAR SHA-256 is
+`d77919bb30b00ad1fa21b7fcf600ede1100d6c1b38aa3a4b32090539417ed2c2`.
+
 | Area | usbdac 0.1.1 | Implementation target | Acceptance evidence |
 |---|---|---|---|
 | Native DSD | Native and DoP packetization exist. Discovery truncates UAC2 format bits to 16 and applies current byte/bit order quirks globally. | Exact built-in device and firmware rules, endpoint-local native layouts, raw Type I detection, and typed known-device mode transitions. Preserve independently usable PCM and DoP alternatives. | Compare format negotiation and emitted wire bytes across DSD word and URB boundaries. Verify matching and nonmatching revisions, hardware mode transitions and PCM restoration. |

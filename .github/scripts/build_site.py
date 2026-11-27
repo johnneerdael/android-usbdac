@@ -43,6 +43,7 @@ SECTIONS = [
         ("integration", "Integration guide"),
         ("integration-player", "The player engine"),
         ("integration-app", "App, service and settings"),
+        ("support-diagnostics", "Collect a support report"),
         ("getting-started", "Getting started"),
         ("automatic-output", "Automatic output"),
         ("media3", "Media3 integration"),
