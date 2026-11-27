@@ -6,7 +6,7 @@ On Android, **Test connected DAC** can select an attachment that was already pre
 
 ## Driver and host responsibilities
 
-Use the existing Android USB host permission and claim path and the same Rust driver on macOS. The Darwin backend uses libusb for device discovery, interface ownership, control requests and isochronous transfers. The applications share the driver’s descriptor parsing, clock programming, negotiation, feedback, packet scheduling, payload audits and playback APIs. They request exact formats and collect the direct transport’s evidence without converting input or routing through the system mixer.
+Use the existing Android USB host permission and claim path and the same Rust driver on macOS. The Darwin backend uses libusb for device discovery, interface ownership, control requests and isochronous transfers. The applications share the driver’s descriptor parsing, clock programming, negotiation, feedback, packet scheduling, payload audits and playback APIs. They first request exact formats and collect the direct transport’s evidence. Where an exact request is refused, the shared suite can exercise a separately reported conversion to an admitted PCM target through the same direct USB driver. Neither path routes through the system mixer.
 
 When a compatible Shizuku service is connected, its optional grant action uses that manager's consent flow and checks whether the service has `MANAGE_USB`. It requests a temporary grant for the selected attachment and this validator. The app verifies the grant through Android's USB host API before claiming the audio interfaces.
 
@@ -26,6 +26,14 @@ Use discrete advertised values. For a continuous range, test eligible endpoints 
 The validator enables source-backed compatibility modes by default so it can exercise matching device-specific formats, including the iBasso DC04 Ultra's native DSD alternate. Clear that option to reproduce the library's verified-only policy. The report records the selected policy and separates mode admission, test execution, USB delivery and decoder observation.
 
 After testing the advertised formats, probe exact requests from a finite standard catalog across signed PCM, unsigned PCM, float PCM, native DSD and DoP. Use the advertised channel counts plus mono and stereo, and include standard points that fall inside advertised rate ranges in the playback matrix. Keep the admission results separate from USB playback verdicts. Record a typed unsupported response as an expected rejection and a clock or host error as inconclusive. If a previously unlisted request negotiates exactly, record the discrepancy and test the resolved format through the usual driver and signal path. Retain the probe plan when a run ends early.
+
+## Converted fallback acceptance
+
+Keep every exact playback and admission probe as its own result. After a typed `Unsupported` exact refusal, resolve a same-channel signed PCM target using the driver's production rate ranking and depth preference, then negotiate that target exactly and use its actual wire slot layout. A DoP request with an admitted carrier but no independent decoder confirmation may also have a separate PCM fallback, identified as `dop_decoder_unconfirmed`; the carrier result remains intact and decoder lock remains unobserved. Do not retry host, device-loss, clock, timeout or other inconclusive failures as format incompatibility.
+
+Use the production `ConversionPlan` and `Converter` for supported PCM conversion, and `DsdPcmConverter` for supported DSD inputs, including DSD64, DSD128 and DSD256 where its input and target rates are within its supported domain. Preserve channel count and submit the negotiated signed PCM wire layout, including significant depth and slot width. Report an unsupported converter input, such as U8 or an out-of-domain rate or channel arrangement, as `no_fallback`; do not label it a failed USB stream or invent a converter result. This direct-USB target selection uses the shared driver's ranking and does not claim parity with the complete Android system-route selector.
+
+Record each fallback separately from the exact request: trigger, original source request, selected policy, target request and negotiated rate, channels, depth, slot and layout, conversion plan, kind and options, input and output bytes and frames, clipping count, errors and stop or retirement outcome. Mark conversion's source fidelity separately from the target transport: resampling, quantization or DSD-to-PCM conversion does not preserve the original source bit-for-bit. A converted target can have verified USB delivery only when the normal clock, timing, payload and transfer criteria pass for that target; its result does not establish source bit-perfect delivery, DAC decoder lock or analog output. Record a typed unsupported source or converter domain separately from a failed target stream, and mark host, clock, device-loss or insufficient-evidence outcomes inconclusive rather than unsupported.
 
 ## Capture and verdicts
 
@@ -47,6 +55,7 @@ Finalize an archive before offering it for Save or Share. If flushing an optiona
 - Independently check generated samples for known signed, unsigned, float, padded and packed byte layouts, DoP payload order, and native DSD bit order and decoded frequency. Verify clock, payload and outcome fields map to the matching stream and format.
 - On each app, start with no DAC, cancel while waiting, and save a valid ZIP with the start, wait and terminal events. Test denial or loss when available and inspect the archived error and connection stage. Keep tests and live-runtime work in separate batches.
 - On each platform, start capture and attach a known DAC. Verify USB identity/configuration, exact PCM playback and drain, healthy transfer counts, result export, and release of the interface. Test an intentional unplug during a run and collect the partial ZIP.
+- Test a typed unsupported exact request and an eligible converted fallback, preserving both outcomes and checking the selected target, conversion evidence and USB verdict. Exercise an admitted DoP carrier with decoder unconfirmed and preserve its separate fallback result where the converter supports it. A fresh physical fallback run remains pending.
 - On hardware with confirmed support, repeat native DSD and DoP through the direct driver. Check the DAC’s indicated mode or an external capture against the run leg. When hardware supports one mode only, verify unsupported modes and failed claims remain individually diagnosable and the capture stays exportable.
 - Keep the app artifacts, representative reports and anonymized hardware evidence identifiable by build and platform. Label any hardware-dependent result that remains unverified.
 
@@ -56,7 +65,7 @@ Use the iBasso DC04 Ultra for the first Android USB-C run, including native DSD 
 
 ### Android hardware evidence
 
-The OnePlus CPH2747 captures on 27 November 2026 reported successful USB delivery and session close for these stereo paths. These captures exercised the playback matrix. Standard admission probes require a fresh run. The DoP results cover the carrier, with decoder lock unobserved.
+The OnePlus CPH2747 captures on 27 November 2026 reported successful USB delivery and session close for these stereo paths. These captures exercised the exact playback matrix on the stated Android USB transport and do not establish fallback behavior or other host routes. Standard admission probes and physical fallback validation require a fresh run. The DoP results cover the carrier, with decoder lock unobserved.
 
 | USB product | VID:PID and bcdDevice | PCM tested | Native DSD tested | DoP carriers tested |
 | --- | --- | --- | --- | --- |

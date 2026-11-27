@@ -174,7 +174,7 @@ private object Capture {
         val total = value.optInt("total").coerceAtLeast(0)
         val index = value.optInt("index").coerceAtLeast(0)
         val phase = value.optString("phase")
-        if (total == 0 || (phase != "running" && phase != "probing")) return null
+        if (total == 0 || (phase != "running" && phase != "probing" && phase != "fallback")) return null
         val leg = value.optString("leg")
         fun field(name: String): String? = Regex("(?:^|[,{]\\s*)" + name + ":\\s*([^,}]+)").find(leg)?.groupValues?.get(1)?.trim()
         val rate = field("sample_rate")?.toIntOrNull()?.takeIf { it > 0 }
@@ -184,7 +184,8 @@ private object Capture {
         val bits = field("bit_depth")
         val channels = field("channels")
         val details = listOfNotNull(encoding, (dsdRate ?: rate)?.let { "$it Hz" }, bits?.takeUnless { it == "0" }?.let { "$it-bit" }, channels?.let { "$it channels" }).joinToString(" · ")
-        return DisplayProgress(index.coerceAtMost(total), total, "${if (phase == "probing") "Checking admission" else "Testing"} ${index + 1} of $total\n$details")
+        val action = when (phase) { "probing" -> "Checking exact admission"; "fallback" -> "Testing converted fallback"; else -> "Testing exact format" }
+        return DisplayProgress(index.coerceAtMost(total), total, "$action ${index + 1} of $total\n$details")
     }
     fun initialize(context: Context) {
         if (::app.isInitialized) return
@@ -428,6 +429,7 @@ private object Capture {
         worker.execute {
             var session: DacSession? = null
             var outcome = "Validation failed"
+            var fallbackSummary = ""
             try {
                 val manager = app.getSystemService(Context.USB_SERVICE) as UsbManager
                 val connection = manager.openDevice(info.device) ?: error("Cannot open USB device for descriptors")
@@ -459,11 +461,32 @@ private object Capture {
                 val legs = result.optJSONArray("legs")
                 val passed = (0 until (legs?.length() ?: 0)).count { legs?.optJSONObject(it)?.optString("status") == "passed_usb" }
                 val count = legs?.length() ?: 0
-                outcome = when (result.optString("status")) { "passed_usb" -> "USB validation passed ($passed of $count cases)"; "cancelled" -> "Cancelled"; "device_lost" -> "Selected DAC lost during validation"; "no_cases" -> "No test cases available"; "failed" -> "Validation failed: ${result.optString("error", "unknown error")}"; else -> "Validation completed with findings ($passed of $count cases passed); see archive" }
+                outcome = if (result.optString("termination_reason") == "retirement_failed") "USB retirement failed during validation. Inspect diagnostics." else when (result.optString("status")) { "passed_usb" -> "USB validation passed ($passed of $count cases)"; "cancelled" -> "Cancelled"; "device_lost" -> "Selected DAC lost during validation"; "no_cases" -> "No admitted exact playback cases. Inspect fallback results in the archive."; "failed" -> "Validation failed: ${result.optString("error", "unknown error")}"; else -> "Validation completed with findings ($passed of $count cases passed); see archive" }
                 result.optJSONArray("admission_results")?.let { probes ->
                     val unexpected = (0 until probes.length()).count { probes.optJSONObject(it)?.optString("admission") == "unexpected_admitted" }
                     val inconclusive = (0 until probes.length()).count { probes.optJSONObject(it)?.optString("admission") == "inconclusive" }
                     outcome += "\nAdmission checks: ${probes.length()} attempted, $unexpected unexpectedly admitted, $inconclusive inconclusive."
+                }
+                result.optJSONArray("fallback_results")?.let { fallbacks ->
+                    if (fallbacks.length() > 0) {
+                        fun count(status: String) = (0 until fallbacks.length()).count { fallbacks.optJSONObject(it)?.optString("status") == status }
+                        val stopped = count("device_lost") + count("cancelled")
+                        fallbackSummary = "\nConverted fallbacks: ${fallbacks.length()} total. ${count("passed_usb")} USB passed, ${count("failed")} failed, ${count("inconclusive")} inconclusive, ${count("no_fallback")} unavailable and $stopped stopped."
+                        val ordered = (0 until fallbacks.length()).sortedBy { i ->
+                            when (fallbacks.optJSONObject(i)?.optString("status")) {
+                                "passed_usb", "failed" -> 0
+                                "inconclusive", "device_lost", "cancelled" -> 1
+                                else -> 2
+                            }
+                        }
+                        val examples = ordered.take(3).mapNotNull { i ->
+                            fallbacks.optJSONObject(i)?.let { item ->
+                                "Fallback ${item.optString("source_request")}. Result ${item.optString("status")}. Source fidelity ${item.optString("source_fidelity", "unknown")}. Target USB ${item.optString("target_wire_integrity", "unknown")}" + if (item.optString("trigger") == "dop_decoder_unconfirmed") " (DoP decoder unobserved. Validator fallback policy.)" else ""
+                            }
+                        }
+                        fallbackSummary += "\n" + examples.joinToString("\n")
+                        if (fallbacks.length() > 3) fallbackSummary += "\nFurther fallback details are in the archive."
+                    }
                 }
                 result.optJSONObject("mode_coverage")?.let { coverage ->
                     val lines = listOf("pcm" to "PCM", "dop" to "DoP", "native_dsd" to "Native DSD").map { (key, label) ->
@@ -477,7 +500,7 @@ private object Capture {
             finally {
                 runCatching { session?.feedbackTraceJson()?.let { File(directory, "feedback-trace.json").writeText(it) } }
                 runCatching { session?.close(); record("session_close", JSONObject().put("status", "closed")) }.onFailure { failure("session_close", it); outcome = "Validation cleanup failed" }
-                main.post { if (runId == generation) finish(if (deviceLost) "Selected DAC disconnected" else if (cancelled) "Cancelled" else outcome) }
+                main.post { if (runId == generation) finish((if (deviceLost) "Selected DAC disconnected" else if (cancelled) "Cancelled" else outcome) + fallbackSummary) }
             }
         }
     }

@@ -215,6 +215,40 @@ fn run(
             }
         }
     }
+    if !report.fallback_results.is_empty() {
+        let count = |status: &str| {
+            report
+                .fallback_results
+                .iter()
+                .filter(|item| item.get("status").and_then(|v| v.as_str()) == Some(status))
+                .count()
+        };
+        emit(
+            json!({"type":"status", "message":format!("Converted fallbacks: {} total. {} USB passed, {} failed, {} inconclusive, {} unavailable and {} stopped.", report.fallback_results.len(), count("passed_usb"), count("failed"), count("inconclusive"), count("no_fallback"), count("device_lost") + count("cancelled"))}),
+        );
+        let mut examples: Vec<_> = report.fallback_results.iter().collect();
+        examples.sort_by_key(|item| match item.get("status").and_then(|v| v.as_str()) {
+            Some("passed_usb" | "failed") => 0,
+            Some("inconclusive" | "device_lost" | "cancelled") => 1,
+            _ => 2,
+        });
+        for item in examples.into_iter().take(3) {
+            let text = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("unknown");
+            let note = if text("trigger") == "dop_decoder_unconfirmed" {
+                " (DoP decoder unobserved. Validator fallback policy.)"
+            } else {
+                ""
+            };
+            emit(
+                json!({"type":"status", "message":format!("Fallback {}. Result {}. Source fidelity {}. Target USB {}{}", text("source_request"), text("status"), text("source_fidelity"), text("target_wire_integrity"), note)}),
+            );
+        }
+        if report.fallback_results.len() > 3 {
+            emit(
+                json!({"type":"status", "message":"Further fallback details are in the archive."}),
+            );
+        }
+    }
     let unexpected = report
         .admission_results
         .iter()
@@ -241,6 +275,9 @@ fn run(
     if let Err(e) = close {
         return Err(format!("DAC teardown: {e}"));
     }
+    if report.termination_reason.as_deref() == Some("retirement_failed") {
+        return Err("USB retirement failed during testing. Inspect diagnostics.".into());
+    }
     if report.cancelled {
         return Err("Cancelled during testing".into());
     }
@@ -262,8 +299,17 @@ fn run(
             "Admission findings: {unexpected} unexpectedly admitted, {inconclusive} inconclusive"
         ));
     }
-    if report.legs.is_empty() {
-        return Err("No supported test cases were found".into());
+    if report.status == "no_cases" {
+        return Err(
+            "No admitted exact playback cases were found. Inspect fallback results in diagnostics."
+                .into(),
+        );
+    }
+    if report.status != "passed_usb" {
+        return Err(format!(
+            "Run completed with findings ({}). Inspect diagnostics for exact and fallback results.",
+            report.status
+        ));
     }
     Ok(())
 }

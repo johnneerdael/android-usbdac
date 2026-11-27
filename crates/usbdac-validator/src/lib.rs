@@ -1,6 +1,8 @@
 //! Bounded, append-on-disk evidence and exact-format USB DAC acceptance runs.
 //! The host must warn users to turn down the amplifier before starting. This
 //! crate never changes hardware volume. USB delivery does not prove audibility.
+mod fallback;
+use fallback::run_fallback;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -71,6 +73,7 @@ pub struct Report {
     pub admission_plan: Vec<Value>,
     pub unattempted_admission_plan: Vec<Value>,
     pub admission_results: Vec<LegResult>,
+    pub fallback_results: Vec<Value>,
     pub termination_reason: Option<String>,
     pub legs: Vec<LegResult>,
     pub cancelled: bool,
@@ -205,7 +208,7 @@ impl Capture {
         device_lost: &AtomicBool,
         progress: impl Fn(&Progress),
     ) -> Report {
-        let mut report = Report { schema_version: 1, started_unix_ms: unix_ms(), coverage: "Each advertised alternate: all discrete rates and standard points within ranges. Separate standard admission probes challenge unrepresented exact requests; unexpected admission is not evidence of decoding. DoP transport is not proof of DAC decoding.".into(), signal: json!({"frequency_hz": TONE_HZ, "amplitude_peak": AMPLITUDE, "channel_polarity": "even positive, odd inverted", "dsd": "first-order delta-sigma, initial integrator zero, chronological MSB-first", "digest": "SHA-256 of bytes accepted by stream.write; DoP marker supplied by driver"}), capabilities: Value::Null, mode_coverage: Value::Null, status: "running".into(), plan: vec![], unattempted_plan: vec![], admission_plan: vec![], unattempted_admission_plan: vec![], admission_results: vec![], termination_reason: None, legs: vec![], cancelled: false, error: None };
+        let mut report = Report { schema_version: 1, started_unix_ms: unix_ms(), coverage: "Each advertised alternate: all discrete rates and standard points within ranges. Separate standard admission probes challenge unrepresented exact requests; unexpected admission is not evidence of decoding. DoP transport is not proof of DAC decoding.".into(), signal: json!({"frequency_hz": TONE_HZ, "amplitude_peak": AMPLITUDE, "channel_polarity": "even positive, odd inverted", "dsd": "first-order delta-sigma, initial integrator zero, chronological MSB-first", "digest": "SHA-256 of bytes accepted by stream.write; DoP marker supplied by driver"}), capabilities: Value::Null, mode_coverage: Value::Null, status: "running".into(), plan: vec![], unattempted_plan: vec![], admission_plan: vec![], unattempted_admission_plan: vec![], admission_results: vec![], fallback_results: vec![], termination_reason: None, legs: vec![], cancelled: false, error: None };
         self.record("run_started", json!({"options": options, "info": format!("{:?}", dac.info()), "volume": format!("{:?}", dac.volume().map(|v| v.get()))}));
         let caps = match dac.capabilities() {
             Ok(c) => c,
@@ -240,6 +243,7 @@ impl Capture {
         }
         self.record("plan", json!(report.plan));
         self.save(&report);
+        let mut dop_fallback_requests: Vec<StreamRequest> = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
             if let Some(reason) = stop_reason(cancel, device_lost) {
                 report.termination_reason = Some(reason.into());
@@ -256,11 +260,47 @@ impl Capture {
             self.record("mode_transition", json!({"index": index, "request": format!("{:?}", plan.request), "advertised_alt": plan.alt}));
             let result = self.run_leg(dac, plan, &options, cancel, device_lost);
             self.record("leg_finished", leg_summary(&result, plan.identity));
-            let terminal = result.termination_reason.clone();
+            let mut terminal = result.termination_reason.clone();
+            let is_dop = matches!(plan.request.encoding, Encoding::DoP);
+            let dop_unconfirmed = is_dop
+                && result.negotiated.is_some()
+                && matches!(result.status.as_str(), "passed_usb" | "not_covered")
+                && result.close_outcome["status"] != "failed";
+            let exact_rejected = result.status == "unsupported"
+                && result.error_stage.as_deref() == Some("negotiate");
+            let should_fallback = (exact_rejected || dop_unconfirmed)
+                && terminal.is_none()
+                && (!is_dop || !dop_fallback_requests.contains(&plan.request));
             report.legs.push(result);
             report.unattempted_plan = unattempted_plan(&report.plan, report.legs.len());
             report.mode_coverage = mode_coverage(&plans, &report.legs);
             self.save(&report);
+            if should_fallback {
+                if is_dop {
+                    dop_fallback_requests.push(plan.request);
+                }
+                let p = Progress {
+                    index,
+                    total: plans.len(),
+                    phase: "fallback".into(),
+                    leg: format!("{:?}", plan.request),
+                };
+                progress(&p);
+                self.record("progress", json!(p));
+                let mut fallback =
+                    run_fallback(dac, &caps, &plan.request, &options, cancel, device_lost);
+                fallback["trigger"] = json!(if exact_rejected {
+                    "exact_unsupported"
+                } else {
+                    "dop_decoder_unconfirmed"
+                });
+                self.record("fallback_finished", fallback_summary(&fallback));
+                if let Some(reason) = fallback.get("termination_reason").and_then(Value::as_str) {
+                    terminal = Some(reason.into());
+                }
+                report.fallback_results.push(fallback);
+                self.save(&report);
+            }
             if terminal.is_some() {
                 report.termination_reason = terminal;
                 break;
@@ -282,14 +322,51 @@ impl Capture {
                 self.record("progress", json!(p));
                 let result = self.run_leg(dac, plan, &options, cancel, device_lost);
                 self.record("admission_finished", leg_summary(&result, plan.identity));
-                let terminal = result.termination_reason.clone();
+                let mut terminal = result.termination_reason.clone();
+                let is_dop = matches!(plan.request.encoding, Encoding::DoP);
+                let expected_rejected = result.admission.as_deref() == Some("expected_rejected");
+                let dop_unconfirmed = is_dop
+                    && result.admission.as_deref() == Some("unexpected_admitted")
+                    && result.status == "passed_usb"
+                    && result.close_outcome["status"] != "failed";
+                let should_fallback = (expected_rejected || dop_unconfirmed)
+                    && terminal.is_none()
+                    && (!is_dop || !dop_fallback_requests.contains(&plan.request));
                 let checkpoint = result.admission.as_deref() == Some("unexpected_admitted")
                     || terminal.is_some()
-                    || (index + 1) % 32 == 0;
+                    || (index + 1) % 32 == 0
+                    || should_fallback;
                 report.admission_results.push(result);
                 report.unattempted_admission_plan =
                     unattempted_plan(&report.admission_plan, report.admission_results.len());
                 if checkpoint {
+                    self.save(&report);
+                }
+                if should_fallback {
+                    if is_dop {
+                        dop_fallback_requests.push(plan.request);
+                    }
+                    let p = Progress {
+                        index,
+                        total: probes.len(),
+                        phase: "fallback".into(),
+                        leg: format!("{:?}", plan.request),
+                    };
+                    progress(&p);
+                    self.record("progress", json!(p));
+                    let mut fallback =
+                        run_fallback(dac, &caps, &plan.request, &options, cancel, device_lost);
+                    fallback["trigger"] = json!(if expected_rejected {
+                        "exact_unsupported"
+                    } else {
+                        "dop_decoder_unconfirmed"
+                    });
+                    self.record("fallback_finished", fallback_summary(&fallback));
+                    if let Some(reason) = fallback.get("termination_reason").and_then(Value::as_str)
+                    {
+                        terminal = Some(reason.into());
+                    }
+                    report.fallback_results.push(fallback);
                     self.save(&report);
                 }
                 if terminal.is_some() {
@@ -309,11 +386,17 @@ impl Capture {
             report.status = "device_lost".into();
         } else if report.cancelled {
             report.status = "cancelled".into();
+        } else if report.termination_reason.as_deref() == Some("retirement_failed") {
+            report.status = "completed_with_findings".into();
         } else if plans.is_empty()
             && report
                 .admission_results
                 .iter()
                 .all(|r| r.admission.as_deref() == Some("expected_rejected"))
+            && report
+                .fallback_results
+                .iter()
+                .all(|r| !matches!(r["status"].as_str(), Some("failed" | "inconclusive")))
         {
             report.status = "no_cases".into();
         } else if !plans.is_empty() || !probes.is_empty() {
@@ -322,6 +405,10 @@ impl Capture {
                     .admission_results
                     .iter()
                     .all(|r| r.admission.as_deref() == Some("expected_rejected"))
+                && report
+                    .fallback_results
+                    .iter()
+                    .all(|r| !matches!(r["status"].as_str(), Some("failed" | "inconclusive")))
             {
                 "passed_usb"
             } else {
@@ -680,6 +767,9 @@ impl Capture {
         result
     }
 }
+fn fallback_summary(value: &Value) -> Value {
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+}
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];
     let trace = &leg.evidence["dac_feedback_trace"];
@@ -1011,10 +1101,25 @@ struct Signal {
 }
 impl Signal {
     fn new(format: &StreamFormat) -> Self {
-        let rate = match format.encoding {
+        Self::from_spec(
+            format.encoding,
+            format.sample_rate,
+            format.channels,
+            format.subslot_bytes,
+            format.valid_bits,
+        )
+    }
+    fn from_spec(
+        encoding: Encoding,
+        sample_rate: u32,
+        channels: u16,
+        subslot_bytes: u8,
+        valid_bits: u8,
+    ) -> Self {
+        let rate = match encoding {
             Encoding::DsdNative { bit_rate } => bit_rate,
-            Encoding::DoP => format.sample_rate * 16,
-            _ => format.sample_rate,
+            Encoding::DoP => sample_rate * 16,
+            _ => sample_rate,
         };
         let step = std::f64::consts::TAU * TONE_HZ / rate as f64;
         let (sin_step, cos_step) = step.sin_cos();
@@ -1022,14 +1127,14 @@ impl Signal {
             step,
             sin_step,
             cos_step,
-            encoding: format.encoding,
-            sample_rate: format.sample_rate,
-            channels: format.channels,
-            subslot_bytes: format.subslot_bytes,
-            valid_bits: format.valid_bits,
+            encoding,
+            sample_rate,
+            channels,
+            subslot_bytes,
+            valid_bits,
             frame: 0,
-            integrator: vec![0.0; format.channels as usize],
-            phase: vec![(0.0, 1.0); format.channels as usize],
+            integrator: vec![0.0; channels as usize],
+            phase: vec![(0.0, 1.0); channels as usize],
         }
     }
     fn bit(&mut self, channel: usize, tick: u64, _rate: u32) -> bool {
