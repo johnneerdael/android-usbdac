@@ -6,6 +6,10 @@ Every ```kotlin and ```xml block in docs/sdk must be an excerpt of a source file
 that is only `// ...` (or `<!-- ... -->` in XML) splits a block into excerpts that are each checked.
 A block preceded by the line `<!-- uncompiled -->` is guidance that is not compiled anywhere and is
 skipped; the script lists those so they stay visible. Other languages (gradle, text) are not checked.
+
+Rust is checked on the pages that opt in with the line `<!-- rust-checked -->`: each ```rust block there must
+be an excerpt of an example or a guide test of usbdac-core (crates/usbdac-core/examples, and the
+tests/guide_*.rs files), by the same rules, with `// ...` splitting a block. Cargo compiles those files.
 """
 import pathlib
 import re
@@ -14,7 +18,12 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 GUIDE = ROOT / "docs" / "sdk"
 SAMPLE = ROOT / "android" / "sample" / "src" / "main"
-SPLIT = {"kotlin": "// ...", "xml": "<!-- ... -->"}
+RUST_SOURCES = [
+    *sorted((ROOT / "crates" / "usbdac-core" / "examples").glob("*.rs")),
+    *sorted((ROOT / "crates" / "usbdac-core" / "tests").glob("guide_*.rs")),
+]
+RUST_OPT_IN = "<!-- rust-checked -->"
+SPLIT = {"kotlin": "// ...", "xml": "<!-- ... -->", "rust": "// ..."}
 
 
 def lines_of(text: str) -> list[str]:
@@ -53,11 +62,13 @@ def main() -> int:
         for path in sorted(SAMPLE.rglob("*"))
         if path.suffix in {".kt", ".xml"}
     }
+    rust_sources = {path: lines_of(path.read_text(encoding="utf-8")) for path in RUST_SOURCES}
     checked = skipped = 0
     failures = []
     for page in sorted(GUIDE.glob("*.md")):
+        rust_checked = RUST_OPT_IN in page.read_text(encoding="utf-8")
         for language, line, body, uncompiled in blocks(page):
-            if language not in SPLIT:
+            if language not in SPLIT or (language == "rust" and not rust_checked):
                 continue
             if uncompiled:
                 skipped += 1
@@ -76,11 +87,13 @@ def main() -> int:
                 if not needle:
                     continue
                 checked += 1
-                if not any(contains(source, needle) for source in sources.values()):
-                    failures.append(f"{page.name}:{line}: not found in the sample: {needle[0]!r} ...")
+                pool = rust_sources if language == "rust" else sources
+                if not any(contains(source, needle) for source in pool.values()):
+                    where = "the Rust examples" if language == "rust" else "the sample"
+                    failures.append(f"{page.name}:{line}: not found in {where}: {needle[0]!r} ...")
     for failure in failures:
         print(failure, file=sys.stderr)
-    print(f"{checked} excerpts checked against the sample, {skipped} blocks marked uncompiled, {len(failures)} failures")
+    print(f"{checked} excerpts checked against the sample and the Rust examples, {skipped} blocks marked uncompiled, {len(failures)} failures")
     return 1 if failures else 0
 
 
