@@ -1,6 +1,9 @@
 """Select immutable source for the release build and reserve automatic patch versions."""
 
 import argparse
+import base64
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -70,7 +73,8 @@ def set_version(old, new, last_release):
     for path, (pattern, _) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         path.write_text(pattern.sub(lambda match: match[1] + new + match[3], path.read_text()))
 
-    # Keep the shipped integration examples in step with the released version.
+    # Examples and release links must refer to a published version, not the
+    # reservation that has yet to pass gates and publication.
     examples = {
         "README.md": ["usbdac-core@{version}"],
         "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
@@ -87,10 +91,142 @@ def set_version(old, new, last_release):
         content = path.read_text()
         updated = content
         for template in literals:
-            for previous in {old, last_release}:
-                updated = updated.replace(template.format(version=previous), template.format(version=new))
+            pattern = re.escape(template).replace(re.escape("{version}"), STABLE_VERSION.pattern)
+            updated = re.sub(pattern, lambda _: template.format(version=last_release), updated)
         if updated != content:
             path.write_text(updated)
+
+
+# Only these reviewed layouts prove that a skipped package job cannot publish.
+HISTORICAL_WORKFLOWS = (
+    '7047b6b2b143389e13e695c37385c7ecfde943a8',
+    '0733689bd30c5e9ffd192947bc4803c380dbdead',
+)
+RELEASE_IMPLEMENTATION = (
+    '.github/workflows/release.yml', '.github/workflows/ci.yml',
+    '.github/scripts/prepare_release.py', '.github/scripts/recover_release.py',
+    '.github/scripts/release_artifact.py', '.github/scripts/publish_release.py',
+    '.github/scripts/release_notes.py',
+)
+PACKAGE_JOB = 'Publish verified gate payload'
+
+
+def reservations(head, version):
+    """Return first-parent reservations newest first, including empty commits."""
+    commits = git('log', '--first-parent', '--format=%H', head,
+                  '--fixed-strings', f'--grep=Release usbdac {version}').splitlines()
+    found = []
+    for commit in commits:
+        message = git('show', '-s', '--format=%B', commit).splitlines()
+        if not message or message[0] != f'Release usbdac {version}':
+            continue
+        markers = [line for line in message if line.startswith('Release-Run: ')]
+        if len(markers) != 1 or not re.fullmatch(r'Release-Run: [1-9][0-9]*', markers[0]):
+            raise ValueError('Ambiguous reservation marker')
+        found.append((commit, int(markers[0].split(': ')[1])))
+    return found
+
+
+def require_latest_reservation(head, version, candidate):
+    records = reservations(head, version)
+    if not records or records[0][0] != candidate:
+        raise SystemExit('Reservation has been superseded or cannot be verified')
+
+
+def trusted_workflow(sha):
+    def contents(ref, path):
+        return subprocess.check_output(['git', 'show', f'{ref}:{path}'], stderr=subprocess.PIPE)
+    for ref in ('HEAD', *HISTORICAL_WORKFLOWS):
+        try:
+            if all(contents(sha, path) == contents(ref, path) for path in RELEASE_IMPLEMENTATION):
+                return True
+        except subprocess.CalledProcessError:
+            continue
+    return False
+
+
+def api_json(*args):
+    return json.loads(subprocess.check_output(['gh', 'api', *args], text=True, stderr=subprocess.PIPE))
+
+
+def never_published(repo, version, records):
+    """Require every attempt of each reservation to have skipped the publisher."""
+    if not records:
+        return False
+    earliest = None
+    for commit, run_id in records:
+        run = api_json(f'repos/{repo}/actions/runs/{run_id}')
+        parent = git('show', '-s', '--format=%P', commit).split()
+        if (len(parent) != 1 or run.get('id') != run_id or run.get('head_sha') != parent[0]
+                or run.get('path') != '.github/workflows/release.yml' or run.get('event') != 'push'
+                or run.get('head_branch') != 'main' or run.get('status') != 'completed'
+                or run.get('conclusion') != 'failure'
+                or run.get('repository', {}).get('full_name') != repo
+                or run.get('head_repository', {}).get('full_name') != repo
+                or not trusted_workflow(parent[0])):
+            return False
+        created = run.get('created_at')
+        if not isinstance(created, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', created):
+            return False
+        earliest = min(earliest, created) if earliest else created
+        attempts = run.get('run_attempt')
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            return False
+        for attempt in range(1, attempts + 1):
+            detail = api_json(f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}')
+            if (detail.get('id') != run_id or detail.get('run_attempt') != attempt
+                    or detail.get('status') != 'completed' or detail.get('conclusion') != 'failure'):
+                return False
+            pages = api_json('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')
+            jobs = [job for page in pages for job in page['jobs'] if job.get('name') == PACKAGE_JOB]
+            if len(jobs) != 1 or jobs[0].get('status') != 'completed' or jobs[0].get('conclusion') != 'skipped':
+                return False
+    # A manual recovery can publish the same reservation under a different run
+    # ID. Refuse adoption if any dispatch occurred since the first reservation;
+    # without proving its inputs and all attempts it is not safe to reuse.
+    pages = api_json('--paginate', '--slurp',
+        f'repos/{repo}/actions/workflows/release.yml/runs?event=workflow_dispatch&per_page=100')
+    for page in pages:
+        for run in page['workflow_runs']:
+            created = run.get('created_at')
+            if not isinstance(created, str) or created >= earliest:
+                return False
+    return True
+
+
+def registry_absent(repo, version, reference):
+    # A 404 alone can hide an authorization failure. Prove the same credentials
+    # can read every object of the latest published Maven version first.
+    from publish_release import fetch
+    token, actor = os.environ['GH_TOKEN'], os.environ['GITHUB_ACTOR']
+    auth = 'Basic ' + base64.b64encode(f'{actor}:{token}'.encode()).decode()
+    if not reference or git('ls-remote', '--tags', 'origin', f'refs/tags/v{version}'):
+        return False
+    index = fetch('https://index.crates.io/us/bd/usbdac-core')
+    if index is None:
+        return False
+    if any(entry.get('vers') == version for entry in (json.loads(line) for line in index.splitlines())):
+        return False
+    if fetch(f'https://static.crates.io/crates/usbdac-core/usbdac-core-{version}.crate') is not None:
+        return False
+    for name in ('usbdac', 'usbdac-media3'):
+        for suffix in ('.aar', '.pom', '.module', '-sources.jar'):
+            base = f'https://maven.pkg.github.com/{repo}/dev/usbdac/{name}'
+            if fetch(f'{base}/{reference}/{name}-{reference}{suffix}', auth) is None:
+                return False
+            if fetch(f'{base}/{version}/{name}-{version}{suffix}', auth) is not None:
+                return False
+    return True
+
+
+def can_adopt(head, version, reference):
+    try:
+        records = reservations(head, version)
+        return (never_published(os.environ['GITHUB_REPOSITORY'], version, records)
+                and registry_absent(os.environ['GITHUB_REPOSITORY'], version, reference))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+        # API errors, missing permissions and unverifiable state never authorize reuse.
+        return False
 
 
 def select_automatic(run_id, source):
@@ -105,7 +241,9 @@ def select_automatic(run_id, source):
         if reserved:
             # A re-run must use the original commit, even if a registry
             # accepted its version before the previous run stopped.
-            return declared_version()
+            version = declared_version()
+            require_latest_reservation(head, version, reserved)
+            return version
 
         previous = stable_tags("--merged", "HEAD")
         if previous and not git("diff", "--name-only", previous[-1], "HEAD", "--", *PACKAGE_PATHS):
@@ -119,6 +257,8 @@ def select_automatic(run_id, source):
         version_commit = git("log", "-1", "--format=%B", "--", "Cargo.toml")
         if numeric > newest and not any(line.startswith("Release-Run: ") for line in version_commit.splitlines()):
             # A maintainer can declare the next major or minor version in a merge.
+            version = current
+        elif numeric > newest and can_adopt(head, current, previous[-1][1:] if previous else None):
             version = current
         else:
             major, minor, patch = max(numeric, newest)

@@ -9,7 +9,7 @@ import subprocess
 import io
 import zipfile
 
-from prepare_release import STABLE_VERSION, version_files, git
+from prepare_release import STABLE_VERSION, version_files, git, require_latest_reservation
 
 GATES = {
     "release-gates / Guide code samples",
@@ -108,17 +108,26 @@ def verify_reservation(run, prepare, log, run_id, version, repo, candidate, pare
         fail('Original reservation log mismatch')
 
 def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attempt, reservation_run_id):
-    # Only a workflow whose release implementation is exactly the currently
-    # reviewed implementation may interpret this versioned receipt.
-    for path in ('.github/workflows/release.yml', '.github/workflows/ci.yml',
-                 '.github/scripts/release_artifact.py', '.github/scripts/publish_release.py',
-                 '.github/scripts/recover_release.py', '.github/scripts/release_notes.py'):
-        if subprocess.check_output(['git', 'show', f"{run['head_sha']}:{path}"]) != Path(path).read_bytes():
-            fail(f'Unknown release workflow layout: {path}')
-    observed = [job.get('name') for job in jobs if job.get('name', '').startswith('release-gates / ')]
-    if len(observed) != len(GATES) or set(observed) != GATES:
-        fail('Original run does not have exactly the required gates')
-    for name in GATES | {PREPARE, 'Seal release gate evidence'}:
+    # Trust only the reviewed current implementation or the explicitly pinned
+    # historical schema-1 implementation. Never infer trust from display names.
+    paths = ('.github/workflows/release.yml', '.github/workflows/ci.yml',
+             '.github/scripts/prepare_release.py', '.github/scripts/release_artifact.py', '.github/scripts/publish_release.py',
+             '.github/scripts/recover_release.py', '.github/scripts/release_notes.py')
+    def matches(ref):
+        try:
+            return all(subprocess.check_output(['git', 'show', f"{run['head_sha']}:{path}"])
+                       == (Path(path).read_bytes() if ref is None else
+                           subprocess.check_output(['git', 'show', f'{ref}:{path}'])) for path in paths)
+        except subprocess.CalledProcessError:
+            return False
+    current = matches(None)
+    historical = any(matches(ref) for ref in (
+        '7047b6b2b143389e13e695c37385c7ecfde943a8',
+        '0733689bd30c5e9ffd192947bc4803c380dbdead',
+    ))
+    if not current and not historical:
+        fail('Unknown release workflow layout')
+    for name in (PREPARE, 'Seal release gate evidence'):
         job = one([j for j in jobs if j.get('name') == name], name)
         if job.get('status') != 'completed' or job.get('conclusion') != 'success':
             fail(f'Required original job did not succeed: {name}')
@@ -134,7 +143,30 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
         if archive.namelist() != ['receipt.json']:
             fail('Unexpected gate receipt archive')
         evidence = json.loads(archive.read('receipt.json'))
-    expected = dict(schema_version=1, repository=repo, version=version, source_sha=candidate,
+    schema = evidence.get('schema_version')
+    if schema == 2:
+        if not current or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
+            fail('Unsupported gate identity or workflow')
+    elif schema == 1:
+        if not historical:
+            fail('Untrusted historical receipt workflow')
+        observed = [j.get('name') for j in jobs if j.get('name', '').startswith('release-gates / ')]
+        if len(observed) != len(GATES) or set(observed) != GATES:
+            fail('Historical run does not have exactly the required gates')
+        for name in GATES:
+            job = one([j for j in jobs if j.get('name') == name], name)
+            if job.get('status') != 'completed' or job.get('conclusion') != 'success':
+                fail(f'Historical gate did not succeed: {name}')
+            gate_log = api('--allow-escape-sequences', f"repos/{repo}/actions/jobs/{job['id']}/logs")
+            checkout = re.findall(r'\[command\][^\n]*git log -1 --format=%H\r?\n[^\n]*Z ([0-9a-f]{40})(?:\r?\n|$)', gate_log)
+            if checkout != [candidate]:
+                fail(f'Historical gate source mismatch: {name}')
+    else:
+        fail('Unsupported receipt schema')
+    if (not re.fullmatch(r'sha256:[0-9a-f]{64}', payload.get('digest') or '')
+            or not re.fullmatch(r'[0-9a-f]{64}', evidence.get('manifest_sha256') or '')):
+        fail('Missing or malformed artifact or manifest digest')
+    expected = dict(repository=repo, version=version, source_sha=candidate,
                     workflow_sha=run['head_sha'], run_id=run_id, run_attempt=attempt,
                     artifact_id=payload['id'], artifact_digest=payload.get('digest'),
                     reservation_run_id=reservation_run_id)
@@ -174,6 +206,7 @@ def main():
     candidates = git("log", "origin/main", "--format=%H", "--fixed-strings", f"--grep={marker}").splitlines()
     candidates = [sha for sha in candidates if marker in git("show", "-s", "--format=%B", sha).splitlines()]
     candidate = one(candidates, "reserved commit on main")
+    require_latest_reservation("origin/main", args.version, candidate)
     parents = git("show", "-s", "--format=%P", candidate).split()
     parent = one(parents, "reserved commit parent")
     versions = []
@@ -211,17 +244,9 @@ def main():
         expected_line = f'Re-gating reserved release {declared} from {candidate}; all five gates will run'
         if gate_prepare.get('conclusion') != 'success' or gate_prepare_log.count(expected_line) != 1:
             fail('Re-gating run did not verify the requested reservation')
-    gate_logs = {}
-    for name in GATES:
-        job = one([j for j in jobs if j.get("name") == name], name)
-        gate_logs[name] = api("--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job['id']}/logs")
     artifact_pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100'))
     artifacts = [item for page in artifact_pages for item in page['artifacts']]
     if any(a.get('name', '').startswith(f'release-gate-receipt-{run_id}-{attempt}') for a in artifacts):
-        for name in GATES:
-            checkout = re.findall(r"\[command\][^\n]*git log -1 --format=%H\r?\n[^\n]*Z ([0-9a-f]{40})(?:\r?\n|$)", gate_logs.get(name, ''))
-            if checkout != [candidate]:
-                fail(f'Prior gate did not check out reserved commit: {name}')
         payload, receipt, evidence = verify_staged(run, jobs, artifacts, repo, args.version, candidate, run_id, attempt, reservation_run_id)
         with args.output.open('a') as output:
             print(f'version={declared}', f'commit={candidate}', 'recovered=true',
@@ -233,7 +258,6 @@ def main():
     # not turn a rebuild into digest-bound provenance.
     if args.gate_run_id is not None or args.version != '0.1.10':
         fail('No complete retained gate receipt; rerun all gates on reserved source')
-    verify(run, jobs, log, gate_logs, run_id, args.version, repo, candidate, parent, declared)
     fail('Historical source-only recovery cannot use the staged-artifact publisher')
 
 

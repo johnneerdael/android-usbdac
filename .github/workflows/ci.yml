@@ -234,7 +234,8 @@ jobs:
     if: inputs.recheck == ''
     name: Defensive USB parsers (bounded fuzz and Miri)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Miri includes the full two-million-byte threaded JNI ring stress test.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -253,6 +254,7 @@ jobs:
           cargo miri setup
           cargo miri test --locked -p usbdac-core --lib iso_transport_loss
           cargo miri test --locked -p usbdac-core --lib ring_pops_report_how_much_of_the_output_was_music
+          cargo miri test --locked -p usbdac-jni --lib ring
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:

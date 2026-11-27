@@ -51,6 +51,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      packages: read
     outputs:
       version: ${{ steps.source.outputs.version }}
       commit: ${{ steps.source.outputs.commit }}
@@ -258,6 +259,7 @@ jobs:
           SOURCE_RUN_ID: ${{ github.run_id }}
           SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
           RESERVATION_RUN_ID: ${{ needs.prepare.outputs.reservation_run_id }}
+          GATE_IDENTITY: usbdac-release-gates/v1
           ARTIFACT_ID: ${{ needs.release-gates.outputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ needs.release-gates.outputs.artifact_digest }}
         run: |
@@ -268,7 +270,11 @@ jobs:
           import hashlib, json, os
           from pathlib import Path
           e = os.environ
-          receipt = dict(schema_version=1, repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
+          if not e['ARTIFACT_ID'] or not e['ARTIFACT_DIGEST']:
+              raise SystemExit('Missing gate payload identity')
+          if e['GATE_IDENTITY'] != 'usbdac-release-gates/v1':
+              raise SystemExit('Unsupported or missing gate identity')
+          receipt = dict(schema_version=2, gate_identity=e['GATE_IDENTITY'], repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
               source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
               run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID']), artifact_id=int(e['ARTIFACT_ID']),
               artifact_digest='sha256:' + e['ARTIFACT_DIGEST'].removeprefix('sha256:'), manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
@@ -331,7 +337,11 @@ jobs:
           from pathlib import Path
           e = os.environ
           r = json.loads(Path('gate-receipt/receipt.json').read_text())
-          expected = dict(schema_version=1, repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
+          if r.get('schema_version') == 2 and r.get('gate_identity') != 'usbdac-release-gates/v1':
+              raise SystemExit('Unsupported gate identity')
+          if r.get('schema_version') not in (1, 2):
+              raise SystemExit('Unsupported receipt schema')
+          expected = dict(repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
               source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
               run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID']), artifact_id=int(e['PAYLOAD_ID']),
               manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
