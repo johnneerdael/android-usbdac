@@ -229,7 +229,7 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 <details>
 <summary><b>Minimal Rust example</b></summary>
 
-Add the core crate with `cargo add usbdac-core@0.1.13`. The example logs
+Add the core crate with `cargo add usbdac-core@0.1.14`. The example logs
 through the `log` crate.
 
 ```rust
