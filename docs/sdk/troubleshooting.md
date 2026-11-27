@@ -56,7 +56,7 @@ reacquires timing. See [all feedback counters](controls.md#diagnostics-the-clock
 
 ### Collect a feedback support report
 
-This setting is available in development builds with the feedback trace API.
+The feedback trace API is available starting in usbdac 0.1.2.
 
 Offer a support toggle that opens a new USB session with
 `DacConfig(captureFeedbackTrace = true)`. If you use `OutputSelector`, pass
