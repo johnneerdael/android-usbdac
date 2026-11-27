@@ -208,6 +208,12 @@ pub fn aaudio_start<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, handle: i6
     run(&mut env, |_env| Ok(output(handle)?.start()?))
 }
 
+/// Marks an invalidated constrained route failed before delivering a disconnect event.
+#[jni_mangle("dev.usbdac.internal.AAudioNative")]
+pub fn aaudio_invalidate_route<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, handle: i64) {
+    run(&mut env, |_env| Ok(output(handle)?.invalidate_route()?))
+}
+
 /// Stops the stream and releases the handle. Blocks for up to about half a second.
 #[jni_mangle("dev.usbdac.internal.AAudioNative")]
 pub fn aaudio_close<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, handle: i64) {

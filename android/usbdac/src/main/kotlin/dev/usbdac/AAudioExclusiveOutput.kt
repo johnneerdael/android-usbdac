@@ -131,6 +131,8 @@ public data class AAudioGrant(
     val asRequested: Boolean,
     val verdict: String,
     val reason: String,
+    /** Complete actual route IDs when supported by the platform, or null when unknown. */
+    val deviceIds: List<Int>? = null,
 ) {
     /** `true` when the stream has the device to itself. */
     public val isExclusive: Boolean get() = sharingMode == AAudioSharingMode.EXCLUSIVE
@@ -239,6 +241,8 @@ internal class AAudioProbe(
         signals.bitPerfect.value = BitPerfectState.NotVerified(null, grant.reason)
         return AAudioExclusiveOutput(backend, handle, grant, frameBytes, signals, nanoTime)
     }
+
+    override fun invalidateRoute() { nativeCall { backend.invalidateRoute(handle) } }
 
     /** Releases the stream if it was not started. Safe to call again. */
     override fun close() {
@@ -408,6 +412,18 @@ public class AAudioExclusiveOutput internal constructor(
             nativeCall { backend.close(handle) }
         } finally {
             signals.state.value = StreamState.CLOSED
+        }
+    }
+
+    // Called by the owner of a constrained route when its monitored identity is invalidated.
+    internal fun invalidateRoute() {
+        if (!closed.get()) nativeCall { backend.invalidateRoute(handle) }
+    }
+
+    internal fun checkRouteFailure() {
+        checkOpen()
+        if (StreamState.fromCode(nativeCall { backend.state(handle) }) == StreamState.FAILED) {
+            throw DacException(DacErrorCode.DEVICE_LOST, "the bound audio route failed")
         }
     }
 
@@ -583,3 +599,8 @@ public class AAudioExclusiveOutput internal constructor(
         private const val MAX_CHANNELS = 8
     }
 }
+
+/** Verify only the reported stream route, not the downstream hardware wire format. */
+internal fun AAudioGrant.matchesStrictRoute(apiLevel: Int, expectedDeviceId: Int): Boolean =
+    expectedDeviceId > 0 && isExclusive && deviceId == expectedDeviceId &&
+        (apiLevel < 36 || deviceIds == listOf(expectedDeviceId))

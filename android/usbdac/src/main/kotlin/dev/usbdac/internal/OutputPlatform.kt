@@ -11,6 +11,7 @@ import dev.usbdac.DacHotplugEvent
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
+import dev.usbdac.DownstreamBinding
 import dev.usbdac.OutputChange
 import dev.usbdac.OutputRoute
 import dev.usbdac.PcmOutput
@@ -53,6 +54,9 @@ internal interface AAudioOffer : Closeable {
 
     /** Starts the stream and returns it as an output. The offer is spent. */
     fun start(): PcmOutput
+
+    /** Fail an offer or its started stream when a bound route is invalidated. */
+    fun invalidateRoute() { throw UnsupportedOperationException("route invalidation unavailable") }
 
     /** Releases the stream if it was not started. */
     override fun close()
@@ -109,6 +113,11 @@ internal interface OutputPlatform {
 
     /** Opens an exclusive AAudio stream on the default route and reads the grant, without starting it. */
     fun probeAAudio(request: StreamRequest, config: AAudioConfig): AAudioOffer
+    fun probeAAudio(request: StreamRequest, config: AAudioConfig, route: OutputRoute): AAudioOffer =
+        throw dev.usbdac.DacException(dev.usbdac.DacErrorCode.UNSUPPORTED, "constrained routing unavailable")
+
+    fun bindDownstream(dac: DacDeviceInfo, protectedRoute: OutputRoute?, independentRoute: OutputRoute, independentDacs: List<DacDeviceInfo>): DownstreamBinding =
+        throw dev.usbdac.DacException(dev.usbdac.DacErrorCode.UNSUPPORTED, "route binding unavailable")
 
     // ---- conversion ----
 

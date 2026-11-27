@@ -18,6 +18,7 @@ internal object AAudioNative {
     @JvmStatic external fun aaudioOpen(requestJson: String, listener: Any, apiLevel: Int): Long
     @JvmStatic external fun aaudioGrant(handle: Long): String
     @JvmStatic external fun aaudioStart(handle: Long)
+    @JvmStatic external fun aaudioInvalidateRoute(handle: Long)
     @JvmStatic external fun aaudioClose(handle: Long)
     @JvmStatic external fun aaudioWrite(handle: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     @JvmStatic external fun aaudioWritableBytes(handle: Long): Int
@@ -42,6 +43,7 @@ internal interface AAudioBackend {
     fun open(requestJson: String, listener: NativeListener, apiLevel: Int): Long
     fun grant(handle: Long): String
     fun start(handle: Long)
+    fun invalidateRoute(handle: Long) { throw UnsupportedOperationException("route invalidation unavailable") }
     fun close(handle: Long)
     fun write(handle: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     fun writableBytes(handle: Long): Int
@@ -64,6 +66,7 @@ internal object NativeAAudioBackend : AAudioBackend {
 
     override fun grant(handle: Long): String = AAudioNative.aaudioGrant(handle)
     override fun start(handle: Long) = AAudioNative.aaudioStart(handle)
+    override fun invalidateRoute(handle: Long) = AAudioNative.aaudioInvalidateRoute(handle)
     override fun close(handle: Long) = AAudioNative.aaudioClose(handle)
     override fun write(handle: Long, buffer: ByteBuffer, offset: Int, count: Int): Int =
         AAudioNative.aaudioWrite(handle, buffer, offset, count)

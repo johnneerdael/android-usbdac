@@ -29,6 +29,34 @@ private fun OutputDecision.rejected(kind: OutputKind): Rejection =
     alternativesRejected.single { it.kind == kind }
 
 class OutputSelectorTest {
+    @Test
+    fun scopedUsbIdentitiesRetainTombstonesAndRejectReusedAttachments() {
+        val protectedKey = DownstreamBinding.UsbKey("/dev/1", 1, 2, 3)
+        val independent = DownstreamBinding.UsbKey("/dev/2", 4, 5, 6)
+        val unknown = DownstreamBinding.UsbKey("/dev/3", 7, 8, 9)
+        val snapshot = UsbBindingIdentities(protectedKey, setOf(independent))
+        val present = setOf(protectedKey, independent, unknown)
+        assertTrue(snapshot.initialPresent(present))
+        assertEquals(UsbBindingClassification.PROTECTED, snapshot.classify(protectedKey, present))
+        assertEquals(UsbBindingClassification.DISTINCT, snapshot.classify(independent, present))
+        assertEquals(UsbBindingClassification.UNKNOWN, snapshot.classify(unknown, present))
+        snapshot.changed(independent, true)
+        snapshot.changed(independent, false)
+        assertEquals(UsbBindingClassification.UNKNOWN, snapshot.classify(independent, present))
+        snapshot.changed(protectedKey, true)
+        snapshot.changed(protectedKey, false)
+        assertEquals(UsbBindingClassification.PROTECTED_ABSENT, snapshot.classify(independent, present))
+    }
+
+    @Test
+    fun bindingInvalidationListenerRunsOnceEvenForLateNotification() {
+        var calls = 0
+        val listener = BindingOnceListener { calls++ }
+        listener.notifyOnce()
+        listener.notifyOnce()
+        assertEquals(1, calls)
+    }
+
 
     @Test
     fun prepared_dac_transfers_the_same_session_to_first_track() {

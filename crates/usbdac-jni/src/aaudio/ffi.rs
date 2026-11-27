@@ -91,6 +91,7 @@ api! {
     optional {
         builder_set_usage: "AAudioStreamBuilder_setUsage" => unsafe extern "C" fn(*mut RawBuilder, i32),
         builder_set_content_type: "AAudioStreamBuilder_setContentType" => unsafe extern "C" fn(*mut RawBuilder, i32),
+        stream_get_device_ids: "AAudioStream_getDeviceIds" => unsafe extern "C" fn(*mut RawStream, *mut i32, *mut i32) -> i32,
         stream_is_mmap_used: "AAudioStream_isMMapUsed" => unsafe extern "C" fn(*mut RawStream) -> bool,
         stream_get_hardware_sample_rate: "AAudioStream_getHardwareSampleRate" => unsafe extern "C" fn(*mut RawStream) -> i32,
         stream_get_hardware_channel_count: "AAudioStream_getHardwareChannelCount" => unsafe extern "C" fn(*mut RawStream) -> i32,
@@ -282,6 +283,16 @@ unsafe fn read_grant(api: &Api, stream: *mut RawStream) -> Grant {
         }),
         _ => None,
     };
+    let device_ids = api.stream_get_device_ids.and_then(|get_ids| {
+        let mut ids = [0i32; 16];
+        let mut count = ids.len() as i32;
+        let result = get_ids(stream, ids.as_mut_ptr(), &mut count);
+        if result != AAUDIO_OK || count < 0 || count as usize > ids.len() {
+            None
+        } else {
+            Some(ids[..count as usize].to_vec())
+        }
+    });
     Grant {
         sharing: (api.stream_get_sharing_mode)(stream),
         sample_rate: (api.stream_get_sample_rate)(stream),
@@ -291,6 +302,7 @@ unsafe fn read_grant(api: &Api, stream: *mut RawStream) -> Grant {
         buffer_capacity_frames: (api.stream_get_buffer_capacity)(stream),
         buffer_size_frames: (api.stream_get_buffer_size)(stream),
         device_id: (api.stream_get_device_id)(stream),
+        device_ids,
         performance_mode: (api.stream_get_performance_mode)(stream),
         mmap: api.stream_is_mmap_used.map(|is_mmap| is_mmap(stream)),
         hardware,

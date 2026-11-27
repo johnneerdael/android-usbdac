@@ -128,8 +128,11 @@ public data class OutputPolicy @JvmOverloads constructor(
     val conversionOptions: ConversionOptions = ConversionOptions(headroomDb = -3.5),
     /** Permit unpacking explicit DoP input for lossy PCM conversion, when allowConversion is also true. */
     val allowDopPcmConversion: Boolean = false,
+    /** Explicit, process-local decoder association; close it when no longer needed. */
+    val downstreamBinding: DownstreamBinding? = null,
 ) {
     init {
+        require(downstreamBinding == null || downstreamLimits != null) { "a downstream binding requires limits" }
         require(!(force == OutputKind.DIRECT_USB && !allowDirectUsb)) {
             "force = DIRECT_USB contradicts allowDirectUsb = false"
         }
