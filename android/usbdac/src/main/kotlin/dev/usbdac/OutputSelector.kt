@@ -147,6 +147,16 @@ public class OutputSelector internal constructor(
     public constructor(context: Context, policy: OutputPolicy = OutputPolicy()) :
         this(AndroidOutputPlatform(context), policy)
 
+    /** Capture a read-only managed PCM fallback rule without opening or probing an output. */
+    public fun managedPcmFallbackSnapshot(): ManagedPcmFallbackSnapshot =
+        ManagedPcmFallbackSnapshot(platform.apiLevel, policy.force, policy.downstreamLimits != null)
+
+    /** Create an owned strict association using current USB and Android device identities. */
+    @JvmOverloads
+    public fun bindDownstream(dac: DacDeviceInfo, protectedRoute: OutputRoute?, independentRoute: OutputRoute,
+        independentDacs: List<DacDeviceInfo> = emptyList()): DownstreamBinding =
+        platform.bindDownstream(dac, protectedRoute, independentRoute, independentDacs)
+
     private val lock = Any()
     private val active = AtomicReference<SelectedOutput?>(null)
     private class Preparation(val link: DirectLink, val handle: PreparedUsbOutput)
@@ -258,7 +268,17 @@ public class OutputSelector internal constructor(
                     throw DacException(DacErrorCode.DEVICE_LOST, "the prepared DAC is no longer available for direct playback")
                 }
                 val pass = Pass(request, RouteView(platform.activeRoute()), null)
-                val candidate = directCandidate(request, dac, prepared.link, negotiate(prepared.link, request))
+                val binding = policy.downstreamBinding
+                val classification = binding?.classify(dac)
+                if (classification == UsbBindingClassification.PROTECTED_ABSENT) {
+                    throw DacException(DacErrorCode.DEVICE_LOST, "protected USB attachment disappeared")
+                }
+                val bypassLimits = classification == UsbBindingClassification.DISTINCT
+                val negotiated = negotiate(prepared.link, request, bypassLimits)
+                if (bypassLimits && binding?.classify(dac) != UsbBindingClassification.DISTINCT) {
+                    throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed during negotiation")
+                }
+                val candidate = directCandidate(request, dac, prepared.link, negotiated, bypassLimits)
                 val resolved = Resolution(decisionOf(candidate, pass, emptyList()), candidate.commit())
                 preparation = null
                 openResolved(resolved)
@@ -336,6 +356,7 @@ public class OutputSelector internal constructor(
         val conversion: ConversionPlan? = null,
         val wireFormat: StreamFormat? = null,
         val processing: OutputConversion? = null,
+        val route: OutputRoute? = null,
         /** Opens it for good. */
         val commit: () -> Opened,
         /** Gives back what the look opened; for a candidate that is committed, nothing more to do. */
@@ -415,7 +436,7 @@ public class OutputSelector internal constructor(
             kind = candidate.kind,
             guarantee = candidate.guarantee,
             reason = candidate.reason,
-            route = pass.route.primary,
+            route = candidate.route ?: pass.route.primary,
             dac = candidate.dac,
             conversion = candidate.conversion,
             needsUsbPermission = if (candidate.kind == OutputKind.DIRECT_USB) null else pass.needsPermission,
@@ -426,15 +447,87 @@ public class OutputSelector internal constructor(
         )
 
     private fun attempts(kind: OutputKind, pass: Pass): Sequence<Attempt> {
-        if (kind != OutputKind.DIRECT_USB && policy.downstreamLimits != null) {
+        if (kind != OutputKind.DIRECT_USB && policy.downstreamLimits != null &&
+            (kind != OutputKind.AAUDIO_EXCLUSIVE || policy.downstreamBinding == null)) {
             return sequenceOf(reject(kind, RejectionReason.POLICY,
                 "the platform output cannot verify the configured downstream decoder limits"))
+        }
+        if (kind != OutputKind.DIRECT_USB && pass.request.encoding in listOf(StreamEncoding.DSD_NATIVE, StreamEncoding.DOP)) {
+            return androidDsdAttempts(kind, pass)
         }
         return when (kind) {
         OutputKind.DIRECT_USB -> directAttempts(pass)
         OutputKind.ANDROID_BIT_PERFECT -> sequence { yield(bitPerfectAttempt(pass)) }
         OutputKind.AAUDIO_EXCLUSIVE -> sequence { yield(aaudioAttempt(pass)) }
         OutputKind.ANDROID_STANDARD -> sequence { yield(standardAttempt(pass)) }
+        }
+    }
+
+    /** PCM targets are finite and lower-first around the DSD intermediate rate. */
+    private fun androidDsdAttempts(kind: OutputKind, pass: Pass): Sequence<Attempt> = sequence {
+        val source = pass.request
+        val bitRate = source.dsdBitRate
+        if (!canConvertDsd(source)) {
+            yield(reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED,
+                "DSD-to-PCM conversion requires supported source format and explicit conversion consent"))
+            return@sequence
+        }
+        val rate = checkNotNull(bitRate)
+        val rates = listOf(44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600)
+        for (targetRate in platform.rankRates(rate / 16, rates)) {
+            val floatTarget = kind == OutputKind.AAUDIO_EXCLUSIVE && policy.aaudioConfig.floatSamples
+            val target = StreamRequest.pcm(targetRate, source.channels, if (floatTarget) 32 else 16)
+            val targetPass = Pass(target, pass.route, pass.matchesUsb)
+            val attempt = when (kind) {
+                OutputKind.ANDROID_BIT_PERFECT -> bitPerfectAttempt(targetPass)
+                OutputKind.AAUDIO_EXCLUSIVE -> aaudioAttempt(targetPass, requireStreamMatch = true)
+                OutputKind.ANDROID_STANDARD -> standardAttempt(targetPass)
+                OutputKind.DIRECT_USB -> error("direct output has its own negotiation")
+            }
+            if (attempt !is Attempt.Ready) {
+                yield(attempt)
+                continue
+            }
+            val candidate = attempt.candidate
+            val gain = if (targetRate == rate / 16) 0.0 else policy.conversionOptions.headroomDb
+            val description = "${if (source.encoding == StreamEncoding.DOP) "DoP unpacked" else "Native DSD"} converted to PCM at $targetRate Hz; resampling gain $gain dB"
+            val sourceRate = if (source.encoding == StreamEncoding.DOP) rate / 16 else rate / 8
+            val written = if (source.encoding == StreamEncoding.DOP)
+                WriteFormat(sourceRate, source.channels, 3, 24, sourceRate, StreamEncoding.DOP)
+            else WriteFormat(sourceRate, source.channels, 1, 8, sourceRate, StreamEncoding.DSD_NATIVE)
+            yield(Attempt.Ready(Candidate(
+                kind = kind,
+                guarantee = Guarantee.NONE,
+                reason = "${candidate.reason} $description; the result is not bit-perfect.",
+                processing = OutputConversion(description, false),
+                route = candidate.route,
+                commit = {
+                    val opened = candidate.commit()
+                    try {
+                        val options = policy.conversionOptions.copy(headroomDb = gain, sourceLayout = null)
+                        val converted = DsdPcmOutput(opened.output, rate, source.channels, targetRate,
+                            source.channels, if (floatTarget) PcmLayout.FLOAT_32 else PcmLayout.PCM_16, options)
+                        val convertedSource = if (source.encoding == StreamEncoding.DOP) DopInputOutput(converted, source.channels, 3) else converted
+                        val output = if (opened.output is RouteGuardedOutput) RouteGuardedOutput(convertedSource, opened.output.guard, false) else convertedSource
+                        Opened(output, written, opened.session, opened.stream, opened.volume, opened.releaseSession)
+                    } catch (error: Throwable) {
+                        try { opened.output.close() } catch (closeError: Throwable) { error.addSuppressed(closeError) }
+                        throw error
+                    }
+                },
+                release = candidate.release,
+            )))
+        }
+    }
+
+    private fun canConvertDsd(source: StreamRequest): Boolean {
+        val rate = source.dsdBitRate ?: return false
+        if (!policy.allowConversion || source.channels !in 1..8 ||
+            rate !in listOf(2_822_400, 5_644_800, 11_289_600)) return false
+        return when (source.encoding) {
+            StreamEncoding.DSD_NATIVE -> source.sampleRate == 0 && source.bitDepth == 0
+            StreamEncoding.DOP -> policy.allowDopPcmConversion && source.sampleRate == rate / 16 && source.bitDepth == 24
+            else -> false
         }
     }
 
@@ -487,6 +580,12 @@ public class OutputSelector internal constructor(
 
     private fun directAttempt(request: StreamRequest, dac: DacDeviceInfo): Attempt {
         val kind = OutputKind.DIRECT_USB
+        val binding = policy.downstreamBinding
+        val classification = binding?.classify(dac)
+        if (classification == UsbBindingClassification.PROTECTED_ABSENT) {
+            return reject(kind, RejectionReason.POLICY, "protected USB attachment disappeared; only the bound independent AAudio route is eligible")
+        }
+        val bypassLimits = classification == UsbBindingClassification.DISTINCT
         val link = try {
             platform.openDac(dac, policy.dacConfig)
         } catch (error: DacException) {
@@ -503,8 +602,11 @@ public class OutputSelector internal constructor(
                     DacErrorCode.VOLUME_UNAVAILABLE,
                 )
             }
-            val negotiated = negotiate(link, request)
-            return Attempt.Ready(directCandidate(request, dac, link, negotiated))
+            val negotiated = negotiate(link, request, bypassLimits)
+            if (bypassLimits && binding?.classify(dac) != UsbBindingClassification.DISTINCT) {
+                throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed during negotiation")
+            }
+            return Attempt.Ready(directCandidate(request, dac, link, negotiated, bypassLimits))
         } catch (error: DacException) {
             link.closeQuietly()
             return Attempt.Rejected(rejectionOf(kind, error, dac.productName), error)
@@ -514,8 +616,9 @@ public class OutputSelector internal constructor(
         }
     }
 
-    private fun permitsWire(format: StreamFormat): Boolean {
+    private fun permitsWire(format: StreamFormat, bypassLimits: Boolean): Boolean {
         if (format.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) return false
+        if (bypassLimits) return true
         val limit = policy.downstreamLimits ?: return true
         // Native DSD is not PCM; the supplied PCM/DoP carrier limits cannot prove its compatibility.
         if (format.encoding == StreamEncoding.DSD_NATIVE) return false
@@ -523,13 +626,18 @@ public class OutputSelector internal constructor(
     }
 
     /** Settle [request] exactly first, then try permitted conversions in ranked order. */
-    private fun negotiate(link: DirectLink, request: StreamRequest): Negotiated {
+    private fun negotiate(link: DirectLink, request: StreamRequest, bypassLimits: Boolean): Negotiated {
+        if (request.encoding == StreamEncoding.PCM) return negotiatePcmCandidates(link, request, bypassLimits)
+        if (request.encoding == StreamEncoding.PCM_FLOAT32 && policy.allowConversion &&
+            link.capabilities.altSettings.isNotEmpty() && !hasFloatAlternate(link.capabilities.altSettings, request)) {
+            return negotiatePcmCandidates(link, request, bypassLimits)
+        }
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
         val first = if (request.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) {
             DacException(DacErrorCode.UNSUPPORTED, "DoP decoder support has not been confirmed")
         } else try {
             val format = link.negotiate(exact)
-            if (permitsWire(format) && format.encoding == request.encoding && format.channels == request.channels &&
+            if (permitsWire(format, bypassLimits) && format.encoding == request.encoding && format.channels == request.channels &&
                 (request.encoding == StreamEncoding.DSD_NATIVE || format.sampleRate == request.sampleRate)) {
                 return Negotiated(format, null)
             }
@@ -544,16 +652,16 @@ public class OutputSelector internal constructor(
                 try {
                     val dop = link.negotiate(StreamRequest.dop(bitRate, request.channels))
                     if (dop.encoding == StreamEncoding.DOP && dop.sampleRate == bitRate / 16 &&
-                        dop.channels == request.channels && dop.subslotBytes in 3..4 && permitsWire(dop)) {
+                        dop.channels == request.channels && dop.subslotBytes in 3..4 && permitsWire(dop, bypassLimits)) {
                         return Negotiated(dop, null, DsdFallback.DOP)
                     }
                 } catch (error: DacException) {
                     if (error.code != DacErrorCode.UNSUPPORTED) throw error
                 }
             }
-            if (policy.allowConversion && bitRate in listOf(2_822_400, 5_644_800, 11_289_600)) {
+            if (canConvertDsd(request)) {
                 try {
-                    val pcm = negotiate(link, StreamRequest.pcm(bitRate / 16, request.channels, 24))
+                    val pcm = negotiate(link, StreamRequest.pcm(bitRate / 16, request.channels, 24), bypassLimits)
                     if (pcm.format.encoding == StreamEncoding.PCM) return Negotiated(pcm.format, null, if (request.encoding == StreamEncoding.DOP) DsdFallback.DOP_PCM else DsdFallback.PCM)
                 } catch (error: DacException) {
                     if (error.code != DacErrorCode.UNSUPPORTED) throw error
@@ -561,8 +669,36 @@ public class OutputSelector internal constructor(
             }
             throw first
         }
-        if ((!policy.allowConversion && !policy.allowWidening) || request.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32)) throw first
+        throw first
+    }
 
+    private fun hasFloatAlternate(alts: List<AltSetting>, request: StreamRequest): Boolean = alts.any { alt ->
+        val rate = request.sampleRate
+        val rateSupported = rate in alt.sampleRates || alt.rateRanges.any { range ->
+            rate in range.minHz..range.maxHz && if (range.stepHz > 0) (rate.toLong() - range.minHz) % range.stepHz == 0L
+            else range.stepHz == 0 && range.minHz == range.maxHz
+        }
+        val frames = (rate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
+        alt.format == AltFormat.PCM_FLOAT32 && alt.channels == request.channels && alt.validBits == 32 &&
+            alt.subslotBytes == 4 && alt.pacing != null && alt.serviceIntervalUs > 0 &&
+            alt.maxPacketBytes > 0 && frames * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && rateSupported
+    }
+
+    /** Construct and validate the complete PCM candidate set before programming a clock. */
+    private fun negotiatePcmCandidates(link: DirectLink, request: StreamRequest, bypassLimits: Boolean): Negotiated {
+        val exact = request.copy(ratePolicy = RatePolicy.EXACT)
+        if (link.capabilities.altSettings.isEmpty()) {
+            val limit = if (bypassLimits) null else policy.downstreamLimits
+            if (limit != null && (request.sampleRate > limit.maxSampleRateHz || request.bitDepth !in limit.allowedValidBits)) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "exact PCM request exceeds downstream limits")
+            }
+            val format = link.negotiate(exact)
+            if (!permitsWire(format, bypassLimits) || format.encoding != StreamEncoding.PCM ||
+                format.sampleRate != request.sampleRate || format.channels != request.channels || format.validBits != request.bitDepth) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "unknown descriptors did not provide the exact PCM request")
+            }
+            return Negotiated(format, null)
+        }
         val alts = link.capabilities.altSettings.filter { it.format == AltFormat.PCM && it.channels == request.channels }
         val pairs = mutableSetOf<Pair<Int, Int>>()
         val standardRates = listOf(8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000,
@@ -578,7 +714,7 @@ public class OutputSelector internal constructor(
             } else {
                 val step = range.stepHz.toLong()
                 val n = ((request.sampleRate.toLong() - range.minHz) / step).coerceAtLeast(0)
-                val ceiling = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz)
+                val ceiling = minOf(range.maxHz, (if (bypassLimits) null else policy.downstreamLimits?.maxSampleRateHz) ?: range.maxHz)
                 val limitIndex = ((ceiling.toLong() - range.minHz) / step).coerceAtLeast(0)
                 for (index in listOf(0L, n, n + 1, limitIndex, (range.maxHz.toLong() - range.minHz) / step)) {
                     val value = range.minHz.toLong() + index * step
@@ -594,7 +730,7 @@ public class OutputSelector internal constructor(
                 }
                 val familyStep = if (request.sampleRate % 11025 == 0) 11025 else if (request.sampleRate % 8000 == 0) 8000 else 0
                 if (familyStep > 0) {
-                    val maximum = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz, 768_000)
+                    val maximum = minOf(range.maxHz, (if (bypassLimits) null else policy.downstreamLimits?.maxSampleRateHz) ?: range.maxHz, 768_000)
                     for (rate in familyStep..maximum step familyStep) add(rate)
                 }
             }
@@ -604,16 +740,11 @@ public class OutputSelector internal constructor(
             alt.sampleRates.forEach { if (it > 0) pairs += it to alt.validBits }
             alt.rateRanges.forEach { addRange(alt.validBits, it) }
         }
-        // Older native libraries may only expose the capability unions, not per-alt entries.
-        if (link.capabilities.altSettings.isEmpty()) {
-            for (depth in link.capabilities.pcmBitDepths) {
-                for (rate in link.capabilities.pcmSampleRates + request.sampleRate) pairs += rate to depth
-            }
-        }
         val eligible = pairs.filter { (rate, depth) ->
             rate > 0 && depth in listOf(16, 24, 32) &&
-                (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true) &&
-                (policy.allowConversion || (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth > request.bitDepth))
+                (bypassLimits || (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true)) &&
+                ((rate == request.sampleRate && depth == request.bitDepth) || policy.allowConversion ||
+                    (policy.allowWidening && rate == request.sampleRate && depth > request.bitDepth))
         }
         val rank = platform.rankRates(request.sampleRate, eligible.map { it.first }).withIndex().associate { it.value to it.index }
         val ordered = eligible.sortedWith(compareBy<Pair<Int, Int>>(
@@ -621,27 +752,51 @@ public class OutputSelector internal constructor(
             { if (it.second >= request.bitDepth) 0 else 1 },
             { kotlin.math.abs(it.second - request.bitDepth) },
         ))
-        for ((rate, depth) in ordered) {
-            if (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth == request.bitDepth) continue
-            val target = exact.copy(sampleRate = rate, bitDepth = depth, encoding = StreamEncoding.PCM)
-            try {
-                val format = link.negotiate(target)
-                if (!permitsWire(format) || format.encoding != StreamEncoding.PCM || format.sampleRate != rate || format.channels != request.channels) continue
-                val options = if (request.sampleRate == format.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0)
-                    else policy.conversionOptions
-                val plan = platform.plan(request, format, options)
-                if (plan.preservesBitPerfect && !policy.allowWidening) continue
-                if (!plan.preservesBitPerfect && !policy.allowConversion) continue
-                if (plan.kind == ConversionKind.NONE) continue
-                return Negotiated(format, plan)
-            } catch (error: DacException) {
-                if (error.code != DacErrorCode.UNSUPPORTED) throw error
+        fun supports(alt: AltSetting, rate: Int, depth: Int): Boolean {
+            val rateSupported = rate in alt.sampleRates || alt.rateRanges.any { range ->
+                rate in range.minHz..range.maxHz && if (range.stepHz > 0) (rate.toLong() - range.minHz) % range.stepHz == 0L
+                else range.stepHz == 0 && range.minHz == range.maxHz
             }
+            val frames = (rate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
+            return alt.validBits == depth && alt.subslotBytes in 1..4 && depth <= alt.subslotBytes * 8 &&
+                alt.pacing != null && alt.serviceIntervalUs > 0 && alt.maxPacketBytes > 0 &&
+                frames * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && rateSupported
         }
-        throw first
+        val candidates = mutableListOf<StreamRequest>()
+        for ((rate, depth) in ordered) {
+            val alt = alts.firstOrNull { supports(it, rate, depth) } ?: continue
+            val target = exact.copy(sampleRate = rate, bitDepth = depth, encoding = StreamEncoding.PCM)
+            if (request.encoding != StreamEncoding.PCM || rate != request.sampleRate || depth != request.bitDepth) {
+                val layout = StreamFormat(0, StreamEncoding.PCM, null, rate, alt.channels, depth,
+                    alt.subslotBytes, alt.subslotBytes * alt.channels, rate, alt.interfaceNumber,
+                    alt.altSetting, alt.endpointAddress, alt.syncType, alt.feedbackEndpoint != null,
+                    link.capabilities.linkSpeed, alt.serviceIntervalUs, false, alt.pacing ?: Pacing.Unknown)
+                val options = if (rate == request.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0) else policy.conversionOptions
+                // A failed origin transform is terminal; do not guess that a different target fixes it.
+                val plan = platform.plan(request, layout, options)
+                if ((plan.preservesBitPerfect && !policy.allowWidening) ||
+                    (!plan.preservesBitPerfect && !policy.allowConversion) || plan.kind == ConversionKind.NONE) continue
+            }
+            candidates += target
+            if (candidates.size == 8) break
+        }
+        if (candidates.isEmpty()) throw DacException(DacErrorCode.UNSUPPORTED, "no descriptor-proven permitted PCM candidate")
+        val format = link.negotiateCandidates(candidates)
+        val selected = candidates.firstOrNull { it.sampleRate == format.sampleRate && it.bitDepth == format.validBits }
+            ?: throw DacException(DacErrorCode.UNSUPPORTED, "negotiation returned an unplanned PCM format")
+        if (!permitsWire(format, bypassLimits) || format.encoding != StreamEncoding.PCM || format.channels != request.channels) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "negotiation returned an incompatible PCM layout")
+        }
+        if (request.encoding == StreamEncoding.PCM && selected.sampleRate == request.sampleRate && selected.bitDepth == request.bitDepth) return Negotiated(format, null)
+        val options = if (selected.sampleRate == request.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0) else policy.conversionOptions
+        val plan = platform.plan(request, format, options)
+        if ((plan.preservesBitPerfect && !policy.allowWidening) || (!plan.preservesBitPerfect && !policy.allowConversion) || plan.kind == ConversionKind.NONE) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "negotiated conversion is not permitted")
+        }
+        return Negotiated(format, plan)
     }
 
-    private fun directCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, negotiated: Negotiated): Candidate {
+    private fun directCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, negotiated: Negotiated, bypassLimits: Boolean): Candidate {
         val format = negotiated.format
         val plan = negotiated.plan
         val unsynchronized = format.pacing == Pacing.Unsynchronized ||
@@ -694,8 +849,14 @@ public class OutputSelector internal constructor(
                 DsdFallback.NONE -> plan?.let { OutputConversion(it.description, it.preservesBitPerfect) }
             },
             commit = {
+                if (bypassLimits && policy.downstreamBinding?.classify(dac) != UsbBindingClassification.DISTINCT) {
+                    throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed before opening")
+                }
                 val stream = link.openStream(format)
                 val output = try {
+                    if (bypassLimits && policy.downstreamBinding?.classify(dac) != UsbBindingClassification.DISTINCT) {
+                        throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed during opening")
+                    }
                     when (negotiated.dsdFallback) {
                         DsdFallback.DOP -> DsdDopOutput(stream, request.channels, format.subslotBytes, true)
                         DsdFallback.PCM, DsdFallback.DOP_PCM -> {
@@ -720,7 +881,15 @@ public class OutputSelector internal constructor(
                     runCatching { stream.close() }
                     throw error
                 }
-                Opened(output, written, session = link.session, stream = link.stream, volume = link.volume, releaseSession = { link.close() })
+                val guarded = if (bypassLimits) {
+                    val guardedOutput = BoundDirectOutput(output, checkNotNull(policy.downstreamBinding), dac)
+                    try { guardedOutput.checkLive() } catch (error: Throwable) {
+                        runCatching { guardedOutput.close() }.onFailure(error::addSuppressed)
+                        throw error
+                    }
+                    guardedOutput
+                } else output
+                Opened(guarded, written, session = link.session, stream = link.stream, volume = link.volume, releaseSession = { link.close() })
             },
             release = { link.close() },
         )
@@ -740,6 +909,9 @@ public class OutputSelector internal constructor(
                 RejectionReason.PLATFORM_TOO_OLD,
                 "the bit-perfect mixer behavior needs Android 14 (API 34); this is API ${platform.apiLevel}",
             )
+        }
+        AndroidManagedOutput.carryProblem(request, platform.apiLevel)?.let {
+            return reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED, it)
         }
         pass.route.wireless?.let { wireless ->
             return reject(
@@ -781,10 +953,11 @@ public class OutputSelector internal constructor(
 
     // ---- 3. an exclusive AAudio stream ----
 
-    private fun aaudioAttempt(pass: Pass): Attempt {
+    private fun aaudioAttempt(pass: Pass, requireStreamMatch: Boolean = false): Attempt {
         val kind = OutputKind.AAUDIO_EXCLUSIVE
         val request = pass.request
-        val config = policy.aaudioConfig.copy(requireExclusive = policy.requireExclusiveForAAudio)
+        val binding = policy.downstreamBinding.takeIf { policy.downstreamLimits != null }
+        val config = policy.aaudioConfig.copy(requireExclusive = binding != null || policy.requireExclusiveForAAudio)
         if (request.encoding != StreamEncoding.PCM) {
             return reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED, "AAudio plays PCM only; DSD and DoP need the direct USB output")
         }
@@ -802,14 +975,14 @@ public class OutputSelector internal constructor(
             }
             else -> return reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED, "${request.bitDepth}-bit PCM is not available through AAudio (16, 24 or 32)")
         }
-        pass.route.wireless?.let { wireless ->
+        pass.route.wireless?.takeIf { binding == null }?.let { wireless ->
             return reject(
                 kind,
                 RejectionReason.ROUTE_UNSUITABLE,
                 "audio is routed to ${wireless.name}, a Bluetooth or cast output: an exclusive stream is not possible there",
             )
         }
-        pass.route.usb?.let { usb ->
+        pass.route.usb?.takeIf { binding == null }?.let { usb ->
             if (!policy.allowDirectUsb) {
                 return reject(
                     kind,
@@ -819,12 +992,29 @@ public class OutputSelector internal constructor(
             }
         }
         val offer: AAudioOffer = try {
-            platform.probeAAudio(request, config)
+            if (binding == null) platform.probeAAudio(request, config) else {
+                binding.ensureLive()
+                platform.probeAAudio(request, config, binding.independent)
+            }
         } catch (error: DacException) {
             return Attempt.Rejected(rejectionOf(kind, error, null), error)
         }
         val grant = offer.grant
+        if (binding != null && (!binding.isLive() || !grant.matchesStrictRoute(platform.apiLevel, binding.independent.id))) {
+            offer.closeQuietly()
+            return reject(kind, RejectionReason.NOT_AS_REQUESTED, "AAudio did not grant the bound independent route")
+        }
         val exclusive = grant.isExclusive
+        val expectedFormat = when {
+            request.bitDepth == 16 -> AAudioSampleFormat.PCM_16
+            request.bitDepth == 24 -> AAudioSampleFormat.PCM_24_PACKED
+            config.floatSamples -> AAudioSampleFormat.FLOAT_32
+            else -> AAudioSampleFormat.PCM_32
+        }
+        if (requireStreamMatch && (grant.sampleRate != request.sampleRate || grant.channels != request.channels || grant.format != expectedFormat)) {
+            offer.closeQuietly()
+            return reject(kind, RejectionReason.NOT_AS_REQUESTED, "AAudio granted a different PCM input layout")
+        }
         if (!exclusive && policy.requireExclusiveForAAudio) {
             offer.closeQuietly()
             return reject(kind, RejectionReason.EXCLUSIVE_NOT_GRANTED, "the platform granted a shared stream, not an exclusive one. ${grant.reason}")
@@ -843,7 +1033,28 @@ public class OutputSelector internal constructor(
                 } else {
                     "The platform granted a shared AAudio stream at ${describe(request)}, so the system mixer is in the path."
                 },
-                commit = { Opened(offer.start(), layoutOf(request)) },
+                route = binding?.independent,
+                commit = {
+                    if (binding == null) Opened(offer.start(), layoutOf(request)) else {
+                        val guard = RouteGuard(binding, offer)
+                        var started: PcmOutput? = null
+                        try {
+                            guard.check()
+                            started = offer.start()
+                            val output = started as? AAudioExclusiveOutput
+                                ?: throw DacException(DacErrorCode.UNSUPPORTED, "constrained AAudio backend unavailable")
+                            guard.output = output
+                            guard.check()
+                            Opened(RouteGuardedOutput(output, guard, true), layoutOf(request))
+                        } catch (error: Throwable) {
+                            guard.close()
+                            val failedOutput = started
+                            if (failedOutput != null) runCatching { failedOutput.close() }.onFailure(error::addSuppressed)
+                            else runCatching { offer.close() }.onFailure(error::addSuppressed)
+                            throw error
+                        }
+                    }
+                },
                 release = { offer.close() },
             ),
         )
@@ -964,5 +1175,67 @@ public class OutputSelector internal constructor(
             RejectionReason.EXCLUSIVE_NOT_GRANTED -> DacErrorCode.EXCLUSIVE_UNAVAILABLE
             RejectionReason.FAILED -> DacErrorCode.UNKNOWN
         }
+    }
+}
+
+/** Immutable preflight facts for the selector's standard Android PCM fallback. */
+public class ManagedPcmFallbackSnapshot internal constructor(
+    private val apiLevel: Int,
+    private val forced: OutputKind?,
+    private val hasDownstreamLimits: Boolean,
+) {
+    /** Whether policy permits the managed fallback and the framework can carry this input layout. */
+    public fun supports(request: StreamRequest): Boolean =
+        !hasDownstreamLimits && (forced == null || forced == OutputKind.ANDROID_STANDARD) &&
+            AndroidManagedOutput.carryProblem(request, apiLevel) == null
+}
+
+private class RouteGuard(private val binding: DownstreamBinding, offer: AAudioOffer) : java.io.Closeable {
+    @Volatile var output: AAudioExclusiveOutput? = null
+    private val subscription = binding.observe { runCatching { offer.invalidateRoute() } }
+    fun check() {
+        binding.ensureLive()
+        output?.checkRouteFailure()
+    }
+    override fun close() = subscription.close()
+}
+
+private class RouteGuardedOutput(
+    private val target: PcmOutput,
+    val guard: RouteGuard,
+    private val ownsGuard: Boolean,
+) : PcmOutput by target {
+    override fun write(buffer: java.nio.ByteBuffer): Int { guard.check(); return target.write(buffer) }
+    override val writableBytes: Int get() = try { guard.check(); target.writableBytes } catch (_: DacException) { 0 }
+    override fun close() { try { target.close() } finally { if (ownsGuard) guard.close() } }
+}
+
+private class BoundDirectOutput(
+    private val target: PcmOutput,
+    private val binding: DownstreamBinding,
+    private val dac: DacDeviceInfo,
+) : PcmOutput by target {
+    private val failed = AtomicBoolean(false)
+    private fun invalidate() {
+        if (failed.compareAndSet(false, true)) {
+            Thread({ runCatching { target.close() } }, "usbdac-bound-route-close").start()
+        }
+    }
+    private val routeSubscription = binding.observe { invalidate() }
+    private val usbSubscription = binding.observeUsb {
+        if (binding.classify(dac) != UsbBindingClassification.DISTINCT) invalidate()
+    }
+    fun checkLive() {
+        if (failed.get() || binding.classify(dac) != UsbBindingClassification.DISTINCT) {
+            invalidate()
+            throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment or binding was invalidated")
+        }
+    }
+    override fun write(buffer: java.nio.ByteBuffer): Int { checkLive(); return target.write(buffer) }
+    override val writableBytes: Int get() = try { checkLive(); target.writableBytes } catch (_: DacException) { 0 }
+    override fun close() {
+        routeSubscription.close()
+        usbSubscription.close()
+        target.close()
     }
 }

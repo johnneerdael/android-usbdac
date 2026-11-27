@@ -599,11 +599,18 @@ class ModelParsingTest {
     @Test
     fun adaptiveAndSchedulerStatsDecodeAndRemainCompatibleWithOlderNativeReports() {
         val stats = parseStats("""{"worker_gap_over_10ms":3,"worker_gap_over_50ms":1,
-            "max_worker_gap_us":65000,"adaptive_queue_changes":2,
+            "max_worker_gap_us":65000,"max_worker_loop_gap_us":71000,
+            "max_event_pump_elapsed_us":6000,"max_event_pump_timeout_overrun_us":1000,"adaptive_queue_changes":2,
             "adaptive_queue_slots":12,"adaptive_queue_us":24000}""")
         assertEquals(3L, stats.workerGapOver10ms)
         assertEquals(1L, stats.workerGapOver50ms)
         assertEquals(65000L, stats.maxWorkerGapUs)
+        assertEquals(71000L, stats.maxWorkerLoopGapUs)
+        assertEquals(6000L, stats.maxEventPumpElapsedUs)
+        assertEquals(1000L, stats.maxEventPumpTimeoutOverrunUs)
+        assertEquals(0L, parseStats("{}").maxWorkerLoopGapUs)
+        assertEquals(0L, parseStats("{}").maxEventPumpElapsedUs)
+        assertEquals(0L, parseStats("{}").maxEventPumpTimeoutOverrunUs)
         assertEquals(2L, stats.adaptiveQueueChanges)
         assertEquals(12L, stats.adaptiveQueueSlots)
         assertEquals(24000L, stats.adaptiveQueueUs)

@@ -333,7 +333,7 @@ fn edited(
     Ok(result)
 }
 
-/// Apply complete volatile rows/banks, preserving padding and every unedited value.
+/// Apply complete live rows/banks, preserving padding and every unedited value.
 /// A failed or uncertain write triggers one bounded reinitialization and guarded
 /// reverse rollback. No command persists configuration to flash.
 pub fn apply_fcp<I: ReadIo>(

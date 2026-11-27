@@ -247,6 +247,8 @@ pub struct CaptureStats {
     /// Valid received frames discarded because a duplex reader held the buffer.
     /// Separate from ring backlog overruns and device transport loss.
     pub contention_frames: u64,
+    /// Valid frames withheld while startup or rate proof is pending.
+    pub proof_suppressed_frames: u64,
     pub empty_packets: u64,
     /// Successful nonempty packets shorter than their submitted capacity.
     pub short_packets: u64,
@@ -260,6 +262,32 @@ pub struct CaptureStats {
 }
 
 impl CaptureStats {
+    pub(crate) fn merge(&mut self, stats: CaptureStats) {
+        self.reordered_completions = self
+            .reordered_completions
+            .saturating_add(stats.reordered_completions);
+        self.captured_frames = self.captured_frames.saturating_add(stats.captured_frames);
+        self.delivered_frames = self.delivered_frames.saturating_add(stats.delivered_frames);
+        self.overrun_frames = self.overrun_frames.saturating_add(stats.overrun_frames);
+        self.contention_frames = self
+            .contention_frames
+            .saturating_add(stats.contention_frames);
+        self.proof_suppressed_frames = self
+            .proof_suppressed_frames
+            .saturating_add(stats.proof_suppressed_frames);
+        self.empty_packets = self.empty_packets.saturating_add(stats.empty_packets);
+        self.short_packets = self.short_packets.saturating_add(stats.short_packets);
+        self.failed_packets = self.failed_packets.saturating_add(stats.failed_packets);
+        self.malformed_packets = self
+            .malformed_packets
+            .saturating_add(stats.malformed_packets);
+        self.malformed_completions = self
+            .malformed_completions
+            .saturating_add(stats.malformed_completions);
+        self.failed_transfers = self.failed_transfers.saturating_add(stats.failed_transfers);
+        self.missing_frames = self.missing_frames.saturating_add(stats.missing_frames);
+    }
+
     /// Classify payload without copying it. The USB worker uses the same rules
     /// when reader contention requires dropping valid frames at the host.
     pub(crate) fn record_completion(
@@ -386,7 +414,7 @@ impl DacCaptureStream {
     pub fn read(&self, destination: &mut [u8]) -> crate::Result<usize> {
         let _scope = self.dac.enter()?;
         let handle = self.handle.lock();
-        let result = handle.lock_buffer().read(destination);
+        let result = handle.read(destination);
         result.map_err(|error| match error {
             CaptureError::PartialFrame => crate::Error::InvalidArgument(
                 "capture read buffer must contain whole wire frames".into(),
@@ -402,13 +430,13 @@ impl DacCaptureStream {
     }
 
     pub fn available_frames(&self) -> usize {
-        self.handle.lock().lock_buffer().available_frames()
+        self.handle.lock().available_frames()
     }
     pub fn stats(&self) -> CaptureStats {
-        self.handle.lock().lock_buffer().stats()
+        self.handle.lock().stats()
     }
     pub fn state(&self) -> CaptureState {
-        self.handle.lock().lock_buffer().state()
+        self.handle.lock().state()
     }
     pub fn last_error(&self) -> Option<crate::Error> {
         self.handle.lock().error.lock().clone()
@@ -425,48 +453,7 @@ impl DacCaptureStream {
 
 impl CaptureBuffer {
     pub(crate) fn merge_stats(&mut self, stats: CaptureStats) {
-        self.stats.reordered_completions = self
-            .stats
-            .reordered_completions
-            .saturating_add(stats.reordered_completions);
-        self.stats.captured_frames = self
-            .stats
-            .captured_frames
-            .saturating_add(stats.captured_frames);
-        self.stats.delivered_frames = self
-            .stats
-            .delivered_frames
-            .saturating_add(stats.delivered_frames);
-        self.stats.overrun_frames = self
-            .stats
-            .overrun_frames
-            .saturating_add(stats.overrun_frames);
-        self.stats.contention_frames = self
-            .stats
-            .contention_frames
-            .saturating_add(stats.contention_frames);
-        self.stats.empty_packets = self.stats.empty_packets.saturating_add(stats.empty_packets);
-        self.stats.short_packets = self.stats.short_packets.saturating_add(stats.short_packets);
-        self.stats.failed_packets = self
-            .stats
-            .failed_packets
-            .saturating_add(stats.failed_packets);
-        self.stats.malformed_packets = self
-            .stats
-            .malformed_packets
-            .saturating_add(stats.malformed_packets);
-        self.stats.malformed_completions = self
-            .stats
-            .malformed_completions
-            .saturating_add(stats.malformed_completions);
-        self.stats.failed_transfers = self
-            .stats
-            .failed_transfers
-            .saturating_add(stats.failed_transfers);
-        self.stats.missing_frames = self
-            .stats
-            .missing_frames
-            .saturating_add(stats.missing_frames);
+        self.stats.merge(stats);
     }
 
     pub(crate) fn note_malformed_completion(&mut self) {
@@ -705,7 +692,7 @@ mod tests {
 
     #[test]
     fn multichannel_vectors_keep_all_wire_bytes_across_packet_batches() {
-        for (bits, subslot) in [(16, 2), (24, 3), (24, 4), (32, 4)] {
+        for (bits, subslot) in [(8, 1), (12, 2), (16, 2), (20, 3), (24, 3), (24, 4), (32, 4)] {
             let mut queue = CaptureBuffer::new(format(bits, subslot, 6), 8).unwrap();
             let frame_bytes = queue.format().bytes_per_frame();
             // Every channel, padding byte, and frame has distinct input bytes.

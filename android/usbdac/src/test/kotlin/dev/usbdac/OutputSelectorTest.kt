@@ -1,5 +1,7 @@
 package dev.usbdac
 
+import dev.usbdac.internal.DirectLink
+import dev.usbdac.internal.OutputPlatform
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -11,6 +13,11 @@ import org.junit.Test
 
 private val PCM_96_24 = StreamRequest.pcm(96_000, channels = 2, bitDepth = 24)
 private val PCM_44_16 = StreamRequest.pcm(44_100, channels = 2, bitDepth = 16)
+
+private fun pcmAlt(rates: List<Int>, depth: Int): AltSetting = AltSetting(
+    1, depth, 1, AltFormat.PCM, 2, depth / 8, depth, emptyList(), rates,
+    SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81),
+)
 
 private fun selector(platform: FakePlatform, policy: OutputPolicy = OutputPolicy()) = OutputSelector(platform, policy)
 
@@ -29,6 +36,63 @@ private fun OutputDecision.rejected(kind: OutputKind): Rejection =
     alternativesRejected.single { it.kind == kind }
 
 class OutputSelectorTest {
+    @Test
+    fun pcmCandidatesArePlannedOnceBeforeNativeCoordinator() {
+        val fake = FakePlatform()
+        val dac = fakeDac()
+        val link = fake.attach(dac)
+        fun alt(rate: Int, depth: Int) = AltSetting(1, depth, 1, AltFormat.PCM, 2, depth / 8, depth,
+            emptyList(), listOf(rate), SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2,
+            Pacing.ExplicitFeedback(0x81))
+        link.capabilities = fakeCapabilities().copy(altSettings = listOf(alt(96_000, 24), alt(48_000, 16)))
+        var batches = 0
+        var ranked = emptyList<StreamRequest>()
+        val wrapped = object : DirectLink by link {
+            override fun negotiate(request: StreamRequest): StreamFormat = error("uncoordinated hardware negotiation")
+            override fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat {
+                batches++
+                ranked = requests
+                return fakeFormat(48_000, 16, 2)
+            }
+        }
+        val platform = object : OutputPlatform by fake {
+            override fun openDac(dac: DacDeviceInfo, config: DacConfig): DirectLink = wrapped
+        }
+        val decision = OutputSelector(platform, OutputPolicy(force = OutputKind.DIRECT_USB)).select(PCM_96_24)
+        assertEquals(1, batches)
+        assertEquals(listOf(96_000 to 24, 48_000 to 16), ranked.map { it.sampleRate to it.bitDepth })
+        assertEquals(48_000, decision.wireFormat!!.sampleRate)
+        assertNotNull(decision.conversion)
+    }
+
+    @Test
+    fun scopedUsbIdentitiesRetainTombstonesAndRejectReusedAttachments() {
+        val protectedKey = DownstreamBinding.UsbKey("/dev/1", 1, 2, 3)
+        val independent = DownstreamBinding.UsbKey("/dev/2", 4, 5, 6)
+        val unknown = DownstreamBinding.UsbKey("/dev/3", 7, 8, 9)
+        val snapshot = UsbBindingIdentities(protectedKey, setOf(independent))
+        val present = setOf(protectedKey, independent, unknown)
+        assertTrue(snapshot.initialPresent(present))
+        assertEquals(UsbBindingClassification.PROTECTED, snapshot.classify(protectedKey, present))
+        assertEquals(UsbBindingClassification.DISTINCT, snapshot.classify(independent, present))
+        assertEquals(UsbBindingClassification.UNKNOWN, snapshot.classify(unknown, present))
+        snapshot.changed(independent, true)
+        snapshot.changed(independent, false)
+        assertEquals(UsbBindingClassification.UNKNOWN, snapshot.classify(independent, present))
+        snapshot.changed(protectedKey, true)
+        snapshot.changed(protectedKey, false)
+        assertEquals(UsbBindingClassification.PROTECTED_ABSENT, snapshot.classify(independent, present))
+    }
+
+    @Test
+    fun bindingInvalidationListenerRunsOnceEvenForLateNotification() {
+        var calls = 0
+        val listener = BindingOnceListener { calls++ }
+        listener.notifyOnce()
+        listener.notifyOnce()
+        assertEquals(1, calls)
+    }
+
 
     @Test
     fun prepared_dac_transfers_the_same_session_to_first_track() {
@@ -177,7 +241,7 @@ class OutputSelectorTest {
     fun selector_prefers_lowest_rate_above_and_reports_source_wire_and_conversion() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(16)).copy(pcmSampleRates = listOf(48_000, 88_200))
+        link.capabilities = fakeCapabilities(depths = listOf(16)).copy(pcmSampleRates = listOf(48_000, 88_200), altSettings = listOf(pcmAlt(listOf(48_000, 88_200), 16)))
         link.onNegotiate = { request ->
             if (request.sampleRate !in listOf(48_000, 88_200)) throw unsupported()
             fakeFormat(request.sampleRate, 16, 2)
@@ -197,7 +261,7 @@ class OutputSelectorTest {
         )) {
             val platform = FakePlatform()
             val link = platform.attach(fakeDac())
-            link.capabilities = fakeCapabilities(depths = listOf(16)).copy(pcmSampleRates = rates)
+            link.capabilities = fakeCapabilities(depths = listOf(16)).copy(pcmSampleRates = rates, altSettings = listOf(pcmAlt(rates, 16)))
             link.onNegotiate = { request ->
                 if (request.sampleRate !in rates) throw unsupported()
                 fakeFormat(request.sampleRate, 16, 2)
@@ -231,7 +295,7 @@ class OutputSelectorTest {
     fun disabling_widening_rejects_lossless_widening_even_if_conversion_is_enabled() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(24)).copy(pcmSampleRates = listOf(44_100))
+        link.capabilities = fakeCapabilities(depths = listOf(24)).copy(pcmSampleRates = listOf(44_100), altSettings = listOf(pcmAlt(listOf(44_100), 24)))
         link.onNegotiate = { request ->
             if (request.bitDepth != 24) throw unsupported()
             fakeFormat(request.sampleRate, 24, 3)
@@ -245,7 +309,7 @@ class OutputSelectorTest {
     fun float_source_is_planned_against_integer_wire() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(24))
+        link.capabilities = fakeCapabilities(depths = listOf(24)).copy(altSettings = listOf(pcmAlt(listOf(44_100), 24)))
         link.onNegotiate = { request ->
             if (request.encoding != StreamEncoding.PCM || request.bitDepth != 24 || request.sampleRate != 44_100) throw unsupported()
             fakeFormat(44_100, 24, 3)
@@ -277,7 +341,7 @@ class OutputSelectorTest {
         for (targetRate in listOf(44_100, 48_000)) {
             val platform = FakePlatform()
             val link = platform.attach(fakeDac())
-            link.capabilities = fakeCapabilities(depths = listOf(24)).copy(pcmSampleRates = listOf(targetRate))
+            link.capabilities = fakeCapabilities(depths = listOf(24)).copy(pcmSampleRates = listOf(targetRate), altSettings = listOf(pcmAlt(listOf(targetRate), 24)))
             link.onNegotiate = { request ->
                 if (request.bitDepth != 24 || request.sampleRate != targetRate) throw unsupported()
                 fakeFormat(targetRate, 24, 3)
@@ -291,9 +355,9 @@ class OutputSelectorTest {
             }
             val options = ConversionOptions(headroomDb = -4.0, quality = ResampleQuality.FAST, ditherSeed = 42)
             OutputSelector(routed, OutputPolicy(conversionOptions = options)).select(PCM_44_16)
-            assertEquals(if (targetRate == 44_100) 0.0 else -4.0, seen.single().headroomDb, 0.0)
-            assertEquals(ResampleQuality.FAST, seen.single().quality)
-            assertEquals(42L, seen.single().ditherSeed)
+            assertTrue(seen.isNotEmpty())
+            assertTrue(seen.all { it.headroomDb == if (targetRate == 44_100) 0.0 else -4.0 })
+            assertTrue(seen.all { it.quality == ResampleQuality.FAST && it.ditherSeed == 42L })
         }
     }
 
@@ -327,7 +391,7 @@ class OutputSelectorTest {
             fakeFormat(request.sampleRate, request.bitDepth, request.bitDepth / 8)
         }
         val source = StreamRequest.dop(2_822_400, 2)
-        val decision = selector(platform).select(source)
+        val decision = selector(platform, OutputPolicy(allowDopPcmConversion = true)).select(source)
         assertEquals(StreamEncoding.PCM, decision.wireFormat!!.encoding)
         assertEquals(source, decision.source)
         assertTrue(decision.processing!!.description.contains("DoP unpacked"))
@@ -348,6 +412,72 @@ class OutputSelectorTest {
         assertEquals(false, decision.processing!!.preservesBitPerfect)
         assertEquals(Guarantee.NONE, decision.guarantee)
         assertTrue(link.negotiated.none { it.encoding == StreamEncoding.DOP })
+    }
+
+    @Test
+    fun dop_pcm_conversion_requires_both_permissions() {
+        for (policy in listOf(OutputPolicy(force = OutputKind.ANDROID_STANDARD),
+            OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowConversion = false, allowDopPcmConversion = true))) {
+            expectError(DacErrorCode.UNSUPPORTED) { selector(FakePlatform(), policy).select(StreamRequest.dop(2_822_400, 2)) }
+        }
+        val direct = FakePlatform()
+        val link = direct.attach(fakeDac())
+        link.onNegotiate = { request ->
+            if (request.encoding != StreamEncoding.PCM) throw unsupported()
+            fakeFormat(request.sampleRate, request.bitDepth, request.bitDepth / 8)
+        }
+        expectError(DacErrorCode.UNSUPPORTED) {
+            selector(direct, OutputPolicy(force = OutputKind.DIRECT_USB)).select(StreamRequest.dop(2_822_400, 2))
+        }
+        assertTrue(link.negotiated.none { it.encoding == StreamEncoding.PCM })
+        val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowDopPcmConversion = true)
+        val source = StreamRequest.dop(2_822_400, 2)
+        val decision = selector(FakePlatform(), policy).select(source)
+        assertEquals(source, decision.source)
+        assertNull(decision.wireFormat)
+        assertEquals(Guarantee.NONE, decision.guarantee)
+        assertFalse(decision.processing!!.preservesBitPerfect)
+    }
+
+    @Test
+    fun android_dsd_pcm_preview_preserves_source_and_finite_managed_rate() {
+        val source = StreamRequest.dsdNative(11_289_600, 2)
+        val decision = selector(FakePlatform(), OutputPolicy(force = OutputKind.ANDROID_STANDARD)).select(source)
+        assertEquals(source, decision.source)
+        assertEquals(Guarantee.NONE, decision.guarantee)
+        assertNull(decision.wireFormat)
+        assertTrue(decision.processing!!.description.contains("176400 Hz"))
+        assertNull(AndroidManagedOutput.carryProblem(StreamRequest.pcm(192_000, 2, 16), 34))
+        assertNotNull(AndroidManagedOutput.carryProblem(StreamRequest.pcm(192_001, 2, 16), 34))
+    }
+
+    @Test
+    fun android_dsd_pcm_preview_covers_mixer_and_aaudio_targets() {
+        val source = StreamRequest.dsdNative(2_822_400, 2)
+        val mixer = FakePlatform().apply { route = listOf(USB_ROUTE) }
+        val mixerDecision = selector(mixer, OutputPolicy(force = OutputKind.ANDROID_BIT_PERFECT)).select(source)
+        assertEquals(Guarantee.NONE, mixerDecision.guarantee)
+        assertNull(mixerDecision.wireFormat)
+        assertFalse(mixerDecision.processing!!.preservesBitPerfect)
+
+        val audio = FakePlatform().apply {
+            grant = fakeGrant().copy(sampleRate = 176_400, channels = 2, format = AAudioSampleFormat.PCM_16)
+        }
+        val audioDecision = selector(audio, OutputPolicy(force = OutputKind.AAUDIO_EXCLUSIVE)).select(source)
+        assertEquals(Guarantee.NONE, audioDecision.guarantee)
+        assertNull(audioDecision.wireFormat)
+        assertEquals(source, audioDecision.source)
+        assertTrue(audio.offers.single().closed)
+    }
+
+    @Test
+    fun unsupported_dsd_conversion_is_refused_before_any_android_open() {
+        val platform = FakePlatform()
+        val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD)
+        expectError(DacErrorCode.UNSUPPORTED) { selector(platform, policy).open(StreamRequest.dsdNative(22_579_200, 2)) }
+        assertTrue(platform.managed.isEmpty())
+        expectError(DacErrorCode.UNSUPPORTED) { selector(platform, policy).open(StreamRequest.dsdNative(2_822_400, 9)) }
+        assertTrue(platform.managed.isEmpty())
     }
 
     // ---- 1. direct USB ----
@@ -581,7 +711,7 @@ class OutputSelectorTest {
     fun with_conversion_allowed_the_nearest_format_is_planned_and_the_guarantee_drops() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(16))
+        link.capabilities = fakeCapabilities(depths = listOf(16)).copy(altSettings = listOf(pcmAlt(listOf(48_000), 16)))
         link.onNegotiate = { request ->
             if (request.sampleRate != 48_000) throw unsupported()
             fakeFormat(rate = 48_000, bits = 16, subslot = 2)
@@ -602,7 +732,7 @@ class OutputSelectorTest {
     fun open_puts_a_converter_in_front_of_the_stream_and_the_host_writes_the_source_layout() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(16))
+        link.capabilities = fakeCapabilities(depths = listOf(16)).copy(altSettings = listOf(pcmAlt(listOf(48_000), 16)))
         link.onNegotiate = { request ->
             if (request.sampleRate != 48_000) throw unsupported()
             fakeFormat(rate = 48_000, bits = 16, subslot = 2)
@@ -620,7 +750,7 @@ class OutputSelectorTest {
     fun a_widening_keeps_the_guarantee_because_every_sample_value_is_kept() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(24))
+        link.capabilities = fakeCapabilities(depths = listOf(24)).copy(altSettings = listOf(pcmAlt(listOf(44_100), 24)))
         link.onNegotiate = { request ->
             if (request.bitDepth != 24) throw unsupported()
             fakeFormat(rate = request.sampleRate, bits = 24, subslot = 3)
@@ -635,14 +765,14 @@ class OutputSelectorTest {
         assertEquals(ConversionKind.BIT_EXACT, decision.conversion!!.kind)
         assertTrue(decision.reason, decision.reason.contains("without changing any sample value"))
         // The same rate at the wider depth was tried before any other rate.
-        assertEquals(listOf(16 to RatePolicy.EXACT, 24 to RatePolicy.EXACT), link.negotiated.map { it.bitDepth to it.ratePolicy })
+        assertEquals(listOf(24 to RatePolicy.EXACT), link.negotiated.map { it.bitDepth to it.ratePolicy })
     }
 
     @Test
     fun conversion_tries_the_same_rate_at_another_depth_before_changing_the_rate() {
         val platform = FakePlatform()
         val link = platform.attach(fakeDac())
-        link.capabilities = fakeCapabilities(depths = listOf(16, 24))
+        link.capabilities = fakeCapabilities(depths = listOf(16, 24)).copy(altSettings = listOf(pcmAlt(listOf(44_100), 24)))
         link.onNegotiate = { request ->
             when {
                 request.ratePolicy == RatePolicy.NEAREST_SUPPORTED -> fakeFormat(48_000, request.bitDepth, request.bitDepth / 8, rateDiffers = true)
@@ -1239,7 +1369,7 @@ class SelectedOutputTest {
         for (proof in listOf("bit_exact", "lossy")) {
             val platform = FakePlatform()
             val link = platform.attach(fakeDac())
-            link.capabilities = fakeCapabilities(depths = listOf(16, 24, 32))
+            link.capabilities = fakeCapabilities(depths = listOf(16, 24, 32)).copy(altSettings = listOf(pcmAlt(listOf(44_100), 32)))
             link.onNegotiate = { request ->
                 if (request.bitDepth != 32) throw unsupported()
                 fakeFormat(request.sampleRate, 32, 4)

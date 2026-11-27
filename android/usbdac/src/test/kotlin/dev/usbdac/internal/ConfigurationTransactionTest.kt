@@ -1,5 +1,6 @@
 package dev.usbdac.internal
 
+import dev.usbdac.StreamRequest
 import dev.usbdac.DacErrorCode
 import dev.usbdac.DacException
 import org.junit.Assert.*
@@ -20,6 +21,52 @@ class ConfigurationTransactionTest {
             if (failAfterSelection && id == 2) throw IllegalStateException("applied then failed")
             return true
         }
+    }
+    @Test fun fallbackRequiresCompleteUac3AndLegacyDescriptorProof() {
+        val active = byteArrayOf(
+            9, 2, 35, 0, 2, 9, 0, -128, 50,
+            8, 11, 0, 2, 1, 1, 0x30, 0,
+            9, 4, 0, 0, 0, 1, 1, 0x30, 0,
+            9, 4, 1, 0, 0, 1, 2, 0x30, 0,
+        )
+        val first = byteArrayOf(
+            9, 2, 73, 0, 2, 7, 0, -128, 50,
+            8, 11, 0, 2, 1, 0, 0x20, 0,
+            9, 4, 0, 0, 0, 1, 1, 0x20, 0,
+            9, 4, 1, 0, 0, 1, 2, 0x20, 0,
+            9, 4, 1, 1, 1, 1, 2, 0x20, 0,
+            16, 0x24, 1, 1, 0, 1, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0,
+            6, 0x24, 2, 1, 2, 16,
+            7, 5, 1, 1, 64, 0, 1,
+        )
+        val current = parseFallbackDescriptor(active)!!
+        val legacy = parseFallbackDescriptor(first, StreamRequest.pcm(48_000, 2, 16))!!
+        assertEquals(7, legacyFallbackId(current, legacy, listOf(7, 9)))
+        assertNull(legacyFallbackId(current, legacy, listOf(7, 7, 9)))
+        assertNull(legacyFallbackId(current.copy(hasIsoOut = true), legacy, listOf(7, 9)))
+        assertNull(legacyFallbackId(current, legacy.copy(legacyPlayback = false), listOf(7, 9)))
+        assertNull(parseFallbackDescriptor(first.copyOf(first.size - 1)))
+        val malformed = first.clone().apply { this[66] = 2 }
+        assertNull(parseFallbackDescriptor(malformed))
+        val io = Io(active = 9)
+        val selection = ConfigurationTransaction.select(io, legacy.id, listOf(7, 9))
+        selection.restore()
+        assertEquals(listOf(7, 9), io.writes)
+    }
+    @Test fun fullUac3FormatExclusionRequiresEveryOutputToBeKnown() {
+        val bytes = byteArrayOf(
+            9, 2, 74, 0, 2, 9, 0, -128, 50,
+            8, 11, 0, 2, 1, 1, 0x30, 0,
+            9, 4, 0, 0, 0, 1, 1, 0x30, 0,
+            9, 4, 1, 0, 0, 1, 2, 0x30, 0,
+            9, 4, 1, 1, 1, 1, 2, 0x30, 0,
+            23, 0x24, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 24, 0, 0, 0,
+            7, 5, 1, 1, 64, 0, 1,
+        )
+        assertTrue(parseFallbackDescriptor(bytes, StreamRequest.pcm(48_000, 2, 16))!!.formatExcluded)
+        assertFalse(parseFallbackDescriptor(bytes, StreamRequest.pcm(48_000, 2, 24))!!.formatExcluded)
+        val unknown = bytes.clone().apply { this[52] = 0 }
+        assertFalse(parseFallbackDescriptor(unknown, StreamRequest.pcm(48_000, 2, 16))!!.formatExcluded)
     }
     @Test fun requestedConfigurationIsSelectedVerifiedAndRestoredOnlyOnce() {
         val io = Io()

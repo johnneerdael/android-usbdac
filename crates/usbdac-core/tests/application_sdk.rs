@@ -103,6 +103,39 @@ fn snapshot_changed_usb_identity_invalidates_old_permission() {
 }
 
 #[test]
+fn attach_event_with_changed_identity_replaces_before_announcing_new_device() {
+    let hub = HotplugHub::new();
+    let old = hub.attached(
+        "port",
+        DeviceInfo::new(1, 2, "old"),
+        UsbPermission::Required,
+    );
+    let events = hub.subscribe();
+    events.try_recv().unwrap();
+    let new = hub.attached(
+        "port",
+        DeviceInfo::new(3, 4, "new"),
+        UsbPermission::Required,
+    );
+    assert!(new.id > old.id);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::Detached(old.clone())
+    );
+    assert_eq!(
+        events.try_recv().unwrap(),
+        HotplugEvent::Attached(new.clone())
+    );
+    assert!(!hub.permission_changed(old.id, UsbPermission::Granted));
+    assert!(!hub.detached(old.id));
+    assert_eq!(
+        hub.attached("port", new.info.clone(), UsbPermission::Granted),
+        new
+    );
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
 fn subscriber_overflow_replaces_old_hints_with_atomic_snapshot() {
     let hub = HotplugHub::new();
     let events = hub.subscribe();

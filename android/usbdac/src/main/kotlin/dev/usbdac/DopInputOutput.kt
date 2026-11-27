@@ -42,11 +42,13 @@ public class DopInputOutput(
         pump()
         if (pending.hasRemaining()) return 0
         val start = buffer.position()
-        val frames = minOf(buffer.remaining() / carrierFrame, pending.capacity() / nativePair)
+        val submittedFrames = buffer.remaining() / carrierFrame
+        val frames = minOf(submittedFrames, pending.capacity() / nativePair)
         val pad = slotBytes - 3
         var next = expected
-        // Validate the complete batch before consuming or writing any of it.
-        for (frame in 0 until frames) {
+        var acceptedNext = expected
+        // Validate every complete submitted frame before consuming any of them.
+        for (frame in 0 until submittedFrames) {
             val p = start + frame * carrierFrame
             val marker = buffer.get(p + pad + 2).toInt() and 255
             if (marker != 0x05 && marker != 0xfa) invalid("invalid DoP marker")
@@ -57,6 +59,7 @@ public class DopInputOutput(
                 if (pad != 0 && buffer.get(at).toInt() != 0) invalid("DoP padding must be zero")
             }
             next = marker xor 0xff
+            if (frame + 1 == frames) acceptedNext = next
         }
         pending.clear()
         for (frame in 0 until frames) {
@@ -65,7 +68,7 @@ public class DopInputOutput(
             for (ch in 0 until channels) pending.put(buffer.get(p + ch * slotBytes + pad))
         }
         buffer.position(start + frames * carrierFrame)
-        expected = next
+        expected = acceptedNext
         pending.flip()
         pump()
         buffer.position() - start

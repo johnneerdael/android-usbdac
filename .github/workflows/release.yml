@@ -16,6 +16,14 @@ on:
         description: Retry packaging from a verified failed automatic release run
         required: false
         type: string
+      gate_run_id:
+        description: Reuse a failed re-gating run payload with the original failed_run_id
+        required: false
+        type: string
+      regate_run_id:
+        description: Re-run all gates on the verified reserved source of a failed run
+        required: false
+        type: string
       skip_package:
         description: Skip both Android Maven uploads if GitHub Packages already has this version
         required: false
@@ -47,6 +55,12 @@ jobs:
       version: ${{ steps.source.outputs.version }}
       commit: ${{ steps.source.outputs.commit }}
       recovered: ${{ steps.source.outputs.recovered }}
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.source.outputs.source_run_attempt }}
+      workflow_sha: ${{ steps.source.outputs.workflow_sha }}
+      artifact_id: ${{ steps.source.outputs.artifact_id }}
+      receipt_id: ${{ steps.source.outputs.receipt_id }}
+      reservation_run_id: ${{ steps.source.outputs.reservation_run_id }}
       validator: ${{ steps.validator.outputs.enabled }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,15 +73,31 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
           FAILED_RUN_ID: ${{ inputs.failed_run_id }}
+          REGATE_RUN_ID: ${{ inputs.regate_run_id }}
+          GATE_RUN_ID: ${{ inputs.gate_run_id }}
           SKIP_PACKAGE: ${{ inputs.skip_package }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -n "$FAILED_RUN_ID" ]; then
-            python3 .github/scripts/recover_release.py --failed-run-id "$FAILED_RUN_ID" --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+          if [ -n "$FAILED_RUN_ID" ] && [ -n "$REGATE_RUN_ID" ]; then
+            echo "Choose recovery or re-gating, not both"; exit 1
+          fi
+          if [ -n "$GATE_RUN_ID" ] && [ -z "$FAILED_RUN_ID" ]; then
+            echo "A gate run ID requires the original failed run ID"; exit 1
+          fi
+          if [ -n "$REGATE_RUN_ID" ]; then
+            python3 .github/scripts/recover_release.py --regate-run-id "$REGATE_RUN_ID" --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+          elif [ -n "$FAILED_RUN_ID" ]; then
+            if [ -n "$GATE_RUN_ID" ]; then
+              python3 .github/scripts/recover_release.py --failed-run-id "$FAILED_RUN_ID" --gate-run-id "$GATE_RUN_ID" --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+            else
+              python3 .github/scripts/recover_release.py --failed-run-id "$FAILED_RUN_ID" --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+            fi
           elif [ "$GITHUB_EVENT_NAME" = push ]; then
             python3 .github/scripts/prepare_release.py --run-id "$GITHUB_RUN_ID" --source "$GITHUB_SHA" --output "$GITHUB_OUTPUT"
+            echo "reservation_run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           else
             python3 .github/scripts/prepare_release.py --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
+            echo "reservation_run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Detect validator sources in the selected commit
@@ -93,6 +123,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       source_sha: ${{ needs.prepare.outputs.commit }}
+      version: ${{ needs.prepare.outputs.version }}
+      reservation_run_id: ${{ needs.prepare.outputs.reservation_run_id }}
     permissions:
       contents: read
 
@@ -111,8 +143,10 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           SIGNING_IDENTITY: ""
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           rustup target add aarch64-apple-darwin
           macos/validator/build.sh
           app="macos/validator/build/USB DAC Validator.app"
@@ -121,83 +155,48 @@ jobs:
           cp macos/validator/build/USB-DAC-Validator-macOS.zip "$RUNNER_TEMP/usbdac-validator-$VERSION-macos-arm64.zip"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mac-validator
+          name: mac-validator-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/usbdac-validator-${{ needs.prepare.outputs.version }}-macos-arm64.zip
           overwrite: true
           if-no-files-found: error
           retention-days: 14
 
-  package:
-    name: Build, test and publish the package
-    needs: [prepare, release-gates, mac-validator]
-    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.version != '' && (needs.release-gates.result == 'success' || (needs.prepare.outputs.recovered == 'true' && needs.release-gates.result == 'skipped')) && (needs.mac-validator.result == 'success' || (needs.prepare.outputs.validator == 'false' && needs.mac-validator.result == 'skipped')) }}
+
+  android-validator:
+    name: Build the Android validator
+    needs: [prepare, release-gates]
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.validator == 'true' && (needs.release-gates.result == 'success' || (needs.prepare.outputs.recovered == 'true' && needs.release-gates.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.commit }}
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Install Rust and the Android targets
+      - name: Install Rust and Android toolchains
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.91.1 --profile minimal
+          rustup default 1.91.1
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
-      - name: Cache cargo-ndk
-        id: cargo-ndk
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/bin/cargo-ndk
-          key: cargo-ndk-${{ env.CARGO_NDK_VERSION }}-${{ runner.os }}
-
-      - name: Install cargo-ndk
-        if: steps.cargo-ndk.outputs.cache-hit != 'true'
-        run: cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
-
+          cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0"
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
-          java-version: "21"
-
-      - name: Install the Android SDK components
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
-            "ndk;$NDK_VERSION" "platforms;android-36" "build-tools;36.0.0"
-
+          java-version: '21.0.8+9'
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
-
-      # Plugin downloads from the Gradle and Maven repositories fail intermittently on
-      # hosted runners. Resolve them first, with retries, so a transient outage does not
-      # fail the build.
-      - name: Resolve Gradle plugins (with retries)
-        working-directory: android
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if ./gradlew help -Pusbdac.skipNative=true --console=plain -q; then exit 0; fi
-            echo "Plugin resolution failed (attempt $attempt); retrying in 30 s"
-            sleep 30
-          done
-          exit 1
-
-      - name: Build and inspect the Android validator APK
-        if: needs.prepare.outputs.validator == 'true'
+      - name: Build and verify the validator APK
         working-directory: android
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           ./gradlew :validator:assembleDebug --console=plain
           apk=validator/build/outputs/apk/debug/validator-debug.apk
-          test -f "$apk"
+          test -s "$apk"
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" > "$RUNNER_TEMP/validator-badging.txt"
           grep -F "versionName='$VERSION'" "$RUNNER_TEMP/validator-badging.txt"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
@@ -207,243 +206,222 @@ jobs:
             "$nm" --dynamic --defined-only "$RUNNER_TEMP/validator-$abi.so" > "$RUNNER_TEMP/validator-$abi.symbols"
             grep -q 'Java_dev_usbdac_internal_Native_validatorRun' "$RUNNER_TEMP/validator-$abi.symbols"
           done
-          cp "$apk" "$RUNNER_TEMP/validator.apk"
-          rm -rf usbdac/src/main/jniLibs
+          cp "$apk" "$RUNNER_TEMP/usbdac-validator-$VERSION-android.apk"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-validator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/usbdac-validator-${{ needs.prepare.outputs.version }}-android.apk
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Build the AAR (all four ABIs) and sample
-        working-directory: android
-        run: ./gradlew :usbdac:assembleRelease :usbdac-media3:assembleRelease :sample:assembleDebug :media3-example:assembleDebug --console=plain
-
-      - name: Check that the AAR carries every ABI
-        run: |
-          listing=$(unzip -l android/usbdac/build/outputs/aar/usbdac-release.aar)
-          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-            echo "$listing" | grep -q "jni/$abi/libusbdac.so" || { echo "jni/$abi/libusbdac.so is missing from the AAR"; exit 1; }
-          done
-
-      - name: Verify the published native libraries exclude the validator bridge
-        if: needs.prepare.outputs.validator == 'true'
+  gate-receipt:
+    name: Seal release gate evidence
+    needs: [prepare, release-gates]
+    if: needs.release-gates.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      receipt_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.release-gates.outputs.artifact_id }}
+          path: release-payload
+      - name: Verify and record the immutable gate payload
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RESERVATION_RUN_ID: ${{ needs.prepare.outputs.reservation_run_id }}
+          ARTIFACT_ID: ${{ needs.release-gates.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.release-gates.outputs.artifact_digest }}
         run: |
           set -euo pipefail
-          nm="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-            unzip -p android/usbdac/build/outputs/aar/usbdac-release.aar "jni/$abi/libusbdac.so" > "$RUNNER_TEMP/library-$abi.so"
-            "$nm" --dynamic --defined-only "$RUNNER_TEMP/library-$abi.so" > "$RUNNER_TEMP/library-$abi.symbols"
-            if grep -q 'Java_dev_usbdac_internal_Native_validator' "$RUNNER_TEMP/library-$abi.symbols"; then echo "Validator bridge leaked into $abi AAR"; exit 1; fi
-          done
+          python3 -I .github/scripts/release_artifact.py verify release-payload --version "$VERSION"
+          mkdir gate-receipt
+          python3 - <<'PYRECEIPT'
+          import hashlib, json, os
+          from pathlib import Path
+          e = os.environ
+          receipt = dict(schema_version=1, repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
+              source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
+              run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID']), artifact_id=int(e['ARTIFACT_ID']),
+              artifact_digest='sha256:' + e['ARTIFACT_DIGEST'].removeprefix('sha256:'), manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
+          Path('gate-receipt/receipt.json').write_text(json.dumps(receipt, sort_keys=True) + '\n')
+          PYRECEIPT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: release-gate-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gate-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: Stage the Maven publication
-        working-directory: android
-        run: ./gradlew :usbdac:publishReleasePublicationToStagingRepository :usbdac-media3:publishReleasePublicationToStagingRepository --console=plain
-
+  package:
+    name: Publish verified gate payload
+    needs: [prepare, release-gates, gate-receipt, mac-validator, android-validator]
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.version != '' && (needs.gate-receipt.result == 'success' || (needs.prepare.outputs.recovered == 'true' && needs.gate-receipt.result == 'skipped')) && ((needs.prepare.outputs.validator == 'true' && needs.mac-validator.result == 'success' && needs.android-validator.result == 'success') || (needs.prepare.outputs.validator == 'false' && needs.mac-validator.result == 'skipped' && needs.android-validator.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+      WORKFLOW_SHA: ${{ needs.prepare.outputs.workflow_sha || github.sha }}
+      SOURCE_RUN_ID: ${{ needs.prepare.outputs.source_run_id || github.run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ needs.prepare.outputs.source_run_attempt || github.run_attempt }}
+      PAYLOAD_ID: ${{ needs.prepare.outputs.artifact_id || needs.release-gates.outputs.artifact_id }}
+      RECEIPT_ID: ${{ needs.prepare.outputs.receipt_id || needs.gate-receipt.outputs.receipt_id }}
+      SKIP_PACKAGE: ${{ inputs.skip_package }}
+      RESERVATION_RUN_ID: ${{ needs.prepare.outputs.reservation_run_id }}
+      VALIDATOR: ${{ needs.prepare.outputs.validator }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          artifact-ids: ${{ env.PAYLOAD_ID }}
+          path: release-payload
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          artifact-ids: ${{ env.RECEIPT_ID }}
+          path: gate-receipt
+      - name: Verify gate receipt and payload
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/release_artifact.py verify release-payload --version "$VERSION"
+          python3 - <<'PYCHECK'
+          import hashlib, json, os
+          from pathlib import Path
+          e = os.environ
+          r = json.loads(Path('gate-receipt/receipt.json').read_text())
+          expected = dict(schema_version=1, repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
+              source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
+              run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID']), artifact_id=int(e['PAYLOAD_ID']),
+              manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
+          if any(r.get(k) != v for k, v in expected.items()):
+              raise SystemExit('Gate receipt or manifest mismatch')
+          PYCHECK
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '21.0.8+9'
+      - name: Install pinned Maven
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 -o "$RUNNER_TEMP/maven.tgz" https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz
+          echo 'bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978  '"$RUNNER_TEMP/maven.tgz" | sha512sum -c -
+          tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
+      - name: Publish and verify exact staged files
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        run: python3 .github/scripts/publish_release.py
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.prepare.outputs.validator == 'true'
         with:
-          name: mac-validator
-          path: ${{ runner.temp }}/mac-validator
-
-      - name: Verify validator release assets are present
+          name: android-validator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validator-assets
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.prepare.outputs.validator == 'true'
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          test -s "$RUNNER_TEMP/validator.apk"
-          test -s "$RUNNER_TEMP/mac-validator/usbdac-validator-$VERSION-macos-arm64.zip"
-
-      - name: Check whether the Rust crate version is published
-        id: crates
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+        with:
+          name: mac-validator-${{ github.run_id }}-${{ github.run_attempt }}
+          path: validator-assets
+      - name: Assemble release assets from the verified payload
         run: |
           set -euo pipefail
-          status=$(curl --silent --show-error --retry 3 --max-time 30 \
-            --output "$RUNNER_TEMP/usbdac-core-index.jsonl" --write-out '%{http_code}' \
-            https://index.crates.io/us/bd/usbdac-core)
-          case "$status" in
-            200)
-              published=$(jq -s --arg version "$VERSION" 'any(.[]; .vers == $version)' \
-                "$RUNNER_TEMP/usbdac-core-index.jsonl")
-              ;;
-            404) published=false ;;
-            *) echo "crates.io index returned HTTP $status"; exit 1 ;;
-          esac
-          if [ "$published" = true ]; then
-            crate="usbdac-core-$VERSION"
-            published_commit=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
-              "https://static.crates.io/crates/usbdac-core/$crate.crate" |
-              tar -xzOf - "$crate/.cargo_vcs_info.json" | jq -er '.git.sha1')
-            if [ "$published_commit" != "$(git rev-parse HEAD)" ]; then
-              echo "crates.io already has $crate from $published_commit. Rerun the original release build."; exit 1
-            fi
-          fi
-          echo "published=$published" >> "$GITHUB_OUTPUT"
-          echo "usbdac-core $VERSION already published: $published"
-
-      - name: Publish the Rust crate to crates.io
-        if: steps.crates.outputs.published == 'false'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
-        run: cargo publish --locked --package usbdac-core
-
-      - name: Check each Maven package before uploading
-        id: maven
-        if: ${{ !inputs.skip_package }}
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+          mkdir release-assets
+          cp release-payload/assets/* release-payload/crates/*.crate release-payload/manifest.json gate-receipt/receipt.json release-assets/
           for artifact in usbdac usbdac-media3; do
-            base="https://maven.pkg.github.com/$GITHUB_REPOSITORY/dev/usbdac/$artifact/$VERSION/$artifact-$VERSION"
-            found=0
-            for suffix in .aar .pom .module -sources.jar; do
-              status=$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GITHUB_TOKEN" |
-                curl --config - --silent --show-error --location --retry 3 --max-time 30 \
-                  --output /dev/null --write-out '%{http_code}' "$base$suffix")
-              case "$status" in
-                200) found=$((found + 1)) ;;
-                404) ;;
-                *) echo "GitHub Packages returned HTTP $status for $artifact$suffix"; exit 1 ;;
-              esac
-            done
-            case "$found" in
-              0) echo "$artifact=false" >> "$GITHUB_OUTPUT" ;;
-              4) echo "$artifact=true" >> "$GITHUB_OUTPUT" ;;
-              *) echo "The Maven upload for $artifact $VERSION is incomplete; repair it before retrying"; exit 1 ;;
-            esac
+            cp release-payload/maven/dev/usbdac/"$artifact"/"$VERSION"/* release-assets/
           done
-
-      - name: Publish the core to GitHub Packages
-        if: ${{ !inputs.skip_package && steps.maven.outputs.usbdac != 'true' }}
-        working-directory: android
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew :usbdac:publishReleasePublicationToGitHubPackagesRepository --console=plain
-
-      - name: Publish the Media3 integration to GitHub Packages
-        if: ${{ !inputs.skip_package && steps.maven.outputs['usbdac-media3'] != 'true' }}
-        working-directory: android
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew :usbdac-media3:publishReleasePublicationToGitHubPackagesRepository --console=plain
-
-      - name: Collect the release assets
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          PUBLISHED_MAVEN: ${{ !inputs.skip_package }}
-          VALIDATOR: ${{ needs.prepare.outputs.validator }}
-          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: |
-          set -euo pipefail
-          assets="$PWD/release-assets"
-          mkdir -p "$assets"
-          for artifact in usbdac usbdac-media3; do
-            staged="android/build/staging/dev/usbdac/$artifact/$VERSION"
-            cp "$staged/$artifact-$VERSION.aar" "$staged/$artifact-$VERSION-sources.jar" \
-               "$staged/$artifact-$VERSION.pom" "$staged/$artifact-$VERSION.module" "$assets/"
-          done
-
           if [ "$VALIDATOR" = true ]; then
-            cp "$RUNNER_TEMP/validator.apk" "$assets/usbdac-validator-$VERSION-android.apk"
-            cp "$RUNNER_TEMP/mac-validator/usbdac-validator-$VERSION-macos-arm64.zip" "$assets/"
+            test -s "validator-assets/usbdac-validator-$VERSION-android.apk"
+            test -s "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip"
+            unzip -tq "validator-assets/usbdac-validator-$VERSION-android.apk" >/dev/null
+            unzip -tq "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip" >/dev/null
+            cp "validator-assets/usbdac-validator-$VERSION-android.apk" "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip" release-assets/
           fi
-
-          # The native libraries on their own, one directory per ABI.
-          (cd android/usbdac/src/main/jniLibs && zip -r -X "$assets/usbdac-$VERSION-jniLibs.zip" .)
-
-          # The Rust driver as a crate (sources only; libusb is compiled from the crates.io dependency).
-          cargo package -p usbdac-core --allow-dirty --no-verify
-          cp "target/package/usbdac-core-$VERSION.crate" "$assets/"
-          cp docs/design/device-compatibility-candidates.md "$assets/"
-
-          (cd "$assets" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-
-          # Release notes from the commits since the previous tag.
-          previous=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
-          {
-            echo "## Changes"
-            echo
-            if [ -n "$previous" ]; then
-              git log --no-merges --pretty='- %s (%h)' "$previous..HEAD"
-            else
-              git log --no-merges --pretty='- %s (%h)' HEAD
-            fi
-            echo
-            echo "Source commit: \`$SOURCE_COMMIT\`"
-            echo
-            echo "## Files"
-            echo
-            if [ "$PUBLISHED_MAVEN" = true ]; then
-              echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library, also published to GitHub Packages as \`dev.usbdac:usbdac:$VERSION\`."
-            else
-              echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library and its Maven metadata."
-            fi
-            if [ "$PUBLISHED_MAVEN" = true ]; then
-              echo "- \`usbdac-media3-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the optional Media3 integration, also published as \`dev.usbdac:usbdac-media3:$VERSION\`."
-            else
-              echo "- \`usbdac-media3-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the optional Media3 integration and Maven metadata."
-            fi
-            echo "- \`usbdac-$VERSION-jniLibs.zip\`: \`libusbdac.so\` for arm64-v8a, armeabi-v7a, x86_64 and x86."
-            echo "- \`usbdac-core-$VERSION.crate\`: the Rust USB DAC driver, also available as [usbdac-core $VERSION on crates.io](https://crates.io/crates/usbdac-core/$VERSION)."
-            if [ "$VALIDATOR" = true ]; then
-              echo "- \`usbdac-validator-$VERSION-android.apk\`: Android validator, signed with the CI debug key."
-              echo "- \`usbdac-validator-$VERSION-macos-arm64.zip\`: Apple Silicon macOS validator, ad hoc signed and not notarized."
-            fi
-            echo "- \`device-compatibility-candidates.md\`: the source-backed decision list for future device-specific work."
-            echo "- \`SHA256SUMS.txt\`: SHA-256 checksums of the files above."
-          } > release-notes.md
-          cat release-notes.md
-
+          (cd release-assets && sha256sum -- * > SHA256SUMS.txt)
+          python3 .github/scripts/release_notes.py --output release-notes.md
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            release-assets/*
+            release-assets/
             release-notes.md
           if-no-files-found: error
-          retention-days: 14
 
   release:
     name: Create the GitHub Release
     needs: [prepare, package]
-    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.package.result == 'success' }}
+    if: needs.package.result == 'success'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
     permissions:
       contents: write
       actions: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-assets
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
-
-      - name: Create or update the release
+      - name: Create the release without replacing existing assets
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
           COMMIT: ${{ needs.prepare.outputs.commit }}
-          TAG: v${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          files=(dist/release-assets/*)
-          if draft=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [ "$GITHUB_EVENT_NAME" = push ] && [ "$draft" = false ]; then
-              echo "$TAG already has a published release"
-              exit 0
-            fi
-            echo "$TAG already has a release: replacing its files and notes"
-            gh release upload "$TAG" "${files[@]}" --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --target "$COMMIT" --draft=false \
-              --notes-file dist/release-notes.md
-          else
-            gh release create "$TAG" "${files[@]}" --repo "$REPO" --target "$COMMIT" \
-              --title "usbdac $VERSION" --notes-file dist/release-notes.md
-          fi
-
+          python3 - <<'PYRELEASE'
+          import hashlib, json, os, subprocess, urllib.error, urllib.request
+          from pathlib import Path
+          e = os.environ
+          repo, version, commit = e['GITHUB_REPOSITORY'], e['VERSION'], e['COMMIT']
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/' + path, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'usbdac-release/1'})
+              request.add_unredirected_header('Authorization', 'Bearer ' + e['GH_TOKEN'])
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise
+          release = get(f'repos/{repo}/releases/tags/v{version}')
+          tag = get(f'repos/{repo}/commits/v{version}')
+          if tag is not None and tag.get('sha') != commit:
+              raise SystemExit('Existing tag points to a different source')
+          if release is not None:
+              expected = {p.name: 'sha256:' + hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('dist/release-assets').iterdir() if p.is_file()}
+              actual = {a['name']: a.get('digest') for a in release['assets']}
+              notes = Path('dist/release-notes.md').read_text()
+              if release.get('draft') or tag is None or expected != actual or (release.get('body') or '').strip() != notes.strip():
+                  raise SystemExit('Existing release, tag or asset digest differs; refusing replacement')
+              print('Existing release and every asset match the verified payload')
+          else:
+              subprocess.run(['gh', 'release', 'create', f'v{version}', *map(str, sorted(Path('dist/release-assets').iterdir())),
+                  '--repo', repo, '--target', commit, '--title', f'usbdac {version}',
+                  '--notes-file', 'dist/release-notes.md'], check=True)
+          PYRELEASE
       - name: Refresh the documentation after an automatic release
         if: github.event_name == 'push'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref main

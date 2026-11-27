@@ -16,6 +16,7 @@ import dev.usbdac.internal.toJson
 import dev.usbdac.internal.toCaptureJson
 import dev.usbdac.internal.parseCaptureFormat
 import org.json.JSONObject
+import org.json.JSONArray
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -83,6 +84,8 @@ public class DacSession private constructor(
     private var duplex: DacDuplexStream? = null
 
     public val routing: DacRouting = DacRouting(dac, ::checkOpen)
+    /** Routing hand-back state, including delayed retirement after close. */
+    public val routingHandBack: RoutingHandBackState get() = routing.handBack
 
     /** State of the session. */
     public val state: StateFlow<DacState> get() = mutableState
@@ -140,6 +143,12 @@ public class DacSession private constructor(
         return nativeCall { parseStreamFormat(Native.dacNegotiate(dac, request.toJson())) }
     }
 
+    internal fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat {
+        checkOpen()
+        val json = JSONArray().apply { requests.forEach { put(JSONObject(it.toJson())) } }
+        return nativeCall { parseStreamFormat(Native.dacNegotiateCandidates(dac, json.toString())) }
+    }
+
     /**
      * Export the most recent stream's USB feedback support report as JSON.
      * Available after the stream fails or closes. Closing an opted-in session
@@ -194,16 +203,25 @@ public class DacSession private constructor(
      * [DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT] while [current] remains open/draining (no hidden flush).
      * [DacErrorCode.RECONFIGURE_UNUSABLE] requires closing this session. Duplex is refused.
      */
+    public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration =
+        reconfigureCandidates(current, listOf(request), drainTimeoutMs)
+
+    /**
+     * Reconfigure once with up to four ascending same-rate/channel PCM widening candidates.
+     * A runtime refusal is rolled back unless the native backend can prove retry is safe.
+     */
     @Synchronized
-    public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration {
+    public fun reconfigureCandidates(current: DacStream, requests: List<StreamRequest>, drainTimeoutMs: Long = 5_000): StreamReconfiguration {
         checkOpen()
+        require(requests.isNotEmpty() && requests.size <= 4) { "expected one to four candidates" }
         require(drainTimeoutMs >= 0) { "negative drain timeout" }
         if (stream !== current || duplex != null) {
             throw DacException(DacErrorCode.INVALID_ARGUMENT, "current must be this session's playback-only stream")
         }
         val signals = StreamSignals { event -> mutableEvents.tryEmit(event) }
-        val response = nativeCall { JSONObject(Native.streamReconfigure(dac, current.handleForReconfigure(),
-            request.toJson(), drainTimeoutMs, signals)) }
+        val candidates = JSONArray().apply { requests.forEach { put(JSONObject(it.toJson())) } }
+        val response = nativeCall { JSONObject(Native.streamReconfigureCandidates(dac, current.handleForReconfigure(),
+            candidates.toString(), drainTimeoutMs, signals)) }
         val handle = nativeCall { response.getLong("stream_id") }
         current.retiredByReconfigure()
         try {
@@ -283,6 +301,7 @@ public class DacSession private constructor(
     public fun close(handBack: HandBack) {
         if (!closed.compareAndSet(false, true)) return
         val retirement = runCatching { Native.dacRetirementToken(dac) }.getOrDefault(0L)
+        routing.beginHandBack(retirement != 0L)
         fun retired() = runCatching { if (retirement != 0L) Native.dacAwaitRetirementToken(retirement) else Native.dacAwaitConnectionRetirement(connection.fileDescriptor) }.getOrDefault(false)
         var failure: DacException? = null
         try {
@@ -304,6 +323,7 @@ public class DacSession private constructor(
             }
         } finally {
             fun releaseHostOwnership() {
+                routing.publishHandBack(retirement)
                 if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }
                 claims.release()
                 runCatching { configurationSelection.restore() }.onFailure {
@@ -343,6 +363,58 @@ public class DacSession private constructor(
         checkOpen()
         check(stream == null && duplex == null) { "validator requires an idle session" }
         return Native.validatorRun(dac, captureDirectory)
+    }
+
+    /** Retire native work after the explicit legacy-open path fails; hand-back is caller-owned. */
+    @Synchronized
+    internal fun closeForFailedLegacyOpen(isAttached: () -> Boolean): PendingUsbConfigurationRestore {
+        if (!closed.compareAndSet(false, true)) {
+            throw DacException(DacErrorCode.INVALID_STATE, "the session is already closed")
+        }
+        var preliminaryFailure: Throwable? = null
+        fun recordPreliminary(error: Throwable) {
+            if (preliminaryFailure == null) preliminaryFailure = error else preliminaryFailure?.addSuppressed(error)
+        }
+        val retirementResult = runCatching { Native.dacRetirementToken(dac) }
+        retirementResult.exceptionOrNull()?.let(::recordPreliminary)
+        val retirement = retirementResult.getOrDefault(0L)
+        routing.beginHandBack(retirement != 0L)
+        val fdResult = runCatching { connection.fileDescriptor }
+        fdResult.exceptionOrNull()?.let(::recordPreliminary)
+        val fd = fdResult.getOrNull()
+        fun retired(): Boolean = runCatching {
+            if (retirement != 0L) Native.dacAwaitRetirementToken(retirement)
+            else fd?.let { Native.dacAwaitConnectionRetirement(it) } ?: false
+        }.getOrDefault(false)
+        // Closing native state starts retirement; no Android configuration restoration occurs here.
+        runCatching { (duplex ?: stream)?.close() }.onFailure(::recordPreliminary)
+        if (config.captureFeedbackTrace) runCatching { readFeedbackTrace() }
+            .onSuccess { closedFeedbackTrace = it }.onFailure(::recordPreliminary)
+        runCatching { volume?.close() }.onFailure(::recordPreliminary)
+        runCatching { volumeExecutor.shutdown() }.onFailure(::recordPreliminary)
+        runCatching { nativeCall { Native.dacClose(dac) } }.onFailure(::recordPreliminary)
+        runCatching { mutableState.value = DacState.CLOSED }.onFailure(::recordPreliminary)
+        return PendingUsbConfigurationRestore(::retired) {
+            var failure: Throwable? = preliminaryFailure
+            fun record(error: Throwable) {
+                if (failure == null) failure = error else failure?.addSuppressed(error)
+            }
+            try {
+                if (runCatching { isAttached() }.getOrDefault(false)) {
+                    val released = runCatching { claims.releaseChecked() }.onFailure(::record).isSuccess
+                    // Recheck after releasing claims; a new attachment must never receive a restore.
+                    if (released && runCatching { isAttached() }.getOrDefault(false)) {
+                        runCatching { configurationSelection.restore() }.onFailure(::record)
+                    } else if (released) record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment changed before configuration restoration"))
+                } else record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment is no longer present; configuration was not restored"))
+            } finally {
+                routing.publishHandBack(retirement)
+                if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }.onFailure(::record)
+                runCatching { connection.close() }.onFailure(::record)
+                runCatching { onClosed() }.onFailure(::record)
+            }
+            failure?.let { throw it }
+        }
     }
 
     private fun checkOpen() {

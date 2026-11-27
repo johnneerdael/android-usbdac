@@ -96,6 +96,13 @@ impl Output {
         &self.grant
     }
 
+    /// Invalidate a constrained route before notifying observers. The device is closed by its owner.
+    pub fn invalidate_route(&self) -> Result<(), AaudioError> {
+        self.check_open()?;
+        self.shared.on_error(ERROR_DISCONNECTED);
+        Ok(())
+    }
+
     pub fn grant_json(&self) -> String {
         grant_json(&self.capability, &self.grant).to_string()
     }
@@ -113,6 +120,11 @@ impl Output {
 
     pub fn start(&self) -> Result<(), AaudioError> {
         self.check_open()?;
+        if self.playback().has_failed() {
+            return Err(AaudioError::device_lost(
+                "the constrained audio route was invalidated",
+            ));
+        }
         self.device.start()
     }
 
@@ -236,6 +248,7 @@ mod tests {
             buffer_capacity_frames: 64,
             buffer_size_frames: 16,
             device_id: 3,
+            device_ids: None,
             performance_mode: PERFORMANCE_LOW_LATENCY,
             mmap: Some(true),
             hardware: None,
@@ -412,6 +425,22 @@ mod tests {
         output.shared.on_error(-896);
         assert_eq!(events.lock().last(), Some(&Event::Failed(-896)));
         output.close().unwrap();
+    }
+
+    #[test]
+    fn explicit_route_invalidation_fails_before_later_writes_and_survives_flush() {
+        let (output, _, events) = open(grant(SHARING_EXCLUSIVE, 1_000, FORMAT_PCM_I16));
+        let output = output.unwrap();
+        output.invalidate_route().unwrap();
+        assert_eq!(output.start().unwrap_err().code, "device_lost");
+        assert_eq!(
+            *events.lock(),
+            vec![Event::Disconnected(ERROR_DISCONNECTED)]
+        );
+        assert_eq!(output.writable_bytes(), 0);
+        assert_eq!(output.write(&[0, 0]).unwrap_err().code, "device_lost");
+        output.flush().unwrap();
+        assert_eq!(output.write(&[0, 0]).unwrap_err().code, "device_lost");
     }
 
     #[test]

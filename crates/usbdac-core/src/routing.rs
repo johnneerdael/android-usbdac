@@ -12,7 +12,10 @@
 
 use std::collections::BTreeMap;
 
-pub use crate::transport::routing_hw::{RouteEdit, RoutingSessionError, RoutingSnapshot};
+pub use crate::transport::routing_hw::{
+    RouteEdit, RoutingDiagnostic, RoutingHandBackOutcome, RoutingHandBackReport,
+    RoutingSessionError, RoutingSnapshot,
+};
 
 /// AudioControl interface and entity identity, scoped to the active configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -667,6 +670,7 @@ pub trait RoutingIo {
     type Error;
     fn read(&mut self, request: ControlRequest, data: &mut [u8]) -> Result<usize, Self::Error>;
     fn write(&mut self, request: ControlRequest, data: &[u8]) -> Result<usize, Self::Error>;
+    fn begin_recovery(&mut self) {}
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -713,7 +717,7 @@ fn read_exact<I: RoutingIo>(
     Ok(())
 }
 
-fn write_verified<I: RoutingIo>(
+pub(crate) fn write_verified<I: RoutingIo>(
     io: &mut I,
     control: RouteControl,
     value: RouteValue,
@@ -746,6 +750,16 @@ pub fn apply_routes<I: RoutingIo>(
     inventory: &RoutingInventory,
     io: &mut I,
     changes: &[RouteChange],
+) -> Result<RouteReport, TransactionError<I::Error>> {
+    apply_routes_traced(inventory, io, changes, &mut Vec::new())
+}
+
+/// Actual CUR and attempted target for each SET, including ambiguous failures.
+pub(crate) fn apply_routes_traced<I: RoutingIo>(
+    inventory: &RoutingInventory,
+    io: &mut I,
+    changes: &[RouteChange],
+    attempted_values: &mut Vec<(ControlKey, RouteValue, RouteValue)>,
 ) -> Result<RouteReport, TransactionError<I::Error>> {
     let error = |index, cause| TransactionError {
         failed_change: index,
@@ -801,8 +815,10 @@ pub fn apply_routes<I: RoutingIo>(
             continue;
         }
         attempted.push(i);
+        attempted_values.push((change.key, *original, change.value));
         if let Err(cause) = write_verified(io, *control, change.value) {
             let mut failure = error(Some(i), cause);
+            io.begin_recovery();
             for &j in attempted.iter().rev() {
                 if let Err(e) = write_verified(io, controls[j], originals[j]) {
                     failure.rollback_failures.push((changes[j].key, e));
@@ -1297,6 +1313,31 @@ mod tests {
     }
 
     #[test]
+    fn trace_retains_actual_prewrite_values_for_failed_and_uncertain_sets() {
+        let mut io = MockIo::selectors();
+        io.fail_writes = vec![2, 3];
+        let edits = [select(7, 2), select(8, 2)];
+        let mut trace = Vec::new();
+        let error = apply_routes_traced(&inventory(), &mut io, &edits, &mut trace).unwrap_err();
+        assert_eq!(
+            trace,
+            vec![
+                (
+                    edits[0].key,
+                    RouteValue::SelectorPin(1),
+                    RouteValue::SelectorPin(2)
+                ),
+                (
+                    edits[1].key,
+                    RouteValue::SelectorPin(1),
+                    RouteValue::SelectorPin(2)
+                ),
+            ]
+        );
+        assert_eq!(error.rollback_failures[0].0, edits[1].key);
+    }
+
+    #[test]
     fn mismatched_readback_restores_attempted_control() {
         let mut io = MockIo::selectors();
         io.ignore_writes = vec![1];
@@ -1348,6 +1389,33 @@ mod tests {
             }
         );
         assert!(io.writes.is_empty());
+    }
+
+    #[test]
+    fn raw_restore_replays_off_grid_cur_and_detects_mismatch() {
+        let inv = inventory();
+        let key = ControlKey::Crosspoint {
+            entity: Entity {
+                interface: 3,
+                id: 9,
+            },
+            input_pin: 1,
+            input_channel: 1,
+            output_channel: 1,
+        };
+        let mut io = MockIo {
+            current: BTreeMap::from([((0x0903, 0x0100), (-256i16).to_le_bytes().to_vec())]),
+            range: vec![1, 0, 0, 254, 0, 0, 0, 1],
+            ..MockIo::default()
+        };
+        let control = inv.control(key).unwrap();
+        write_verified(&mut io, control, RouteValue::MixerGain(-255)).unwrap();
+        assert_eq!(io.current[&(0x0903, 0x0100)], (-255i16).to_le_bytes());
+        io.ignore_writes = vec![2];
+        assert!(matches!(
+            write_verified(&mut io, control, RouteValue::MixerGain(-256)),
+            Err(RoutingError::ReadbackMismatch { .. })
+        ));
     }
 
     #[test]

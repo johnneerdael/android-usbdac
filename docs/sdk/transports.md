@@ -29,7 +29,7 @@ The library opens the USB device, claims the audio interfaces away from Android'
   [Clock and pacing](decisions-clock.md#feedback)
 - **Hardware volume.** Volume is the DAC's own volume control (`DacVolume`), which scales the audio in the DAC and leaves the stream bit-perfect.
 - **DSD.** DoP and native DSD, when the DAC offers them.
-- **Costs.** A permission dialog per device. `UsbDac.open`, `negotiate` and `openStream` take 100 ms or more each. One session per process. It depends on the DAC following the USB Audio Class; a DAC with quirks may need an entry in `DacConfig.quirks`. A foreground service is the app's business if it plays in the background.
+- **Costs.** A permission dialog per device. `UsbDac.open`, `negotiate` and `openStream` take 100 ms or more each. One owner per attachment; distinct attachments can have independent sessions. It depends on the DAC following the USB Audio Class; a DAC with quirks may need an entry in `DacConfig.quirks`. A foreground service is the app's business if it plays in the background.
 - **Failure modes.** A DAC that Android will not let go of (`CLAIM`), an asynchronous route without usable feedback (`IMPLICIT_FEEDBACK_UNSUPPORTED`), a DAC whose clock readback does not work (`CLOCK_UNVERIFIED`). See [troubleshooting](troubleshooting.md).
 
 ## Android-managed: `AndroidManagedOutput`
@@ -51,7 +51,7 @@ What you write is PCM in the encoding of the request, little-endian and interlea
 | 24 | packed signed 24-bit, 3 bytes | Android 12 (API 31) |
 | 32 | signed 32-bit | Android 12 (API 31) |
 
-DSD, DoP and other encodings fail with `UNSUPPORTED`: the platform mixer would destroy them. `StreamRequest.ratePolicy` is ignored; the track is created at the requested rate and Android decides what to do if the route cannot run it. There is no software gain; the system volume applies.
+These low-level outputs accept PCM, not raw DSD or DoP. The selector can convert eligible DSD to PCM before opening a platform output when policy permits; see [automatic output](automatic-output.md#conversion). `StreamRequest.ratePolicy` is ignored; the track is created at the requested rate and Android decides what to do if the route cannot run it. There is no software gain; the system volume applies.
 
 ### What is and is not guaranteed
 
@@ -90,7 +90,7 @@ What you write is PCM in the encoding of the request, little-endian and interlea
 | 32 | signed 32-bit | Android 12 (API 31) |
 | 32 with `AAudioConfig(floatSamples = true)` | 32-bit float | Android 8.0 |
 
-Below the release a format needs, `open` fails with `UNSUPPORTED` and a message naming the API levels. DSD and DoP fail with `UNSUPPORTED` as well. `StreamRequest.ratePolicy` is ignored: the stream runs at exactly the rate you ask for, or the open fails. [Controls](controls.md#the-aaudio-output-aaudioconfig) lists every option.
+Below the release a format needs, `open` fails with `UNSUPPORTED` and a message naming the API levels. The low-level AAudio output accepts PCM, not raw DSD or DoP; the selector may supply a converted PCM stream when policy permits. `StreamRequest.ratePolicy` is ignored: the stream runs at exactly the rate you ask for, or the open fails. [Controls](controls.md#the-aaudio-output-aaudioconfig) lists every option.
 
 ### The grant
 

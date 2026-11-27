@@ -6,6 +6,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.exoplayer.audio.AudioSink
 import dev.usbdac.DacErrorCode
 import dev.usbdac.DacException
+import dev.usbdac.*
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -189,13 +190,48 @@ class UsbDacAudioSinkTest {
     }
 
     @Test
-    fun declinesWhatItCannotPlayExactly() {
-        val sink = UsbDacAudioSink(FakeOutputSource())
+    fun supportUsesCachedSourceVerdictAndLeavesUnknownConservative() {
+        val fake = FakeOutputSource()
+        var support = OutputFormatSupport.DIRECT
+        var queries = 0
+        val source = object : OutputSource by fake {
+            override fun formatSupport(request: StreamRequest): OutputSupport {
+                queries++
+                return OutputSupport(support, request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
         val float = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_RAW).setPcmEncoding(C.ENCODING_PCM_FLOAT)
             .setSampleRate(44_100).setChannelCount(2).build()
         assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(float))
         assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(pcm(16, channels = 6)))
-        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(pcm(24)))
+        val compressed = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_MPEG).setSampleRate(44_100).setChannelCount(2).build()
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(compressed))
+        support = OutputFormatSupport.WITH_TRANSCODING
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, sink.getFormatSupport(pcm(24)))
+        support = OutputFormatSupport.UNSUPPORTED
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(float))
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, UsbDacAudioSink(fake).getFormatSupport(pcm(16)))
+        assertEquals(3, queries)
+        assertTrue(fake.opened.isEmpty())
+    }
+
+    @Test
+    fun directSessionSupportUsesMatchingAlternatesAndReportsWidening() {
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 4, 24, emptyList(), listOf(48_000),
+            SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        val pcm24 = StreamRequest.pcm(48_000, 2, 24)
+        val pcm16 = StreamRequest.pcm(48_000, 2, 16)
+        assertEquals(OutputFormatSupport.DIRECT, directSessionSupport(listOf(alt), pcm24, true).support)
+        assertEquals(OutputFormatSupport.WITH_TRANSCODING, directSessionSupport(listOf(alt), pcm16, true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), pcm16, false).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), pcm24.copy(sampleRate = 96_000), true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), StreamRequest.pcmFloat32(48_000, 2), true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt.copy(pacing = null)), pcm24, true).support)
+        val alt32 = alt.copy(validBits = 32)
+        val wrongRate = alt.copy(validBits = 16, sampleRates = listOf(96_000))
+        assertEquals(listOf(24, 32), reconfigurationCandidates(listOf(wrongRate, alt32, alt), pcm16, true).map { it.bitDepth })
+        assertTrue(reconfigurationCandidates(listOf(alt), pcm16, false).isEmpty())
     }
     @Test
     fun trimsDelayAndPaddingWithoutChangingIntegerPrecisionAcrossGaplessTracks() {
@@ -352,6 +388,104 @@ class UsbDacAudioSinkTest {
         assertEquals("pause", fake.opened.last().calls.last())
         sink.reset()
         assertTrue(fake.opened.last().closed)
+    }
+
+    @Test
+    fun invalidReplacementIsClosedOnceAndNeverUsedAfterFlush() {
+        val fake = FakeOutputSource()
+        val source = object : OutputSource by fake {
+            override fun reconfigure(output: OpenedOutput, request: dev.usbdac.StreamRequest): OutputReconfiguration {
+                output.output.close()
+                return OutputReconfiguration(fake.open(output.request)) // wrong format for requested transition
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        fake.opened.first().drained = true
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(24, 96_000)).build())
+        val input = audio(4, 6)
+        assertThrows(AudioSink.InitializationException::class.java) { sink.handleBuffer(input, 0, 1) }
+        assertEquals(1, fake.opened.last().calls.count { it == "close" })
+        assertEquals(0, input.position())
+        sink.flush()
+        assertTrue(sink.handleBuffer(input, 0, 1))
+        assertEquals(1, fake.opened[1].calls.count { it == "close" })
+        assertEquals(0, fake.opened[1].written.size())
+    }
+
+    @Test
+    fun invalidFirstLayoutIsClosedOnceAndRetryOpensFreshOutput() {
+        val invalid = FakeOutputSource(wireBytes = 1)
+        val valid = FakeOutputSource()
+        var first = true
+        val source = object : OutputSource by valid {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput =
+                if (first) { first = false; invalid.open(request) } else valid.open(request)
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        val input = audio(4, 4)
+        assertThrows(AudioSink.InitializationException::class.java) { sink.handleBuffer(input, 0, 1) }
+        assertEquals(1, invalid.opened.single().calls.count { it == "close" })
+        assertTrue(sink.handleBuffer(input, 0, 1))
+        assertEquals(1, invalid.opened.single().calls.count { it == "close" })
+    }
+
+    @Test
+    fun malformedSampleRateIsAConfigurationException() {
+        val sink = UsbDacAudioSink(FakeOutputSource())
+        assertThrows(AudioSink.ConfigurationException::class.java) {
+            sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16, 0)).build())
+        }
+    }
+
+    @Test
+    fun switchDrainFailureIsTypedAndRetainsOldFormat() {
+        val fake = FakeOutputSource()
+        val failure = DacException(DacErrorCode.INVALID_STATE, "drain failed")
+        val source = object : OutputSource by fake {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput {
+                val opened = fake.open(request)
+                val failing = object : dev.usbdac.PcmOutput by opened.output {
+                    override fun drain() { throw failure }
+                }
+                return OpenedOutput(failing, opened.format, opened.request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        val oldFormat = pcm(16)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(oldFormat).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(24, 96_000)).build())
+        val error = assertThrows(AudioSink.WriteException::class.java) {
+            sink.handleBuffer(audio(4, 6), 0, 1)
+        }
+        assertEquals(oldFormat, error.format)
+        assertTrue(error.cause is OutputRecoveryRequiredException)
+        assertEquals(failure, error.cause?.cause)
+    }
+
+    @Test
+    fun drainStatusFailureIsReportedByNextEndOfStreamCallback() {
+        val fake = FakeOutputSource()
+        val failure = DacException(DacErrorCode.INVALID_STATE, "drain status failed")
+        val source = object : OutputSource by fake {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput {
+                val opened = fake.open(request)
+                val failing = object : dev.usbdac.PcmOutput by opened.output {
+                    override val isDrained: Boolean get() = throw failure
+                }
+                return OpenedOutput(failing, opened.format, opened.request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        sink.playToEndOfStream()
+        assertFalse(sink.isEnded())
+        val error = assertThrows(AudioSink.WriteException::class.java) { sink.playToEndOfStream() }
+        assertEquals(failure, error.cause?.cause)
     }
 
 }

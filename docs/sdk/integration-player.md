@@ -12,7 +12,7 @@ A direct stream sends the bytes you write. For the output to be what the file co
 | 24-bit | `StreamRequest.pcm(rate, channels, 24)` | The DAC may carry it in a 3-byte or 4-byte slot. `format.subslotBytes` says which; you write what it says |
 | 32-bit integer | `StreamRequest.pcm(rate, channels, 32)` | |
 | A lossy source (AAC, MP3, Opus, Vorbis) | The decoder's output rate and depth | The transport is bit-perfect with respect to the decoded PCM. The audio is not the file's. Label it by source, see below |
-| DSD | `StreamRequest.dop(...)` or `dsdNative(...)` | [Bit-perfect output](bit-perfect.md#dsd). DSF files store the least significant bit first, so reverse every byte before writing |
+| DSD | `StreamRequest.dop(...)` or `dsdNative(...)` | [Bit-perfect output](bit-perfect.md#dsd). DSF field `1` requires per-byte reversal; field `8` is already MSB-first |
 
 **Ask for the depth the source has and let `negotiate` choose the alternate setting.** `StreamFormat.validBits` and `subslotBytes` then tell you the layout. A source with fewer bits than the slot is widened by padding the low bits with zero.
 
@@ -78,7 +78,7 @@ The compiled `Transport` class that holds these rules is in [getting started](ge
 
 **The seek order.** The writer may be holding a chunk it rendered for the old position. If the seek flushes the ring and the writer then writes that chunk, the old audio plays after the flush. So the seek takes the writer's lock, repositions the decoder and drops the pending chunk, flushes, and only then lets the writer continue. Flush while paused is fine and cancels nothing on the bus; the ring refills when the writer resumes.
 
-**Why flush on every replacement.** The ring holds up to 250 ms and the bus 16 ms. A flush clears the ring and, by default, cancels the music-carrying transfers on the bus, so the new position is heard within a couple of milliseconds. A deep buffer costs nothing in responsiveness if you flush ([decision 2](decisions-stream.md#ring-depth)).
+**Why flush on replacement.** A flush clears the ring and, by default, requests cancellation of submitted music transfers. The default queue starts around 16 ms and can adapt; already submitted and downstream audio affect audible timing ([decision 2](decisions-stream.md#ring-depth)).
 
 ## Position {#position}
 
@@ -131,7 +131,7 @@ fun setLiveEq(output: SelectedOutput, active: Boolean) {
 
 Native DSD64 through DSD256 and the transition to PCM were verified on the AP80 Pro-X. [Hardware evidence](evidence.md#ap80-native-dsd-transition)
 
-The DSD input and wire-layout rules are in [bit-perfect output](bit-perfect.md#dsd). For the engine: DSF stores bits least significant first and DFF most significant first, so bit-reverse DSF bytes before writing; DoP wants 16 DSD bits per sample in the slot layout with the marker byte left for the library to overwrite; native DSD wants one byte per channel in stream order; the position counters count bytes, so `counterRateHz` is the bit rate over 8; and no gain, no conversion and no equaliser can touch the stream. Use `capabilities.supportsDop` to identify a feasible PCM carrier, then establish that the device decodes DoP markers. `supportsNativeDsd` covers standard UAC3 DSD and supported legacy layouts. Standard UAC3 packing is fixed; retain per-DAC overrides for legacy native DSD, because a wrong legacy byte order sounds like noise and the library cannot detect it.
+The DSD input and wire-layout rules are in [bit-perfect output](bit-perfect.md#dsd). For the engine: DSF field `1` needs per-byte bit reversal while field `8` does not; deblock, interleave channels chronologically and trim to the declared sample count. Raw DSDIFF is MSB-first in Channels Chunk order, excluding IFF padding; unsupported compression must be rejected; DoP wants 16 DSD bits per sample in the slot layout with the marker byte left for the library to overwrite; native DSD wants one byte per channel in stream order; the position counters count bytes, so `counterRateHz` is the bit rate over 8; and no gain, no conversion and no equaliser can touch the stream. Use `capabilities.supportsDop` to identify a feasible PCM carrier, then establish that the device decodes DoP markers. `supportsNativeDsd` covers standard UAC3 DSD and supported legacy layouts. Standard UAC3 packing is fixed; retain per-DAC overrides for legacy native DSD, because a wrong legacy byte order can corrupt playback and the library cannot detect it.
 
 ## Events the engine should react to
 

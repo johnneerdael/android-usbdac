@@ -280,6 +280,10 @@ impl Playback {
         self.closing.store(true, Ordering::Release);
     }
 
+    pub fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// The route failed (`code` is the AAudio error); further writes are `device_lost`.
     pub fn fail(&self, code: i32) {
         self.failure.store(code, Ordering::Relaxed);

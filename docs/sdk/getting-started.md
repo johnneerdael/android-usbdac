@@ -37,7 +37,7 @@ Add the dependency in your app module's `build.gradle.kts`.
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.10")
+    implementation("dev.usbdac:usbdac:0.1.11")
 }
 ```
 
@@ -45,27 +45,27 @@ For ExoPlayer/Media3, add the optional integration at the same version. It bring
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac-media3:0.1.10")
+    implementation("dev.usbdac:usbdac-media3:0.1.11")
 }
 ```
 
 See [the Kotlin player guide](guide-kotlin.md) for the integer-precision sink, gapless trimming and session volume. The base AAR and sample app do not depend on Media3. When downloading AARs directly, include both core and integration AARs plus their declared Maven dependencies; a standalone AAR does not resolve dependencies automatically.
 
-For a download without registry credentials, put `usbdac-0.1.10.aar`
-from the [0.1.10 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.10)
+For a download without registry credentials, put `usbdac-0.1.11.aar`
+from the [0.1.11 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.11)
 in your app module's `libs/` directory. Use these dependencies in place of
 the registry coordinate.
 
 ```gradle
 dependencies {
-    implementation(files("libs/usbdac-0.1.10.aar"))
+    implementation(files("libs/usbdac-0.1.11.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
 ```
 
 If you build from source, run `./gradlew :usbdac:publishToMavenLocal` in
 `android/`, add `mavenLocal()` to your repositories and depend on
-`dev.usbdac:usbdac:0.1.10`. The Maven metadata brings in coroutines.
+`dev.usbdac:usbdac:0.1.11`. The Maven metadata brings in coroutines.
 
 The library needs Android 8.0 (API 26) or later. An app that uses the published AAR needs no Rust and no NDK; [building from source](#building-from-source) does.
 
@@ -211,7 +211,7 @@ fun openConverting(session: DacSession, source: StreamRequest, wireBitDepth: Int
 }
 ```
 
-`negotiate` with `RatePolicy.NEAREST_SUPPORTED` returns the rate the DAC runs (`StreamFormat.rateDiffersFromRequest`). `ConversionPlan.between(source, format)` works out the smallest chain from what the host has to what the DAC runs, and says how much damage it does (`plan.kind`, `plan.description`): a changed rate is `LOSSY`, and so are fewer bits; mono to stereo is `LOSSLESS` but not identical; widening to more bits (the new low bits are zero) and moving a sample between slot sizes are `BIT_EXACT` and keep the stream bit-perfect. The `ConvertingOutput` is a `PcmOutput`: write the **source** format to it, and its `playedFrames`, `latencyFrames` and `writableBytes` are in source units, so the position arithmetic below is unchanged. Its `bitPerfect` is `NotVerified` with the plan's description whenever the plan is not `NONE` or `BIT_EXACT`. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) and [controls](controls.md#conversion-conversionoptions) have the details; DoP and native DSD are never converted. Build the plan and the converter off the main thread (negotiating takes 100 ms or more, and a resampler synthesises its filter).
+`negotiate` with `RatePolicy.NEAREST_SUPPORTED` returns the rate the DAC runs (`StreamFormat.rateDiffersFromRequest`). `ConversionPlan.between(source, format)` works out the smallest chain from what the host has to what the DAC runs, and says how much damage it does (`plan.kind`, `plan.description`): a changed rate is `LOSSY`, and so are fewer bits; mono to stereo is `LOSSLESS` but not identical; widening to more bits (the new low bits are zero) and moving a sample between slot sizes are `BIT_EXACT` and keep the stream bit-perfect. The `ConvertingOutput` is a `PcmOutput`: write the **source** format to it, and its `playedFrames`, `latencyFrames` and `writableBytes` are in source units, so the position arithmetic below is unchanged. Its `bitPerfect` is `NotVerified` with the plan's description whenever the plan is not `NONE` or `BIT_EXACT`. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) and [controls](controls.md#conversion-conversionoptions) have the details; This PCM helper does not accept DoP or native DSD; the selector has a separate, lossy DSD-to-PCM path with explicit consent to unpack DoP. Build the plan and the converter off the main thread (negotiating takes 100 ms or more, and a resampler synthesises its filter).
 
 ## 6. Write audio
 
@@ -283,7 +283,7 @@ The buffer is deep (250 ms by default) so that a stall upstream does not become 
 | Position | `startTime + playedFrames / counterRateHz`, with `startTime` set at each flush |
 | Volume | `DacSession.volume` (hardware). Software gain only if you accept losing bit-perfect output |
 
-`flush()` drops everything in the buffer and resets `playedFrames` to 0 at once, and cancels the audio already on the bus (`busQueueMs`, 16 ms by default; `DacConfig.cancelInFlightOnFlush`), so a seek is heard within a couple of milliseconds. The cancelled audio is not lost audio and the flag stays bit-perfect. `pause()` sends silence so the DAC stays locked. The sample's buttons (the same calls drive the other two outputs, which the sample reaches through `other`):
+`flush()` drops the ring and resets `playedFrames` to 0; by default it requests cancellation of submitted audio (`DacConfig.cancelInFlightOnFlush`). Cancellation is asynchronous, and downstream or already submitted audio affects audible timing. The cancelled audio is not lost audio and the flag stays bit-perfect. `pause()` sends silence so the DAC stays locked. The sample's buttons (the same calls drive the other two outputs, which the sample reaches through `other`):
 
 ```kotlin
         click(R.id.flushButton) {

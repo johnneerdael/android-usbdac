@@ -21,6 +21,10 @@ import dev.usbdac.DacHotplugEvent
 import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
+import dev.usbdac.DownstreamBinding
+import dev.usbdac.DacException
+import dev.usbdac.DacErrorCode
+import dev.usbdac.RouteKind
 import dev.usbdac.OutputChange
 import dev.usbdac.OutputRoute
 import dev.usbdac.PcmConverter
@@ -74,6 +78,39 @@ internal class AndroidOutputPlatform(context: Context) : OutputPlatform {
     override fun probeAAudio(request: StreamRequest, config: AAudioConfig): AAudioOffer =
         AAudioExclusiveOutput.probe(NativeAAudioBackend, Build.VERSION.SDK_INT, request, deviceId = 0, config = config)
 
+    override fun probeAAudio(request: StreamRequest, config: AAudioConfig, route: OutputRoute): AAudioOffer =
+        AAudioExclusiveOutput.probe(NativeAAudioBackend, Build.VERSION.SDK_INT, request, route.id, config)
+
+    override fun bindDownstream(dac: DacDeviceInfo, protectedRoute: OutputRoute?, independentRoute: OutputRoute, independentDacs: List<DacDeviceInfo>): DownstreamBinding {
+        if (Build.VERSION.SDK_INT < 28 || independentRoute.kind != RouteKind.BUILT_IN) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "a built-in output on API 28 or later is required")
+        }
+        val device = independentRoute.device ?: throw DacException(DacErrorCode.INVALID_ARGUMENT, "route lacks platform identity")
+        if (!device.isSink || device.id != independentRoute.id || device.type !in listOf(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)) {
+            throw DacException(DacErrorCode.INVALID_ARGUMENT, "independent route must be a built-in sink")
+        }
+        if (protectedRoute != null) {
+            val protectedDevice = protectedRoute.device
+            if (protectedRoute.kind != RouteKind.USB || protectedDevice == null || !protectedDevice.isSink ||
+                protectedDevice.id != protectedRoute.id || protectedDevice.type !in listOf(
+                    AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_ACCESSORY) ||
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).none {
+                    it.id == protectedDevice.id && it.type == protectedDevice.type && it.address == protectedDevice.address && it.isSink
+                }) throw DacException(DacErrorCode.INVALID_ARGUMENT, "protected route is not a current USB sink")
+        }
+        if (attachedDacs().none { it.deviceName == dac.deviceName && it.device.deviceId == dac.device.deviceId &&
+                it.vendorId == dac.vendorId && it.productId == dac.productId }) {
+            throw DacException(DacErrorCode.DEVICE_LOST, "protected USB attachment is absent")
+        }
+        val attached = attachedDacs()
+        fun same(a: DacDeviceInfo, b: DacDeviceInfo): Boolean = a.deviceName == b.deviceName &&
+            a.device.deviceId == b.device.deviceId && a.vendorId == b.vendorId && a.productId == b.productId
+        if (independentDacs.any { declared -> same(declared, dac) || attached.none { same(it, declared) } }) {
+            throw DacException(DacErrorCode.INVALID_ARGUMENT, "independent DACs must be distinct current USB attachments")
+        }
+        return DownstreamBinding(app, dac, independentRoute, device, independentDacs)
+    }
+
     override fun plan(source: StreamRequest, target: StreamFormat): ConversionPlan =
         ConversionPlan.between(source, target, ConversionOptions())
 
@@ -123,6 +160,8 @@ internal class SessionLink(override val session: DacSession) : DirectLink {
         private set
 
     override fun negotiate(request: StreamRequest): StreamFormat = session.negotiate(request)
+
+    override fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat = session.negotiateCandidates(requests)
 
     override fun openStream(format: StreamFormat): PcmOutput = session.openStream(format).also { stream = it }
 

@@ -9,16 +9,28 @@ on:
       source_sha:
         required: true
         type: string
+      version:
+        required: true
+        type: string
+      reservation_run_id:
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.android.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.android.outputs.artifact_digest }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_call' && github.run_id || github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.source_sha != '' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.91.1
   # The NDK the native build is pinned to (android/usbdac/build.gradle.kts, ndkVersion).
   NDK_VERSION: 28.2.13676358
   CARGO_NDK_VERSION: 4.1.2
@@ -36,8 +48,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_VERSION"
           rustup target add aarch64-linux-android
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -83,6 +95,9 @@ jobs:
         run: python3 -I .github/scripts/check_docs_snippets.py
 
   android:
+    outputs:
+      artifact_id: ${{ steps.release_payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.release_payload.outputs.artifact-digest }}
     name: AAR, unit tests and sample
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -90,12 +105,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Pin the Gradle distribution checksum
+        run: |
+          echo 'distributionSha256Sum=17f277867f6914d61b1aa02efab1ba7bb439ad652ca485cd8ca6842fccec6e43' >> android/gradle/wrapper/gradle-wrapper.properties
 
       - name: Install Rust and the Android targets
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -114,7 +134,7 @@ jobs:
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21.0.8+9"
 
       - name: Install the Android SDK components
         run: |
@@ -154,6 +174,28 @@ jobs:
             echo "$listing" | grep -q "jni/$abi/libusbdac.so" || { echo "jni/$abi/libusbdac.so is missing from the AAR"; exit 1; }
           done
 
+      - name: Stage immutable release deliverables
+        if: inputs.source_sha != ''
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RESERVATION_RUN_ID: ${{ inputs.reservation_run_id }}
+        run: |
+          set -euo pipefail
+          git show "$GITHUB_SHA:.github/scripts/release_artifact.py" > "$RUNNER_TEMP/release_artifact.py"
+          (cd android && ./gradlew :usbdac:publishReleasePublicationToStagingRepository :usbdac-media3:publishReleasePublicationToStagingRepository --console=plain)
+          cargo package --locked -p usbdac-core --no-verify
+          python3 -I "$RUNNER_TEMP/release_artifact.py" stage release-payload --version "$VERSION"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: release_payload
+        if: inputs.source_sha != ''
+        with:
+          name: release-payload-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.source_sha }}
+          path: release-payload/
+          if-no-files-found: error
+          retention-days: 90
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: usbdac-aar-and-sample
@@ -166,7 +208,9 @@ jobs:
         if: failure()
         with:
           name: unit-test-reports
-          path: android/usbdac/build/reports/tests
+          path: |
+            android/usbdac/build/reports/tests
+            android/usbdac-media3/build/reports/tests
           retention-days: 7
 
   defensive-fuzz:

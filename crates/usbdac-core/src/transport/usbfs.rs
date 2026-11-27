@@ -21,6 +21,99 @@ impl DeviceKey {
     }
 }
 
+pub(super) fn badd_snapshot_matches(
+    active_id: u8,
+    header: &[u8; 9],
+    raw: &[u8],
+    snapshot: &[u8],
+) -> bool {
+    active_id != 0
+        && header[0] == 9
+        && header[1] == 2
+        && header[5] == active_id
+        && raw.len() >= 9
+        && raw[..9] == *header
+        && raw == snapshot
+}
+
+/// A bounded read-only witness on a duplicate of the caller's still-owned fd.
+/// It creates no Dac/session, makes no claim and sends only standard reads.
+pub fn badd_descriptor_witness(fd: RawFd, active_id: u8, snapshot: &[u8]) -> u8 {
+    if fd < 0 || active_id == 0 || snapshot.len() < 9 || snapshot.len() > 16384 {
+        return 0;
+    }
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return 0;
+    }
+    let owned = OwnedUsbFd(duplicated);
+    let result = (|| -> Option<u8> {
+        let context = Context::new().ok()?;
+        let handle = unsafe { context.open_device_with_fd(owned.0) }.ok()?;
+        let mut active = [0u8; 1];
+        let get_active = |data: &mut [u8]| {
+            handle
+                .read_control(0x80, 0x08, 0, 0, data, Duration::from_millis(500))
+                .ok()
+                == Some(1)
+        };
+        if !get_active(&mut active) || active[0] != active_id {
+            return None;
+        }
+        let device = handle.device();
+        let speed = device.speed();
+        let config = device.active_config_descriptor().ok()?;
+        if config.number() != active_id || handle.active_configuration().ok()? != active_id {
+            return None;
+        }
+        let count = device.device_descriptor().ok()?.num_configurations();
+        let mut index = None;
+        for n in 0..count {
+            let c = device.config_descriptor(n).ok()?;
+            if c.number() == active_id && index.replace(n).is_some() {
+                return None;
+            }
+        }
+        let index = index?;
+        let read = |buf: &mut [u8]| {
+            handle
+                .read_control(
+                    0x80,
+                    0x06,
+                    0x0200 | u16::from(index),
+                    0,
+                    buf,
+                    Duration::from_millis(500),
+                )
+                .ok()
+        };
+        let mut header = [0u8; 9];
+        if read(&mut header) != Some(9)
+            || header[0] != 9
+            || header[1] != 2
+            || header[5] != active_id
+        {
+            return None;
+        }
+        let len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if !(9..=16384).contains(&len) || len != snapshot.len() {
+            return None;
+        }
+        let mut raw = vec![0; len];
+        if read(&mut raw) != Some(len) || !badd_snapshot_matches(active_id, &header, &raw, snapshot)
+        {
+            return None;
+        }
+        let proved = super::adc3::badd_only_fixed_rate_witness(&config, &raw, speed);
+        active[0] = 0;
+        if !get_active(&mut active) || active[0] != active_id {
+            return None;
+        }
+        Some(proved)
+    })();
+    result.unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub(super) struct OwnedUsbFd(pub(super) RawFd);
 
@@ -182,6 +275,46 @@ impl UsbDevice {
         index: u16,
         data: &mut [u8],
     ) -> std::io::Result<usize> {
+        self.feature_unit_control_inner(
+            request_type,
+            request,
+            value,
+            index,
+            data,
+            Duration::from_secs(1),
+            false,
+        )
+    }
+
+    pub(super) fn feature_unit_control_timed(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout: Duration,
+    ) -> std::io::Result<usize> {
+        self.feature_unit_control_inner(request_type, request, value, index, data, timeout, true)
+    }
+
+    fn feature_unit_control_inner(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+        timeout: Duration,
+        bounded_delay: bool,
+    ) -> std::io::Result<usize> {
+        let started = std::time::Instant::now();
+        if timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "routing deadline expired",
+            ));
+        }
         if !self.claimed_interfaces.contains(&(index as u8)) {
             return Err(std::io::Error::other(
                 "AudioControl interface is not claimed",
@@ -207,7 +340,14 @@ impl UsbDevice {
             value,
             index,
             length,
-            timeout_ms: 1000,
+            timeout_ms: timeout
+                .as_millis()
+                .saturating_add(if timeout.subsec_nanos() % 1_000_000 != 0 {
+                    1
+                } else {
+                    0
+                })
+                .clamp(1, u32::MAX as u128) as u32,
             data: data.as_mut_ptr().cast(),
         };
         // This synchronous ioctl does not reap URBs. A separate libusb control
@@ -247,7 +387,18 @@ impl UsbDevice {
         if request_type & 0x60 == USB_TYPE_CLASS {
             let delay = settings().control_delay_us();
             if delay > 0 {
-                thread::sleep(Duration::from_micros(delay));
+                let delay = Duration::from_micros(delay);
+                if bounded_delay {
+                    let left = timeout.saturating_sub(started.elapsed());
+                    if left < delay {
+                        thread::sleep(left);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "routing deadline during control delay",
+                        ));
+                    }
+                }
+                thread::sleep(delay);
             }
         }
         result

@@ -1,16 +1,20 @@
 //! A capture attachment to the playback worker, never a second USB event owner.
 use super::capture_stream::{CaptureEndpoint, CaptureHandle};
 use super::*;
-use crate::capture::{CaptureBuffer, CapturePacket, CaptureRequest};
+use crate::capture::{CapturePacket, CaptureRequest};
+use crate::clock_resolution::ClockResolution;
 use crate::error::OrControl;
 use std::collections::VecDeque;
 
 pub(super) struct Attachment {
     pub(super) endpoint: CaptureEndpoint,
     pub(super) shared_implicit: bool,
-    buffer: Arc<Mutex<CaptureBuffer>>,
+    owned: Arc<capture_stream::CaptureSpsc>,
     error: Arc<Mutex<Option<Error>>>,
     retired: Arc<AtomicBool>,
+    independent: AtomicBool,
+    isolated_failure: Arc<AtomicBool>,
+    capture_retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
     uac1_rate: Mutex<Option<Uac1DuplexRate>>,
@@ -385,9 +389,8 @@ fn prepare_endpoint(
         )
         .or_control()?
     };
-    let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
+    let mut attachment = Attachment::new(endpoint, shared, capacity)
         .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
-    let mut attachment = Attachment::new(endpoint, shared, buffer);
     attachment.lock_delay = delay;
     attachment.capacity = capacity;
     Ok(attachment)
@@ -486,26 +489,52 @@ pub(super) fn configure_with_retry(
     }
 }
 
+fn independent_direct_clocks(
+    input: &ClockChoice,
+    output: &ClockChoice,
+    capture_control: u8,
+) -> bool {
+    use crate::clock_resolution::ClockHopKind;
+    let direct = |choice: &ClockChoice| {
+        choice.resolution == ClockResolution::Resolved
+            && matches!(choice.path.as_slice(), [terminal, source]
+                if matches!(terminal.kind, ClockHopKind::Terminal)
+                    && matches!(source.kind, ClockHopKind::Source)
+                    && source.id == choice.source_id)
+    };
+    direct(input)
+        && direct(output)
+        && input.control_interface == capture_control
+        && input.control_interface != output.control_interface
+}
+
 impl Attachment {
     pub(super) fn new(
         endpoint: CaptureEndpoint,
         shared_implicit: bool,
-        buffer: CaptureBuffer,
-    ) -> Self {
-        Self {
+        capacity: usize,
+    ) -> Result<Self, crate::capture::CaptureError> {
+        let owned = Arc::new(capture_stream::CaptureSpsc::new(
+            capacity,
+            endpoint.format.bytes_per_frame(),
+        )?);
+        Ok(Self {
             endpoint,
             shared_implicit,
-            buffer: Arc::new(Mutex::new(buffer)),
+            deferred: owned.deferred.clone(),
+            owned,
             error: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(capture_stream::DeferredCapture::default()),
+            independent: AtomicBool::new(false),
+            isolated_failure: Arc::new(AtomicBool::new(false)),
+            capture_retired: Arc::new(AtomicBool::new(false)),
             original_rate: Mutex::new(None),
             uac1_rate: Mutex::new(None),
             rate_uncertain: AtomicBool::new(false),
             retry_endpoints: Vec::new(),
-            capacity: 0,
+            capacity,
             lock_delay: None,
-        }
+        })
     }
     fn verify_uac1_pair(
         &self,
@@ -986,18 +1015,37 @@ impl Attachment {
             ));
         }
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
+        // Restrict the first independent admission to separately owned AC
+        // functions with direct, fully resolved roots and no timing companion.
+        let input = input_clock(claimed, &self.endpoint);
+        let independent = !self.shared_implicit
+            && playback.implicit_feedback.is_none()
+            && !playback.is_uac1
+            && self.endpoint.protocol == 0x20
+            && self.endpoint.vendor_pcm.is_none()
+            && self.endpoint.adc3_route.is_none()
+            && self.endpoint.feedforward().is_none()
+            && self.endpoint.interface != playback.interface_number
+            && input
+                .as_ref()
+                .zip(expected.clock.as_ref())
+                .is_some_and(|(input, output)| {
+                    independent_direct_clocks(input, output, self.endpoint.control)
+                });
+        self.independent.store(independent, Ordering::Release);
         Ok(true)
     }
     pub(super) fn reader(&self, stop: Arc<AtomicBool>) -> CaptureHandle {
         CaptureHandle {
             endpoint: self.endpoint.clone(),
-            buffer: self.buffer.clone(),
+            presentation: capture_stream::CapturePresentation::Duplex(self.owned.clone()),
             error: self.error.clone(),
             stop,
             worker: None,
             paired: true,
             retired: Some(self.retired.clone()),
-            deferred: Some(self.deferred.clone()),
+            isolated_failure: Some(self.isolated_failure.clone()),
+            capture_retired: Some(self.capture_retired.clone()),
         }
     }
     pub(super) fn ingest(
@@ -1006,49 +1054,73 @@ impl Attachment {
         status: i32,
         scratch: &mut [CapturePacket],
     ) -> Result<(), Error> {
-        let result = if let Some(mut buffer) = self.buffer.try_lock() {
-            self.deferred.merge_into(&mut buffer);
-            capture_stream::ingest_slot(slot, status, &mut buffer, scratch)
-        } else {
-            // No payload is retained while presentation owns the queue. Inspect
-            // the same descriptors and count only valid full frames as a host
-            // drop; empty/malformed/failed packets remain separate telemetry.
-            let mut stats = crate::capture::CaptureStats::default();
-            let result = match capture_stream::inspect_slot(slot, status, scratch) {
-                Ok((data, detached)) => {
-                    let result = stats
-                        .record_completion(
-                            data.len(),
-                            &slot.packet_sizes,
-                            scratch,
-                            true,
-                            0,
-                            self.endpoint.format.bytes_per_frame(),
-                        )
-                        .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
-                    stats.contention_frames = stats.captured_frames;
-                    if detached {
-                        Err(Error::DeviceLost)
-                    } else {
-                        result
+        let mut stats = crate::capture::CaptureStats::default();
+        let result = match capture_stream::inspect_slot(slot, status, scratch) {
+            Ok((data, detached)) => {
+                let classification = stats
+                    .record_completion(
+                        data.len(),
+                        &slot.packet_sizes,
+                        scratch,
+                        true,
+                        0,
+                        self.endpoint.format.bytes_per_frame(),
+                    )
+                    .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
+                // Publish classified frame totals before the ring's release store
+                // can make any payload visible to a concurrent reader.
+                self.deferred.record(stats);
+                stats = Default::default();
+                if classification.is_ok() {
+                    let frame_bytes = self.endpoint.format.bytes_per_frame();
+                    let mut offset = 0;
+                    for (length, packet) in slot.packet_sizes.iter().zip(scratch.iter()) {
+                        if packet.succeeded
+                            && packet.actual_bytes <= *length
+                            && packet.actual_bytes % frame_bytes == 0
+                        {
+                            let frames = packet.actual_bytes / frame_bytes;
+                            // Terminal admission is not an overrun.
+                            if let Ok(accepted) = self
+                                .owned
+                                .push_packet(&data[offset..offset + packet.actual_bytes])
+                            {
+                                stats.overrun_frames = stats
+                                    .overrun_frames
+                                    .saturating_add((frames - accepted) as u64);
+                            }
+                        }
+                        offset += length;
                     }
                 }
-                Err(error) => {
-                    if status == LIBUSB_TRANSFER_COMPLETED {
-                        stats.malformed_completions = 1;
-                    } else {
-                        stats.failed_transfers = 1;
-                    }
-                    Err(error)
+                if detached {
+                    Err(Error::DeviceLost)
+                } else {
+                    classification
                 }
-            };
-            self.deferred.record(stats);
-            result
+            }
+            Err(error) => {
+                if status == LIBUSB_TRANSFER_COMPLETED {
+                    stats.malformed_completions = 1;
+                } else {
+                    stats.failed_transfers = 1;
+                }
+                Err(error)
+            }
         };
+        self.deferred.record(stats);
         if let Err(error) = &result {
             *self.error.lock() = Some(error.clone());
         }
         result
+    }
+    /// A qualified recoverable whole-transfer gap has no trustworthy payload
+    /// or independently known lost-frame count. Do not latch attachment failure.
+    pub(super) fn note_recoverable_transfer_failure(&self) {
+        self.deferred.record(crate::capture::CaptureStats {
+            failed_transfers: 1,
+            ..Default::default()
+        });
     }
     fn discard_before_timing(
         &self,
@@ -1084,6 +1156,7 @@ impl Attachment {
                 Err(error)
             }
         };
+        stats.proof_suppressed_frames = stats.captured_frames;
         self.deferred.record(stats);
         if let Err(error) = &result {
             *self.error.lock() = Some(error.clone());
@@ -1212,9 +1285,6 @@ impl Attachment {
             *self.error.lock() = Some(error);
         }
         self.deferred.finish(failed);
-        if let Some(mut buffer) = self.buffer.try_lock() {
-            self.deferred.merge_into(&mut buffer);
-        }
     }
 }
 impl Drop for Attachment {
@@ -1333,6 +1403,9 @@ pub(super) struct InputPool {
     reordered: Vec<bool>,
     scratch: Vec<CapturePacket>,
     lock_delay: endpoint_lock::LockDelayGate,
+    local_transfer_failure: bool,
+    retiring_since: Option<Instant>,
+    retired: bool,
 }
 impl InputPool {
     pub(super) fn new(attachment: Arc<Attachment>) -> Result<Self, String> {
@@ -1368,6 +1441,9 @@ impl InputPool {
             implicit_feedforward,
             rate_proof,
             lock_delay,
+            local_transfer_failure: false,
+            retiring_since: None,
+            retired: false,
             attachment,
             order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots],
@@ -1431,6 +1507,71 @@ impl InputPool {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn test_allow_isolation(&self) {
+        self.attachment.independent.store(true, Ordering::Release);
+    }
+    pub(super) fn isolate_failure(&mut self, error: Error) -> bool {
+        self.begin_isolation(error, self.local_transfer_failure)
+    }
+    pub(super) fn isolate_status_failure(&mut self, control: u8, error: Error) -> bool {
+        self.begin_isolation(error, control == self.attachment.endpoint.control)
+    }
+    fn begin_isolation(&mut self, error: Error, capture_local: bool) -> bool {
+        if self.is_retiring()
+            || !capture_local
+            || error == Error::DeviceLost
+            || !self.attachment.independent.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.attachment
+            .isolated_failure
+            .store(true, Ordering::Release);
+        self.attachment.finish(Some(error));
+        self.retiring_since = Some(Instant::now());
+        self.cancel();
+        true
+    }
+    pub(super) fn capture_control(&self) -> u8 {
+        self.attachment.endpoint.control
+    }
+    pub(super) fn is_retiring(&self) -> bool {
+        self.retiring_since.is_some() || self.retired
+    }
+    pub(super) fn poll_retirement(&mut self) -> Result<(), Error> {
+        let Some(since) = self.retiring_since else {
+            return Ok(());
+        };
+        for slot in &mut self.slots {
+            if slot.in_flight && slot.take_completion().is_some() {
+                slot.mark_completed();
+            }
+        }
+        if let Some(pool) = self.feedforward.as_mut() {
+            for slot in &mut pool.slots {
+                if slot.in_flight && slot.take_completion().is_some() {
+                    slot.mark_completed();
+                }
+            }
+        }
+        let feedforward_done = self
+            .feedforward
+            .as_ref()
+            .map_or(true, |pool| pool.slots.iter().all(|slot| !slot.in_flight));
+        if self.slots.iter().all(|slot| !slot.in_flight) && feedforward_done {
+            self.retired = true;
+            self.retiring_since = None;
+            self.attachment
+                .capture_retired
+                .store(true, Ordering::Release);
+        } else if since.elapsed() >= Duration::from_secs(3) {
+            return Err(Error::Transfer(
+                "capture cancellation retirement deadline expired".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn cancel(&mut self) {
         for slot in &mut self.slots {
             slot.cancel();
@@ -1445,13 +1586,20 @@ impl InputPool {
         if let Some(pool) = self.feedforward.as_mut() {
             pool.drain(context);
         }
+        if self.attachment.isolated_failure.load(Ordering::Acquire) {
+            self.retired = true;
+            self.retiring_since = None;
+            self.attachment
+                .capture_retired
+                .store(true, Ordering::Release);
+        }
     }
     pub(super) fn pump(
         &mut self,
         handle: &DeviceHandle<Context>,
         stop: &AtomicBool,
     ) -> Result<(), Error> {
-        if usb_stop_requested(stop) {
+        if self.is_retiring() || usb_stop_requested(stop) {
             return Ok(());
         }
         if let Some(pool) = self.feedforward.as_mut() {
@@ -1480,6 +1628,22 @@ impl InputPool {
             };
             self.order.pop_front();
             self.reordered[index] = false;
+            self.local_transfer_failure = false;
+            if status != LIBUSB_TRANSFER_COMPLETED && status != LIBUSB_TRANSFER_NO_DEVICE {
+                if let Ok((_, false)) = capture_stream::inspect_slot(
+                    &self.slots[index],
+                    LIBUSB_TRANSFER_COMPLETED,
+                    &mut self.scratch,
+                ) {
+                    self.local_transfer_failure = self
+                        .scratch
+                        .iter()
+                        .zip(&self.slots[index].packet_sizes)
+                        .all(|(packet, &size)| {
+                            packet.requested_bytes == size && packet.actual_bytes <= size
+                        });
+                }
+            }
             let timing_allowed = self.feedforward.as_ref().map_or(true, |pool| {
                 pool.accepts_capture_transfer(completed, self.slots[index].submitted_at)
             }) && self
@@ -1634,6 +1798,39 @@ mod tests {
             path: vec![],
             resolution: ClockResolution::Resolved,
         }
+    }
+    #[test]
+    fn isolation_requires_separate_resolved_direct_control_functions() {
+        use crate::clock_resolution::{ClockHop, ClockHopKind};
+        let mut input = clock(2, 4);
+        input.path = vec![
+            ClockHop {
+                id: 7,
+                kind: ClockHopKind::Terminal,
+            },
+            ClockHop {
+                id: 4,
+                kind: ClockHopKind::Source,
+            },
+        ];
+        let mut output = clock(1, 5);
+        output.path = vec![
+            ClockHop {
+                id: 8,
+                kind: ClockHopKind::Terminal,
+            },
+            ClockHop {
+                id: 5,
+                kind: ClockHopKind::Source,
+            },
+        ];
+        assert!(independent_direct_clocks(&input, &output, 2));
+        assert!(!independent_direct_clocks(&input, &output, 3));
+        output.control_interface = 2;
+        assert!(!independent_direct_clocks(&input, &output, 2));
+        output.control_interface = 1;
+        output.resolution = ClockResolution::FallbackFirstSource;
+        assert!(!independent_direct_clocks(&input, &output, 2));
     }
     #[test]
     fn implicit_feedforward_drops_capture_until_accepted_playback_timing() {

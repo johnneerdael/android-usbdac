@@ -190,13 +190,14 @@ pub(super) fn get_wire_frequency_ranges(
     choice: Option<&ClockChoice>,
 ) -> Result<Vec<SamplingFrequencySubrange>, String> {
     if !has_multiplier(choice) {
-        return get_sampling_frequency_ranges(handle, clock.interface_number, clock.clock_id);
+        return get_uac2_sampling_frequency_ranges(handle, clock.interface_number, clock.clock_id);
     }
     let ratio = uac2_clock_ratio(choice)?;
     if let Some(c) = choice {
         verify_active_uac2_choice(handle, clock, c)?;
     }
-    let ranges = get_sampling_frequency_ranges(handle, clock.interface_number, clock.clock_id)?;
+    let ranges =
+        get_uac2_sampling_frequency_ranges(handle, clock.interface_number, clock.clock_id)?;
     if let Some(c) = choice {
         verify_active_uac2_choice(handle, clock, c)?;
     }
@@ -247,6 +248,8 @@ pub(super) fn apply_wire_frequency(
         reported_sample_rate,
         known_mismatch: !clock_ok,
         set_cur_succeeded: false,
+        write_attempted: false,
+        uncertain_write_seen: false,
         message,
     }
 }
@@ -981,6 +984,31 @@ pub(super) fn get_sampling_frequency_ranges(
     parse_sampling_frequency_ranges(&data[..transferred])
 }
 
+// UAC2 compatibility: ambiguous zero-resolution ranges expose only MIN.
+// The shared wire parser and ADC3 policy remain strict.
+fn normalize_uac2_ranges(
+    mut ranges: Vec<SamplingFrequencySubrange>,
+) -> Vec<SamplingFrequencySubrange> {
+    for range in &mut ranges {
+        if range.min > 0 && range.min < range.max && range.res == 0 {
+            log::info!(
+                "[USB] UAC2 RANGE {}..{} has zero resolution; using minimum only",
+                range.min,
+                range.max
+            );
+            range.max = range.min;
+        }
+    }
+    ranges
+}
+pub(super) fn get_uac2_sampling_frequency_ranges(
+    handle: &DeviceHandle<Context>,
+    interface_number: u8,
+    clock_id: u8,
+) -> Result<Vec<SamplingFrequencySubrange>, String> {
+    get_sampling_frequency_ranges(handle, interface_number, clock_id).map(normalize_uac2_ranges)
+}
+
 pub(super) fn parse_sampling_frequency_ranges(
     data: &[u8],
 ) -> Result<Vec<SamplingFrequencySubrange>, String> {
@@ -1125,7 +1153,11 @@ pub(super) fn format_sampling_frequency_ranges(ranges: &[SamplingFrequencySubran
         .join(", ")
 }
 
-fn uac2_source_controls(handle: &DeviceHandle<Context>, interface: u8, source: u8) -> Option<u32> {
+pub(super) fn uac2_source_controls(
+    handle: &DeviceHandle<Context>,
+    interface: u8,
+    source: u8,
+) -> Option<u32> {
     let config = handle.device().active_config_descriptor().ok()?;
     let raw = read_active_configuration_bytes(handle, &config)?;
     let bytes = audio_control_descriptors_from_config(&raw, interface);
@@ -1155,7 +1187,8 @@ pub(super) fn apply_sampling_frequency(
     );
 
     let source_controls = uac2_source_controls(handle, interface_number, clock_id);
-    let supported_ranges = get_sampling_frequency_ranges(handle, interface_number, clock_id).ok();
+    let supported_ranges =
+        get_uac2_sampling_frequency_ranges(handle, interface_number, clock_id).ok();
     match &supported_ranges {
         Some(ranges) => {
             log::info!(
@@ -1182,6 +1215,8 @@ pub(super) fn apply_sampling_frequency(
                 reported_sample_rate: get_sampling_frequency(handle, interface_number, clock_id).ok(),
                 known_mismatch: true,
                 set_cur_succeeded: false,
+                write_attempted: false,
+                uncertain_write_seen: false,
                 message: Some(format!(
                     "Requested {} Hz is not supported by clock {} on interface {}; supported rates: {}",
                     sample_rate,
@@ -1231,6 +1266,8 @@ pub(super) fn apply_sampling_frequency(
                         reported_sample_rate: Some(current_rate),
                         known_mismatch: false,
                         set_cur_succeeded: false,
+                        write_attempted: false,
+                        uncertain_write_seen: false,
                         message: Some(
                             "fixed descriptor and live clock proof; no SET required".into(),
                         ),
@@ -1265,6 +1302,7 @@ pub(super) fn apply_sampling_frequency(
     let mut last_readback_error = None;
     let mut last_reported_rate = None;
     let mut set_cur_succeeded = false;
+    let mut uncertain_write_seen = false;
 
     for attempt in 1..=attempts {
         log::info!(
@@ -1282,6 +1320,7 @@ pub(super) fn apply_sampling_frequency(
             Err(error) => {
                 log::error!("[USB] SET_CUR attempt {}/3: failed: {}", attempt, error);
                 set_cur_succeeded = false;
+                uncertain_write_seen = true;
                 last_set_error = Some(error);
                 thread::sleep(Duration::from_millis(settle_delay_ms));
                 continue;
@@ -1350,6 +1389,8 @@ pub(super) fn apply_sampling_frequency(
                         reported_sample_rate: Some(reported_sample_rate),
                         known_mismatch: false,
                         set_cur_succeeded,
+                        write_attempted: true,
+                        uncertain_write_seen,
                         message: None,
                     };
                 }
@@ -1384,6 +1425,8 @@ pub(super) fn apply_sampling_frequency(
             reported_sample_rate: Some(reported_sample_rate),
             known_mismatch: reported_sample_rate > 0 && reported_sample_rate != sample_rate,
             set_cur_succeeded,
+            write_attempted: true,
+            uncertain_write_seen,
             message: Some(match last_readback_error {
                 Some(error) if reported_sample_rate == sample_rate => error,
                 _ => format!(
@@ -1400,6 +1443,8 @@ pub(super) fn apply_sampling_frequency(
         reported_sample_rate: None,
         known_mismatch: false,
         set_cur_succeeded,
+        write_attempted: true,
+        uncertain_write_seen,
         message: Some(format!(
             "Failed to set USB clock {} on interface {} to {} Hz{}{}",
             clock_id,
@@ -1667,7 +1712,7 @@ fn probe_clock_source(
     if current == 0 {
         return Err(format!("clock {source} returned zero frequency"));
     }
-    let ranges = get_sampling_frequency_ranges(handle, control, source)?;
+    let ranges = get_uac2_sampling_frequency_ranges(handle, control, source)?;
     if ranges.is_empty()
         || ranges.iter().any(|range| {
             range.min == 0 || range.max < range.min || (range.res == 0 && range.min != range.max)
@@ -1927,7 +1972,7 @@ pub(super) fn select_requested_clock_route(
         let mutation = capture_clock_mutates(plan, original, source_rate);
         if mutation {
             let Ok(ranges) =
-                get_sampling_frequency_ranges(&claimed.handle, control, plan.source_id)
+                get_uac2_sampling_frequency_ranges(&claimed.handle, control, plan.source_id)
             else {
                 continue;
             };
@@ -2142,7 +2187,8 @@ impl crate::clock_resolution::ClockPlanIo for CaptureClockIo<'_> {
             return Err("capture clock frequency is not readable".into());
         }
         if self.usb.allow_program {
-            let ranges = get_sampling_frequency_ranges(self.usb.handle, self.usb.control, source)?;
+            let ranges =
+                get_uac2_sampling_frequency_ranges(self.usb.handle, self.usb.control, source)?;
             if !capture_ranges_serve(&ranges, self.usb.rate)
                 || !capture_ranges_serve(&ranges, self.expected_frequency)
             {
@@ -2319,7 +2365,7 @@ pub(super) fn select_capture_clock_route(
         let mutation = capture_clock_mutates(&plan, original, source_rate);
         if mutation {
             let Ok(ranges) =
-                get_sampling_frequency_ranges(&claimed.handle, control, plan.source_id)
+                get_uac2_sampling_frequency_ranges(&claimed.handle, control, plan.source_id)
             else {
                 continue;
             };
@@ -2496,6 +2542,10 @@ pub(super) fn verify_requested_clock_route(
             allow_program: false,
         })
         .map_err(|e| format!("negotiated clock route changed or became invalid: {e}"))
+}
+
+pub(super) fn requested_clock_route_active() -> bool {
+    SELECTED_CLOCK_ROUTE.lock().is_some()
 }
 
 /// Restore the first saved selector state before renegotiation or hand-back.
@@ -2930,6 +2980,27 @@ mod capture_clock_transaction_tests {
 #[cfg(test)]
 mod uac2_multiplier_control_tests {
     use super::*;
+    #[test]
+    fn ambiguous_uac2_zero_resolution_is_minimum_only() {
+        let raw = vec![SamplingFrequencySubrange {
+            min: 44_100,
+            max: 96_000,
+            res: 0,
+        }];
+        assert!(!sampling_frequency_ranges_support_rate(&raw, 44_100));
+        let ranges = normalize_uac2_ranges(raw);
+        assert!(sampling_frequency_ranges_support_rate(&ranges, 44_100));
+        assert!(!sampling_frequency_ranges_support_rate(&ranges, 48_000));
+        assert!(!sampling_frequency_ranges_support_rate(&ranges, 96_000));
+        assert_eq!(ranges[0].max, 44_100);
+        let stepped = normalize_uac2_ranges(vec![SamplingFrequencySubrange {
+            min: 1,
+            max: 3,
+            res: 1,
+        }]);
+        assert!(sampling_frequency_ranges_support_rate(&stepped, 2));
+    }
+
     #[test]
     fn multiplier_reads_two_exact_little_endian_positive_controls() {
         let mut selectors = Vec::new();

@@ -217,11 +217,15 @@ public class AndroidManagedOutput private constructor(
             if (problem != null) throw DacException(DacErrorCode.UNSUPPORTED, problem)
             val encoding = requireNotNull(encodingFor(request.bitDepth, Build.VERSION.SDK_INT))
             val channelMask = requireNotNull(channelMaskFor(request.channels))
-            val format = AudioFormat.Builder()
-                .setEncoding(encoding)
-                .setSampleRate(request.sampleRate)
-                .setChannelMask(channelMask)
-                .build()
+            val format = try {
+                AudioFormat.Builder()
+                    .setEncoding(encoding)
+                    .setSampleRate(request.sampleRate)
+                    .setChannelMask(channelMask)
+                    .build()
+            } catch (error: IllegalArgumentException) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "unsupported AudioTrack format: ${error.message}", error)
+            }
             val attributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -271,6 +275,8 @@ public class AndroidManagedOutput private constructor(
         internal fun carryProblem(request: StreamRequest, apiLevel: Int): String? = when {
             request.encoding != StreamEncoding.PCM ->
                 "the managed output plays PCM only; the platform mixer would destroy DoP and native DSD"
+            request.sampleRate !in 4_000..192_000 ->
+                "${request.sampleRate} Hz is outside the AudioTrack PCM range (4000 to 192000 Hz)"
             encodingFor(request.bitDepth, apiLevel) == null ->
                 "${request.bitDepth}-bit PCM is not available through AudioTrack on API $apiLevel"
             channelMaskFor(request.channels) == null -> "${request.channels} channels are not supported"
@@ -280,11 +286,15 @@ public class AndroidManagedOutput private constructor(
         /** The platform format an `AudioTrack` for [request] has, or `null` if [carryProblem] says it cannot be carried. */
         internal fun audioFormatOf(request: StreamRequest, apiLevel: Int): AudioFormat? {
             if (carryProblem(request, apiLevel) != null) return null
-            return AudioFormat.Builder()
-                .setEncoding(requireNotNull(encodingFor(request.bitDepth, apiLevel)))
-                .setSampleRate(request.sampleRate)
-                .setChannelMask(requireNotNull(channelMaskFor(request.channels)))
-                .build()
+            return try {
+                AudioFormat.Builder()
+                    .setEncoding(requireNotNull(encodingFor(request.bitDepth, apiLevel)))
+                    .setSampleRate(request.sampleRate)
+                    .setChannelMask(requireNotNull(channelMaskFor(request.channels)))
+                    .build()
+            } catch (_: IllegalArgumentException) {
+                null
+            }
         }
 
         // The guard is [apiLevel] (callers pass `Build.VERSION.SDK_INT`, or a level under test), which lint

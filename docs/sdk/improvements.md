@@ -18,7 +18,7 @@ A DAC's sample rate is set on a "clock" inside it. Some DACs have more than one 
 
 ### A fixed, small amount of audio waiting on the cable
 
-Audio travels to the DAC in small packets, and the driver keeps a short queue of them lined up on the USB connection. usbdac always queues 16 milliseconds, whatever the DAC's packet size and for PCM, DoP and native DSD alike, and can never queue 256 packets at once. The original queued up to 128 ms on some DACs and exactly 256 packets for DSD.
+Audio travels to the DAC in small packets, and the driver keeps a short queue of them lined up on the USB connection. The default starts at about 16 milliseconds for PCM, DoP and native DSD. Adaptive depth may grow within the time, slot and 255-packet caps; custom geometry fixes the requested depth. The original queued up to 128 ms on some DACs and exactly 256 packets for DSD.
 
 **In plain terms:** on one tested phone, having exactly 256 packets lined up made the sound stop after two seconds. usbdac is built so that number cannot be reached. And because the queue is the same short length on every DAC, pausing and seeking feel equally quick on all of them.
 
@@ -51,8 +51,7 @@ SuperSpeed devices that report in the USB 3 format are decoded too.
 that an IN stream shares the playback clock, wire rate and service interval.
 It starts that stream first and uses its USB packet frame counts to schedule
 output. The playback sample path stays the same. When an asynchronous route
-has no usable source, the app can fall back to Android output. Nominal timing
-is an opt-in and gives up bit-perfect verification.
+has no usable source, the app can fall back to Android output. A narrow full-speed UAC1 PCM case can use nominal timing by default; broader eligible fallback needs explicit opt-in. Nominal timing gives up bit-perfect verification.
 
 **In plain terms.** Your app can play directly on compatible USB audio
 interfaces that convey timing through their input stream. On a DAC with a
@@ -83,23 +82,23 @@ On an idle session an app can list and change the DAC's standard selector and mi
 
 ## Controls that respond at once
 
-### Pause stops the music now, and resume loses nothing
+### Pause retains queued audio
 
-On pause, usbdac immediately sends silence to the DAC and keeps the audio it was holding. On resume it continues from exactly that audio. The original kept playing whatever was already buffered before going silent, and started again with a moment of silence.
+On pause, usbdac holds the ring and schedules wire silence. Previously submitted audio may still play; resume continues from the held queue. The point heard by the listener also depends on downstream buffering.
 
-**In plain terms:** press pause and the sound stops, instead of running on for a tenth of a second. Press play and it picks up at the same sample. The DAC stays "awake" on silence during the pause, so it does not click or need to re-lock.
+**In plain terms:** pause retains audio the library has not submitted yet. The implementation keeps the stream active on silence; acoustic timing and clicks are not established by host tests.
 
-### Seeking is heard immediately
+### Seek discards queued audio
 
-A flush (used for seek, stop and skip) discards the held audio and also withdraws the packets already lined up on the cable.
+A flush discards held audio and requests cancellation of submitted music transfers when configured. Cancellation is asynchronous.
 
-**In plain terms:** when you drag to another part of a song, you hear the new position within a couple of milliseconds, with no leftover snippet of the old position first.
+**In plain terms:** the library clears its queue, but submitted and downstream audio can affect what is heard. A transport test does not establish audible seek latency.
 
-### Software volume takes effect within milliseconds
+### Software volume applies near the output
 
 When an app uses software volume (for a DAC with no volume control of its own), usbdac applies it at the last moment before the audio leaves, not when it enters the reserve.
 
-**In plain terms:** the volume changes as you move the slider, not a quarter of a second later.
+**In plain terms:** the new value does not wait behind the full app-side ring, but submitted and downstream audio still affect when it is heard.
 
 ### The position shown is what you are hearing
 
@@ -136,7 +135,7 @@ usbdac remembers the level the DAC had before it changed anything and puts it ba
 
 A helper closes the audio stream after 30 seconds of pause while keeping hold of the DAC, and reopens it on play.
 
-**In plain terms:** a paused player stops streaming silence, so the phone and a bus-powered DAC use less battery. A short pause still resumes instantly.
+**In plain terms:** a paused player stops streaming silence, so the phone and a bus-powered DAC use less battery. A short pause retains the existing queue; audible timing depends on the device.
 
 ## An honest "bit-perfect" indicator
 

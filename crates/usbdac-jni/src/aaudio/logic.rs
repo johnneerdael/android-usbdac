@@ -439,6 +439,8 @@ pub struct Grant {
     pub buffer_capacity_frames: i32,
     pub buffer_size_frames: i32,
     pub device_id: i32,
+    /// Complete device list when the platform API can report it, otherwise unknown.
+    pub device_ids: Option<Vec<i32>>,
     pub performance_mode: i32,
     /// `Some(true)` when the stream uses the memory-mapped (MMAP) path; `None` below Android 9.
     pub mmap: Option<bool>,
@@ -662,6 +664,7 @@ pub fn grant_json(request: &Capability, grant: &Grant) -> Value {
         "buffer_capacity_frames": grant.buffer_capacity_frames,
         "buffer_size_frames": grant.buffer_size_frames,
         "device_id": grant.device_id,
+        "device_ids": grant.device_ids,
         "performance_mode": match grant.performance_mode {
             PERFORMANCE_LOW_LATENCY => "low_latency",
             PERFORMANCE_POWER_SAVING => "power_saving",
@@ -743,6 +746,7 @@ mod tests {
             buffer_capacity_frames: 960,
             buffer_size_frames: 192,
             device_id: 7,
+            device_ids: None,
             performance_mode: PERFORMANCE_LOW_LATENCY,
             mmap: Some(true),
             hardware: None,

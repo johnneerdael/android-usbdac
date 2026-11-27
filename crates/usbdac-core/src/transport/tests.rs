@@ -2042,11 +2042,13 @@ mod push_stream_tests {
             !slot.completion_ready(),
             "libusb has not handed it back yet"
         );
+        unsafe { &(*slot.user_data).completion }.reset();
         unsafe { &(*slot.user_data).completion }
             .status
             .lock()
             .unwrap()
             .replace(LIBUSB_TRANSFER_CANCELLED);
+        unsafe { &(*slot.user_data).completion }.publish_for_test();
         assert!(slot.completion_ready());
         assert_eq!(
             slot.take_completion().map(|(status, _, _)| status),
@@ -3331,4 +3333,28 @@ mod empty_reconfigure_drain_tests {
         shared.drain();
         assert!(!shared.is_drained());
     }
+}
+
+#[test]
+fn active_clock_evidence_keeps_a_mismatch_until_verified_retry() {
+    use super::stream_open::active_rate_evidence;
+    let mismatch = Some(44_100);
+    for read in [None, Some(0), Some(48_000)] {
+        assert_eq!(
+            active_rate_evidence(48_000, mismatch, read, false),
+            (mismatch, true)
+        );
+    }
+    assert_eq!(
+        active_rate_evidence(48_000, mismatch, Some(48_000), true),
+        (Some(48_000), false)
+    );
+    assert_eq!(
+        active_rate_evidence(48_000, None, None, false),
+        (None, false)
+    );
+    assert_eq!(
+        active_rate_evidence(48_000, None, Some(48_000), false),
+        (Some(48_000), false)
+    );
 }

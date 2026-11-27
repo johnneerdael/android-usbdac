@@ -9,7 +9,7 @@
 
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JByteBuffer, JObject, JString};
-use jni::{jni_mangle, Env, EnvUnowned};
+use jni::{jni_mangle, jni_sig, jni_str, Env, EnvUnowned};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -21,7 +21,7 @@ use usbdac_core::convert::{
 };
 
 /// What went wrong inside a native call.
-enum Failure {
+pub(crate) enum Failure {
     Convert(ConvertError),
     Jni(jni::errors::Error),
 }
@@ -38,9 +38,9 @@ impl From<jni::errors::Error> for Failure {
     }
 }
 
-type Outcome<T> = Result<T, Failure>;
+pub(crate) type Outcome<T> = Result<T, Failure>;
 
-fn run<'l, T: Default>(
+pub(crate) fn run<'l, T: Default>(
     env: &mut EnvUnowned<'l>,
     body: impl FnOnce(&mut Env<'l>) -> Outcome<T>,
 ) -> T {
@@ -251,6 +251,16 @@ fn direct_range(
     Ok((unsafe { base.add(offset) }, count))
 }
 
+pub(crate) fn require_writable(env: &mut Env<'_>, buffer: &JByteBuffer<'_>) -> Outcome<()> {
+    if env
+        .call_method(buffer, jni_str!("isReadOnly"), jni_sig!("()Z"), &[])?
+        .z()?
+    {
+        return Err(bad("the output buffer is read-only").into());
+    }
+    Ok(())
+}
+
 // ---- JNI --------------------------------------------------------------------------------------
 
 /// Plans a conversion without building a converter: the request is
@@ -323,11 +333,12 @@ pub fn convert_process<'l>(
         let converter = converter(handle)?;
         let (in_ptr, in_len) = direct_range(env, &input, in_offset, in_count, "input")?;
         let (out_ptr, out_len) = direct_range(env, &output, out_offset, out_capacity, "output")?;
+        require_writable(env, &output)?;
         let (a, b) = (in_ptr as usize, out_ptr as usize);
         if a < b + out_len && b < a + in_len {
             return Err(bad("the input and output ranges overlap").into());
         }
-        // SAFETY: both ranges lie inside direct buffers the caller keeps alive for this call, and they do not overlap.
+        // SAFETY: both ranges lie inside direct buffers the caller keeps alive for this call, and they do not overlap; the caller keeps input immutable and output exclusive, including aliases.
         let (input, output) = unsafe {
             (
                 std::slice::from_raw_parts(in_ptr as *const u8, in_len),
@@ -352,7 +363,8 @@ pub fn convert_finish<'l>(
     run(&mut env, |env| {
         let converter = converter(handle)?;
         let (out_ptr, out_len) = direct_range(env, &output, out_offset, out_capacity, "output")?;
-        // SAFETY: the range lies inside a direct buffer the caller keeps alive for this call.
+        require_writable(env, &output)?;
+        // SAFETY: the range lies inside a writable direct buffer kept alive and exclusively accessible for this call.
         let output = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
         let produced = converter.lock().finish(output)?;
         Ok(i32::try_from(produced).unwrap_or(i32::MAX))

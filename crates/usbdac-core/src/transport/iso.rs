@@ -6,6 +6,9 @@ pub(super) struct IsoTransferCompletion {
     pub(super) status: StdMutex<Option<i32>>,
     pub(super) completed_at: StdMutex<Option<Instant>>,
     pub(super) actual_length: AtomicUsize,
+    generation: std::sync::atomic::AtomicU64,
+    returned: std::sync::atomic::AtomicU64,
+    consumed: std::sync::atomic::AtomicBool,
 }
 
 impl IsoTransferCompletion {
@@ -14,10 +17,20 @@ impl IsoTransferCompletion {
             status: StdMutex::new(None),
             completed_at: StdMutex::new(None),
             actual_length: AtomicUsize::new(0),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            returned: std::sync::atomic::AtomicU64::new(0),
+            consumed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub(super) fn reset(&self) {
+        let generation = self
+            .generation
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .expect("transfer generation exhausted");
+        self.consumed.store(false, Ordering::Relaxed);
+        self.generation.store(generation, Ordering::Release);
         match self.status.lock() {
             Ok(mut guard) => *guard = None,
             Err(poisoned) => *poisoned.into_inner() = None,
@@ -31,17 +44,25 @@ impl IsoTransferCompletion {
 
     /// libusb has handed the transfer back and nobody has taken the result yet.
     pub(super) fn is_published(&self) -> bool {
-        match self.status.lock() {
-            Ok(guard) => guard.is_some(),
-            Err(poisoned) => poisoned.into_inner().is_some(),
-        }
+        let generation = self.generation.load(Ordering::Acquire);
+        generation != 0 && self.returned.load(Ordering::Acquire) == generation
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_for_test(&self) {
+        self.returned
+            .store(self.generation.load(Ordering::Acquire), Ordering::Release);
     }
 
     pub(super) fn take(&self) -> Option<(i32, Instant, usize)> {
+        if !self.is_published() || self.consumed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
         let status = match self.status.lock() {
-            Ok(mut guard) => guard.take()?,
-            Err(poisoned) => poisoned.into_inner().take()?,
-        };
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+        .unwrap_or(LIBUSB_TRANSFER_ERROR);
         let completed_at = match self.completed_at.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -252,6 +273,9 @@ impl IsoTransferSlot {
             }
 
             let submit_result = libusb_submit_transfer(self.transfer.as_ptr());
+            if submit_result == 0 {
+                self.in_flight = true;
+            }
             if submit_result != 0 {
                 if submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
                     return Err("USB DAC disconnected (isochronous submit)".into());
@@ -326,6 +350,15 @@ impl IsoTransferSlot {
                 .length = packet_bytes as u32;
             }
             let result = libusb_submit_transfer(self.transfer.as_ptr());
+            if result == 0 {
+                self.in_flight = true;
+                self.packet_sizes.fill(packet_bytes);
+                self.generation = self.generation.saturating_add(1);
+                self.submitted_endpoint = endpoint;
+                self.submitted_bytes = bytes;
+                self.in_flight = true;
+                self.submitted_at = Some(Instant::now());
+            }
             if let Some(trace) = trace {
                 trace.record(crate::FeedbackTraceEvent::Submit {
                     slot: Some(self.slot_index),
@@ -341,18 +374,17 @@ impl IsoTransferSlot {
                     },
                 );
             }
-            self.packet_sizes.fill(packet_bytes);
-            self.generation = self.generation.saturating_add(1);
-            self.submitted_endpoint = endpoint;
-            self.submitted_bytes = bytes;
-            self.in_flight = true;
-            self.submitted_at = Some(Instant::now());
         }
         Ok(())
     }
 
     pub(super) fn take_completion(&mut self) -> Option<(i32, Instant, usize)> {
         let completion = unsafe { &(*self.user_data).completion };
+        if !completion.is_published() {
+            return None;
+        }
+        // Retire native ownership before any consumer bookkeeping can unwind.
+        self.in_flight = false;
         completion.take()
     }
 
@@ -471,7 +503,8 @@ impl IsoTransferSlot {
 
     /// libusb has handed this transfer back: its result is waiting to be taken.
     pub(super) fn completion_ready(&self) -> bool {
-        unsafe { &(*self.user_data).completion }.is_published()
+        let completion = unsafe { &(*self.user_data).completion };
+        completion.is_published() && !completion.consumed.load(Ordering::Acquire)
     }
 }
 
@@ -561,6 +594,9 @@ impl InterruptTransferSlot {
                 0, // Status endpoints may NAK indefinitely until a change occurs.
             );
             let result = libusb_submit_transfer(self.slot.transfer.as_ptr());
+            if result == 0 {
+                self.slot.in_flight = true;
+            }
             if result != 0 {
                 return Err(
                     if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
@@ -856,6 +892,9 @@ impl FeedbackTransferSlot {
             }
 
             let submit_result = libusb_submit_transfer(self.transfer.as_ptr());
+            if submit_result == 0 {
+                self.in_flight = true;
+            }
             self.last_submit_status = Some(submit_result);
             self.submit_no_device = submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE;
             if submit_result != 0 {
@@ -870,8 +909,12 @@ impl FeedbackTransferSlot {
         Ok(())
     }
 
-    pub(super) fn take_completion(&self) -> Option<(i32, Instant, usize)> {
+    pub(super) fn take_completion(&mut self) -> Option<(i32, Instant, usize)> {
         let completion = unsafe { &(*self.user_data).completion };
+        if !completion.is_published() {
+            return None;
+        }
+        self.in_flight = false;
         completion.take()
     }
 
@@ -1694,9 +1737,23 @@ pub(super) fn feedback_base_interval_us(speed: Speed, data_service_interval_us: 
     }
 }
 
+// Publication happens in Drop even if optional completion metadata panics. This
+// guard is created only after the callback's final transfer/user_data access.
+struct ReturnPublication {
+    completion: Arc<IsoTransferCompletion>,
+    generation: u64,
+}
+impl Drop for ReturnPublication {
+    fn drop(&mut self) {
+        if self.completion.generation.load(Ordering::Acquire) == self.generation {
+            self.completion
+                .returned
+                .store(self.generation, Ordering::Release);
+        }
+    }
+}
+
 pub(super) extern "system" fn iso_transfer_callback(transfer: *mut libusb_transfer) {
-    // Panicking across the FFI boundary aborts the process, so contain every
-    // panic here; a poisoned lock must not kill the app either.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
             return;
@@ -1705,29 +1762,27 @@ pub(super) extern "system" fn iso_transfer_callback(transfer: *mut libusb_transf
         let Some(user_data) = std::ptr::NonNull::new(user_data_ptr) else {
             return;
         };
-
-        let completed_at = Instant::now();
         let status = unsafe { transfer.as_ref().status };
-        let actual_length = unsafe { transfer.as_ref().actual_length } as usize;
-        // Keep the completion state alive independently of the transfer/user
-        // data so the output thread can re-arm or free the slot as soon as the
-        // status is published.
+        let actual_length = unsafe { transfer.as_ref().actual_length }.max(0) as usize;
         let completion = unsafe { user_data.as_ref() }.completion.clone();
+        let generation = completion.generation.load(Ordering::Acquire);
+        // No transfer or user_data access is permitted beyond this point.
+        let publication = ReturnPublication {
+            completion,
+            generation,
+        };
+        let completion = &publication.completion;
         completion
             .actual_length
-            .store(actual_length, Ordering::Release);
-        match completion.completed_at.lock() {
-            Ok(mut guard) => *guard = Some(completed_at),
-            Err(poisoned) => *poisoned.into_inner() = Some(completed_at),
+            .store(actual_length, Ordering::Relaxed);
+        // Install a usable result before optional timestamp collection.
+        *completion.status.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+        if let Ok(now) = std::panic::catch_unwind(Instant::now) {
+            *completion
+                .completed_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(now);
         }
-        // Publish status last. Everything above is mine; after this store the
-        // slot owner may refill or release the transfer without racing this
-        // callback, because the callback no longer touches either object.
-        let mut guard = match completion.status.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Some(status);
     }));
 }
 
@@ -2589,6 +2644,36 @@ mod explicit_feedback_tests {
     }
 
     #[test]
+    fn returned_ownership_survives_missing_metadata_and_stale_publication() {
+        let completion = Arc::new(IsoTransferCompletion::new());
+        completion.reset();
+        let first = completion.generation.load(Ordering::Acquire);
+        let publication = ReturnPublication {
+            completion: completion.clone(),
+            generation: first,
+        };
+        assert!(!completion.is_published()); // cancellation alone returns nothing
+        drop(publication); // metadata failure still publishes ownership
+        assert!(completion.is_published());
+        assert_eq!(completion.take().unwrap().0, LIBUSB_TRANSFER_ERROR);
+        assert!(completion.take().is_none());
+        assert!(completion.is_published()); // taking the result does not undo return
+        completion.reset();
+        let second = completion.generation.load(Ordering::Acquire);
+        drop(ReturnPublication {
+            completion: completion.clone(),
+            generation: first,
+        });
+        assert!(!completion.is_published());
+        *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_NO_DEVICE);
+        drop(ReturnPublication {
+            completion: completion.clone(),
+            generation: second,
+        });
+        assert_eq!(completion.take().unwrap().0, LIBUSB_TRANSFER_NO_DEVICE);
+    }
+
+    #[test]
     fn ordered_dual_polls_share_one_playback_startup_skip_budget() {
         let endpoint = FeedbackEndpoint {
             service_interval_us: 1000,
@@ -2621,9 +2706,14 @@ mod explicit_feedback_tests {
                     packet.status = LIBUSB_TRANSFER_COMPLETED;
                 }
                 slot.transfer.as_mut().num_iso_packets = 2;
+                data.completion.reset();
                 *data.completion.completed_at.lock().unwrap() =
                     Some(first + Duration::from_millis(index as u64));
                 *data.completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
+                let generation = data.completion.generation.load(Ordering::Acquire);
+                data.completion
+                    .returned
+                    .store(generation, Ordering::Release);
             }
             if index == 1 {
                 assert!(transfers.take_next_completion().is_none());

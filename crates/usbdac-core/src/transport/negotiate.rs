@@ -24,6 +24,110 @@ fn adaptive_rate_verified(
     (!attempted && before == Some(actual)) || (verified_after && after == Some(actual))
 }
 
+// Private per-batch certificate. Only a retained, identical idle owner may
+// consume a clean refusal, and its configuration must remain the same.
+pub(crate) struct RetryBaseline {
+    owner: usize,
+    configuration: Option<u8>,
+    clean: bool,
+}
+impl RetryBaseline {
+    pub(crate) fn new(owner: usize) -> Self {
+        Self {
+            owner,
+            configuration: None,
+            clean: false,
+        }
+    }
+    pub(crate) fn take_clean(&mut self) -> bool {
+        std::mem::take(&mut self.clean)
+    }
+}
+
+fn idle_snapshot(handle: &DeviceHandle<Context>, claimed: &[u8]) -> Result<(u8, Vec<u8>), String> {
+    let config = handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    if handle.active_configuration().map_err(|e| e.to_string())? != config.number() {
+        return Err("active configuration changed".into());
+    }
+    let mut interfaces = Vec::new();
+    for interface in config.interfaces() {
+        if interface
+            .descriptors()
+            .any(|d| d.class_code() == 1 && d.sub_class_code() == 2)
+        {
+            if !claimed.contains(&interface.number()) {
+                return Err("unowned streaming interface".into());
+            }
+            let mut current = [0u8; 1];
+            let len = handle
+                .read_control(
+                    0x81,
+                    0x0a,
+                    0,
+                    u16::from(interface.number()),
+                    &mut current,
+                    Duration::from_millis(500),
+                )
+                .map_err(|e| e.to_string())?;
+            if len != 1 || current[0] != 0 {
+                return Err("streaming interface is not proven idle".into());
+            }
+            interfaces.push(interface.number());
+        }
+    }
+    Ok((config.number(), interfaces))
+}
+
+// A no-match certificate is based only on successfully parsed UAC2 output
+// descriptors, not the broad SelectError::NoMatch (which also wraps I/O).
+fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
+    if format.pcm_encoding != PcmEncoding::Signed
+        || format.is_dop
+        || format.dsd_transport != DsdTransportMode::None
+    {
+        return false;
+    }
+    let Ok(config) = claimed.handle.device().active_config_descriptor() else {
+        return false;
+    };
+    if !matches!(
+        vendor_pcm::discover(&claimed.handle, &config, speed),
+        Ok(None)
+    ) {
+        return false;
+    }
+    let mut seen = false;
+    for alt in config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .filter(|d| {
+            d.class_code() == 1
+                && d.sub_class_code() == 2
+                && d.setting_number() != 0
+                && d.endpoint_descriptors()
+                    .any(|ep| ep.direction() == Direction::Out)
+        })
+    {
+        seen = true;
+        if alt.protocol_code() != 0x20 {
+            return false;
+        }
+        let Some(parsed) = scan::parse_android_streaming_interface_format(&alt) else {
+            return false;
+        };
+        if parsed.channels == format.channels
+            && parsed.bit_resolution == format.bit_depth
+            && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
+        {
+            return false;
+        }
+    }
+    seen
+}
+
 /// Programs and verifies the DAC clock for `requested_format` and settles on the
 /// format the DAC will actually run (which differs only when the exact rate is
 /// not available). Runs with the alternate setting at 0 and leaves it there.
@@ -34,6 +138,7 @@ fn adaptive_rate_verified(
 pub(super) fn negotiate_playback_format(
     requested_format: PlaybackFormat,
     rate_policy: crate::RatePolicy,
+    mut retry: Option<&mut RetryBaseline>,
 ) -> Result<(PlaybackFormat, Option<ClockChoice>), crate::Error> {
     use crate::Error;
     clear_adc3_negotiation();
@@ -51,12 +156,40 @@ pub(super) fn negotiate_playback_format(
     let mut cleanup_interface: Option<u8> = None;
     let mut clock_choice: Option<ClockChoice> = None;
     let mut uac2_alternate = None;
+    let mut snapshot = None;
+    let mut clean_descriptor = false;
+    let mut clean_clock = None;
+    if let Some(batch) = retry.as_deref_mut() {
+        batch.clean = false;
+    }
     let negotiated = (|| {
         // SessionGuard excludes transfers; restore the preceding negotiation's
         // selector state before discovering this request's candidates.
         restore_requested_clock_route(&claimed_handle).map_err(Error::Transfer)?;
+        if let Some(batch) = retry.as_deref_mut() {
+            if claimed_handle.handle.as_raw() as usize == batch.owner && lock_requested {
+                if let Ok(value) =
+                    idle_snapshot(&claimed_handle.handle, &claimed_handle.claimed_interfaces)
+                {
+                    if batch.configuration.is_none() || batch.configuration == Some(value.0) {
+                        batch.configuration = Some(value.0);
+                        snapshot = Some(value);
+                    }
+                }
+            }
+        }
         let usb_device = claimed_handle.handle.device();
         let speed = resolve_device_speed(&usb_device);
+        if snapshot.is_some()
+            && rate_policy == crate::RatePolicy::Exact
+            && descriptor_shape_absent(&claimed_handle, requested_format, speed)
+        {
+            clean_descriptor = true;
+            return Err(Error::Unsupported {
+                reason: "no UAC2 output descriptor carries the requested PCM shape".into(),
+                offered: offered_alt_settings(),
+            });
+        }
         let capability_model = build_usb_capability_model(
             &usb_device,
             &claimed_handle.handle,
@@ -141,6 +274,35 @@ pub(super) fn negotiate_playback_format(
                 },
             )?,
             ..requested_format
+        };
+
+        let original_clock = if snapshot.is_some()
+            && !candidate.is_uac1
+            && candidate.implicit_feedback.is_none()
+            && !requested_format.is_dop
+            && requested_format.dsd_transport == DsdTransportMode::None
+            && !settings().has(crate::Quirk::SetInterfaceFirst)
+        {
+            candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
+                .ok()
+                .flatten()
+                .and_then(|(clock, choice)| {
+                    if uac2_choice_has_multiplier(Some(&choice))
+                        || choice.path.iter().any(|hop| {
+                            matches!(
+                                hop.kind,
+                                crate::clock_resolution::ClockHopKind::Selector { .. }
+                            )
+                        })
+                    {
+                        return None;
+                    }
+                    let rate =
+                        get_wire_frequency(&claimed_handle.handle, clock, Some(&choice)).ok()?;
+                    (rate > 0).then_some((clock, choice, rate))
+                })
+        } else {
+            None
         };
 
         if let Err(error) = claimed_handle.ensure_interface_claimed(candidate.interface_number) {
@@ -280,6 +442,7 @@ pub(super) fn negotiate_playback_format(
                         .map_or(true, |rate| rate == 0)
                     && !clock_outcome.known_mismatch;
                 let allow_unverified = settings().allow_unusable_clock_readback(
+                    candidate.is_uac1,
                     true,
                     clock_outcome.set_cur_succeeded,
                     clock_outcome.reported_sample_rate,
@@ -341,10 +504,32 @@ pub(super) fn negotiate_playback_format(
                                     } else {
                                         Ok(())
                                     };
+                                    let eligible = matches!(
+                                        error,
+                                        super::uac2_live_alternate::LiveAlternateError::Unavailable
+                                    ) && clock_outcome.write_attempted
+                                        && clock_outcome.set_cur_succeeded
+                                        && !clock_outcome.uncertain_write_seen
+                                        && !requested_clock_route_active()
+                                        && original_clock.as_ref().is_some_and(
+                                            |(original, route, rate)| {
+                                                original.clock_id == clock.clock_id
+                                                    && original.interface_number
+                                                        == clock.interface_number
+                                                    && route == choice
+                                                    && Some(*rate) == current_rate
+                                            },
+                                        );
+                                    if eligible && restore.is_ok() {
+                                        if let Some((_, route, rate)) = original_clock.clone() {
+                                            clean_clock =
+                                                Some((candidate.clone(), clock, route, rate));
+                                        }
+                                    }
                                     return Err(Error::Transfer(match restore {
-                                    Ok(()) => error,
-                                    Err(restore_error) => format!("{error}; UAC2 source rate restoration uncertain: {restore_error}"),
-                                }));
+                                        Ok(()) => error.to_string(),
+                                        Err(restore_error) => format!("{error}; UAC2 source rate restoration uncertain: {restore_error}"),
+                                    }));
                                 }
                             };
                     }
@@ -534,19 +719,77 @@ pub(super) fn negotiate_playback_format(
         Ok(effective_format)
     })();
 
-    if negotiated.is_err() {
-        if let Err(error) = restore_requested_clock_route(&claimed_handle) {
-            log_warn!("[USB] Failed negotiation could not restore clock selectors: {error}");
-        }
-    }
+    let restoration_error = if negotiated.is_err() {
+        restore_requested_clock_route(&claimed_handle).err()
+    } else {
+        None
+    };
     let cleanup_ok = cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
     if !cleanup_ok || negotiated.is_err() {
         clear_adc3_negotiation();
+        if let Some(state) = SESSION_STATE.lock().as_mut() {
+            state.requested_playback_format = None;
+            state.playback_format = None;
+            state.clock_status = None;
+            state.clock_control_attempted = false;
+            state.clock_control_succeeded = false;
+            state.clock_verification_passed = false;
+            state.negotiated_uac2_alternate = None;
+        }
     }
-    if !cleanup_ok && negotiated.is_ok() {
-        return Err(Error::Transfer(
-            "USB negotiation could not restore a PCM-safe idle state".into(),
-        ));
+    if negotiated.is_err() && restoration_error.is_none() && cleanup_ok {
+        if let (Some(batch), Some(expected)) = (retry, snapshot.as_ref()) {
+            let idle = IDLE_LOCK.lock();
+            if let Some(retained) = idle
+                .as_ref()
+                .filter(|idle| idle.handle.as_raw() as usize == batch.owner)
+            {
+                let unchanged = idle_snapshot(&retained.handle, &retained.claimed_interfaces)
+                    .is_ok_and(|actual| &actual == expected);
+                let clock_restored =
+                    clean_clock
+                        .as_ref()
+                        .is_some_and(|(candidate, clock, choice, rate)| {
+                            let config = retained.handle.device().active_config_descriptor().ok();
+                            config
+                                .as_ref()
+                                .and_then(|config| {
+                                    strict_implicit_clock(
+                                        config,
+                                        &retained.handle,
+                                        choice.control_interface,
+                                        candidate.terminal_link,
+                                    )
+                                })
+                                .as_ref()
+                                == Some(choice)
+                                && get_wire_frequency(&retained.handle, *clock, Some(choice)).ok()
+                                    == Some(*rate)
+                                && uac2_source_controls(
+                                    &retained.handle,
+                                    clock.interface_number,
+                                    clock.clock_id,
+                                )
+                                .is_some_and(|controls| {
+                                    crate::clock_resolution::clock_validity(controls, || {
+                                        get_clock_validity(
+                                            &retained.handle,
+                                            clock.interface_number,
+                                            clock.clock_id,
+                                        )
+                                    })
+                                    .is_ok()
+                                })
+                        });
+                batch.clean = unchanged && (clean_descriptor || clock_restored);
+            }
+        }
+    }
+    if restoration_error.is_some() || !cleanup_ok {
+        return Err(Error::Transfer(format!(
+            "USB negotiation could not restore a PCM-safe idle state: original={:?}; route restoration={:?}; cleanup_ok={cleanup_ok}",
+            negotiated.as_ref().err(), restoration_error,
+        )));
     }
     if negotiated.is_ok() {
         if let Some(state) = SESSION_STATE.lock().as_mut() {
@@ -607,6 +850,7 @@ fn restore_uac2_rate_after_alternate_failure(
         settings().settle_delay_ms(),
     );
     if !restored.clock_ok
+        || restored.uncertain_write_seen
         || !restored.rate_verified
         || restored.reported_sample_rate != Some(previous_rate)
     {
@@ -725,7 +969,7 @@ pub fn rank_sample_rates(rates: &mut Vec<u32>, requested: u32) {
     rates.dedup();
 }
 
-fn rates_for_format(model: &CapabilityModel, format: PlaybackFormat) -> Vec<u32> {
+pub(super) fn rates_for_format(model: &CapabilityModel, format: PlaybackFormat) -> Vec<u32> {
     use crate::capabilities::AltFormat;
     let expected = match format.pcm_encoding {
         PcmEncoding::Unsigned8 => AltFormat::PcmU8,

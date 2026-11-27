@@ -323,6 +323,11 @@ fn retirement(token: i64) -> Result<usbdac_core::UsbRetirement, Error> {
 pub fn await_retirement(token: i64) -> Result<bool, Error> {
     Ok(retirement(token)?.wait(std::time::Duration::from_millis(500)))
 }
+pub fn retirement_routing_report(
+    token: i64,
+) -> Result<Option<usbdac_core::routing::RoutingHandBackReport>, Error> {
+    retirement(token)?.routing_hand_back_report()
+}
 pub fn release_retirement(token: i64) -> Result<(), Error> {
     if !retirement(token)?.wait(std::time::Duration::ZERO) {
         return Err(Error::InvalidState("USB owner has not retired".into()));
@@ -489,6 +494,7 @@ mod tests {
         assert!(remove_dac(0).is_err());
         assert!(retirement_token(0).is_err());
         assert!(await_retirement(0).is_err());
+        assert!(retirement_routing_report(0).is_err());
         assert!(release_retirement(0).is_err());
     }
 }

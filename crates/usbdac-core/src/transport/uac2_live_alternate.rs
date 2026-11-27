@@ -9,12 +9,33 @@ pub(super) struct Uac2LiveAlternate {
     implicit_clock: Option<ClockChoice>,
 }
 
+#[derive(Debug)]
+pub(super) enum LiveAlternateError {
+    Unavailable,
+    Fault(String),
+}
+impl From<String> for LiveAlternateError {
+    fn from(error: String) -> Self {
+        Self::Fault(error)
+    }
+}
+impl std::fmt::Display for LiveAlternateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str(
+                "No compatible UAC2 alternate is currently available at the verified PCM clock",
+            ),
+            Self::Fault(error) => f.write_str(error),
+        }
+    }
+}
+
 pub(super) fn select_uac2_live_alternate(
     claimed: &ClaimedHandle,
     original: &IsoStreamCandidate,
     format: PlaybackFormat,
     clock: &ClockChoice,
-) -> Result<Option<Uac2LiveAlternate>, String> {
+) -> Result<Option<Uac2LiveAlternate>, LiveAlternateError> {
     // Unsupported protocols keep their existing activation path. Never turn a
     // descriptor/control error into permission to try a different transport.
     if !standard_pcm(original, format) || !resolved(clock) {
@@ -53,7 +74,7 @@ pub(super) fn select_uac2_live_alternate(
             implicit_clock,
         }));
     }
-    Err("No compatible UAC2 alternate is currently available at the verified PCM clock".into())
+    Err(LiveAlternateError::Unavailable)
 }
 
 pub(super) fn rebuild_uac2_live_alternate(

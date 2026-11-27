@@ -8,6 +8,7 @@ use super::{ClockChoice, Direction, Error, TransferType, UsageType};
 use crate::clock_resolution::{ClockHopKind, ClockResolution};
 use crate::descriptors::DescriptorIter;
 use libusb1_sys::constants::{LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_NO_DEVICE};
+use log::{info as log_info, warn as log_warn};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -241,16 +242,102 @@ struct EndpointFault {
     armed: bool,
 }
 
+#[derive(Clone)]
+struct RawExpectedRead {
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    expected: Vec<u8>,
+    fallback_index: Option<u16>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RawCheck {
+    Match,
+    RetryAlternate,
+    Changed,
+}
+fn classify_raw_check(
+    read: &RawExpectedRead,
+    fallback: bool,
+    result: Option<(usize, &[u8])>,
+) -> RawCheck {
+    if let Some((length, response)) = result {
+        if length == read.expected.len() && response == read.expected {
+            return RawCheck::Match;
+        }
+        if read.fallback_index.is_some() && length == 3 && response.len() == 3 {
+            let value = u32::from_le_bytes([response[0], response[1], response[2], 0]);
+            if (1..=0x7f_ffff).contains(&value) {
+                return RawCheck::Changed;
+            }
+        }
+    }
+    if !fallback && read.fallback_index.is_some() {
+        RawCheck::RetryAlternate
+    } else {
+        RawCheck::Changed
+    }
+}
+
+struct Revalidation {
+    deadline: Instant,
+    next: usize,
+    fallback: bool,
+}
+
+impl Revalidation {
+    fn begin(existing: bool, now: Instant) -> Result<Self, Error> {
+        if existing {
+            return Err(Error::Transfer(
+                "AudioControl status failed again during revalidation".into(),
+            ));
+        }
+        Ok(Self {
+            deadline: now + VERIFICATION_BUDGET,
+            next: 0,
+            fallback: false,
+        })
+    }
+    fn complete_read(&mut self, total: usize) -> bool {
+        self.next = self.next.saturating_add(1);
+        self.fallback = false;
+        self.next >= total
+    }
+}
+
 struct EndpointStatus {
+    control: u8,
+    disabled: bool,
+    capture_only: bool,
     endpoint: u8,
     slot: InterruptTransferSlot,
     reads: Vec<ExpectedRead>,
     faults: Vec<EndpointFault>,
     uac1: Option<Uac1Status>,
+    uac1_reads: Vec<RawExpectedRead>,
+    revalidation: Option<Revalidation>,
 }
 
 pub(super) struct AudioStatus {
     endpoints: Vec<EndpointStatus>,
+    fault_capture_control: Option<u8>,
+}
+
+fn capture_only_scope<'a>(
+    targets: impl Iterator<Item = &'a StreamStatusTarget>,
+    control: u8,
+) -> bool {
+    let targets: Vec<_> = targets.filter(|target| target.control == control).collect();
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            !target.data_endpoints.is_empty()
+                && target
+                    .data_endpoints
+                    .iter()
+                    .all(|(_, _, address)| address & 0x80 != 0)
+        })
 }
 
 impl AudioStatus {
@@ -269,6 +356,7 @@ impl AudioStatus {
         if targets.is_empty() {
             return Ok(Self {
                 endpoints: Vec::new(),
+                fault_capture_control: None,
             });
         }
         let config = claimed
@@ -300,6 +388,9 @@ impl AudioStatus {
             }) else {
                 continue;
             };
+            // Unknown or mixed directions remain shared. A control endpoint
+            // exclusively serving capture does not degrade playback proof.
+            let capture_only = capture_only_scope(targets.iter().copied(), target.control);
             let mut status_endpoints = ac.endpoint_descriptors().filter(|endpoint| {
                 endpoint.direction() == Direction::In
                     && endpoint.transfer_type() == TransferType::Interrupt
@@ -419,9 +510,31 @@ impl AudioStatus {
                     }
                     Some(watches)
                 })();
-                let Some(status) = watches
-                    .and_then(|watches| Uac1Status::new(target.control, ac.extra(), watches))
-                else {
+                let Some(watches) = watches else { continue };
+                let mut uac1_reads = Vec::new();
+                for watch in &watches {
+                    uac1_reads.push(RawExpectedRead {
+                        request_type: 0x81,
+                        request: 0x0a,
+                        value: 0,
+                        index: u16::from(watch.interface),
+                        expected: vec![watch.alternate],
+                        fallback_index: None,
+                    });
+                    if let Some(rate) = watch.rate {
+                        uac1_reads.push(RawExpectedRead {
+                            request_type: 0xa2,
+                            request: 0x81,
+                            value: 0x0100,
+                            index: u16::from(watch.endpoint),
+                            expected: rate.to_le_bytes()[..3].to_vec(),
+                            fallback_index: (watch.interface != 0).then_some(
+                                u16::from(watch.endpoint) | u16::from(watch.interface) << 8,
+                            ),
+                        });
+                    }
+                }
+                let Some(status) = Uac1Status::new(target.control, ac.extra(), watches) else {
                     continue;
                 };
                 if addresses.contains(&endpoint.address()) {
@@ -431,11 +544,16 @@ impl AudioStatus {
                 let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
                     .map_err(Error::Transfer)?;
                 endpoints.push(EndpointStatus {
+                    control: target.control,
+                    disabled: false,
+                    capture_only,
                     endpoint: endpoint.address(),
                     slot,
                     reads: Vec::new(),
                     faults: Vec::new(),
                     uac1: Some(status),
+                    uac1_reads,
+                    revalidation: None,
                 });
                 continue;
             }
@@ -565,18 +683,26 @@ impl AudioStatus {
             let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
                 .map_err(Error::Transfer)?;
             endpoints.push(EndpointStatus {
+                control: target.control,
+                disabled: false,
+                capture_only,
                 endpoint: endpoint.address(),
                 slot,
                 reads,
                 faults,
                 uac1: None,
+                uac1_reads: Vec::new(),
+                revalidation: None,
             });
         }
         // Resolve contradictory targets before arming any endpoint.
         for endpoint in &mut endpoints {
             endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
         }
-        Ok(Self { endpoints })
+        Ok(Self {
+            endpoints,
+            fault_capture_control: None,
+        })
     }
 
     /// Clear pre-stream sticky state immediately before this endpoint's first data submission.
@@ -598,58 +724,198 @@ impl AudioStatus {
         Ok(())
     }
 
-    pub(super) fn poll(&mut self, claimed: &ClaimedHandle) -> Result<(), Error> {
-        let deadline = Instant::now() + VERIFICATION_BUDGET;
+    /// Used only after admission proved the capture AC function is separate.
+    /// Keep the submitted interrupt owned until its callback or pair teardown.
+    pub(super) fn disable_capture_control(&mut self, control: u8) {
         for endpoint in &mut self.endpoints {
-            let Some((status, bytes)) = endpoint.slot.take_completion() else {
+            if endpoint.control == control {
+                endpoint.disabled = true;
+                endpoint.revalidation = None;
+            }
+        }
+    }
+
+    pub(super) fn is_revalidating(&self) -> bool {
+        self.endpoints
+            .iter()
+            .any(|endpoint| endpoint.revalidation.is_some())
+    }
+
+    pub(super) fn is_degraded(&self) -> bool {
+        self.endpoints
+            .iter()
+            .any(|endpoint| !endpoint.capture_only && endpoint.revalidation.is_some())
+    }
+
+    pub(super) fn capture_fault_control(&self) -> Option<u8> {
+        self.fault_capture_control
+    }
+
+    pub(super) fn poll(&mut self, claimed: &ClaimedHandle) -> Result<(), Error> {
+        let result = self.poll_inner(claimed);
+        if result.is_ok() {
+            self.fault_capture_control = None;
+        }
+        result
+    }
+
+    fn poll_inner(&mut self, claimed: &ClaimedHandle) -> Result<(), Error> {
+        let mut revalidation_attempted = false;
+        for endpoint in &mut self.endpoints {
+            self.fault_capture_control = endpoint.capture_only.then_some(endpoint.control);
+            if endpoint.disabled {
+                if let Some((status, _)) = endpoint.slot.take_completion() {
+                    if status == LIBUSB_TRANSFER_NO_DEVICE {
+                        return Err(Error::DeviceLost);
+                    }
+                }
+                continue;
+            }
+            if endpoint
+                .revalidation
+                .as_ref()
+                .is_some_and(|r| Instant::now() >= r.deadline)
+            {
+                return Err(verification_expired());
+            }
+            if let Some((status, bytes)) = endpoint.slot.take_completion() {
+                if status == LIBUSB_TRANSFER_NO_DEVICE {
+                    return Err(Error::DeviceLost);
+                }
+                if status != LIBUSB_TRANSFER_COMPLETED {
+                    let recovery =
+                        Revalidation::begin(endpoint.revalidation.is_some(), Instant::now())?;
+                    // Rearm exactly once; the deadline includes that attempt.
+                    endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+                    endpoint.revalidation = Some(recovery);
+                    log_warn!(
+                        "[USB] AudioControl status monitor degraded on {:#04x}; revalidating",
+                        endpoint.endpoint
+                    );
+                } else if endpoint.revalidation.is_some() {
+                    // A notification can invalidate any check already performed.
+                    // Restart the proof without extending its original deadline.
+                    let recovery = endpoint.revalidation.as_mut().expect("checked");
+                    recovery.next = 0;
+                    recovery.fallback = false;
+                    endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+                } else {
+                    let deadline = Instant::now() + VERIFICATION_BUDGET;
+                    if let Some(status) = &endpoint.uac1 {
+                        status.poll(bytes, |request_type, request, value, index, length| {
+                            raw_read_control(
+                                claimed,
+                                request_type,
+                                request,
+                                value,
+                                index,
+                                length,
+                                deadline,
+                            )
+                            .map(|(_, response)| response)
+                        })?;
+                    } else {
+                        for index in triggered_reads(&endpoint.reads, bytes) {
+                            read_expected(claimed, &endpoint.reads[index], deadline)?;
+                        }
+                        for index in triggered_faults(&endpoint.faults, bytes) {
+                            let fault = &endpoint.faults[index];
+                            if read_fault(claimed, fault.address, deadline)? {
+                                let name = if fault.address.selector == 2 {
+                                    "overrun"
+                                } else {
+                                    "underrun"
+                                };
+                                return Err(Error::Transfer(format!(
+                                    "Confirmed audio endpoint {:#04x} {name}",
+                                    fault.address.interface
+                                )));
+                            }
+                        }
+                    }
+                    endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+                }
+            }
+            let Some(recovery) = endpoint.revalidation.as_ref() else {
                 continue;
             };
-            if status == LIBUSB_TRANSFER_NO_DEVICE {
-                return Err(Error::DeviceLost);
-            }
-            if status != LIBUSB_TRANSFER_COMPLETED {
-                // A pending NAK never completes (the transfer has no timeout).
-                // Any completed transport error makes the status proof unavailable.
-                return Err(Error::Transfer(format!(
-                    "AudioControl status endpoint {:#04x} failed: {status}",
-                    endpoint.endpoint
-                )));
-            }
-            if let Some(status) = &endpoint.uac1 {
-                status.poll(bytes, |request_type, request, value, index, length| {
-                    raw_read_control(
-                        claimed,
-                        request_type,
-                        request,
-                        value,
-                        index,
-                        length,
-                        deadline,
-                    )
-                    .map(|(_, response)| response)
-                })?;
-                endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+            if revalidation_attempted {
                 continue;
             }
-            let pending = triggered_reads(&endpoint.reads, bytes);
-            for index in pending {
-                read_expected(claimed, &endpoint.reads[index], deadline)?;
-            }
-            for index in triggered_faults(&endpoint.faults, bytes) {
-                let fault = &endpoint.faults[index];
+            let deadline = recovery.deadline;
+            let index = recovery.next;
+            let raw_count = endpoint.uac1_reads.len();
+            let read_count = endpoint.reads.len();
+            let armed_faults: Vec<_> = endpoint.faults.iter().filter(|fault| fault.armed).collect();
+            let total = raw_count + read_count + armed_faults.len();
+            if index < raw_count {
+                let read = &endpoint.uac1_reads[index];
+                let using_fallback = recovery.fallback;
+                let request_index = if using_fallback {
+                    read.fallback_index.expect("fallback selected")
+                } else {
+                    read.index
+                };
+                let result = raw_read_control(
+                    claimed,
+                    read.request_type,
+                    read.request,
+                    read.value,
+                    request_index,
+                    read.expected.len(),
+                    deadline,
+                );
+                revalidation_attempted = true;
+                let observation = match &result {
+                    Ok((length, response)) => Some((*length, response.as_slice())),
+                    Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                    Err(_) => None,
+                };
+                match classify_raw_check(read, using_fallback, observation) {
+                    RawCheck::Match => (),
+                    RawCheck::RetryAlternate => {
+                        endpoint
+                            .revalidation
+                            .as_mut()
+                            .expect("revalidation active")
+                            .fallback = true;
+                        continue;
+                    }
+                    RawCheck::Changed => {
+                        return Err(Error::Control(
+                            "AudioControl revalidation changed or returned invalid data".into(),
+                        ))
+                    }
+                }
+            } else if index < raw_count + read_count {
+                read_expected(claimed, &endpoint.reads[index - raw_count], deadline)?;
+                revalidation_attempted = true;
+            } else if index < total {
+                let fault = armed_faults[index - raw_count - read_count];
                 if read_fault(claimed, fault.address, deadline)? {
-                    let name = if fault.address.selector == 2 {
-                        "overrun"
-                    } else {
-                        "underrun"
-                    };
                     return Err(Error::Transfer(format!(
-                        "Confirmed audio endpoint {:#04x} {name}",
+                        "Confirmed audio endpoint {:#04x} fault",
                         fault.address.interface
                     )));
                 }
+                revalidation_attempted = true;
             }
-            endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+            let complete = if index < total {
+                endpoint
+                    .revalidation
+                    .as_mut()
+                    .expect("revalidation active")
+                    .complete_read(total)
+            } else {
+                true
+            };
+            if complete {
+                endpoint.revalidation = None;
+                log_info!(
+                    "[USB] AudioControl status monitor revalidated on {:#04x}",
+                    endpoint.endpoint
+                );
+            }
         }
         Ok(())
     }
@@ -876,6 +1142,60 @@ fn verification_expired() -> Error {
 mod tests {
     use super::*;
     use crate::clock_resolution::{ClockHop, ClockHopKind};
+
+    #[test]
+    fn uac1_revalidation_retries_only_unusable_primary_readback() {
+        let read = RawExpectedRead {
+            request_type: 0xa2,
+            request: 0x81,
+            value: 0x100,
+            index: 0x81,
+            expected: vec![0x80, 0xbb, 0],
+            fallback_index: Some(0x381),
+        };
+        assert_eq!(
+            classify_raw_check(&read, false, None),
+            RawCheck::RetryAlternate
+        );
+        assert_eq!(
+            classify_raw_check(&read, false, Some((3, &[0, 0, 0]))),
+            RawCheck::RetryAlternate
+        );
+        assert_eq!(
+            classify_raw_check(&read, false, Some((3, &[0x44, 0xac, 0]))),
+            RawCheck::Changed
+        );
+        assert_eq!(
+            classify_raw_check(&read, true, Some((3, &[0x80, 0xbb, 0]))),
+            RawCheck::Match
+        );
+        assert_eq!(classify_raw_check(&read, true, None), RawCheck::Changed);
+    }
+
+    #[test]
+    fn status_recovery_requires_one_rearm_and_all_reads_before_health() {
+        let now = Instant::now();
+        let mut recovery = Revalidation::begin(false, now).unwrap();
+        assert_eq!(recovery.deadline, now + VERIFICATION_BUDGET);
+        assert!(Revalidation::begin(true, now + Duration::from_millis(1)).is_err());
+        assert!(!recovery.complete_read(3));
+        assert!(!recovery.complete_read(3));
+        assert!(recovery.complete_read(3));
+        assert_eq!(recovery.deadline, now + VERIFICATION_BUDGET);
+    }
+
+    #[test]
+    fn capture_scope_requires_all_watches_to_be_capture() {
+        let mut capture = StreamStatusTarget::new(0x20, 1, 2, 1, None);
+        capture.add_data_endpoint(2, 1, 0x81);
+        let mut playback = StreamStatusTarget::new(0x20, 1, 3, 1, None);
+        playback.add_data_endpoint(3, 1, 0x01);
+        let unknown = StreamStatusTarget::new(0x20, 1, 4, 1, None);
+        assert!(capture_only_scope([&capture].into_iter(), 1));
+        assert!(!capture_only_scope([&capture, &playback].into_iter(), 1));
+        assert!(!capture_only_scope([&capture, &unknown].into_iter(), 1));
+        assert!(!capture_only_scope([&capture].into_iter(), 9));
+    }
 
     #[test]
     fn uac1_sampling_readback_needs_one_exact_advertisement() {

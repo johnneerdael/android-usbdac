@@ -41,6 +41,7 @@ pub(crate) struct SessionContext {
     pub(super) gen1: Arc<Mutex<Option<routing_hw::RecordedGen1>>>,
     pub(super) fcp: Arc<Mutex<Option<routing_hw::RecordedFcp>>>,
     pub(super) routing: Arc<Mutex<Option<routing_hw::RecordedRouting>>>,
+    pub(super) routing_report: Arc<Mutex<Option<routing_hw::RoutingHandBackReport>>>,
 }
 impl SessionContext {
     #[cfg(test)]
@@ -73,6 +74,7 @@ impl SessionContext {
             gen1: Arc::new(Mutex::new(None)),
             fcp: Arc::new(Mutex::new(None)),
             routing: Arc::new(Mutex::new(None)),
+            routing_report: Arc::new(Mutex::new(None)),
         })
     }
     pub(crate) fn reserve(fd: RawFd) -> Result<Arc<Self>, Error> {
@@ -172,6 +174,9 @@ impl SessionContext {
             registry.owners.remove(&identity);
         }
     }
+    pub(crate) fn routing_hand_back_report(&self) -> Option<routing_hw::RoutingHandBackReport> {
+        self.routing_report.lock().clone()
+    }
     pub(crate) fn retired(self: &Arc<Self>, timeout: Duration) -> bool {
         let _scope = self.enter();
         super::api::await_usb_retirement(timeout)
@@ -249,6 +254,9 @@ impl<T> ScopedMutex<T> {
     pub(super) fn lock(&self) -> ArcMutexGuard<RawMutex, T> {
         (self.0)(&current()).lock_arc()
     }
+    pub(super) fn try_lock_for(&self, timeout: Duration) -> Option<ArcMutexGuard<RawMutex, T>> {
+        (self.0)(&current()).try_lock_arc_for(timeout)
+    }
     pub(super) fn try_lock(&self) -> Option<ArcMutexGuard<RawMutex, T>> {
         (self.0)(&current()).try_lock_arc()
     }
@@ -294,6 +302,27 @@ impl ScopedU32 {
 mod tests {
     use super::*;
     use crate::transport::fake_dac;
+    #[test]
+    fn routing_report_is_cloned_and_scoped_to_its_owner() {
+        use crate::routing::{ControlKey, Entity, RoutingHandBackOutcome, RoutingHandBackReport};
+        let first = SessionContext::unregistered();
+        let second = SessionContext::unregistered();
+        let expected = RoutingHandBackReport {
+            controls: vec![(
+                ControlKey::Selector(Entity {
+                    interface: 3,
+                    id: 7,
+                }),
+                RoutingHandBackOutcome::DeadlineExpired,
+            )],
+        };
+        *first.routing_report.lock() = Some(expected.clone());
+        let mut copy = first.routing_hand_back_report().unwrap();
+        copy.controls.clear();
+        assert_eq!(first.routing_hand_back_report(), Some(expected));
+        assert_eq!(second.routing_hand_back_report(), None);
+    }
+
     #[test]
     fn independent_owners_keep_volume_payload_clock_state_and_close_separate() {
         let _serial = PAYLOAD_LATCH_TEST_LOCK
@@ -445,16 +474,45 @@ mod tests {
             .unwrap();
         let owner = SessionContext::reserve(file.as_raw_fd()).unwrap();
         owner.admit();
-        owner.active.store(true, Ordering::SeqCst);
-        assert!(!owner.retired(Duration::ZERO));
+        // Reuse the existing session model. Its -1 FD owner is a safe sentinel;
+        // it observes coordinator ownership, not a real libusb handle.
+        let state = super::super::session::test_state(None);
+        let fd_owner = Arc::downgrade(state.device._fd_owner.as_ref().expect("usbfs owner"));
+        *owner.session.lock() = Some(state);
+        let session_guard = {
+            let _scope = owner.enter();
+            let _gate = USB_SESSION_GATE.lock();
+            SessionGuard::start_locked()
+        };
+        {
+            let _scope = owner.enter();
+            clear_device();
+            assert!(USB_SESSION_CLEAR_PENDING.load(Ordering::SeqCst));
+            assert!(USB_STOP_REQUESTED.load(Ordering::SeqCst));
+            assert!(!wait_for_session_stop(Duration::ZERO));
+            assert!(session_registered());
+        }
+        assert!(!await_connection_retirement(file.as_raw_fd(), Duration::ZERO).unwrap());
+        assert!(fd_owner.upgrade().is_some());
         assert!(matches!(
             SessionContext::reserve(file.as_raw_fd()),
             Err(Error::Busy)
         ));
-        owner.active.store(false, Ordering::SeqCst);
-        owner.release();
+
+        // The session guard is held by the worker until the return/retirement
+        // boundary. Its drop performs the actual pending-clear coordination.
+        drop(session_guard);
         assert!(owner.retired(Duration::ZERO));
+        assert!(await_connection_retirement(file.as_raw_fd(), Duration::ZERO).unwrap());
+        assert!(owner.session.lock().is_none());
+        assert!(fd_owner.upgrade().is_none());
         let replacement = SessionContext::reserve(file.as_raw_fd()).unwrap();
+        // Repeated cleanup of the old owner must not release its replacement.
+        owner.release();
+        assert!(matches!(
+            SessionContext::reserve(file.as_raw_fd()),
+            Err(Error::Busy)
+        ));
         replacement.release();
     }
 

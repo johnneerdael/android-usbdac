@@ -16,6 +16,13 @@ class DacSessionOutputSource(
     private val allowWidening: Boolean = true,
     private val volumeMultiplier: (Float) -> Unit = {},
 ) : OutputSource {
+    private val supportSnapshot = session.capabilities.altSettings.map { alt ->
+        alt.copy(sampleRates = alt.sampleRates.toList(), rateRanges = alt.rateRanges.toList())
+    }
+
+    override fun formatSupport(request: StreamRequest): OutputSupport =
+        directSessionSupport(supportSnapshot, request, allowWidening)
+
     override fun open(request: StreamRequest): OpenedOutput {
         require(request.encoding in listOf(StreamEncoding.PCM, StreamEncoding.PCM_U8, StreamEncoding.PCM_FLOAT32)) { "Media3 integration requires integer PCM" }
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
@@ -42,28 +49,56 @@ class DacSessionOutputSource(
     }
 
     override fun reconfigure(output: OpenedOutput, request: StreamRequest): OutputReconfiguration? {
-        var current = output.output as? DacStream ?: return null
-        val depths = listOf(request.bitDepth) + if (allowWidening && request.encoding == StreamEncoding.PCM) {
-            session.capabilities.pcmBitDepths.filter { it > request.bitDepth }.distinct().sorted()
-        } else emptyList()
-        var cause: DacException? = null
-        for (depth in depths) {
-            val report = session.reconfigure(current, request.copy(bitDepth = depth, ratePolicy = RatePolicy.EXACT))
-            current = report.stream
-            cause = report.rollbackCause
-            if (cause == null) {
-                val wire = current.format
-                return OutputReconfiguration(OpenedOutput(current, WriteFormat(wire.sampleRate, wire.channels,
-                    wire.subslotBytes, wire.validBits, wire.counterRateHz, wire.encoding), request))
-            }
-            if (cause.code != DacErrorCode.UNSUPPORTED) break
-        }
-        val wire = current.format
-        return OutputReconfiguration(OpenedOutput(current, WriteFormat(wire.sampleRate, wire.channels,
-            wire.subslotBytes, wire.validBits, wire.counterRateHz, wire.encoding), output.request), cause)
+        val current = output.output as? DacStream ?: return null
+        val candidates = reconfigurationCandidates(supportSnapshot, request, allowWidening)
+        if (candidates.isEmpty()) throw DacException(DacErrorCode.UNSUPPORTED, "no cached same-rate output alternate")
+        val report = session.reconfigureCandidates(current, candidates)
+        val wire = report.stream.format
+        val actualRequest = if (report.rollbackCause == null) request else output.request
+        return OutputReconfiguration(OpenedOutput(report.stream, WriteFormat(wire.sampleRate, wire.channels,
+            wire.subslotBytes, wire.validBits, wire.counterRateHz, wire.encoding), actualRequest), report.rollbackCause)
     }
 
     override fun close(output: OpenedOutput) = output.output.close()
     override fun takeLookAgain(): Boolean = false
     override fun setVolumeMultiplier(multiplier: Float) = volumeMultiplier(multiplier)
+}
+
+internal fun reconfigurationCandidates(alts: List<AltSetting>, request: StreamRequest, allowWidening: Boolean): List<StreamRequest> {
+    val depths = (listOf(request.bitDepth) + if (allowWidening && request.encoding == StreamEncoding.PCM) {
+        alts.filter { it.format == AltFormat.PCM }.map { it.validBits }
+            .filter { it > request.bitDepth }.distinct().sorted()
+    } else emptyList()).distinct()
+    return depths.map { request.copy(bitDepth = it, ratePolicy = RatePolicy.EXACT) }
+        .filter { directSessionSupport(alts, it, false).support == OutputFormatSupport.DIRECT }
+}
+
+/** Conservative descriptor-only check; no clock programming or stream open occurs. */
+internal fun directSessionSupport(alts: List<AltSetting>, request: StreamRequest, allowWidening: Boolean): OutputSupport {
+    val expected = when (request.encoding) {
+        StreamEncoding.PCM -> AltFormat.PCM
+        StreamEncoding.PCM_U8 -> AltFormat.PCM_U8
+        StreamEncoding.PCM_FLOAT32 -> AltFormat.PCM_FLOAT32
+        else -> return OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "unsupported source encoding")
+    }
+    val candidates = alts.filter { alt ->
+        val rateSupported = request.sampleRate in alt.sampleRates || alt.rateRanges.any { range ->
+            request.sampleRate in range.minHz..range.maxHz &&
+                if (range.stepHz > 0) (request.sampleRate.toLong() - range.minHz) % range.stepHz == 0L
+                else range.stepHz == 0 && range.minHz == range.maxHz
+        }
+        val framesPerInterval = (request.sampleRate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
+        val slotValid = alt.subslotBytes in 1..4 && alt.validBits > 0 && alt.validBits <= alt.subslotBytes * 8
+        val exact = alt.validBits == request.bitDepth
+        val widened = request.encoding == StreamEncoding.PCM && allowWidening && alt.validBits > request.bitDepth
+        alt.format == expected && alt.channels == request.channels && alt.pacing != null &&
+            request.sampleRate > 0 && rateSupported && slotValid && alt.subslotBytes >= request.bitDepth / 8 &&
+            alt.serviceIntervalUs > 0 && alt.maxPacketBytes > 0 &&
+            framesPerInterval * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && (exact || widened)
+    }
+    val alt = candidates.minByOrNull { it.validBits } ?:
+        return OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no matching cached alternate")
+    val processing = if (alt.validBits == request.bitDepth) OutputFormatSupport.DIRECT else OutputFormatSupport.WITH_TRANSCODING
+    return OutputSupport(processing, request, request.copy(bitDepth = alt.validBits),
+        if (processing == OutputFormatSupport.DIRECT) "cached exact format" else "integer widening")
 }

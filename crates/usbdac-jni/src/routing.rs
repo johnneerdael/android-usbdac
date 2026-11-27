@@ -2,8 +2,8 @@
 use super::*;
 use serde_json::json;
 use usbdac_core::routing::{
-    Access, ControlKey, Entity, RouteEdit, RouteValue, RoutingError, RoutingSessionError,
-    RoutingUnit,
+    Access, ControlKey, Entity, RouteEdit, RouteValue, RoutingError, RoutingHandBackOutcome,
+    RoutingHandBackReport, RoutingSessionError, RoutingUnit,
 };
 
 fn key_json(key: ControlKey) -> Value {
@@ -133,8 +133,51 @@ fn snapshot_json(snapshot: &usbdac_core::routing::RoutingSnapshot, id: u64) -> V
             }
         }
     }
-    json!({"snapshot_id":id,"configuration_id":snapshot.configuration(),"controls":controls})
+    let diagnostics = snapshot
+        .diagnostics()
+        .iter()
+        .map(|d| json!({"interface":d.interface,"entity":d.entity_id,"detail":d.detail}))
+        .collect::<Vec<_>>();
+    json!({"snapshot_id":id,"configuration_id":snapshot.configuration(),"controls":controls,"diagnostics":diagnostics})
 }
+fn hand_back_json(report: Option<RoutingHandBackReport>) -> Value {
+    let Some(report) = report else {
+        return json!({"status":"no_recorded_changes"});
+    };
+    let controls = report
+        .controls
+        .into_iter()
+        .map(|(key, outcome)| {
+            let (kind, detail) = match outcome {
+                RoutingHandBackOutcome::Restored => ("restored", None),
+                RoutingHandBackOutcome::AlreadyOriginal => ("already_original", None),
+                RoutingHandBackOutcome::ExternallyChanged => ("externally_changed", None),
+                RoutingHandBackOutcome::Unreadable(s) => ("unreadable", Some(s)),
+                RoutingHandBackOutcome::IdentityOrTopologyChanged(s) => {
+                    ("identity_or_topology_changed", Some(s))
+                }
+                RoutingHandBackOutcome::RestoreUncertain(s) => ("restore_uncertain", Some(s)),
+                RoutingHandBackOutcome::DeadlineExpired => ("deadline_expired", None),
+                RoutingHandBackOutcome::Disabled => ("disabled", None),
+            };
+            json!({"key":key_json(key),"outcome":kind,"detail":detail})
+        })
+        .collect::<Vec<_>>();
+    json!({"status":"complete", "controls":controls})
+}
+
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_retirement_routing_report<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    token: i64,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let report = registry::retirement_routing_report(token)?;
+        java_string(env, &hand_back_json(report))
+    })
+}
+
 fn access(access: Access) -> &'static str {
     match access {
         Access::Absent => "absent",
@@ -347,6 +390,29 @@ mod tests {
         assert_eq!(value["error"]["session_code"], "control");
         assert_eq!(value["error"]["power_restore_failure"], "power restore");
     }
+    #[test]
+    fn hand_back_json_keeps_control_keys_uncertainty_and_absence_distinct() {
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 8,
+        });
+        assert_eq!(hand_back_json(None)["status"], "no_recorded_changes");
+        let value = hand_back_json(Some(RoutingHandBackReport {
+            controls: vec![
+                (
+                    key,
+                    RoutingHandBackOutcome::RestoreUncertain("rounding".into()),
+                ),
+                (key, RoutingHandBackOutcome::DeadlineExpired),
+            ],
+        }));
+        assert_eq!(value["status"], "complete");
+        assert_eq!(value["controls"][0]["key"], key_json(key));
+        assert_eq!(value["controls"][0]["outcome"], "restore_uncertain");
+        assert_eq!(value["controls"][0]["detail"], "rounding");
+        assert_eq!(value["controls"][1]["outcome"], "deadline_expired");
+    }
+
     #[test]
     fn transaction_failure_keeps_edit_index_and_each_rollback_cause() {
         let key = ControlKey::Selector(Entity {

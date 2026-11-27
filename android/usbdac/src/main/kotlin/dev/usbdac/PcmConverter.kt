@@ -338,7 +338,8 @@ public class PcmConverter private constructor(
 
     /**
      * Converts from the input's position up to its limit into the output's position up to its limit, and
-     * advances both positions. Both must be direct buffers, and must not overlap.
+     * advances both positions. Both must be direct buffers, and must not overlap. The input storage must
+     * remain immutable and output storage exclusively accessible, including aliases, throughout the call.
      *
      * @throws DacException [DacErrorCode.INVALID_STATE] after [finish] without a [reset], or after [close];
      *   [DacErrorCode.INVALID_ARGUMENT] for a heap buffer or nonzero declared padding bits.
@@ -346,6 +347,7 @@ public class PcmConverter private constructor(
     public fun convert(input: ByteBuffer, output: ByteBuffer): ConvertResult {
         checkOpen()
         requireDirect(input, output)
+        requireWritable(output)
         val packed = nativeCall {
             backend.process(handle, input, input.position(), input.remaining(), output, output.position(), output.remaining())
         }
@@ -364,6 +366,7 @@ public class PcmConverter private constructor(
     public fun finish(output: ByteBuffer): Int {
         checkOpen()
         requireDirect(output)
+        requireWritable(output)
         val produced = nativeCall { backend.finish(handle, output, output.position(), output.remaining()) }
         output.position(output.position() + produced)
         return produced
@@ -383,6 +386,10 @@ public class PcmConverter private constructor(
 
     private fun checkOpen() {
         if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "the converter is closed")
+    }
+
+    private fun requireWritable(buffer: ByteBuffer) {
+        if (buffer.isReadOnly) throw DacException(DacErrorCode.INVALID_ARGUMENT, "output buffer is read-only")
     }
 
     private fun requireDirect(vararg buffers: ByteBuffer) {

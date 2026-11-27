@@ -205,9 +205,26 @@ fn adc3_pcm_encoding(header: &wire::AsHeader, capture: bool) -> Option<PcmEncodi
     ) {
         return None;
     }
+    // Capture exposes raw signed PCM bytes with valid bits left-justified in
+    // the complete subslot. Keep playback's narrower supported format policy.
+    let signed_capture = capture
+        && (1..=4).contains(&header.subslot_size)
+        && header.bit_resolution > 0
+        && header.bit_resolution <= header.subslot_size * 8;
+    // Signed 8-bit PCM and unsigned PCM8 have identical geometry but different
+    // sample interpretation; an advertised choice alone does not select one.
+    if signed_capture
+        && header.formats & 3 == 3
+        && header.subslot_size == 1
+        && header.bit_resolution == 8
+    {
+        return None;
+    }
     if header.formats & 1 != 0
-        && matches!(header.subslot_size, 2..=4)
-        && matches!(header.bit_resolution, 16 | 24 | 32)
+        && (signed_capture
+            || (!capture
+                && matches!(header.subslot_size, 2..=4)
+                && matches!(header.bit_resolution, 16 | 24 | 32)))
     {
         return Some(PcmEncoding::Signed);
     }
@@ -780,6 +797,303 @@ fn validate_badd_function(
     validate_badd_inventory(profile, &evidence)
 }
 
+// These projections contain every field used by the BADD validator, including
+// descriptor extras used for SuperSpeed companions and feedback geometry.
+#[derive(Debug, PartialEq, Eq)]
+struct WitnessEndpoint {
+    length: u8,
+    address: u8,
+    attributes: u8,
+    packet: u16,
+    interval: u8,
+    refresh: u8,
+    synch: u8,
+    extra: Vec<u8>,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct WitnessAlt {
+    interface: u8,
+    alt: u8,
+    count: u8,
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    extra: Vec<u8>,
+    endpoints: Vec<WitnessEndpoint>,
+}
+
+fn raw_witness_projection(raw: &[u8]) -> Option<Vec<WitnessAlt>> {
+    if raw.len() < 9
+        || raw.len() > 16384
+        || raw[0] != 9
+        || raw[1] != 2
+        || usize::from(u16::from_le_bytes([raw[2], raw[3]])) != raw.len()
+    {
+        return None;
+    }
+    let mut alts: Vec<WitnessAlt> = Vec::new();
+    let mut at = 9;
+    let mut current = None;
+    let mut endpoint = None;
+    while at < raw.len() {
+        if raw.len() - at < 2 {
+            return None;
+        }
+        let len = usize::from(raw[at]);
+        if len < 2 || len > raw.len() - at {
+            return None;
+        }
+        let d = &raw[at..at + len];
+        match d[1] {
+            2 => return None,
+            11 => {
+                current = None;
+                endpoint = None;
+            }
+            4 => {
+                if len != 9 || alts.iter().any(|a| a.interface == d[2] && a.alt == d[3]) {
+                    return None;
+                }
+                alts.push(WitnessAlt {
+                    interface: d[2],
+                    alt: d[3],
+                    count: d[4],
+                    class: d[5],
+                    subclass: d[6],
+                    protocol: d[7],
+                    extra: Vec::new(),
+                    endpoints: Vec::new(),
+                });
+                current = Some(alts.len() - 1);
+                endpoint = None;
+            }
+            5 => {
+                let idx = current?;
+                if len != 7 && len != 9 {
+                    return None;
+                }
+                if alts[idx].endpoints.iter().any(|e| e.address == d[2]) {
+                    return None;
+                }
+                alts[idx].endpoints.push(WitnessEndpoint {
+                    length: d[0],
+                    address: d[2],
+                    attributes: d[3] & 0x3f,
+                    packet: u16::from_le_bytes([d[4], d[5]]),
+                    interval: d[6],
+                    refresh: if len == 9 { d[7] } else { 0 },
+                    synch: if len == 9 { d[8] } else { 0 },
+                    extra: Vec::new(),
+                });
+                endpoint = Some(alts[idx].endpoints.len() - 1);
+            }
+            _ => {
+                if let Some(idx) = current {
+                    if let Some(ep) = endpoint {
+                        alts[idx].endpoints[ep].extra.extend_from_slice(d);
+                    } else {
+                        alts[idx].extra.extend_from_slice(d);
+                    }
+                }
+            }
+        }
+        at += len;
+    }
+    if alts
+        .iter()
+        .any(|a| usize::from(a.count) != a.endpoints.len())
+    {
+        return None;
+    }
+    let mut interfaces: Vec<_> = alts.iter().map(|a| a.interface).collect();
+    interfaces.sort_unstable();
+    interfaces.dedup();
+    if interfaces.len() != usize::from(raw[4]) {
+        return None;
+    }
+    alts.sort_by_key(|a| (a.interface, a.alt));
+    Some(alts)
+}
+
+fn parsed_witness_projection(config: &ConfigDescriptor) -> Vec<WitnessAlt> {
+    let mut alts: Vec<_> = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .map(|d| {
+            let endpoints = d
+                .endpoint_descriptors()
+                .map(|e| {
+                    let transfer = match e.transfer_type() {
+                        TransferType::Control => 0,
+                        TransferType::Isochronous => 1,
+                        TransferType::Bulk => 2,
+                        TransferType::Interrupt => 3,
+                    };
+                    let sync = match e.sync_type() {
+                        SyncType::NoSync => 0,
+                        SyncType::Asynchronous => 1,
+                        SyncType::Adaptive => 2,
+                        SyncType::Synchronous => 3,
+                    };
+                    let usage = match e.usage_type() {
+                        UsageType::Data => 0,
+                        UsageType::Feedback => 1,
+                        UsageType::FeedbackData => 2,
+                        UsageType::Reserved => 3,
+                    };
+                    WitnessEndpoint {
+                        length: e.length(),
+                        address: e.address(),
+                        attributes: transfer | sync << 2 | usage << 4,
+                        packet: e.max_packet_size(),
+                        interval: e.interval(),
+                        refresh: e.refresh(),
+                        synch: e.synch_address(),
+                        extra: e.extra().unwrap_or(&[]).to_vec(),
+                    }
+                })
+                .collect();
+            WitnessAlt {
+                interface: d.interface_number(),
+                alt: d.setting_number(),
+                count: d.num_endpoints(),
+                class: d.class_code(),
+                subclass: d.sub_class_code(),
+                protocol: d.protocol_code(),
+                extra: d.extra().to_vec(),
+                endpoints,
+            }
+        })
+        .collect();
+    alts.sort_by_key(|a| (a.interface, a.alt));
+    alts
+}
+
+fn badd_witness_speed_known(speed: Speed) -> bool {
+    matches!(
+        speed,
+        Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus
+    )
+}
+
+pub(super) fn badd_only_fixed_rate_witness(
+    config: &ConfigDescriptor,
+    raw: &[u8],
+    speed: Speed,
+) -> u8 {
+    if !badd_witness_speed_known(speed)
+        || raw.get(5) != Some(&config.number())
+        || raw_witness_projection(raw).as_ref() != Some(&parsed_witness_projection(config))
+    {
+        return 0;
+    }
+    let Ok(iads) = functions(raw) else {
+        return 0;
+    };
+    for (i, a) in iads.iter().enumerate() {
+        let start = u16::from(a.b_first_interface);
+        let end = start + u16::from(a.b_interface_count);
+        if end > 256
+            || a.b_interface_count == 0
+            || iads.iter().skip(i + 1).any(|b| {
+                let other = u16::from(b.b_first_interface);
+                start < other + u16::from(b.b_interface_count) && other < end
+            })
+        {
+            return 0;
+        }
+    }
+    let mut playback = false;
+    for interface in config.interfaces() {
+        for alt in interface.descriptors() {
+            if !alt.endpoint_descriptors().any(|e| {
+                e.direction() == Direction::Out && e.transfer_type() == TransferType::Isochronous
+            }) {
+                continue;
+            }
+            playback = true;
+            let owners: Vec<_> = iads
+                .iter()
+                .filter(|iad| {
+                    let id = u16::from(alt.interface_number());
+                    id >= u16::from(iad.b_first_interface)
+                        && id < u16::from(iad.b_first_interface) + u16::from(iad.b_interface_count)
+                })
+                .collect();
+            let [iad] = owners.as_slice() else {
+                return 0;
+            };
+            let Ok(wire::FunctionProfile::Badd(profile)) = wire::function_profile(iad, 0x30) else {
+                return 0;
+            };
+            let controls: Vec<_> = config
+                .interfaces()
+                .flat_map(|i| i.descriptors())
+                .filter(|d| {
+                    d.interface_number() == iad.b_first_interface && d.setting_number() == 0
+                })
+                .collect();
+            if controls.len() != 1
+                || controls[0].class_code() != 1
+                || controls[0].sub_class_code() != 1
+                || controls[0].protocol_code() != 0x30
+                || validate_badd_function(config, iad, profile, speed).is_err()
+            {
+                return 0;
+            }
+        }
+    }
+    if playback {
+        return 1;
+    }
+    // A microphone-only BADD function can prove absence of playback only if
+    // the entire audio-streaming inventory is within validated BADD IADs.
+    let mut valid = 0;
+    for iad in &iads {
+        let Ok(wire::FunctionProfile::Badd(profile)) = wire::function_profile(iad, 0x30) else {
+            return 0;
+        };
+        let controls: Vec<_> = config
+            .interfaces()
+            .flat_map(|i| i.descriptors())
+            .filter(|d| d.interface_number() == iad.b_first_interface && d.setting_number() == 0)
+            .collect();
+        if controls.len() != 1
+            || controls[0].class_code() != 1
+            || controls[0].sub_class_code() != 1
+            || controls[0].protocol_code() != 0x30
+            || validate_badd_function(config, iad, profile, speed).is_err()
+        {
+            return 0;
+        }
+        valid += 1;
+    }
+    if valid == 0 {
+        return 0;
+    }
+    for interface in config.interfaces() {
+        for alt in interface.descriptors() {
+            if alt.class_code() == 1 && alt.sub_class_code() == 2 {
+                let id = u16::from(alt.interface_number());
+                if iads
+                    .iter()
+                    .filter(|iad| {
+                        id >= u16::from(iad.b_first_interface)
+                            && id
+                                < u16::from(iad.b_first_interface)
+                                    + u16::from(iad.b_interface_count)
+                    })
+                    .count()
+                    != 1
+                {
+                    return 0;
+                }
+            }
+        }
+    }
+    2
+}
+
 fn read_exact(
     handle: &DeviceHandle<Context>,
     control: u8,
@@ -876,6 +1190,16 @@ fn linked_terminal_clock(descriptors: &[&[u8]], terminal: u8, capture: bool) -> 
     }
     Ok(id)
 }
+fn clock_entity<'a>(descriptors: &[&'a [u8]], id: u8) -> Result<&'a [u8], String> {
+    let mut nodes = descriptors.iter().copied().filter(|d| {
+        d.get(2).is_some_and(|subtype| (2..=0x10).contains(subtype)) && d.get(3) == Some(&id)
+    });
+    let node = nodes.next().ok_or("ADC3 clock ID missing or duplicated")?;
+    if nodes.next().is_some() {
+        return Err("ADC3 clock ID missing or duplicated".into());
+    }
+    Ok(node)
+}
 fn clock_route(
     handle: &DeviceHandle<Context>,
     control: u8,
@@ -896,13 +1220,7 @@ fn clock_route(
         if path.iter().any(|h| h.id == id) {
             return Err("ADC3 clock cycle".into());
         }
-        let nodes: Vec<_> = descriptors
-            .iter()
-            .filter(|d| d.get(3) == Some(&id))
-            .collect();
-        let [d] = nodes.as_slice() else {
-            return Err("ADC3 clock ID missing or duplicated".into());
-        };
+        let d = clock_entity(&descriptors, id)?;
         match d[2] {
             0x0b => {
                 let source = wire::parse_clock_source(d).map_err(|e| e.to_string())?;
@@ -2741,6 +3059,7 @@ fn validate_adc3_clock(
 pub(super) struct Adc3PowerLease {
     fd: DeviceKey,
     handle: Option<Arc<DeviceHandle<Context>>>,
+    routing_deadline: Mutex<Option<Instant>>,
     pending: Mutex<Vec<(u8, u8, u8)>>,
     clock: Mutex<Option<(Adc3Route, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
 }
@@ -2749,9 +3068,45 @@ impl Adc3PowerLease {
         Self {
             fd,
             handle,
+            routing_deadline: Mutex::new(None),
             pending: Mutex::new(vec![]),
             clock: Mutex::new(None),
         }
+    }
+    pub(super) fn set_routing_deadline(&self, deadline: Instant) {
+        *self.routing_deadline.lock() = Some(deadline);
+    }
+    fn routing_timeout(&self) -> Result<u32, String> {
+        let deadline = *self.routing_deadline.lock();
+        let Some(deadline) = deadline else {
+            return Ok(1000);
+        };
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        if remaining.is_zero() {
+            return Err("ADC3 routing deadline expired".into());
+        }
+        Ok(remaining
+            .as_millis()
+            .saturating_add(if remaining.subsec_nanos() % 1_000_000 != 0 {
+                1
+            } else {
+                0
+            })
+            .clamp(1, 1000) as u32)
+    }
+    fn routing_delay(&self, delay: Duration) -> Result<(), String> {
+        let deadline = *self.routing_deadline.lock();
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < delay {
+                thread::sleep(remaining);
+                return Err("ADC3 routing deadline during recovery delay".into());
+            }
+        }
+        thread::sleep(delay);
+        Ok(())
     }
     fn control(&self, input: bool, ac: u8, id: u8, state: &mut [u8; 1]) -> Result<(), String> {
         let request = UsbfsControlTransfer {
@@ -2760,11 +3115,11 @@ impl Adc3PowerLease {
             value: 0x0200,
             index: u16::from(ac) | (u16::from(id) << 8),
             length: 1,
-            timeout_ms: 1000,
+            timeout_ms: self.routing_timeout()?,
             data: state.as_mut_ptr().cast(),
         };
         let result = source_control(self.fd, self.handle.as_deref(), &request);
-        class_control_delay();
+        self.routing_delay(Duration::from_micros(settings().control_delay_us()))?;
         if result.map_err(|error| error.to_string())? != 1 {
             return Err("ADC3 power control width mismatch".into());
         }
@@ -2818,7 +3173,7 @@ impl Adc3PowerLease {
             value: 0,
             index: u16::from(interface),
             length: 1,
-            timeout_ms: 1000,
+            timeout_ms: self.routing_timeout()?,
             data: alternate.as_mut_ptr().cast(),
         };
         let n =
@@ -3034,7 +3389,9 @@ impl PowerIo for PowerUsb<'_> {
         self.0.control(false, ac, id, &mut [state])
     }
     fn delay(&mut self, micros: u32) {
-        thread::sleep(Duration::from_micros(u64::from(micros)));
+        let _ = self
+            .0
+            .routing_delay(Duration::from_micros(u64::from(micros)));
     }
 }
 fn acquire_domain(
@@ -4108,6 +4465,57 @@ pub(super) fn adc3_badd_volume_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badd_witness_requires_identical_live_snapshot_and_configuration() {
+        let header = [9, 2, 9, 0, 0, 7, 0, 0x80, 50];
+        assert!(super::super::usbfs::badd_snapshot_matches(
+            7, &header, &header, &header
+        ));
+        assert!(!super::super::usbfs::badd_snapshot_matches(
+            9, &header, &header, &header
+        ));
+        let mut changed = header;
+        changed[8] = 10;
+        assert!(!super::super::usbfs::badd_snapshot_matches(
+            7, &header, &header, &changed
+        ));
+        assert!(!super::super::usbfs::badd_snapshot_matches(
+            7,
+            &header,
+            &header[..8],
+            &header
+        ));
+    }
+
+    #[test]
+    fn badd_witness_rejects_unknown_speed_and_malformed_inventory() {
+        assert!(!badd_witness_speed_known(Speed::Unknown));
+        assert!(!badd_witness_speed_known(Speed::Low));
+        assert!(badd_witness_speed_known(Speed::High));
+        let raw = [
+            9, 2, 25, 0, 1, 7, 0, 0x80, 50, 9, 4, 1, 1, 1, 1, 2, 0x30, 0, 7, 5, 1, 5, 192, 0, 4,
+        ];
+        let projection = raw_witness_projection(&raw).unwrap();
+        assert_eq!(projection.len(), 1);
+        assert_eq!(projection[0].endpoints[0].packet, 192);
+        let mut duplicate = raw.to_vec();
+        duplicate.extend_from_slice(&raw[9..]);
+        duplicate[2] = duplicate.len() as u8;
+        assert!(raw_witness_projection(&duplicate).is_none());
+        assert!(raw_witness_projection(&raw[..24]).is_none());
+    }
+    #[test]
+    fn clock_entity_ignores_headers_and_rejects_real_duplicates() {
+        let header = [4, 0x24, 1, 9];
+        let clock = [4, 0x24, 0x0b, 9];
+        let terminal = [4, 0x24, 2, 9];
+        assert_eq!(clock_entity(&[&header, &clock], 9).unwrap(), &clock);
+        assert!(clock_entity(&[&header, &clock, &terminal], 9).is_err());
+        assert_eq!(clock_entity(&[&terminal], 9).unwrap()[2], 2);
+        assert!(wire::parse_clock_source(clock_entity(&[&clock], 9).unwrap()).is_err());
+    }
+
     fn ratio_choice(factors: &[(u8, u16, u16)]) -> ClockChoice {
         ClockChoice {
             control_interface: 0,
@@ -4774,6 +5182,7 @@ mod tests {
         states: std::collections::HashMap<(u8, u8), u8>,
         events: Vec<String>,
         fail: Option<u8>,
+        fail_after_write: bool,
     }
     impl PowerIo for PowerMock {
         fn read(&mut self, ac: u8, id: u8) -> Result<u8, String> {
@@ -4783,6 +5192,9 @@ mod tests {
         fn write(&mut self, ac: u8, id: u8, state: u8) -> Result<(), String> {
             self.events.push(format!("write:{ac}:{id}:{state}"));
             if state == 0 && self.fail == Some(id) {
+                if self.fail_after_write {
+                    self.states.insert((ac, id), state);
+                }
                 return Err("wake failed".into());
             }
             self.states.insert((ac, id), state);
@@ -4811,6 +5223,51 @@ mod tests {
         assert_eq!(io.states[&(4, 11)], 2);
         assert!(!io.events.iter().any(|e| e.starts_with("write:4:10:")));
     }
+    #[test]
+    fn checked_scopes_reprove_d0_and_keep_equal_domain_ids_per_interface_separate() {
+        let mut io = PowerMock::default();
+        io.states.insert((4, 10), 0);
+        io.states.insert((5, 10), 2);
+        let mut first = Vec::new();
+        acquire_domain(&mut io, &mut first, 4, &domain(10)).unwrap();
+        acquire_domain(&mut io, &mut first, 4, &domain(10)).unwrap();
+        restore_domains_checked(&mut io, first).unwrap();
+        let mut second = Vec::new();
+        acquire_domain(&mut io, &mut second, 5, &domain(10)).unwrap();
+        restore_domains_checked(&mut io, second).unwrap();
+        assert_eq!(io.states[&(4, 10)], 0);
+        assert_eq!(io.states[&(5, 10)], 2);
+        assert_eq!(io.events.iter().filter(|e| *e == "read:4:10").count(), 3);
+        assert!(!io.events.iter().any(|e| e.starts_with("write:4:10:")));
+        let restored_first = io.events.iter().rposition(|e| e == "read:4:10").unwrap();
+        let started_second = io.events.iter().position(|e| e == "read:5:10").unwrap();
+        assert!(restored_first < started_second);
+    }
+
+    #[test]
+    fn lost_wake_ack_uses_checked_journal_to_restore_exact_prior_state() {
+        let mut io = PowerMock::default();
+        io.states.insert((4, 10), 1);
+        io.states.insert((4, 11), 2);
+        io.fail = Some(11);
+        io.fail_after_write = true;
+        let mut pending = Vec::new();
+        acquire_domain(&mut io, &mut pending, 4, &domain(10)).unwrap();
+        assert!(acquire_domain(&mut io, &mut pending, 4, &domain(11)).is_err());
+        assert_eq!(io.states[&(4, 11)], 0);
+        restore_domains_checked(&mut io, pending).unwrap();
+        assert_eq!(io.states[&(4, 10)], 1);
+        assert_eq!(io.states[&(4, 11)], 2);
+        assert!(io
+            .events
+            .windows(3)
+            .any(|e| e == ["read:4:11", "write:4:11:2", "read:4:11"]));
+        assert!(io
+            .events
+            .windows(3)
+            .any(|e| e == ["read:4:10", "write:4:10:1", "read:4:10"]));
+    }
+
     #[test]
     fn capture_alternative_graph_uses_output_terminal_clock_and_writable_pins() {
         let mut bytes = vec![19, 0x24, 3, 6, 1, 1, 0, 4, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -4973,6 +5430,38 @@ mod tests {
             auxiliary_protocols: 0,
             control_size: 0,
         }
+    }
+
+    #[test]
+    fn standard_capture_pcm_admits_only_proven_signed_geometry() {
+        let mut h = format_control_route(0).header.unwrap();
+        h.formats = 1;
+        for (slot, bits) in [(1, 8), (2, 12), (3, 20), (4, 24)] {
+            h.subslot_size = slot;
+            h.bit_resolution = bits;
+            assert_eq!(adc3_pcm_encoding(&h, true), Some(PcmEncoding::Signed));
+            assert!(adc3_standard_encoding(&h, true).is_ok());
+        }
+        for (slot, bits) in [(0, 8), (1, 0), (2, 17), (8, 64)] {
+            h.subslot_size = slot;
+            h.bit_resolution = bits;
+            assert_eq!(adc3_pcm_encoding(&h, true), None);
+        }
+        h.subslot_size = 1;
+        h.bit_resolution = 8;
+        for formats in [2, 3, 4, 1 << 6] {
+            h.formats = formats;
+            assert!(adc3_standard_encoding(&h, true).is_err());
+        }
+        h.formats = 1;
+        assert_eq!(adc3_pcm_encoding(&h, false), None);
+        h.subslot_size = 2;
+        h.bit_resolution = 12;
+        assert_eq!(adc3_pcm_encoding(&h, false), None);
+        h.subslot_size = 4;
+        h.bit_resolution = 32;
+        h.formats = 5;
+        assert_eq!(adc3_pcm_encoding(&h, true), None);
     }
 
     #[test]

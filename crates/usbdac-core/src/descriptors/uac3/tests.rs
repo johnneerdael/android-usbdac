@@ -63,6 +63,26 @@ fn clusters_preserve_information_and_ambisonic_wire_order() {
     assert!(decode(&cluster(0, &[])).unwrap().channels.is_empty());
 }
 #[test]
+fn empty_common_block_requires_complete_identified_channels() {
+    let channel = [6, 0, 0x20, 1, 1, 0, 3, 0, 0xff];
+    let mut with_common = vec![3, 0, 0xff];
+    with_common.extend_from_slice(&channel);
+    assert_eq!(
+        decode(&cluster(1, &with_common)).unwrap(),
+        decode(&cluster(1, &channel)).unwrap()
+    );
+    assert!(decode(&cluster(2, &with_common)).is_err());
+    assert!(decode(&cluster(1, &[3, 0, 0xff, 3, 0, 0xff])).is_err());
+    assert!(decode(&cluster(
+        1,
+        &[4, 0, 0xff, 0, 6, 0, 0x20, 1, 1, 0, 3, 0, 0xff]
+    ))
+    .is_err());
+    let mut duplicate = with_common.clone();
+    duplicate.extend_from_slice(&[3, 0, 0xff]);
+    assert!(decode(&cluster(1, &duplicate)).is_err());
+}
+#[test]
 fn cluster_transfer_header_is_bounded_and_stable() {
     let d = cluster(1, &[6, 0, 0x20, 1, 1, 0, 3, 0, 0xff]);
     let h = parse_cluster_header(&d[..6], 0x1234, 4096).unwrap();

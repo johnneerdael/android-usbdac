@@ -42,7 +42,7 @@ Apps built with Flutter, React Native or another cross-platform toolkit should k
 5. **Write the pull loop** and the transport mapping ([the player engine](integration-player.md#the-writer)).
 6. **Wire the position** from `playedFrames` and the anchor at the last flush ([position](integration-player.md#position)).
 7. **Add the volume interface**: the DAC's slider, the keys, the system panel if you have a media session ([volume](integration-app.md#volume)).
-8. **Handle the lifecycle**: permission and hot-plug, one session per process, audio focus, a foreground media service, unplug ([app, service and settings](integration-app.md)).
+8. **Handle the lifecycle**: permission and hot-plug, one owner per physical attachment, audio focus, a foreground media service, unplug ([app, service and settings](integration-app.md)).
 9. **Handle failure** with a rule for each error code ([failures and fallback](integration-app.md#failures-and-fallback)).
 10. **Test on hardware** with the matrix in [testing your integration](integration-app.md#testing-your-integration), and send what you find upstream.
 

@@ -36,7 +36,7 @@ The library is a push design. It owns a ring and one USB output thread. You writ
 **Do.** Add the crate.
 
 ```sh
-cargo add usbdac-core@0.1.5
+cargo add usbdac-core@0.1.11
 ```
 
 The crate has no Cargo features. It needs Rust 1.76 or later. Its dependencies are `libc`, `libusb1-sys`, `rusb`, `log`, `parking_lot`, `once_cell`, `crossbeam-channel`, `serde`, `serde_json`, `base64` and `flate2`. The libusb sources are compiled with your build, so you need a C compiler for the target.
@@ -57,7 +57,7 @@ Log through the `log` facade and install a logger before you open a DAC: `androi
 
 **Why.** The core has no JNI and no Android types, so the same crate serves Android and Linux. On any other host it compiles and its logic tests run, but `Dac::open` returns `Error::PlatformUnsupported`.
 
-**Limits to know now.** One `Dac` can be open in a process. A second `Dac::open` returns `Error::Busy`. If the same process also loads the Kotlin library of usbdac, that library has its own copy of the driver and its own state: do not open the same DAC from both.
+**Limits to know now.** One owner is allowed per physical attachment; distinct attachments can have independent owners. Opening an already owned attachment returns `Error::Busy`. If the same process also loads the Kotlin library of usbdac, that library has its own copy of the driver and its own state: do not open the same DAC from both.
 
 **Check.** `cargo check --examples` passes. On a Mac or a Windows machine a call to `Dac::open` returns `Error::PlatformUnsupported`. That is the expected answer and it shows that the crate is linked.
 
@@ -989,7 +989,7 @@ fn write_loop(ring: &dyn Ring, shape: Shape, shared: &Mutex<Shared>, stop: &Atom
 | End of the last track | `drain()`, then wait for `is_drained()` |
 | Position | `start_seconds + played_frames() / counter_rate_hz()`, with `start_seconds` set at each flush |
 
-`pause()` sends wire-correct silence, so the DAC stays locked, and leaves the ring alone. What is already on the bus (about 16 ms by default) still plays first. `flush()` drops the ring, sets `played_frames()` to 0 at once and, by default, cancels the transfers already on the bus, so a seek is heard within a couple of milliseconds. The cancelled audio is not lost audio and the flag stays bit-perfect. `drain()` declares the end of the audio: the ring plays out, even a tail shorter than the start threshold.
+`pause()` schedules wire-correct silence and holds the ring. Already submitted audio may still play. `flush()` drops the ring, resets `played_frames()` and, by default, requests cancellation of submitted transfers; cancellation is asynchronous and acoustic timing is not established. The cancelled audio is not lost audio and the flag stays bit-perfect. `drain()` declares the end of the audio: the ring plays out, even a tail shorter than the start threshold.
 
 **Why the seek order matters.** The writer may hold a chunk rendered for the old position. If the seek flushed the ring and the writer then wrote that chunk, the old audio would play after the flush. So the seek takes the writer's lock, repositions the decoder, drops the chunk and only then flushes. The test below checks exactly this:
 
@@ -1026,7 +1026,7 @@ fn a_seek_drops_the_chunk_that_was_rendered_for_the_old_position() {
 
 **Position.** `played_frames()` counts music the DAC has completed on the bus since the last flush: not held silence, not padding, not lost frames. It is cheap to read, so poll it for a progress bar. The rate of the count is `counter_rate_hz()`: the sample rate for PCM, and the DSD bit rate divided by 8 for native DSD.
 
-**Check.** Seek while playing: the old position stops at once. Pause for a few seconds and resume: the sound continues where it stopped. Seek while paused, then resume: no old audio.
+**Check.** Exercise seek while playing, pause/resume and seek while paused on the target device. Observe submitted and downstream audio as well as the reported counters; host tests do not establish acoustic timing.
 
 ## 8. Volume
 
@@ -1293,7 +1293,7 @@ impl Ring for FakeRing {
 | 44.1, 48, 96 kHz and the DAC's highest rate; 16 and 24 bit | No `ClockUnverified`; the DAC shows each rate |
 | Gapless in one format | No gap, no click, `played_frames` continuous |
 | A rate change between tracks | A gap of 100 ms or more; the right rate on the DAC |
-| Pause, resume, seek while playing and while paused | Stops and starts at once; no old audio after a seek |
+| Pause, resume, seek while playing and while paused | Observe acoustic response and old submitted audio; compare the counters |
 | Slow the decoder | `Underrun` events and `underruns` rise, then recover |
 | Unplug during playback | `DeviceLost`; the writer stops; close returns; replug and open again works |
 | A DAC with no volume control | `VolumeUnavailable` until the fixed-level setting is on |
@@ -1311,7 +1311,7 @@ Know these before you ship.
 - **It does not enumerate devices, ask for permission or claim interfaces.** Every host writes the claim planning itself: the AudioControl interfaces and the AudioStreaming interfaces that have an isochronous OUT endpoint, in the active configuration. The Kotlin library has this logic and does not export it.
 - **It does not watch for DACs.** Hot-plug is the host's: broadcasts on Android, udev on Linux.
 - **It has no public fake DAC.** The tests above work through a seam of your own.
-- **One DAC per process.** A second `Dac::open` returns `Busy`.
+- **One owner per attachment.** A second owner for the same attachment returns `Busy`; separate attachments can be owned independently.
 - **It does not decode, resample or mix.** Resampling and bit-depth conversion are in the opt-in `convert` module, and the direct path never calls them.
 - **Linux is checked less than Android.** The Linux code of this guide compiles for Android's kernel target and has not been run on a Linux desktop. A DAC with several configurations needs the active one before it is claimed: `UsbfsHost` reads only the first configuration.
 - **DSD.** The crate carries DoP and native DSD, with layouts and quirks of their own. This guide plays PCM. See [bit-perfect output](bit-perfect.md#dsd) and [the native API document](API.md#4-sample-layouts).

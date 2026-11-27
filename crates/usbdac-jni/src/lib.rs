@@ -27,7 +27,7 @@ mod scarlett;
 mod validator;
 
 use jni::errors::ThrowRuntimeExAndDefault;
-use jni::objects::{JByteBuffer, JObject, JString};
+use jni::objects::{JByteArray, JByteBuffer, JObject, JString};
 use jni::strings::JNIString;
 use jni::{jni_mangle, jni_str, Env, EnvUnowned};
 use listener::JavaListener;
@@ -157,6 +157,34 @@ pub fn rank<'l>(
 pub fn version<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) -> JString<'l> {
     run(&mut env, |env| {
         Ok(JString::from_str(env, env!("CARGO_PKG_VERSION"))?)
+    })
+}
+
+/// Read-only BADD proof before interface claims and native registration.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn badd_descriptor_witness<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    active_id: i32,
+    snapshot: JByteArray<'l>,
+) -> i32 {
+    run(&mut env, |env| {
+        if !(1..=255).contains(&active_id) {
+            return Ok(0);
+        }
+        let len = snapshot.len(env)?;
+        if !(9..=16384).contains(&len) {
+            return Ok(0);
+        }
+        let mut bytes = vec![0i8; len];
+        snapshot.get_region(env, 0, &mut bytes)?;
+        let raw: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
+        Ok(i32::from(usbdac_core::badd_descriptor_witness(
+            fd,
+            active_id as u8,
+            &raw,
+        )))
     })
 }
 
@@ -388,6 +416,36 @@ pub fn dac_negotiate<'l>(
     })
 }
 
+/// Negotiate a bounded ordered candidate list using one retained-owner reservation.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_negotiate_candidates<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    requests_json: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let value: Value = serde_json::from_str(&string_of(env, &requests_json)?)
+            .map_err(|error| Failure::Bad(format!("invalid candidate list: {error}")))?;
+        let array = value
+            .as_array()
+            .ok_or_else(|| Failure::Bad("candidate list must be an array".into()))?;
+        if array.is_empty() || array.len() > 8 {
+            return Err(Failure::Bad("expected one to eight PCM candidates".into()));
+        }
+        let requests = array
+            .iter()
+            .map(|item| json::parse_request(&item.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let entry = registry::dac(dac)?;
+        let format = entry.dac.negotiate_candidates(&requests)?;
+        let mut description = json::stream_format(0, &format);
+        let id = entry.remember_format(format);
+        description["format_id"] = Value::from(id);
+        java_string(env, &description)
+    })
+}
+
 /// Sets the listener for device-level events (volume, device loss); `null`
 /// clears it.
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -446,30 +504,71 @@ pub fn stream_reconfigure<'l>(
     listener: JObject<'l>,
 ) -> JString<'l> {
     run(&mut env, |env| {
-        let timeout =
-            u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
         let request = json::parse_request(&string_of(env, &request_json)?)?;
-        let entry = registry::dac(dac)?;
-        let old = registry::stream_for_dac(&entry, current)?;
-        let listener = listener_of(env, &listener)?
-            .ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
-        let report = entry.dac.reconfigure_stream(
-            &old,
-            &request,
-            listener,
-            std::time::Duration::from_millis(timeout),
-        )?;
-        let id = registry::next_id();
-        let format_id = entry.remember_format(report.stream.format().clone());
-        let response = serde_json::json!({"stream_id": id,
-            "format": json::stream_format(format_id, report.stream.format()),
-            "rolled_back": report.rollback_cause.is_some(),
-            "error_code": report.rollback_cause.as_ref().map(|e| e.code()),
-            "error_message": report.rollback_cause.as_ref().map(|e| e.message())});
-        let result = java_string(env, &response)?;
-        registry::replace_stream(&entry, current, id, report.stream)?;
-        Ok(result)
+        reconfigure_registered(env, dac, current, &[request], timeout_ms, &listener)
     })
+}
+
+/// Reconfigure from a bounded list of equivalent source-layout candidates.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn stream_reconfigure_candidates<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    current: i64,
+    requests_json: JString<'l>,
+    timeout_ms: i64,
+    listener: JObject<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let value: Value = serde_json::from_str(&string_of(env, &requests_json)?)
+            .map_err(|error| Failure::Bad(format!("invalid candidate list: {error}")))?;
+        let array = value
+            .as_array()
+            .ok_or_else(|| Failure::Bad("candidate list must be an array".into()))?;
+        if array.is_empty() || array.len() > 4 {
+            return Err(Failure::Bad(
+                "candidate list must contain one to four entries".into(),
+            ));
+        }
+        let requests = array
+            .iter()
+            .map(|item| json::parse_request(&item.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        reconfigure_registered(env, dac, current, &requests, timeout_ms, &listener)
+    })
+}
+
+fn reconfigure_registered<'l>(
+    env: &mut Env<'l>,
+    dac: i64,
+    current: i64,
+    requests: &[usbdac_core::StreamRequest],
+    timeout_ms: i64,
+    listener: &JObject<'l>,
+) -> Outcome<JString<'l>> {
+    let timeout =
+        u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
+    let entry = registry::dac(dac)?;
+    let old = registry::stream_for_dac(&entry, current)?;
+    let listener = listener_of(env, listener)?
+        .ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
+    let report = entry.dac.reconfigure_stream_candidates(
+        &old,
+        requests,
+        listener,
+        std::time::Duration::from_millis(timeout),
+    )?;
+    let id = registry::next_id();
+    let format_id = entry.remember_format(report.stream.format().clone());
+    let response = serde_json::json!({"stream_id": id,
+        "format": json::stream_format(format_id, report.stream.format()),
+        "rolled_back": report.rollback_cause.is_some(),
+        "error_code": report.rollback_cause.as_ref().map(|e| e.code()),
+        "error_message": report.rollback_cause.as_ref().map(|e| e.message())});
+    let result = java_string(env, &response)?;
+    registry::replace_stream(&entry, current, id, report.stream)?;
+    Ok(result)
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]

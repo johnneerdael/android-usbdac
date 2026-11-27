@@ -13,7 +13,7 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 
 | # | The question | What usbdac does | Status |
 |---|---|---|---|
-| 1 | [How the bus queue is shaped](decisions-stream.md#queue-geometry) | 16 ms at every interval and encoding, 8 transfers, never 256 packets in flight | Hardware for PCM at 125 us (16 x 8). Tests for every other case |
+| 1 | [How the bus queue is shaped](decisions-stream.md#queue-geometry) | Approximately 16 ms and 8 transfers by default; adaptive depth is bounded by 64 ms and 255 packets | Hardware for PCM at 125 us (16 x 8). Tests for every other case |
 | 2 | [How deep the ring is](decisions-stream.md#ring-depth) | 250 ms, shrinking to 100 ms while live processing is on; gain applied as each transfer is built | Tests |
 | 3 | [What a late or lost transfer does](decisions-stream.md#loss-handling) | Count it exactly, carry on, bound it, clear the bit-perfect flag for good | Hardware (fault injection in Flick, PCM). Tests in usbdac. Since 0.1.5 one isolated empty packet error is counted as loss; any other packet error still ends the stream |
 | 4 | [What pause, flush and position mean](decisions-stream.md#pause-and-flush) | Pause holds the ring and sends silence; flush cancels what is on the bus; position counts what the DAC took | Tests |
@@ -30,7 +30,7 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 | 15 | [When a DAC cannot play the file as it is](decisions-reporting.md#conversion) | Opt-in conversion, classified exact, lossless or lossy | Tests and measured quality on a host |
 | 16 | [Who takes the DAC from Android](decisions-library.md#claiming) | Kotlin claims control and playback interfaces, then eligible IN interfaces for implicit feedback | Tests for claim planning |
 | 17 | [Three outputs and one that chooses](decisions-library.md#outputs) | `OutputSelector` with a stated guarantee and typed reasons | Tests |
-| 18 | [What the library limits itself to](decisions-library.md#scope) | One DAC per process; UAC 1, 2 and 3; playback, with capture, duplex and routing as separate, explicit APIs; events on their own thread | Tests |
+| 18 | [What the library limits itself to](decisions-library.md#scope) | One owner per physical attachment, with independent distinct attachments; UAC 1, 2 and 3; playback, with capture, duplex and routing as separate, explicit APIs; events on their own thread | Tests |
 
 ## At a glance, driver by driver
 
@@ -41,12 +41,12 @@ Short answers; the decision pages have the file paths and the reasoning. "Flick"
 | Bus queue | 16 x 8 for PCM at 125 us; 32 x 8 for DSD and DoP; 128 ms at 1 ms | 4 x about 4 ms = 16 ms | 4 x about 4 ms = 16 ms | 8 x 2 ms = 16 ms, any interval, configurable |
 | Ring | 100 ms, capacity 200 ms | 1.5 s | 200 ms | 250 ms, capacity 500 ms, 100 ms while live processing |
 | Timed-out transfer | Survives for PCM, counted | Ends the stream | Ends the stream | Survives, counted, any encoding |
-| Packet-level error | Ends the stream | Ends the stream | Ends the stream | One zero-byte `LIBUSB_TRANSFER_ERROR` packet in a completed transfer is counted as loss; any other packet error ends the stream |
+| Packet-level error | Ends the stream | Ends the stream | Ends the stream | Failed packets and transfers are charged conservatively against bounded recovery; malformed geometry or unsupported status is terminal |
 | Pause | Silence, ring held | Flush and re-seek; bus idle | Stop submitting; queue kept | Silence, ring held |
 | Seek or stop | Ring cleared, bus plays out | Cancel all in flight | Cancel all in flight | Cancel what carries music, refill with silence |
 | Position | Decoder | Completed frames | Completed frames | Completed frames, epoch-tagged |
 | Clock | First source if the terminal names a selector | Walks selectors, checks range | Terminal's clock id directly | Walks selectors, checks range, reports the path |
-| Explicit feedback | Windowed poll, smoothed | One-packet poll, direct | One-packet poll, direct | Two queued polls, newest valid report per completed transfer, capacity checked and smoothed |
+| Explicit feedback | Windowed poll, smoothed | One-packet poll, direct | One-packet poll, direct | Two queued polls, newest valid report per completed transfer, capacity checked, direct by default with optional smoothing |
 | Stale feedback | Warning | Ends the stream after 2 s | Ends the stream after 2 s | Clears lock and verification, emits `FeedbackStale`, fails at the deadline |
 | Implicit feedback | Plays at nominal rate | Refuses | Refuses | Follows a compatible UAC2 or UAC3 IN stream on the same clock |
 | Volume | DAC, software or system | DAC only | DAC only | DAC; software gain ends bit-perfect |
@@ -69,7 +69,7 @@ Short answers; the decision pages have the file paths and the reasoning. "Flick"
 
 ## Where they differ, and which differences are open
 
-- **Per-packet errors.** Flick, Mornye and BitChord end the stream on any of them. BitChord issue #1485 reports them on a Snapdragon phone, and a third-party patch counts them. usbdac counts one isolated zero-byte error packet in an otherwise completed transfer against the loss budget and carries on; a second failed packet, a different status or a packet that delivered bytes still ends the stream. usbdac has no data on how often this happens on other phones. See [decision 3](decisions-stream.md#loss-handling).
+- **Per-packet errors.** Flick, Mornye and BitChord end the stream on any of them. BitChord issue #1485 reports them on a Snapdragon phone, and a third-party patch counts them. usbdac charges failed packets conservatively against a decaying budget and bounds consecutive failures; unconfirmed bytes are not credited as delivered. Malformed geometry and unsupported statuses remain terminal. usbdac has no data on how often this happens on other phones. See [decision 3](decisions-stream.md#loss-handling).
 - **Feedback smoothing.** usbdac now applies accepted explicit reports directly by default, like the Linux driver. The optional EWMA policy preserves the old 0.8-old/0.2-new filter and its per-completion timing. No physical or audible comparison is claimed. See [decision 7](decisions-clock.md#feedback).
 - **Implicit feedback and fallback.** Mornye and BitChord refuse it. Flick uses nominal timing. usbdac follows a compatible UAC2 or UAC3 IN source, and lets the app fall back when it cannot use one. It has not run on a DAC. See [decision 8](decisions-clock.md#implicit-feedback).
 - **The claim path.** usbdac's Kotlin SDK force-claims control and playback interfaces and tries eligible capture interfaces for implicit feedback. Flick's pull request description records a streaming interface claim failure on the DC04U. See [decision 16](decisions-library.md#claiming).

@@ -32,6 +32,8 @@ pub struct DsdPcmConverter {
     output_rate: u32,
     output_frame_bytes: usize,
     tail_scratch: Vec<u8>,
+    tail_read: usize,
+    tail_valid: usize,
     first_stage_gain: f64,
 }
 
@@ -107,6 +109,8 @@ impl DsdPcmConverter {
             output_rate: target.sample_rate,
             output_frame_bytes: target.bytes_per_frame(),
             tail_scratch,
+            tail_read: 0,
+            tail_valid: 0,
             first_stage_gain,
         })
     }
@@ -199,22 +203,38 @@ impl DsdPcmConverter {
         let expected = (u128::from(self.input_frames) * u128::from(self.output_rate))
             .div_ceil(u128::from(self.input_rate));
         let remaining = expected.saturating_sub(u128::from(self.output_frames));
-        let cap = remaining
+        let cap = (remaining
             .saturating_mul(self.output_frame_bytes as u128)
-            .min(output.len() as u128) as usize;
-        if cap < self.output_frame_bytes {
+            .min(output.len() as u128) as usize
+            / self.output_frame_bytes)
+            * self.output_frame_bytes;
+        if cap == 0 {
             return Ok(0);
         }
-        let made = if cap < self.min_output_bytes() {
-            let mut scratch = std::mem::take(&mut self.tail_scratch);
-            let result = self.finish_inner(&mut scratch);
-            let copied = result.as_ref().copied().unwrap_or(0).min(cap);
-            output[..copied].copy_from_slice(&scratch[..copied]);
-            self.tail_scratch = scratch;
-            result.map(|_| copied)?
-        } else {
-            self.finish_inner(&mut output[..cap])?
-        };
+        let mut made = 0;
+        while made < cap {
+            if self.tail_read == self.tail_valid {
+                self.tail_read = 0;
+                self.tail_valid = 0;
+                let mut scratch = std::mem::take(&mut self.tail_scratch);
+                let result = self.finish_inner(&mut scratch);
+                self.tail_scratch = scratch;
+                let generated = result?;
+                // Discard synthesis padding beyond the exact source duration.
+                let legitimate = (remaining * self.output_frame_bytes as u128)
+                    .saturating_sub(made as u128)
+                    .min(usize::MAX as u128) as usize;
+                self.tail_valid = generated.min(legitimate);
+                if self.tail_valid == 0 {
+                    break;
+                }
+            }
+            let copied = (self.tail_valid - self.tail_read).min(cap - made);
+            output[made..made + copied]
+                .copy_from_slice(&self.tail_scratch[self.tail_read..self.tail_read + copied]);
+            self.tail_read += copied;
+            made += copied;
+        }
         self.output_frames = self
             .output_frames
             .saturating_add((made / self.output_frame_bytes) as u64);
@@ -264,6 +284,8 @@ impl DsdPcmConverter {
         self.final_partial = false;
         self.input_frames = 0;
         self.output_frames = 0;
+        self.tail_read = 0;
+        self.tail_valid = 0;
     }
 }
 
@@ -388,6 +410,42 @@ mod tests {
             }
             let expected = (137u64 * u64::from(target)).div_ceil(2_822_400 / 8) as usize;
             assert_eq!(produced, expected * 4, "target {target}");
+        }
+    }
+    #[test]
+    fn finish_preserves_tail_with_small_unaligned_buffers() {
+        for rate in [192_000, 352_800] {
+            for sample in [SampleFormat::Float32, SampleFormat::int(16, 2).unwrap()] {
+                let frame = PcmFormat::new(rate, 1, sample).bytes_per_frame();
+                let render = |capacity: usize| {
+                    let mut c = DsdPcmConverter::new(2_822_400, 1, PcmFormat::new(rate, 1, sample))
+                        .unwrap();
+                    let mut result = Vec::new();
+                    let input = [0x69; 137];
+                    let mut out = vec![0; 8192];
+                    let done = c.process(&input, &mut out).unwrap();
+                    assert_eq!(done.consumed, input.len());
+                    result.extend_from_slice(&out[..done.produced]);
+                    assert_eq!(c.finish(&mut out[..frame - 1]).unwrap(), 0);
+                    loop {
+                        let n = c.finish(&mut out[..capacity]).unwrap();
+                        assert_eq!(n % frame, 0);
+                        result.extend_from_slice(&out[..n]);
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    assert_eq!(c.finish(&mut out[..capacity]).unwrap(), 0);
+                    assert_eq!(
+                        result.len(),
+                        (137u64 * rate as u64).div_ceil(352_800) as usize * frame
+                    );
+                    result
+                };
+                let reference = render(8192);
+                assert_eq!(reference, render(frame));
+                assert_eq!(reference, render(frame * 3 + 1));
+            }
         }
     }
     #[test]

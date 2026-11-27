@@ -64,5 +64,6 @@ internal fun parseAAudioGrant(json: String): AAudioGrant {
         asRequested = value.getBoolean("as_requested"),
         verdict = value.getString("verdict"),
         reason = value.getString("reason"),
+        deviceIds = value.optJSONArray("device_ids")?.let { ids -> List(ids.length()) { ids.getInt(it) } },
     )
 }

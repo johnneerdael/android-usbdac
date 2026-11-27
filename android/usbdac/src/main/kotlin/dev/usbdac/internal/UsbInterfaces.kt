@@ -205,6 +205,26 @@ internal class ClaimedInterfaces private constructor(
         claimed.clear()
     }
 
+    /** Release every claim once; refuse configuration restoration if any hand-back failed. */
+    fun releaseChecked() {
+        var failure: Throwable? = null
+        fun attempt(description: String, action: () -> Boolean) {
+            val result = runCatching(action)
+            if (result.getOrDefault(false)) return
+            val error = DacException(DacErrorCode.CLAIM, description, result.exceptionOrNull())
+            if (failure == null) failure = error else failure?.addSuppressed(error)
+        }
+        for (usbInterface in claimed.asReversed()) {
+            if (usbInterface.alternateSetting == 0 &&
+                (usbInterface.interfaceSubclass == SUBCLASS_AUDIO_STREAMING || usbInterface.interfaceClass == 0xff)) {
+                attempt("could not reset USB interface ${usbInterface.id}") { connection.setInterface(usbInterface) }
+            }
+            attempt("could not release USB interface ${usbInterface.id}") { connection.releaseInterface(usbInterface) }
+        }
+        claimed.clear()
+        failure?.let { throw it }
+    }
+
     companion object {
         /** Claims [plan] on [connection], all or none. */
         fun claim(

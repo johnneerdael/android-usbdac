@@ -31,6 +31,7 @@ internal object Native {
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 
+    @JvmStatic external fun baddDescriptorWitness(fd: Int, activeId: Int, snapshot: ByteArray): Int
     @JvmStatic external fun dacVendorPcmPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacVendorPcmClaimsPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
@@ -48,6 +49,7 @@ internal object Native {
     @JvmStatic external fun dacAwaitRetirement(): Boolean
     @JvmStatic external fun dacRetirementToken(dac: Long): Long
     @JvmStatic external fun dacAwaitRetirementToken(token: Long): Boolean
+    @JvmStatic external fun dacRetirementRoutingReport(token: Long): String
     @JvmStatic external fun dacReleaseRetirementToken(token: Long)
     @JvmStatic external fun dacAwaitConnectionRetirement(fd: Int): Boolean
     @JvmStatic external fun pioneerDjmDiscover(dac: Long): String
@@ -73,10 +75,12 @@ internal object Native {
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacFeedbackTrace(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
+    @JvmStatic external fun dacNegotiateCandidates(dac: Long, requestsJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)
 
     @JvmStatic external fun streamOpen(dac: Long, formatId: Long, listener: Any): Long
     @JvmStatic external fun streamReconfigure(dac: Long, current: Long, requestJson: String, timeoutMs: Long, listener: Any): String
+    @JvmStatic external fun streamReconfigureCandidates(dac: Long, current: Long, requestsJson: String, timeoutMs: Long, listener: Any): String
     @JvmStatic external fun streamClose(stream: Long)
     @JvmStatic external fun streamWrite(stream: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     @JvmStatic external fun streamWritableBytes(stream: Long): Int

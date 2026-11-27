@@ -9,6 +9,36 @@ import org.junit.Test
 
 class DacExceptionTest {
     @Test
+    fun routingHandBackDoesNotInventSuccessWithoutRetirementToken() {
+        val routing = DacRouting(1L) { }
+        assertEquals(RoutingHandBackState.NotClosed, routing.handBack)
+        routing.beginHandBack(false)
+        assertTrue(routing.handBack is RoutingHandBackState.Unavailable)
+        routing.publishHandBack(0L)
+        assertTrue(routing.handBack is RoutingHandBackState.Unavailable)
+        routing.beginHandBack(true)
+        assertEquals(RoutingHandBackState.Pending, routing.handBack)
+    }
+
+    @Test
+    fun routingHandBackParsesUncertaintyAndPreservesUnknownOutcomes() {
+        val result = parseRoutingHandBack("""{"status":"complete","controls":[{"key":{"kind":"selector","interface":3,"entity":7},"outcome":"restore_uncertain","detail":"rounded"},{"key":{"kind":"selector","interface":3,"entity":8},"outcome":"future_outcome"}]}""")
+        val report = (result as RoutingHandBackState.Complete).report
+        assertEquals(RoutingHandBackOutcome.RESTORE_UNCERTAIN, report.controls[0].outcome)
+        assertEquals("rounded", report.controls[0].detail)
+        assertEquals(RoutingHandBackOutcome.UNKNOWN, report.controls[1].outcome)
+        assertEquals("future_outcome", report.controls[1].rawOutcome)
+        assertEquals(RoutingHandBackState.NoRecordedChanges, parseRoutingHandBack("""{"status":"no_recorded_changes"}"""))
+    }
+
+    @Test
+    fun routingDiscoveryDiagnosticsAllowLegacyAndPartialEntries() {
+        assertEquals(emptyList<RoutingDiagnostic>(), parseRoutingDiagnostics(org.json.JSONObject("{}")))
+        val result = parseRoutingDiagnostics(org.json.JSONObject("""{"diagnostics":[{"interface":3,"entity":7,"detail":"unreadable"},{"interface":4,"entity":null,"detail":"ambiguous"},{"detail":"bad"}]}"""))
+        assertEquals(listOf(RoutingDiagnostic(3, 7, "unreadable"), RoutingDiagnostic(4, null, "ambiguous")), result)
+    }
+
+    @Test
     fun routingPowerFailureKeepsTransactionAndRollbackDetails() {
         val response = """{"error":{"kind":"transaction","detail":"write failed","failed_change":2,
             "cause":{"kind":"io","detail":"write"},"rollback_failures":[

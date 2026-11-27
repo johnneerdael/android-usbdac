@@ -2,6 +2,7 @@ package dev.usbdac
 
 import dev.usbdac.internal.AAudioBackend
 import dev.usbdac.internal.NativeListener
+import dev.usbdac.internal.parseAAudioGrant
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -133,6 +134,26 @@ private fun failsWith(code: DacErrorCode, block: () -> Unit): DacException {
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AAudioExclusiveOutputTest {
+    @Test
+    fun completeGrantedDeviceListIsOptionalAndPreserved() {
+        assertNull(parseAAudioGrant(grantJson()).deviceIds)
+        val single = JSONObject(grantJson()).put("device_ids", org.json.JSONArray(listOf(7))).toString()
+        val multiple = JSONObject(grantJson()).put("device_ids", org.json.JSONArray(listOf(7, 8))).toString()
+        assertEquals(listOf(7), parseAAudioGrant(single).deviceIds)
+        assertEquals(listOf(7, 8), parseAAudioGrant(multiple).deviceIds)
+    }
+
+    @Test
+    fun strictRouteRequiresExclusiveAndCompleteSingleDeviceOnApi36() {
+        val grant = parseAAudioGrant(grantJson())
+        assertTrue(grant.matchesStrictRoute(35, 7))
+        assertFalse(grant.matchesStrictRoute(36, 7))
+        assertTrue(grant.copy(deviceIds = listOf(7)).matchesStrictRoute(36, 7))
+        assertFalse(grant.copy(deviceIds = listOf(7, 8)).matchesStrictRoute(36, 7))
+        assertFalse(grant.copy(deviceIds = listOf(8)).matchesStrictRoute(36, 7))
+        assertFalse(grant.copy(sharingMode = AAudioSharingMode.SHARED).matchesStrictRoute(35, 7))
+    }
+
     // ---- the request ----
 
     @Test

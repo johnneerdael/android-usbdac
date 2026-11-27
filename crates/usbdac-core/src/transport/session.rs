@@ -541,7 +541,12 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
     }) {
         return Some(BitPerfectBlocker::FeedbackUnlocked);
     }
-    if !state.clock_verification_passed {
+    if !state.clock_verification_passed
+        || state
+            .runtime_stats
+            .as_ref()
+            .is_some_and(|stats| stats.status_monitor_degraded.load(Ordering::Acquire))
+    {
         return Some(BitPerfectBlocker::ClockUnverified);
     }
     if state.software_volume_active {

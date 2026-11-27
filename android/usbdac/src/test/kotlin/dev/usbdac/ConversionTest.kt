@@ -256,6 +256,18 @@ class PcmConverterTest {
     }
 
     @Test
+    fun readOnlyOutputIsRejectedWithoutChangingPositionsOrState() {
+        val converter = converter()
+        val input = directOf(1, 2).asReadOnlyBuffer()
+        val output = ByteBuffer.allocateDirect(8).asReadOnlyBuffer()
+        failsWith(DacErrorCode.INVALID_ARGUMENT) { converter.convert(input, output) }
+        failsWith(DacErrorCode.INVALID_ARGUMENT) { converter.finish(output) }
+        assertEquals(0, input.position())
+        assertEquals(0, output.position())
+        assertEquals(ConvertResult(2, 4), converter.convert(input, ByteBuffer.allocateDirect(8)))
+    }
+
+    @Test
     fun finishWritesTheTailAndThenZeroAndConvertThenFailsUntilReset() {
         val converter = converter()
         val output = ByteBuffer.allocateDirect(64)
