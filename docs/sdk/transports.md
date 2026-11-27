@@ -51,7 +51,7 @@ What you write is PCM in the encoding of the request, little-endian and interlea
 | 24 | packed signed 24-bit, 3 bytes | Android 12 (API 31) |
 | 32 | signed 32-bit | Android 12 (API 31) |
 
-These low-level outputs accept PCM, not raw DSD or DoP. The selector can convert eligible DSD to PCM before opening a platform output when policy permits; see [automatic output](automatic-output.md#conversion). `StreamRequest.ratePolicy` is ignored; the track is created at the requested rate and Android decides what to do if the route cannot run it. There is no software gain; the system volume applies.
+These low-level outputs accept PCM, not raw DSD or DoP. The selector can convert eligible DSD to PCM before opening a platform output when policy permits; see [automatic output](automatic-output.md#conversion). `StreamRequest.ratePolicy` is ignored; the track is created at the requested rate and Android decides what to do if the route cannot run it. A rate outside 4,000 to 192,000 Hz, or a format `AudioFormat` refuses, fails with `UNSUPPORTED` before a track is created. There is no software gain; the system volume applies.
 
 ### What is and is not guaranteed
 
@@ -132,7 +132,7 @@ AAudio's own buffer is a few milliseconds deep, which a writer thread that sleep
 
 ## Converting in front of any output: `ConvertingOutput`
 
-Not a transport, but a wrapper that goes in front of one: `ConvertingOutput(target, converter)` is a `PcmOutput` that converts what it is given (a new sample rate, more or fewer bits, mono to stereo) before it reaches `target`, which can be any of the three. It is how an app plays a source the DAC does not run as it is. It is opt-in, the direct USB path never converts by itself, and **a plan that is not `NONE` or `BIT_EXACT` is not bit-perfect**. See [getting started](getting-started.md#when-the-dac-refuses-what-you-have) for the flow with `RatePolicy.NEAREST_SUPPORTED`, [bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) for what it reports and [controls](controls.md#conversion-conversionoptions) for the options.
+Not a transport, but a wrapper that goes in front of one: `ConvertingOutput(target, converter)` is a `PcmOutput` that converts what it is given (a new sample rate, more or fewer bits, mono to stereo) before it reaches `target`, which can be any of the three. It is how an app plays a source the DAC does not run as it is. A `DacStream` never converts by itself; the selector puts a converter in front of its direct output by default when the DAC cannot run the request (`allowConversion`, `allowWidening`). **A plan that is not `NONE` or `BIT_EXACT` is not bit-perfect**. See [getting started](getting-started.md#when-the-dac-refuses-what-you-have) for the flow with `RatePolicy.NEAREST_SUPPORTED`, [bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) for what it reports and [controls](controls.md#conversion-conversionoptions) for the options.
 
 ## Choosing
 

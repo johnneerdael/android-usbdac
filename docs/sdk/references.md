@@ -1,6 +1,6 @@
 # Public references
 
-Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. The original links were fetched on 2026-11-26; the UAC3 format reference was added on 2026-11-27. The USB 3.2 entry was added for 0.1.5 without fetching the document and has no excerpt. Every other excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
+Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. The original links were fetched on 2026-11-26; the UAC3 format reference was added on 2026-11-27, and the UAC 2.0 formats document and the USB 2.0 pipe clause on 2026-11-27 from local text copies of the USB-IF PDFs. The USB 3.2 entry was added for 0.1.5 without fetching the document and has no excerpt. Every other excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
 
 ## Standards
 
@@ -9,6 +9,7 @@ Every source the [design decisions](decisions.md) cite, with what it was used fo
 [usb.org document library](https://www.usb.org/document-library/usb-20-specification) (the archive `usb_20_20250603.zip` holds `usb_20.pdf`).
 
 - **Feedback format, section 5.12.4.2.** A full-speed endpoint reports "an unsigned 10.10 (K=10) format" left-justified in three bytes "so that it has a 10.14 format"; a high-speed endpoint "an unsigned 12.13 (K=13) format which fits into four bytes", aligned "so that it has a 16.16 format". The lower 4 (full speed) and 3 (high speed) bits are optional extra precision.
+- **Pipes, section 4.7 (p. 20).** "In general, data movement though one pipe is independent from the data flow in any other pipe", while control transfers can be used for "control of other pipes on the device". This is general independence. It promises nothing about host scheduling or error handling for streams that share a clock, a transfer owner or a feedback dependency.
 - **No retry, section 5.6 and 8.5.5.** "In the case of a delivery failure due to error, no retrying of the attempt to deliver the data"; "Isochronous transactions do not support a handshake phase or retry capability."
 - Used in [decisions 1, 3, 7 and 8](decisions.md).
 
@@ -38,6 +39,14 @@ Every source the [design decisions](decisions.md) cite, with what it was used fo
 - The document refers the feedback format to the USB 2.0 specification, which is why that is the source above.
 - Used in [decisions 6, 9, 11 and 18](decisions.md).
 
+### USB Audio Class 2.0 audio data formats {#ref-uac2-formats}
+
+`Frmts20 final.pdf`, Release 2.0, May 31, 2006, in the [USB-IF Audio 2.0 archive](https://www.usb.org/sites/default/files/Audio2.0_final.zip).
+
+- **Packet sizes, section 2.3.1.1 (pp. 13-14).** "If the sampling rate is a constant, the allowable variation on ni is limited to one audio slot", so every packet carries "INT(nav) audio slots (small VFP) or INT(nav) + 1 (large VFP)". When the average is a whole number, "ni may vary between INT(nav) - 1 (small VFP), INT(nav) (medium VFP) and INT(nav) + 1 (large VFP)". "The sink must be capable to accept a large VFP at all times." This, not the USB 2.0 specification, is the source of the one-frame packet rule.
+- **Type I Raw Data, section 2.3.1.7.5 (p. 17).** Data "in the form of PCM-like audio slots when the actual format or even the meaning of the transported data is unknown"; it "can never be interpreted inside the audio function". The format bit therefore names a candidate, not a DSD layout.
+- Used in [decisions 5 and 7](decisions.md) and [what usbdac improves](improvements.md).
+
 ### USB Audio Class 3.0 audio data formats {#ref-uac3-formats}
 
 [`Frmts30.pdf`, USB-IF Release 3.0, mirrored copy](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/commit/4762eed5fd4d612bef1a5a43ee87f4f4047bdbe5/Frmts30.pdf).
@@ -45,6 +54,7 @@ Every source the [design decisions](decisions.md) cite, with what it was used fo
 - **DSD format, section 2.3.1.6.5.** Native DSD uses 64-bit subslots (`bBitResolution = 64`, `bSubslotSize = 8`) at one sixty-fourth of the DSD sampling rate. This is a standard format, distinct from legacy device-specific DSD layouts.
 - **Type I format bitmap, Table A-2.** PCM and DSD have distinct format bits. A PCM DoP carrier therefore uses PCM framing, including on UAC3.
 - The current [USB-IF audio specification archive](https://www.usb.org/document-library/usb-audio-devices-release-40-and-adopters-agreement) makes the little-endian 64-bit DSD word convention explicit: D0 is newest, hence D63 is oldest. The SDK accepts chronological, MSB-first interleaved bytes and packs them accordingly.
+- Section numbers are those of the linked initial release. In the April 2019 errata release (`Frmts30-Errata`), DSD Format is section 2.3.1.7.5 (p. 14) and PCM Format section 2.3.1.7.1 (p. 13).
 - Used in [decision 5](decisions-stream.md#dsd) and [bit-perfect output](bit-perfect.md#dsd).
 
 ### DSD over PCM (DoP) open standard 1.1 {#ref-dop}
@@ -174,5 +184,6 @@ The usbdac commits behind the decisions, such as [`eada7d7`](https://github.com/
 - **The xHCI sources do not explain the 256-packet stall.** The explanation is a hypothesis.
 - **The USB 3.2 section numbers are not checked against the PDF.** They come from the code and the ledger.
 - **The Dither paper supports "first and second moments independent", not "fully independent".**
-- **The "UAC 2.0 RAW_DATA" format is not cited.** The audio data format document that defines it was not fetched; legacy native DSD is cited through the Linux quirks; standard UAC3 DSD is cited through `Frmts30.pdf` above.
+- **The UAC 2.0 RAW_DATA format does not say what the data is.** [The formats document](#ref-uac2-formats) defines it as uninterpreted PCM-like slots, so legacy native DSD layouts are cited through the Linux quirks; standard UAC3 DSD is cited through `Frmts30.pdf` above.
+- **USB 2.0 section 4.7 does not make streams on one device independent in failure.** It describes pipes in general; whether one direction survives a fault in the other is usbdac's own rule.
 - A third-party mirror of Alan Stern's `snd-usb-audio` URB rework, cited in Flick PR #400, redirected to a sign-in page and was not used.

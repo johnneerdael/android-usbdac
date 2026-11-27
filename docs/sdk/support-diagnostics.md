@@ -202,6 +202,34 @@ interval and keep the timestamps.
 adb logcat -d -v threadtime -s usbdac > usbdac-log.txt
 ```
 
+## The validator apps {#validator}
+
+When a listener can install a separate app, the validator gives support a
+report that does not depend on your player. From 0.1.11 each release lists
+`usbdac-validator-<version>-android.apk`, signed with the CI debug key, and
+`usbdac-validator-<version>-macos-arm64.zip`, an Apple Silicon app that is ad
+hoc signed and not notarized. Both are built from the same commit as the
+library and use the same direct USB driver; neither plays through the system
+mixer. Download them from the
+[0.1.11 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.11).
+
+The listener lowers or mutes the amplifier and removes headphones, starts
+capture, then attaches one DAC; on Android, **Test connected DAC** selects one
+that is already attached. Both validators keep the DAC's own volume level
+(`StartupVolume.Keep`, without the library's -40 dB start-up limit) and accept
+a DAC with no hardware volume. The app plays a test matrix of exact formats
+(signed, unsigned and float PCM, native DSD and DoP where the DAC advertises
+them), records a separately reported converted fallback after a typed refusal,
+and saves a local ZIP at every outcome, including cancellation and unplug. A
+DAC that does not decode DoP can play marker noise. The ZIP contains device
+identifiers and debug logs; sharing it is the listener's choice.
+
+Source-backed compatibility modes are on by default in the validator, unlike
+the library's `VerifiedOnly` default; the report records the policy used. A
+report shows what the driver delivered over USB. It does not show DAC decoder
+lock or analog output unless the operator adds an independent observation.
+[Validator design](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/dac-validator.md)
+
 ## How the report narrows the cause {#triage}
 
 | What the report shows | Where to investigate |
@@ -232,10 +260,18 @@ session, and that capture turns off when the attempt ends.
 
 ## Queue and timing evidence
 
-Stream statistics expose worker gaps over 10 and 50 ms, maximum worker gap in
-microseconds, adaptive queue changes, active slot count, and active queue time.
-These distinguish a late host worker from packet failures; they do not infer an
-OEM cause from a device name. Opt-in explicit feedback reports include accepted
+Stream statistics expose output-worker checkpoint intervals over 10 and 50 ms
+and the longest one in microseconds, all excluding time spent in the libusb
+event pump (`workerGapOver10ms`, `workerGapOver50ms`, `maxWorkerGapUs`). The
+longest interval including the pump is `maxWorkerLoopGapUs`, the longest pump
+call is `maxEventPumpElapsedUs`, and the largest pump overrun beyond its
+requested timeout is `maxEventPumpTimeoutOverrunUs`. These are lifetime maxima
+and counts, with no timestamps; a pump call that returns at once because a
+completion is already pending shows no overrun, so a late wake-up then appears
+only in the interval maxima.
+Adaptive queue changes, active slot count and active queue time complete the
+set. These distinguish a late host worker from packet failures; they do not
+infer an OEM cause from a device name. Opt-in explicit feedback reports include accepted
 unsmoothed sample count, minimum, maximum, mean and population variance in frames
 per OUT service interval, alongside the existing packet outcomes. These values
 and `feedbackRateHz` describe accepted raw reports, not a filtered scheduling rate.

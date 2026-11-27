@@ -18,13 +18,13 @@ A DAC's sample rate is set on a "clock" inside it. Some DACs have more than one 
 
 ### A fixed, small amount of audio waiting on the cable
 
-Audio travels to the DAC in small packets, and the driver keeps a short queue of them lined up on the USB connection. The default starts at about 16 milliseconds for PCM, DoP and native DSD. Adaptive depth may grow within the time, slot and 255-packet caps; custom geometry fixes the requested depth. The original queued up to 128 ms on some DACs and exactly 256 packets for DSD.
+Audio travels to the DAC in small packets, and the driver keeps a short queue of them lined up on the USB connection. The default starts at about 16 milliseconds for PCM, DoP and native DSD. After a loss the default geometry can grow, two transfers at a time, to at most 30 ms at a 125 µs service interval and 32 ms at longer ones; custom geometry fixes the requested depth. The original queued up to 128 ms on some DACs and exactly 256 packets for DSD.
 
 **In plain terms:** on one tested phone, having exactly 256 packets lined up made the sound stop after two seconds. usbdac is built so that number cannot be reached. And because the queue is the same short length on every DAC, pausing and seeking feel equally quick on all of them.
 
 ### A hiccup on the cable no longer ends playback
 
-When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB standard allows. Packet and transfer errors are accounted for within the configured recovery limits; see the streaming decision for the current behavior and limitations.
+When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB Audio 2.0 formats document allows ([§2.3.1.1](references.md#ref-uac2-formats): the whole part of the average or one more, and one less as well when the average is a whole number). Packet and transfer errors are accounted for within the configured recovery limits; see the streaming decision for the current behavior and limitations.
 
 **In plain terms:** a brief stumble between phone and DAC used to stop the music. Now playback carries on, and the library remembers that a sliver of audio was lost, so it will not claim the playback was perfect.
 
@@ -177,7 +177,7 @@ Direct USB, an Android-managed output (which asks Android 14 and later for its o
 
 If a DAC cannot play a file's sample rate or bit depth, an app may ask usbdac to convert: mono to stereo, a different bit depth, or a different sample rate using a high-quality resampler (measured at about 110 dB of rejection). Every conversion is classified as exact, lossless or lossy, and anything other than exact turns the bit-perfect flag off.
 
-**In plain terms:** the file still plays on a limited DAC, and the app is told plainly that it is no longer bit-perfect. Nothing is ever converted unless the app asks.
+**In plain terms:** the file still plays on a limited DAC, and the app is told plainly that it is no longer bit-perfect. A direct stream never converts on its own. `OutputSelector` permits PCM conversion and lossless widening by default (`OutputPolicy.allowConversion`, `allowWidening`); an app that never wants converted output turns them off.
 
 ### Around the driver
 
@@ -189,7 +189,7 @@ Current shipped transport boundaries and pending physical prerequisites are gene
 
 - **Concurrent-device support** follows the generated [shipped capability manifest](status.md#implementation-boundaries).
 - **Capture is PCM only**, in the device's own format. There is no DSD or float capture and no conversion on that path, and the output selector chooses playback only.
-- **No vendor-specific controls yet.** Code for fixed-rate vendor PCM streams, the Pioneer DJM and Focusrite routing controls and per-device feedback corrections is in the repository and switched off in 0.1.5. Standard USB Audio Class controls only.
+- **No vendor-specific controls yet.** Code for fixed-rate vendor PCM streams, the Pioneer DJM and Focusrite routing controls and per-device feedback corrections is in the repository and switched off in the current release. Standard USB Audio Class controls only.
 - **Limited hardware coverage.** PCM has played through Flick on the iBasso DC04U, through the SDK sample on the DC04U and on the AP80 Pro-X, and native DSD on the AP80 Pro-X. [Hardware status](evidence.md#hardware-status)
 
 ## Where it came from

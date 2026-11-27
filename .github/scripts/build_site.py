@@ -38,6 +38,7 @@ SECTIONS = [
         ("getting-started", "Getting started"),
         ("automatic-output", "Automatic output"),
         ("media3", "Media3 integration"),
+        ("migration", "Upgrading from 0.1.10"),
     ]),
     ("Design decisions", [
         ("decisions", "All decisions at a glance"),

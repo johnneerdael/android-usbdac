@@ -22,11 +22,15 @@ The module targets Media3 1.11.1's `AudioSink.AudioSinkConfig` API. It deliberat
 
 `OpenedOutput.format` must keep sample rate, channel count and counter rate equal to the request, with at least its bit precision and slot size. Wider slots are filled with zero low bytes (24-bit in four bytes becomes `00 LL MM HH`). Narrowing and resampling cannot be hidden behind a changed sink layout. An output owner that intentionally uses a converting `PcmOutput` reports the source write layout and exposes its conversion/guarantee separately.
 
-The sink holds at most one bounded staging buffer plus encoder padding (at most 16 MiB). It does not discard malformed partial frames. It retains a partly accepted input buffer until Media3 retries it and maps DAC failures to Media3 write/initialization exceptions.
+The sink holds at most one bounded staging buffer plus encoder padding (at most 16 MiB). It does not discard malformed partial frames. It retains a partly accepted input buffer until Media3 retries it and maps DAC failures to Media3 write/initialization exceptions. Both are created with `isRecoverable = false`, so ExoPlayer stops and reports a playback error instead of recreating the sink. A write failure's cause is `OutputRecoveryRequiredException`.
 
-## Capability migration
+## Capability migration {#capability-migration}
 
-`OutputSource.formatSupport(request)` must use a cached, side-effect-free capability snapshot. It returns `OutputSupport` with `UNSUPPORTED`, `DIRECT` or `WITH_TRANSCODING` and the source and known target. Custom `OutputSource` implementations that only supplied `open` must override this method: its default is conservatively unsupported, so the sink will otherwise reject formats before opening. Do not negotiate or open a device during this query. The bundled `DacSessionOutputSource` supplies its own snapshot.
+**A custom `OutputSource` written for 0.1.10 plays nothing in 0.1.11 until it overrides `formatSupport`.** `UsbDacAudioSink.getFormatSupport` asks `OutputSource.formatSupport(request)` for every raw PCM format, and the default answers `UNSUPPORTED` for every request. Such a source still compiles. See [upgrading from 0.1.10](migration.md).
+
+`formatSupport` must use a cached, side-effect-free capability snapshot. It returns `OutputSupport` with `UNSUPPORTED`, `DIRECT` or `WITH_TRANSCODING`, the source and the known target. The sink reports these to Media3 as `SINK_FORMAT_UNSUPPORTED`, `SINK_FORMAT_SUPPORTED_DIRECTLY` and `SINK_FORMAT_SUPPORTED_WITH_TRANSCODING`. Do not negotiate or open a device during this query. `DacSessionOutputSource` answers from the session's alternate settings, copied when it is constructed: `DIRECT` for an exact alternate, `WITH_TRANSCODING` for integer widening.
+
+The example's `DirectOutputController` answers only from `OutputSelector.managedPcmFallbackSnapshot()`: `WITH_TRANSCODING` when the Android-managed output could carry the format, otherwise `UNSUPPORTED`. It never reports `DIRECT`. It reports `UNSUPPORTED` above 192 kHz, for unsigned8 and float32, for 24- and 32-bit PCM below Android 12, when `DownstreamLimits` are set, and when another output than `ANDROID_STANDARD` is forced, even if the attached DAC could play the format. A player that should accept every format its DAC runs has to answer from the DAC's capabilities as well.
 
 ## Volume and lifetime
 
