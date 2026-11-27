@@ -21,11 +21,11 @@ class DsdDopOutputTest {
         val target = RecordingOutput().apply { room = 0 }
         val output = DsdDopOutput(target, 2, 4, true)
         val source = heapOf(1, 2, 3, 4, 5, 6)
-        assertEquals(4, output.write(source))
-        assertEquals(2, source.remaining())
+        assertEquals(6, output.write(source))
+        assertEquals(0, source.remaining())
         assertEquals(0, output.writableBytes)
         target.room = 8
-        assertEquals(2, output.write(source))
+        assertEquals(0, output.write(source))
         assertEquals(listOf(0,3,1,5,0,4,2,5), target.received.map { it.toInt() and 255 })
     }
     @Test fun oneByteFrameSurvivesDisjointWritesAndIncompleteEosFails() {
@@ -36,6 +36,32 @@ class DsdDopOutputTest {
         assertEquals(2, output.write(heapOf(3, 4)))
         assertEquals(listOf(3,1,5,4,2,5), target.received.map { it.toInt() and 255 })
         output.drain()
+    }
+
+    @Test fun longWritesUseBoundedBatches() {
+        val target = RecordingOutput()
+        val output = DsdDopOutput(target, 2, 3, true)
+        val source = java.nio.ByteBuffer.wrap(ByteArray(40_000) { it.toByte() })
+        while (source.hasRemaining()) assertTrue(output.write(source) > 0)
+        assertTrue(target.calls.count { it == "write" } <= 2)
+        assertEquals(60_000, target.received.size)
+    }
+
+    @Test fun shortTargetWritesRetainBatchAcrossDrainAndFlush() {
+        val target = RecordingOutput().apply { room = 6 }
+        val output = DsdDopOutput(target, 2, 3, true)
+        assertEquals(8, output.write(heapOf(1, 2, 3, 4, 5, 6, 7, 8)))
+        assertEquals(2L, output.latencyFrames)
+        output.drain()
+        assertFalse(target.calls.contains("drain"))
+        target.room = 6
+        assertFalse(output.isDrained)
+        assertTrue(target.calls.contains("drain"))
+        assertEquals(listOf(3,1,5,4,2,5,7,5,250,8,6,250), target.received.map { it.toInt() and 255 })
+        output.flush()
+        target.room = 6
+        assertEquals(4, output.write(heapOf(9,10,11,12)))
+        assertEquals(5, target.received.last().toInt())
     }
 
 }
