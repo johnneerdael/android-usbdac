@@ -1,4 +1,8 @@
 use super::*;
+use alternate_controls::{
+    AlternateControls, AS_ACTIVE_ALT_SETTING_CONTROL, AS_VALID_ALT_SETTINGS_CONTROL,
+    MAX_VALID_ALTERNATES_REPLY_LEN,
+};
 
 #[derive(Debug)]
 pub(super) struct OwnedUsbFd(pub(super) RawFd);
@@ -197,6 +201,12 @@ impl ClaimedHandle {
         alternate_setting: u8,
     ) -> Result<(), String> {
         self.ensure_interface_claimed(interface_number)?;
+        let controls = if alternate_setting == 0 {
+            // Always permit alt zero for recovery, even after a control failure.
+            AlternateControls::default()
+        } else {
+            self.verify_alternate_available(interface_number, alternate_setting)?
+        };
         let request = UsbfsSetInterface {
             interface: interface_number.into(),
             altsetting: alternate_setting.into(),
@@ -215,7 +225,98 @@ impl ClaimedHandle {
         }
         drop(active);
         itf_interface_delay(&self.handle.device(), interface_number);
+        // Record the successful SET_INTERFACE before verification: callers'
+        // existing rollback paths must reset this interface if readback fails.
+        if controls.active {
+            let mut response = [0u8; 1];
+            let length = self.read_alternate_control(
+                interface_number,
+                AS_ACTIVE_ALT_SETTING_CONTROL,
+                &mut response,
+            )?;
+            alternate_controls::validate_active_alt(&response[..length], alternate_setting)?;
+        }
         Ok(())
+    }
+
+    fn verify_alternate_available(
+        &self,
+        interface_number: u8,
+        alternate_setting: u8,
+    ) -> Result<AlternateControls, String> {
+        let config = self
+            .handle
+            .device()
+            .active_config_descriptor()
+            .map_err(|error| format!("Cannot inspect streaming alternate: {error}"))?;
+        let interface = config
+            .interfaces()
+            .find(|interface| interface.number() == interface_number)
+            .ok_or_else(|| format!("USB interface {interface_number} disappeared"))?;
+        let descriptor = interface
+            .descriptors()
+            .find(|descriptor| descriptor.setting_number() == alternate_setting)
+            .ok_or_else(|| {
+                format!("USB interface {interface_number} alternate {alternate_setting} disappeared")
+            })?;
+        if descriptor.class_code() != 1 || descriptor.sub_class_code() != 2 {
+            return Ok(AlternateControls::default());
+        }
+
+        let controls = alternate_controls::advertised_controls(
+            descriptor.protocol_code(),
+            descriptor.extra(),
+        )?;
+        if controls.valid {
+            let declared: Vec<u8> = interface
+                .descriptors()
+                .map(|descriptor| descriptor.setting_number())
+                .collect();
+            let mut response = [0; MAX_VALID_ALTERNATES_REPLY_LEN];
+            let length = self.read_alternate_control(
+                interface_number,
+                AS_VALID_ALT_SETTINGS_CONTROL,
+                &mut response,
+            )?;
+            alternate_controls::validate_valid_alternates(
+                &response[..length],
+                &declared,
+                alternate_setting,
+            )?;
+        }
+        Ok(controls)
+    }
+
+    fn read_alternate_control(
+        &self,
+        interface_number: u8,
+        value: u16,
+        response: &mut [u8],
+    ) -> Result<usize, String> {
+        let request = UsbfsControlTransfer {
+            request_type: 0xa1,
+            request: 0x01,
+            value,
+            index: u16::from(interface_number),
+            length: response.len() as u16,
+            timeout_ms: 1000,
+            data: response.as_mut_ptr().cast(),
+        };
+        // Keep class requests on the owning usbfs fd, without another libusb
+        // completion consumer or any write to the alternate-setting controls.
+        let result = unsafe { libc::ioctl(self.device_fd, USBDEVFS_CONTROL, &request) };
+        let error = (result < 0).then(std::io::Error::last_os_error);
+        itf_class_control_delay(&self.handle);
+        if let Some(error) = error {
+            return Err(format!(
+                "USB interface {interface_number} alternate control {value:#06x}: {error}"
+            ));
+        }
+        let length = result as usize;
+        if length > response.len() {
+            return Err("Alternate control response exceeds requested length".into());
+        }
+        Ok(length)
     }
 }
 

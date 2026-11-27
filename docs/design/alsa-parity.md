@@ -45,6 +45,30 @@ Resolve a terminal's graph under the selected AudioControl function. A reachable
 
 Capture and implicit feedback can share one IN endpoint only when they use the same alternate and wire format. The session owns one event pump and one transfer pool per active endpoint. Fan out packet metadata to feedback and actual bytes to an explicitly opened capture stream. Give the reader a bounded whole-frame buffer, capture position and overrun telemetry. A paused or slow capture caller cannot stall feedback or playback. A requested duplex plan must declare whether it shares a clock. Accept independent clock domains if the app independently clocks and consumes both streams. Refuse concurrent requests that demand conflicting alts or clock settings. Unit contracts must distinguish zero/short successful capture packets, transport loss and dropped host-side backlog. Keep Android permissions and optional capture claims with the existing connection owner.
 
+### Live AudioStreaming alternate admission
+
+After clock setup, read the standard Valid Alternate Settings control
+when the selected UAC2 or full ADC3 AudioStreaming descriptor advertises
+it. Check the bitmap against that USB interface and require the selected
+alternate to be valid before sending SET_INTERFACE. If the interface
+also advertises Active Alternate Setting, read it back before starting
+transfers. Alternate zero remains available for cleanup after control
+failure. Negotiation still selects from static candidates. Reselecting an
+alternate after a live rejection would require renegotiating the exposed
+format and endpoint geometry. [USB-IF UAC2 §5.2.6.1](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), [USB-IF ADC3 §5.2.2.1 via IEC](https://www.iteh.eu/catalog/standards/clc/777313ac-7790-430c-8e99-17c611c46dd2/en-iec-62680-1-5-2019)
+
+For hardware acceptance, capture the Valid Alternate Settings read after
+clock selection and the Active Alternate Setting read after activation
+on a device that advertises both. Exercise an unavailable alternate and
+a failed readback, then verify that the stream submits no transfers and
+cleanup returns the interface to alternate zero.
+
+Rust workspace tests, the Android arm64 target, Kotlin unit tests, and
+the four-ABI AAR and sample builds passed. Both packages contain the
+same native library per ABI. The AAR SHA-256 is
+`c81fef47bdda8dc448169f755d82ed50ac10d6a5456308d2f34c51dd53272453`.
+Physical alternate-control validation remains pending.
+
 ## Channel layout and hardware routing
 
 Expose descriptor channel labels alongside count and preserve wire order in capture and playback. Distinguish spatial positions from unnamed channels. Treat unsupported conversion requests as typed failures. Model class selectors and mixer crosspoints as typed nodes and writable edges. Probe control readability and writability before exposing them, use protocol-specific CUR/RANGE encodings, verify writes and roll back partially applied route sets where supported. Device topology and vendor routing are distinct capabilities. Start vendor integration with known device/firmware identities and read-only route discovery, then implement verified changes for supported models. ALSA's Scarlett Gen 2–4 families encode generation/model differences, hardware ports, mixer/mux data and control transactions. Plan per-family implementations with exact evidence rather than forwarding arbitrary messages through the public API. [ALSA USB mixer](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c), [ALSA Scarlett controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c)
