@@ -444,6 +444,16 @@ pub(super) fn set_clock_verification(
     }
 }
 
+pub(super) fn invalidate_clock_verification() {
+    if let Some(state) = SESSION_STATE.lock().as_mut() {
+        state.clock_verification_passed = false;
+        if let Some(clock_status) = state.clock_status.as_mut() {
+            clock_status.reported_sample_rate = None;
+        }
+        state.bit_perfect_verified = direct_path_is_bit_perfect(state);
+    }
+}
+
 /// What stands in the way of a bit-perfect claim, if anything. The order is the
 /// order of precedence of the reported reason.
 pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBlocker> {

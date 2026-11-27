@@ -37,6 +37,10 @@ pub(super) struct Adc3Route {
     clock_context: Option<Adc3ClockContext>,
 }
 impl Adc3Route {
+    pub(super) fn implicit_status_route(&self) -> Option<&Adc3Route> {
+        self.implicit.as_deref()
+    }
+
     fn ratio(&self) -> Result<RateRatio, String> {
         match &self.choice {
             Some(choice) => adc3_choice_ratio(choice),

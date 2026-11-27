@@ -359,6 +359,90 @@ impl Drop for IsoTransferSlot {
     }
 }
 
+/// AudioControl status IN transfer, retired by the stream's existing event owner.
+pub(super) struct InterruptTransferSlot {
+    slot: IsoTransferSlot,
+    packet_bytes: usize,
+}
+
+impl InterruptTransferSlot {
+    pub(super) fn new(packet_bytes: usize) -> Result<Self, String> {
+        if packet_bytes == 0 || packet_bytes > i32::MAX as usize {
+            return Err("invalid interrupt transfer capacity".into());
+        }
+        Ok(Self {
+            slot: IsoTransferSlot::new(0, 0, packet_bytes)?,
+            packet_bytes,
+        })
+    }
+
+    pub(super) fn submit(
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        endpoint: u8,
+    ) -> Result<(), Error> {
+        if self.slot.in_flight {
+            return Err(Error::InvalidState("interrupt transfer already in flight".into()));
+        }
+        if endpoint & 0x80 == 0 || endpoint & 0x70 != 0 || endpoint & 0x0f == 0 {
+            return Err(Error::InvalidArgument("invalid interrupt IN endpoint".into()));
+        }
+
+        unsafe {
+            let data = &mut *self.slot.user_data;
+            if self.packet_bytes == 0 || self.packet_bytes > i32::MAX as usize
+                || self.packet_bytes > data.buffer.len()
+            {
+                return Err(Error::InvalidArgument("invalid interrupt transfer capacity".into()));
+            }
+            data.completion.reset();
+            self.slot.retirement_context = Some(handle.context().clone());
+            libusb_fill_interrupt_transfer(
+                self.slot.transfer.as_mut(),
+                handle.as_raw(),
+                endpoint,
+                data.buffer.as_mut_ptr(),
+                self.packet_bytes as i32,
+                iso_transfer_callback,
+                self.slot.user_data as *mut c_void,
+                0, // Status endpoints may NAK indefinitely until a change occurs.
+            );
+            let result = libusb_submit_transfer(self.slot.transfer.as_ptr());
+            if result != 0 {
+                return Err(if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                    Error::DeviceLost
+                } else {
+                    Error::Transfer(format!("interrupt submit failed with code {}", result))
+                });
+            }
+        }
+        self.slot.submitted_endpoint = endpoint;
+        self.slot.submitted_bytes = self.packet_bytes;
+        self.slot.in_flight = true;
+        Ok(())
+    }
+
+    pub(super) fn take_completion(&mut self) -> Option<(i32, &[u8])> {
+        if !self.slot.in_flight {
+            return None;
+        }
+        let (mut status, _, actual_length) = self.slot.take_completion()?;
+        self.slot.mark_completed();
+        let buffer = unsafe { &(*self.slot.user_data).buffer };
+        let length = if status == LIBUSB_TRANSFER_COMPLETED {
+            if actual_length > self.packet_bytes || actual_length > buffer.len() {
+                status = libusb1_sys::constants::LIBUSB_TRANSFER_OVERFLOW;
+                0
+            } else {
+                actual_length
+            }
+        } else {
+            0
+        };
+        Some((status, &buffer[..length]))
+    }
+}
+
 /// Built-in rules are bound to the opened descriptor and selected explicit pipe.
 #[derive(Default, Debug)]
 pub(super) struct FeedbackCompatibility {

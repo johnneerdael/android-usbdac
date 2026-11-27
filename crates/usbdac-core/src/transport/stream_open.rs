@@ -1222,6 +1222,80 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         candidate.max_packet_bytes,
     );
 
+    // Retain the exact selected route and raw root rate; never derive a
+    // Clock Source from a wire cadence alone (UAC1, BADD and vendor PCM).
+    let status_targets = (|| -> Result<Vec<audio_status::StreamStatusTarget>, Error> {
+        let mut targets = Vec::new();
+        if vendor_profile.is_none() {
+            if let Some((_, choice)) = clock_choice.as_ref().filter(|_| !candidate.is_uac1) {
+                // AS status remains useful without frequency evidence, but a
+                // nominal/ignored/fallback rate must never become a CUR claim.
+                let proven_clock = if clock_verification_passed
+                    && post_alt_readback_hz == Some(playback_format.sample_rate)
+                    && choice.resolution == crate::clock_resolution::ClockResolution::Resolved {
+                    let source_rate = if let Some(route) = adc3_route.as_ref() {
+                        route.source_rate(playback_format.sample_rate).map_err(Error::Control)?
+                    } else {
+                        uac2_clock_ratio(Some(choice)).map_err(Error::Control)?
+                            .source_rate(playback_format.sample_rate).ok_or_else(|| Error::Control(
+                                "status watch cannot represent the exact playback root rate".into()))?
+                    };
+                    Some((choice, source_rate))
+                } else { None };
+                let protocol = if adc3_route.is_some() { 0x30 } else { 0x20 };
+                let mut target = audio_status::StreamStatusTarget::new(protocol,
+                    choice.control_interface, candidate.interface_number, candidate.alt_setting,
+                    proven_clock);
+                if let Some(source) = candidate.implicit_feedback {
+                    target.add_streaming_alt(source.interface_number, source.alt_setting);
+                }
+                targets.push(target);
+                if let (Some(source), Some((_, root_rate))) = (candidate.implicit_feedback, proven_clock) {
+                    let peer = if let Some(route) = adc3_route.as_ref() {
+                        route.implicit_status_route().and_then(|peer| peer.choice.as_ref()
+                            .map(|choice| (choice.clone(), peer.source_rate(playback_format.sample_rate))))
+                    } else {
+                        claimed_handle.handle.device().active_config_descriptor().ok().and_then(|config| {
+                            let terminal = config.interfaces().flat_map(|i| i.descriptors())
+                                .find(|alt| alt.interface_number() == source.interface_number
+                                    && alt.setting_number() == source.alt_setting)
+                                .and_then(|alt| parse_android_streaming_interface_format(&alt))
+                                .and_then(|format| format.terminal_link);
+                            strict_implicit_clock(&config, &claimed_handle.handle,
+                                choice.control_interface, terminal).map(|peer| {
+                                    let rate = uac2_clock_ratio(Some(&peer)).and_then(|ratio|
+                                        ratio.source_rate(playback_format.sample_rate)
+                                            .ok_or_else(|| "implicit status root rate is not exact".into()));
+                                    (peer, rate)
+                                })
+                        })
+                    };
+                    if let Some((peer, Ok(peer_rate))) = peer {
+                        if peer.control_interface == choice.control_interface && peer.source_id == choice.source_id
+                            && peer_rate == root_rate {
+                            targets.push(audio_status::StreamStatusTarget::new(protocol,
+                                peer.control_interface, source.interface_number, source.alt_setting,
+                                Some((&peer, peer_rate))));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(capture) = attachment.as_ref() {
+            if let Some(target) = capture_stream::status_target(&claimed_handle, &capture.endpoint)? {
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    })();
+    let status_targets = match status_targets {
+        Ok(targets) => targets,
+        Err(error) => {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
+        }
+    };
+
     set_last_error(None);
     set_direct_mode_refusal_reason(None);
     let unsynchronized_async =
@@ -1286,7 +1360,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz);
+                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz, status_targets);
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);

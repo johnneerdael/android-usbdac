@@ -679,6 +679,29 @@ impl Drop for CaptureUsbOwner {
     }
 }
 
+/// Build only from the active, strictly resolved capture route after activation.
+pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
+    -> Result<Option<audio_status::StreamStatusTarget>, Error> {
+    if endpoint.vendor_pcm.is_some() || !matches!(endpoint.protocol, 0x20 | 0x30) {
+        return Ok(None);
+    }
+    let proven = if let Some(route) = endpoint.adc3_route.as_ref() {
+        let Some(choice) = route.choice.as_ref() else { return Ok(None); }; // BADD
+        route.source_rate(endpoint.format.sample_rate()).ok().map(|rate| (choice.clone(), rate))
+    } else {
+        claimed.handle.device().active_config_descriptor().ok().and_then(|config| {
+            let choice = strict_implicit_clock(&config, &claimed.handle, endpoint.control,
+                Some(endpoint.terminal))?;
+            let rate = uac2_clock_ratio(Some(&choice)).ok()?.source_rate(endpoint.format.sample_rate())?;
+            Some((choice, rate))
+        })
+    };
+    // Optional monitoring never turns an inconclusive extra snapshot into a
+    // new startup gate. The completed configuration owns initial verification.
+    Ok(Some(audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
+        endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)))))
+}
+
 pub(super) fn configure_capture_endpoint(
     claimed: &ClaimedHandle,
     candidate: &CaptureEndpoint,
@@ -1544,6 +1567,10 @@ fn run_capture(
     stop: &AtomicBool,
     ready: &std::sync::mpsc::SyncSender<Result<(), Error>>,
 ) -> Result<(), Error> {
+    let targets: Vec<_> = status_target(owner.claimed(), endpoint)?.into_iter().collect();
+    // Declared after the owner and before data transfers: all failure/unwind
+    // paths retire the status request before resetting an alternate or handle.
+    let mut audio_status = audio_status::AudioStatus::start(owner.claimed(), &targets)?;
     let transfer_bytes = capture_queue_bytes(endpoint.packet_bytes, geometry)?;
     let mut slots = Vec::with_capacity(geometry.transfer_slots);
     let mut order = VecDeque::with_capacity(geometry.transfer_slots);
@@ -1609,6 +1636,8 @@ fn run_capture(
                     Error::Transfer(format!("capture event pump: {e}"))
                 }
             })?;
+        if usb_stop_requested(stop) { break; }
+        audio_status.poll(owner.claimed())?;
         if let Some(pool) = feedforward.as_mut() {
             pool.pump(&owner.claimed().handle, stop)?;
         }

@@ -145,6 +145,7 @@ pub(crate) mod duplex;
 mod adc3;
 use adc3::*;
 mod alternate_controls;
+mod audio_status;
 mod clock;
 mod encode;
 mod endpoint_geometry;

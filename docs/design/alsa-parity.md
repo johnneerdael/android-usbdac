@@ -69,6 +69,34 @@ same native library per ABI. The AAR SHA-256 is
 `c81fef47bdda8dc448169f755d82ed50ac10d6a5456308d2f34c51dd53272453`.
 Physical alternate-control validation remains pending.
 
+### AudioControl notifications during a stream
+
+When a claimed UAC2 or full UAC3 AudioControl interface exposes a
+standard interrupt IN endpoint, the same USB worker monitors it during
+playback, capture, and duplex. A notification for the stream's active
+alternate or resolved clock path triggers a readback of the reported
+control. Verify the alternate, root frequency, clock validity, selector
+pin, or multiplier factor against the active route. Unrelated controls
+and vendor notifications do not change stream timing evidence.
+[USB-IF UAC2 §6.1](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[USB-IF ADC3 §6.1 via IEC](https://webstore.iec.ch/en/publication/63921)
+
+Stop the stream if a relevant readback fails or disagrees with the
+active route. For playback, clear the verified clock and feedback lock
+before reporting the failure. A subsequent negotiation can select a
+different alternate or clock. Retire the interrupt transfer together
+with the stream's USB work before releasing interfaces or power.
+
+For hardware acceptance, change an external clock or its selector
+while a stream is active. Verify the readback and stream failure, then
+negotiate again. Repeat with a device that returns to alternate zero.
+Exercise unrelated volume notifications, normal close, and unplug.
+
+Rust workspace tests, the Android arm64 check, Kotlin unit tests, and
+the four-ABI AAR and sample builds passed. The AAR and sample contain
+identical native libraries for each ABI. The AAR SHA-256 is
+`a091546bd145b265945816580358c1b3941f8baf3245ab099b6c0ee8c466c5aa`.
+
 ## Channel layout and hardware routing
 
 Expose descriptor channel labels alongside count and preserve wire order in capture and playback. Distinguish spatial positions from unnamed channels. Treat unsupported conversion requests as typed failures. Model class selectors and mixer crosspoints as typed nodes and writable edges. Probe control readability and writability before exposing them, use protocol-specific CUR/RANGE encodings, verify writes and roll back partially applied route sets where supported. Device topology and vendor routing are distinct capabilities. Start vendor integration with known device/firmware identities and read-only route discovery, then implement verified changes for supported models. ALSA's Scarlett Gen 2–4 families encode generation/model differences, hardware ports, mixer/mux data and control transactions. Plan per-family implementations with exact evidence rather than forwarding arbitrary messages through the public API. [ALSA USB mixer](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c), [ALSA Scarlett controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c)

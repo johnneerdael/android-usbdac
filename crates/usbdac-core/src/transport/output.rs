@@ -525,6 +525,19 @@ fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounte
     }
 }
 
+/// Process status only on the USB event owner, before any completed data is
+/// exposed or rearmed. Preserve the original typed detach/failure for duplex.
+fn poll_playback_status(status: &mut audio_status::AudioStatus, claimed: &ClaimedHandle,
+    shared: &StreamShared) -> Result<(), Error> {
+    status.poll(claimed).map_err(|error| {
+        invalidate_clock_verification();
+        shared.stats.feedback_locked.store(false, Ordering::Release);
+        set_usb_stream_stable(false);
+        shared.note_bit_perfect();
+        error
+    })
+}
+
 pub(super) fn run_usb_output_loop(
     usb_owner: StreamUsbOwner,
     candidate: IsoStreamCandidate,
@@ -533,6 +546,7 @@ pub(super) fn run_usb_output_loop(
     stop: Arc<AtomicBool>,
     capture: Option<Arc<duplex::Attachment>>,
     post_alt_readback_hz: Option<u32>,
+    status_targets: Vec<audio_status::StreamStatusTarget>,
 ) {
     let pcm_buffer = Arc::clone(&shared.ring);
     let runtime_stats = Arc::clone(&shared.stats);
@@ -567,6 +581,23 @@ pub(super) fn run_usb_output_loop(
         return;
     }
 
+    // The owner predates this guard, so unwinding retires status before USB
+    // alternate restoration. Start before explicit feedback or data submission.
+    let mut audio_status = match audio_status::AudioStatus::start(claimed_handle, &status_targets) {
+        Ok(status) => status,
+        Err(error) => {
+            invalidate_clock_verification();
+            shared.note_bit_perfect();
+            if let Some(capture) = capture.as_ref() { capture.finish(Some(error.clone())); }
+            set_last_error(Some(error.to_string()));
+            set_engine_state(EngineState::Error, Some(error.to_string()));
+            shared.fail(error);
+            set_stream_active(false);
+            set_runtime_stats(None);
+            set_usb_stream_stable(false);
+            return;
+        }
+    };
     let (playback_first, programmed_vendor_rate) = match vendor_pcm::for_candidate(&handle, &candidate) {
         Ok(profile) => (profile.is_some(), profile.as_ref().is_some_and(|profile| profile.rate_control)),
         Err(message) => { set_last_error(Some(message.clone())); set_engine_state(EngineState::Error, Some(message.clone())); shared.fail(Error::Transfer(message)); set_stream_active(false); return; }
@@ -758,6 +789,18 @@ pub(super) fn run_usb_output_loop(
         runtime_stats.buffer_target_samples,
     );
     while fatal_error.is_none() && !usb_stop_requested(&stop) {
+        if audio_status.is_active() {
+            if let Err(error) = context.handle_events(Some(Duration::from_millis(2))) {
+                device_lost = error == rusb::Error::NoDevice;
+                fatal_error = Some(format!("status prime event pump: {error}"));
+                break;
+            }
+            if usb_stop_requested(&stop) { break; }
+            if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+                device_lost = error == Error::DeviceLost;
+                fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            }
+        }
         let buffered = runtime_stats.buffered_samples.load(Ordering::Acquire);
         // drain() with a short tail: play it rather than wait for the threshold.
         if buffered >= priming_target
@@ -770,7 +813,7 @@ pub(super) fn run_usb_output_loop(
             );
             break;
         }
-        thread::sleep(Duration::from_millis(2));
+        if !audio_status.is_active() { thread::sleep(Duration::from_millis(2)); }
     }
 
     for slot_index in 0..transfer_slot_count {
@@ -810,7 +853,8 @@ pub(super) fn run_usb_output_loop(
 
     let stream_started_at = Instant::now();
     let mut capture_pool = None;
-    if let Some(attachment) = capture.as_ref().filter(|a| !a.shared_implicit) {
+    if let Some(attachment) = capture.as_ref().filter(|a| !a.shared_implicit
+        && fatal_error.is_none() && !usb_stop_requested(&stop)) {
         match duplex::InputPool::new(Arc::clone(attachment)) {
             Ok(mut pool) => {
                 if let Err(error) = pool.start(&handle, &stop) {
@@ -831,6 +875,11 @@ pub(super) fn run_usb_output_loop(
             let failure = if error == rusb::Error::NoDevice { Error::DeviceLost }
                 else { Error::Transfer(format!("duplex feedforward event pump: {error}")) };
             device_lost = failure == Error::DeviceLost; fatal_error = Some(failure.to_string()); capture_failure = Some(failure); break;
+        }
+        if usb_stop_requested(&stop) { break; }
+        if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+            device_lost = error == Error::DeviceLost;
+            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
         }
         if let Some(pool) = capture_pool.as_mut() {
             if let Err(error) = pool.pump(&handle, &stop) {
@@ -865,6 +914,11 @@ pub(super) fn run_usb_output_loop(
                         if let Err(error) = context.handle_events(Some(Duration::from_micros(u64::from(candidate.service_interval_us).min(1000)))) {
                             device_lost = error == rusb::Error::NoDevice;
                             implicit_feedback_fault = true; fatal_error = Some(format!("implicit event pump failed: {}", error)); break;
+                        }
+                        if usb_stop_requested(&stop) { break; }
+                        if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+                            device_lost = error == Error::DeviceLost;
+                            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
                         }
                         if let Some(pool) = capture_pool.as_mut() {
                             if let Err(error) = pool.pump(&handle, &stop) {
@@ -1036,6 +1090,10 @@ pub(super) fn run_usb_output_loop(
         }
 
         if usb_stop_requested(&stop) { break; }
+        if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+            device_lost = error == Error::DeviceLost;
+            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+        }
         // A flush since the last look: cut what is still queued of the old
         // position. Only transfers filled before the flush are touched; their
         // completions come back below as `CancelledByFlush`.
@@ -1053,6 +1111,12 @@ pub(super) fn run_usb_output_loop(
                     }
                     Ok(targets.len())
                 } else { cancel_stale_transfers_for_flush(&context, &mut slots, flush_epoch) };
+                // Synchronous flush retirement can pump another event batch.
+                if usb_stop_requested(&stop) { break; }
+                if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+                    device_lost = error == Error::DeviceLost;
+                    fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                }
                 match cancel_result {
                     Ok(0) => {}
                     Ok(asked) => {
@@ -1653,6 +1717,7 @@ pub(super) fn run_usb_output_loop(
     drain_feedback_transfer_slot(&context, &mut feedback_slot);
     runtime_stats.feedback_locked.store(false, Ordering::Release);
 
+    drop(audio_status);
     drop(usb_owner);
     set_stream_active(false);
     set_runtime_stats(None);
