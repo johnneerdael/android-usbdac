@@ -331,7 +331,7 @@ These are separate from playback and from `OutputSelector`, which chooses playba
 
 | Call | What it does |
 |---|---|
-| `UsbDac.attachedCaptureDevices(context)`, `UsbDac.describeCapture(device)` | Lists USB devices that have a PCM IN interface, including input-only ones |
+| `UsbDac.attachedCaptureDevices(context)`, `UsbDac.describeCapture(device)` | Lists attached USB audio inputs, including devices with no playback interface. Exact PCM support is checked after USB permission |
 | `UsbDac.openCapture(context, device, config, configurationId)` | Opens a `DacCaptureSession` that holds the IN and AudioControl claims only. It opens no playback and does no output-volume setup. Android applies its microphone permission and privacy rules, and the library requests no permission itself |
 | `DacCaptureSession.openCapture(CaptureRequest, capacityFrames = 8192)` | Starts exact PCM capture. `CaptureRequest` is a rate, a channel count, valid bits and an optional channel map. There is no rate substitution, conversion or channel remix: the request is met or it fails |
 | `UsbDac.openDuplex(...)`, then `DacSession.openDuplex(format, request, capacityFrames = 48_000)` | Claims playback and input together, then opens both on one USB worker after the output has been negotiated. Closing either direction closes both. Two directions on one clock must use the same rate |
