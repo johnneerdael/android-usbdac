@@ -1504,7 +1504,7 @@ is `Unsupported` for channels (no downmix, no upmix); rates are 8000 to 768000 H
 
 `ConvertOptions` (all with defaults): `narrowing` is `TpdfDither` (the default) or
 `Truncate`; `quality` is `High` (default) or `Fast`; `headroom_db` (0 to -60,
-default 0); `dither_seed`; `source_sample`.
+default -3.5 dB, applied only after resampling); `dither_seed`; `source_sample`.
 
 ### 14.2 Running
 
@@ -1525,6 +1525,8 @@ source frame turns into). `finish` flushes the filter by feeding it silence, so 
 total output for `N` input frames is exactly `ceil(N * L / M)` frames (14.4); after
 it `process` fails `InvalidState` until `reset`. Chunking changes nothing: the
 output is bit-identical whatever the chunk sizes (tested).
+
+For signed integer input with a declared significant width smaller than its slot, every complete input buffer is checked for zero low padding bits before any output or state change. An invalid buffer fails with `InvalidArgument`; declaring 16 significant bits in a 32-bit slot permits exact repacking to 16-bit, while full 32-bit input to 16-bit remains lossy. A plan is exact conditional on that declared input contract; it does not infer precision from a silent prefix. Kotlin `ConvertingOutput` validates before forwarding each block, including plans that otherwise copy unchanged.
 
 Everything the converter needs is allocated in `Converter::new`: `process`,
 `finish` and `reset` do not allocate (tested with a counting allocator, for every
@@ -1548,10 +1550,7 @@ reconstruction can exceed its input's peak. Measured: a full-scale 1 kHz square
 wave resampled from 44.1 to 48 kHz peaks at 1.41 (+3.0 dB), and clips; a
 full-scale sine does not (the passband ripple is 0.00004 dB, less than one 16-bit
 step at full scale: tested for 100 Hz to 19 kHz at 16 bits with truncation). The
-strategy is therefore: unity gain by default (DC gain exactly 1, so a resampled stream is as loud as the
-source), saturation with a count, and `headroom_db` for material that can
-overshoot (`-3.5` keeps the square wave above from clipping, tested). The
-headroom applies after resampling only.
+default is -3.5 dB after resampling, which covers the measured square wave but is not a guarantee for every signal. Set `headroom_db = 0` explicitly for unity gain. Saturation remains counted, and headroom never applies to exact or widening paths.
 
 ### 14.4 The resampler
 

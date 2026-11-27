@@ -84,6 +84,40 @@ class ConvertingOutputTest {
         assertTrue(backend.calls.none { it == "process" || it == "finish" || it == "reset" })
     }
 
+    @Test
+    fun paddedCopyUsesConverterAndRetainsVerifiedVerdict() {
+        val backend = FakeConvertBackend(planJson(kind = "none", description = "conditional copy", resamples = false, delayFrames = 0, targetRate = 24_000, steps = "[]"))
+        val target = RecordingOutput()
+        val base = planFor(backend)
+        val json = org.json.JSONObject(base.requestJson)
+        json.getJSONObject("source").getJSONObject("sample").put("bits", 16).put("slot_bytes", 4)
+        val padded = ConversionPlan(
+            backend = backend, requestJson = json.toString(), kind = ConversionKind.NONE,
+            description = "conditional copy", steps = emptyList(), sourceSampleRate = 24_000,
+            sourceChannels = 1, sourceFrameBytes = 4, targetSampleRate = 24_000,
+            targetChannels = 1, targetFrameBytes = 4, resamples = false, delayFrames = 0,
+            minOutputBytes = 4, resampler = null,
+        )
+        val output = ConvertingOutput(target, PcmConverter.create(padded))
+        assertTrue(output.bitPerfect.value.isVerified)
+        output.write(directOf(0, 0, 1, 2))
+        assertTrue(backend.calls.contains("process"))
+    }
+
+    @Test
+    fun failedConversionNeverForwardsScratchOnLaterCalls() {
+        val backend = FakeConvertBackend()
+        val target = RecordingOutput()
+        val converter = PcmConverter.create(planFor(backend))
+        val output = ConvertingOutput(target, converter)
+        output.write(directOf(1, 2))
+        val before = target.received.toList()
+        converter.finish(ByteBuffer.allocateDirect(16))
+        expectCode(DacErrorCode.INVALID_STATE) { output.write(directOf(3, 4)) }
+        output.writableBytes
+        assertEquals(before, target.received)
+    }
+
     // ---- writing ----
 
     @Test

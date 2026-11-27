@@ -93,3 +93,61 @@ fn the_options_are_plain_data() {
     assert!(plan.description().contains("fast quality"));
     assert!(plan.description().contains("-3.0 dB of headroom"));
 }
+
+#[test]
+fn declared_padded_samples_are_exact_and_checked_on_every_call() {
+    let source = PcmFormat::new(48_000, 1, SampleFormat::int(16, 4).unwrap());
+    let target = PcmFormat::new(48_000, 1, SampleFormat::I16);
+    let plan = ConversionPlan::pcm(source, target, &ConvertOptions::default()).unwrap();
+    assert_eq!(plan.kind(), ConversionKind::BitExact);
+    assert!(plan
+        .description()
+        .contains("validated on every input buffer"));
+    let mut converter = Converter::new(&plan).unwrap();
+    let mut out = [0xaau8; 2];
+    let result = converter.process(&[0, 0, 0x34, 0x12], &mut out).unwrap();
+    assert_eq!((result.consumed, result.produced), (4, 2));
+    assert_eq!(out, [0x34, 0x12]);
+    out.fill(0xaa);
+    let error = converter
+        .process(&[0, 1, 0x34, 0x12], &mut out)
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_argument");
+    assert_eq!(out, [0xaa; 2]);
+    let result = converter.process(&[0, 0, 0xff, 0xff], &mut out).unwrap();
+    assert_eq!((result.consumed, result.produced), (4, 2));
+    assert_eq!(out, [0xff, 0xff]);
+}
+
+#[test]
+fn padding_validation_covers_copy_and_non_byte_aligned_samples() {
+    let sample = SampleFormat::int(20, 3).unwrap();
+    let format = PcmFormat::new(44_100, 1, sample);
+    let plan = ConversionPlan::pcm(format, format, &ConvertOptions::default()).unwrap();
+    let mut converter = Converter::new(&plan).unwrap();
+    let mut output = [0xcc; 3];
+    assert!(converter.process(&[1, 0, 0], &mut output).is_err());
+    assert_eq!(output, [0xcc; 3]);
+    assert_eq!(
+        converter
+            .process(&[0x10, 0, 0], &mut output)
+            .unwrap()
+            .produced,
+        3
+    );
+    assert_eq!(output, [0x10, 0, 0]);
+}
+
+#[test]
+fn malformed_public_integer_layout_is_rejected() {
+    let invalid = PcmFormat::new(
+        48_000,
+        1,
+        SampleFormat::Int {
+            bits: 0,
+            slot_bytes: 0,
+        },
+    );
+    let valid = PcmFormat::new(48_000, 1, SampleFormat::I16);
+    assert!(ConversionPlan::pcm(invalid, valid, &ConvertOptions::default()).is_err());
+}
