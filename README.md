@@ -53,7 +53,7 @@ technically, and in plain terms. In short:
 | Capture and duplex | Explicit PCM input APIs, shared endpoint ownership, channel layouts and separate loss/overrun reporting | Record input alone or alongside playback without stalling USB pacing |
 | Hardware routing | Session-bound USB Audio Class controls with readback and rollback | Expose the controls the device can prove it supports |
 | Output choice | An `OutputSelector` that detects the DAC, permission, route and what the platform grants, and returns one ready output with the reason and the guarantee | The app asks for the best way to play and is told what it got and why |
-| Conversion | Optional resampling, bit-depth and mono-to-stereo, always labelled | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
+| Conversion | Resampling, bit-depth and mono-to-stereo, always labelled. `OutputSelector` uses it by default when the DAC cannot run a request; the direct stream never converts on its own | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
 | Packaging | Rust core, Kotlin API, sample app, tests, published builds | A dependency and a few dozen lines instead of writing a USB driver |
 
 Several of these came from studying how two other open-source players, Mornye
@@ -73,9 +73,13 @@ acceptance and additional models are tracked in
 ```text
 crates/usbdac-core/   the driver (Rust): no JNI, no application types
 crates/usbdac-jni/    libusbdac.so, the JNI bindings
+crates/usbdac-validator/ the shared physical DAC test suite and report writer
 android/usbdac/       the Android library (AAR, Kotlin, package dev.usbdac)
 android/usbdac-media3/ optional Media3 AudioSink integration
 android/sample/       a small app that exercises every feature
+android/validator/    the Android DAC validator app
+macos/validator/      the Apple Silicon macOS DAC validator app
+fuzz/                 cargo-fuzz target for the descriptor, clock, feedback and control-reply parsers
 docs/sdk/             the SDK guide (published to the site above)
 docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
 ```
@@ -93,8 +97,11 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   profiles and standard 8-byte UAC3 words). Legacy byte and bit order are
   resolved per alternate, device and applicable firmware.
 - Output: a ring buffer (250 ms target, 500 ms capacity by default) feeds eight
-  isochronous transfers initially, targeting about 16 ms. Adaptive depth can
-  grow within 64 ms and 255 packets; explicit custom geometry fixes the depth.
+  isochronous transfers initially, targeting about 16 ms. Adaptive depth (on by
+  default) adds two transfers after a loss and removes one after 30 s without
+  loss. It stops at 16 transfers, 64 ms or 255 packets in flight, whichever
+  comes first: with the default 2 ms transfers that is 32 ms, or 30 ms at a
+  125 µs service interval. Explicit custom geometry fixes the depth.
   Explicit rate reports and
   implicit capture packet counts steer asynchronous playback packet sizes.
 - Flush: `flush()` drops the ring and cancels what is already on the bus (not
@@ -108,8 +115,8 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   and checks that the resulting packet fits. A short report gap can recover
   while playback holds the last good rate. Stale feedback clears the
   bit-perfect verdict, and a persistent outage ends the stream. Implicit
-  feedback uses frame counts from a compatible UAC2 IN stream that shares the
-  playback clock, rate and service interval. An otherwise valid asynchronous
+  feedback uses frame counts from a compatible UAC2 or UAC3 IN stream that
+  shares the playback clock, rate and service interval. An otherwise valid asynchronous
   full-speed UAC1 PCM route without a declared feedback pipe can use nominal
   pacing by default; the explicit `allow_unsynchronized_async` option permits
   a broader fallback. Either is unverified.
@@ -119,19 +126,33 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   volume is lowered to at most -40 dB when the DAC opens (never raising a
   channel, verified by reading it back), and a DAC without a usable hardware
   volume refuses to stream unless the host allows a fixed level.
-- Opt-in conversion helpers (`usbdac_core::convert`): a polyphase windowed-sinc
+- Rates: `StreamRequest` defaults to `RatePolicy::Exact`, which refuses a rate
+  the DAC cannot run. `RatePolicy::NearestSupported` picks another rate in
+  this order: the highest supported integer divisor of the request, the
+  highest lower rate in the same family, the highest other lower rate, then
+  the lowest higher rate. 192 kHz on a DAC with 96 and 48 kHz gives 96 kHz.
+  Lower-first ranking can cost bandwidth: an 88.2 kHz source on a DAC with
+  only 44.1 and 176.4 kHz gets 44.1 kHz. The host then resamples, and the stream
+  is not bit-perfect.
+- Conversion helpers (`usbdac_core::convert`): a polyphase windowed-sinc
   resampler, integer widening and narrowing with TPDF dither, float and mono-to-stereo,
   planned and classified (`None`, `BitExact`, `Lossless`, `Lossy`) so a host can play a
   rate the DAC refuses and say honestly that it is not bit-perfect. The direct path never
-  calls them (`docs/API.md` section 14).
+  calls them by itself (`docs/API.md` section 14). On Android, `OutputPolicy` enables
+  them by default (`allowConversion` and `allowWidening`). Resampling applies −3.5 dB of
+  headroom, which reduces clipping but does not prevent it, so clipped samples are counted.
+  Unpacking DoP to PCM needs `allowDopPcmConversion`, which is off by default.
 - Events through one library thread: state changes, underruns, lost frames,
   bit-perfect changes, volume changes, stale feedback, errors, device loss.
 
 ## Limits
 
 - One owner per physical attachment; distinct attachments can have independent owners. A second owner for the same attachment is refused.
-- Linux/Android usbfs only. On other hosts everything compiles and the logic
-  tests run, but `Dac::open` returns `Error::PlatformUnsupported`.
+- `Dac::open` takes a usbfs file descriptor and works on Linux and Android
+  only. On macOS, `Dac::open_darwin` drives a libusb attachment found by
+  `darwin_discovery`. The Apple Silicon validator uses this path, and no
+  macOS hardware result is recorded yet. On other hosts everything compiles
+  and the logic tests run, but opening a DAC returns `Error::PlatformUnsupported`.
 - UAC 1.0/2.0/3.0 playback and PCM capture, including BADD profiles.
   Capture and duplex require explicit input APIs and USB claims.
 - Standard routing and supported vendor controls depend on the active
@@ -143,7 +164,7 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 
 Library changes merged to `main` start the Release workflow. It advances the
 patch version, builds and tests a versioned commit, publishes the Rust crate
-and Android AAR, and creates the GitHub Release with its downloads. A merge
+and the `usbdac` and `usbdac-media3` AARs, and creates the GitHub Release with its downloads. A merge
 that declares a higher version can select the next minor or major release.
 For releases from sources containing the validator, the downloads also include
 a versioned Android validator APK and Apple Silicon macOS validator ZIP built
@@ -177,9 +198,12 @@ PATH=$NDKBIN:$PATH CC_aarch64_linux_android=aarch64-linux-android26-clang \
 ```
 
 Add `-t armeabi-v7a`, `x86_64`, ... for other ABIs. `usbdac-core` depends on
-`rusb`, `libusb1-sys`, `parking_lot`, `once_cell`, `crossbeam-channel`, `log`
-and `libc`; the JNI crate adds `jni`, `serde_json` and, on Android,
-`android_logger`.
+`rusb`, `libusb1-sys`, `parking_lot`, `once_cell`, `crossbeam-channel`, `log`,
+`libc`, `serde`, `serde_json`, `base64` and `flate2` (`base64` and `flate2`
+decode Focusrite FCP data; `serde` and `serde_json` serialize error codes and
+macOS discovery evidence); the JNI crate adds `jni` and, on Android,
+`android_logger`, and links `usbdac-validator` only with its `validator`
+feature.
 
 ## Minimal Rust example
 

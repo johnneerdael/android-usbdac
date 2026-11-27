@@ -133,9 +133,10 @@ Every failure is a `DacException` with a typed `code`; [troubleshooting](trouble
 |---|---|---|
 | `PERMISSION_DENIED` | Opening a direct session | Ask ([permission](#permission-and-hot-plug)). If denied, tell the listener once and use the next output. With the selector this is already the decision |
 | `BUSY` | Opening a session or a selector output | Something in your own process holds the DAC. Close it. Treat it as a bug in your lifecycle |
+| `BUSY` | `negotiate` or a `routing` call during `DacSession.reconfigure` | The reconfigure, including its drain, is still running. These calls fail at once instead of waiting; call again after `reconfigure` returns |
 | `CLAIM` | Opening a session | Android keeps the DAC. Offer the steps in [Android keeps the DAC](troubleshooting.md#android-keeps-the-dac) and use the next output meanwhile |
 | `UNSUPPORTED` | `negotiate`, `openStream` | The DAC has no alternate setting for the request. Offer conversion if the listener allowed it, otherwise the next output, saying why |
-| `IMPLICIT_FEEDBACK_UNSUPPORTED` | `negotiate`, `openStream` | The selector already moves to the next output. With the direct calls, use `AndroidManagedOutput`, or `allowUnsynchronizedAsync` if the listener accepts clicks and no bit-perfect claim |
+| `IMPLICIT_FEEDBACK_UNSUPPORTED` | `negotiate`, `openStream` | The selector already moves to the next output. With the direct calls, use `AndroidManagedOutput`, or `allowUnsynchronizedAsync` if the listener accepts host-paced playback, where clock drift ends in underruns or overruns at the DAC, and no bit-perfect claim |
 | `CLOCK_UNVERIFIED` | `openStream` | The DAC did not confirm the rate. Report with `format.clock`; as a last resort the listener can turn off `requireVerifiedRate`, and the stream is then never verified |
 | `VOLUME_UNAVAILABLE` | `openStream` | Ask whether to allow a fixed level, and reopen with `requireHardwareVolume = false` |
 | `TRANSFER`, `StreamFailed` | While playing | The stream is `FAILED` and stays open until closed. Stop the writer, close the stream, keep the position, and **pause with an explanation**. Retry once on the listener's play; if it fails again, report |
@@ -168,12 +169,12 @@ Failed packets and transfers are charged conservatively: bytes reported by a fai
 | Cold start: DAC plugged in, app launched, direct output chosen | The stream starts, the indicator reaches `Verified` after real audio, the level is at or below -40 dB |
 | 44.1, 48, 96 kHz and the highest rate the DAC offers, 16 and 24 bit | No clock refusal, no timeouts, `format.clock` and `pacing` as expected |
 | Rate change between tracks | The output reopens, a gap of about 100 ms or more, the right rate on the DAC |
-| Gapless in one format | No gap, no click, `playedFrames` continuous |
+| Gapless in one format | The output stays open, `playedFrames` keeps counting and no underrun is reported at the boundary. Listen for a gap or a click and record what you hear |
 | Pause, resume, seek while playing and while paused | Observe acoustic response, queued audio and whether the DAC remains locked on silence |
 | Skip tracks quickly | No stale audio, no stuck state |
 | A long pause (over 30 s) with `DacIdleRelease` | The stream closes, the session stays, play reopens it |
 | Unplug during playback, then replug | Pause with a message, no sound on the speaker, play opens the DAC again |
-| Volume: slider, keys, keys with the screen off, the knob on the DAC | The level follows the control, the dB shown is right, no click on a step |
+| Volume: slider, keys, keys with the screen off, the knob on the DAC | The level follows the control and the dB shown is right. The library writes each level to the DAC's control without a ramp, so record whether a step is audible |
 | Close the app, then play from another app | The DAC is back at its original level and Android plays through it |
 | A DAC with no volume control | `VOLUME_UNAVAILABLE`, then the fixed-level path after the listener agrees |
 | Bluetooth connected | The selector chooses standard output, not direct USB |

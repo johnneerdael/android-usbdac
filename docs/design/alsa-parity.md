@@ -489,7 +489,15 @@ submission to clear any older flag. Then handle matching endpoint
 notifications on the existing USB event worker. Read the named
 control by endpoint address. A zero reply leaves the stream running.
 A confirmed fault reports a stream error, stops affected playback or
-capture, and clears playback's bit-perfect verdict. The one-bit
+capture, and clears playback's bit-perfect verdict. In a duplex stream,
+playback survives a capture fault only when the capture attachment is
+proven independent: UAC2, no shared implicit feedback or feedforward, a
+separate AudioStreaming interface on its own AudioControl interface, and
+both directions on a direct, fully resolved terminal-to-source clock
+(`independent_direct_clocks` in `transport/duplex.rs`). A device removal
+is never isolated. A normal single-function duplex device loses both
+directions. USB 2.0 §4.7 describes pipes as generally independent but
+does not promise that one survives a fault on another. The one-bit
 response establishes that a fault occurred and gives no frame count.
 [USB-IF UAC2 §§5.2.6.4.2–3 and 6.1](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
 [USB-IF ADC3 §§5.2.2.2.2–3 and 6.1](https://amatriz.net/PDFs/Audio30.pdf)
@@ -563,7 +571,7 @@ Expose descriptor channel labels alongside count and preserve wire order in capt
 
 ## USB Audio Class 3
 
-Select UAC3 from the interface protocol and the Audio Interface Association profile. Keep explicit protocol dispatch in class parsers and control addressing. BADD is a separate configuration/profile contract with inferred topology and a fixed 48 kHz stream profile. Match the documented endpoint direction, sync and packet capacity before inferring width and channels. Full ADC3 requires parsing its 64-bit format mask and fetching bounded High Capability descriptor bodies by cluster ID through the AudioControl interface. Validate declared lengths and IDs on both reads and derive channel order from cluster segments. Inspect existing mixed-configuration Android ownership before any SET_CONFIGURATION. Recompute claims and capabilities if configuration changes. [USB-IF ADC3 via IEC 62680-1-5](https://www.iteh.eu/catalog/standards/clc/777313ac-7790-430c-8e99-17c611c46dd2/en-iec-62680-1-5-2019), [USB-IF BADD via IEC 62680-1-6](https://cdn.standards.iteh.ai/samples/102576/dceddfdc0b3e48879b48480be81b1805/IEC-62680-1-6-2019.pdf), [ALSA ADC3 stream parsing](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/stream.c#L872-L1099)
+Select UAC3 from the interface protocol and the Audio Interface Association profile. Keep explicit protocol dispatch in class parsers and control addressing. BADD is a separate configuration/profile contract with inferred topology and a fixed 48 kHz stream profile. Match the documented endpoint direction, sync and packet capacity before inferring width and channels. Full ADC3 requires parsing its 64-bit format mask and fetching bounded High Capability descriptor bodies by cluster ID through the AudioControl interface. Validate declared lengths and IDs on both reads and derive channel order from cluster segments. Inspect existing mixed-configuration Android ownership before any SET_CONFIGURATION. Recompute claims and capabilities if configuration changes. UAC3 (2019 errata) §3.3 requires the first configuration descriptor (index 0) of a compliant device to contain an ADC 1.0 or 2.0 compliant Audio Interface Association. The Kotlin SDK's fallback to it is opt-in and playback-only: `UsbDac.openPlaybackForRequest` with `PlaybackConfigurationFallback.LEGACY_FIRST_IF_DESCRIPTOR_INCOMPATIBLE` (default `DISABLED`) selects the first configuration only when complete descriptors prove that the active full-UAC3 configuration cannot carry the exact request. It does not fire when the native UAC3 path refuses for any other reason, an explicit configuration ID wins, and a failed fallback keeps its USB resources until the explicit hand-back. [USB-IF ADC3 via IEC 62680-1-5](https://www.iteh.eu/catalog/standards/clc/777313ac-7790-430c-8e99-17c611c46dd2/en-iec-62680-1-5-2019), [USB-IF BADD via IEC 62680-1-6](https://cdn.standards.iteh.ai/samples/102576/dceddfdc0b3e48879b48480be81b1805/IEC-62680-1-6-2019.pdf), [ALSA ADC3 stream parsing](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/stream.c#L872-L1099)
 
 Track the power domain associated with each active entity and reference-count shared domains. Bring a stopped domain to D0, honor specified recovery time, then verify control and streaming state. Keep it awake while a stream or active control holds it. Shut down after the final owner and after retiring transfers, including abort and device hand-back. Preserve UAC1/UAC2 paths through existing CI and verify actual Android configuration and power transitions before stating hardware coverage. [ALSA UAC3 declarations](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/include/linux/usb/audio-v3.h), [ALSA power-domain control](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/power.c)
 
@@ -895,6 +903,14 @@ extend the coverage estimate for a queue that already ran out. Accept
 IN timing only after verifying the original submission and packet spans.
 An IN packet that reports device loss follows the device-loss path.
 
+One isolated timing gap is tolerated. Trust returns only after a full
+100 ms window of valid timing; a second gap before then ends the stream
+with `TimingBudgetExhausted`, and the app must reopen it. A pattern FIFO
+overflow also ends it. ALSA instead keeps queuing through any number of
+bad IN packets (a failed packet becomes a zero-size entry) and reports a
+FIFO overflow as an xrun the application can recover
+([v7.3 endpoint.c](https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/endpoint.c#L1765-L1845)).
+
 Rust tests, the Android arm64 NDK check, Kotlin unit tests, and the
 four-ABI AAR and sample builds passed. The AAR SHA-256 is
 `a346493d93fc2a53d921d432d6ce1753687499a6822d03fa96466a104e6b92e2`.
@@ -999,6 +1015,21 @@ upstream cluster widths. For full ADC3, distinguish equal channel
 counts from equal selector input cluster identities. Require a known
 owned power state for control operations that cannot complete while a
 domain sleeps.
+
+The UAC2 and full ADC3 crosspoint request keeps the specified encoding:
+`wValue` is `MU_MIXER_CONTROL` (`0x01`) in the high byte and the
+zero-based MCN, `(u - 1) * m + (v - 1)`, in the low byte, so the first
+crosspoint is `0x0100` (UAC2 §5.2.5.5, UAC3 §5.2.1.7;
+`crates/usbdac-core/src/routing.rs`). ALSA builds every mixer unit
+control with `cval->control = in_ch + 1` and addresses it as
+`(control << 8) | channel` with a one-based output channel, which is the
+UAC1 form, for every protocol version (`build_mixer_unit_ctl` and the
+control value helpers in v6.12 `sound/usb/mixer.c`). The two differ on
+UAC2 and ADC3 devices. Matching ALSA on a particular device would need a
+firmware trace showing that it accepts ALSA's form; until then the
+library follows the specification and has no ALSA-compatible mode.
+[USB-IF UAC2 §5.2.5.5](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[ALSA v6.12 mixer unit](https://github.com/torvalds/linux/blob/v6.12/sound/usb/mixer.c#L2182-L2215),
 [USB-IF UAC1 audio controls §5.2.2](https://www.usb.org/sites/default/files/audio10.pdf),
 [USB-IF ADC3 via IEC 62680-1-5](https://www.iteh.eu/catalog/standards/clc/777313ac-7790-430c-8e99-17c611c46dd2/en-iec-62680-1-5-2019),
 [ALSA mixer discovery](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c#L2137-L2317)
@@ -1615,9 +1646,15 @@ An explicit edit revalidates the open session, exact device and active
 configuration, vendor transport geometry, and owned interface. The
 streaming interface must still be at alternate zero. A single
 zero-payload device request `0x40/0x03` carries the selected model's
-value and index. A successful call means USB acknowledged the write.
-ALSA's getter reads its software value, so hardware state and route
-rollback remain unavailable through this protocol.
+value and index. A successful call means USB acknowledged the write: the option is
+acknowledged, not verified. ALSA's getter reads its software value, and
+neither source has a hardware read that could confirm the option or
+recover its previous value, so hardware state and route rollback remain
+unavailable through this protocol. Enabling the operation requires
+independent physical confirmation of the routing. In the current release
+both operations are behind the vendor-routing fence
+(`VENDOR_ROUTING_RELEASED = false` in `transport/routing_hw.rs`) and
+return an unsupported-topology error.
 [ALSA DJM request and getter](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_quirks.c#L4245-L4332)
 
 Hardware acceptance should route a distinguishable input to each USB

@@ -81,7 +81,7 @@ active configuration. It includes the required control and playback interfaces
 and any successfully claimed optional IN sources. An unavailable optional
 claim leaves other viable playback routes available.
 
-The Kotlin SDK also offers `UsbDac.openPlaybackForRequest` for a checked exact playback request. Its optional `LEGACY_FIRST_IF_DESCRIPTOR_INCOMPATIBLE` policy defaults off; an explicit configuration ID wins. The fallback selects the actual ID at descriptor index zero only when the first configuration provides legacy playback and complete descriptors prove that the active configuration cannot carry that exact request. Full-UAC3 incompatibility is established by its active descriptors. For exact signed PCM, a same-connection native witness can also prove that a validated microphone-only BADD inventory has no playback, or that an unambiguous BADD output is fixed at 48 kHz and excludes a different requested rate. It requires fresh matching raw and parsed descriptors, stable configuration and supported bus speed; unknown or mixed output leaves normal selection unchanged. This is descriptor evidence, not physical playback proof. Selection and checks use one retained connection, but cannot prove that a caller's earlier device snapshot survived a matching detach/replug. On a failed fallback open, `DacPlaybackOpenException.failure` preserves the error and `pendingCleanup` retains the connection until native retirement; off the main thread, use `isReady` and explicit `finish()` for one verified restoration. See [checked playback open](sdk/integration-app.md#checked-playback-open-and-configuration-hand-back). This Kotlin transaction does not add an automatic second-configuration retry to the Rust API below.
+The Kotlin SDK also offers `UsbDac.openPlaybackForRequest` for a checked exact playback request. Its optional `LEGACY_FIRST_IF_DESCRIPTOR_INCOMPATIBLE` policy defaults off; an explicit configuration ID wins. The fallback selects the actual ID at descriptor index zero only when the first configuration provides legacy playback and complete descriptors prove that the active configuration cannot carry that exact request. Full-UAC3 incompatibility is established by its active descriptors. For exact signed PCM, a same-connection native witness can also prove that a validated microphone-only BADD inventory has no playback, or that an unambiguous BADD output is fixed at 48 kHz and excludes a different requested rate. It requires fresh matching raw and parsed descriptors, stable configuration and supported bus speed; unknown or mixed output leaves normal selection unchanged. This is descriptor evidence, not physical playback proof. The fallback is playback-only and does not fire when the active configuration refuses for any other reason (a clock, claim or transfer failure). Selection and checks use one retained connection, but cannot prove that a caller's earlier device snapshot survived a matching detach/replug. On a failed fallback open, `DacPlaybackOpenException.failure` preserves the error and `pendingCleanup` retains the connection until native retirement; off the main thread, use `isReady` and explicit `finish()` for one verified restoration. See [checked playback open](sdk/integration-app.md#checked-playback-open-and-configuration-hand-back). This Kotlin transaction does not add an automatic second-configuration retry to the Rust API below.
 
 ## 3. Rust API
 
@@ -103,6 +103,12 @@ dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD by
 dac.feedback_trace() -> Option<FeedbackTrace>      // the last stream's support capture
 Dac::feedback_preflight(fd, &DeviceInfo) -> Result<(u8, Vec<u8>)>   // see section 2
 Dac::await_usb_retirement(Duration) -> bool        // after a close that timed out
+dac.negotiate_candidates(&[StreamRequest]) -> Result<StreamFormat>  // one to eight exact PCM formats, in order
+dac.reconfigure_stream(&DacStream, &StreamRequest, listener, drain_timeout) -> Result<StreamReconfiguration>
+dac.reconfigure_stream_candidates(&DacStream, &[StreamRequest], listener, drain_timeout) -> Result<StreamReconfiguration>
+dac.retirement() -> UsbRetirement                  // this owner's retirement: wait(timeout), routing_hand_back_report()
+Dac::await_connection_retirement(fd, Duration) -> Result<bool>   // one connection, after a failed open or close
+Dac::open_darwin(Attachment, DacConfig, allow_capture: bool) -> Result<Dac>   // macOS only
 ```
 
 Capture, duplex and routing have their own entry points; they are listed under
@@ -111,8 +117,15 @@ Capture, duplex and routing have their own entry points; they are listed under
 - `open` scans the descriptors, finds the hardware volume control, records the
   DAC's level and lowers it (`DacConfig::startup_volume`, see section 8). It does
   not touch the clock and starts no audio. Errors:
-  `Busy`, `PlatformUnsupported` (not Linux or Android), `Claim`,
+  `Busy`, `PlatformUnsupported` (not Linux or Android, macOS included), `Claim`,
   `Unsupported` (no isochronous OUT audio interface), `InvalidArgument` (config).
+- `open_darwin` (macOS only) opens an attachment from
+  `usbdac_core::darwin_discovery::snapshot` for playback through libusb. It
+  claims the audio interfaces of the active configuration; only when
+  `allow_capture` is true and an ordinary claim fails with an access or busy
+  error does it detach the system driver from the whole device, which can need
+  administrator rights. Its own failures are `HostUsb`. Capture and duplex have
+  no macOS path. No macOS hardware result is recorded in the evidence.
 - `negotiate` settles the wire format. It programs the DAC's sampling
   frequency and reads it back, so it takes 100 ms or more, and it fails with
   `InvalidState` while a stream is open. With `RatePolicy::Exact` a rate the DAC
@@ -120,6 +133,33 @@ Capture, duplex and routing have their own entry points; they are listed under
   format carries the rate the DAC will run (`rate_differs_from_request()`), and
   the host must resample. Nothing is resampled by the library on this path; the
   host that wants it done can use the conversion helpers of section 14.
+  `NearestSupported` applies to PCM only; DoP and native DSD are always exact.
+  The candidates are ranked: the requested rate, then the highest integer
+  divisor of it, then the highest lower rate of the same family (44.1 or 48 kHz
+  multiples), then the highest other lower rate, then the lowest higher rate.
+  An 88.2 kHz request on a DAC with {44.1, 176.4} kHz therefore runs at
+  44.1 kHz, halving the bandwidth; a host that prefers 176.4 kHz asks for it
+  with `Exact`. Each candidate is tried as an exact request on the retained USB
+  handle, at most eight within 15 s. The next one is tried only after a
+  certified clean refusal: complete descriptors (standard UAC1 Type I, or UAC2
+  PCM) show that no alternate setting carries the candidate, or a UAC2 Valid
+  Alternate Settings control excluded it after an acknowledged SET and the
+  original clock was restored and read back. Since 0.1.11 a UAC1 refusal can be
+  clean in this way. Any other failure (a claim, a stalled clock write, a
+  disconnect, an uncertain restoration) ends the call with that error.
+- `negotiate_candidates` takes one to eight distinct exact PCM requests with the
+  same channel count and tries them in order under the same clean-refusal rule.
+- `reconfigure_stream` drains a playback-only stream (playing it if it was
+  paused) and replaces it without releasing the USB handle or the host's claims.
+  Stop the writer first. The replacement is paused with counters at zero; supply
+  audio from the right position and call `play()`. If the new request is refused,
+  the previous format is restored and `rollback_cause` carries the refusal.
+  `reconfigure_stream_candidates` takes one to four same-rate, same-channel PCM
+  requests in ascending bit depth. `ReconfigureDrainTimeout` leaves the original
+  stream open and draining; `ReconfigureUnusable` means the DAC must be closed.
+  While the drain runs, `negotiate`, `negotiate_candidates`, `open_stream`,
+  `open_capture`, `open_duplex`, `set_dsd_overrides` and every routing call fail
+  at once with `Busy` instead of waiting.
 - `open_stream` switches the alternate setting, re-verifies the clock and
   starts the output thread (100 ms or more). Errors include
   `ClockUnverified` (see `DacConfig::require_verified_rate`), `Unsupported`,
@@ -155,7 +195,11 @@ Capture, duplex and routing have their own entry points; they are listed under
 | `buffer_capacity_ms` | 500 | Hard capacity; `write` never accepts more. |
 | `start_threshold_ms` | 100 | Audio the ring must hold before the stream starts or resumes after `flush()`. Never above the target. |
 | `processing_buffer_target_ms` | 100 | Recommended depth while software gain is not 1.0 on PCM (DoP and native DSD always keep the deep target). Nothing is flushed when the depth changes: see `writable_bytes`. |
-| `require_verified_rate` | `true` | Refuse to stream unless the DAC confirms the sampling frequency. Off: a DAC with a broken readback streams, and the stream is never bit-perfect. |
+| `require_verified_rate` | `true` | Refuse to stream unless the DAC confirms the sampling frequency. Off: an acknowledged SET whose read-back is missing or zero is admitted on every device (UAC1, UAC2 and UAC3), and the stream is never bit-perfect. On, that admission needs `Quirk::SkipClockValidation`, `ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet` or the source-backed `SkipSampleRateReadback` rule, which is UAC1-only. A multiplied clock, DSD, `Quirk::RequireVerifiedRate` and a positive different rate are refused either way. |
+| `clock_readback_policy` | `RequireVerified` | `AllowUnusableAfterSuccessfulSet` admits a missing or zero PCM read-back after a successful SET, as above; the stream stays unverified. |
+| `async_fallback_policy` | `FullSpeedUac1` | Host-paced nominal timing for full-speed UAC1 PCM without a feedback pipe; `Forbid` refuses it. See "Asynchronous endpoints without feedback". |
+| `quirk_policy` | `VerifiedOnly` | `SourceBacked` also applies the implemented, exact-identity ALSA facts of the source-backed table; that is not hardware verification. |
+| `adaptive_queue` | `true` | Deepen the bus queue after lost audio, within the bounds in "The bus queue". Applies only to the default queue geometry without implicit feedback. |
 | `clock_settle_delay_ms` | `None` | Wait after programming the clock. `None`: the device quirk, else 20 ms. |
 | `dsd_big_endian` | `None` | Legacy native DSD byte order on the wire. `None`: the device quirk, else little-endian. Standard UAC3 DSD stays little-endian. |
 | `dsd_subslot` | `None` | Legacy native DSD subslot size (1, 2, 4). `None`: the device quirk, else the descriptor. Standard UAC3 DSD uses 8 bytes. |
@@ -243,11 +287,29 @@ between two transfers so the endpoint can keep polling while the worker
 processes the previous completion. The log line
 `[USB] Isochronous queue:` states the resulting geometry.
 
+**Adaptive depth.** With `adaptive_queue` on (the default), the default
+geometry (`bus_queue_ms` 16, eight transfers, no `transfer_period_us`) and no
+implicit feedback, the worker changes only the number of active transfers; the
+packets per transfer stay as above. A completion batch that lost audio adds two
+slots; each 30 s without loss removes one, never below the configured eight. The
+ceiling is the smallest of 16 slots, fewer than 256 packets in flight and 64 ms.
+With the default 2 ms transfers that is 15 slots, 30 ms, at a 125 us service
+interval, and 16 slots, 32 ms, at 250 us, 500 us and 1 ms; the 64 ms bound is
+not reached. Any other geometry, a queue profile other than `Balanced`, or
+implicit feedback keeps the configured depth.
+
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,
 `RequireVerifiedRate`, `SettleDelayMs(u64)`, `PreferPadded24BitTransport`,
 `DsdSubslotSize(u8)`, `DsdBigEndian`, `DsdBitReverse`,
-`ExplicitFeedbackPerServiceInterval`. Config fields set
-explicitly win over quirks. The built-in table has two entries (MOONDROP Dawn
+`ExplicitFeedbackPerServiceInterval`, and the source-backed values
+`ControlMessageDelayUs(u64)`, `InterfaceDelayMs(u64)`, `SetInterfaceFirst`,
+`PlaybackUrbFixup`, `SkipSampleRateReadback`, `SkipImplicitFeedback`,
+`MixerPlaybackMinMute`, `MixerPlaybackLinearVolume`, `RawDsd32Be`, `FixedRate`,
+`ImplicitSilenceOnEmpty`, `SkipClockSelectorWrites`,
+`IgnoreOptionalControlErrors`, `TxLengthPrefix` and `PlaybackFirst`. The last
+two act only from the scoped source-backed table: in a Rust `QuirkOverride` they
+have no effect, and the JSON config rejects them (section 11). `Quirk`
+is `#[non_exhaustive]`. Config fields set explicitly win over quirks. The built-in table has two entries (MOONDROP Dawn
 Pro; Fosi Audio DS2), both verified in the project this was extracted from.
 
 ### `Capabilities`
@@ -279,6 +341,11 @@ AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat 
              pacing: Option<Pacing> /* how a stream here would be paced; None if it would not be streamed */ }
 ```
 
+UAC2 clock rates come from the Clock Source's `GET_RANGE`. A UAC2 subrange
+with MIN below MAX and a resolution of 0 is ambiguous; the library keeps only
+its MIN and logs it. UAC3 range reads are used as returned, so on UAC3 such a
+subrange offers no rate.
+
 ### `StreamRequest`, `StreamFormat`
 
 ```rust
@@ -286,9 +353,16 @@ StreamRequest { sample_rate, channels, bit_depth, encoding: Encoding, rate_polic
 StreamRequest::pcm(rate, channels, bits)
 StreamRequest::dop(dsd_bit_rate, channels)          // 24-bit carrier, rate = dsd_bit_rate / 16
 StreamRequest::dsd_native(dsd_bit_rate, channels)   // sample_rate and bit_depth ignored
-Encoding::{ Pcm, DoP, DsdNative { bit_rate } }
+StreamRequest::pcm_u8(rate, channels)                // Type I unsigned 8-bit
+StreamRequest::pcm_float32(rate, channels)           // Type I IEEE-754 binary32
+Encoding::{ Pcm, PcmU8, PcmFloat32, DoP, DsdNative { bit_rate } }
 RatePolicy::{ Exact (default), NearestSupported }
 ```
+
+`Encoding` is an exhaustive enum: it is not `#[non_exhaustive]`, so a new
+variant in a later release is a breaking change for a `match` without a
+wildcard arm. A PCM request needs an alternate setting whose valid bits equal
+`bit_depth`; the library does not pick a deeper one.
 
 `StreamFormat` is what will go on the wire: `sample_rate` (PCM rate, DoP
 carrier rate, or for native DSD the rate of subslot-sized words, `bit_rate / (8 *
@@ -396,7 +470,7 @@ stream.host_processing() -> bool
   audio. `play()` is only needed after `pause()`.
 - `pause()` sends wire-correct silence (zero for PCM, the idle pattern for DSD,
   DoP markers keep alternating) so the DAC stays locked, and does not consume
-  the ring. Submitted transfers may still play first. The default starts at eight slots and about 16 ms; adaptive queue depth can change.
+  the ring. Submitted transfers may still play first. The default starts at eight slots and about 16 ms; the adaptive queue can deepen it to 30 or 32 ms (see "The bus queue").
   `play()` continues exactly where the ring was.
 - `flush()` drops everything in the ring, resets `played_frames()` to 0
   immediately, clears a pending `drain()`, and holds silence until the ring has
@@ -456,9 +530,10 @@ completions and invalid IN packets (`implicit_fifo_depth`,
 
 | Variant | `code()` | When |
 |---|---|---|
-| `Busy` | `busy` | This attachment already has an owner, or its previous owner is still shutting down. |
-| `PlatformUnsupported` | `platform_unsupported` | Not Linux or Android. |
+| `Busy` | `busy` | This attachment already has an owner, or its previous owner is still shutting down; or a `reconfigure_stream` drain is in progress on this DAC. |
+| `PlatformUnsupported` | `platform_unsupported` | Not Linux or Android (on macOS, every entry point except `open_darwin`). |
 | `Claim(String)` | `claim` | Bad descriptor, interfaces not claimed as required, libusb could not take the descriptor. |
+| `HostUsb { operation, kind, detail }` | `host_usb` | macOS only: the libusb open, an interface claim or the whole-device capture of `open_darwin` failed. `kind` is `AccessDenied`, `InUse`, `DeviceLost`, `NotSupported` or `Other`; it does not by itself mean a DAC fault. |
 | `Unsupported { reason, offered }` | `unsupported` | No alternate setting carries the request; `offered` lists what the DAC has. |
 | `ImplicitFeedbackUnsupported` | `implicit_feedback_unsupported` | The request needs an asynchronous route and no compatible feedback source is available. See below. |
 | `ClockUnverified { requested_hz, reported_hz }` | `clock_unverified` | The DAC did not confirm the rate and `require_verified_rate` is on, or it reported a different rate. |
@@ -468,8 +543,10 @@ completions and invalid IN packets (`implicit_fifo_depth`,
 | `InvalidState(String)` | `invalid_state` | The call is not valid now (closed, drained, second stream, ...). |
 | `InvalidArgument(String)` | `invalid_argument` | Out of range or malformed argument. |
 | `VolumeUnavailable` | `volume_unavailable` | `open_stream` on a DAC with no usable hardware volume control while `require_hardware_volume` is on. The host asks the user to allow fixed-level output and opens the DAC again with `require_hardware_volume = false`. |
+| `ReconfigureDrainTimeout` | `reconfigure_drain_timeout` | `reconfigure_stream` did not drain before its deadline. The original stream stays open and draining; no alternate setting or clock was changed. |
+| `ReconfigureUnusable(String)` | `reconfigure_unusable` | Retirement, the retained USB owner or the rollback of a reconfiguration failed. Close the DAC before using it again. |
 
-`Display` is `"<code>: <message>"`.
+`Error` is `#[non_exhaustive]`. `Display` is `"<code>: <message>"`.
 
 ### Asynchronous endpoints without feedback
 
@@ -477,7 +554,12 @@ An asynchronous OUT endpoint runs on the DAC's own clock. Explicit feedback
 reports that rate on a dedicated IN endpoint. For UAC2 implicit feedback, the
 driver uses whole-frame counts from an associated IN audio endpoint with the
 same resolved clock source, wire rate and service interval (UAC2, or UAC3 with a
-marked input). It primes the IN transfer queue before submitting playback. A
+marked input). It primes the IN transfer queue before submitting playback.
+A gap in the IN timing before the cadence has qualified ends the stream. Once
+it is trusted, one missing IN pattern is tolerated while the cadence
+requalifies; a second gap before that, or no requalification within 100 ms plus
+the queued bus time, ends the stream with an `implicit_xrun` `Transfer` error,
+and the stream has to be opened again. A
 playback-only session does not give the IN samples to the app; a duplex stream
 hands them to its capture reader from the same transfers. On Android, the SDK
 returns capture-only claims when the session closes.
@@ -591,7 +673,9 @@ capture.available_frames() / stats() / state() / last_error() / close()
   owned-frame pool is full. `contention_frames` is retained for compatibility.
   `CaptureState` is `Active`, `Stopped` or `Failed`.
 - In duplex, one USB worker runs both directions. Closing either direction stops
-  both. Two directions on one clock must use the same rate; directions on separately
+  both. A capture fault also stops playback, unless capture sits on a separate
+  AudioControl interface with its own directly resolved clock; only then does
+  playback continue after the capture side fails. A disconnect always stops both. Two directions on one clock must use the same rate; directions on separately
   proven clocks keep their own rates and counters. When the playback uses implicit
   feedback from an IN stream that capture also reads, they share one transfer pool.
 - While a standalone capture stream is open, concurrent playback, duplex and routing
@@ -612,11 +696,17 @@ dac.routing_discover_powered() / routing_read_powered(..) / routing_apply_powere
   edit fails before anything is written; every write is read back and a failed
   transaction restores what it changed. Rediscover after a selector edit. The configured
   `HandBack` policy decides whether routes are restored on close.
+- An apply that changed a control, or whose rollback failed, discards the session's
+  negotiated format and its hardware volume route: `open_stream` with an earlier
+  `StreamFormat` fails with `InvalidState` ("call negotiate first"), and `volume()` is
+  `None` until `negotiate` has found the playback route again. Negotiate after every
+  routing change.
 - The `_powered` variants wake the affected UAC 3.0 power domains for the call, and put
   the checked original power state back afterwards. The plain variants never wake a domain.
 - Vendor routing (`djm_routing_*`, `scarlett_*`, `fcp_routing_*`) is in the crate for
-  source compatibility. In 0.1.5 its calls return `RoutingSessionError::UnsupportedTopology`
-  or report no capability. Vendor PCM profiles are switched off in the same way.
+  source compatibility. Since 0.1.5, and still in 0.1.11, its calls return
+  `RoutingSessionError::UnsupportedTopology` or report no capability. Vendor PCM profiles
+  are switched off in the same way.
 
 ## 4. Sample layouts
 
@@ -936,7 +1026,15 @@ object Native {
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)            // 0 off .. 5 trace; logcat tag "usbdac"
 
+    // Used by the validator app only
+    @JvmStatic external fun validatorBegin(directory: String)
+    @JvmStatic external fun validatorRun(dac: Long, directory: String): String
+    @JvmStatic external fun validatorCancel()
+    @JvmStatic external fun validatorDeviceLost()
+    @JvmStatic external fun validatorFlush()
+
     // Device: preflight, open, close, capabilities, negotiation, events, feedback capture
+    @JvmStatic external fun baddDescriptorWitness(fd: Int, activeId: Int, snapshot: ByteArray): Int
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacCapturePreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacOpenCaptureDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
@@ -944,13 +1042,21 @@ object Native {
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean
+    @JvmStatic external fun dacRetirementToken(dac: Long): Long
+    @JvmStatic external fun dacAwaitRetirementToken(token: Long): Boolean
+    @JvmStatic external fun dacRetirementRoutingReport(token: Long): String
+    @JvmStatic external fun dacReleaseRetirementToken(token: Long)
+    @JvmStatic external fun dacAwaitConnectionRetirement(fd: Int): Boolean
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacFeedbackTrace(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
+    @JvmStatic external fun dacNegotiateCandidates(dac: Long, requestsJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)
 
     // Playback stream
     @JvmStatic external fun streamOpen(dac: Long, formatId: Long, listener: Any): Long
+    @JvmStatic external fun streamReconfigure(dac: Long, current: Long, requestJson: String, timeoutMs: Long, listener: Any): String
+    @JvmStatic external fun streamReconfigureCandidates(dac: Long, current: Long, requestsJson: String, timeoutMs: Long, listener: Any): String
     @JvmStatic external fun streamClose(stream: Long)
     @JvmStatic external fun streamWrite(stream: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     @JvmStatic external fun streamWritableBytes(stream: Long): Int
@@ -994,7 +1100,7 @@ object Native {
     @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
     @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String
 
-    // Vendor controls (switched off in 0.1.5)
+    // Vendor controls (switched off since 0.1.5; still off in 0.1.11)
     @JvmStatic external fun dacVendorPcmPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun dacVendorPcmClaimsPreflight(fd: Int, deviceInfoJson: String): String
     @JvmStatic external fun pioneerDjmDiscover(dac: Long): String
@@ -1032,11 +1138,34 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
   active and empty.
 - `dacAwaitRetirement` returns true when every USB transfer of the session has
   retired. The host must keep its connection and claims until it does.
+  `dacRetirementToken` takes a token for one DAC owner before `dacClose`;
+  `dacAwaitRetirementToken` waits on that owner only, so another open DAC does
+  not delay it, `dacRetirementRoutingReport` returns its routing hand-back once it
+  has retired, and `dacReleaseRetirementToken` frees the token once the owner has
+  retired (before that it fails with `invalid_state`).
+  `dacAwaitConnectionRetirement` waits on the connection's own descriptor, for
+  example after a failed open. Each wait is bounded at about 500 ms; call again
+  until it returns true.
+- `dacNegotiateCandidates` takes a JSON array of one to eight exact PCM requests
+  (section 3, `negotiate_candidates`). `streamReconfigure` and
+  `streamReconfigureCandidates` are `reconfigure_stream` and
+  `reconfigure_stream_candidates`: they return `{ "stream_id", "format",
+  "rolled_back", "error_code", "error_message" }`, and the old stream handle is
+  replaced by `stream_id`.
+- `baddDescriptorWitness` reads the active configuration and its raw descriptor
+  on a duplicate of `fd`, with standard requests only, and returns a nonzero code
+  when they prove one of the BADD cases of the checked playback open (section 2),
+  else 0. The Kotlin
+  SDK calls it before any claim. Never call it, or the Rust
+  `usbdac_core::badd_descriptor_witness`, with the descriptor of a DAC that has
+  an open session: a duplicate shares the kernel's URB queue, so the witness's
+  libusb context could reap the stream's transfers. The function does not check
+  this itself.
 - `streamSetHostProcessing` is the buffering hint of `set_host_processing`.
 - The routing functions take and return JSON; a snapshot is an opaque id that
   belongs to one open DAC, and at most eight are kept. The vendor functions
   (`pioneer*`, `scarlett*`, `fcp*`, `dacVendorPcm*`) are present and fail with an
-  unsupported error or report no capability in 0.1.5.
+  unsupported error or report no capability (since 0.1.5; still so in 0.1.11).
 - `streamWrite` takes a **direct** `ByteBuffer` (`ByteBuffer.allocateDirect`),
   reads `count` bytes from `offset` (the buffer's position and limit are
   ignored and not moved) and returns the bytes taken, as in section 3.
@@ -1058,7 +1187,9 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 Every failure is a `java.lang.IllegalStateException` whose message is
 `usbdac:<code>: <message>`, with `<code>` one of `busy`, `platform_unsupported`,
 `claim`, `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
-`control`, `invalid_state`, `invalid_argument`, `volume_unavailable` (section 3). Malformed JSON and
+`control`, `invalid_state`, `invalid_argument`, `volume_unavailable`, `reconfigure_drain_timeout`,
+`reconfigure_unusable` (section 3). In an `Error` event the two reconfiguration codes, like any
+code without a number in the table below, arrive as `a` = 0. Malformed JSON and
 bad handles are `invalid_argument`. A Rust panic is converted to a
 `RuntimeException`.
 
@@ -1133,7 +1264,7 @@ The preflight response is `{ "configuration_id": 1, "interfaces": [2] }`.
 ```
 
 `encoding` is `pcm` (default), `pcm_u8`, `pcm_float32`, `dop` or `dsd_native`; `rate_policy` is `exact`
-(default) or `nearest`. For `dop`, `dsd_bit_rate` derives the carrier rate (rate
+(default) or `nearest`. `nearest` has no effect for `dop` and `dsd_native`: they are always exact. For `dop`, `dsd_bit_rate` derives the carrier rate (rate
 / 16, 24-bit); an explicit `sample_rate` or `bit_depth` overrides it.
 
 **Capabilities** (`dacCapabilities`):
@@ -1214,9 +1345,10 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
 ## 12. Limits of v0.1
 
 - One owner per physical attachment (a second owner is `Busy`); distinct attachments can have independent owners.
-- Linux and Android only (usbfs through libusb's wrap-by-descriptor call). On
-  other hosts the crate builds and its logic is unit-tested, but `Dac::open`
-  returns `PlatformUnsupported`.
+- Linux and Android (usbfs through libusb's wrap-by-descriptor call). On macOS
+  the crate builds and its logic is unit-tested; `Dac::open`, capture and duplex
+  return `PlatformUnsupported`, and only `Dac::open_darwin` plays, through libusb,
+  without recorded hardware evidence. Windows is not supported.
 - UAC 1.0, 2.0 and 3.0 playback include PCM and native DSD; standard
   UAC3 DSD has a fixed 8-byte transport word. PCM capture and duplex use
   explicit input APIs and claims. Standard routing requires verified
@@ -1225,9 +1357,10 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
   See the
   [integration surface](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#reference-integration-surface).
 - Vendor PCM profiles, vendor routing and device-specific feedback and DSD
-  rules are written and tested on the host and switched off in 0.1.5; the
-  device profiles that are active are the two built-in quirks and the
-  AP80 Pro-X native DSD profile.
+  rules are written and tested on the host and switched off (since 0.1.5,
+  still in 0.1.11); the device profiles that are active by default are the two
+  built-in quirks and the AP80 Pro-X and MOONDROP Dawn Pro native DSD layouts.
+  `QuirkPolicy::SourceBacked` adds the implemented source-backed facts on request.
 - Direct PCM and legacy native DSD have limited physical coverage on the
   OnePlus 15 / AP80 Pro-X, with additional PCM evidence from the DC04U and
   from Flick. New parity paths remain subject to the documented physical
@@ -1542,7 +1675,7 @@ reconstruction can exceed its input's peak. Measured: a full-scale 1 kHz square
 wave resampled from 44.1 to 48 kHz peaks at 1.41 (+3.0 dB), and clips; a
 full-scale sine does not (the passband ripple is 0.00004 dB, less than one 16-bit
 step at full scale: tested for 100 Hz to 19 kHz at 16 bits with truncation). The
-default is -3.5 dB after resampling, which covers the measured square wave but is not a guarantee for every signal. Set `headroom_db = 0` explicitly for unity gain. Saturation remains counted, and headroom never applies to exact or widening paths.
+default is -3.5 dB after resampling, which covers the measured square wave but is not a guarantee for every signal: it reduces clipping and does not prevent it. A review probe with an adversarial input measured peaks of +3.18 dBFS (`High`) and +5.24 dBFS (`Fast`) after the default headroom; such samples saturate and are counted by `clipped_samples()`. Set `headroom_db = 0` explicitly for unity gain. Saturation remains counted, and headroom never applies to exact or widening paths.
 
 ### 14.4 The resampler
 
@@ -1680,3 +1813,32 @@ chunk) and delivered first on the next call; `drain()` writes the resampler's ta
 before it drains the target; `flush()` resets the converter. Its
 `bitPerfect` is the target's for `None` and `BitExact` plans and
 `NotVerified(null, plan.description)` otherwise.
+
+### 14.7 DSD to PCM
+
+`usbdac_core::dsd_pcm::DsdPcmConverter` turns native DSD into PCM for a DAC
+without a DSD path. It is always `Lossy`, and DoP carrier words are not
+accepted.
+
+```rust
+DsdPcmConverter::new(bit_rate, channels, target: PcmFormat) -> Result<DsdPcmConverter, ConvertError>
+DsdPcmConverter::with_options(bit_rate, channels, target, &ConvertOptions) -> Result<...>
+converter.process(input: &[u8], output: &mut [u8]) / finish(output) / reset()
+converter.clipped_samples() / delay_byte_frames() / min_output_bytes()
+```
+
+- Input is the native DSD layout of section 4: chronological bytes, oldest bit
+  in bit 7, channels interleaved. DSD64, DSD128 and DSD256 with one to eight
+  channels.
+- A 512-tap Blackman-windowed low-pass decimates the one-bit stream by 16, then
+  the resampler of 14.4 (`ConvertOptions::quality`, `High` by default) reaches
+  the target rate. No stopband
+  specification is published for the first stage.
+- Amplitude: a one bit is +1 and a zero bit -1, and the filter has unity gain at
+  DC, so ±1.0 is 100 % modulation. A 50 % modulated signal comes out at
+  -6.02 dBFS before headroom. `headroom_db` (default -3.5 dB) is applied once,
+  in the first stage when the target rate needs no resampling and in the
+  resampler otherwise, so 50 % modulation becomes -9.52 dBFS with the defaults.
+  Integer outputs saturate and `clipped_samples()` counts it.
+- The filter history starts filled with the DSD idle pattern `0x69`. `reset()`
+  starts a new stream.

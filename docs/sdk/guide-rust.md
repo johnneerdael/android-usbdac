@@ -55,11 +55,11 @@ PATH=$NDKBIN:$PATH CC_aarch64_linux_android=aarch64-linux-android26-clang \
 
 Log through the `log` facade and install a logger before you open a DAC: `android_logger` on Android, `env_logger` on Linux. The library logs through it at the levels of the `log` crate.
 
-**Why.** The core has no JNI and no Android types, so the same crate serves Android and Linux. On any other host it compiles and its logic tests run, but `Dac::open` returns `Error::PlatformUnsupported`.
+**Why.** The core has no JNI and no Android types, so the same crate serves Android and Linux. On macOS it compiles and its logic tests run, but `Dac::open` returns `Error::PlatformUnsupported`; macOS playback goes through the separate `Dac::open_darwin` entry point instead ([the native API document](API.md#dac)). Windows is not a supported host: the crate uses Unix file descriptors.
 
 **Limits to know now.** One owner is allowed per physical attachment; distinct attachments can have independent owners. Opening an already owned attachment returns `Error::Busy`. If the same process also loads the Kotlin library of usbdac, that library has its own copy of the driver and its own state: do not open the same DAC from both.
 
-**Check.** `cargo check --examples` passes. On a Mac or a Windows machine a call to `Dac::open` returns `Error::PlatformUnsupported`. That is the expected answer and it shows that the crate is linked.
+**Check.** `cargo check --examples` passes. On a Mac a call to `Dac::open` returns `Error::PlatformUnsupported`. That is the expected answer and it shows that the crate is linked.
 
 ## 2. Get a file descriptor and permission
 
@@ -535,7 +535,9 @@ pub fn next_step(error: &Error) -> Next {
         Error::Claim(_) => Next::AskListener(
             "the system keeps the DAC: replug it and check that nothing else holds it",
         ),
-        Error::Busy => Next::FixTheHost("another Dac is open in this process: close it first"),
+        Error::Busy => Next::FixTheHost(
+            "this DAC already has an owner, or a reconfigure is running: close it or retry",
+        ),
         Error::Unsupported { .. } => {
             Next::OtherOutput("the DAC has no alternate setting for this format")
         }
@@ -619,9 +621,9 @@ pub fn offers(capabilities: &Capabilities, track: TrackFormat) -> bool {
 
 `offers` answers "does the DAC list this format at all" from the descriptors, without touching its clock, which is what a track list wants before anything plays. `negotiate` programs the DAC's sampling frequency, reads it back and picks the alternate setting that carries the request. It takes 100 ms or more, and it fails with `InvalidState` while a stream is open. So the order for each track is: close the old stream, negotiate, open the new stream. For a gapless run of tracks in one format, do none of this: keep writing.
 
-**Why.** By default the library never changes the rate. With `RatePolicy::Exact`, a rate the DAC cannot run fails with `Error::Unsupported`, and that error lists what the DAC offers. `NearestSupported` makes the DAC run the nearest rate it has and returns the rate in the format. Then you have to resample, and the stream is not bit-perfect (`BitPerfectBlocker::FormatChanged`). The crate's opt-in `convert` module has a resampler and bit-depth conversion for that, and it labels each conversion as exact, lossless or lossy ([the conversion helpers](API.md#14-conversion-helpers)). The direct path never calls it by itself.
+**Why.** By default the library never changes the rate. With `RatePolicy::Exact`, a rate the DAC cannot run fails with `Error::Unsupported`, and that error lists what the DAC offers. `NearestSupported` (PCM only) picks a rate the DAC has and returns it in the format. It prefers lower rates: the requested rate, then the highest integer divisor of it, then the highest lower rate of the same family, then the highest other lower rate, and only then the lowest higher rate. An 88.2 kHz track on a DAC with 44.1 and 176.4 kHz therefore runs at 44.1 kHz, half the bandwidth; ask for 176.4 kHz with `Exact` if you would rather upsample. A candidate is skipped only when the DAC cleanly refused it ([the request](controls.md#the-request-streamrequest)); any other failure ends the call. Then you have to resample, and the stream is not bit-perfect (`BitPerfectBlocker::FormatChanged`). The crate's opt-in `convert` module has a resampler and bit-depth conversion for that, and it labels each conversion as exact, lossless or lossy ([the conversion helpers](API.md#14-conversion-helpers)). The direct path never calls it by itself.
 
-Ask for the depth the source has. A 16-bit source with a DAC that only has a 24-bit alternate setting is widened by padding the low bits with zero, which keeps every sample. `format.valid_bits` and `format.subslot_bytes` tell you the layout.
+Ask for a depth the DAC has. `negotiate` needs an alternate setting whose valid bits equal `bit_depth`, so a 16-bit request on a DAC that only has 24-bit alternate settings fails with `Error::Unsupported`. Request 24 bits instead and write the 16-bit samples left-justified (`write_i32` with `sample << 16`): the low bits are zero and every sample is kept. `format.valid_bits` and `format.subslot_bytes` tell you the layout.
 
 **Check.** Negotiate 44.1 kHz and then 96 kHz in a row (closing the stream between them). The DAC shows the rate change. `format.clock` and `format.pacing` say which clock was set and how packets are paced; read them first when a DAC plays at the wrong pitch ([diagnostics](controls.md#diagnostics-the-clock-and-the-pacing)).
 
@@ -1283,7 +1285,7 @@ impl Ring for FakeRing {
 }
 ```
 
-`crates/usbdac-core/tests/guide_player.rs` runs five tests against it, under `cargo test --workspace`. They check that the writer renders only when the ring has room, that it drains once at the end, that a seek drops the stale chunk, that the position is the last seek plus what was played, and that pause and resume leave the writer running. The crate's own tests use an internal fake DAC that is not public.
+`crates/usbdac-core/tests/guide_player.rs` runs five tests against it, under `cargo test --workspace`. They check that the writer renders only when the ring has room, that it drains once at the end, that a seek drops the stale chunk, that the position is the last seek plus what was played, and that pause and resume leave the writer running. The transport's own tests use an internal fake DAC that is not public; the public `fake::FakeDac` ([below](#fake-dac-at-the-application-boundary)) substitutes for the application-level playback calls only.
 
 **With a DAC on Linux or Android.** Adapt this to your devices and write down the phone or computer, the DAC, the cable and any hub:
 
@@ -1309,8 +1311,8 @@ Send what you find, with the log, to [the issue tracker](https://github.com/john
 Know these before you ship.
 
 - **It does not enumerate devices, ask for permission or claim interfaces.** Every host writes the claim planning itself: the AudioControl interfaces and the AudioStreaming interfaces that have an isochronous OUT endpoint, in the active configuration. The Kotlin library has this logic and does not export it.
-- **It does not watch for DACs.** Hot-plug is the host's: broadcasts on Android, udev on Linux.
-- **It has no public fake DAC.** The tests above work through a seam of your own.
+- **It does not watch for DACs by itself.** On Android the host feeds its broadcasts into `HotplugHub`; on Linux `LinuxHotplugMonitor` is opt-in ([discovery](#discovery-and-permission-events)).
+- **Its public fake covers playback calls only.** `fake::FakeDac` has no clock, feedback, capture, routing or hardware volume; the tests above work through a seam of your own.
 - **One owner per attachment.** A second owner for the same attachment returns `Busy`; separate attachments can be owned independently.
 - **It does not decode, resample or mix.** Resampling and bit-depth conversion are in the opt-in `convert` module, and the direct path never calls them.
 - **Linux is checked less than Android.** The Linux code of this guide compiles for Android's kernel target and has not been run on a Linux desktop. A DAC with several configurations needs the active one before it is claimed: `UsbfsHost` reads only the first configuration.
@@ -1325,7 +1327,7 @@ Know these before you ship.
 - **Closing the `Dac` from the event listener.** The library forbids it.
 - **Flushing or draining between gapless tracks.** `drain()` ends the stream until the next `flush()`.
 - **Showing "bit-perfect" while your engine processes the audio.** The flag is about the transport.
-- **Opening a second `Dac`**, or one in a process that also opens the same DAC through the Kotlin library.
+- **Opening a second `Dac` for the same attachment**, or opening the same DAC from Rust and through the Kotlin library in one process.
 - **Running `negotiate` or `open_stream` on a UI thread.** Each takes 100 ms or more.
 - **Ignoring `VolumeUnavailable`.** A DAC with no volume control plays at its own level, possibly full scale. Ask the listener first.
 
@@ -1381,7 +1383,9 @@ host opens/claims the selected device with its usual OS permissions. Linux
 names are descriptor identities (`USB audio VID:PID`), not product strings, so
 populate the actual product/manufacturer fields before `Dac::open` if required
 for quirk matching. Other platforms return `PlatformUnsupported`; Android uses
-the explicit host bridge, not the Linux monitor.
+the explicit host bridge, not the Linux monitor. On macOS,
+`darwin_discovery::snapshot` lists attachments read-only, without opening or
+claiming them, and is polled rather than called back.
 
 ## Volume without blocking the UI
 

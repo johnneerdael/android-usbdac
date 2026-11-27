@@ -66,7 +66,7 @@ At the end of the queue, call `drain()` once and wait for `isDrained` (or the `D
 | Player action | Call | Notes |
 |---|---|---|
 | Play | `play()` | A new stream starts by itself when the ring holds `startThresholdMs` (100 ms). `play()` is for after a pause |
-| Pause | `pause()` | Keep the writer running. The ring fills to its target and the writer idles when `writableBytes` is 0. What is on the bus (up to 16 ms) plays out first |
+| Pause | `pause()` | Keep the writer running. The ring fills to its target and the writer idles when `writableBytes` is 0. What is already on the bus plays out first: about 16 ms with the default queue, up to about 32 ms after the adaptive queue has grown |
 | Resume | `play()` | Continues from exactly the held audio |
 | Seek | Under the writer's lock: reposition the decoder, discard the chunk rendered for the old position, `flush()`, set the new anchor | The order matters, see below |
 | A track the listener picked, or Stop | `flush()`, then write the new audio or nothing | |
@@ -78,7 +78,7 @@ The compiled `Transport` class that holds these rules is in [getting started](ge
 
 **The seek order.** The writer may be holding a chunk it rendered for the old position. If the seek flushes the ring and the writer then writes that chunk, the old audio plays after the flush. So the seek takes the writer's lock, repositions the decoder and drops the pending chunk, flushes, and only then lets the writer continue. Flush while paused is fine and cancels nothing on the bus; the ring refills when the writer resumes.
 
-**Why flush on replacement.** A flush clears the ring and, by default, requests cancellation of submitted music transfers. The default queue starts around 16 ms and can adapt; already submitted and downstream audio affect audible timing ([decision 2](decisions-stream.md#ring-depth)).
+**Why flush on replacement.** A flush clears the ring and, by default, requests cancellation of submitted music transfers. The default queue starts around 16 ms and can grow to about 32 ms after losses. A transfer that completes before its cancellation takes effect still plays, and downstream buffering in the DAC adds to it; no time to silence is guaranteed ([decision 2](decisions-stream.md#ring-depth)).
 
 ## Position {#position}
 

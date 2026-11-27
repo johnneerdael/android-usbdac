@@ -13,9 +13,9 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 
 | # | The question | What usbdac does | Status |
 |---|---|---|---|
-| 1 | [How the bus queue is shaped](decisions-stream.md#queue-geometry) | Approximately 16 ms and 8 transfers by default; adaptive depth is bounded by 64 ms and 255 packets | Hardware for PCM at 125 us (16 x 8). Tests for every other case |
+| 1 | [How the bus queue is shaped](decisions-stream.md#queue-geometry) | Approximately 16 ms and 8 transfers by default; with the default geometry, adaptive depth grows two transfers per loss to at most 30 ms at 125 us and 32 ms at longer intervals (255-packet and 16-slot caps) | Hardware for PCM at 125 us (16 x 8). Tests for every other case |
 | 2 | [How deep the ring is](decisions-stream.md#ring-depth) | 250 ms, shrinking to 100 ms while live processing is on; gain applied as each transfer is built | Tests |
-| 3 | [What a late or lost transfer does](decisions-stream.md#loss-handling) | Count it exactly, carry on, bound it, clear the bit-perfect flag for good | Hardware (fault injection in Flick, PCM). Tests in usbdac. Since 0.1.5 one isolated empty packet error is counted as loss; any other packet error still ends the stream |
+| 3 | [What a late or lost transfer does](decisions-stream.md#loss-handling) | Count it exactly, carry on, bound it, clear the bit-perfect flag for good | Hardware (fault injection in Flick, PCM). Tests in usbdac. Supported failed packets (error, timeout, overflow, stall) are charged as loss within the budget; malformed geometry and unsupported statuses still end the stream |
 | 4 | [What pause, flush and position mean](decisions-stream.md#pause-and-flush) | Pause holds the ring and sends silence; flush cancels what is on the bus; position counts what the DAC took | Tests |
 | 5 | [How DSD is carried](decisions-stream.md#dsd) | Standard UAC3 DSD packing; legacy quirks; PCM DoP carrier with library-owned markers | AP80 Pro-X legacy native DSD64 through DSD256 and PCM transition verified. UAC3 DSD and DoP covered by host tests |
 | 6 | [Which clock gets the rate](decisions-clock.md#clock-path) | Walk selectors and multipliers to the source, check the range, verify by read-back, switch a writable selector only when the current input cannot run the rate | Hardware for a plain clock. Tests for selectors and multipliers |
@@ -27,7 +27,7 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 | 12 | [Volume keys, the system panel, idle release](decisions-volume.md#keys-and-idle) | Optional helpers for each; 30 s idle release | Tests |
 | 13 | [When the library may say bit-perfect](decisions-reporting.md#bit-perfect-claim) | Named blockers, including loss of feedback lock on direct USB routes that use it | Tests |
 | 14 | [MQA](decisions-reporting.md#mqa) | No MQA code; pass the PCM through untouched | None needed. No MQA DAC tried |
-| 15 | [When a DAC cannot play the file as it is](decisions-reporting.md#conversion) | Opt-in conversion, classified exact, lossless or lossy | Tests and measured quality on a host |
+| 15 | [When a DAC cannot play the file as it is](decisions-reporting.md#conversion) | A separate converter, classified exact, lossless or lossy; the direct stream never converts, and `OutputSelector` permits PCM conversion by default (`allowConversion`) | Tests and measured quality on a host |
 | 16 | [Who takes the DAC from Android](decisions-library.md#claiming) | Kotlin claims control and playback interfaces, then eligible IN interfaces for implicit feedback | Tests for claim planning |
 | 17 | [Three outputs and one that chooses](decisions-library.md#outputs) | `OutputSelector` with a stated guarantee and typed reasons | Tests |
 | 18 | [What the library limits itself to](decisions-library.md#scope) | One owner per physical attachment, with independent distinct attachments; UAC 1, 2 and 3; playback, with capture, duplex and routing as separate, explicit APIs; events on their own thread | Tests |
@@ -38,7 +38,7 @@ Short answers; the decision pages have the file paths and the reasoning. "Flick"
 
 | | Flick | Mornye | BitChord | usbdac |
 |---|---|---|---|---|
-| Bus queue | 16 x 8 for PCM at 125 us; 32 x 8 for DSD and DoP; 128 ms at 1 ms | 4 x about 4 ms = 16 ms | 4 x about 4 ms = 16 ms | 8 x 2 ms = 16 ms, any interval, configurable |
+| Bus queue | 16 x 8 for PCM at 125 us; 32 x 8 for DSD and DoP; 128 ms at 1 ms | 4 x about 4 ms = 16 ms | 4 x about 4 ms = 16 ms | 8 x 2 ms = 16 ms at the start, any interval, configurable; grows after loss to 30 or 32 ms |
 | Ring | 100 ms, capacity 200 ms | 1.5 s | 200 ms | 250 ms, capacity 500 ms, 100 ms while live processing |
 | Timed-out transfer | Survives for PCM, counted | Ends the stream | Ends the stream | Survives, counted, any encoding |
 | Packet-level error | Ends the stream | Ends the stream | Ends the stream | Failed packets and transfers are charged conservatively against bounded recovery; malformed geometry or unsupported status is terminal |
@@ -56,7 +56,7 @@ Short answers; the decision pages have the file paths and the reasoning. "Flick"
 | Volume keys | System volume only (#417 open) | Not routed (README) | Routed to the DAC | Optional helpers |
 | Idle release | #418 open (30 s, claim kept) | 5 s, DAC given back to Android | 30 s | `DacIdleRelease`, 30 s, claim kept |
 | Bit-perfect claim | Flag with a payload audit | By construction | By construction | Eight checks, named blocker |
-| Conversion | Engine resamples | Automatic, 130 dB design | Opt-in setting, dithered | Opt-in module, classified |
+| Conversion | Engine resamples | Automatic, 130 dB design | Opt-in setting, dithered | Separate module, classified; on by default in the selector |
 | Interface claim | Kotlin force-claim | libusb auto-detach | libusb auto-detach | Kotlin force-claim |
 | Outputs | Direct USB, AAudio | Direct USB, Android 14 mixer, AAudio | Direct USB, Android 14 mixer, AAudio | Same three plus a selector |
 

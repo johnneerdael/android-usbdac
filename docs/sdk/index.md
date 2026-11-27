@@ -44,7 +44,8 @@ For support captures, use the [USB playback report guide](support-diagnostics.md
 This guide covers usbdac 0.1.11.
 
 - **Software coverage is recorded by revision.** Rust and Kotlin tests cover protocol and control behavior without a DAC; Android checks and builds cover the library and sample for four processor types. See the [release validation scope](evidence.md#release-validation-scope) for the limits of those checks and for the QEMU playback check, which ran in a virtual machine and not on a DAC.
-- **Hardware testing is still limited.** On a OnePlus 15, the Hidizs AP80 Pro-X played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit direct USB PCM, with explicit feedback. The iBasso DC04U played 44.1 kHz PCM with explicit feedback through the SDK sample on an Android host, and earlier in Flick. Those are the only physical streaming results. Implicit feedback, UAC3 and BADD, capture and duplex, routing controls, DoP, the Android-managed output and AAudio have not been run on a device. [Hardware status](evidence.md#hardware-status)
+- **Hardware testing is still limited.** On a OnePlus 15, the Hidizs AP80 Pro-X played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit direct USB PCM, with explicit feedback. The iBasso DC04U played 44.1 kHz PCM with explicit feedback through the SDK sample on an Android host, and earlier in Flick. Those are the only physical streaming results. Implicit feedback, UAC3 and BADD, capture and duplex, routing controls, DoP, the Android-managed output, AAudio and the macOS playback path have not been run on a device. [Hardware status](evidence.md#hardware-status)
+- **Validators.** Each release from 0.1.11 on includes an Android validator APK and an Apple Silicon macOS validator ZIP, built from the same commit as the library. They run the direct USB format tests on one attached DAC and save a report ZIP. The APK is signed with the CI debug key, and the macOS app is ad hoc signed and not notarized. See the [validator design](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/dac-validator.md).
 
 ## Which transport to use
 
@@ -76,7 +77,7 @@ Most apps do not need to choose. `OutputSelector` looks at the attached DAC, the
 | `PcmOutput` | The interface `DacStream`, `AndroidManagedOutput` and `AAudioExclusiveOutput` share |
 | `AndroidManagedOutput` | The managed transport |
 | `AAudioExclusiveOutput` | The AAudio exclusive transport: `AAudioConfig` options, the `AAudioGrant` the platform gave, `AAudioEvent`s |
-| `ConversionPlan`, `PcmConverter`, `ConvertingOutput` | Opt-in conversion in front of any output: a rate the DAC refuses, a depth it lacks, mono to stereo. Classified `NONE`, `BIT_EXACT`, `LOSSLESS` or `LOSSY`; not bit-perfect unless the first two |
+| `ConversionPlan`, `PcmConverter`, `ConvertingOutput` | Conversion in front of any output: a rate the DAC refuses, a depth it lacks, mono to stereo. Classified `NONE`, `BIT_EXACT`, `LOSSLESS` or `LOSSY`; not bit-perfect unless the first two. `OutputSelector` uses it by default (`OutputPolicy.allowConversion`); `DacStream` never converts on its own |
 | `DacConfig` | Every tunable of a session: buffer depths, the USB queue, clock policy, DSD options, quirks, hand-back, the feedback support capture |
 | `dev.usbdac.controls` | `DacVolumeKeys` (volume keys), `DacVolumeProvider` (system volume panel), `DacIdleRelease` (close the stream after a long pause) |
 
