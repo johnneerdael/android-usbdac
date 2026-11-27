@@ -17,7 +17,7 @@ The status column says what has been confirmed about the usbdac behaviour: **Har
 | 2 | [How deep the ring is](decisions-stream.md#ring-depth) | 250 ms, shrinking to 100 ms while live processing is on; gain applied as each transfer is built | Tests |
 | 3 | [What a late or lost transfer does](decisions-stream.md#loss-handling) | Count it exactly, carry on, bound it, clear the bit-perfect flag for good | Hardware (fault injection in Flick, PCM). Tests in usbdac. A per-packet error still ends the stream |
 | 4 | [What pause, flush and position mean](decisions-stream.md#pause-and-flush) | Pause holds the ring and sends silence; flush cancels what is on the bus; position counts what the DAC took | Tests |
-| 5 | [How DSD is carried](decisions-stream.md#dsd) | Capability from descriptors, byte order from quirks; the library owns the DoP marker | Tests. Not run on a DAC |
+| 5 | [How DSD is carried](decisions-stream.md#dsd) | Native DSD requires a matching alternate and wire layout. The library sets DoP markers | AP80 Pro-X native DSD64 through DSD256 and PCM transition verified. DoP covered by host tests |
 | 6 | [Which clock gets the rate](decisions-clock.md#clock-path) | Walk selectors and multipliers to the source, check the range, verify by read-back | Hardware for a plain clock. Tests for selectors |
 | 7 | [How the host follows the DAC's clock](decisions-clock.md#feedback) | Newest valid explicit report, packet-capacity check and bounded recovery when reports stop | Tests |
 | 8 | [DACs that need implicit feedback](decisions-clock.md#implicit-feedback) | Use a compatible shared-clock source or return a typed refusal | Tests |

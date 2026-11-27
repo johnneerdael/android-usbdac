@@ -14,7 +14,8 @@ SDK sample. The table distinguishes those runs from host and CI coverage.
 | 16 packets x 8 transfers (the default at 125 us) | The geometry sweep and benchmark runs played cleanly at 44.1 kHz, judged from the app log. The listening checks (cold start, five minutes without a dropout, 48 and 96 kHz, pause, seek, unplug and replug, 192 to 384 kHz at up to 32-bit) were made on the earlier 8 x 16 build and "have not been repeated" on 16 x 8 | Flick PR #400 |
 | Loss tolerance and exact loss accounting | Fault injection on the OnePlus 15 and DC04U with a test-only build, on 8 x 16. Not repeated on 16 x 8. What loss sounds like was not judged | Flick PR #406 |
 | Full-speed (1 ms interval) DACs | Not tested | Flick PR #400 |
-| DSD and DoP, native and over PCM | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
+| Native DSD64, DSD128 and DSD256, then PCM | Verified on the OnePlus 15 with the AP80 Pro-X | [AP80 native DSD transition](#ap80-native-dsd-transition) |
+| DoP | Host tests | [decision 5](decisions-stream.md#dsd) |
 | Clock selectors and multipliers, range check | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
 | Explicit feedback changes in 0.1.1 | Host tests for report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
 | UAC2 implicit feedback in 0.1.1 | Host tests for source pairing, packet sizing and ordering, and Android claim planning and diagnostics. Hardware validation pending | [decision 8](decisions-clock.md#implicit-feedback) |
@@ -47,6 +48,28 @@ units after three matching completions on the same phone and DAC. It
 reported verified direct playback at 44.1 kHz / 16 bit and reached 2,133,448
 played frames (48.4 s) with zero underruns and lost frames. The sample
 exported the opted-in report after stopping the stream.
+
+### AP80 Pro-X native DSD transition {#ap80-native-dsd-transition}
+
+The AP80 Pro-X advertises UAC2 Type I RAW_DATA on configuration 1, interface
+1, alternate setting 4. Its documented native layout uses four-byte,
+big-endian words, with no bit reversal. The driver preserves the full USB
+format bitmap and recognizes this layout for the measured device and
+endpoint. Native requests require a DSD alternate. [Hidizs specifications](https://www.hidizs.net/pages/ap80pro-x-specifications)
+
+The SDK ran these legs in order on the OnePlus 15 in one DAC session. Each
+leg verified its clock and feedback, reached the driver's bit-perfect
+verdict, and finished with zero lost frames and underruns.
+
+| Mode | Alternate setting | Wire rate | Feedback units |
+|---|---|---|---|
+| DSD64 | 4 | 88,200 Hz | Inferred from live feedback |
+| DSD128 | 4 | 176,400 Hz | Reused and validated |
+| DSD256 | 4 | 352,800 Hz | Reused and validated |
+| 16-bit PCM | 2 | 44,100 Hz | Inferred for the PCM alternate |
+
+The probe used balanced DSD data and low-level PCM. This validates USB
+delivery, clock changes and the transition on this device.
 
 ## The geometry sweep {#the-geometry-sweep}
 

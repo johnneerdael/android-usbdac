@@ -55,7 +55,8 @@ Several of these came from studying how two other open-source players, Mornye
 and BitChord, behave with the same DACs. No code from either was used.
 
 **Status: 0.1.** Direct USB PCM has played on a OnePlus 15 with an iBasso DC04U
-in Flick and with a Hidizs AP80 Pro-X in a development build of the SDK sample.
+in Flick and with a Hidizs AP80 Pro-X in the SDK sample. The AP80 Pro-X also
+verified native DSD64 through DSD256 and the transition back to PCM.
 See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
 formats and paths.
 

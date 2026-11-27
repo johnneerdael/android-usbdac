@@ -118,7 +118,7 @@ With live processing, a shallower ring makes changes audible sooner. The Rust AP
 
 ## DSD sources {#dsd-sources}
 
-DSD playback has not been run on a DAC. The rules are in [bit-perfect output](bit-perfect.md#dsd). For the engine: DSF stores bits least significant first and DFF most significant first, so bit-reverse DSF bytes before writing; DoP wants 16 DSD bits per sample in the slot layout with the marker byte left for the library to overwrite; native DSD wants one byte per channel in stream order; the position counters count bytes, so `counterRateHz` is the bit rate over 8; and no gain, no conversion and no equaliser can touch the stream. Decide per DAC whether to offer DoP or native, from `capabilities.supportsDop` and `supportsNativeDsd`, and give the listener an override, because a wrong byte order sounds like noise and the library cannot detect it.
+Native DSD64 through DSD256 and the transition to PCM were verified on the AP80 Pro-X. [Hardware evidence](evidence.md#ap80-native-dsd-transition) The rules are in [bit-perfect output](bit-perfect.md#dsd). For the engine: DSF stores bits least significant first and DFF most significant first, so bit-reverse DSF bytes before writing; DoP wants 16 DSD bits per sample in the slot layout with the marker byte left for the library to overwrite; native DSD wants one byte per channel in stream order; the position counters count bytes, so `counterRateHz` is the bit rate over 8; and no gain, no conversion and no equaliser can touch the stream. Decide per DAC whether to offer DoP or native, from `capabilities.supportsDop` and `supportsNativeDsd`, and give the listener an override, because a wrong byte order sounds like noise and the library cannot detect it.
 
 ## Events the engine should react to
 
