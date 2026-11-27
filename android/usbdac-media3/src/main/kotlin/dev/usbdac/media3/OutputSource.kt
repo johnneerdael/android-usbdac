@@ -18,6 +18,9 @@ class OpenedOutput(
     var failure: DacException? = null
 }
 
+/** A drained track's replacement, including a usable restored old format on rollback. */
+class OutputReconfiguration(val opened: OpenedOutput, val rollbackCause: DacException? = null)
+
 /**
  * What the audio sink needs from the app. The sink is written against this and [PcmOutput], so a test
  * can give it a fake output and no DAC.
@@ -25,6 +28,9 @@ class OpenedOutput(
 interface OutputSource {
     /** Opens the best output for [request]. Blocks for 100 ms or more: the sink calls it off the main thread. */
     fun open(request: StreamRequest): OpenedOutput
+
+    /** Optional transactional format change after drain; null retains the close/open fallback. */
+    fun reconfigure(output: OpenedOutput, request: StreamRequest): OutputReconfiguration? = null
 
     /** Closes [output] and everything opened for it. Blocks. */
     fun close(output: OpenedOutput)

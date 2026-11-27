@@ -485,7 +485,7 @@ public class OutputSelector internal constructor(
         }
         // What the host writes: the wire layout, or, behind a converter, the request's own.
         val written = if (plan == null) {
-            WriteFormat(format.sampleRate, format.channels, format.subslotBytes, format.validBits, format.counterRateHz)
+            WriteFormat(format.sampleRate, format.channels, format.subslotBytes, format.validBits, format.counterRateHz, format.encoding)
         } else {
             layoutOf(request)
         }
@@ -678,16 +678,20 @@ public class OutputSelector internal constructor(
     private fun failureOf(rejection: Rejection): DacException = DacException(rejection.error, rejection.why)
 
     private fun layoutOf(request: StreamRequest): WriteFormat =
-        WriteFormat(request.sampleRate, request.channels, request.bitDepth / 8, request.bitDepth, request.sampleRate)
+        WriteFormat(request.sampleRate, request.channels, request.bitDepth / 8, request.bitDepth, request.sampleRate, request.encoding)
 
     private fun describe(request: StreamRequest): String = when (request.encoding) {
         StreamEncoding.PCM -> "${request.sampleRate} Hz, ${request.bitDepth}-bit, ${request.channels} channels"
+        StreamEncoding.PCM_U8 -> "${request.sampleRate} Hz, unsigned 8-bit PCM, ${request.channels} channels"
+        StreamEncoding.PCM_FLOAT32 -> "${request.sampleRate} Hz, IEEE float32 PCM, ${request.channels} channels"
         StreamEncoding.DOP -> "DoP at DSD ${request.dsdBitRate} Hz, ${request.channels} channels"
         StreamEncoding.DSD_NATIVE -> "native DSD at ${request.dsdBitRate} Hz, ${request.channels} channels"
     }
 
     private fun describe(format: StreamFormat): String = when (format.encoding) {
         StreamEncoding.PCM -> "${format.sampleRate} Hz, ${format.validBits}-bit, ${format.channels} channels"
+        StreamEncoding.PCM_U8 -> "${format.sampleRate} Hz, unsigned 8-bit PCM, ${format.channels} channels"
+        StreamEncoding.PCM_FLOAT32 -> "${format.sampleRate} Hz, IEEE float32 PCM, ${format.channels} channels"
         StreamEncoding.DOP -> "DoP, ${format.sampleRate} Hz carrier, ${format.channels} channels"
         StreamEncoding.DSD_NATIVE -> "native DSD at ${format.dsdBitRate} Hz, ${format.channels} channels"
     }

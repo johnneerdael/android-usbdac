@@ -1,5 +1,24 @@
 //! Configuration of a [`Dac`](crate::Dac) session.
 
+/// Policy for asynchronous endpoints without a proven feedback source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsyncFallbackPolicy {
+    /// Admit only full-speed UAC1 PCM with no declared feedback pipe.
+    #[default]
+    FullSpeedUac1,
+    /// Require explicit or proven implicit feedback.
+    Forbid,
+}
+
+/// Policy for unusable frequency readback after an acknowledged rate write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockReadbackPolicy {
+    #[default]
+    RequireVerified,
+    /// Continue unverified after three unusable reads; never hide a mismatch.
+    AllowUnusableAfterSuccessfulSet,
+}
+
 use crate::error::{Error, Result};
 use crate::iso_packet_scheduler::{DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT};
 use crate::quirk::Quirk;
@@ -119,14 +138,22 @@ pub struct DacConfig {
     pub padded_24bit: Option<bool>,
     /// Quirks added to the built-in table for this session.
     pub quirks: Vec<QuirkOverride>,
+    /// Apply supported exact-identity ALSA facts only when explicitly selected.
+    pub quirk_policy: crate::quirk::QuirkPolicy,
     /// Allow streaming an asynchronous endpoint that has no explicit feedback
-    /// source. By
-    /// default `negotiate` and `open_stream` refuse it with
+    /// source, beyond the narrow default [`AsyncFallbackPolicy`] tier.
+    /// Otherwise `negotiate` and `open_stream` refuse it with
     /// [`Error::ImplicitFeedbackUnsupported`]. Allowed, it streams at the nominal
     /// rate, host-paced, and any drift between the DAC's clock and the host's
     /// timing ends in underruns or overruns on the DAC; the stream is never
     /// bit-perfect (`DacStream::bit_perfect_blocker` says why). Default `false`.
     pub allow_unsynchronized_async: bool,
+    /// Narrow default fallback; never bit-perfect.
+    pub async_fallback_policy: AsyncFallbackPolicy,
+    /// Permit the unverified clock tier only after an acknowledged SET.
+    pub clock_readback_policy: ClockReadbackPolicy,
+    /// Adapt active URB count to loss, bounded by 64 ms and 255 packets.
+    pub adaptive_queue: bool,
     /// Disable explicit and implicit feedback for diagnosis. Default `false`.
     /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.
     pub disable_feedback: bool,
@@ -187,7 +214,11 @@ impl Default for DacConfig {
             dsd_subslot: None,
             padded_24bit: None,
             quirks: Vec::new(),
+            quirk_policy: crate::quirk::QuirkPolicy::VerifiedOnly,
             allow_unsynchronized_async: false,
+            async_fallback_policy: AsyncFallbackPolicy::default(),
+            clock_readback_policy: ClockReadbackPolicy::default(),
+            adaptive_queue: true,
             disable_feedback: false,
             capture_feedback_trace: false,
             realtime_priority: true,

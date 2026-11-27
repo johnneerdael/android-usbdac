@@ -6,26 +6,55 @@ struct PatternFifo {
     storage: Vec<Vec<usize>>,
     read: usize,
     depth: usize,
+    silence: Vec<bool>,
+    last_pop_silence: bool,
 }
 impl PatternFifo {
     fn new(capacity: usize, packets: usize) -> Self {
-        Self { storage: vec![vec![0; packets]; capacity], read: 0, depth: 0 }
+        Self { storage: vec![vec![0; packets]; capacity], read: 0, depth: 0, silence:vec![false;capacity],last_pop_silence:false }
     }
-    fn clear(&mut self) { self.read = 0; self.depth = 0; }
+    fn clear(&mut self) { self.read = 0; self.depth = 0; self.last_pop_silence=false; }
     fn push(&mut self, pattern: &[usize]) -> Result<(), String> {
         if self.depth == self.storage.len() { return Err("implicit feedback FIFO overflow".into()); }
         let index = (self.read + self.depth) % self.storage.len();
         if pattern.len() != self.storage[index].len() { return Err("incomplete implicit feedback pattern".into()); }
         self.storage[index].copy_from_slice(pattern);
+        self.silence[index]=false;
         self.depth += 1;
+        Ok(())
+    }
+    fn push_silence(&mut self, pattern:&[usize]) -> Result<(),String> {
+        self.push(pattern)?;
+        let index=(self.read+self.depth-1)%self.storage.len();
+        self.silence[index]=true;
         Ok(())
     }
     fn pop(&mut self) -> Option<Vec<usize>> {
         if self.depth == 0 { return None; }
         let value = self.storage[self.read].clone();
+        self.last_pop_silence=self.silence[self.read];
         self.read = (self.read + 1) % self.storage.len();
         self.depth -= 1;
         Some(value)
+    }
+}
+
+/// One fallback vector, copied only from a validated non-empty source pattern.
+/// It never contributes rate samples or renews the source health deadline.
+#[derive(Default)]
+struct MeasuredSilence {
+    previous:Option<Vec<usize>>,
+    used:bool,
+}
+impl MeasuredSilence {
+    fn observed(&mut self, pattern:&[usize]) {
+        self.previous=Some(pattern.to_vec()); self.used=false;
+    }
+    fn take(&mut self, enabled:bool, running:bool, locked:bool) -> Option<Vec<usize>> {
+        if !enabled || !running || !locked || self.used { return None; }
+        let pattern=self.previous.clone()?;
+        self.used=true;
+        Some(pattern)
     }
 }
 
@@ -47,6 +76,20 @@ pub(super) fn capture_pattern(packets: impl Iterator<Item = (i32, usize, usize)>
     if count != pattern.len() { return Err("incomplete implicit feedback pattern".into()); }
     if !empty && pattern.contains(&0) { return Err("implicit feedback packet gap".into()); }
     Ok(!empty)
+}
+
+fn known_empty_implicit_completion(slot:&IsoTransferSlot,status:i32,source:&ImplicitFeedbackSource,
+    packets:&mut[crate::capture::CapturePacket]) -> bool {
+    let Ok((data,detached))=capture_stream::inspect_slot(slot,status,packets) else {return false;};
+    if detached || packets.is_empty() || slot.submitted_endpoint != source.address
+        || slot.packet_sizes.len()!=packets.len()
+        || slot.packet_sizes.iter().any(|size| *size!=source.max_packet_bytes)
+        || packets.iter().any(|packet| packet.actual_bytes!=0 || packet.requested_bytes!=source.max_packet_bytes)
+        || slot.submitted_bytes!=packets.len().saturating_mul(source.max_packet_bytes)
+        || slot.submitted_bytes!=data.len() {return false;}
+    let transfer=unsafe {slot.transfer.as_ref()};
+    let descriptors=unsafe {std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(),packets.len())};
+    descriptors.iter().all(|packet| matches!(packet.status,LIBUSB_TRANSFER_COMPLETED|LIBUSB_TRANSFER_ERROR|LIBUSB_TRANSFER_TIMED_OUT|LIBUSB_TRANSFER_OVERFLOW))
 }
 
 /// Admit the complete source schedule before using its lengths for OUT timing
@@ -126,6 +169,7 @@ pub(super) struct ImplicitFeedback {
     pub(super) slots: Vec<IsoTransferSlot>,
     order: VecDeque<usize>,
     fifo: PatternFifo,
+    measured_silence:MeasuredSilence,
     scratch: Vec<usize>,
     source: ImplicitFeedbackSource,
     out_stride: usize,
@@ -156,6 +200,7 @@ impl ImplicitFeedback {
         }
         Ok(Self { slots, order: VecDeque::with_capacity(geometry.transfer_slots),
             fifo: PatternFifo::new(2 * geometry.transfer_slots, geometry.packets_per_transfer),
+            measured_silence:MeasuredSilence::default(),
             scratch: vec![0; geometry.packets_per_transfer], source, out_stride, max_out, rate,
             startup_rate_proof: None, startup_rate_proved: false, window_frames: 0, window_us: 0, bad_windows: 0, prime_count: 0,
             prime_target: geometry.transfer_slots, running: false, started: Instant::now(),
@@ -224,6 +269,10 @@ impl ImplicitFeedback {
             if status == LIBUSB_TRANSFER_TIMED_OUT { stats.feedback_timeouts.fetch_add(1, Ordering::Relaxed); }
             let result = inspect_implicit_pattern(&self.slots[index], status, &self.source,
                 self.out_stride, self.max_out, &mut self.capture_scratch, &mut self.scratch);
+            let result = if result.is_err() && settings().has(crate::Quirk::ImplicitSilenceOnEmpty)
+                && known_empty_implicit_completion(&self.slots[index],status,&self.source,&mut self.capture_scratch) {
+                Ok(false)
+            } else {result};
             // Failed transfers contain no presentable payload. Completed URBs
             // must pass the entire timing contract first, including packet gaps.
             let capture_result = if result.is_ok() || status != LIBUSB_TRANSFER_COMPLETED {
@@ -232,6 +281,7 @@ impl ImplicitFeedback {
             } else { Ok(None) };
             match result {
                 Ok(true) => {
+                    self.measured_silence.observed(&self.scratch);
                     let last_report_ms = record_valid_completion(&mut self.last_valid, completed_at, stats.started_at);
                     let frames = self.scratch.iter().sum::<usize>() / self.out_stride;
                     stats.feedback_reports.fetch_add(1, Ordering::Relaxed);
@@ -272,7 +322,17 @@ impl ImplicitFeedback {
                 }
                 Ok(false) => {
                     stats.feedback_empty.fetch_add(1, Ordering::Relaxed);
-                    if self.running { return Err("empty implicit feedback pattern while running".into()); }
+                    if self.running {
+                        if let Some(pattern)=self.measured_silence.take(settings().has(crate::Quirk::ImplicitSilenceOnEmpty),
+                            self.running,stats.feedback_locked.load(Ordering::Acquire)) {
+                            self.fifo.push_silence(&pattern)?;
+                            stats.feedback_locked.store(false,Ordering::Release);
+                            if let Some(trace)=&stats.feedback_trace {
+                                trace.record(crate::FeedbackTraceEvent::Lock {locked:false,stale:true});
+                            }
+                            log_warn!("[USB] Empty implicit completion: one measured-cadence wire-silence pattern; source health lease unchanged");
+                        } else { return Err("empty implicit feedback pattern while running (no bounded proven silence available)".into()); }
+                    } else {
                     self.prime_count = 0; self.fifo.clear(); self.window_frames = 0; self.window_us = 0;
                     if let Some(proof) = self.startup_rate_proof.as_mut() {
                         proof.reset();
@@ -283,6 +343,7 @@ impl ImplicitFeedback {
                                 trace.record(crate::FeedbackTraceEvent::Lock { locked: false, stale: false });
                             }
                         }
+                    }
                     }
                 }
                 Err(error) => {
@@ -309,6 +370,7 @@ impl ImplicitFeedback {
     pub(super) fn primed(&self) -> bool {
         (self.startup_rate_proof.is_none() || self.startup_rate_proved) && self.prime_count >= self.prime_target
     }
+    pub(super) fn pattern_is_silence(&self) -> bool {self.fifo.last_pop_silence}
     pub(super) fn take_pattern(&mut self, stats: &RuntimeStats) -> Option<Vec<usize>> {
         let value = self.fifo.pop()?;
         stats.implicit_fifo_depth.store(self.fifo.depth, Ordering::Relaxed);
@@ -457,5 +519,64 @@ mod tests {
         for input in [vec![(0,4,100)],vec![(0,4,100),(1,4,100)],vec![(0,4,100),(0,0,100)],vec![(0,104,100),(0,4,100)]] {
             assert!(capture_pattern(input.into_iter(),4,8,200,&mut pattern).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod measured_silence_tests {
+    use super::*;
+    #[test]
+    fn silence_requires_previous_proof_and_is_bounded_to_one_pattern() {
+        let mut fallback=MeasuredSilence::default();
+        assert!(fallback.take(true,true,true).is_none());
+        fallback.observed(&[20,24,20,24]);
+        assert!(fallback.take(false,true,true).is_none());
+        assert!(fallback.take(true,false,true).is_none());
+        assert!(fallback.take(true,true,false).is_none());
+        assert_eq!(fallback.take(true,true,true),Some(vec![20,24,20,24]));
+        assert!(fallback.take(true,true,true).is_none());
+        fallback.observed(&[24,20,24,20]);
+        assert_eq!(fallback.take(true,true,true),Some(vec![24,20,24,20]));
+    }
+    #[test]
+    fn empty_error_recovery_rejects_detach_halt_partial_payload_and_changed_schedule() {
+        let source=ImplicitFeedbackSource {interface_number:1,alt_setting:1,address:0x81,
+            bytes_per_frame:4,service_interval_us:1000,max_packet_bytes:12};
+        let mut slot=IsoTransferSlot::new(0,2,24).unwrap();
+        slot.packet_sizes=vec![12,12]; slot.submitted_endpoint=0x81; slot.submitted_bytes=24;
+        unsafe {
+            let buffer=&mut (*slot.user_data).buffer;
+            let transfer=slot.transfer.as_mut(); transfer.endpoint=0x81; transfer.length=24; transfer.num_iso_packets=2;
+            transfer.buffer=buffer.as_mut_ptr();
+            let descriptors=std::slice::from_raw_parts_mut(transfer.iso_packet_desc.as_mut_ptr(),2);
+            for descriptor in descriptors {descriptor.length=12;descriptor.actual_length=0;descriptor.status=LIBUSB_TRANSFER_ERROR;}
+        }
+        let mut packets=vec![crate::capture::CapturePacket {requested_bytes:0,actual_bytes:0,succeeded:false};2];
+        assert!(known_empty_implicit_completion(&slot,LIBUSB_TRANSFER_COMPLETED,&source,&mut packets));
+        assert!(!known_empty_implicit_completion(&slot,LIBUSB_TRANSFER_ERROR,&source,&mut packets));
+        for status in [LIBUSB_TRANSFER_NO_DEVICE,LIBUSB_TRANSFER_STALL,LIBUSB_TRANSFER_CANCELLED] {
+            unsafe {(*slot.transfer.as_ptr()).iso_packet_desc.as_mut_ptr().as_mut().unwrap().status=status;}
+            assert!(!known_empty_implicit_completion(&slot,LIBUSB_TRANSFER_COMPLETED,&source,&mut packets));
+        }
+        unsafe {
+            let descriptor=(*slot.transfer.as_ptr()).iso_packet_desc.as_mut_ptr().as_mut().unwrap();
+            descriptor.status=LIBUSB_TRANSFER_ERROR;descriptor.actual_length=4;
+        }
+        assert!(!known_empty_implicit_completion(&slot,LIBUSB_TRANSFER_COMPLETED,&source,&mut packets));
+        unsafe {(*slot.transfer.as_ptr()).iso_packet_desc.as_mut_ptr().as_mut().unwrap().actual_length=0;}
+        slot.packet_sizes[0]=8;
+        assert!(!known_empty_implicit_completion(&slot,LIBUSB_TRANSFER_COMPLETED,&source,&mut packets));
+    }
+
+    #[test]
+    fn queued_silence_keeps_its_tag_through_fifo_wrap_and_clear() {
+        let mut fifo=PatternFifo::new(2,2);
+        fifo.push(&[20,24]).unwrap(); fifo.push_silence(&[24,20]).unwrap();
+        assert_eq!(fifo.pop(),Some(vec![20,24])); assert!(!fifo.last_pop_silence);
+        fifo.push(&[20,24]).unwrap();
+        assert_eq!(fifo.pop(),Some(vec![24,20])); assert!(fifo.last_pop_silence);
+        assert_eq!(fifo.pop(),Some(vec![20,24])); assert!(!fifo.last_pop_silence);
+        fifo.push_silence(&[20,24]).unwrap(); fifo.clear();
+        assert!(!fifo.last_pop_silence); assert!(fifo.pop().is_none());
     }
 }

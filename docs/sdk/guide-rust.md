@@ -67,7 +67,7 @@ The library does not enumerate USB devices, ask for permission or claim interfac
 
 ### On Android
 
-**Do.** Only Kotlin or Java can ask for USB permission and open the device, so a small Kotlin part comes first. It asks for permission from an activity that is in front, opens the device and claims the interfaces. You also need the attach intent filter and device filter of [the Kotlin guide, step 2](guide-kotlin.md#2-declare-what-android-needs).
+**Do.** Only Kotlin or Java can ask for USB permission and open the device, so a small Kotlin part comes first. It asks for permission from an activity that is in front, opens the device and claims the interfaces. You also need the attach intent filter and device filter of [the Android setup guide](getting-started.md#2-the-manifest).
 
 ```kotlin
 /** Asks for USB permission. Call it from an activity that is in front: the dialog needs a screen. */
@@ -1234,3 +1234,101 @@ Know these before you ship.
 - Every option and its effect on bit-perfect output: [controls and configuration](controls.md).
 - Wire layouts, events, threading rules and the JNI contract: [the native API document](API.md).
 - A Kotlin app on Media3: [the Kotlin guide](guide-kotlin.md).
+
+## Discovery and permission events
+
+`HotplugHub` is the Rust host boundary for attachment and permission events.
+Subscribe before taking action. Each subscription starts with an atomic
+`HotplugEvent::Snapshot`; subsequent events describe changes. If a slow consumer
+overwhelms its bounded queue, the next receive replaces old hints with a fresh
+snapshot. Replace application discovery state on **every** snapshot.
+
+```rust
+use usbdac_core::{DeviceInfo, HotplugHub, UsbPermission};
+let hub = HotplugHub::new();
+let events = hub.subscribe();
+let attachment = hub.attached("android-device-name", DeviceInfo::new(1, 2, "DAC"),
+    UsbPermission::Required);
+// Pass attachment.id through the host permission request/callback.
+assert!(hub.permission_changed(attachment.id, UsbPermission::Granted));
+hub.detached(attachment.id);
+assert!(!hub.permission_changed(attachment.id, UsbPermission::Granted));
+drop(events);
+```
+
+On Android register the `UsbManager` attach/detach and application permission
+receiver, then seed the hub from `deviceList`. Feed broadcasts and permission
+results into the same hub. Query `hasPermission` for each initial/attached
+device; report denial as `UsbPermission::Denied`. Use the attachment ID captured
+when requesting permission: delayed callbacks for a detached device must not
+grant a replacement with the same OS path. Requests, microphone permission for
+capture, configuration selection, claims, and the connection FD remain the
+Android host's responsibility, as in Kotlin `UsbDac.hotplug` and
+`UsbDac.requestPermission`. `Granted` records a host result and never bypasses
+`Dac::open` validation. Discovery does not reroute audio or open a DAC.
+
+On Linux `LinuxHotplugMonitor::start()` enumerates audio-class/composite devices
+and registers native libusb hotplug callbacks. Retain the monitor and subscribe
+through `monitor.hub()`. When libusb lacks hotplug capability it polls cached
+descriptors every 250 ms; a complete removal/reinsert between fallback polls can
+be missed. Permission is `Unknown` because enumeration proves no access; the
+host opens/claims the selected device with its usual OS permissions. Linux
+names are descriptor identities (`USB audio VID:PID`), not product strings, so
+populate the actual product/manufacturer fields before `Dac::open` if required
+for quirk matching. Other platforms return `PlatformUnsupported`; Android uses
+the explicit host bridge, not the Linux monitor.
+
+## Volume without blocking the UI
+
+The existing `VolumeControl` methods remain synchronous. Create one
+`volume.nonblocking()?` controller per open device to dispatch verified control
+I/O to its dedicated worker. No async runtime dependency is required.
+
+```rust
+use usbdac_core::{VolumeControl, Result};
+async fn change(volume: VolumeControl) -> Result<()> {
+let controls = volume.nonblocking()?;
+let applied = controls.set_db(-45.0)?.await?;
+assert!(applied.db <= 0.0);
+Ok(())
+}
+```
+
+Submission is nonblocking and returns `Busy` when 32 requests are queued. Retry
+or coalesce slider input in the host. Accepted operations run in FIFO order and
+use the same hardware readback, multi-channel rollback, and events as blocking
+calls. Each result handle supports `.await`, `try_result()`, or blocking `wait()`;
+retrieve it once. Dropping a result does **not** cancel an accepted write, so do
+not use result cancellation to undo a volume change. Close serializes with
+control I/O, and queued requests on a closed device fail without touching a new
+session. Startup attenuation and hand-back policy are unchanged.
+
+## Fake DAC at the application boundary
+
+Use `PlaybackDevice` and `PlaybackStream` for the common push-playback subset
+implemented by the real `Dac`/`DacStream` and `fake::FakeDac`/`fake::FakeStream`.
+The fake is public, has no USB dependency at runtime, and does not occupy the
+real process session. It is a deterministic application substitute, not USB
+protocol or hardware evidence.
+
+```rust
+use std::sync::Arc;
+use usbdac_core::{fake::FakeDac, DeviceInfo, PlaybackDevice, PlaybackStream, StreamRequest};
+let request = StreamRequest::pcm(48_000, 2, 16);
+let dac = FakeDac::new(DeviceInfo::new(1, 2, "test"), vec![request], 128).unwrap();
+let format = dac.negotiate(&request).unwrap();
+let stream = dac.open_stream(&format, Arc::new(|_| {})).unwrap();
+assert_eq!(stream.write(&[0; 16]).unwrap(), 16);
+assert_eq!(stream.advance(4).unwrap(), 4);
+assert_eq!(stream.played_frames(), 4);
+dac.detach();
+assert!(stream.write(&[0; 4]).is_err());
+```
+
+Profiles are exact PCM formats. Explicit `advance` consumes queued frames;
+`lose_frames` injects loss, and `detach` invalidates all existing handles. Test
+backpressure, pause, drain, flush, and recovery decisions without timers.
+Callbacks run inline after fake locks are released; real callbacks run on the
+library event thread. Clock/feedback, capture/duplex, routing, hardware volume,
+and bit-perfect verification require their real implementations and dedicated
+protocol/hardware checks.

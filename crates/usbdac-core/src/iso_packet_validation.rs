@@ -20,6 +20,7 @@ const MAX_DIAGNOSTIC_PACKETS: usize = 32;
 pub(crate) struct PacketAcceptance {
     legal_sizes: [usize; 2],
     bytes_per_frame: usize,
+    prefix_bytes: usize,
     /// Only the exact submitted length is acceptable.
     exact: bool,
 }
@@ -38,6 +39,7 @@ impl PacketAcceptance {
         Self {
             legal_sizes,
             bytes_per_frame,
+            prefix_bytes: 0,
             exact: false,
         }
     }
@@ -49,9 +51,18 @@ impl PacketAcceptance {
         Self {
             legal_sizes: [0, 0],
             bytes_per_frame: 1,
+            prefix_bytes: 0,
             exact: true,
         }
     }
+
+    /// Prefix bytes are transport metadata, never samples or lost audio.
+    pub(crate) fn with_packet_prefix(mut self, prefix_bytes:usize) -> Self {
+        self.prefix_bytes=prefix_bytes;
+        self.legal_sizes=self.legal_sizes.map(|size|size.saturating_add(prefix_bytes));
+        self
+    }
+    fn audio_bytes(&self,wire_bytes:usize) -> usize {wire_bytes.saturating_sub(self.prefix_bytes)}
 
     pub(crate) fn legal_sizes(&self) -> [usize; 2] {
         self.legal_sizes
@@ -68,7 +79,7 @@ impl PacketAcceptance {
     }
 
     fn is_frame_aligned(&self, actual_length: usize) -> bool {
-        actual_length % self.bytes_per_frame == 0
+        actual_length >= self.prefix_bytes && self.audio_bytes(actual_length) % self.bytes_per_frame == 0
     }
 }
 
@@ -95,10 +106,10 @@ impl CompletionStats {
 /// stream's service interval.
 ///
 /// A completed packet shorter (or, after repacketisation, longer) than the
-/// submitted length can be legal after repacketisation. A single generic
-/// packet error with a matching request and no delivered bytes is recoverable
-/// on an otherwise completed transfer. The caller accounts for the loss and
-/// applies the stream's loss budget. Other packet errors remain fatal.
+/// submitted length can be legal after repacketisation. Bounded generic,
+/// timeout and overflow packet errors are charged as full-request loss.
+/// The caller applies the stream loss budget. Removal, halt, cancellation and
+/// malformed descriptors remain fatal.
 pub(crate) fn validate_iso_packet_descriptors(
     packet_sizes: &[usize],
     descriptors: &[libusb_iso_packet_descriptor],
@@ -118,16 +129,15 @@ pub(crate) fn validate_iso_packet_descriptors(
     for (&requested, packet) in packet_sizes.iter().zip(descriptors) {
         let actual = packet.actual_length as usize;
         if packet.status != LIBUSB_TRANSFER_COMPLETED {
-            if packet.status == LIBUSB_TRANSFER_ERROR
+            if matches!(packet.status, LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_TIMED_OUT | LIBUSB_TRANSFER_OVERFLOW)
                 && !acceptance.exact
-                && failed_packet_bytes == 0
                 && requested > 0
                 && acceptance.is_frame_aligned(requested)
                 && packet.length as usize == requested
                 && actual == 0
             {
-                failed_packet_bytes = requested;
-                stats.zero_packets += 1;
+                failed_packet_bytes += acceptance.audio_bytes(requested);
+                stats.zero_packets += usize::from(actual == 0 && acceptance.audio_bytes(requested) > 0);
                 continue;
             }
             return Err(format_diagnostics(
@@ -142,8 +152,8 @@ pub(crate) fn validate_iso_packet_descriptors(
             stats.descriptor_rewrites = stats.descriptor_rewrites.saturating_add(1);
         }
 
-        if actual == 0 {
-            if requested == 0 {
+        if actual == 0 || actual == acceptance.prefix_bytes {
+            if acceptance.audio_bytes(requested) == 0 {
                 // Nothing was asked of this packet, so nothing was dropped.
                 continue;
             }
@@ -207,7 +217,9 @@ pub(crate) fn validate_iso_packet_descriptors(
     // Never credit neighbouring packets for a known failed request. Their
     // larger legal sizes can reflect repacketisation, not delivery of the
     // specific audio that was scheduled in the failed packet.
-    stats.lost_bytes = (requested_total - actual_total).max(failed_packet_bytes) as u64;
+    let requested_audio:usize=packet_sizes.iter().map(|bytes|acceptance.audio_bytes(*bytes)).sum();
+    let actual_audio:usize=descriptors.iter().map(|packet|acceptance.audio_bytes(packet.actual_length as usize)).sum();
+    stats.lost_bytes = requested_audio.saturating_sub(actual_audio).max(failed_packet_bytes) as u64;
     stats.shortfall_frames = stats.lost_bytes / acceptance.bytes_per_frame.max(1) as u64;
 
     Ok(stats)
@@ -234,7 +246,7 @@ pub(crate) fn account_timed_out_transfer(
     descriptors: &[libusb_iso_packet_descriptor],
     acceptance: PacketAcceptance,
 ) -> CompletionStats {
-    let requested_total: u64 = packet_sizes.iter().map(|length| *length as u64).sum();
+    let requested_total: u64 = packet_sizes.iter().map(|length| acceptance.audio_bytes(*length) as u64).sum();
     let delivered_total: u64 = if packet_sizes.len() == descriptors.len() {
         packet_sizes
             .iter()
@@ -243,7 +255,7 @@ pub(crate) fn account_timed_out_transfer(
                 packet.status == LIBUSB_TRANSFER_COMPLETED
                     && packet.actual_length as usize == **requested
             })
-            .map(|(requested, _)| *requested as u64)
+            .map(|(requested, _)| acceptance.audio_bytes(*requested) as u64)
             .sum()
     } else {
         0
@@ -312,7 +324,7 @@ fn format_diagnostics(
 
     format!(
         "isochronous transfer completed with packet errors: {}; \
-         packet_counts=requested:{},descriptors:{} legal={}/{} frame={} \
+         packet_counts=requested:{},descriptors:{} legal={}/{} frame={} prefix={} \
          requested_total={} descriptor_total={} actual_total={} actual_minus_requested={} \
          status_errors={} descriptor_changes={} length_mismatches={}; \
          packet_results=[{}] omitted_packets={}",
@@ -322,6 +334,7 @@ fn format_diagnostics(
         acceptance.legal_sizes[0],
         acceptance.legal_sizes[1],
         acceptance.bytes_per_frame,
+        acceptance.prefix_bytes,
         requested_total,
         descriptor_total,
         actual_total,

@@ -596,4 +596,78 @@ class ModelParsingTest {
         assertFalse(json.has("manufacturer_name"))
         assertEquals(3, json.getJSONArray("claimed_interfaces").length())
     }
+    @Test
+    fun adaptiveAndSchedulerStatsDecodeAndRemainCompatibleWithOlderNativeReports() {
+        val stats = parseStats("""{"worker_gap_over_10ms":3,"worker_gap_over_50ms":1,
+            "max_worker_gap_us":65000,"adaptive_queue_changes":2,
+            "adaptive_queue_slots":12,"adaptive_queue_us":24000}""")
+        assertEquals(3L, stats.workerGapOver10ms)
+        assertEquals(1L, stats.workerGapOver50ms)
+        assertEquals(65000L, stats.maxWorkerGapUs)
+        assertEquals(2L, stats.adaptiveQueueChanges)
+        assertEquals(12L, stats.adaptiveQueueSlots)
+        assertEquals(24000L, stats.adaptiveQueueUs)
+        assertEquals(0L, parseStats("{}").adaptiveQueueChanges)
+    }
+
+    @Test
+    fun compatibilityPolicyDefaultsAndOptInsReachNativeWithoutBroadeningLegacyOverride() {
+        val defaults = JSONObject(DacConfig().toNativeJson())
+        assertEquals("full_speed_uac1", defaults.getString("async_fallback_policy"))
+        assertEquals("require_verified", defaults.getString("clock_readback_policy"))
+        assertTrue(defaults.getBoolean("adaptive_queue"))
+        assertFalse(defaults.getBoolean("allow_unsynchronized_async"))
+        val explicit = JSONObject(DacConfig(asyncFallbackPolicy = AsyncFallbackPolicy.FORBID,
+            clockReadbackPolicy = ClockReadbackPolicy.ALLOW_UNUSABLE_AFTER_SUCCESSFUL_SET,
+            adaptiveQueue = false).toNativeJson())
+        assertEquals("forbid", explicit.getString("async_fallback_policy"))
+        assertEquals("allow_unusable_after_successful_set", explicit.getString("clock_readback_policy"))
+        assertFalse(explicit.getBoolean("adaptive_queue"))
+        assertFalse(explicit.getBoolean("allow_unsynchronized_async"))
+    }
+
+    @Test
+    fun minimumMuteDbIsExplicitAndNeverDefaultsMalformedValuesToFullScale() {
+        assertEquals(Double.NEGATIVE_INFINITY, parseVolumeState("""{"db":"-Infinity","fraction":0,"muted":true}""").db, 0.0)
+        assertEquals(Double.NEGATIVE_INFINITY, parseVolumeRange("""{"min_db":"-Infinity","max_db":0,"res_db":1}""").minDb, 0.0)
+        val startup = parseStartupReport("""{"original_db":["-Infinity"],"applied_db":["-Infinity"],
+            "limit_db":"-Infinity","attenuated":false,"clamped_to_minimum":false,"max_db":-40}""")
+        assertEquals(listOf(Double.NEGATIVE_INFINITY), startup.originalDb)
+        assertEquals(listOf(Double.NEGATIVE_INFINITY), startup.appliedDb)
+        assertEquals(Double.NEGATIVE_INFINITY, startup.limitDb, 0.0)
+        for (invalid in listOf("null", "\"bad\"", "\"Infinity\"", "\"NaN\"")) {
+            org.junit.Assert.assertThrows(org.json.JSONException::class.java) {
+                parseVolumeState("""{"db":$invalid,"fraction":0,"muted":false}""")
+            }
+        }
+    }
+
+    @Test
+    fun unsignedAndFloatPcmKeepDistinctWireEncodings() {
+        for ((request, wire) in listOf(StreamRequest.pcmU8(48_000, 2) to "pcm_u8",
+                StreamRequest.pcmFloat32(96_000, 2) to "pcm_float32")) {
+            val json = JSONObject(request.toJson())
+            assertEquals(wire, json.getString("encoding"))
+            assertEquals(request.bitDepth, json.getInt("bit_depth"))
+            assertEquals(request.sampleRate, json.getInt("sample_rate"))
+        }
+        assertEquals("source_backed", JSONObject(DacConfig(quirkPolicy = QuirkPolicy.SOURCE_BACKED).toNativeJson()).getString("quirk_policy"))
+    }
+
+    @Test
+    fun sourceBackedQuirkOverridesPreserveExplicitKindsAndDurations() {
+        val quirks = listOf(DacQuirk.ControlMessageDelayUs(50), DacQuirk.InterfaceDelayMs(20),
+            DacQuirk.SetInterfaceFirst, DacQuirk.PlaybackUrbFixup, DacQuirk.SkipSampleRateReadback,
+            DacQuirk.SkipImplicitFeedback, DacQuirk.MixerPlaybackMinMute, DacQuirk.MixerPlaybackLinearVolume,
+            DacQuirk.RawDsd32Be, DacQuirk.FixedRate, DacQuirk.ImplicitSilenceOnEmpty,
+            DacQuirk.SkipClockSelectorWrites, DacQuirk.IgnoreOptionalControlErrors)
+        val config = DacConfig(quirks = listOf(QuirkOverride(1, 2, quirks = quirks)))
+        val encoded = JSONObject(config.toNativeJson()).getJSONArray("quirks").getJSONObject(0).getJSONArray("quirks")
+        assertEquals(50L, encoded.getJSONObject(0).getLong("control_message_delay_us"))
+        assertEquals(20L, encoded.getJSONObject(1).getLong("interface_delay_ms"))
+        assertEquals("set_interface_first", encoded.getString(2))
+        assertEquals("ignore_optional_control_errors", encoded.getString(12))
+        assertEquals(quirks.size, encoded.length())
+    }
+
 }

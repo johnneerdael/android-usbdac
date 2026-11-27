@@ -378,6 +378,7 @@ pub(crate) fn common_channel_volume(channels: &[i16]) -> Option<i16> {
 pub(crate) struct HardwareVolumeSnapshot {
     /// The level every channel reads, exactly as the DAC reported it.
     pub(crate) raw: i16,
+    pub(crate) db: f64,
     pub(crate) volume: f64,
     pub(crate) muted: Option<bool>,
     pub(crate) mute_error: Option<String>,
@@ -403,10 +404,12 @@ pub(crate) fn read_hardware_volume_snapshot(
     }
     let (muted, mute_error) = match read_mute() {
         Ok(muted) => (muted, None),
+        Err(error) if crate::error::is_device_gone(&error) => return Err(error),
         Err(error) => (None, Some(error)),
     };
     Ok(HardwareVolumeSnapshot {
         raw,
+        db: crate::volume::raw_to_db(raw),
         volume: normalize_volume(raw, ranges),
         muted,
         mute_error,
@@ -959,4 +962,99 @@ mod tests {
         assert_eq!(single_level(vec![-3, -9, -5]), vec![-9, -9, -9]);
     }
 
+}
+
+/// Device-specific meaning of the verified raw Feature Unit lattice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeCurve {
+    Decibels { minimum_is_mute: bool },
+    LinearAmplitude,
+}
+impl VolumeCurve {
+    pub(crate) fn db(self, raw: i16, ranges: &[RawRange]) -> f64 {
+        let (min,max) = volume_bounds(ranges);
+        match self {
+            Self::Decibels { minimum_is_mute } => {
+                if minimum_is_mute && raw == min { f64::NEG_INFINITY }
+                else { crate::volume::raw_to_db(raw) }
+            }
+            Self::LinearAmplitude => {
+                if raw <= min || min == max { f64::NEG_INFINITY }
+                else { 20.0 * ((i32::from(raw)-i32::from(min)) as f64
+                    / (i32::from(max)-i32::from(min)) as f64).log10() }
+            }
+        }
+    }
+    pub(crate) fn fraction(self, raw: i16, ranges: &[RawRange]) -> f64 {
+        match self {
+            Self::Decibels { .. } => normalize_volume(raw,ranges),
+            Self::LinearAmplitude => ((self.db(raw,ranges) + 80.0) / 80.0).clamp(0.0,1.0),
+        }
+    }
+    pub(crate) fn floor_db(self, db: f64, ranges: &[RawRange]) -> Option<i16> {
+        match self {
+            Self::Decibels { .. } => floor_db(db,ranges),
+            Self::LinearAmplitude => {
+                let (min,max) = volume_bounds(ranges);
+                let amplitude = 10.0_f64.powf(db.min(0.0) / 20.0);
+                let target = (f64::from(min) + amplitude * (i32::from(max)-i32::from(min)) as f64).floor() as i32;
+                ranges.iter().filter_map(|range| range.floor_on_lattice(target)).max()
+            }
+        }
+    }
+    pub(crate) fn target_db(self, db: f64, ranges: &[RawRange]) -> i16 {
+        let min = volume_bounds(ranges).0;
+        if db == f64::NEG_INFINITY { return min; }
+        match self {
+            Self::Decibels { .. } => quantize_db(db,ranges),
+            Self::LinearAmplitude => self.floor_db(db,ranges).unwrap_or(min),
+        }
+    }
+    pub(crate) fn target_fraction(self, fraction: f64, ranges: &[RawRange]) -> i16 {
+        match self {
+            Self::Decibels { .. } => quantize_volume(fraction,ranges),
+            Self::LinearAmplitude if fraction <= 0.0 => volume_bounds(ranges).0,
+            Self::LinearAmplitude => self.target_db(-80.0 + fraction.clamp(0.0,1.0)*80.0,ranges),
+        }
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+    #[test]
+    fn linear_amplitude_never_treats_raw_units_as_decibels_or_raises_safety_ceiling() {
+        let ranges = [RawRange { min:0,max:1000,resolution:1 }];
+        let curve = VolumeCurve::LinearAmplitude;
+        assert_eq!(curve.db(0,&ranges),f64::NEG_INFINITY);
+        assert!((curve.db(500,&ranges)+6.0206).abs()<0.0001);
+        assert_eq!(curve.db(1000,&ranges),0.0);
+        assert_eq!(curve.floor_db(-40.0,&ranges),Some(10));
+        assert_eq!(curve.target_db(-6.0,&ranges),501);
+        for ceiling in [-80.0,-60.0,-40.0,-20.0,-6.0,0.0] {
+            let raw=curve.floor_db(ceiling,&ranges).unwrap();
+            assert!(curve.db(raw,&ranges)<=ceiling+1e-9);
+        }
+    }
+    #[test]
+    fn minimum_mute_preserves_raw_lattice_and_other_levels() {
+        let ranges=[RawRange {min:-40*256,max:0,resolution:256}];
+        let curve=VolumeCurve::Decibels { minimum_is_mute:true };
+        assert_eq!(curve.db(-40*256,&ranges),f64::NEG_INFINITY);
+        assert_eq!(curve.db(-39*256,&ranges),-39.0);
+        assert_eq!(curve.target_db(f64::NEG_INFINITY,&ranges),-40*256);
+        assert_eq!(curve.target_fraction(0.0,&ranges),-40*256);
+    }
+}
+
+#[cfg(test)]
+mod optional_mute_detach_tests {
+    use super::*;
+    #[test]
+    fn optional_mute_may_fail_without_fabricating_a_live_detached_device() {
+        let ranges=[RawRange {min:-80*256,max:0,resolution:256}];
+        assert!(read_hardware_volume_snapshot(&[0],&ranges,|_|Ok(-40*256),||Err("USB DAC disconnected".into())).is_err());
+        let sample=read_hardware_volume_snapshot(&[0],&ranges,|_|Ok(-40*256),||Err("Pipe error".into())).unwrap();
+        assert_eq!(sample.db,-40.0);assert_eq!(sample.muted,None);assert!(sample.mute_error.is_some());
+    }
 }

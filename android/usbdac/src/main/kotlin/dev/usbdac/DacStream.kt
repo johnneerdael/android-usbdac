@@ -181,6 +181,16 @@ public class DacStream internal constructor(
         }
     }
 
+    internal fun handleForReconfigure(): Long { checkOpen(); return handle }
+
+    /** Native replacement already removed the old registration; do not close its stale token. */
+    internal fun retiredByReconfigure() {
+        if (!closed.compareAndSet(false, true)) return
+        signals.state.value = StreamState.CLOSED
+        signals.statsSource = null
+        onClosed()
+    }
+
     private fun checkOpen() {
         if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "the stream is closed")
     }

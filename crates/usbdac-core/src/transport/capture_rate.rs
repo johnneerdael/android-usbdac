@@ -95,7 +95,7 @@ impl CaptureRateProof {
             || endpoint.format.sample_rate() != self.rate || endpoint.service_us != self.service_us
             || scratch.len() != self.packets || slot.packet_sizes.len() != self.packets
             || stride == 0 || endpoint.packet_bytes == 0
-            || slot.submitted_at.is_none_or(|submitted| submitted > completed
+            || slot.submitted_at.map_or(true, |submitted| submitted > completed
                 || completed.saturating_duration_since(submitted) >= self.stale)
             || slot.packet_sizes.iter().any(|size| *size != endpoint.packet_bytes)
             || slot.packet_sizes.iter().try_fold(0usize, |sum, size| sum.checked_add(*size))

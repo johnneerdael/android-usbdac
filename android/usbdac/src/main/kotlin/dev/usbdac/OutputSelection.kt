@@ -221,6 +221,8 @@ public data class WriteFormat(
     val subslotBytes: Int,
     val validBits: Int,
     val counterRateHz: Int,
+    /** Exact source/wire encoding; unsigned8 and float32 must never be interpreted as signed PCM. */
+    val encoding: StreamEncoding = StreamEncoding.PCM,
 ) {
     /** Bytes of one frame: the unit [PcmOutput.write] takes. */
     val bytesPerFrame: Int get() = channels * subslotBytes

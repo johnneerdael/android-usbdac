@@ -126,6 +126,13 @@ pub(super) fn encode_i32_le(sample: i32) -> [u8; 4] {
     sample.to_le_bytes()
 }
 
+/// Encode exact Type I U8 from the ring's reversible centered bit representation.
+pub(super) fn encode_unsigned8_slots(input: &[i32], output: &mut [u8]) -> Result<(), String> {
+    if input.len() != output.len() { return Err("unsigned8 sample/byte count mismatch".into()); }
+    for (sample, byte) in input.iter().zip(output) { *byte = sample.to_le_bytes()[3] ^ 0x80; }
+    Ok(())
+}
+
 /// Pack PCM / DoP / native DSD for the active UAC subslot.
 ///
 /// PCM and DoP: each i32 encodes `subslot_size` wire bytes.

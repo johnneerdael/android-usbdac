@@ -8,7 +8,18 @@ pub(crate) enum DsdTransportMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PcmEncoding { Signed, Unsigned8, Float32 }
+
+impl PcmEncoding {
+    pub(super) fn format_tag(self) -> u16 {
+        match self { Self::Signed => FORMAT_TAG_PCM, Self::Unsigned8 => FORMAT_TAG_PCM8,
+            Self::Float32 => FORMAT_TAG_IEEE_FLOAT }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaybackFormat {
+    pub pcm_encoding: PcmEncoding,
     pub sample_rate: u32,
     pub bit_depth: u8,
     pub channels: u16,
@@ -86,6 +97,8 @@ pub(super) struct SessionState {
     pub(super) runtime_stats: Option<Arc<RuntimeStats>>,
     /// Routes that have supplied timely reports in OUT service interval units.
     pub(super) service_interval_feedback_routes: Arc<Mutex<HashSet<FeedbackTimebaseRoute>>>,
+    /// Scoped to this opened physical session, AC interface and clock entity.
+    pub(super) unreadable_clocks: Arc<Mutex<std::collections::HashMap<(u8, u8), u8>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,8 +143,8 @@ pub(super) struct ClockApplyOutcome {
     pub(super) message: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct HardwareVolumeControl {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HardwareVolumeControl {
     pub(super) interface_number: u8,
     pub(super) feature_unit_id: u8,
     pub(super) protocol: AudioControlProtocol,

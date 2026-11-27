@@ -59,11 +59,14 @@ SECTIONS = [
     ("Evidence", [
         ("drivers", "The three drivers studied"),
         ("evidence", "Evidence and status"),
+        ("status", "Generated capability and result ledger"),
+        ("source-backed-quirks", "Source-backed device compatibility"),
         ("references", "Public references"),
     ]),
 ]
 GUIDE_PAGES = [page for _, pages in SECTIONS for page in pages]
 NATIVE_API_PAGE = ("native-api", "Native API (Rust and JNI)")
+SOURCE_DATA_FILES = ("alsa-quirk-flags-v7.3.json", "alsa-descriptor-quirks-v7.3.json")
 
 REPOSITORY = "https://github.com/johnneerdael/android-usbdac"
 
@@ -130,6 +133,8 @@ def rewrite_links(source: str, pages: dict) -> str:
         name = pathlib.PurePosixPath(target).name
         return f"]({pages[name]}.html{anchor})" if name in pages else match.group(0)
 
+    for filename in SOURCE_DATA_FILES:
+        source = source.replace(f"](../{filename})", f"]({filename})")
     return re.sub(r"\]\(([^)#\s]+\.md)(#[^)\s]*)?\)", replace, source)
 
 
@@ -199,6 +204,8 @@ def main() -> int:
         )
         (args.output / f"{name}.html").write_text(page, encoding="utf-8")
 
+    for filename in SOURCE_DATA_FILES:
+        shutil.copyfile(args.guide.parent / filename, args.output / filename)
     shutil.copytree(args.dokka, args.output / "api")
     (args.output / ".nojekyll").write_text("", encoding="utf-8")
     print(f"site written to {args.output} ({len(sources)} pages and the API reference)")

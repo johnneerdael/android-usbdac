@@ -184,9 +184,11 @@ If a DAC cannot play a file's sample rate or bit depth, an app may ask usbdac to
 
 A Kotlin API for Android, a sample app that the guide's code is taken from, automated tests for the driver and the Kotlin layer, and published builds for four processor types.
 
+Current shipped transport boundaries and pending physical prerequisites are generated from the authoritative support manifest and checked results ledger: [capabilities and evidence](status.md).
+
 ## What it does not do yet
 
-- **One DAC at a time** per app.
+- **Concurrent-device support** follows the generated [shipped capability manifest](status.md#implementation-boundaries).
 - **Capture is PCM only**, in the device's own format. There is no DSD or float capture and no conversion on that path, and the output selector chooses playback only.
 - **No vendor-specific controls yet.** Code for fixed-rate vendor PCM streams, the Pioneer DJM and Focusrite routing controls and per-device feedback corrections is in the repository and switched off in 0.1.5. Standard USB Audio Class controls only.
 - **Limited hardware coverage.** PCM has played through Flick on the iBasso DC04U, through the SDK sample on the DC04U and on the AP80 Pro-X, and native DSD on the AP80 Pro-X. [Hardware status](evidence.md#hardware-status)

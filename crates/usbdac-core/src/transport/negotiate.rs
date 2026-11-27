@@ -167,6 +167,11 @@ pub(super) fn negotiate_playback_format(
                     candidate.endpoint_address,
                     requested_format.sample_rate,
                 );
+                if settings().has(crate::Quirk::SetInterfaceFirst) && candidate.implicit_feedback.is_none()
+                    && requested_format.dsd_transport == DsdTransportMode::None {
+                    claimed_handle.set_alternate_setting(candidate.interface_number,candidate.alt_setting)
+                        .map_err(|error| Error::Transfer(format!("interface-first negotiation activation failed: {error}")))?;
+                }
                 let clock_outcome = apply_wire_frequency(
                     &claimed_handle.handle,
                     clock,
@@ -175,7 +180,7 @@ pub(super) fn negotiate_playback_format(
                     settings().settle_delay_ms(),
                 );
                 clock_attempted = true;
-                clock_succeeded = clock_outcome.clock_ok;
+                clock_succeeded = clock_outcome.set_cur_succeeded || clock_outcome.clock_ok;
                 rate_verified = clock_outcome.rate_verified;
                 reported_rate = clock_outcome.reported_sample_rate.or(current_rate);
                 last_message = clock_outcome.message.clone();
@@ -187,6 +192,29 @@ pub(super) fn negotiate_playback_format(
                     clock.clock_id,
                     clock.interface_number,
                 );
+                let unusable_after_set = clock_outcome.set_cur_succeeded
+                    && clock_outcome.reported_sample_rate.map_or(true, |rate| rate == 0)
+                    && !clock_outcome.known_mismatch;
+                let allow_unverified = settings().allow_unusable_clock_readback(true,
+                    clock_outcome.set_cur_succeeded, clock_outcome.reported_sample_rate,
+                    uac2_choice_has_multiplier(clock_choice.as_ref()),
+                    requested_format.dsd_transport != DsdTransportMode::None);
+                if unusable_after_set && !allow_unverified {
+                    return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate,
+                        reported_hz: None });
+                }
+                if !clock_outcome.set_cur_succeeded && !clock_outcome.clock_ok {
+                    return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate,
+                        reported_hz: clock_outcome.reported_sample_rate.filter(|rate| *rate > 0) });
+                }
+                if allow_unverified {
+                    dac_mode = DacMode::FullControl;
+                    set_effective_playback_format(requested_format);
+                    set_dac_mode(dac_mode);
+                    set_clock_verification(true, true, false,
+                        clock_outcome.reported_sample_rate.filter(|rate| *rate > 0));
+                    return Ok(requested_format);
+                }
                 if clock_outcome.rate_verified
                     && clock_outcome.reported_sample_rate == Some(requested_format.sample_rate)
                 {
@@ -577,13 +605,17 @@ pub(super) fn sanitize_playback_format(playback_format: PlaybackFormat) -> Playb
         }
     } else if playback_format.dsd_transport == DsdTransportMode::Native {
         playback_format.bit_depth
+    } else if playback_format.pcm_encoding == PcmEncoding::Unsigned8 {
+        8
+    } else if playback_format.pcm_encoding == PcmEncoding::Float32 {
+        32
     } else {
         match playback_format.bit_depth {
             16 | 24 | 32 => playback_format.bit_depth,
             _ => 16,
         }
     };
-    PlaybackFormat {
+    PlaybackFormat { pcm_encoding: playback_format.pcm_encoding,
         sample_rate: playback_format.sample_rate.max(8_000),
         bit_depth,
         channels: playback_format.channels.max(1),
@@ -601,9 +633,12 @@ pub(super) fn transport_compatibility_penalty(
     let fmt_ok = if is_native_dsd {
         stream_format.native_dsd.is_some()
     } else {
-        stream_format.format_tag == FORMAT_TAG_PCM
+        stream_format.format_tag == playback_format.pcm_encoding.format_tag()
+            || stream_format.uac2_formats.is_some_and(|bits|
+                bits & (1 << (playback_format.pcm_encoding.format_tag() - 1)) != 0)
     };
-    if !fmt_ok {
+    if !fmt_ok || (!is_native_dsd && ambiguous_type_i_pcm(stream_format.uac2_formats,
+        stream_format.subslot_size, stream_format.bit_resolution)) {
         return u32::MAX;
     }
     if stream_format.subslot_size == 0 || stream_format.channels == 0 {
@@ -613,6 +648,10 @@ pub(super) fn transport_compatibility_penalty(
         return u32::MAX;
     }
     if !is_native_dsd {
+        if (playback_format.pcm_encoding == PcmEncoding::Unsigned8 && stream_format.subslot_size != 1)
+            || (playback_format.pcm_encoding == PcmEncoding::Float32 && stream_format.subslot_size != 4) {
+            return u32::MAX;
+        }
         let Some(min_subslot_size) = bytes_per_sample(playback_format.bit_depth) else {
             return u32::MAX;
         };

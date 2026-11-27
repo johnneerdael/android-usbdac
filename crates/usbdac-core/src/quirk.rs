@@ -4,16 +4,20 @@
 //! project this library was extracted from. A host can add its own entries
 //! through [`DacConfig::quirks`](crate::DacConfig::quirks).
 
+mod source;
+pub use source::{AlsaQuirkFlag, QuirkPolicy, SourceQuirkEntry, SOURCE_QUIRKS};
+pub(crate) use source::resolve as source_quirks;
+
 /// One behaviour switch for a device. Only switches the transport actually
 /// honours are listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Quirk {
     /// The clock readback is unreliable (GET_CUR/GET_RANGE return 0 or
-    /// fail). Trust SET_CUR for PCM and skip verification.
+    /// fail). Permit acknowledged PCM SET in an unverified tier.
     SkipClockValidation,
     /// The DAC reports a rate that differs from the one just set (some report
-    /// 0 Hz) while playing correctly; do not refuse over the mismatch (PCM).
+    /// 0 Hz) while playing correctly; zero remains unverified and positive mismatches are refused.
     IgnoreInvalidSampleRate,
     /// Refuse to stream unless the DAC confirms the sampling frequency, even
     /// if [`DacConfig::require_verified_rate`](crate::DacConfig) is off.
@@ -33,6 +37,36 @@ pub enum Quirk {
     /// Opt in only with a device trace proving these units (e.g. Linux UAC2 gadget).
     /// No built-in device enables this compatibility rule.
     ExplicitFeedbackPerServiceInterval,
+    /// Wait after class-control requests, including failed replies.
+    ControlMessageDelayUs(u64),
+    /// Wait after a successful SET_INTERFACE.
+    InterfaceDelayMs(u64),
+    /// Activate the proven playback alternate before clock programming.
+    SetInterfaceFirst,
+    /// Start with twelve URBs where the 255-packet cap permits.
+    PlaybackUrbFixup,
+    /// Omit unreliable frequency GET_CUR; retain CLOCK_UNVERIFIED.
+    SkipSampleRateReadback,
+    /// Refuse implicit sources for this device.
+    SkipImplicitFeedback,
+    /// The verified raw minimum means silence on playback volume controls.
+    MixerPlaybackMinMute,
+    /// The playback raw range is linear amplitude from silence to unity.
+    MixerPlaybackLinearVolume,
+    /// Exact source-backed RAW_DATA UAC2 alternate uses 32-bit big-endian words.
+    RawDsd32Be,
+    /// Skip a rate write only after fixed descriptor and exact live rate proof.
+    FixedRate,
+    /// Replace at most one empty implicit completion with measured-cadence silence.
+    ImplicitSilenceOnEmpty,
+    /// Read current clock selector pins but never rewrite them.
+    SkipClockSelectorWrites,
+    /// Skip unusable optional mixer controls; never waive rate, attenuation or SET proof.
+    IgnoreOptionalControlErrors,
+    /// Exact Zoom standard PCM OUT profile: four-byte LE audio-length prefix.
+    TxLengthPrefix,
+    /// Start bounded nominal OUT silence before a proven implicit IN source.
+    PlaybackFirst,
 }
 
 struct BuiltinEntry {

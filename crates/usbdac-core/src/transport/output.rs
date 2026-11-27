@@ -168,6 +168,12 @@ fn prepare_iso_transfer_payload_held(
     }
 
     let mut transfer_buffer = vec![0u8; total_bytes];
+    if candidate.format_tag == FORMAT_TAG_PCM8 {
+        if candidate.subslot_size != 1 || candidate.bit_resolution != 8 {
+            return Err("unsigned8 requires exactly one byte and eight valid bits".into());
+        }
+        encode_unsigned8_slots(&packet_samples, &mut transfer_buffer)?;
+    } else {
     encode_usb_pcm_slots(
         &packet_samples,
         &mut transfer_buffer,
@@ -178,6 +184,7 @@ fn prepare_iso_transfer_payload_held(
         dsd_big_endian,
         dsd_bit_reverse,
     )?;
+    }
     if held {
         // Expected silence: leave the audit latch alone.
     } else if dsd_transport != DsdTransportMode::None {
@@ -633,13 +640,20 @@ pub(super) fn run_usb_output_loop(
             return;
         }
     };
-    let (playback_first, programmed_vendor_rate) = match vendor_pcm::for_candidate(&handle, &candidate) {
+    let (vendor_playback_first, programmed_vendor_rate) = match vendor_pcm::for_candidate(&handle, &candidate) {
         Ok(profile) => (profile.is_some(), profile.as_ref().is_some_and(|profile| profile.rate_control)),
         Err(message) => { set_last_error(Some(message.clone())); set_engine_state(EngineState::Error, Some(message.clone())); shared.fail(Error::Transfer(message)); set_stream_active(false); return; }
     };
+    let playback_first=vendor_playback_first || (settings().has(crate::Quirk::PlaybackFirst)
+        && candidate.implicit_feedback.is_some() && playback_format.dsd_transport==DsdTransportMode::None);
     let channels = candidate.channels as usize;
     let bytes_per_frame = slot_bytes.saturating_mul(channels);
-    let bus_config = settings().config.clone();
+    let mut bus_config = settings().config.clone();
+    if settings().has(crate::Quirk::PlaybackUrbFixup) && candidate.implicit_feedback.is_none() {
+        // Deeper initial geometry, still subject to the same hard packet cap.
+        bus_config.bus_queue_ms = bus_config.bus_queue_ms.max(48);
+        bus_config.transfers_in_flight = bus_config.transfers_in_flight.max(12);
+    }
     let geometry = IsoQueueGeometry::for_config(candidate.service_interval_us, &bus_config);
     let mut scheduler = IsoPacketScheduler::with_geometry(
         playback_format.sample_rate,
@@ -647,7 +661,13 @@ pub(super) fn run_usb_output_loop(
         candidate.service_interval_us,
         geometry,
     );
-    let transfer_slot_count = geometry.transfer_slots;
+    // Implicit feedback owns a matched IN/OUT pool and must retain its geometry.
+    let mut adaptive_queue = crate::iso_packet_scheduler::AdaptiveQueue::new(geometry,
+        bus_config.adaptive_queue && candidate.implicit_feedback.is_none());
+    let transfer_slot_count = adaptive_queue.slots;
+    let allocated_slot_count = adaptive_queue.max_slots;
+    runtime_stats.adaptive_queue_slots.store(adaptive_queue.slots as u64, Ordering::Relaxed);
+    runtime_stats.adaptive_queue_us.store(geometry.queued_us(), Ordering::Relaxed);
     // Only declared startup delays need ordered retirement. Reuse this storage
     // until the one-shot proof completes; ordinary streams allocate nothing.
     let mut lock_retirement_order = lock_gate.pending()
@@ -767,7 +787,7 @@ pub(super) fn run_usb_output_loop(
         playback_format.sample_rate,
         candidate.service_interval_us,
         bytes_per_frame,
-    );
+    ).with_packet_prefix(data_packet_prefix_bytes());
     // Lost audio is counted in the unit `consumer_frames` uses, which for native
     // DSD is one byte per channel rather than a transport frame.
     let ring_frame_bytes = ring_bytes_per_frame(
@@ -795,8 +815,8 @@ pub(super) fn run_usb_output_loop(
     );
     let transfer_buffer_capacity = scheduler
         .packets_per_transfer()
-        .saturating_mul(candidate.max_packet_bytes.max(1));
-    let mut slots = Vec::with_capacity(transfer_slot_count);
+        .saturating_mul(candidate.max_packet_bytes.max(1).saturating_add(data_packet_prefix_bytes()));
+    let mut slots = Vec::with_capacity(allocated_slot_count);
     let mut active_slots = 0usize;
     let mut explicit_feedback_fault = feedback_start_error.is_some();
     let mut out_flush_deadline: Option<Instant> = None;
@@ -856,7 +876,7 @@ pub(super) fn run_usb_output_loop(
         if !audio_status.is_active() { thread::sleep(Duration::from_millis(2)); }
     }
 
-    for slot_index in 0..transfer_slot_count {
+    for slot_index in 0..allocated_slot_count {
         if fatal_error.is_some() || usb_stop_requested(&stop) {
             break;
         }
@@ -1052,7 +1072,7 @@ pub(super) fn run_usb_output_loop(
         }
     }
     if fatal_error.is_none() {
-        for slot in slots.iter_mut() {
+        for slot in slots.iter_mut().take(transfer_slot_count) {
             if slot.in_flight { continue; }
             if usb_stop_requested(&stop) {
                 break;
@@ -1074,7 +1094,7 @@ pub(super) fn run_usb_output_loop(
                 playback_format.dsd_transport,
                 dsd_big_endian,
                 dsd_bit_reverse,
-                lock_gate.pending(),
+                lock_gate.pending() || implicit.as_ref().is_some_and(|engine|engine.pattern_is_silence()),
             ) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => continue,
@@ -1131,6 +1151,11 @@ pub(super) fn run_usb_output_loop(
         capture_failure = Some(error);
     }
     if let Some(engine) = implicit.as_mut() { engine.running = active_slots > 0; }
+    let mut previous_worker_at = Instant::now();
+    let nominal_guarded = candidate.is_uac1 && candidate.usb_speed == Speed::Full
+        && candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none()
+        && candidate.implicit_feedback.is_none();
+    let mut nominal_starvation = crate::iso_packet_scheduler::NominalStarvation::default();
     while fatal_error.is_none() && !usb_stop_requested(&stop) {
         if active_slots == 0 && implicit.is_none() { break; }
         // Retire and refill the whole event batch with the startup decision
@@ -1264,6 +1289,20 @@ pub(super) fn run_usb_output_loop(
             }
         }
 
+        let now = Instant::now();
+        let gap_us = now.saturating_duration_since(previous_worker_at).as_micros().min(u128::from(u64::MAX)) as u64;
+        previous_worker_at = now;
+        runtime_stats.max_worker_gap_us.fetch_max(gap_us, Ordering::Relaxed);
+        if gap_us > 10_000 { runtime_stats.worker_gap_over_10ms.fetch_add(1, Ordering::Relaxed); }
+        if gap_us > 50_000 { runtime_stats.worker_gap_over_50ms.fetch_add(1, Ordering::Relaxed); }
+        // Ring occupancy describes the producer, not the DAC FIFO. A full
+        // ring is normal and must never terminate nominal playback.
+        if nominal_guarded && nominal_starvation.observe(stream_started_at.elapsed().as_millis() as u64,
+            runtime_stats.buffered_samples.load(Ordering::Acquire),
+            !runtime_stats.paused.load(Ordering::Acquire) && !runtime_stats.draining.load(Ordering::Acquire)) {
+            log_warn!("[USB] Nominal asynchronous producer ring empty for 5 seconds; DAC FIFO drift is unobservable from host occupancy");
+        }
+        let mut batch_lossy = false;
         let mut latest_playback_completion = None;
         let retirement_count = if batch_lock_pending {
             let order = lock_retirement_order.as_mut().expect("pending lock has retirement storage");
@@ -1430,6 +1469,7 @@ pub(super) fn run_usb_output_loop(
 
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
                 .with_held(completed_held);
+            batch_lossy |= urb_loss.lost_frames > 0;
             let verdict = loss_tracker.record(queued_frame_count, urb_loss);
             if verdict.lossy || urb_loss.short_packets > 0 || urb_loss.zero_packets > 0 {
                 publish_transport_loss(&runtime_stats, &loss_tracker);
@@ -1551,7 +1591,7 @@ pub(super) fn run_usb_output_loop(
             }
 
             let mut submit_gap_us = 0u64;
-            if fatal_error.is_none() && !usb_stop_requested(&stop) && implicit.is_none() {
+            if fatal_error.is_none() && !usb_stop_requested(&stop) && implicit.is_none() && active_slots < adaptive_queue.slots {
                 match submit_next_transfer(
                     slot,
                     &handle,
@@ -1666,6 +1706,28 @@ pub(super) fn run_usb_output_loop(
                 set_usb_stream_stable(false);
             }
         }
+        if adaptive_queue.observe(stream_started_at.elapsed().as_millis() as u64, batch_lossy) {
+            runtime_stats.adaptive_queue_changes.fetch_add(1, Ordering::Relaxed);
+            runtime_stats.adaptive_queue_slots.store(adaptive_queue.slots as u64, Ordering::Relaxed);
+            runtime_stats.adaptive_queue_us.store(adaptive_queue.slots as u64 * geometry.transfer_us(), Ordering::Relaxed);
+            log_info!("[USB] Adaptive queue: {} active slots, {} us coverage (packet cap {})",
+                adaptive_queue.slots, adaptive_queue.slots as u64 * geometry.transfer_us(),
+                crate::iso_packet_scheduler::PACKET_FLIGHT_LIMIT - 1);
+        }
+        if implicit.is_none() && fatal_error.is_none() && !usb_stop_requested(&stop) {
+            for slot in slots.iter_mut().filter(|slot| !slot.in_flight) {
+                if active_slots >= adaptive_queue.slots { break; }
+                match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
+                    &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
+                    dsd_bit_reverse, batch_lock_pending, &mut logged_transfer_preview, &mut logged_usb_encode_format,
+                    &mut underrun_count, &shared, &mut was_underrun) {
+                    Ok(true) => active_slots += 1,
+                    Ok(false) => (),
+                    Err(error) => { fatal_error = Some(error); break; }
+                }
+            }
+            runtime_stats.transfer_queue_depth.store(active_slots, Ordering::Relaxed);
+        }
         if let Some(deadline) = out_flush_deadline {
             if !slots.iter().any(|slot| slot.in_flight && slot.cancelled_for_flush) {
                 out_flush_deadline = None;
@@ -1699,7 +1761,7 @@ pub(super) fn run_usb_output_loop(
                     scheduler.set_packet_pattern(pattern);
                     match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
                         &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
-                        dsd_bit_reverse, batch_lock_pending, &mut logged_transfer_preview, &mut logged_usb_encode_format,
+                        dsd_bit_reverse, batch_lock_pending || engine.pattern_is_silence(), &mut logged_transfer_preview, &mut logged_usb_encode_format,
                         &mut underrun_count, &shared, &mut was_underrun) {
                         Ok(true) => {
                             active_slots += 1;

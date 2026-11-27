@@ -51,6 +51,12 @@ pub(crate) struct RuntimeStats {
     pub(crate) max_transfer_turnaround_us: AtomicU64,
     pub(crate) last_submit_gap_us: AtomicU64,
     pub(crate) max_submit_gap_us: AtomicU64,
+    pub(crate) worker_gap_over_10ms: AtomicU64,
+    pub(crate) worker_gap_over_50ms: AtomicU64,
+    pub(crate) max_worker_gap_us: AtomicU64,
+    pub(crate) adaptive_queue_changes: AtomicU64,
+    pub(crate) adaptive_queue_slots: AtomicU64,
+    pub(crate) adaptive_queue_us: AtomicU64,
     pub(crate) effective_consumer_rate_milli_hz: AtomicU64,
     pub(crate) feedback_reports: AtomicU64,
     pub(crate) feedback_timeouts: AtomicU64,
@@ -178,6 +184,12 @@ impl RuntimeStats {
             max_transfer_turnaround_us: AtomicU64::new(0),
             last_submit_gap_us: AtomicU64::new(0),
             max_submit_gap_us: AtomicU64::new(0),
+            worker_gap_over_10ms: AtomicU64::new(0),
+            worker_gap_over_50ms: AtomicU64::new(0),
+            max_worker_gap_us: AtomicU64::new(0),
+            adaptive_queue_changes: AtomicU64::new(0),
+            adaptive_queue_slots: AtomicU64::new(0),
+            adaptive_queue_us: AtomicU64::new(0),
             effective_consumer_rate_milli_hz: AtomicU64::new(0),
             feedback_reports: AtomicU64::new(0),
             feedback_timeouts: AtomicU64::new(0),
@@ -378,7 +390,13 @@ impl PcmRing {
     /// the top, which is what the encoder expects), or for native DSD one byte
     /// per ring sample. Takes whole wire frames (`subslot * channels` bytes)
     /// only and returns the bytes consumed.
+    #[cfg(test)]
     pub(super) fn push_bytes(&mut self, bytes: &[u8], subslot: usize, native_dsd: bool) -> usize {
+        self.push_bytes_encoding(bytes, subslot, native_dsd, false)
+    }
+
+    pub(super) fn push_bytes_encoding(&mut self, bytes: &[u8], subslot: usize,
+        native_dsd: bool, unsigned8: bool) -> usize {
         // Native DSD has byte-valued ring entries even for 64-bit words.
         // Keep PCM limited to its i32 container independently.
         let subslot = if native_dsd {
@@ -403,6 +421,8 @@ impl PcmRing {
             } else {
                 let mut word = [0u8; 4];
                 word[4 - subslot..].copy_from_slice(chunk);
+                // Center U8 around signed zero using bits only; the encoder reverses this mapping.
+                if unsigned8 { word[3] ^= 0x80; }
                 i32::from_le_bytes(word)
             };
             self.samples[self.write_index] = sample;

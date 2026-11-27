@@ -41,14 +41,20 @@ pub(crate) fn playback_format_from_request(
         return invalid("channels must be between 1 and 32");
     }
     let format = match request.encoding {
-        Encoding::Pcm => {
+        Encoding::Pcm | Encoding::PcmU8 | Encoding::PcmFloat32 => {
             if request.sample_rate < 8_000 || request.sample_rate > 1_536_000 {
                 return invalid("sample_rate must be between 8000 and 1536000 Hz");
             }
-            if !matches!(request.bit_depth, 16 | 24 | 32) {
-                return invalid("PCM bit_depth must be 16, 24 or 32");
+            let pcm_encoding = match request.encoding {
+                Encoding::Pcm => PcmEncoding::Signed,
+                Encoding::PcmU8 if request.bit_depth == 8 => PcmEncoding::Unsigned8,
+                Encoding::PcmFloat32 if request.bit_depth == 32 => PcmEncoding::Float32,
+                _ => return invalid("unsigned PCM requires 8 bits; IEEE float requires 32 bits"),
+            };
+            if pcm_encoding == PcmEncoding::Signed && !matches!(request.bit_depth, 16 | 24 | 32) {
+                return invalid("signed PCM bit_depth must be 16, 24 or 32");
             }
-            PlaybackFormat {
+            PlaybackFormat { pcm_encoding,
                 sample_rate: request.sample_rate,
                 bit_depth: request.bit_depth,
                 channels: request.channels,
@@ -64,7 +70,7 @@ pub(crate) fn playback_format_from_request(
             if !matches!(request.bit_depth, 24 | 32) {
                 return invalid("DoP bit_depth must be 24 or 32");
             }
-            PlaybackFormat {
+            PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
                 sample_rate: request.sample_rate,
                 bit_depth: request.bit_depth,
                 channels: request.channels,
@@ -77,7 +83,7 @@ pub(crate) fn playback_format_from_request(
             if !valid_native_dsd_bit_rate(bit_rate) {
                 return invalid("the native DSD bit_rate must be a DSD rate (at least 2822400)");
             }
-            PlaybackFormat {
+            PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
                 // The wire rate for a 4-byte subslot; the real one follows from
                 // the alternate setting that gets chosen.
                 sample_rate: bit_rate / 32,
@@ -242,6 +248,15 @@ pub(crate) fn open_stream(format: &StreamFormat, events: EventSink) -> Result<St
         }
     }
     start_stream(events, format)
+}
+
+pub(crate) fn volume_route_signature() -> Option<HardwareVolumeControl> {
+    SESSION_STATE.lock().as_ref().and_then(|state| state.hardware_volume_control.clone())
+}
+
+/// The exact libusb owner retained after a normal lock-requested stream retires.
+pub(crate) fn retained_usb_handle_identity() -> Option<usize> {
+    IDLE_LOCK.lock().as_ref().map(|lock| lock.handle.as_raw() as usize)
 }
 
 /// The DAC's capabilities, from the descriptor scan done at open.

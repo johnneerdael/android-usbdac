@@ -12,12 +12,13 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.audio.AudioSink
 import dev.usbdac.DacException
 import dev.usbdac.StreamRequest
+import dev.usbdac.StreamEncoding
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 // region sink-layout
 /**
- * How Media3's PCM maps onto what the output wants. Media3 hands over little-endian PCM in 2, 3 or 4
+ * How Media3's PCM maps onto what the output wants. Media3 hands over little-endian PCM in 1, 2, 3 or 4
  * bytes per sample. The output wants the layout of its [dev.usbdac.WriteFormat]: the same, or a wider
  * slot with the sample left-justified (24 bits in a 4-byte slot is the sample shifted left by 8).
  */
@@ -44,7 +45,7 @@ fun repack(source: ByteBuffer, inputBytes: Int, outputBytes: Int, samples: Int, 
 /**
  * An [AudioSink] that plays Media3's decoded PCM through an [OutputSource]: direct USB when the DAC
  * allows it, otherwise whatever the library's selector chose. It does no processing: no gain, no speed
- * change, no silence skipping. Stereo and mono integer PCM only.
+ * change, no silence skipping. Stereo and mono signed integer PCM, unsigned8 and IEEE float32.
  *
  * Media3 calls it from its playback thread, one call at a time.
  */
@@ -87,10 +88,12 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (format.sampleMimeType == MimeTypes.AUDIO_RAW && bitDepthOf(format.pcmEncoding) != null && format.channelCount in 1..2) {
             AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
         } else {
-            AudioSink.SINK_FORMAT_UNSUPPORTED // float, 8-bit, more than two channels, compressed audio
+            AudioSink.SINK_FORMAT_UNSUPPORTED // more than two channels, unsupported layouts, compressed audio
         }
 
     private fun bitDepthOf(pcmEncoding: Int): Int? = when (pcmEncoding) {
+        C.ENCODING_PCM_8BIT -> 8
+        C.ENCODING_PCM_FLOAT -> 32
         C.ENCODING_PCM_16BIT -> 16
         C.ENCODING_PCM_24BIT -> 24
         C.ENCODING_PCM_32BIT -> 32
@@ -108,7 +111,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         }
         val bits = bitDepthOf(format.pcmEncoding)
         if (format.sampleMimeType != MimeTypes.AUDIO_RAW || bits == null || format.channelCount !in 1..2) {
-            throw AudioSink.ConfigurationException("not integer PCM in one or two channels", format)
+            throw AudioSink.ConfigurationException("not supported Type I PCM in one or two channels", format)
         }
         require(format.sampleRate > 0) { "sample rate must be positive" }
         require(format.encoderDelay >= 0 && format.encoderPadding >= 0) { "negative encoder trim" }
@@ -120,7 +123,11 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         trimBuffer = null
         pendingFormat = format
         // Nothing is opened here. The output opens in handleBuffer, after the one in use has played out.
-        wanted = Wanted(format, StreamRequest.pcm(format.sampleRate, format.channelCount, bits))
+        wanted = Wanted(format, when (format.pcmEncoding) {
+            C.ENCODING_PCM_8BIT -> StreamRequest.pcmU8(format.sampleRate, format.channelCount)
+            C.ENCODING_PCM_FLOAT -> StreamRequest.pcmFloat32(format.sampleRate, format.channelCount)
+            else -> StreamRequest.pcm(format.sampleRate, format.channelCount, bits)
+        })
     }
     // endregion
 
@@ -270,6 +277,24 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             drainingForSwitch = true
         }
         if (!out.output.isDrained) return false
+        val replacement = try { outputs.reconfigure(out, next.request) } catch (error: DacException) {
+            throw AudioSink.InitializationException("USB reconfiguration failed: ${error.detail}", 0, next.format, false, error)
+        }
+        if (replacement != null) {
+            active = replacement.opened
+            layout = outputLayout(replacement.opened, replacement.opened.request, next.format)
+            drainingForSwitch = false
+            startMediaTimeUsNeedsInit = true
+            submittedFrames = 0
+            receivedFrames = 0
+            trimmedStartFrames = 0
+            replacement.rollbackCause?.let { error ->
+                throw AudioSink.InitializationException("requested USB format failed; old format restored paused: ${error.detail}",
+                    0, next.format, false, error)
+            }
+            if (playing) replacement.opened.output.play() else replacement.opened.output.pause()
+            return true
+        }
         closeActive()
         startMediaTimeUsNeedsInit = true
         submittedFrames = 0
@@ -279,7 +304,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     }
 
     private fun sameFormat(a: StreamRequest, b: StreamRequest) =
-        a.sampleRate == b.sampleRate && a.channels == b.channels && a.bitDepth == b.bitDepth
+        a.sampleRate == b.sampleRate && a.channels == b.channels && a.bitDepth == b.bitDepth && a.encoding == b.encoding
 
     private fun openOutput(): OpenedOutput {
         val next = checkNotNull(wanted) { "configure() comes before the first buffer" }
@@ -288,19 +313,26 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         } catch (error: DacException) {
             throw AudioSink.InitializationException("no output can play ${next.request}: ${error.message}", 0, next.format, false, error)
         }
-        val write = out.format
-        if (write.subslotBytes !in 2..4 || write.subslotBytes < next.request.bitDepth / 8 ||
-            write.validBits !in next.request.bitDepth..(write.subslotBytes * 8) ||
-            write.channels != next.request.channels || write.sampleRate != next.request.sampleRate ||
-            write.counterRateHz != next.request.sampleRate) {
-            outputs.close(out)
-            throw AudioSink.InitializationException("the output wants ${write}, which is not a widening of ${next.request}", 0, next.format, false, null)
-        }
         active = out
         drainingForSwitch = false
-        layout = SinkLayout(next.request.bitDepth / 8, write.subslotBytes, write.channels, write.sampleRate, write.counterRateHz)
+        layout = outputLayout(out, next.request, next.format)
         if (!playing) out.output.pause()
         return out
+    }
+
+    private fun outputLayout(out: OpenedOutput, request: StreamRequest, format: Format): SinkLayout {
+        val write = out.format
+        if (write.encoding != request.encoding ||
+            (write.encoding == StreamEncoding.PCM_U8 && write.subslotBytes != 1) ||
+            (write.encoding == StreamEncoding.PCM_FLOAT32 && write.subslotBytes != 4) ||
+            write.subslotBytes !in 1..4 || write.subslotBytes < request.bitDepth / 8 ||
+            write.validBits !in request.bitDepth..(write.subslotBytes * 8) ||
+            write.channels != request.channels || write.sampleRate != request.sampleRate ||
+            write.counterRateHz != request.sampleRate) {
+            outputs.close(out)
+            throw AudioSink.InitializationException("the output wants ${write}, which is not a widening of ${request}", 0, format, false, null)
+        }
+        return SinkLayout(request.bitDepth / 8, write.subslotBytes, write.channels, write.sampleRate, write.counterRateHz)
     }
 
     private fun closeActive() {

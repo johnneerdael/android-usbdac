@@ -50,7 +50,10 @@ impl Adc3Route {
             if route.profile != wire::FunctionProfile::Full { return None; }
             route.header.as_ref().filter(|header|
                 header.controls.access(3) == wire::ControlAccess::ReadOnly)
-                .map(|_| (route.interface, if route.native_dsd.is_some() { 1 << 5 } else { 1 }))
+                .map(|_| (route.interface, if route.native_dsd.is_some() { 1 << 5 } else {
+                    1 << (route.header.as_ref().and_then(|h| adc3_pcm_encoding(h, false))
+                        .unwrap_or(PcmEncoding::Signed).format_tag() - 1)
+                }))
         })
     }
 
@@ -136,6 +139,21 @@ fn validate_adc3_format_control(header: &wire::AsHeader) -> Result<(), String> {
         _ => Err("ADC3 AS Format control is reserved or writable".into()),
     }
 }
+fn adc3_pcm_encoding(header: &wire::AsHeader, capture: bool) -> Option<PcmEncoding> {
+    if ambiguous_type_i_pcm(Some((header.formats & 7) as u32), header.subslot_size, header.bit_resolution) {
+        return None;
+    }
+    if header.formats & 1 != 0 && matches!(header.subslot_size, 2..=4)
+        && matches!(header.bit_resolution, 16 | 24 | 32) { return Some(PcmEncoding::Signed); }
+    if !capture && header.formats & 2 != 0 && header.subslot_size == 1 && header.bit_resolution == 8 {
+        return Some(PcmEncoding::Unsigned8);
+    }
+    if !capture && header.formats & 4 != 0 && header.subslot_size == 4 && header.bit_resolution == 32 {
+        return Some(PcmEncoding::Float32);
+    }
+    None
+}
+
 // USB-IF Frmts30 section 2.3.1.6.5 / Table A-2 assigns D5 to DSD;
 // D6 is unrelated RAW_DATA. DSD carries one 64-bit word per channel.
 fn adc3_standard_encoding(header: &wire::AsHeader, capture: bool) -> Result<Option<NativeDsdProfile>, String> {
@@ -147,10 +165,7 @@ fn adc3_standard_encoding(header: &wire::AsHeader, capture: bool) -> Result<Opti
         return Ok(Some(NativeDsdProfile { word_bytes: 8, big_endian: false,
             bit_reverse: false, origin: NativeDsdOrigin::StandardAdc3 }));
     }
-    if header.formats & 1 != 0 && matches!(header.subslot_size, 2..=4)
-        && matches!(header.bit_resolution, 16 | 24 | 32) {
-        return Ok(None);
-    }
+    if adc3_pcm_encoding(header, capture).is_some() { return Ok(None); }
     Err("ADC3 alternate has no implemented standard encoding/geometry".into())
 }
 
@@ -177,7 +192,8 @@ fn adc3_playback_format(route: &Adc3Route, rate: u32) -> Result<PlaybackFormat, 
             .ok_or("ADC3 native DSD bit rate overflows")?,
         None => 0,
     };
-    Ok(PlaybackFormat { sample_rate: rate, channels: route.pcm.0,
+    Ok(PlaybackFormat { pcm_encoding: route.header.as_ref().and_then(|h| adc3_pcm_encoding(h, false))
+        .unwrap_or(PcmEncoding::Signed), sample_rate: rate, channels: route.pcm.0,
         bit_depth: if native.is_some() { 1 } else { route.pcm.2 }, is_dop: false,
         dsd_transport: if native.is_some() { DsdTransportMode::Native } else { DsdTransportMode::None },
         dsd_bit_rate: bit_rate })
@@ -592,7 +608,7 @@ fn read_exact(
     request: u8,
     data: &mut [u8],
 ) -> Result<(), String> {
-    let n = handle
+    let result = handle
         .read_control(
             0xa1,
             request,
@@ -600,8 +616,9 @@ fn read_exact(
             u16::from(control) | (u16::from(entity) << 8),
             data,
             Duration::from_secs(1),
-        )
-        .map_err(|e| format!("ADC3 control read: {e}"))?;
+        );
+    itf_class_control_delay(handle);
+    let n=result.map_err(|e| format!("ADC3 control read: {e}"))?;
     if n != data.len() {
         return Err("ADC3 control response has wrong width".into());
     }
@@ -614,7 +631,7 @@ fn write_exact(
     selector: u8,
     data: &[u8],
 ) -> Result<(), String> {
-    let n = handle
+    let result = handle
         .write_control(
             0x21,
             1,
@@ -622,8 +639,9 @@ fn write_exact(
             u16::from(control) | (u16::from(entity) << 8),
             data,
             Duration::from_secs(1),
-        )
-        .map_err(|e| format!("ADC3 control write: {e}"))?;
+        );
+    itf_class_control_delay(handle);
+    let n=result.map_err(|e| format!("ADC3 control write: {e}"))?;
     if n != data.len() {
         return Err("ADC3 control write has wrong width".into());
     }
@@ -1193,7 +1211,10 @@ fn adc3_alternate_base(
         max_packet_bytes: packet_bytes,
         sync_type: ep.sync_type(),
         usage_type: ep.usage_type(),
-        format_tag: if route.native_dsd.is_some() { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM },
+        format_tag: if route.native_dsd.is_some() { FORMAT_TAG_DSD } else {
+            route.header.as_ref().and_then(|h| adc3_pcm_encoding(h, capture))
+                .unwrap_or(PcmEncoding::Signed).format_tag()
+        },
         uac2_formats: None,
         native_dsd: route.native_dsd,
         channels,
@@ -1697,7 +1718,7 @@ pub(super) fn select_standalone_adc3_capture(
         let Ok(format) = crate::capture::CaptureFormat::pcm(request.sample_rate,
             candidate.bit_resolution, candidate.subslot_size, map) else { return false; };
         format.satisfies(request) && adc3_candidate_matches(&claimed.handle, candidate, route,
-            PlaybackFormat { sample_rate: request.sample_rate, channels: request.channels,
+            PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: request.sample_rate, channels: request.channels,
                 bit_depth: request.valid_bits, is_dop: false,
                 dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 })
     };
@@ -1924,9 +1945,11 @@ impl Adc3PowerLease {
             data: state.as_mut_ptr().cast(),
         };
         let n = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &request) };
+        let failure=(n<0).then(std::io::Error::last_os_error);
+        class_control_delay();
         if n != 1 {
-            return Err(if n < 0 {
-                std::io::Error::last_os_error().to_string()
+            return Err(if let Some(error)=failure {
+                error.to_string()
             } else {
                 "ADC3 power control width mismatch".into()
             });
@@ -1993,6 +2016,9 @@ impl Adc3LeaseClockIo<'_> {
             request: 1, value: u16::from(selector) << 8, index: u16::from(self.control) | (u16::from(entity) << 8),
             length: pin.len() as u16, timeout_ms: 1000, data: pin.as_mut_ptr().cast() };
         let n = unsafe { libc::ioctl(self.lease.fd, USBDEVFS_CONTROL, &request) };
+        let failure=(n<0).then(std::io::Error::last_os_error);
+        class_control_delay();
+        if let Some(error)=failure {return Err(format!("ADC3 clock control failed: {error}"));}
         if n != pin.len() as i32 { return Err(format!("ADC3 clock control transferred {n}, expected {}", pin.len())); }
         Ok(())
     }
@@ -2002,6 +2028,10 @@ impl ClockPlanIo for Adc3LeaseClockIo<'_> {
         let mut pin = [0]; self.transfer(true, selector, &mut pin)?; Ok(pin[0])
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        if settings().has(crate::Quirk::SkipClockSelectorWrites) {
+            let current=self.read_pin(selector)?;
+            if !selector_write_required(true,current,pin)? {return Ok(());}
+        }
         self.verify_ratios()?;
         self.transfer(false, selector, &mut [pin])?;
         self.verify_ratios()
@@ -2059,6 +2089,10 @@ impl ClockPlanIo for Adc3ClockIo<'_> {
         let mut pin = [0]; read_exact(self.handle, self.route.control, selector, 1, 1, &mut pin)?; Ok(pin[0])
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        if settings().has(crate::Quirk::SkipClockSelectorWrites) {
+            let current=self.read_pin(selector)?;
+            if !selector_write_required(true,current,pin)? {return Ok(());}
+        }
         verify_adc3_route_ratios(self.route, |entity, selector, bytes|
             read_exact(self.handle, self.route.control, entity, selector, 1, bytes))?;
         write_exact(self.handle, self.route.control, selector, 1, &[pin])?;
@@ -2705,7 +2739,8 @@ pub(super) fn adc3_candidate_matches_ranges(candidate: &IsoStreamCandidate, rang
         (DsdTransportMode::DoP, None) if candidate.format_tag == FORMAT_TAG_PCM
             && matches!(requested.bit_depth, 24 | 32)
             && requested.bit_depth == candidate.bit_resolution && candidate.subslot_size >= 3 => requested.sample_rate,
-        (DsdTransportMode::None, None) if requested.bit_depth == candidate.bit_resolution => requested.sample_rate,
+        (DsdTransportMode::None, None) if requested.bit_depth == candidate.bit_resolution
+            && requested.pcm_encoding.format_tag() == candidate.format_tag => requested.sample_rate,
         _ => return false,
     };
     requested.channels == candidate.channels
@@ -3376,7 +3411,7 @@ mod tests {
         candidate.native_dsd = adc3_standard_encoding(&native_header(), false).unwrap();
         candidate.subslot_size = 8; candidate.bit_resolution = 64;
         candidate.max_packet_bytes = 720;
-        let requested = PlaybackFormat { sample_rate: 88_200, channels: 2, bit_depth: 1,
+        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 88_200, channels: 2, bit_depth: 1,
             is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 2_822_400 };
         let ranges = [SamplingFrequencySubrange { min: 44_100, max: 44_100, res: 0 }];
         assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
@@ -3402,7 +3437,7 @@ mod tests {
         let all_words = [SamplingFrequencySubrange { min: 44_100, max: 800_001, res: 1 }];
         assert_eq!(representative_sample_rates_from_ranges(&adc3_encoding_ranges(candidate.native_dsd, &all_words)),
             ADC3_DSD_WORD_RATES.to_vec());
-        assert!(!adc3_candidate_matches_ranges(&candidate, &all_words, PlaybackFormat {
+        assert!(!adc3_candidate_matches_ranges(&candidate, &all_words, PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 264_600, channels: 2, bit_depth: 1, is_dop: false,
             dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 132_300 * 64 }));
         let mut route = live_test_route();
@@ -3419,7 +3454,7 @@ mod tests {
         assert_eq!(rates, vec![88_200, 176_400, 352_800, 705_600]);
         assert!(published.iter().all(|range| range.min == range.max && range.res == 0));
         for rate in rates {
-            let requested = PlaybackFormat { sample_rate: rate * 2, channels: 2, bit_depth: 1,
+            let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: rate * 2, channels: 2, bit_depth: 1,
                 is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: rate * 64 };
             assert!(adc3_candidate_matches_ranges(&candidate, &published, requested));
             assert!(validate_adc3_static_rate(&route, rate).is_ok());
@@ -3427,7 +3462,7 @@ mod tests {
         // The range's arbitrary endpoint and nonstandard intermediate clock
         // words never become native DSD capabilities or selectable rates.
         for rate in [44_100, 132_300, 749_700, 882_000] {
-            let requested = PlaybackFormat { sample_rate: rate * 2, channels: 2, bit_depth: 1,
+            let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: rate * 2, channels: 2, bit_depth: 1,
                 is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: rate * 64 };
             assert!(!adc3_candidate_matches_ranges(&candidate, &published, requested));
             assert!(validate_adc3_static_rate(&route, rate).is_err());
@@ -3447,7 +3482,7 @@ mod tests {
     fn dop_matches_exact_pcm_carrier_without_admitting_native_or_badd() {
         let mut candidate = pcm_candidate();
         candidate.service_interval_us = 125; candidate.max_packet_bytes = 184;
-        let requested = PlaybackFormat { sample_rate: 176_400, channels: 2, bit_depth: 32,
+        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 176_400, channels: 2, bit_depth: 32,
             is_dop: true, dsd_transport: DsdTransportMode::DoP, dsd_bit_rate: 0 };
         let ranges = [SamplingFrequencySubrange { min: 176_400, max: 176_400, res: 0 }];
         assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
@@ -3618,7 +3653,7 @@ mod tests {
         replacement.implicit.as_mut().unwrap().endpoint.0 = 0x82;
         assert!(!adc3_live_route_compatible(&paired, &replacement));
         let candidate = pcm_candidate();
-        let requested = PlaybackFormat { sample_rate: 48_000, channels: candidate.channels,
+        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 48_000, channels: candidate.channels,
             bit_depth: candidate.bit_resolution, is_dop: false, dsd_transport: DsdTransportMode::None,
             dsd_bit_rate: 0 };
         let ranges = [SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }];
@@ -3754,7 +3789,7 @@ mod tests {
         assert!(sampling_frequency_ranges_support_rate(&pairs[0].2, 89_100));
         assert!(!sampling_frequency_ranges_support_rate(&pairs[1].2, 48_100));
         assert!(!sampling_frequency_ranges_support_rate(&pairs[0].2, 44_100));
-        let requested = PlaybackFormat { sample_rate: 44_100, channels: sink.channels,
+        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 44_100, channels: sink.channels,
             bit_depth: sink.bit_resolution, is_dop: false,
             dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
         let chosen = pairs.iter().find(|(candidate, _, ranges)|

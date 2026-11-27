@@ -37,8 +37,10 @@ use crate::output_position::{
 };
 use crate::payload_audit_latch::PayloadAuditLatch;
 use crate::settings::settings;
+#[cfg(test)]
+use crate::volume_control::quantize_volume;
 use crate::volume_control::{
-    parse_uac2_volume_ranges, quantize_volume,
+    parse_uac2_volume_ranges,
     read_hardware_volume_snapshot, volume_bounds, AudioControlProtocol, OriginalVolumeSlot,
     RawRange,
 };
@@ -194,3 +196,25 @@ use volume_hw::*;
 mod implicit;
 mod implicit_ranges;
 use implicit::*;
+
+/// Exercise the same bounded parsers used for untrusted USB control replies.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn fuzz_transport_bytes(data: &[u8]) {
+    for speed in [Speed::Full,Speed::High,Speed::Super,Speed::SuperPlus] {
+        for interval in [0,125,250,1000,4_096_000] {
+            let _ = iso::decode_feedback_report(data,interval,speed);
+        }
+    }
+    let _ = clock::parse_sampling_frequency_ranges(data);
+    let _ = adc3::functions(data);
+}
+
+#[cfg(test)]
+mod fuzz_transport_regression {
+    #[test]
+    fn malformed_short_and_extreme_replies_remain_bounded() {
+        for bytes in [&[][..], &[0][..], &[0xff,0xff][..], &[0;8][..], &[0xff;514][..]] {
+            super::fuzz_transport_bytes(bytes);
+        }
+    }
+}

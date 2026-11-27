@@ -209,7 +209,7 @@ impl CaptureFormat {
             && request
                 .channel_map
                 .as_ref()
-                .is_none_or(|map| map == &self.channel_map)
+                .map_or(true, |map| map == &self.channel_map)
     }
 }
 

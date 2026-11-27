@@ -86,6 +86,27 @@ pub(super) struct IsoTransferSlot {
     pub(super) cancelled_for_flush: bool,
 }
 
+pub(super) fn data_packet_prefix_bytes() -> usize {
+    if settings().has(crate::Quirk::TxLengthPrefix) {4} else {0}
+}
+
+fn add_tx_length_prefix(payload:&mut IsoTransferPayload) -> Result<(),String> {
+    let expected=payload.packet_sizes.iter().try_fold(0usize,|sum,size|sum.checked_add(*size)).ok_or("ISO payload size overflow")?;
+    if expected!=payload.transfer_buffer.len() {return Err("TX_LENGTH payload schedule changed".into());}
+    let capacity=expected.checked_add(payload.packet_sizes.len().checked_mul(4).ok_or("TX_LENGTH header count overflow")?).ok_or("TX_LENGTH wire capacity overflow")?;
+    let mut wire=Vec::with_capacity(capacity);
+    let mut offset=0;
+    for size in &mut payload.packet_sizes {
+        let length=u32::try_from(*size).map_err(|_|"TX_LENGTH audio span too large")?;
+        wire.extend_from_slice(&length.to_le_bytes());
+        wire.extend_from_slice(&payload.transfer_buffer[offset..offset+*size]);
+        offset+=*size;
+        *size+=4;
+    }
+    payload.transfer_buffer=wire;
+    Ok(())
+}
+
 pub(super) struct IsoTransferPayload {
     pub(super) packet_sizes: Vec<usize>,
     pub(super) packet_samples: Vec<i32>,
@@ -149,7 +170,7 @@ impl IsoTransferSlot {
     }
 
     pub(super) fn submit_with_timeout(&mut self, handle: &DeviceHandle<Context>, endpoint: u8,
-        payload: IsoTransferPayload, timeout_ms: u32) -> Result<(), String> {
+        mut payload: IsoTransferPayload, timeout_ms: u32) -> Result<(), String> {
         if self.in_flight {
             return Err("isochronous transfer slot already has a transfer in flight".to_string());
         }
@@ -162,6 +183,11 @@ impl IsoTransferSlot {
             ));
         }
 
+        // Payload verification ran before framing. The extra bytes carry no
+        // samples and never enter queued frame/music counts.
+        if endpoint & 0x80 == 0 && settings().has(crate::Quirk::TxLengthPrefix) {
+            add_tx_length_prefix(&mut payload)?;
+        }
         self.retirement_context = Some(handle.context().clone());
         unsafe {
             let user_data = &mut *self.user_data;
@@ -784,6 +810,7 @@ pub(super) struct FeedbackCounters {
     pub(super) cached_service_interval: bool,
     selected_timebase: Option<FeedbackTimebase>,
     service_interval_confirmations: u8,
+    redetecting: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -928,13 +955,27 @@ fn inspect_feedback_packets_with_compatibility(
                     )
                 };
             }
+            // A selected interpretation can become stale after firmware relock.
+            // Drop it and require the ordinary three-completion inference again;
+            // never reinterpret Tenor or bypass the live clock cross-check.
+            if !per_service && compatibility.tenor_nominal_q16.is_none()
+                && counters.infer_service_interval && counters.selected_timebase.is_some()
+                && decoded.is_some_and(|(frames, _)| !scheduler.feedback_rate_is_plausible(frames)) {
+                counters.selected_timebase = None;
+                counters.service_interval_confirmations = 0;
+                counters.cached_service_interval = false;
+                counters.redetecting = true;
+                decoded = decode_feedback_report_with_scale(bytes, service_us, speed, false);
+            }
             // Startup reports cannot select units, acquire lock or renew its deadline.
             // Retain ordinary malformed/empty/failed diagnostics below.
             if skip && decoded.is_some() { continue; }
             match decoded {
                 None => Outcome::InvalidEncoding,
                 Some((frames, _)) if !scheduler.feedback_rate_is_plausible(frames) => {
-                    let compatible = (detecting && bytes.len() == 4)
+                    let compatible = ((detecting || (counters.selected_timebase.is_none() && counters.infer_service_interval
+                        && !per_service && speed == Speed::High && service_us > 125
+                        && compatibility.tenor_nominal_q16.is_none())) && bytes.len() == 4)
                         .then(|| decode_feedback_report_with_scale(bytes, service_us, speed, true))
                         .flatten()
                         .filter(|(frames, _)| scheduler.feedback_rate_is_plausible(*frames)
@@ -994,7 +1035,15 @@ fn inspect_feedback_packets_with_compatibility(
         }
     }
     if counters.selected_timebase.is_none() {
-        if newest.is_some() {
+        if newest.is_some() && counters.redetecting {
+            counters.service_interval_confirmations += 1;
+            if counters.service_interval_confirmations < SERVICE_INTERVAL_CONFIRMATIONS {
+                newest = None;
+            } else {
+                counters.redetecting = false;
+                counters.select_timebase(FeedbackTimebase::Bus, speed, true);
+            }
+        } else if newest.is_some() {
             // A conforming report always wins, even if an earlier packet in
             // the same completion resembled a different timebase.
             let unit = if per_service && speed == Speed::High && counters.last_report_len == 4 {
@@ -1013,12 +1062,30 @@ fn inspect_feedback_packets_with_compatibility(
             {
                 counters.record_valid_bytes(bytes);
                 counters.select_timebase(FeedbackTimebase::OutService, speed, true);
+                counters.redetecting = false;
                 newest = Some(decoded);
             }
         } else if conflicting_report {
             counters.service_interval_confirmations = 0;
             counters.cached_service_interval = false;
         }
+    }
+    if let (Some((frames, _)), Some(diagnostics)) = (newest, counters.diagnostics.as_mut()) {
+        diagnostics.rate_samples = diagnostics.rate_samples.saturating_add(1);
+        let n = diagnostics.rate_samples as f64;
+        if diagnostics.rate_samples == 1 {
+            diagnostics.rate_min_frames = frames;
+            diagnostics.rate_max_frames = frames;
+            diagnostics.rate_mean_frames = frames;
+        } else {
+            diagnostics.rate_min_frames = diagnostics.rate_min_frames.min(frames);
+            diagnostics.rate_max_frames = diagnostics.rate_max_frames.max(frames);
+            let delta = frames - diagnostics.rate_mean_frames;
+            diagnostics.rate_mean_frames += delta / n;
+            diagnostics.rate_variance_frames = (diagnostics.rate_variance_frames * (n - 1.0)
+                + delta * (frames - diagnostics.rate_mean_frames)) / n;
+        }
+        counters.diagnostics_dirty = true;
     }
     newest
 }
@@ -1144,7 +1211,7 @@ impl ExplicitFeedbackHealth {
 /// The feedback endpoint's own polling
 /// interval is not the data endpoint's packet interval; using it as the
 /// timebase previously produced a rate error of up to 8x at 125 us service.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 pub(super) fn decode_feedback_report(
     raw_bytes: &[u8],
     data_service_interval_us: u32,
@@ -1298,6 +1365,37 @@ mod explicit_feedback_tests {
     fn q16(frames: f64) -> [u8; 4] { ((frames * 65536.0).round() as u32).to_le_bytes() }
     fn q32(frames: f64) -> [u8; 8] { ((frames * 4_294_967_296.0).round() as u64).to_le_bytes() }
     fn scheduler(service_us: u32) -> IsoPacketScheduler { IsoPacketScheduler::new(48_000, 8, service_us) }
+
+    #[test]
+    fn swinging_feedback_keeps_capacity_guard_and_reports_unsmoothed_variance() {
+        let scheduler = scheduler(125);
+        let mut counters = FeedbackCounters { diagnostics: Some(Default::default()), ..Default::default() };
+        for value in [6.0, 5.4, 6.6, 6.0] {
+            assert!(select_feedback_report(&q16(value), [(0,4,4)], &scheduler,125,Speed::High,8,false,&mut counters).is_some());
+        }
+        let stats = counters.diagnostics.unwrap();
+        assert_eq!(stats.rate_samples, 4);
+        assert!((stats.rate_min_frames - 5.4).abs() < 0.0001);
+        assert!((stats.rate_max_frames - 6.6).abs() < 0.0001);
+        assert!((stats.rate_mean_frames - 6.0).abs() < 0.0001);
+        assert!((stats.rate_variance_frames - 0.18).abs() < 0.0001);
+        assert!(select_feedback_report(&q16(9.0), [(0,4,4)], &scheduler,125,Speed::High,8,false,&mut counters).is_none());
+    }
+
+    #[test]
+    fn stale_inferred_units_are_redetected_against_proven_clock() {
+        let scheduler = scheduler(1000);
+        let mut counters = FeedbackCounters { infer_service_interval: true, ..Default::default() };
+        for _ in 0..3 { select_feedback_report(&q16(48.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters); }
+        assert!(counters.selected_service_interval());
+        // Firmware relocks to ordinary per-microframe reporting.
+        for _ in 0..2 {
+            assert!(select_feedback_report(&q16(6.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters).is_none());
+        }
+        assert!(select_feedback_report(&q16(6.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters).is_some());
+        assert!(!counters.selected_service_interval());
+    }
+
 
     #[test]
     fn enhanced_superspeed_feedback_uses_q32_bus_units_at_every_output_interval() {
@@ -1458,7 +1556,7 @@ mod explicit_feedback_tests {
         let report = q16(6.01 + 0.9375);
         assert!(compatible_report(&report, 1000, 48, false, &mut compatibility).is_none());
         assert!(compatible_report(&report, 1000, 49, false, &mut compatibility).is_some());
-        assert!(compatible_report(&q16(7.2), 125, 8, false, &mut compatibility).is_none());
+        assert!(compatible_report(&q16(11.0), 125, 16, false, &mut compatibility).is_none());
         // The explicit user scale wins and is never followed by the Tenor subtraction.
         assert_eq!(compatible_report(&q16(48.0), 1000, 49, true, &mut compatibility), Some((48.0, 48_000.0)));
         // A three-byte report keeps the existing Q10.14 interpretation.
@@ -1983,5 +2081,25 @@ mod explicit_feedback_tests {
         let invalid = ExplicitFeedbackHealth::new(1000, Some(10));
         assert_eq!(invalid.warning, Duration::from_millis(500));
         assert_eq!(ExplicitFeedbackHealth::new(1_024_000, None).terminal, Duration::from_millis(6144));
+    }
+}
+
+#[cfg(test)]
+mod tx_length_prefix_tests {
+    use super::*;
+    #[test]
+    fn headers_preserve_pcm_and_silence_payload_and_music_counts() {
+        for held in [false,true] {
+            let bytes=if held {vec![0;12]} else {(0..12).collect()};
+            let mut payload=IsoTransferPayload {packet_sizes:vec![6,6],packet_samples:vec![],transfer_buffer:bytes.clone(),
+                underrun:false,held,frame_count:2,music_frames:if held {0} else {2},epoch:7};
+            add_tx_length_prefix(&mut payload).unwrap();
+            assert_eq!(payload.packet_sizes,vec![10,10]);
+            assert_eq!(&payload.transfer_buffer[0..4],&6u32.to_le_bytes());
+            assert_eq!(&payload.transfer_buffer[4..10],&bytes[..6]);
+            assert_eq!(&payload.transfer_buffer[10..14],&6u32.to_le_bytes());
+            assert_eq!(&payload.transfer_buffer[14..20],&bytes[6..]);
+            assert_eq!(payload.frame_count,2);assert_eq!(payload.music_frames,if held {0} else {2});assert_eq!(payload.epoch,7);
+        }
     }
 }

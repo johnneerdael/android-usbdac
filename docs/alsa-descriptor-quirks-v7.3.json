@@ -1,0 +1,2502 @@
+{
+  "source_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
+  "source_path": "sound/usb/quirks-table.h",
+  "scope": "Each literal USB match macro is a source fact; matching alone does not activate descriptor changes. Nonliteral macro-generated identities remain in the pinned source.",
+  "entries": [
+    {
+      "vendor_id": 1027,
+      "product_id": 47320,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_FTDI"
+      ],
+      "source_line": 117,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L117"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 5,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 128,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L128"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16130,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 147,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L147"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16132,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 149,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L149"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16138,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 151,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L151"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16153,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 153,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L153"
+    },
+    {
+      "vendor_id": 12722,
+      "product_id": 17,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 155,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L155"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16533,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 164,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L164"
+    },
+    {
+      "vendor_id": 1060,
+      "product_id": 47154,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 196,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L196"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2128,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 217,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L217"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2222,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 218,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L218"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2246,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 219,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L219"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2288,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 220,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L220"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2293,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 221,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L221"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2294,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 222,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L222"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2448,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 223,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L223"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5379,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 328,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L328"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5383,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 341,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L341"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5385,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 354,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L354"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5386,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 368,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L368"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5388,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 381,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L381"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5389,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 394,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L394"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5912,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_AUTODETECT",
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 408,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L408"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 0,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 460,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L460"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 2,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 506,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L506"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 3,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 524,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L524"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 4,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 542,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L542"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 5,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 562,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L562"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 7,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 580,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L580"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 8,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 598,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L598"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 9,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 617,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L617"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 11,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 635,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L635"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 12,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 655,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L655"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 16,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 681,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L681"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 18,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 694,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L694"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 20,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 706,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L706"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 22,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 718,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L718"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 27,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 737,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L737"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 29,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 756,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L756"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 35,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 768,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L768"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 37,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 784,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L784"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 39,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 832,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L832"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 41,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 844,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L844"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 43,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_EDIROL_UAXX",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 860,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L860"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 45,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 874,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L874"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 47,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 886,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L886"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 51,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 898,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L898"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 55,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 913,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L913"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 59,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 929,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L929"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 64,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 943,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L943"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 66,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 955,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L955"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 71,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 967,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L967"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 72,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 981,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L981"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 76,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 993,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L993"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 77,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1006,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1006"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 80,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1021,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1021"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 82,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1033,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1033"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 96,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1041,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1041"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 100,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1050,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1050"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 101,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1063,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1063"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 109,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1075,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1075"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 116,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_EDIROL_UAXX",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1091,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1091"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 117,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1105,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1105"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 122,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1117,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1117"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 128,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1129,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1129"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 139,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1141,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1141"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 163,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_EDIROL_UAXX",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1156,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1156"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 196,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1170,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1170"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 230,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_EDIROL_UAXX",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1190,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1190"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 264,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1204,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1204"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 275,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1214,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1214"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 288,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1231,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1231"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 303,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1282,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1282"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 345,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1332,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1332"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 68,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_NODEV_INTERFACE"
+      ],
+      "source_line": 1352,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1352"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 125,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_NODEV_INTERFACE"
+      ],
+      "source_line": 1358,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1358"
+    },
+    {
+      "vendor_id": 1410,
+      "product_id": 141,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_AUTODETECT",
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_NODEV_INTERFACE"
+      ],
+      "source_line": 1364,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1364"
+    },
+    {
+      "vendor_id": 1784,
+      "product_id": 45056,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1390,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1390"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4098,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1403,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1403"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4113,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1414,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1414"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4117,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1425,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1425"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4129,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1436,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1436"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4145,
+      "match_macro": "USB_DEVICE_VER",
+      "extra_match_arguments": "0x0100, 0x0109",
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1452,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1452"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4147,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1463,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1463"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 4161,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1474,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1474"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8193,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1485,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1485"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8195,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1516,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1516"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8200,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1527,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1527"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8205,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1538,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1538"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8217,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1563,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1563"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8218,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 1583,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1583"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8240,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1586,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1586"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8241,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1646,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1646"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8320,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1706,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1706"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8321,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1762,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1762"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8324,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1826,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1826"
+    },
+    {
+      "vendor_id": 1999,
+      "product_id": 26625,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1842,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1842"
+    },
+    {
+      "vendor_id": 1999,
+      "product_id": 26626,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_YAMAHA",
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1851,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1851"
+    },
+    {
+      "vendor_id": 2154,
+      "product_id": 1,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_EMAGIC",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1881,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1881"
+    },
+    {
+      "vendor_id": 2154,
+      "product_id": 2,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_EMAGIC",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1892,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1892"
+    },
+    {
+      "vendor_id": 2154,
+      "product_id": 3,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_MIDI_EMAGIC",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1903,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1903"
+    },
+    {
+      "vendor_id": 2372,
+      "product_id": 512,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1916,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1916"
+    },
+    {
+      "vendor_id": 2372,
+      "product_id": 513,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1925,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1925"
+    },
+    {
+      "vendor_id": 2372,
+      "product_id": 516,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1934,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1934"
+    },
+    {
+      "vendor_id": 2536,
+      "product_id": 98,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_AKAI"
+      ],
+      "source_line": 1944,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1944"
+    },
+    {
+      "vendor_id": 2536,
+      "product_id": 33,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1955,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1955"
+    },
+    {
+      "vendor_id": 2638,
+      "product_id": 8256,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1968,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1968"
+    },
+    {
+      "vendor_id": 2638,
+      "product_id": 16448,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 1986,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L1986"
+    },
+    {
+      "vendor_id": 3277,
+      "product_id": 18,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2005,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2005"
+    },
+    {
+      "vendor_id": 3277,
+      "product_id": 19,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2013,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2013"
+    },
+    {
+      "vendor_id": 3277,
+      "product_id": 20,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2021,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2021"
+    },
+    {
+      "vendor_id": 3277,
+      "product_id": 53,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_CME"
+      ],
+      "source_line": 2029,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2029"
+    },
+    {
+      "vendor_id": 4157,
+      "product_id": 256,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 2039,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2039"
+    },
+    {
+      "vendor_id": 4157,
+      "product_id": 257,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 2040,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2040"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 1,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_NOVATION"
+      ],
+      "source_line": 2044,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2044"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 2,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_NOVATION"
+      ],
+      "source_line": 2053,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2053"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 10,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2062,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2062"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 14,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2070,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2070"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 16,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2078,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2078"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 24,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2140,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2140"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 30,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DATA_RAW_BYTES",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2171,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2171"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 18017,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_NOVATION"
+      ],
+      "source_line": 2179,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2179"
+    },
+    {
+      "vendor_id": 4926,
+      "product_id": 2069,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2191,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2191"
+    },
+    {
+      "vendor_id": 6790,
+      "product_id": 29997,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_CH345"
+      ],
+      "source_line": 2228,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2228"
+    },
+    {
+      "vendor_id": 7992,
+      "product_id": 1,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [],
+      "source_line": 2238,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2238"
+    },
+    {
+      "vendor_id": 18258,
+      "product_id": 17,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_CME"
+      ],
+      "source_line": 2242,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2242"
+    },
+    {
+      "vendor_id": 28932,
+      "product_id": 8706,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_MIDI_CME"
+      ],
+      "source_line": 2254,
+      "status": "reference_only",
+      "reason": "MIDI-only registration: outside this audio stream/control driver",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2254"
+    },
+    {
+      "vendor_id": 3514,
+      "product_id": 4096,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2264,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2264"
+    },
+    {
+      "vendor_id": 3514,
+      "product_id": 12288,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_MIDIMAN",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2320,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2320"
+    },
+    {
+      "vendor_id": 3514,
+      "product_id": 20480,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_MIDI_FIXED_ENDPOINT",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2382,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2382"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32801,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2452,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2452"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 20494,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2487,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2487"
+    },
+    {
+      "vendor_id": 1118,
+      "product_id": 643,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2543,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2543"
+    },
+    {
+      "vendor_id": 8204,
+      "product_id": 4107,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2588,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2588"
+    },
+    {
+      "vendor_id": 5766,
+      "product_id": 221,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DATA_STANDARD_MIDI",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2625,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2625"
+    },
+    {
+      "vendor_id": 5093,
+      "product_id": 1,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_ANY_INTERFACE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2652,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2652"
+    },
+    {
+      "vendor_id": 2578,
+      "product_id": 4675,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2669,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2669"
+    },
+    {
+      "vendor_id": 6479,
+      "product_id": 769,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2708,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2708"
+    },
+    {
+      "vendor_id": 6581,
+      "product_id": 33,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2767,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2767"
+    },
+    {
+      "vendor_id": 2045,
+      "product_id": 4,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2798,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2798"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 35,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2858,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2858"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 23,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2939,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2939"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 14,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 2988,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L2988"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 13,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3037,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3037"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 30,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3087,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3087"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 10,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3136,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3136"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 41,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3194,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3194"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 60,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3243,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3243"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 52,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3298,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3298"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 55,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_FLAG_ALIGN_TRANSFER",
+        "QUIRK_IGNORE_INTERFACE",
+        "QUIRK_MIDI_STANDARD_INTERFACE"
+      ],
+      "source_line": 3349,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3349"
+    },
+    {
+      "vendor_id": 21325,
+      "product_id": 33,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_FLAG_ALIGN_TRANSFER"
+      ],
+      "source_line": 3425,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3425"
+    },
+    {
+      "vendor_id": 21325,
+      "product_id": 8457,
+      "match_macro": "USB_AUDIO_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3464,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3464"
+    },
+    {
+      "vendor_id": 2276,
+      "product_id": 383,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3495,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3495"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 27,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3547,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3547"
+    },
+    {
+      "vendor_id": 2276,
+      "product_id": 355,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3599,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3599"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 19,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3653,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3653"
+    },
+    {
+      "vendor_id": 5013,
+      "product_id": 768,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3701,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3701"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 35,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3719,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3719"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 36,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3774,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3774"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 49,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 3829,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3829"
+    },
+    {
+      "vendor_id": 65453,
+      "product_id": 40961,
+      "match_macro": "USB_DEVICE_VENDOR_SPEC",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_AF16RIG",
+        "QUIRK_AF16RIG_CLOCK",
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_AUDIOFORMAT",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_AUDIO",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO",
+        "QUIRK_RME_DIGIFACE"
+      ],
+      "source_line": 3886,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L3886"
+    },
+    {
+      "vendor_id": 7285,
+      "product_id": 44832,
+      "match_macro": "USB_DEVICE",
+      "extra_match_arguments": null,
+      "quirk_types": [
+        "QUIRK_AF16RIG",
+        "QUIRK_AF16RIG_CLOCK",
+        "QUIRK_COMPOSITE_END",
+        "QUIRK_DATA_COMPOSITE",
+        "QUIRK_DATA_IGNORE",
+        "QUIRK_DATA_STANDARD_MIXER",
+        "QUIRK_DRIVER_INFO"
+      ],
+      "source_line": 4115,
+      "status": "reference_only",
+      "reason": "Reference-only descriptor/registration plan; exact interface layout, ranges and ownership are not independently implemented",
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks-table.h#L4115"
+    }
+  ]
+}

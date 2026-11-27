@@ -35,9 +35,9 @@ struct UsbIdentity {
     revision: u16,
 }
 
-// Facts only: exact product IDs, alternate numbers and word order. No chipset
+// Source facts: https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2033-L2084
+// Exact product IDs, alternate numbers and word order. No chipset
 // matching, product substring guesses, or implicit vendor mode transitions.
-#[cfg(test)]
 fn builtin_layout(id: UsbIdentity) -> Option<(u8, bool)> {
     match (id.vendor, id.product) {
         (0x16d0, 0x071a) => match id.revision {
@@ -247,46 +247,6 @@ mod itf {
     }
 }
 
-/// The descriptor plan is read-only. Executing it additionally requires the
-/// claimed-handle transaction path, which is never called from discovery.
-#[cfg(test)]
-fn itf_descriptor_recipe(device: &Device<Context>, config: &ConfigDescriptor,
-                         descriptor: &rusb::InterfaceDescriptor,
-                         format: &StreamingInterfaceFormat, mode: itf::Mode) -> Option<itf::Recipe> {
-    let id = identity(device)?;
-    itf::model(id)?;
-    if descriptor.interface_number() != 1 || descriptor.protocol_code() != 0x20 { return None; }
-    let alternatives: Vec<_> = config.interfaces().flat_map(|i| i.descriptors())
-        .filter(|d| d.interface_number() == 1).collect();
-    let mut numbers: Vec<_> = alternatives.iter().map(|d| d.setting_number()).collect();
-    numbers.sort_unstable();
-    if !matches!(numbers.as_slice(), [0, 1, 2] | [0, 1, 2, 3]) { return None; }
-    for alt in &alternatives {
-        if alt.class_code() != USB_CLASS_AUDIO || alt.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
-            || alt.protocol_code() != 0x20 { return None; }
-        if alt.setting_number() == 0 {
-            if alt.num_endpoints() != 0 { return None; }
-            continue;
-        }
-        let f = parse_android_streaming_interface_format(alt)?;
-        if f.channels != 2 || !matches!(f.subslot_size, 2 | 4)
-            || f.bit_resolution == 0 || f.bit_resolution > f.subslot_size * 8 { return None; }
-        let mut out = 0;
-        for ep in alt.endpoint_descriptors() {
-            if ep.transfer_type() != TransferType::Isochronous || !(1..=16).contains(&ep.interval())
-                || !itf_packet_geometry(ep.max_packet_size(), device.speed()) { return None; }
-            if ep.direction() == Direction::Out && ep.usage_type() == UsageType::Data {
-                if usize::from(ep.max_packet_size() & 0x07ff) < usize::from(f.channels) * usize::from(f.subslot_size) { return None; }
-                out += 1;
-            } else if ep.direction() != Direction::In || ep.usage_type() != UsageType::Feedback {
-                return None;
-            }
-        }
-        if out != 1 { return None; }
-    }
-    itf::recipe(id, descriptor.interface_number(), descriptor.setting_number(), &numbers, format, mode)
-}
-
 #[cfg(test)]
 fn itf_packet_geometry(raw: u16, speed: Speed) -> bool {
     let base = raw & 0x07ff;
@@ -349,9 +309,17 @@ pub(super) fn apply_itf_mode(_claimed: &ClaimedHandle, _candidate: &IsoStreamCan
     Ok(())
 }
 
-pub(super) fn itf_class_control_delay(_handle: &DeviceHandle<Context>) {}
+pub(super) fn itf_class_control_delay(_handle: &DeviceHandle<Context>) { class_control_delay(); }
 
-pub(super) fn itf_interface_delay(_device: &Device<Context>, _interface: u8) {}
+pub(super) fn class_control_delay() {
+    let delay = settings().control_delay_us();
+    if delay > 0 { thread::sleep(Duration::from_micros(delay)); }
+}
+
+pub(super) fn itf_interface_delay(_device: &Device<Context>, _interface: u8) {
+    let delay = settings().interface_delay_ms();
+    if delay > 0 { thread::sleep(Duration::from_millis(delay)); }
+}
 
 fn identity(device: &Device<Context>) -> Option<UsbIdentity> {
     let d = device.device_descriptor().ok()?;
@@ -364,13 +332,11 @@ fn identity(device: &Device<Context>) -> Option<UsbIdentity> {
     })
 }
 
-#[cfg(test)]
 fn eligible(format: &StreamingInterfaceFormat) -> bool {
     !format.is_uac1 && format.channels == 2 && format.subslot_size == 4
         && format.bit_resolution > 0 && format.bit_resolution <= 32
 }
 
-#[cfg(test)]
 fn compatibility_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFormat,
                          eligible_alts: usize) -> Option<NativeDsdProfile> {
     let (target_alt, big_endian) = builtin_layout(id)?;
@@ -381,7 +347,7 @@ fn compatibility_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFo
 
 /// Admit the shipped Dawn Pro dialect and explicit host policy identically
 /// for capability reporting and selection. RAW_DATA alone is insufficient.
-pub(super) fn resolve_native_dsd(device: &Device<Context>, _config: &ConfigDescriptor,
+pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescriptor,
                                 alt: &rusb::InterfaceDescriptor,
                                 format: &StreamingInterfaceFormat) -> Option<NativeDsdProfile> {
     let id = identity(device)?;
@@ -393,7 +359,35 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, _config: &ConfigDescr
         && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
         && (1..=16).contains(&ep.interval()) && ep.max_packet_size() & 0x07ff > 0).count();
     if out_count(alt) != 1 { return None; }
-    release_native_dsd_policy(id, format, &settings())
+    let policy = settings();
+    if let Some(explicit) = release_native_dsd_policy(id,format,&policy) { return Some(explicit); }
+    if policy.config.quirk_policy != crate::quirk::QuirkPolicy::SourceBacked { return None; }
+    let eligible_alts = config.interfaces().flat_map(|interface| interface.descriptors())
+        .filter(|other| other.setting_number() == alt.setting_number() && out_count(other) == 1
+            && parse_android_streaming_interface_format(other).is_some_and(|other_format| eligible(&other_format)))
+        .count();
+    source_native_dsd_policy(id,alt.setting_number(),format,eligible_alts,&policy)
+}
+
+fn source_native_dsd_policy(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFormat,
+    eligible_alts: usize, policy: &crate::settings::Settings) -> Option<NativeDsdProfile> {
+    if policy.config.quirk_policy != crate::quirk::QuirkPolicy::SourceBacked { return None; }
+    // Explicit alternate and revision facts override a generic RAW_DATA flag.
+    if let Some(profile) = compatibility_profile(id,alt,format,eligible_alts) {
+        return Some(profile);
+    }
+    if policy.has(crate::Quirk::RawDsd32Be) && eligible_alts == 1 && eligible(format)
+        && format.uac2_formats.is_some_and(|bits| bits & 0x8000_0000 != 0) {
+        return Some(NativeDsdProfile { word_bytes:4,big_endian:true,bit_reverse:false,
+            origin:NativeDsdOrigin::DeviceCompatibility });
+    }
+    None
+}
+
+/// An exact source layout replaces the descriptor's ambiguous PCM spelling.
+/// It cannot be selected for PCM/DoP merely because the original tag said PCM.
+pub(super) fn native_only_profile(format:&StreamingInterfaceFormat) -> bool {
+    format.native_dsd.is_some_and(|profile|profile.origin==NativeDsdOrigin::DeviceCompatibility)
 }
 
 // AP80 admission is handled by scan's exact shipped configuration/interface/alt
@@ -514,7 +508,7 @@ mod tests {
         assert!(!playback_designs_dop_profile(id, 1, &wrong, 1));
         let mut carrier = f.clone(); carrier.subslot_size = 3; carrier.bit_resolution = 24;
         assert!(playback_designs_dop_profile(id, 1, &carrier, 1));
-        let dop = PlaybackFormat { sample_rate:176_400, bit_depth:24, channels:2,
+        let dop = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate:176_400, bit_depth:24, channels:2,
             is_dop:true, dsd_transport:DsdTransportMode::DoP, dsd_bit_rate:2_822_400 };
         let mut wire = f.clone();
         apply_playback_designs_dop(&mut wire, dop, true);
@@ -582,7 +576,7 @@ mod tests {
     }
     #[test]
     fn wire_clock_uses_word_width_and_refuses_fractional_words() {
-        let mut f = PlaybackFormat { sample_rate: 88_200, bit_depth: 1, channels: 2,
+        let mut f = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 88_200, bit_depth: 1, channels: 2,
             is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 2_822_400 };
         for (width, rate) in [(1, 352_800), (2, 176_400), (4, 88_200), (8, 44_100)] {
             assert_eq!(native_wire_rate(f, width), Some(rate));
@@ -643,7 +637,7 @@ mod tests {
     #[test]
     fn overlapping_pcm_keeps_pcm_and_dop_while_native_requires_profile() {
         let mut f = format();
-        let pcm = PlaybackFormat { sample_rate: 176_400, bit_depth: 32, channels: 2,
+        let pcm = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed, sample_rate: 176_400, bit_depth: 32, channels: 2,
             is_dop: false, dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
         let native = PlaybackFormat { bit_depth: 1, dsd_transport: DsdTransportMode::Native,
             dsd_bit_rate: 2_822_400, ..pcm };
@@ -853,4 +847,36 @@ mod tests {
         assert!(!itf_packet_geometry(8, Speed::Low));
     }
 
+}
+
+#[cfg(test)]
+mod source_native_tests {
+    use super::*;
+    use crate::{DacConfig,DeviceInfo};
+    #[test]
+    fn source_native_layout_never_activates_by_default_or_unknown_revision() {
+        let id=UsbIdentity {vendor:0x16d0,product:0x071a,revision:0x0199};
+        let format=super::tests::format();
+        let mut policy=crate::settings::Settings::for_device(DacConfig::default(),&DeviceInfo::new(id.vendor,id.product,""));
+        assert!(source_native_dsd_policy(id,2,&format,1,&policy).is_none());
+        policy.config.quirk_policy=crate::quirk::QuirkPolicy::SourceBacked;
+        assert!(!source_native_dsd_policy(id,2,&format,1,&policy).unwrap().big_endian);
+        assert!(source_native_dsd_policy(UsbIdentity {revision:0x019a,..id},2,&format,1,&policy).is_none());
+        assert!(source_native_dsd_policy(id,3,&format,1,&policy).is_none());
+        assert!(source_native_dsd_policy(id,2,&format,2,&policy).is_none());
+    }
+}
+
+#[cfg(test)]
+mod native_only_source_tests {
+    use super::*;
+    #[test]
+    fn known_native_layout_does_not_keep_a_pcm_descriptor_alias() {
+        let mut format=super::tests::format();
+        assert!(!native_only_profile(&format));
+        format.native_dsd=Some(NativeDsdProfile {word_bytes:4,big_endian:true,bit_reverse:false,origin:NativeDsdOrigin::DeviceCompatibility});
+        assert!(native_only_profile(&format));
+        format.native_dsd.as_mut().unwrap().origin=NativeDsdOrigin::HostPolicy;
+        assert!(!native_only_profile(&format));
+    }
 }

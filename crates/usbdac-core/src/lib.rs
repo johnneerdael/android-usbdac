@@ -42,6 +42,12 @@ pub mod routing;
 pub mod pioneer;
 pub mod scarlett;
 
+mod async_volume;
+pub mod fake;
+pub mod hotplug;
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;
 mod capabilities;
 mod clock_resolution;
 mod config;
@@ -71,11 +77,14 @@ mod tests;
 
 pub use capabilities::{
     AltFormat, AltSetting, Capabilities, DeviceInfo, EndpointUsage, LinkSpeed, Pacing, RateRange,
-    SyncKind, UacVersion,
+    SyncKind, UacVersion, ShippedSupport, SHIPPED_SUPPORT,
 };
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
-pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume, UsbQueueProfile};
-pub use dac::Dac;
+pub use config::{AsyncFallbackPolicy, ClockReadbackPolicy, CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume, UsbQueueProfile};
+pub use dac::{Dac, StreamReconfiguration};
+pub use async_volume::{AsyncVolumeControl, VolumeOperation};
+pub use fake::{PlaybackDevice, PlaybackStream};
+pub use hotplug::{HotplugEvent, HotplugHub, HotplugSubscription, LinuxHotplugMonitor, UsbAttachment, UsbPermission};
 pub use capture::{CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition, DacCaptureStream};
 pub use error::{Error, Result};
 pub use events::{DacEvent, DacListener, StreamState};
@@ -84,7 +93,7 @@ pub use feedback_diagnostics::{
     FeedbackTrace, FeedbackTraceEntry, FeedbackTraceEvent,
 };
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
-pub use quirk::Quirk;
+pub use quirk::{Quirk, QuirkPolicy, AlsaQuirkFlag, SourceQuirkEntry, SOURCE_QUIRKS};
 pub use stream::{BitPerfectBlocker, DacStream, StreamStats};
 pub use volume::{
     StartupVolumeReport, VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS,

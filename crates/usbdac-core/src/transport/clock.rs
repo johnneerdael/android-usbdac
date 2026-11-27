@@ -350,12 +350,30 @@ pub(super) fn uac1_playback_rate_profile(
                 let ranges = if uac1_complete_rate_descriptor(alt.extra()) {
                     matching_format.map(|format| format.sample_rate_ranges.as_slice()).unwrap_or(&[])
                 } else { &[] };
-                return Ok(uac1_rate_profile(ep.extra().unwrap_or(&[]), ep.sync_type(), ranges, rate));
+                let mut profile = uac1_rate_profile(ep.extra().unwrap_or(&[]), ep.sync_type(), ranges, rate);
+                if settings().config.quirk_policy == crate::quirk::QuirkPolicy::SourceBacked {
+                    let descriptor = claimed.handle.device().device_descriptor().map_err(|error| error.to_string())?;
+                    if let Some(corrected) = uac1_sampling_attribute_correction(descriptor.vendor_id(),descriptor.product_id()) {
+                        profile.sampling_control = Some(corrected);
+                    }
+                }
+                return Ok(profile);
             }
             return Err("UAC1 playback endpoint disappeared".into());
         }
     }
     Err("UAC1 playback alternate disappeared".into())
+}
+
+// Factual attribute corrections, Linux v7.3 quirks.c:2117-2131. Apply only
+// after exact fd identity and selected UAC1 OUT descriptor proof. These change
+// standard Sampling Frequency Control admission, never a vendor command.
+fn uac1_sampling_attribute_correction(vendor: u16, product: u16) -> Option<bool> {
+    match (vendor,product) {
+        (0x0a92,0x0053) => Some(false),
+        (0x041e,0x3020) | (0x0763,0x2003) => Some(true),
+        _ => None,
+    }
 }
 
 fn uac1_complete_rate_descriptor(extra: &[u8]) -> bool {
@@ -420,6 +438,16 @@ pub(super) fn uac1_playback_rate_verified(requested: u32, reported: Option<u32>,
         None => pcm && profile.sampling_control == Some(false)
             && (profile.fixed_at_request || profile.host_paced_at_request),
     }
+}
+
+pub(super) fn selector_write_required(skip_writes:bool,current:u8,target:u8) -> Result<bool,String> {
+    if target==0 {return Err("clock selector pins are one-based".into());}
+    if !skip_writes {return Ok(true);}
+    if current==target {Ok(false)} else {Err("source-backed clock selector policy preserves the current route".into())}
+}
+
+pub(super) fn fixed_rate_live_proof(requested: u32, reported: Option<u32>, descriptor_fixed: bool, clock_valid: bool) -> bool {
+    requested > 0 && descriptor_fixed && clock_valid && reported == Some(requested)
 }
 
 fn valid_uac1_rate(rate: u32) -> bool { (1..=0x7f_ffff).contains(&rate) }
@@ -517,6 +545,9 @@ pub(super) fn get_uac1_sampling_frequency(
     interface_number: u8,
     endpoint_address: u8,
 ) -> Result<u32, String> {
+    if settings().has(crate::Quirk::SkipSampleRateReadback) {
+        return Err("frequency GET_CUR omitted by exact source-backed identity rule; clock remains unverified".into());
+    }
     let mut data = [0u8; 3];
     let encodings: [(u8, u16, &str); 2] = [
         (
@@ -575,6 +606,9 @@ pub(super) fn get_sampling_frequency(
     interface_number: u8,
     clock_id: u8,
 ) -> Result<u32, String> {
+    if settings().has(crate::Quirk::SkipSampleRateReadback) {
+        return Err("frequency GET_CUR omitted by exact source-backed identity rule; clock remains unverified".into());
+    }
     let request_type = USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE;
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);
@@ -587,7 +621,8 @@ pub(super) fn get_sampling_frequency(
             &mut data,
             Duration::from_secs(1),
         )
-        .map_err(|error| format!("Failed to read sampling frequency: {}", error))?;
+        .map_err(|error| if error == rusb::Error::NoDevice { "Failed to read sampling frequency: no device".into() }
+            else { format!("Failed to read sampling frequency: {}", error) })?;
     if transferred != data.len() {
         return Err(format!(
             "Sampling-frequency read returned {} bytes, expected {}",
@@ -670,10 +705,15 @@ pub(super) fn get_sampling_frequency_ranges(
             Duration::from_secs(1),
         )
         .map_err(|error| format!("Failed to read sampling-frequency range: {}", error))?;
-    if transferred < 2 {
+    parse_sampling_frequency_ranges(&data[..transferred])
+}
+
+pub(super) fn parse_sampling_frequency_ranges(data: &[u8]) -> Result<Vec<SamplingFrequencySubrange>, String> {
+    if data.len() > 512 { return Err("frequency RANGE reply exceeds bounded control buffer".into()); }
+    if data.len() < 2 {
         return Err(format!(
             "Sampling-frequency GET_RANGE returned {} bytes, expected at least 2",
-            transferred
+            data.len()
         ));
     }
 
@@ -683,10 +723,10 @@ pub(super) fn get_sampling_frequency_ranges(
     }
 
     let expected = 2 + count * 12;
-    if transferred < expected {
+    if data.len() < expected {
         return Err(format!(
             "Sampling-frequency GET_RANGE returned {} bytes, expected at least {} for {} subranges",
-            transferred, expected, count
+            data.len(), expected, count
         ));
     }
 
@@ -883,6 +923,16 @@ pub(super) fn apply_sampling_frequency(
                 current_rate,
                 sample_rate,
             );
+            let descriptor_fixed = supported_ranges.as_ref().is_some_and(|ranges|
+                !ranges.is_empty() && ranges.iter().all(|range| range.min == sample_rate && range.max == sample_rate));
+            if settings().has(crate::Quirk::FixedRate) && descriptor_fixed {
+                let validity = source_controls.is_some_and(|controls|
+                    crate::clock_resolution::clock_validity(controls,|| get_programmed_clock_validity(handle,interface_number,clock_id)).is_ok());
+                if fixed_rate_live_proof(sample_rate,Some(current_rate),descriptor_fixed,validity) {
+                    return ClockApplyOutcome {clock_ok:true,rate_verified:true,reported_sample_rate:Some(current_rate),
+                        known_mismatch:false,set_cur_succeeded:false,message:Some("fixed descriptor and live clock proof; no SET required".into())};
+                }
+            }
         }
         Err(error) => {
             dev_eprintln!(
@@ -894,12 +944,20 @@ pub(super) fn apply_sampling_frequency(
         }
     }
 
+    let learning = SESSION_STATE.lock().as_ref().map(|state| Arc::clone(&state.unreadable_clocks));
+    let clock_key = (interface_number, clock_id);
+    let learned = learning.as_ref().is_some_and(|clocks| clocks.lock().get(&clock_key).copied().unwrap_or(0) >= 3);
+    let allow_learned = settings().config.clock_readback_policy
+        == crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet;
+    // Still sample GET_CUR after every SET: learning must never hide a newly
+    // readable mismatch or turn an ACK into a verified clock.
+    let attempts = if learned && allow_learned { 1 } else { 3 };
     let mut last_set_error = None;
     let mut last_readback_error = None;
     let mut last_reported_rate = None;
     let mut set_cur_succeeded = false;
 
-    for attempt in 1..=3 {
+    for attempt in 1..=attempts {
         log::info!(
             "[USB] SET_CUR attempt {}/3: clock {} interface {} rate {}Hz",
             attempt,
@@ -914,6 +972,7 @@ pub(super) fn apply_sampling_frequency(
             }
             Err(error) => {
                 log::error!("[USB] SET_CUR attempt {}/3: failed: {}", attempt, error);
+                set_cur_succeeded = false;
                 last_set_error = Some(error);
                 thread::sleep(Duration::from_millis(settle_delay_ms));
                 continue;
@@ -923,7 +982,14 @@ pub(super) fn apply_sampling_frequency(
         thread::sleep(Duration::from_millis(settle_delay_ms));
         match get_sampling_frequency(handle, interface_number, clock_id) {
             Ok(reported_sample_rate) => {
-                last_reported_rate = Some(reported_sample_rate);
+                if reported_sample_rate > 0 || last_reported_rate.is_none() {
+                    last_reported_rate = Some(reported_sample_rate);
+                }
+                if let Some(clocks) = &learning {
+                    let mut clocks = clocks.lock();
+                    if reported_sample_rate > 0 { clocks.remove(&clock_key); }
+                    else { let strikes = clocks.entry(clock_key).or_default(); *strikes = strikes.saturating_add(1); }
+                }
                 if reported_sample_rate == sample_rate {
                     let validity = match source_controls {
                         Some(controls) => crate::clock_resolution::clock_validity(controls, || {
@@ -969,28 +1035,31 @@ pub(super) fn apply_sampling_frequency(
                 }
             }
             Err(error) => {
+                if error.contains("no device") {
+                    set_cur_succeeded = false;
+                    last_readback_error = Some(error);
+                    break;
+                }
+                if let Some(clocks) = &learning {
+                    let mut clocks = clocks.lock();
+                    let strikes = clocks.entry(clock_key).or_default();
+                    *strikes = strikes.saturating_add(1);
+                }
                 last_readback_error = Some(error);
                 continue;
             }
         }
     }
+    if learning.as_ref().is_some_and(|clocks| clocks.lock().get(&clock_key).copied().unwrap_or(0) >= 3) {
+        log_warn!("[USB] Clock interface={} entity={}: three unusable GET_CUR replies; session-scoped readback quirk suggested (unverified tier only)", interface_number, clock_id);
+    }
 
-    if let Some(mut reported_sample_rate) = last_reported_rate {
-        // Some DACs (e.g. Fosi DS2 / Savitech bridge) report 0 Hz via GET_CUR
-        // even after a successful SET_CUR. Replace the bogus 0 with the
-        // requested rate so it doesn't poison downstream code paths.
-        if reported_sample_rate == 0 {
-            dev_eprintln!(
-                "[USB] DAC reports 0 Hz after SET_CUR on clock {} / interface {}; falling back to requested {} Hz",
-                clock_id, interface_number, sample_rate
-            );
-            reported_sample_rate = sample_rate;
-        }
+    if let Some(reported_sample_rate) = last_reported_rate {
         return ClockApplyOutcome {
             clock_ok: false,
             rate_verified: false,
             reported_sample_rate: Some(reported_sample_rate),
-            known_mismatch: reported_sample_rate != sample_rate,
+            known_mismatch: reported_sample_rate > 0 && reported_sample_rate != sample_rate,
             set_cur_succeeded,
             message: Some(match last_readback_error {
                 Some(error) if reported_sample_rate == sample_rate => error,
@@ -1263,6 +1332,10 @@ impl crate::clock_resolution::ClockPlanIo for UsbClockPlanIo<'_> {
         get_clock_selector_pin(self.handle, self.control, selector)
     }
     fn write_pin(&mut self, selector: u8, pin: u8) -> Result<(), String> {
+        if settings().has(crate::Quirk::SkipClockSelectorWrites) {
+            let current=get_clock_selector_pin(self.handle,self.control,selector)?;
+            if !selector_write_required(true,current,pin)? {return Ok(());}
+        }
         if pin == 0 {
             return Err("clock selector pins are one-based".into());
         }
@@ -1815,7 +1888,7 @@ pub(super) fn finish_requested_clock_route() {
     if SELECTED_CLOCK_ROUTE
         .lock()
         .as_ref()
-        .is_none_or(|r| r.fd != device.fd)
+        .map_or(true, |r| r.fd != device.fd)
     {
         return;
     }
@@ -2169,5 +2242,47 @@ mod uac1_playback_rate_tests {
         assert!(!uac1_complete_rate_descriptor(&[general.as_slice(), general.as_slice(), single.as_slice()].concat()));
         let continuous = [14, 0x24, 2, 1, 2, 2, 16, 0, 0x44, 0xac, 0, 0, 0x77, 1];
         assert!(uac1_complete_rate_descriptor(&[general.as_slice(), continuous.as_slice()].concat()));
+    }
+}
+
+#[cfg(test)]
+mod source_uac1_attribute_tests {
+    use super::*;
+    #[test]
+    fn sampling_control_corrections_require_exact_identity_and_cannot_supply_rate_evidence() {
+        assert_eq!(uac1_sampling_attribute_correction(0x0a92,0x0053),Some(false));
+        assert_eq!(uac1_sampling_attribute_correction(0x041e,0x3020),Some(true));
+        assert_eq!(uac1_sampling_attribute_correction(0x0763,0x2003),Some(true));
+        assert_eq!(uac1_sampling_attribute_correction(0x0763,0x2004),None);
+        let profile=Uac1PlaybackRateProfile { sampling_control:Some(true),fixed_at_request:false,host_paced_at_request:false };
+        assert!(!uac1_playback_rate_verified(48_000,None,profile,true));
+        assert!(!uac1_playback_rate_verified(48_000,Some(44_100),profile,true));
+        assert!(uac1_playback_rate_verified(48_000,Some(48_000),profile,true));
+    }
+}
+
+#[cfg(test)]
+mod fixed_rate_source_tests {
+    use super::*;
+    #[test]
+    fn fixed_rate_write_skip_requires_independent_live_and_descriptor_proof() {
+        assert!(fixed_rate_live_proof(48_000,Some(48_000),true,true));
+        for args in [(Some(44_100),true,true),(None,true,true),(Some(48_000),false,true),(Some(48_000),true,false)] {
+            assert!(!fixed_rate_live_proof(48_000,args.0,args.1,args.2));
+        }
+        assert!(!fixed_rate_live_proof(0,Some(0),true,true));
+    }
+}
+
+#[cfg(test)]
+mod selector_write_source_tests {
+    use super::*;
+    #[test]
+    fn selector_skip_retains_current_readback_and_cannot_change_pin() {
+        assert_eq!(selector_write_required(true,2,2),Ok(false));
+        assert!(selector_write_required(true,1,2).is_err());
+        assert!(selector_write_required(true,0,1).is_err());
+        assert!(selector_write_required(true,1,0).is_err());
+        assert_eq!(selector_write_required(false,1,2),Ok(true));
     }
 }

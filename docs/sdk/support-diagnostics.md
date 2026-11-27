@@ -195,3 +195,21 @@ Run the flow for a direct USB failure, a failure before stream open, and a
 Stop or disconnect during playback. Verify that a user can share a readable
 file, that it includes the first failure even after fallback or a new
 session, and that capture turns off when the attempt ends.
+
+## Queue and timing evidence
+
+Stream statistics expose worker gaps over 10 and 50 ms, maximum worker gap in
+microseconds, adaptive queue changes, active slot count, and active queue time.
+These distinguish a late host worker from packet failures; they do not infer an
+OEM cause from a device name. Opt-in explicit feedback reports include accepted
+unsmoothed sample count, minimum, maximum, mean and population variance in frames
+per OUT service interval, alongside the existing packet outcomes. The EWMA
+coefficient remains 0.2. No smoothing or audible tradeoff has been measured from
+these statistics alone.
+
+For an attachment or permission issue, retain the current attachment ID as well
+as VID/PID and device path. Paths can be reused after unplug; an old permission
+result must not reopen a replacement. For an audible click, keep an independent
+loopback WAV, capture-loss counters and clock-aligned start/stop/alt-zero event
+timeline. The [acceptance prerequisites](https://github.com/johnneerdael/android-usbdac/blob/main/docs/evidence/prerequisites.md) describe
+the software probe and the limits of its ADC-relative metrics.

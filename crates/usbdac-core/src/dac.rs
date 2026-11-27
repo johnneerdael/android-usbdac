@@ -4,7 +4,7 @@ mod routing;
 
 use crate::capabilities::{Capabilities, DeviceInfo};
 use crate::config::{CloseVolume, DacConfig, HandBack};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, OrControl};
 use crate::events::{DacListener, EventHub, EventSink};
 use crate::format::{StreamFormat, StreamRequest};
 use crate::settings::{self, Settings};
@@ -24,12 +24,24 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// settings.
 static OPEN_GUARD: Mutex<()> = Mutex::new(());
 
+fn reconfigure_or_restore<T>(requested: &StreamRequest, previous: &StreamRequest,
+    mut attempt: impl FnMut(&StreamRequest) -> Result<T>) -> Result<(T, Option<Error>)> {
+    match attempt(requested) {
+        Ok(stream) => Ok((stream, None)),
+        Err(error) => match attempt(previous) {
+            Ok(stream) => Ok((stream, Some(error))),
+            Err(rollback) => Err(Error::ReconfigureUnusable(format!("requested format failed: {error}; rollback failed: {rollback}"))),
+        },
+    }
+}
+
 /// State shared by the `Dac`, its streams and its volume handle.
 pub(crate) struct DacShared {
     pub(crate) events: EventSink,
     pub(crate) info: DeviceInfo,
     pub(crate) config: DacConfig,
     closed: AtomicBool,
+    pub(crate) control_guard: Mutex<()>,
     pub(crate) stream: Mutex<Option<Weak<StreamInner>>>,
     last_feedback_stream: Mutex<Option<(StreamFormat, Arc<transport::RuntimeStats>)>>,
 }
@@ -61,6 +73,7 @@ impl DacShared {
     /// Closes with what the configuration says about the original volume
     /// (`None`) or with what the host decided at close.
     fn shutdown(&self, volume: Option<CloseVolume>) -> Result<()> {
+        let _control = self.control_guard.lock();
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -84,6 +97,7 @@ impl DacShared {
             }
         };
         let stopped = transport::api::close_device(action, CLOSE_TIMEOUT);
+        drop(_control);
         self.events.shutdown();
         if stopped {
             Ok(())
@@ -103,6 +117,15 @@ impl DacShared {
 /// `UsbDeviceConnection` open until then.
 pub struct Dac {
     shared: Arc<DacShared>,
+}
+
+/// A replacement stream on the same physical handle, paused with zero-based counters.
+/// A failed requested format can still return a successfully restored old-format stream.
+#[derive(Debug)]
+pub struct StreamReconfiguration {
+    pub stream: DacStream,
+    /// The requested-format error when rollback restored the old format; `None` on success.
+    pub rollback_cause: Option<Error>,
 }
 
 impl std::fmt::Debug for Dac {
@@ -162,7 +185,7 @@ impl Dac {
             return Err(error);
         }
         Ok(Dac { shared: Arc::new(DacShared { events: EventHub::start(), info, config,
-            closed: AtomicBool::new(false), stream: Mutex::new(None),
+            closed: AtomicBool::new(false), control_guard: Mutex::new(()), stream: Mutex::new(None),
             last_feedback_stream: Mutex::new(None) }) })
     }
 
@@ -245,7 +268,7 @@ impl Dac {
                 events,
                 info,
                 config,
-                closed: AtomicBool::new(false),
+                closed: AtomicBool::new(false), control_guard: Mutex::new(()),
                 stream: Mutex::new(None),
                 last_feedback_stream: Mutex::new(None),
             }),
@@ -282,6 +305,11 @@ impl Dac {
     ///
     /// [`RatePolicy::Exact`]: crate::RatePolicy::Exact
     pub fn negotiate(&self, request: &StreamRequest) -> Result<StreamFormat> {
+        let _control = self.shared.control_guard.lock();
+        self.negotiate_locked(request)
+    }
+
+    fn negotiate_locked(&self, request: &StreamRequest) -> Result<StreamFormat> {
         self.shared.ensure_open()?;
         transport::api::negotiate(request)
     }
@@ -302,6 +330,11 @@ impl Dac {
         format: &StreamFormat,
         listener: Arc<dyn DacListener>,
     ) -> Result<DacStream> {
+        let _control = self.shared.control_guard.lock();
+        self.open_stream_locked(format, listener)
+    }
+
+    fn open_stream_locked(&self, format: &StreamFormat, listener: Arc<dyn DacListener>) -> Result<DacStream> {
         self.shared.ensure_open()?;
         let mut slot = self.shared.stream.lock();
         if slot
@@ -327,6 +360,70 @@ impl Dac {
         Ok(DacStream::from_inner(inner))
     }
 
+    /// Drain and replace a playback-only stream without reopening the physical USB handle or host claims.
+    ///
+    /// Stop the writer before calling. The stream must belong to this DAC. Drain temporarily plays
+    /// a paused stream so queued audio can complete. A drain timeout retains the original open
+    /// stream in draining state; the caller still owns it and may wait, flush or close it.
+    ///
+    /// After retirement, normal lock-requested cleanup retains the exact libusb owner in IDLE_LOCK.
+    /// Every negotiation/open must reuse that identity; losing it is an unusable-state error, never
+    /// an implicit physical reopen. No volume initialization/hand-back occurs. Success or rollback
+    /// returns a paused replacement with zero-based counters; supply/reseek PCM and explicitly play.
+    /// A rollback failure returns `ReconfigureUnusable` and requires closing the DAC.
+    pub fn reconfigure_stream(&self, current: &DacStream, request: &StreamRequest,
+        listener: Arc<dyn DacListener>, drain_timeout: Duration) -> Result<StreamReconfiguration> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.ensure_open()?;
+        transport::api::playback_format_from_request(request)?;
+        let identity = current.reconfigure_identity(&self.shared)?;
+        let previous = current.format().request;
+        let deadline = std::time::Instant::now().checked_add(drain_timeout)
+            .ok_or_else(|| Error::InvalidArgument("drain timeout overflows monotonic clock".into()))?;
+        let volume_route = transport::api::volume_route_signature();
+        let volume_before = if volume_route.is_some() { Some(transport::volume_hw::read_volume_state().or_control()?) } else { None };
+        current.drain()?;
+        current.play()?;
+        while !current.is_drained() {
+            if matches!(current.state(), crate::StreamState::Failed | crate::StreamState::Closed) {
+                return Err(Error::ReconfigureUnusable("original stream failed during drain; retained stream remains available for explicit close".into()));
+            }
+            if std::time::Instant::now() >= deadline { return Err(Error::ReconfigureDrainTimeout); }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        current.retire_for_reconfigure().map_err(|error| Error::ReconfigureUnusable(error.to_string()))?;
+        if transport::api::retained_usb_handle_identity() != Some(identity) {
+            return Err(Error::ReconfigureUnusable("old USB owner was not retained after retirement".into()));
+        }
+        let mut attempt = |target: &StreamRequest| -> Result<DacStream> {
+            if transport::api::retained_usb_handle_identity() != Some(identity) {
+                return Err(Error::ReconfigureUnusable("retained USB owner was lost before negotiation".into()));
+            }
+            let format = self.negotiate_locked(target)?;
+            if transport::api::retained_usb_handle_identity() != Some(identity) {
+                return Err(Error::ReconfigureUnusable("negotiation replaced or lost the USB owner".into()));
+            }
+            let opened = self.open_stream_locked(&format, listener.clone())?;
+            if opened.reconfigure_identity(&self.shared)? != identity {
+                drop(opened);
+                return Err(Error::ReconfigureUnusable("replacement used a different physical USB owner".into()));
+            }
+            opened.pause()?;
+            if transport::api::volume_route_signature() != volume_route {
+                drop(opened);
+                return Err(Error::Control("reconfiguration changed the hardware volume route; rollback required".into()));
+            }
+            let volume_after = if volume_route.is_some() { Some(transport::volume_hw::read_volume_state().or_control()?) } else { None };
+            if volume_after != volume_before {
+                drop(opened);
+                return Err(Error::Control("hardware volume changed during reconfiguration; preservation not proved".into()));
+            }
+            Ok(opened)
+        };
+        let (stream, rollback_cause) = reconfigure_or_restore(request, &previous, &mut attempt)?;
+        Ok(StreamReconfiguration { stream, rollback_cause })
+    }
+
     /// Open playback and PCM capture atomically on one USB worker.
     ///
     /// The output must have a current negotiated format. Shared source clocks
@@ -337,6 +434,7 @@ impl Dac {
     pub fn open_duplex(&self, format: &StreamFormat, capture: &crate::capture::CaptureRequest,
         capacity_frames: usize, listener: Arc<dyn DacListener>)
         -> Result<(DacStream, crate::capture::DacCaptureStream)> {
+        let _control = self.shared.control_guard.lock();
         self.shared.ensure_open()?;
         let mut slot = self.shared.stream.lock();
         if slot.as_ref().and_then(Weak::upgrade).is_some_and(|stream| !stream.is_closed()) {
@@ -472,7 +570,7 @@ mod tests {
                 events: EventHub::start(),
                 info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
                 config,
-                closed: AtomicBool::new(false),
+                closed: AtomicBool::new(false), control_guard: Mutex::new(()),
                 stream: Mutex::new(None),
                 last_feedback_stream: Mutex::new(None),
             }),
@@ -658,7 +756,7 @@ mod tests {
             events: events.clone(),
             info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
             config: DacConfig::default(),
-            closed: AtomicBool::new(false),
+            closed: AtomicBool::new(false), control_guard: Mutex::new(()),
             stream: Mutex::new(None),
             last_feedback_stream: Mutex::new(None),
         });
@@ -718,4 +816,51 @@ mod tests {
         shared.closed.store(true, Ordering::Release);
         assert!(matches!(volume.get(), Err(Error::InvalidState(_))));
     }
+    #[test]
+    fn nonblocking_volume_is_bounded_ordered_and_keeps_verified_writes() {
+        let fake = transport::fake_dac::Registered::new(false, true);
+        let dac = fake_dac_handle(DacConfig::default());
+        let volume = dac.volume().unwrap().nonblocking().unwrap();
+        let (arrived_tx, arrived_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        fake.dac.lock().unwrap().hold_next_volume_write = Some((arrived_tx, release_rx));
+        let mut first = volume.set_db(-30.0).unwrap();
+        // Submission returned while the actual verified USB write is held.
+        arrived_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(first.try_result().is_none());
+        let mut queued = Vec::new();
+        for _ in 0..32 { queued.push(volume.set_db(-40.0).unwrap()); }
+        assert!(matches!(volume.set_db(-50.0), Err(Error::Busy)));
+        release_tx.send(()).unwrap();
+        assert_eq!(first.wait().unwrap().db, -30.0);
+        for operation in queued { assert_eq!(operation.wait().unwrap().db, -40.0); }
+        assert_eq!(fake.raw(), vec![-40 * 256, -40 * 256]);
+        let result = volume.get().unwrap();
+        // A completion can be observed with polling and then cannot be awaited twice.
+        let state = result.wait().unwrap();
+        assert_eq!(state.db, -40.0);
+        dac.close().unwrap();
+        assert!(matches!(volume.set_db(-20.0).unwrap().wait(), Err(Error::InvalidState(_))));
+    }
+
+    #[test]
+    fn reconfigure_transaction_attempts_requested_then_previous_and_reports_both_failures() {
+        let old = StreamRequest::pcm(44_100, 2, 16);
+        let new = StreamRequest::pcm_float32(96_000, 2);
+        let mut calls = Vec::new();
+        let (restored, cause) = reconfigure_or_restore(&new, &old, |request| {
+            calls.push(*request);
+            if *request == new { Err(Error::Unsupported { reason: "no float alternate".into(), offered: vec![] }) }
+            else { Ok("restored paused stream") }
+        }).unwrap();
+        assert_eq!(calls, vec![new, old]);
+        assert_eq!(restored, "restored paused stream");
+        assert_eq!(cause.unwrap().code(), "unsupported");
+        let error = reconfigure_or_restore::<()>(&new, &old, |_| Err(Error::Control("clock failed".into()))).unwrap_err();
+        assert_eq!(error.code(), "reconfigure_unusable");
+        let mut calls = Vec::new();
+        let (_, cause) = reconfigure_or_restore(&new, &old, |request| { calls.push(*request); Ok(()) }).unwrap();
+        assert_eq!(calls, vec![new]); assert!(cause.is_none());
+    }
+
 }

@@ -11,6 +11,12 @@ public enum class AltFormat {
     /** Linear PCM. */
     PCM,
 
+    /** Type I unsigned 8-bit PCM. */
+    PCM_U8,
+
+    /** Type I IEEE-754 binary32 PCM. */
+    PCM_FLOAT32,
+
     /** DoP carrier without independently advertised linear PCM. */
     DOP,
 

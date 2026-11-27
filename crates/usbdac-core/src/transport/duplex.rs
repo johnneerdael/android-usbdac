@@ -689,7 +689,7 @@ impl Drop for Retirement {
 
 pub(super) fn cleanup_claimed(claimed: ClaimedHandle, attachment: Option<&Arc<Attachment>>,
     active_interface: Option<u8>, keep_locked: bool) -> bool {
-    let capture_restored = attachment.is_none_or(|attachment| attachment.restore_rate(&claimed));
+    let capture_restored = attachment.map_or(true, |attachment| attachment.restore_rate(&claimed));
     let owner_restored = cleanup_claimed_handle(claimed, active_interface, keep_locked && capture_restored);
     capture_restored && owner_restored
 }

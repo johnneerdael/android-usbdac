@@ -286,6 +286,7 @@ fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(),
         startup_volume: None,
         runtime_stats: None,
         service_interval_feedback_routes: Default::default(),
+        unreadable_clocks: Default::default(),
     });
     drop(guard);
     if let Err(error) = ensure_idle_lock() {
@@ -691,7 +692,7 @@ impl Drop for TestSession {
 
 #[cfg(test)]
 pub(crate) fn test_pcm_format() -> PlaybackFormat {
-    PlaybackFormat {
+    PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
         sample_rate: 44_100,
         bit_depth: 16,
         channels: 2,
@@ -737,5 +738,6 @@ pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionSta
         startup_volume: None,
         runtime_stats,
         service_interval_feedback_routes: Default::default(),
+        unreadable_clocks: Default::default(),
     }
 }

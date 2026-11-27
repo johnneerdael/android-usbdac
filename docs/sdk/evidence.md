@@ -2,6 +2,8 @@
 
 This page collects the data points that the [design decisions](decisions.md) rest on, says where each came from, and lists plainly what has been verified and what has not. Read it before relying on usbdac in an app.
 
+The [generated status ledger](status.md) is checked against the compiled shipped-support manifest and preserves historical, virtual, and pending OEM results separately. Physical acceptance is waived for the current software-delivery task; pending hardware rows remain unverified.
+
 ## Hardware status {#hardware-status}
 
 Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 17) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
@@ -93,7 +95,7 @@ Version 0.1.5 carries the shared USB Audio implementation: UAC1, UAC2 and UAC3 (
 and their artifacts by implementation batch. These include Rust protocol,
 control and packet tests, Kotlin tests, Android target checks and four-ABI
 AAR and sample builds. Those results apply to their recorded
-revisions. [The tests section](#tests) has the counts taken at 0.1.5.
+revisions. [The tests section](#tests) preserves historical counts; the generated ledger tracks current source inventory.
 
 **Written, tested on the host, and switched off in 0.1.5.** Each of these is behind a constant in the code, so no SDK call reaches it. Some calls exist for source compatibility and fail with an unsupported error.
 
@@ -189,7 +191,7 @@ These are not usbdac's measurements. Each is a record in another project's repos
 
 ## Tests {#tests}
 
-Counted for usbdac `main` at `353e039` (`v0.1.5`), on a Mac:
+Historical run: usbdac `main` at `353e039` (`v0.1.5`), on a Mac. Current source annotations are generated in the [status ledger](status.md#validation-source-inventory); annotation counts are not passing-run evidence:
 
 | Suite | Count | What it covers |
 |---|---|---|

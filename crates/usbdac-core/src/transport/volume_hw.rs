@@ -3,9 +3,14 @@ use crate::volume::{raw_to_db, VolumeRange as PublicVolumeRange, VolumeState};
 use crate::config::StartupVolume;
 use crate::volume::StartupVolumeReport;
 use crate::volume_control::{
-    plan_startup_attenuation, quantize_db, single_level, step_target_raw, HardwareVolumeSnapshot,
-    SameRoute,
+    plan_startup_attenuation, single_level, step_target_raw, HardwareVolumeSnapshot,
+    SameRoute, VolumeCurve,
 };
+
+fn playback_volume_curve() -> VolumeCurve {
+    if settings().has(crate::Quirk::MixerPlaybackLinearVolume) { VolumeCurve::LinearAmplitude }
+    else { VolumeCurve::Decibels { minimum_is_mute: settings().has(crate::Quirk::MixerPlaybackMinMute) } }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct AudioControlTopology {
@@ -381,9 +386,16 @@ pub(super) fn discover_hardware_volume_control_for_terminal(
             .find(|feature_unit| feature_unit.b_unit_id == entity_id)
         {
             if ancestors.contains(&entity_id) {
-                if let Some(control) = build_hardware_volume_control_from_feature_unit(
-                    device, topology, feature_unit, channels,
-                )? { return Ok(Some(control)); }
+                match build_hardware_volume_control_from_feature_unit(device,topology,feature_unit,channels) {
+                    Ok(Some(control)) => return Ok(Some(control)),
+                    Ok(None) => (),
+                    Err(error) if settings().has(crate::Quirk::IgnoreOptionalControlErrors)
+                        && !crate::error::is_device_gone(&error) => {
+                        log_warn!("[USB] Optional mixer unit {} unavailable: {}; startup attenuation and mandatory control failures remain strict",
+                            feature_unit.b_unit_id,error);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -449,7 +461,10 @@ pub(super) fn refresh_android_usb_hardware_volume_snapshot(
             )).transpose(),
         );
         match read {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
+                let curve = playback_volume_curve();
+                snapshot.db = curve.db(snapshot.raw,&control.ranges);
+                snapshot.volume = curve.fraction(snapshot.raw,&control.ranges);
                 if let Some(error) = &snapshot.mute_error {
                     log_warn!("[USB] Hardware volume remains available; optional mute unavailable: {error}");
                 }
@@ -491,7 +506,7 @@ impl HardwareVolumeControl {
 
 pub(super) fn volume_state_of(snapshot: &HardwareVolumeSnapshot) -> VolumeState {
     VolumeState {
-        db: raw_to_db(snapshot.raw),
+        db: snapshot.db,
         fraction: snapshot.volume,
         muted: snapshot.muted,
     }
@@ -573,9 +588,10 @@ pub(crate) fn hardware_volume_range() -> Option<PublicVolumeRange> {
     let guard = SESSION_STATE.lock();
     let control = guard.as_ref()?.hardware_volume_control.as_ref()?;
     Some(PublicVolumeRange {
-        min_db: raw_to_db(control.min_volume_raw),
-        max_db: raw_to_db(control.max_volume_raw),
-        res_db: raw_to_db(control.resolution_raw.max(1)),
+        min_db: playback_volume_curve().db(control.min_volume_raw,&control.ranges),
+        max_db: playback_volume_curve().db(control.max_volume_raw,&control.ranges),
+        res_db: if playback_volume_curve() == VolumeCurve::LinearAmplitude { 0.0 }
+            else { raw_to_db(control.resolution_raw.max(1)) },
     })
 }
 
@@ -620,14 +636,14 @@ fn write_volume_raw_locked(
 pub(crate) fn write_volume_db(db: f64) -> Result<VolumeState, String> {
     let _hold = HARDWARE_VOLUME_MUTEX.lock();
     let (state, control) = volume_route()?;
-    let target_raw = quantize_db(db, &control.ranges);
+    let target_raw = playback_volume_curve().target_db(db, &control.ranges);
     write_volume_raw_locked(&state, &control, target_raw)
 }
 
 pub(crate) fn write_volume_fraction(fraction: f64) -> Result<VolumeState, String> {
     let _hold = HARDWARE_VOLUME_MUTEX.lock();
     let (state, control) = volume_route()?;
-    let target_raw = quantize_volume(fraction, &control.ranges);
+    let target_raw = playback_volume_curve().target_fraction(fraction, &control.ranges);
     write_volume_raw_locked(&state, &control, target_raw)
 }
 
@@ -644,7 +660,10 @@ pub(crate) fn step_volume(direction: i8, steps: u8) -> Result<VolumeState, Strin
         publish_hardware_volume_snapshot(state.hardware_volume_generation, volume)?;
         return Ok(volume);
     }
-    let target_raw = step_target_raw(snapshot.raw, snapshot.volume, direction, steps, &control.ranges);
+    let target_raw = if playback_volume_curve() == VolumeCurve::LinearAmplitude {
+        let target = playback_volume_curve().target_fraction(snapshot.volume + f64::from(direction.signum()) / f64::from(steps.max(1)),&control.ranges);
+        if target == snapshot.raw { crate::volume_control::adjacent_raw(snapshot.raw,direction,&control.ranges) } else {target}
+    } else { step_target_raw(snapshot.raw, snapshot.volume, direction, steps, &control.ranges) };
     if target_raw == snapshot.raw {
         let volume = volume_state_of(&snapshot);
         publish_hardware_volume_snapshot(state.hardware_volume_generation, volume)?;
@@ -920,7 +939,7 @@ pub(crate) fn original_volume_db() -> Option<f64> {
         .lock()
         .peek(&original_volume_device_key(&device), &control)
         .and_then(|original| original.common())
-        .map(raw_to_db)
+        .map(|raw| playback_volume_curve().db(raw,&control.ranges))
 }
 
 /// Writes the recorded original level of every channel back now and ends the
@@ -1048,6 +1067,7 @@ pub(super) fn run_startup_volume(
         &originals,
         current,
         &control.ranges,
+        playback_volume_curve(),
         |channel_index, raw| {
             write_feature_unit_i16_control(
                 device,
@@ -1078,14 +1098,22 @@ pub(super) fn apply_startup_volume(
     originals: &[i16],
     current: Vec<i16>,
     ranges: &[RawRange],
+    curve: VolumeCurve,
     mut write: impl FnMut(usize, i16) -> Result<(), String>,
     mut read_back: impl FnMut() -> Result<Vec<i16>, String>,
 ) -> Result<(StartupVolumeReport, bool), String> {
     let (targets, clamped_to_minimum, max_db) = match startup {
         StartupVolume::Keep => (current.clone(), false, None),
         StartupVolume::Attenuate { max_db } => {
-            let plan = plan_startup_attenuation(&current, ranges, max_db);
-            (single_level(plan.targets), plan.clamped_to_minimum, Some(max_db))
+            if matches!(curve,VolumeCurve::Decibels { .. }) {
+                let plan = plan_startup_attenuation(&current,ranges,max_db);
+                (single_level(plan.targets),plan.clamped_to_minimum,Some(max_db))
+            } else {
+                let min = volume_bounds(ranges).0;
+                let ceiling = curve.floor_db(max_db,ranges);
+                let targets = current.iter().map(|raw| (*raw).min(ceiling.unwrap_or(min))).collect();
+                (single_level(targets), ceiling.is_none(), Some(max_db))
+            }
         }
     };
     let mut lowered = false;
@@ -1103,7 +1131,7 @@ pub(super) fn apply_startup_volume(
             ));
         }
     }
-    let db = |raws: &[i16]| raws.iter().map(|&raw| raw_to_db(raw)).collect::<Vec<_>>();
+    let db = |raws: &[i16]| raws.iter().map(|&raw| curve.db(raw,ranges)).collect::<Vec<_>>();
     let original_db = db(originals);
     let limit_db = original_db
         .iter()

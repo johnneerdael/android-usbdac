@@ -415,7 +415,7 @@ fn test_scheduler_feedback_rejects_and_recovers_from_outlier() {
     let mut scheduler = IsoPacketScheduler::new(352_800, bytes_per_frame, 125);
     assert!(!scheduler.update_feedback_frames_per_packet(0.0));
     assert!(!scheduler.update_feedback_frames_per_packet(f64::NAN));
-    assert!(!scheduler.update_feedback_frames_per_packet(44.1 * 1.5));
+    assert!(!scheduler.update_feedback_frames_per_packet(44.1 * 1.501));
     assert!(scheduler.update_feedback_frames_per_packet(44.1 * 1.000_1));
 
     let total_frames: usize = (0..8_000)
@@ -449,4 +449,16 @@ fn explicit_feedback_validation_preserves_phase_and_updates_ewma_once() {
     }
     let integrated = first.len() as f64 * 48.25 + remaining_packets as f64 * 48.35;
     assert!((total as f64 - integrated).abs() < 1.0);
+}
+
+#[test]
+fn feedback_recentering_window_is_bounded_and_ewma_retained() {
+    let mut scheduler = IsoPacketScheduler::new(48_000, 4, 125);
+    assert!(scheduler.update_feedback_frames_per_packet(6.0));
+    for factor in [0.875, 1.5, 1.10, 0.90] {
+        assert!(scheduler.update_feedback_frames_per_packet(6.0 * factor));
+    }
+    for factor in [0.874, 1.501, 0.0, f64::INFINITY, f64::NAN] {
+        assert!(!scheduler.update_feedback_frames_per_packet(6.0 * factor));
+    }
 }

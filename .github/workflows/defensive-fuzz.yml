@@ -1,0 +1,54 @@
+name: Extended defensive USB fuzz evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Bounded ASan parser fuzz duration
+        type: choice
+        required: true
+        default: "60"
+        options: ["10", "60", "180"]
+
+permissions:
+  contents: read
+
+jobs:
+  defensive-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      FUZZ_MINUTES: ${{ inputs.duration_minutes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nightly defensive tooling
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Record source and execute bounded ASan fuzz
+        run: |
+          set -euo pipefail
+          case "$FUZZ_MINUTES" in 10|60|180) ;; *) exit 2 ;; esac
+          mkdir -p target
+          git rev-parse HEAD > target/defensive-fuzz-revision.txt
+          rustc --version --verbose > target/defensive-fuzz-toolchain.txt
+          seconds=$((FUZZ_MINUTES * 60))
+          cargo fuzz run defensive_parsers --sanitizer address -- -max_total_time="$seconds" -max_len=4096 -timeout=10 2>&1 | tee target/defensive-fuzz.log
+      - name: Hash retained regression corpus and findings
+        if: always()
+        run: |
+          mkdir -p target fuzz/artifacts
+          find fuzz/corpus fuzz/artifacts -type f -exec sha256sum {} + > target/defensive-fuzz-SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: defensive-fuzz-evidence-${{ github.sha }}
+          path: |
+            target/defensive-fuzz*
+            fuzz/corpus
+            fuzz/artifacts
+          retention-days: 30

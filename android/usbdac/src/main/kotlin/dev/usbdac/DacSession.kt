@@ -172,11 +172,49 @@ public class DacSession private constructor(
         if (stream != null) throw DacException(DacErrorCode.INVALID_STATE, "a stream is already open")
         val signals = StreamSignals { event -> mutableEvents.tryEmit(event) }
         val handle = nativeCall { Native.streamOpen(dac, format.formatId, signals) }
-        val opened = DacStream(handle, format, signals) { streamClosed() }
+        lateinit var opened: DacStream
+        opened = DacStream(handle, format, signals) { streamClosed(opened) }
         stream = opened
         signals.seedBitPerfect(nativeCall { Native.streamIsBitPerfect(handle) })
         mutableState.update { if (it == DacState.READY) DacState.STREAMING else it }
         return opened
+    }
+
+    /**
+     * Drain and replace [current] on the same retained physical USB handle and host claims.
+     * Stop the writer first; call off the main thread. Hardware volume remains available unchanged.
+     *
+     * Success and recovered rollback return a paused stream with zero-based counters. Rebase/reseek
+     * the decoder for its actual [DacStream.format], supply PCM, then play. A timeout throws
+     * [DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT] while [current] remains open/draining (no hidden flush).
+     * [DacErrorCode.RECONFIGURE_UNUSABLE] requires closing this session. Duplex is refused.
+     */
+    @Synchronized
+    public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration {
+        checkOpen()
+        require(drainTimeoutMs >= 0) { "negative drain timeout" }
+        if (stream !== current || duplex != null) {
+            throw DacException(DacErrorCode.INVALID_ARGUMENT, "current must be this session's playback-only stream")
+        }
+        val signals = StreamSignals { event -> mutableEvents.tryEmit(event) }
+        val response = nativeCall { JSONObject(Native.streamReconfigure(dac, current.handleForReconfigure(),
+            request.toJson(), drainTimeoutMs, signals)) }
+        val handle = nativeCall { response.getLong("stream_id") }
+        current.retiredByReconfigure()
+        try {
+            val format = nativeCall { parseStreamFormat(response.getJSONObject("format").toString()) }
+            val cause = if (response.getBoolean("rolled_back")) DacException(
+                DacErrorCode.fromWireName(response.getString("error_code")), response.getString("error_message")) else null
+            lateinit var opened: DacStream
+            opened = DacStream(handle, format, signals) { streamClosed(opened) }
+            signals.seedBitPerfect(nativeCall { Native.streamIsBitPerfect(handle) })
+            stream = opened
+            mutableState.update { if (it == DacState.READY) DacState.STREAMING else it }
+            return StreamReconfiguration(opened, cause)
+        } catch (error: Throwable) {
+            runCatching { Native.streamClose(handle) }.onFailure(error::addSuppressed)
+            throw error
+        }
     }
 
     /**
@@ -212,7 +250,8 @@ public class DacSession private constructor(
     }
 
     @Synchronized
-    private fun streamClosed() {
+    private fun streamClosed(expected: DacStream? = null) {
+        if (expected != null && stream !== expected) return
         stream = null
         duplex = null
         mutableState.update { if (it == DacState.STREAMING) DacState.READY else it }
@@ -235,6 +274,7 @@ public class DacSession private constructor(
      * @throws DacException if the native library fails to close. USB ownership remains held until
      *   all native transfers retire, then Android receives the interfaces.
      */
+    @Synchronized
     public fun close(handBack: HandBack) {
         if (!closed.compareAndSet(false, true)) return
         var failure: DacException? = null

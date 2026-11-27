@@ -40,3 +40,22 @@ and formats before relying on it in production.
 - [Rust API reference](https://docs.rs/usbdac-core)
 - [Native integration guide and wire layouts](https://johnneerdael.github.io/android-usbdac/native-api.html)
 - [Android SDK quickstart for Kotlin and Gradle](https://johnneerdael.github.io/android-usbdac/getting-started.html)
+
+Rust applications can subscribe to `HotplugHub` attachment/permission changes;
+Linux hosts can retain `LinuxHotplugMonitor` for native libusb hotplug events
+(with a documented polling fallback). Android hosts bridge `UsbManager`
+broadcasts and permission results; discovery never opens or claims a device.
+Each physical attachment receives a new ID, including when its path is reused.
+
+For UI/async callers, `dac.volume().unwrap().nonblocking()?` provides a bounded
+FIFO control worker. Its requests return futures with polling/blocking result
+alternatives, preserving verified hardware writes and startup/hand-back safety.
+Existing blocking calls remain available. Accepted writes are not cancelled by
+dropping their future.
+
+`fake::FakeDac` implements the same public `PlaybackDevice`/`PlaybackStream`
+application boundary as real playback. It supports deterministic PCM queue
+progress, pause/drain/flush, injected loss, and unplug without hardware; it is
+not a protocol emulator or a bit-perfect hardware verification claim. See the
+[Rust SDK guide](https://johnneerdael.github.io/android-usbdac/sdk/guide-rust/) for
+examples and platform/permission ownership.

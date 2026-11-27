@@ -228,7 +228,7 @@ mod dsd_bitperfect_tests {
     #[test]
     fn effective_ring_rate_uses_byte_rate_for_native() {
         // DSD64: dsd_bit_rate 2_822_400 -> byte rate 352_800, wire rate 88_200.
-        let native = PlaybackFormat {
+        let native = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 88_200,
             bit_depth: 1,
             channels: 2,
@@ -237,7 +237,7 @@ mod dsd_bitperfect_tests {
             dsd_bit_rate: 2_822_400,
         };
         assert_eq!(effective_ring_rate(&native), 352_800);
-        let pcm = PlaybackFormat {
+        let pcm = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 96_000,
             bit_depth: 24,
             channels: 2,
@@ -614,7 +614,7 @@ mod pcm_ring_hold_tests {
         let mut candidate = pcm_candidate();
         candidate.subslot_size = 4;
         candidate.bit_resolution = 32;
-        let requested = PlaybackFormat {
+        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 88_200,
             bit_depth: 1,
             channels: 2,
@@ -1004,7 +1004,7 @@ mod push_stream_tests {
             let hub = EventHub::start();
             let events = Arc::new(Collector::default());
             hub.set_stream_listener(Some(events.clone()));
-            let format = PlaybackFormat {
+            let format = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
                 sample_rate: rate,
                 bit_depth: bits,
                 channels,
@@ -2742,5 +2742,107 @@ mod pacing_tests {
         assert_eq!(Pacing::Synchronous.code(), "synchronous");
         assert_eq!(Pacing::Unsynchronized.code(), "unsynchronized");
         assert_eq!(Pacing::Adaptive.feedback_endpoint(), None);
+    }
+}
+
+#[cfg(test)]
+mod type_i_exact_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned8_and_float32_use_the_real_ring_and_encoder_without_changing_source_bits() {
+        let _guard = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for encoding in [PcmEncoding::Unsigned8, PcmEncoding::Float32] {
+            let slot = if encoding == PcmEncoding::Unsigned8 { 1 } else { 4 };
+            let stats = Arc::new(RuntimeStats::new(48_000, 2, 40, 20, 1, 10));
+            let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
+            let mut format = test_pcm_format(); format.pcm_encoding = encoding; format.bit_depth = slot * 8;
+            let hub = crate::events::EventHub::start();
+            let shared = StreamShared::new(ring.clone(), stats.clone(), hub, format, slot);
+            let mut candidate = super::pcm_ring_hold_tests::pcm_candidate();
+            candidate.format_tag = encoding.format_tag(); candidate.subslot_size = slot;
+            candidate.bit_resolution = slot * 8;
+            let source: Vec<u8> = if encoding == PcmEncoding::Unsigned8 {
+                (0..=255u8).cycle().take(1024).collect()
+            } else {
+                // Exact IEEE bit patterns: signed zero, infinities, quiet/signaling NaNs, subnormals.
+                [0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc12345, 0x7fa12345,
+                 1, 0x80000001].into_iter().cycle().take(256).flat_map(u32::to_le_bytes).collect()
+            };
+            assert_eq!(shared.write_bytes(&source).unwrap(), source.len());
+            assert!(shared.write_samples(&[0, 0]).is_err());
+            assert!(shared.set_software_gain(0.5).is_err());
+            let mut scheduler = IsoPacketScheduler::new(48_000, usize::from(slot) * 2, 125);
+            let silence = if encoding == PcmEncoding::Unsigned8 { 0x80 } else { 0 };
+            shared.set_paused(true);
+            let prepare = |scheduler: &mut IsoPacketScheduler| prepare_iso_transfer_payload(scheduler,
+                &ring, &stats, &candidate, usize::from(slot), 2, usize::from(slot) * 2,
+                DsdTransportMode::None, false, false).unwrap().unwrap();
+            let held = prepare(&mut scheduler);
+            assert!(held.transfer_buffer.iter().all(|byte| *byte == silence));
+            assert_eq!(ring.lock().len_samples() * usize::from(slot), source.len());
+            shared.set_paused(false); shared.drain();
+            let mut restored = Vec::new();
+            while ring.lock().len_samples() > 0 {
+                let payload = prepare(&mut scheduler);
+                let music_bytes = payload.music_frames * 2 * usize::from(slot);
+                restored.extend_from_slice(&payload.transfer_buffer[..music_bytes]);
+                assert!(payload.transfer_buffer[music_bytes..].iter().all(|byte| *byte == silence));
+            }
+            assert_eq!(restored, source);
+            shared.flush();
+            let primed = prepare(&mut scheduler);
+            assert!(primed.held);
+            assert!(primed.transfer_buffer.iter().all(|byte| *byte == silence));
+        }
+    }
+
+    #[test]
+    fn unsigned_and_float_requests_are_distinct_and_type_ii_iii_never_become_pcm() {
+        for request in [crate::StreamRequest::pcm_u8(48_000, 2), crate::StreamRequest::pcm_float32(48_000, 2)] {
+            let format = api::playback_format_from_request(&request).unwrap();
+            assert_ne!(format.pcm_encoding, PcmEncoding::Signed);
+            let mut candidate = super::pcm_ring_hold_tests::pcm_candidate();
+            candidate.subslot_size = request.bit_depth / 8; candidate.bit_resolution = request.bit_depth;
+            assert!(validate_transport_against_playback_format(&candidate, format).is_err());
+            candidate.format_tag = format.pcm_encoding.format_tag();
+            assert!(validate_transport_against_playback_format(&candidate, format).is_ok());
+        }
+        for kind in [2, 3] {
+            let bytes = [16, 0x24, 1, 1, 0, kind, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0,
+                6, 0x24, 2, kind, 4, 32];
+            assert!(parse_streaming_extra(0x20, &bytes).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod ambiguous_pcm_format_tests {
+    use super::*;
+    #[test]
+    fn equal_geometry_signed32_float32_bitmap_never_selects_a_numeric_interpretation() {
+        let mut bytes = [16, 0x24, 1, 1, 0, 1, 5, 0, 0, 0, 2, 3, 0, 0, 0, 0,
+            6, 0x24, 2, 1, 4, 32];
+        assert!(parse_streaming_extra(0x20, &bytes).is_none());
+        bytes[6] = 4;
+        assert_eq!(parse_streaming_extra(0x20, &bytes).unwrap().format_tag, FORMAT_TAG_IEEE_FLOAT);
+        bytes[6] = 1;
+        assert_eq!(parse_streaming_extra(0x20, &bytes).unwrap().format_tag, FORMAT_TAG_PCM);
+    }
+}
+
+#[cfg(test)]
+mod empty_reconfigure_drain_tests {
+    use super::*;
+    #[test]
+    fn unprimed_empty_stream_drains_without_waiting_for_audio_that_will_never_arrive() {
+        let stats = Arc::new(RuntimeStats::new(48_000, 2, 40, 20, 10, 10));
+        let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
+        let shared = StreamShared::new(ring, stats.clone(), crate::events::EventHub::start(), test_pcm_format(), 2);
+        assert!(!stats.started.load(Ordering::Acquire));
+        shared.drain(); assert!(shared.is_drained());
+        shared.flush(); assert!(!shared.is_drained());
+        shared.write_bytes(&[1, 2, 3, 4]).unwrap();
+        shared.drain(); assert!(!shared.is_drained());
     }
 }

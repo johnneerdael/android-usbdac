@@ -3,6 +3,20 @@ use crate::capabilities::{
     AltFormat, AltSetting, EndpointUsage, LinkSpeed, RateRange, SyncKind, UacVersion,
 };
 
+fn type_i_pcm_tag(tag: u16) -> bool {
+    matches!(tag, FORMAT_TAG_PCM | FORMAT_TAG_PCM8 | FORMAT_TAG_IEEE_FLOAT)
+}
+
+/// Descriptor possibilities do not select a live numeric decoder. Reject equal-geometry
+/// signed32/float32 ambiguity until a protocol-backed active-format control is implemented.
+pub(super) fn ambiguous_type_i_pcm(bits: Option<u32>, slot: u8, depth: u8) -> bool {
+    let Some(bits) = bits else { return false; };
+    let signed = bits & 1 != 0 && matches!(depth, 16 | 24 | 32) && slot >= depth / 8;
+    let unsigned = bits & 2 != 0 && slot == 1 && depth == 8;
+    let float = bits & 4 != 0 && slot == 4 && depth == 32;
+    u8::from(signed) + u8::from(unsigned) + u8::from(float) > 1
+}
+
 /// Read-only preflight: base AudioControl/playback claims are already held.
 /// No alternate is activated and no capture transfer is allocated or submitted.
 pub(super) fn preflight_implicit_feedback_interfaces(
@@ -43,7 +57,7 @@ fn structural_feedback_interfaces(
         let Some(format) = parse_android_streaming_interface_format(&out) else {
             continue;
         };
-        if format.is_uac1 || format.format_tag != FORMAT_TAG_PCM {
+        if format.is_uac1 || !type_i_pcm_tag(format.format_tag) {
             continue;
         }
         for ep in out.endpoint_descriptors() {
@@ -158,8 +172,14 @@ fn structural_feedback_interfaces(
 /// the historical private short AS dialect must not acquire fixed endpoint profiles.
 fn standard_implicit_pcm_format(format: &StreamingInterfaceFormat) -> bool {
     !format.is_uac1
-        && format.uac2_formats.is_some_and(|bits| bits & 1 != 0)
-        && format.format_tag == FORMAT_TAG_PCM
+        && !ambiguous_type_i_pcm(format.uac2_formats, format.subslot_size, format.bit_resolution)
+        && type_i_pcm_tag(format.format_tag)
+        && format.uac2_formats.is_some_and(|bits| bits & (1 << (format.format_tag - 1)) != 0)
+        && match format.format_tag {
+            FORMAT_TAG_PCM8 => format.subslot_size == 1 && format.bit_resolution == 8,
+            FORMAT_TAG_IEEE_FLOAT => format.subslot_size == 4 && format.bit_resolution == 32,
+            _ => true,
+        }
         && format.channels > 0
         && format.subslot_size > 0
         && format.bit_resolution > 0
@@ -204,6 +224,7 @@ fn implicit_source_inventory(
     speed: Speed,
     claimed_controls: Option<&[u8]>,
 ) -> Vec<ImplicitSourceCandidate> {
+    if settings().has(crate::Quirk::SkipImplicitFeedback) { return Vec::new(); }
     if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
         return Vec::new();
     }
@@ -286,14 +307,16 @@ fn implicit_source_inventory(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaybackImplicitProfile {
     Generic,
+    #[cfg(test)]
     Fixed { address: u8, interface: u8 },
     Skip,
 }
 
 fn playback_implicit_profile(_vendor: u16, _product: u16) -> PlaybackImplicitProfile {
-    // Shared-parity release: device-specific fixed pipes and exclusions remain
-    // deferred. Descriptor/function/clock-based generic discovery stays active.
-    PlaybackImplicitProfile::Generic
+    // Only source-backed exact identity exclusions are active; fixed-pipe
+    // vendor mappings still require a separately proven source contract.
+    if settings().has(crate::Quirk::SkipImplicitFeedback) { PlaybackImplicitProfile::Skip }
+    else { PlaybackImplicitProfile::Generic }
 }
 
 /// Apply the identity rule only after a sink's explicit-feedback path has been
@@ -308,6 +331,7 @@ fn implicit_source_rank(
 ) -> Option<u8> {
     match profile {
         PlaybackImplicitProfile::Skip => None,
+        #[cfg(test)]
         PlaybackImplicitProfile::Fixed { address, interface } => {
             (source.address == address
                 && source.interface_number == interface
@@ -330,15 +354,16 @@ fn implicit_source_rank(
 
 fn implicit_profile_proven(
     profile: PlaybackImplicitProfile,
-    standard_sink: bool,
-    standard_source: bool,
-    rate_proven: bool,
+    _standard_sink: bool,
+    _standard_source: bool,
+    _rate_proven: bool,
 ) -> bool {
     match profile {
         PlaybackImplicitProfile::Skip => false,
         PlaybackImplicitProfile::Generic => true,
+        #[cfg(test)]
         PlaybackImplicitProfile::Fixed { .. } => {
-            standard_sink && standard_source && rate_proven
+            _standard_sink && _standard_source && _rate_proven
         }
     }
 }
@@ -771,6 +796,7 @@ pub(super) fn build_usb_capability_model(
             } else {
                 resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
             };
+            if native_only_profile(&stream_format) {stream_format.format_tag=FORMAT_TAG_DSD;}
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             let standard_grid = descriptor.protocol_code() == 0x20
                 && standard_implicit_pcm_format(&stream_format)
@@ -826,6 +852,11 @@ pub(super) fn build_usb_capability_model(
 
                 let Ok((max_packet_bytes, service_interval_us)) =
                     standard_endpoint_geometry(&endpoint, speed) else { continue; };
+                let max_packet_bytes=if settings().has(crate::Quirk::TxLengthPrefix) {
+                    if descriptor.interface_number()!=1 || !stream_format.is_uac1 || stream_format.format_tag!=FORMAT_TAG_PCM {continue;}
+                    let Some(capacity)=max_packet_bytes.checked_sub(4) else {continue;};
+                    capacity
+                } else {max_packet_bytes};
 
                 let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
@@ -835,7 +866,7 @@ pub(super) fn build_usb_capability_model(
                     speed,
                 ) else { continue; };
                 let feedback_address = discovered_feedback.map(|feedback| feedback.address);
-                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) {
+                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) || settings().has(crate::Quirk::TxLengthPrefix) {
                     capacity_limited_rates(&sample_rate_ranges, max_packet_bytes, service_interval_us,
                         usize::from(stream_format.channels) * usize::from(stream_format.subslot_size))
                 } else {
@@ -869,7 +900,7 @@ pub(super) fn build_usb_capability_model(
                 let implicit = if standard_routes.is_none() && discovered_feedback.is_none()
                     && endpoint.sync_type() == SyncType::Asynchronous
                     && !stream_format.is_uac1
-                    && stream_format.format_tag == FORMAT_TAG_PCM
+                    && type_i_pcm_tag(stream_format.format_tag)
                 {
                     endpoint_rates.iter().find_map(|rate| {
                         resolve_implicit_source(
@@ -921,7 +952,8 @@ pub(super) fn build_usb_capability_model(
                         endpoint.sync_type(),
                         endpoint.synch_address(),
                         feedback_address,
-                        settings().allow_unsynchronized_async(),
+                        settings().allow_nominal_uac1(stream_format.is_uac1, speed == Speed::Full,
+                            type_i_pcm_tag(stream_format.format_tag), endpoint.synch_address()),
                     )
                 };
                 let base_alt = AltSetting {
@@ -1075,7 +1107,7 @@ pub(super) fn build_usb_capability_model(
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
             endpoint_address: candidate.endpoint_address,
-            format: if candidate.native_dsd.is_some() { AltFormat::Dsd } else { AltFormat::Pcm },
+            format: if candidate.native_dsd.is_some() { AltFormat::Dsd } else { alt_format(candidate.format_tag) },
             channels: candidate.channels, subslot_bytes: candidate.subslot_size,
             valid_bits: if candidate.native_dsd.is_some() { 1 } else { candidate.bit_resolution },
             rate_ranges: ranges.iter().map(|r| RateRange { min_hz:r.min,max_hz:r.max,step_hz:r.res }).collect(),
@@ -1090,6 +1122,23 @@ pub(super) fn build_usb_capability_model(
             } else { admitted_pacing(candidate.sync_type,candidate.feedback_endpoint.map(|f|f.address)) }),
         });
     }
+    // A UAC2 Type I bitmap may expose signed and float on the same physical alternate.
+    // Publish distinct layouts while retaining the exact same rate/ownership/pacing evidence.
+    let mut extra_formats = Vec::new();
+    for alt in &alt_settings {
+        if !matches!(alt.format, AltFormat::Pcm | AltFormat::PcmU8 | AltFormat::PcmFloat32) { continue; }
+        let bitmap = config_descriptor.interfaces().flat_map(|itf| itf.descriptors())
+            .find(|d| d.interface_number() == alt.interface_number && d.setting_number() == alt.alt_setting)
+            .and_then(|d| parse_android_streaming_interface_format(&d)).and_then(|f| f.uac2_formats);
+        if let Some(bits) = bitmap {
+            for (flag, format, slot, depth) in [(2, AltFormat::PcmU8, 1, 8), (4, AltFormat::PcmFloat32, 4, 32)] {
+                if bits & flag != 0 && alt.format != format && alt.subslot_bytes == slot && alt.valid_bits == depth {
+                    let mut variant = alt.clone(); variant.format = format; extra_formats.push(variant);
+                }
+            }
+        }
+    }
+    alt_settings.extend(extra_formats);
     supported_sample_rates.sort_unstable();
     supported_sample_rates.dedup();
     alt_settings.sort_by_key(|alt| {
@@ -1142,7 +1191,7 @@ pub(super) fn select_stream_candidates(
             return Err(SelectError::NoMatch("vendor PCM requires implicit feedback".into()));
         }
         if playback_format.dsd_transport != DsdTransportMode::None || playback_format.is_dop
-            || !profile.supports_rate(playback_format.sample_rate) || playback_format.bit_depth != profile.output.subslot_bytes * 8
+            || playback_format.pcm_encoding != PcmEncoding::Signed || !profile.supports_rate(playback_format.sample_rate) || playback_format.bit_depth != profile.output.subslot_bytes * 8
             || playback_format.channels != profile.output.channels {
             return Err(SelectError::NoMatch("vendor PCM requires its supported native PCM rate and channel format".into()));
         }
@@ -1169,6 +1218,13 @@ pub(super) fn select_stream_candidates(
                 Some(format) => format,
                 None => continue,
             };
+            if playback_format.dsd_transport == DsdTransportMode::None {
+                let tag = playback_format.pcm_encoding.format_tag();
+                let present = stream_format.uac2_formats.map_or(stream_format.format_tag == tag,
+                    |bits| bits & (1 << (tag - 1)) != 0);
+                if !present { continue; }
+                stream_format.format_tag = tag;
+            }
             let ap80_dsd = matches_ap80_raw_dsd(
                 usb_id, config_descriptor.number(), &descriptor, &stream_format,
             );
@@ -1177,6 +1233,7 @@ pub(super) fn select_stream_candidates(
             } else {
                 resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
             };
+            if native_only_profile(&stream_format) && playback_format.dsd_transport!=DsdTransportMode::Native {continue;}
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             apply_playback_designs_dop(&mut stream_format, playback_format, playback_designs_dop);
             if playback_format.dsd_transport == DsdTransportMode::Native {
@@ -1277,6 +1334,11 @@ pub(super) fn select_stream_candidates(
                 );
                 let Ok((max_packet_bytes, service_interval_us)) =
                     standard_endpoint_geometry(&endpoint, speed) else { continue; };
+                let max_packet_bytes=if settings().has(crate::Quirk::TxLengthPrefix) {
+                    if descriptor.interface_number()!=1 || !stream_format.is_uac1 || stream_format.format_tag!=FORMAT_TAG_PCM {continue;}
+                    let Some(capacity)=max_packet_bytes.checked_sub(4) else {continue;};
+                    capacity
+                } else {max_packet_bytes};
                 let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
                     endpoint.address(),
@@ -1287,7 +1349,7 @@ pub(super) fn select_stream_candidates(
                 let discovered_implicit_sources = if endpoint.sync_type() == SyncType::Asynchronous
                     && discovered_feedback.is_none()
                     && !stream_format.is_uac1
-                    && stream_format.format_tag == FORMAT_TAG_PCM
+                    && type_i_pcm_tag(stream_format.format_tag)
                     && (1..=16).contains(&endpoint.interval())
                     && valid_standard_implicit_capacity(&endpoint, speed)
                 {
@@ -1366,6 +1428,8 @@ pub(super) fn select_stream_candidates(
                     refused_unsynchronized = true;
                     continue;
                 }
+                let allow_unsynchronized_async = settings().allow_nominal_uac1(stream_format.is_uac1,
+                    speed == Speed::Full, type_i_pcm_tag(stream_format.format_tag), endpoint.synch_address());
                 match admit_endpoint(
                     endpoint.sync_type(),
                     endpoint.synch_address(),
@@ -2010,6 +2074,7 @@ pub(super) fn required_max_packet_bytes(
 
 pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
     match bit_depth {
+        8 => Some(1),
         16 => Some(2),
         24 => Some(3),
         32 => Some(4),
@@ -2190,6 +2255,8 @@ pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<Stream
         bit_resolution?
     };
 
+    if ambiguous_type_i_pcm(uac2_formats, subslot_size, bit_resolution) { return None; }
+
     Some(StreamingInterfaceFormat {
         format_tag,
         uac2_formats,
@@ -2245,9 +2312,9 @@ pub(super) fn validate_transport_against_playback_format(
     playback_format: PlaybackFormat,
 ) -> Result<(), String> {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM };
+    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { playback_format.pcm_encoding.format_tag() };
     if if is_native_dsd { candidate.native_dsd.is_none() }
-        else { candidate.format_tag != FORMAT_TAG_PCM } {
+        else { candidate.format_tag != required_format } {
         return Err(format!(
             "USB direct requires {} transport, got {}",
             format_tag_label(required_format),
@@ -2305,6 +2372,8 @@ pub(super) fn current_lock_requested_for_fd(device_fd: RawFd) -> bool {
 pub(super) fn alt_format(format_tag: u16) -> AltFormat {
     match format_tag {
         FORMAT_TAG_PCM => AltFormat::Pcm,
+        FORMAT_TAG_PCM8 => AltFormat::PcmU8,
+        FORMAT_TAG_IEEE_FLOAT => AltFormat::PcmFloat32,
         FORMAT_TAG_DSD => AltFormat::Dsd,
         _ => AltFormat::Other,
     }

@@ -8,11 +8,11 @@ The module targets Media3 1.11.1's `AudioSink.AudioSinkConfig` API. It deliberat
 
 | Operation | Behavior |
 |---|---|
-| Format support | Mono/stereo raw integer PCM at 16, 24 or 32 bits; float/compressed formats rejected |
+| Format support | Mono/stereo raw signed integer PCM at 16, 24 or 32 bits, unsigned8 and IEEE float32; compressed formats rejected |
 | Configure | Retain track delay/padding metadata; open nothing until PCM arrives |
 | Handle buffer | Skip encoder delay, retain trailing padding, write remaining integer bytes with backpressure |
 | Same-format track | Discard previous track's held padding and retain the existing stream |
-| Different format | Drain the old output, close it, then open the replacement |
+| Different format | Drain, use transactional source reconfigure when supplied, otherwise close/open |
 | Position | Initial presentation timestamp plus hardware frames played, bounded by submitted frames |
 | Discontinuity | Reconcile the next presentation timestamp against submitted/trimmed input |
 | Flush / seek | Discard pending PCM and padding, reset counters; initial delay is not reapplied without configure |
@@ -35,3 +35,9 @@ The integration is covered by JVM tests for integer byte preservation, delay/pad
 ## Pinned renderer transitions
 
 The [official 1.11.1 sources](https://dl.google.com/dl/android/maven2/androidx/media3/media3-exoplayer/1.11.1/media3-exoplayer-1.11.1-sources.jar) show `MediaCodecAudioRenderer.onOutputFormatChanged` copying encoder delay/padding into its raw sink format before `configure`. `MediaCodecRenderer` sets `needToNotifyOutputFormatChangeAfterStreamChange` when the stream changes, so even codec reuse notifies the audio renderer for the next stream. The last previous-stream buffer triggers `onProcessedStreamChange`/`handleDiscontinuity`; the first next-stream buffer gets the new configuration. `setOutputStreamOffsetUs` updates output metadata in DefaultAudioSink; it does not subtract from the sink's renderer-time position. The custom sink likewise returns renderer-time positions, which the renderer maps into its period. Seek calls the sink's `flush` before the next output timestamp anchors position.
+
+## Additional Type I PCM encodings
+
+`StreamRequest.pcmU8` and `pcmFloat32` are distinct direct USB requests. The sink maps Media3 `ENCODING_PCM_8BIT` to unsigned bytes and `ENCODING_PCM_FLOAT` to IEEE binary32 bits. Delay/padding trimming and backpressure retain those bytes exactly. Float32 NaN payloads, signed zero and subnormals are not converted to integer samples. Unsigned8 silence is `0x80`; float silence is positive zero. These two encodings require matching slots and never use signed-integer widening or software gain. Unsupported Type II/III compressed alternates are refused rather than reinterpreted as PCM.
+
+An alternate advertising signed32 and float32 in the same four-byte geometry does not establish a live numeric interpretation. Such ambiguous UAC2/ADC3 alternates are refused until an active-format control is implemented. A bitmap lists possibilities; it is not proof that arbitrary source bits are decoded as the requested numeric format. See [USB Audio 2.0 section 4.9.2](https://usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), which restricts grouped formats to ones handled by the same decoder.

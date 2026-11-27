@@ -116,6 +116,13 @@ pub struct StreamStats {
     pub max_turnaround_us: u64,
     pub last_submit_gap_us: u64,
     pub max_submit_gap_us: u64,
+    pub worker_gap_over_10ms: u64,
+    pub worker_gap_over_50ms: u64,
+    pub max_worker_gap_us: u64,
+    pub adaptive_queue_changes: u64,
+    pub adaptive_queue_slots: u64,
+    pub adaptive_queue_us: u64,
+
     /// Rate the DAC has actually consumed frames at since the start.
     pub effective_rate_hz: f64,
     /// Live feedback is locked. Equivalent to `feedback_locked` in 0.1.1.
@@ -163,6 +170,7 @@ pub(crate) struct StreamInner {
     handle: Mutex<Option<StreamHandle>>,
     pub(crate) shared: Arc<StreamShared>,
     format: StreamFormat,
+    usb_handle_identity: usize,
     closed: AtomicBool,
 }
 
@@ -171,6 +179,7 @@ impl StreamInner {
         Arc::new(Self {
             dac,
             shared: Arc::clone(&handle.shared),
+            usb_handle_identity: handle.usb_handle_identity,
             handle: Mutex::new(Some(handle)),
             format,
             closed: AtomicBool::new(false),
@@ -229,6 +238,10 @@ impl StreamInner {
 ///   in a 4-byte subslot is the `i24` shifted left by 8 (low byte zero);
 ///   32-bit audio is an `i32`. With the layout the DAC advertises, the bytes
 ///   written are the bytes on the wire.
+/// * **Unsigned 8-bit PCM** — one unsigned byte per sample, silence 0x80. Bytes are retained exactly.
+/// * **IEEE float32 PCM** — one little-endian binary32 bit pattern per sample. NaN payloads,
+///   signed zero, infinity and subnormals are retained without a numeric conversion. Silence is +0.
+///   For these two explicit encodings, use `write`; `write_i32` and nonunity software gain refuse.
 /// * **DoP** — each sample is the DoP word in the same subslot layout, the 16
 ///   DSD bits in the top two bytes below the marker: for a 3-byte subslot
 ///   `[dsd_low, dsd_high, marker]`, for a 4-byte subslot `[0, dsd_low,
@@ -279,6 +292,19 @@ impl DacStream {
         }
         Ok(())
     }
+
+    pub(crate) fn reconfigure_identity(&self, owner: &Arc<DacShared>) -> Result<usize> {
+        self.ensure_open()?;
+        if !Arc::ptr_eq(owner, &self.inner.dac) {
+            return Err(Error::InvalidArgument("stream belongs to another DAC session".into()));
+        }
+        if self.inner.handle.lock().as_ref().is_some_and(|handle| handle.capture.is_some()) {
+            return Err(Error::Unsupported { reason: "reconfigure the duplex pair explicitly; playback-only reconfiguration is refused".into(), offered: vec![] });
+        }
+        Ok(self.inner.usb_handle_identity)
+    }
+
+    pub(crate) fn retire_for_reconfigure(&self) -> Result<()> { self.inner.close() }
 
     /// The wire format this stream runs.
     pub fn format(&self) -> &StreamFormat {
@@ -511,6 +537,13 @@ impl DacStream {
             max_turnaround_us: stats.max_transfer_turnaround_us.load(Relaxed),
             last_submit_gap_us: stats.last_submit_gap_us.load(Relaxed),
             max_submit_gap_us: stats.max_submit_gap_us.load(Relaxed),
+            worker_gap_over_10ms: stats.worker_gap_over_10ms.load(Relaxed),
+            worker_gap_over_50ms: stats.worker_gap_over_50ms.load(Relaxed),
+            max_worker_gap_us: stats.max_worker_gap_us.load(Relaxed),
+            adaptive_queue_changes: stats.adaptive_queue_changes.load(Relaxed),
+            adaptive_queue_slots: stats.adaptive_queue_slots.load(Relaxed),
+            adaptive_queue_us: stats.adaptive_queue_us.load(Relaxed),
+
             effective_rate_hz: stats.effective_consumer_rate_milli_hz.load(Relaxed) as f64 / 1_000.0,
             feedback_active: stats.feedback_locked.load(Relaxed),
             feedback_reports: stats.feedback_reports.load(Relaxed),

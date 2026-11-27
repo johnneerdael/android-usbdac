@@ -56,6 +56,12 @@ public enum class DacErrorCode(internal val wireName: String?) {
      */
     VOLUME_UNAVAILABLE("volume_unavailable"),
 
+    /** Drain deadline expired; the original stream is still open and draining. */
+    RECONFIGURE_DRAIN_TIMEOUT("reconfigure_drain_timeout"),
+
+    /** Replacement/rollback lost a usable stream or retained USB ownership; close the session. */
+    RECONFIGURE_UNUSABLE("reconfigure_unusable"),
+
     /** The app does not hold USB permission for the device. */
     PERMISSION_DENIED(null),
 

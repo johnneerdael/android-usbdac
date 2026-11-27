@@ -283,6 +283,33 @@ pub fn stream(id: i64) -> Result<Arc<DacStream>, Error> {
         .ok_or_else(|| stale("stream", id))
 }
 
+/// Resolve only a stream registered to this exact DAC owner.
+pub fn stream_for_dac(dac: &Arc<DacEntry>, id: i64) -> Result<Arc<DacStream>, Error> {
+    let owners = DACS.lock();
+    let owner = owners.iter().find(|(_, entry)| Arc::ptr_eq(entry, dac)).map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed during reconfiguration".into()))?;
+    let key = u64::try_from(id).map_err(|_| stale("stream", id))?;
+    STREAMS.lock().get(&key).filter(|(registered, _)| *registered == owner)
+        .map(|(_, stream)| stream.clone()).ok_or_else(|| Error::InvalidArgument("stream is stale or belongs to another DAC".into()))
+}
+
+/// Commit replacement only while both the DAC and old registration still exist.
+/// On failure the unregistered replacement drops/closes and cannot become an orphan.
+pub fn replace_stream(dac: &Arc<DacEntry>, previous: i64, id: u64, stream: DacStream) -> Result<(), Error> {
+    let owners = DACS.lock();
+    let owner = owners.iter().find(|(_, entry)| Arc::ptr_eq(entry, dac)).map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed before replacement registration".into()))?;
+    let previous = u64::try_from(previous).map_err(|_| stale("stream", previous))?;
+    let mut streams = STREAMS.lock();
+    if !streams.get(&previous).is_some_and(|(registered, _)| *registered == owner) {
+        return Err(Error::InvalidState("old stream closed during reconfiguration".into()));
+    }
+    streams.remove(&previous);
+    streams.insert(id, (owner, Arc::new(stream)));
+    dac.forget_stream(previous); dac.add_stream(id);
+    Ok(())
+}
+
 pub fn remove_stream(id: i64) -> Result<Arc<DacStream>, Error> {
     let (owner, stream) = u64::try_from(id)
         .ok()

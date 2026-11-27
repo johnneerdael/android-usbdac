@@ -141,6 +141,13 @@ pub struct ExplicitFeedbackDiagnostics {
     pub transfer_status_counts: [u64; 8],
     pub packet_status_counts: [u64; 8],
     pub accepted_reports: u64,
+    /// Accepted unsmoothed observations, in frames per OUT service interval.
+    pub rate_samples: u64,
+    pub rate_min_frames: f64,
+    pub rate_max_frames: f64,
+    pub rate_mean_frames: f64,
+    /// Population variance; EWMA remains 0.2. No audible smoothing tradeoff is inferred.
+    pub rate_variance_frames: f64,
     pub empty_polls: u64,
     pub rejected_reports: u64,
     pub(crate) samples: [Option<ExplicitFeedbackPacket>; 9],

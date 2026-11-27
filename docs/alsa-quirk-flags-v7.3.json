@@ -1,0 +1,2091 @@
+{
+  "source_commit": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
+  "source_path": "sound/usb/quirks.c",
+  "entries": [
+    {
+      "vendor_id": 1452,
+      "product_id": 4363,
+      "match": "DEVICE_STRING_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2228,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2228"
+    },
+    {
+      "vendor_id": 31,
+      "product_id": 2849,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2233,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2233"
+    },
+    {
+      "vendor_id": 31,
+      "product_id": 2851,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2235,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2235"
+    },
+    {
+      "vendor_id": 32,
+      "product_id": 2849,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2237,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2237"
+    },
+    {
+      "vendor_id": 292,
+      "product_id": 3105,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2239,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2239"
+    },
+    {
+      "vendor_id": 1008,
+      "product_id": 25930,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIC_RES_16"
+      ],
+      "source_line": 2241,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2241"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 12288,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2243,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2243"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 12877,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2245,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2245"
+    },
+    {
+      "vendor_id": 1054,
+      "product_id": 16512,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2247,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2247"
+    },
+    {
+      "vendor_id": 1118,
+      "product_id": 2108,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "CTL_MSG_DELAY",
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2249,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2249"
+    },
+    {
+      "vendor_id": 1118,
+      "product_id": 1807,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2252,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2252"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2055,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2254,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2254"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2056,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2256,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2256"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2057,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2258,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2258"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2073,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2260,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2260"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2075,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2262,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2262"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2077,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2264,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2264"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2085,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2266,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2266"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2086,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2268,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2268"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2124,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2270,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2270"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2250,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2272,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2272"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2449,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "IGNORE_CTL_ERROR",
+        "MIC_RES_384"
+      ],
+      "source_line": 2274,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2274"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2466,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIC_RES_384"
+      ],
+      "source_line": 2277,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2277"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2468,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2279,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2279"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2703,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2281,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2281"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": 2746,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_GET_CUR_OK",
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2284,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2284"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5382,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2287,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2287"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 5385,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2289,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2289"
+    },
+    {
+      "vendor_id": 1177,
+      "product_id": 12552,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2291,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2291"
+    },
+    {
+      "vendor_id": 1240,
+      "product_id": 65258,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2293,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2293"
+    },
+    {
+      "vendor_id": 1256,
+      "product_id": 41041,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SKIP_CLOCK_SELECTOR",
+        "CTL_MSG_DELAY_5M"
+      ],
+      "source_line": 2295,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2295"
+    },
+    {
+      "vendor_id": 1317,
+      "product_id": 42157,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IFACE_SKIP_CLOSE"
+      ],
+      "source_line": 2297,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2297"
+    },
+    {
+      "vendor_id": 1356,
+      "product_id": 2956,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SET_IFACE_FIRST"
+      ],
+      "source_line": 2299,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2299"
+    },
+    {
+      "vendor_id": 1366,
+      "product_id": 20,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2301,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2301"
+    },
+    {
+      "vendor_id": 1394,
+      "product_id": 6920,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2303,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2303"
+    },
+    {
+      "vendor_id": 1394,
+      "product_id": 6921,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2305,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2305"
+    },
+    {
+      "vendor_id": 1443,
+      "product_id": 37920,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2307,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2307"
+    },
+    {
+      "vendor_id": 1447,
+      "product_id": 4128,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2309,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2309"
+    },
+    {
+      "vendor_id": 1505,
+      "product_id": 1032,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2311,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2311"
+    },
+    {
+      "vendor_id": 1505,
+      "product_id": 1152,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2313,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2313"
+    },
+    {
+      "vendor_id": 1532,
+      "product_id": 561,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_LINEAR_VOL",
+        "MIXER_CAPTURE_LINEAR_VOL",
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2315,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2315"
+    },
+    {
+      "vendor_id": 1572,
+      "product_id": 15679,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2318,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2318"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32835,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2320,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2320"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32836,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY",
+        "FORCE_IFACE_RESET"
+      ],
+      "source_line": 2323,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2323"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32842,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2326,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2326"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32863,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET"
+      ],
+      "source_line": 2329,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2329"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32875,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY",
+        "FORCE_IFACE_RESET"
+      ],
+      "source_line": 2331,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2331"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32893,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY",
+        "FORCE_IFACE_RESET"
+      ],
+      "source_line": 2334,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2334"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": 32876,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY",
+        "FORCE_IFACE_RESET"
+      ],
+      "source_line": 2337,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2337"
+    },
+    {
+      "vendor_id": 1633,
+      "product_id": 2179,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2340,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2340"
+    },
+    {
+      "vendor_id": 1638,
+      "product_id": 2176,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY",
+        "CTL_MSG_DELAY_5M"
+      ],
+      "source_line": 2342,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2342"
+    },
+    {
+      "vendor_id": 1784,
+      "product_id": 45056,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2345,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2345"
+    },
+    {
+      "vendor_id": 1784,
+      "product_id": 53250,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2347,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2347"
+    },
+    {
+      "vendor_id": 1809,
+      "product_id": 22528,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2349,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2349"
+    },
+    {
+      "vendor_id": 1869,
+      "product_id": 13651,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2351,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2351"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8240,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2353,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2353"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8241,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2355,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2355"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8320,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2357,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2357"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8321,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2359,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2359"
+    },
+    {
+      "vendor_id": 1891,
+      "product_id": 8324,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2361,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2361"
+    },
+    {
+      "vendor_id": 2045,
+      "product_id": 11,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2363,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2363"
+    },
+    {
+      "vendor_id": 2235,
+      "product_id": 9986,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2365,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2365"
+    },
+    {
+      "vendor_id": 2385,
+      "product_id": 5805,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2367,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2367"
+    },
+    {
+      "vendor_id": 2675,
+      "product_id": 58,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ALWAYS_SET_RATE"
+      ],
+      "source_line": 2369,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2369"
+    },
+    {
+      "vendor_id": 2821,
+      "product_id": 6182,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2371,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2371"
+    },
+    {
+      "vendor_id": 2821,
+      "product_id": 6183,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2373,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2373"
+    },
+    {
+      "vendor_id": 2821,
+      "product_id": 6310,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_CAPTURE_MIN_MUTE"
+      ],
+      "source_line": 2375,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2375"
+    },
+    {
+      "vendor_id": 2830,
+      "product_id": 841,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2377,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2377"
+    },
+    {
+      "vendor_id": 3034,
+      "product_id": 18826,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE",
+        "MIXER_CAPTURE_MIN_MUTE"
+      ],
+      "source_line": 2379,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2379"
+    },
+    {
+      "vendor_id": 3141,
+      "product_id": 25408,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2381,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2381"
+    },
+    {
+      "vendor_id": 3141,
+      "product_id": 25451,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2383,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2383"
+    },
+    {
+      "vendor_id": 3468,
+      "product_id": 12,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2385,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2385"
+    },
+    {
+      "vendor_id": 3468,
+      "product_id": 18,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2387,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2387"
+    },
+    {
+      "vendor_id": 3468,
+      "product_id": 20,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M",
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2389,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2389"
+    },
+    {
+      "vendor_id": 3468,
+      "product_id": 258,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2391,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2391"
+    },
+    {
+      "vendor_id": 3595,
+      "product_id": 64001,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2393,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2393"
+    },
+    {
+      "vendor_id": 3787,
+      "product_id": 8284,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FIXED_RATE"
+      ],
+      "source_line": 2395,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2395"
+    },
+    {
+      "vendor_id": 3787,
+      "product_id": 8485,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FIXED_RATE"
+      ],
+      "source_line": 2397,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2397"
+    },
+    {
+      "vendor_id": 3787,
+      "product_id": 8297,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FIXED_RATE"
+      ],
+      "source_line": 2399,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2399"
+    },
+    {
+      "vendor_id": 4057,
+      "product_id": 8,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2401,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2401"
+    },
+    {
+      "vendor_id": 4152,
+      "product_id": 4756,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2403,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2403"
+    },
+    {
+      "vendor_id": 4353,
+      "product_id": 3,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2405,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2405"
+    },
+    {
+      "vendor_id": 4817,
+      "product_id": 14855,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE",
+        "MIXER_CAPTURE_MIN_MUTE",
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2407,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2407"
+    },
+    {
+      "vendor_id": 4644,
+      "product_id": 10789,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIC_RES_16"
+      ],
+      "source_line": 2410,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2410"
+    },
+    {
+      "vendor_id": 5013,
+      "product_id": 29706,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2412,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2412"
+    },
+    {
+      "vendor_id": 5015,
+      "product_id": 1287,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_FIRST",
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2414,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2414"
+    },
+    {
+      "vendor_id": 5015,
+      "product_id": 1288,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_FIRST",
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2416,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2416"
+    },
+    {
+      "vendor_id": 5015,
+      "product_id": 1289,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_FIRST",
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2418,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2418"
+    },
+    {
+      "vendor_id": 5015,
+      "product_id": 1292,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IFB_SILENCE_ON_EMPTY"
+      ],
+      "source_line": 2420,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2420"
+    },
+    {
+      "vendor_id": 5015,
+      "product_id": 1296,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_FIRST",
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2422,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2422"
+    },
+    {
+      "vendor_id": 5093,
+      "product_id": 1,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2424,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2424"
+    },
+    {
+      "vendor_id": 5418,
+      "product_id": 34269,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW",
+        "DISABLE_AUTOSUSPEND",
+        "SKIP_IFACE_SETUP"
+      ],
+      "source_line": 2426,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2426"
+    },
+    {
+      "vendor_id": 5418,
+      "product_id": 34826,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2429,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2429"
+    },
+    {
+      "vendor_id": 5426,
+      "product_id": 1374,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2431,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2431"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 4098,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2433,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2433"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 4099,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2435,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2435"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 12293,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2437,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2437"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 12294,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2439,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2439"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 12299,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2441,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2441"
+    },
+    {
+      "vendor_id": 5454,
+      "product_id": 20494,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CLOCK_SOURCE"
+      ],
+      "source_line": 2443,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2443"
+    },
+    {
+      "vendor_id": 5766,
+      "product_id": 221,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "TX_LENGTH",
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2445,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2445"
+    },
+    {
+      "vendor_id": 5840,
+      "product_id": 2737,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2447,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2447"
+    },
+    {
+      "vendor_id": 5840,
+      "product_id": 60577,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2449,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2449"
+    },
+    {
+      "vendor_id": 6058,
+      "product_id": 4166,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2451,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2451"
+    },
+    {
+      "vendor_id": 6058,
+      "product_id": 4173,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DISABLE_AUTOSUSPEND"
+      ],
+      "source_line": 2453,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2453"
+    },
+    {
+      "vendor_id": 6127,
+      "product_id": 12419,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2455,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2455"
+    },
+    {
+      "vendor_id": 6226,
+      "product_id": 20578,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2457,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2457"
+    },
+    {
+      "vendor_id": 6226,
+      "product_id": 20581,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2459,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2459"
+    },
+    {
+      "vendor_id": 6401,
+      "product_id": 401,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2461,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2461"
+    },
+    {
+      "vendor_id": 6647,
+      "product_id": 3,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2463,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2463"
+    },
+    {
+      "vendor_id": 6647,
+      "product_id": 53,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2465,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2465"
+    },
+    {
+      "vendor_id": 7119,
+      "product_id": 8833,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIC_RES_16"
+      ],
+      "source_line": 2467,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2467"
+    },
+    {
+      "vendor_id": 7119,
+      "product_id": 8835,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIC_RES_16"
+      ],
+      "source_line": 2469,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2469"
+    },
+    {
+      "vendor_id": 7691,
+      "product_id": 53278,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_URB_FIXUP"
+      ],
+      "source_line": 2471,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2471"
+    },
+    {
+      "vendor_id": 8183,
+      "product_id": 3969,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2473,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2473"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29184,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2475,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2475"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29185,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2477,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2477"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29200,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2479,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2479"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29201,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2481,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2481"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29203,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2483,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2483"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29207,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2485,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2485"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29211,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2487,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2487"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29214,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2489,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2489"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29215,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2491,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2491"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29248,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2493,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2493"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29280,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2495,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2495"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29296,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2497,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2497"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29312,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2499,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2499"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 29313,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2501,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2501"
+    },
+    {
+      "vendor_id": 8369,
+      "product_id": 8201,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SKIP_IMPLICIT_FB",
+        "DSD_RAW"
+      ],
+      "source_line": 2503,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2503"
+    },
+    {
+      "vendor_id": 8256,
+      "product_id": 33280,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SHARE_MEDIA_DEVICE",
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2505,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2505"
+    },
+    {
+      "vendor_id": 8628,
+      "product_id": 129,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2507,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2507"
+    },
+    {
+      "vendor_id": 8628,
+      "product_id": 560,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2509,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2509"
+    },
+    {
+      "vendor_id": 8628,
+      "product_id": 562,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2511,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2511"
+    },
+    {
+      "vendor_id": 8936,
+      "product_id": 51728,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2513,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2513"
+    },
+    {
+      "vendor_id": 9506,
+      "product_id": 7,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "SET_IFACE_FIRST"
+      ],
+      "source_line": 2515,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2515"
+    },
+    {
+      "vendor_id": 9642,
+      "product_id": 24587,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2517,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2517"
+    },
+    {
+      "vendor_id": 9770,
+      "product_id": 37634,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2519,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2519"
+    },
+    {
+      "vendor_id": 10098,
+      "product_id": 1282,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2521,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2521"
+    },
+    {
+      "vendor_id": 10514,
+      "product_id": 12488,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2523,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2523"
+    },
+    {
+      "vendor_id": 10864,
+      "product_id": 6273,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE",
+        "MIXER_CAPTURE_MIN_MUTE"
+      ],
+      "source_line": 2525,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2525"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 35,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2527,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2527"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 36,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2529,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2529"
+    },
+    {
+      "vendor_id": 11091,
+      "product_id": 49,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2531,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2531"
+    },
+    {
+      "vendor_id": 11123,
+      "product_id": 71,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "PLAYBACK_FIRST",
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2533,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2533"
+    },
+    {
+      "vendor_id": 11669,
+      "product_id": 32785,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2535,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2535"
+    },
+    {
+      "vendor_id": 11669,
+      "product_id": 32801,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2537,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2537"
+    },
+    {
+      "vendor_id": 11673,
+      "product_id": 38,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2539,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2539"
+    },
+    {
+      "vendor_id": 12230,
+      "product_id": 61547,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2541,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2541"
+    },
+    {
+      "vendor_id": 12230,
+      "product_id": 61621,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2543,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2543"
+    },
+    {
+      "vendor_id": 12230,
+      "product_id": 61623,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2545,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2545"
+    },
+    {
+      "vendor_id": 12478,
+      "product_id": 257,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2547,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2547"
+    },
+    {
+      "vendor_id": 12885,
+      "product_id": 0,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ITF_USB_DSD_DAC",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2549,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2549"
+    },
+    {
+      "vendor_id": 12987,
+      "product_id": 4,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2551,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2551"
+    },
+    {
+      "vendor_id": 13058,
+      "product_id": 6082,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2553,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2553"
+    },
+    {
+      "vendor_id": 13211,
+      "product_id": 14855,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_MIN_MUTE"
+      ],
+      "source_line": 2555,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2555"
+    },
+    {
+      "vendor_id": 13379,
+      "product_id": 37645,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "MIC_RES_16"
+      ],
+      "source_line": 2557,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2557"
+    },
+    {
+      "vendor_id": 14073,
+      "product_id": 49161,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2559,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2559"
+    },
+    {
+      "vendor_id": 15392,
+      "product_id": 15649,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "FORCE_IFACE_RESET",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2561,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2561"
+    },
+    {
+      "vendor_id": 16700,
+      "product_id": 42246,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2563,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2563"
+    },
+    {
+      "vendor_id": 21325,
+      "product_id": 33,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2565,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2565"
+    },
+    {
+      "vendor_id": 21325,
+      "product_id": 8457,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "ALIGN_TRANSFER"
+      ],
+      "source_line": 2567,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2567"
+    },
+    {
+      "vendor_id": 34031,
+      "product_id": 42,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "GENERIC_IMPLICIT_FB"
+      ],
+      "source_line": 2569,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2569"
+    },
+    {
+      "vendor_id": 34031,
+      "product_id": 130,
+      "match": "DEVICE_FLG",
+      "flags": [
+        "MIXER_PLAYBACK_LINEAR_VOL",
+        "MIXER_CAPTURE_LINEAR_VOL"
+      ],
+      "source_line": 2571,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2571"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": null,
+      "match": "VENDOR_STRING_FLG",
+      "flags": [],
+      "source_line": 2575,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2575"
+    },
+    {
+      "vendor_id": 1118,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2580,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2580"
+    },
+    {
+      "vendor_id": 1133,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "CTL_MSG_DELAY_1M"
+      ],
+      "source_line": 2582,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2582"
+    },
+    {
+      "vendor_id": 1151,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE",
+        "CTL_MSG_DELAY"
+      ],
+      "source_line": 2584,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2584"
+    },
+    {
+      "vendor_id": 1604,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY"
+      ],
+      "source_line": 2586,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2586"
+    },
+    {
+      "vendor_id": 2045,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "VALIDATE_RATES"
+      ],
+      "source_line": 2588,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2588"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 32774,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2590,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2590"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 32778,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2591,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2591"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 32780,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2592,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2592"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 32790,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2593,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2593"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": 32796,
+      "match": "DEVICE_FLG",
+      "flags": [],
+      "source_line": 2594,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2594"
+    },
+    {
+      "vendor_id": 4661,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "SKIP_CLOCK_SELECTOR",
+        "SKIP_IFACE_SETUP"
+      ],
+      "source_line": 2595,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2595"
+    },
+    {
+      "vendor_id": 5393,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2598,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2598"
+    },
+    {
+      "vendor_id": 5418,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2600,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2600"
+    },
+    {
+      "vendor_id": 6353,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2602,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2602"
+    },
+    {
+      "vendor_id": 7655,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "GET_SAMPLE_RATE"
+      ],
+      "source_line": 2604,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2604"
+    },
+    {
+      "vendor_id": 8369,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2606,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2606"
+    },
+    {
+      "vendor_id": 8685,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2608,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2608"
+    },
+    {
+      "vendor_id": 8921,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2610,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2610"
+    },
+    {
+      "vendor_id": 9146,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "CTL_MSG_DELAY",
+        "IFACE_DELAY",
+        "DSD_RAW"
+      ],
+      "source_line": 2612,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2612"
+    },
+    {
+      "vendor_id": 9678,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2615,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2615"
+    },
+    {
+      "vendor_id": 9762,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2617,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2617"
+    },
+    {
+      "vendor_id": 9992,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "IGNORE_CTL_ERROR"
+      ],
+      "source_line": 2619,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2619"
+    },
+    {
+      "vendor_id": 10098,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2621,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2621"
+    },
+    {
+      "vendor_id": 10123,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2623,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2623"
+    },
+    {
+      "vendor_id": 10539,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2625,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2625"
+    },
+    {
+      "vendor_id": 10610,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2627,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2627"
+    },
+    {
+      "vendor_id": 10934,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2629,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2629"
+    },
+    {
+      "vendor_id": 11005,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2631,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2631"
+    },
+    {
+      "vendor_id": 11655,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2633,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2633"
+    },
+    {
+      "vendor_id": 12230,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2635,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2635"
+    },
+    {
+      "vendor_id": 13110,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2637,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2637"
+    },
+    {
+      "vendor_id": 13139,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2639,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2639"
+    },
+    {
+      "vendor_id": 13812,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2641,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2641"
+    },
+    {
+      "vendor_id": 14402,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2643,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2643"
+    },
+    {
+      "vendor_id": 50434,
+      "product_id": null,
+      "match": "VENDOR_FLG",
+      "flags": [
+        "DSD_RAW"
+      ],
+      "source_line": 2645,
+      "source_url": "https://github.com/torvalds/linux/blob/c03c1a14507dfaf8b856c2608f9ac216021fc222/sound/usb/quirks.c#L2645"
+    }
+  ]
+}
