@@ -637,7 +637,7 @@ pub(super) struct FeedbackCounters {
     pub(super) empty_polls: u64,
     malformed: u64,
     rate_rejected: u64,
-    last_report_bytes: [u8; 4],
+    last_report_bytes: [u8; 8],
     last_report_len: usize,
     pub(super) diagnostics: Option<crate::ExplicitFeedbackDiagnostics>,
     pub(super) diagnostics_dirty: bool,
@@ -697,7 +697,7 @@ impl FeedbackCounters {
     }
 
     fn record_valid_bytes(&mut self, bytes: &[u8]) {
-        self.last_report_bytes = [0; 4];
+        self.last_report_bytes = [0; 8];
         self.last_report_bytes[..bytes.len()].copy_from_slice(bytes);
         self.last_report_len = bytes.len();
     }
@@ -769,8 +769,14 @@ fn inspect_feedback_packets_with_compatibility(
             Outcome::PacketFailed
         } else if actual == 0 {
             Outcome::Empty
-        } else if let Some(bytes) = report.filter(|bytes| matches!(bytes.len(), 3 | 4)) {
-            if !inferred_service_interval || bytes.len() == 4 {
+        } else if let Some(bytes) = report.filter(|bytes| {
+            if requested == 8 && matches!(speed, Speed::Super | Speed::SuperPlus) {
+                bytes.len() == 8
+            } else {
+                matches!(bytes.len(), 3 | 4)
+            }
+        }) {
+            if !inferred_service_interval || matches!(bytes.len(), 4 | 8) {
                 decoded = if !per_service && !inferred_service_interval && speed == Speed::High
                     && bytes.len() == 4 && compatibility.tenor_nominal_q16.is_some()
                 {
@@ -993,7 +999,9 @@ impl ExplicitFeedbackHealth {
 /// Decode UAC feedback into frames per data-endpoint service interval.
 ///
 /// UAC2 feedback reports samples per microframe on high-speed links and
-/// samples per frame on full-speed links. The feedback endpoint's own polling
+/// samples per frame on full-speed links. Enhanced SuperSpeed reports unsigned
+/// Q32.32 samples per 125 us bus interval (USB 3.2 section 4.4.8.4.1).
+/// The feedback endpoint's own polling
 /// interval is not the data endpoint's packet interval; using it as the
 /// timebase previously produced a rate error of up to 8x at 125 us service.
 #[cfg(test)]
@@ -1026,6 +1034,10 @@ fn decode_feedback_report_with_scale(raw_bytes: &[u8], data_service_interval_us:
             if high_speed && raw & 0xf000_0000 != 0 { return None; }
             let base_interval_us = if per_service { f64::from(data_service_interval_us) } else { feedback_base_interval_us(speed, data_service_interval_us) };
             (raw as f64 / 65_536.0, base_interval_us)
+        }
+        8 if matches!(speed, Speed::Super | Speed::SuperPlus) => {
+            let raw = u64::from_le_bytes(raw_bytes.try_into().ok()?);
+            (raw as f64 / 4_294_967_296.0, 125.0)
         }
         _ => return None,
     };
@@ -1144,7 +1156,86 @@ mod explicit_feedback_tests {
     use super::*;
 
     fn q16(frames: f64) -> [u8; 4] { ((frames * 65536.0).round() as u32).to_le_bytes() }
+    fn q32(frames: f64) -> [u8; 8] { ((frames * 4_294_967_296.0).round() as u64).to_le_bytes() }
     fn scheduler(service_us: u32) -> IsoPacketScheduler { IsoPacketScheduler::new(48_000, 8, service_us) }
+
+    #[test]
+    fn enhanced_superspeed_feedback_uses_q32_bus_units_at_every_output_interval() {
+        for speed in [Speed::Super, Speed::SuperPlus] {
+            for rate in [48_000, 44_100] {
+                let report = q32(f64::from(rate) / 8000.0);
+                for service_us in [125, 250, 1000] {
+                    let scheduler = IsoPacketScheduler::new(rate, 8, service_us);
+                    let mut counters = FeedbackCounters {
+                        infer_service_interval: true, ..FeedbackCounters::default()
+                    };
+                    let (frames, decoded_rate) = select_feedback_report(&report, [(0, 8, 8)],
+                        &scheduler, service_us, speed, 128, true, &mut counters).unwrap();
+                    assert!((decoded_rate - f64::from(rate)).abs() < 0.00001);
+                    let expected_frames = f64::from(rate) * f64::from(service_us) / 1_000_000.0;
+                    assert!((frames - expected_frames).abs() < 0.00001);
+                    assert_eq!(counters.last_report_bytes, report);
+                    assert_eq!(counters.last_report_len, 8);
+                    assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
+                    assert!(!counters.selected_service_interval());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enhanced_superspeed_keeps_valid_report_before_newer_short_report() {
+        let report = q32(6.0);
+        let mut batch = report.to_vec();
+        batch.extend_from_slice(&q16(6.0));
+        batch.extend_from_slice(&[0; 4]);
+        let mut counters = FeedbackCounters::default();
+        assert_eq!(select_feedback_report(&batch, [(0, 8, 8), (0, 8, 4)],
+            &scheduler(250), 250, Speed::Super, 16, false, &mut counters), Some((12.0, 48_000.0)));
+        assert_eq!(counters.last_report_bytes, report);
+        assert_eq!(counters.last_report_len, 8);
+        assert_eq!(counters.malformed, 1);
+        assert_eq!(counters.rejected, 1);
+    }
+
+    #[test]
+    fn enhanced_superspeed_feedback_retains_capacity_and_rate_rejection() {
+        for (frames, max_frames) in [(6.0, 47), (48.0, 1024)] {
+            let mut counters = FeedbackCounters::default();
+            assert!(select_feedback_report(&q32(frames), [(0, 8, 8)], &scheduler(1000),
+                1000, Speed::SuperPlus, max_frames, false, &mut counters).is_none());
+            assert_eq!(counters.rate_rejected, 1);
+            assert_eq!(counters.rejected, 1);
+            assert_eq!(counters.last_report_len, 0);
+            assert!(counters.last_report_at.is_none());
+            assert!(counters.selected_timebase.is_none());
+        }
+    }
+
+    #[test]
+    fn eight_byte_feedback_requires_superspeed_and_exact_selected_request_span() {
+        let report = q32(6.0);
+        for speed in [Speed::Low, Speed::Full, Speed::High, Speed::Unknown] {
+            assert!(decode_feedback_report(&report, 125, speed).is_none());
+            let mut counters = FeedbackCounters::default();
+            assert!(select_feedback_report(&report, [(0, 8, 8)], &scheduler(125),
+                125, speed, 16, false, &mut counters).is_none());
+            assert_eq!(counters.malformed, 1);
+        }
+        for speed in [Speed::Super, Speed::SuperPlus] {
+            for actual in [3, 4, 7] {
+                let mut counters = FeedbackCounters::default();
+                assert!(select_feedback_report(&report, [(0, 8, actual)], &scheduler(125),
+                    125, speed, 16, false, &mut counters).is_none());
+                assert_eq!(counters.malformed, 1);
+            }
+            let mut counters = FeedbackCounters::default();
+            assert!(select_feedback_report(&report.repeat(2), [(0, 16, 8)], &scheduler(125),
+                125, speed, 16, false, &mut counters).is_none());
+            assert_eq!(select_feedback_report(&q16(6.0), [(0, 4, 4)], &scheduler(125),
+                125, speed, 16, false, &mut counters), Some((6.0, 48_000.0)));
+        }
+    }
 
     fn feedback_pipe() -> FeedbackEndpoint {
         FeedbackEndpoint { refresh: 0, address: 0x81, transfer_type: TransferType::Isochronous,

@@ -263,14 +263,73 @@ fn capture_format(
     }
 }
 
+/// Keep endpoint extras scoped to this endpoint. In particular, a companion
+/// belonging to another endpoint or alternate cannot qualify a capture pipe.
+fn capture_input_geometry(
+    interface: &RawInterface<'_>,
+    index: usize,
+    speed: Speed,
+) -> Option<(usize, u32)> {
+    let ep = *interface.descriptors.get(index)?;
+    if ep.len() < 7
+        || ep[1] != 5
+        || ep[2] & 0x80 == 0
+        || ep[2] & 0x0f == 0
+        || ep[2] & 0x70 != 0
+        || ep[3] & 3 != 1
+        || !matches!((ep[3] >> 4) & 3, 0 | 2)
+        || !(1..=16).contains(&ep[6])
+    {
+        return None;
+    }
+    let packet = u16::from_le_bytes([ep[4], ep[5]]);
+    if matches!(speed, Speed::Super | Speed::SuperPlus) {
+        let extra: Vec<_> = interface.descriptors[index + 1..]
+            .iter()
+            .take_while(|d| d[1] != 5)
+            .flat_map(|d| d.iter().copied())
+            .collect();
+        let (capacity, service, _) = super::endpoint_geometry::ss_endpoint_geometry(
+            packet, ep[6], &extra, speed, true,
+        ).ok()?;
+        return Some((capacity, service));
+    }
+    let base = packet & 0x7ff;
+    if !matches!(speed, Speed::Full | Speed::High)
+        || packet & 0xe000 != 0
+        || base == 0
+        || (speed == Speed::Full && (base > 1023 || packet & 0x1800 != 0))
+        || (speed == Speed::High && (base > 1024 || (packet >> 11) & 3 == 3))
+    {
+        return None;
+    }
+    Some((effective_iso_packet_bytes(packet, speed), service_interval_micros(speed, ep[6])))
+}
+
+/// Claim discovery is structural: prove SS geometry without assuming a rate.
+/// ADC3 retains its own descriptor admission and activation proof.
+fn claimable_capture_input(interface: &RawInterface<'_>, speed: Speed) -> bool {
+    interface.descriptors.iter().enumerate().any(|(index, ep)| {
+        if interface.protocol != 0x30 && matches!(speed, Speed::Super | Speed::SuperPlus) {
+            return capture_input_geometry(interface, index, speed).is_some();
+        }
+        ep.len() >= 7
+            && ep[1] == 5
+            && ep[2] & 0x80 != 0
+            && ep[2] & 0x0f != 0
+            && ep[3] & 3 == 1
+            && matches!((ep[3] >> 4) & 3, 0 | 2)
+    })
+}
+
 pub(super) fn capture_candidates(
     raw: &[u8],
     configuration: u8,
     speed: Speed,
     rate: u32,
 ) -> Result<Vec<CaptureEndpoint>, String> {
-    if !matches!(speed, Speed::Full | Speed::High) {
-        return Err("standalone capture currently requires Full or High Speed USB".into());
+    if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
+        return Err("capture requires a recognized Full, High or SuperSpeed USB link".into());
     }
     let interfaces = raw_interfaces(raw)?;
     let mut candidates = Vec::new();
@@ -289,29 +348,9 @@ pub(super) fn capture_candidates(
             continue;
         };
         for (index, ep) in interface.descriptors.iter().enumerate() {
-            if ep.len() < 7
-                || ep[1] != 5
-                || ep[2] & 0x80 == 0
-                || ep[2] & 0x0f == 0
-                || ep[2] & 0x70 != 0
-                || ep[3] & 3 != 1
-                || (ep[3] >> 4) & 3 == 1
-                || !matches!((ep[3] >> 4) & 3, 0 | 2)
-                || !(1..=16).contains(&ep[6])
-            {
+            let Some((packet_bytes, service_us)) = capture_input_geometry(interface, index, speed) else {
                 continue;
-            }
-            let packet = u16::from_le_bytes([ep[4], ep[5]]);
-            let base = packet & 0x7ff;
-            if packet & 0xe000 != 0
-                || base == 0
-                || (speed == Speed::Full && (base > 1023 || packet & 0x1800 != 0))
-                || (speed == Speed::High && (base > 1024 || (packet >> 11) & 3 == 3))
-            {
-                continue;
-            }
-            let service_us = service_interval_micros(speed, ep[6]);
-            let packet_bytes = effective_iso_packet_bytes(packet, speed);
+            };
             if packet_bytes < required_max_packet_bytes(rate, service_us, format.bytes_per_frame())
             {
                 continue;
@@ -371,12 +410,7 @@ fn class_capture_candidates(
     let raw = read_active_configuration_bytes(&claimed.handle, config)
         .ok_or("cannot read active capture configuration")?;
     let speed = resolve_device_speed(&claimed.handle.device());
-    // Legacy UAC1/2 admission remains FS/HS; ADC3 resolves its own SS companion.
-    let mut candidates = if matches!(speed, Speed::Super | Speed::SuperPlus) {
-        Vec::new()
-    } else {
-        capture_candidates(&raw, config.number(), speed, rate)?
-    };
+    let mut candidates = capture_candidates(&raw, config.number(), speed, rate)?;
     for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)? {
         candidates.push(adc3_capture_endpoint(config.number(), rate, candidate, route)?);
     }
@@ -506,6 +540,7 @@ pub(super) fn validate_capture_registration(
     let raw = read_active_configuration_bytes(&claimed.handle, &config)
         .ok_or("cannot read active capture configuration")?;
     let interfaces = raw_interfaces(&raw)?;
+    let speed = resolve_device_speed(&claimed.handle.device());
     let ids: HashSet<u8> = device.claimed_interfaces.iter().copied().collect();
     if ids.len() != device.claimed_interfaces.len() || ids.is_empty() {
         return Err("capture claims are empty or contain duplicates".into());
@@ -522,13 +557,7 @@ pub(super) fn validate_capture_registration(
         let Some(control) = capture_control(&raw, &interfaces, interface) else {
             continue;
         };
-        if interface.descriptors.iter().any(|ep| {
-            ep.len() >= 7
-                && ep[1] == 5
-                && ep[2] & 0x80 != 0
-                && ep[3] & 3 == 1
-                && matches!((ep[3] >> 4) & 3, 0 | 2)
-        }) {
+        if claimable_capture_input(interface, speed) {
             allowed.insert(interface.number);
             allowed.insert(control.number);
             if ids.contains(&interface.number) {
@@ -572,6 +601,7 @@ pub(crate) fn capture_claim_preflight(
     let raw = read_active_configuration_bytes(&claimed.handle, &config)
         .ok_or("cannot read active capture configuration")?;
     let interfaces = raw_interfaces(&raw)?;
+    let speed = resolve_device_speed(&claimed.handle.device());
     let mut controls = Vec::new();
     let mut inputs = Vec::new();
     for interface in &interfaces {
@@ -599,14 +629,7 @@ pub(crate) fn capture_claim_preflight(
         if interface.protocol != 0x30 && capture_format(interface, control, probe_rate).is_none() {
             continue;
         }
-        if interface.descriptors.iter().any(|ep| {
-            ep.len() >= 7
-                && ep[1] == 5
-                && ep[2] & 0x80 != 0
-                && ep[2] & 0x0f != 0
-                && ep[3] & 3 == 1
-                && matches!((ep[3] >> 4) & 3, 0 | 2)
-        }) {
+        if claimable_capture_input(interface, speed) {
             controls.push(control.number);
             inputs.push(interface.number);
         }
@@ -1916,6 +1939,93 @@ mod tests {
         let length = raw.len() as u16;
         raw[2..4].copy_from_slice(&length.to_le_bytes());
         raw
+    }
+
+    fn superspeed_configuration(protocol: u8, packet: u16, extra: &[u8]) -> Vec<u8> {
+        let mut raw = configuration(protocol);
+        let endpoint = raw.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
+        raw[endpoint + 4..endpoint + 6].copy_from_slice(&packet.to_le_bytes());
+        raw.splice(endpoint + 9..endpoint + 9, extra.iter().copied());
+        let length = raw.len() as u16;
+        raw[2..4].copy_from_slice(&length.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn standard_superspeed_capture_uses_companion_capacity_for_both_audio_classes() {
+        for protocol in [0, 0x20] {
+            let raw = superspeed_configuration(protocol, 1024, &[6, 0x30, 1, 1, 0, 16]);
+            for speed in [Speed::Super, Speed::SuperPlus] {
+                let candidates = capture_candidates(&raw, 1, speed, 48_000).unwrap();
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].packet_bytes, 4096);
+                assert_eq!(candidates[0].service_us, 125);
+                assert_eq!(candidates[0].protocol, protocol);
+                assert!(candidates[0].vendor_pcm.is_none());
+                assert!(candidates[0].adc3_route.is_none());
+            }
+            // The packet field alone is sufficient, but the effective service
+            // capacity cannot carry this rate's largest whole-frame packet.
+            let raw = superspeed_configuration(protocol, 1024, &[6, 0x30, 0, 0, 32, 0]);
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+            let interfaces = raw_interfaces(&raw).unwrap();
+            let interface = interfaces.last().unwrap();
+            assert!(claimable_capture_input(interface, Speed::Super));
+        }
+    }
+
+    #[test]
+    fn superspeed_capture_rejects_missing_misplaced_and_malformed_companions() {
+        for extra in [
+            &[][..],
+            &[7, 0x25, 1, 1, 0, 0, 0, 6, 0x30, 0, 0, 64, 0][..],
+            &[6, 0x30, 0, 0, 0, 0][..],
+            &[6, 0x30, 0, 0, 1, 4][..], // capacity exceeds packet
+            &[6, 0x30, 0, 3, 64, 0][..],
+            &[6, 0x30, 0, 4, 64, 0][..],
+            &[6, 0x30, 0, 0, 64, 0, 6, 0x30, 0, 0, 64, 0][..],
+            &[7, 5, 0x82, 5, 0, 4, 1, 6, 0x30, 0, 0, 64, 0][..],
+        ] {
+            let raw = superspeed_configuration(0x20, 1024, extra);
+            let candidates = capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap();
+            // The last case gives a companion only to endpoint 0x82.
+            assert!(candidates.iter().all(|candidate| candidate.address != 0x81));
+            let interfaces = raw_interfaces(&raw).unwrap();
+            let interface = interfaces.last().unwrap();
+            let endpoint = interface.descriptors.iter().position(|ep| ep[1] == 5).unwrap();
+            assert!(capture_input_geometry(interface, endpoint, Speed::Super).is_none());
+        }
+        for packet in [0, 1025, 0x0c00] {
+            let raw = superspeed_configuration(0x20, packet, &[6, 0x30, 0, 0, 64, 0]);
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn extended_capture_companion_requires_superplus_and_retains_effective_capacity() {
+        let raw = superspeed_configuration(0x20, 1024,
+            &[6, 0x30, 0, 0x80, 1, 0, 8, 0x31, 0, 0, 0, 0, 1, 0]);
+        assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+        let candidates = capture_candidates(&raw, 1, Speed::SuperPlus, 48_000).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].packet_bytes, 65_536);
+        let interfaces = raw_interfaces(&raw).unwrap();
+        assert!(!claimable_capture_input(interfaces.last().unwrap(), Speed::Super));
+        assert!(claimable_capture_input(interfaces.last().unwrap(), Speed::SuperPlus));
+    }
+
+    #[test]
+    fn ordinary_capture_keeps_full_and_high_speed_packet_geometry() {
+        for protocol in [0, 0x20] {
+            let raw = configuration(protocol);
+            for (speed, service_us) in [(Speed::Full, 1000), (Speed::High, 125)] {
+                let candidates = capture_candidates(&raw, 1, speed, 48_000).unwrap();
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].packet_bytes, 512);
+                assert_eq!(candidates[0].service_us, service_us);
+            }
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+        }
     }
 
     #[test]

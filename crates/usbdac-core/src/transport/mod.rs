@@ -146,6 +146,7 @@ mod adc3;
 use adc3::*;
 mod clock;
 mod encode;
+mod endpoint_geometry;
 mod iso;
 mod negotiate;
 mod native_dsd;

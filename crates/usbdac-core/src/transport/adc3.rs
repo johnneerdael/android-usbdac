@@ -1,5 +1,8 @@
 //! Active-configuration ADC3 PCM playback and capture. No configuration changes or clock guesses.
 use super::*;
+use super::endpoint_geometry::{ss_endpoint_geometry, ss_feedback_geometry};
+#[cfg(test)]
+use super::endpoint_geometry::ss_periodic_geometry;
 use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution, ClockPlan, ClockPlanIo, ClockGraph, RateRatio};
 use crate::descriptors::uac3 as wire;
 
@@ -152,6 +155,15 @@ pub(super) struct FeedforwardEndpoint {
 }
 impl FeedforwardEndpoint {
     pub(super) fn nominal(self, rate: u32) -> Result<Vec<u8>, String> {
+        if !self.full_speed && self.bytes == 8 {
+            // USB 3.2 section 4.4.8.4.1: unsigned Q32.32 per 125us bus
+            // interval, rounded to nearest using integer arithmetic.
+            let value = ((u64::from(rate) << 32) + 4000) / 8000;
+            if rate == 0 || value == 0 {
+                return Err("ADC3 feedforward nominal rate cannot be represented".into());
+            }
+            return Ok(value.to_le_bytes().to_vec());
+        }
         // Match endpoint.c: round the nominal fixed-point rate first; FS
         // transmits that result shifted from Q16.16 to Q10.14.
         let (value, maximum) = if self.full_speed {
@@ -384,7 +396,7 @@ fn validate_badd_function(
                     && asynchronous
                     && !feedback.is_some_and(|f| {
                         f.transfer_type == TransferType::Isochronous
-                            && f.max_packet_bytes == if speed == Speed::Full { 3 } else { 4 }
+                            && feedback_packet_bytes_supported(speed, f.max_packet_bytes)
                     })
                 {
                     return Err("BADD asynchronous sink requires a correctly sized isochronous feedback endpoint".into());
@@ -673,76 +685,6 @@ fn adc3_alternate(
 ) -> Result<(IsoStreamCandidate, Adc3Route), String> {
     adc3_alternate_plan(config, handle, alt, speed, capture, None)
 }
-/// USB 3.2 section 9.6.7 ordinary periodic companion geometry. Keep this
-/// separate from USB 2 high-bandwidth wMaxPacketSize transaction bits. libusb
-/// retains the wire companion descriptor in the endpoint's extra bytes.
-fn ss_periodic_geometry(
-    packet: u16,
-    interval: u8,
-    extra: &[u8],
-    isochronous: bool,
-) -> Result<(usize, u32, [u8; 6]), String> {
-    if !(1..=1024).contains(&packet) || !(1..=16).contains(&interval) {
-        return Err("ADC3 invalid SuperSpeed endpoint packet/interval".into());
-    }
-    if extra.len() < 6 || extra[0] != 6 || extra[1] != 0x30 {
-        return Err("ADC3 SuperSpeed endpoint requires an immediate companion".into());
-    }
-    let companion: [u8; 6] = extra[..6].try_into().unwrap();
-    let burst = companion[2];
-    let attributes = companion[3];
-    let extended = attributes & 0x80 != 0;
-    // USB 3.2 rev 1.1 Table 9-28: Mult is ignored in SSP mode.
-    if burst > 15 || attributes & 0x7c != 0 || (!extended && attributes & 3 == 3)
-        || (burst > 0 && packet != 1024)
-        || (!extended && burst == 0 && attributes & 3 != 0)
-        || (!isochronous && attributes != 0)
-    {
-        return Err("ADC3 invalid SuperSpeed burst/Mult or reserved attributes".into());
-    }
-    // USB 3.2 rev 1.1 sections 9.6.8/9.8, Tables 9-29/9-32.
-    // rusb's SuperPlus does not retain lane count/rate. Every above-Gen1
-    // link supports at least twice Gen1x1 bandwidth: admit strictly below
-    // 49152 * 2, never assume the fourfold bound of Gen2x2.
-    let extended_capacity = if extended {
-        if extra.len() < 14 || extra[6] != 8 || extra[7] != 0x31
-            || extra[8..10] != [0, 0] || companion[4..6] != [1, 0]
-        {
-            return Err("ADC3 invalid immediate SSP isochronous companion".into());
-        }
-        let bytes = u32::from_le_bytes(extra[10..14].try_into().unwrap());
-        if bytes == 0 {
-            return Err("ADC3 SSP capacity must be nonzero".into());
-        }
-        if bytes >= 96 * 1024 {
-            return Err("ADC3 SSP capacity requires negotiated lane/rate evidence".into());
-        }
-        Some(usize::try_from(bytes).map_err(|_| "ADC3 SSP capacity exceeds host size")?)
-    } else {
-        None
-    };
-    let mut at = if extended { 14 } else { 6 };
-    while at < extra.len() {
-        if extra.len() - at < 2 || extra[at] < 2
-            || usize::from(extra[at]) > extra.len() - at
-        {
-            return Err("ADC3 malformed SuperSpeed endpoint extras".into());
-        }
-        if matches!(extra[at + 1], 0x30 | 0x31) {
-            return Err("ADC3 duplicated or unsupported extended companion".into());
-        }
-        at += usize::from(extra[at]);
-    }
-    let capacity = extended_capacity.unwrap_or_else(|| usize::from(u16::from_le_bytes([companion[4], companion[5]])));
-    let maximum = usize::from(packet)
-        .checked_mul(usize::from(burst) + 1)
-        .and_then(|n| n.checked_mul(usize::from(attributes & 3) + 1))
-        .ok_or("ADC3 SuperSpeed capacity overflow")?;
-    if capacity == 0 || (!extended && capacity > maximum) {
-        return Err("ADC3 invalid SuperSpeed wBytesPerInterval".into());
-    }
-    Ok((capacity, 125u32 << (interval - 1), companion))
-}
 
 fn adc3_endpoint_geometry(
     ep: &rusb::EndpointDescriptor,
@@ -752,11 +694,8 @@ fn adc3_endpoint_geometry(
         return Err("ADC3 invalid endpoint address".into());
     }
     if matches!(speed, Speed::Super | Speed::SuperPlus) {
-        if speed != Speed::SuperPlus && ep.extra().is_some_and(|d| d.len() >= 4 && d[3] & 0x80 != 0) {
-            return Err("ADC3 SSP companion requires a SuperPlus link".into());
-        }
-        let (capacity, service, companion) = ss_periodic_geometry(
-            ep.max_packet_size(), ep.interval(), ep.extra().unwrap_or(&[]),
+        let (capacity, service, companion) = ss_endpoint_geometry(
+            ep.max_packet_size(), ep.interval(), ep.extra().unwrap_or(&[]), speed,
             ep.transfer_type() == TransferType::Isochronous,
         )?;
         return Ok((capacity, service, Some(companion)));
@@ -773,15 +712,6 @@ fn adc3_endpoint_geometry(
     Ok((effective_iso_packet_bytes(packet, speed), service_interval_micros(speed, ep.interval()), None))
 }
 
-fn ss_feedback_geometry(packet: u16, interval: u8, extra: &[u8], isochronous: bool)
-    -> Result<(usize, u32, [u8; 6]), String>
-{
-    let geometry = ss_periodic_geometry(packet, interval, extra, isochronous)?;
-    if geometry.0 != 4 || packet != 4 || geometry.2[2] != 0 || geometry.2[3] != 0 {
-        return Err("ADC3 SuperSpeed feedback requires four-byte unburst capacity".into());
-    }
-    Ok(geometry)
-}
 
 fn adc3_feedback(
     alt: &rusb::InterfaceDescriptor,
@@ -798,6 +728,10 @@ fn adc3_feedback(
                 endpoint.max_packet_size(), endpoint.interval(), endpoint.extra().unwrap_or(&[]),
                 endpoint.transfer_type() == TransferType::Isochronous,
             )?;
+            if capacity == 8 {
+                validate_enhanced_feedback_shape(ep.address(), endpoint.address(),
+                    endpoint.transfer_type(), endpoint.sync_type(), endpoint.usage_type())?;
+            }
             feedback.max_packet_bytes = capacity;
             feedback.service_interval_us = service;
             companion = Some(descriptor);
@@ -807,7 +741,7 @@ fn adc3_feedback(
 }
 
 fn adc3_feedforward(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
-    alt: &rusb::InterfaceDescriptor, speed: Speed,
+    alt: &rusb::InterfaceDescriptor, data: &rusb::EndpointDescriptor, speed: Speed,
 ) -> Result<(FeedforwardEndpoint, Option<[u8; 6]>), String> {
     if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
     // Section 4.8.2: exactly one explicit, same-AS OUT Feedback/NoSync pipe.
@@ -837,12 +771,16 @@ fn adc3_feedforward(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
     }
     if found != 1 { return Err("ADC3 feedforward standard endpoint missing or duplicated".into()); }
     let (capacity, service, companion) = adc3_endpoint_geometry(ep, speed)?;
-    let bytes = if speed == Speed::Full { 3 } else { 4 };
-    if capacity != bytes || usize::from(ep.max_packet_size()) != bytes {
-        return Err("ADC3 feedforward requires exact three/four-byte unburst capacity".into());
+    let bytes = usize::from(ep.max_packet_size());
+    if capacity != bytes || !feedback_packet_bytes_supported(speed, bytes) {
+        return Err("ADC3 feedforward requires exact three/four/eight-byte unburst capacity".into());
     }
     if let Some(d) = companion {
         if d[2] != 0 || d[3] != 0 { return Err("ADC3 feedforward bursting is unsupported".into()); }
+    }
+    if bytes == 8 {
+        validate_enhanced_feedback_shape(data.address(), ep.address(),
+            ep.transfer_type(), ep.sync_type(), ep.usage_type())?;
     }
     Ok((FeedforwardEndpoint { address: ep.address(), interval: ep.interval(), service_us: service,
         bytes, full_speed: speed == Speed::Full }, companion))
@@ -852,11 +790,29 @@ fn adaptive_implicit_inventory(profile: wire::FunctionProfile, duplex: bool,
     profile == wire::FunctionProfile::Full && duplex && endpoints == 1
         && synch_address == 0 && !disabled
 }
+// BADD Table 6-25 specifies 3/4/8 bytes at FS/HS/SS respectively. Preserve
+// legacy four-byte SuperSpeed compatibility after exact companion validation.
+fn validate_enhanced_feedback_shape(data: u8, report: u8, transfer: TransferType,
+    sync: SyncType, usage: UsageType) -> Result<(), String> {
+    // USB 3.2 section 9.6.6: opposite direction with the same endpoint number.
+    if report != (data ^ 0x80) || transfer != TransferType::Isochronous
+        || sync != SyncType::NoSync || usage != UsageType::Feedback {
+        return Err("ADC3 Enhanced SuperSpeed feedback requires opposite-direction matching endpoint number and Isochronous/NoSync/Feedback shape".into());
+    }
+    Ok(())
+}
+fn feedback_packet_bytes_supported(speed: Speed, bytes: usize) -> bool {
+    match speed {
+        Speed::Full => bytes == 3,
+        Speed::High => bytes == 4,
+        Speed::Super | Speed::SuperPlus => matches!(bytes, 4 | 8),
+        _ => false,
+    }
+}
 fn validate_feedforward_descriptor(d: &[u8], speed: Speed) -> Result<(), String> {
-    let bytes = match speed { Speed::Full => 3, Speed::High | Speed::Super | Speed::SuperPlus => 4,
-        _ => return Err("ADC3 feedforward requires known USB speed".into()) };
     if d.len() != 7 || d[0] != 7 || d[1] != 5 || d[2] & 0xf0 != 0 || d[2] & 15 == 0
-        || d[3] != 0x11 || u16::from_le_bytes([d[4], d[5]]) != bytes || !(1..=16).contains(&d[6]) {
+        || d[3] != 0x11 || !feedback_packet_bytes_supported(speed, usize::from(u16::from_le_bytes([d[4], d[5]])))
+        || !(1..=16).contains(&d[6]) {
         return Err("ADC3 malformed feedforward standard endpoint".into());
     }
     Ok(())
@@ -940,7 +896,7 @@ fn adc3_alternate_overlay(
     let (feedforward, feedforward_companion) = if capture && ep.sync_type() == SyncType::Adaptive {
         if settings().disable_feedback() { return Err("ADC3 adaptive capture requires enabled feedforward".into()); }
         if implicit_feedforward { (None, None) } else {
-            let (pipe, companion) = adc3_feedforward(config, handle, alt, speed)?;
+            let (pipe, companion) = adc3_feedforward(config, handle, alt, ep, speed)?;
             (Some(pipe), companion)
         }
     } else { (None, None) };
@@ -2504,6 +2460,45 @@ mod tests {
         assert!(hs.nominal(32_768_000).is_err());
         assert!(FeedforwardEndpoint { bytes: 4, ..fs }.nominal(48_000).is_err());
     }
+    #[test]
+    fn enhanced_capture_feedforward_is_unsigned_q32_32_with_data_capacity_guard() {
+        let pipe = FeedforwardEndpoint { address: 2, interval: 4, service_us: 1000,
+            bytes: 8, full_speed: false };
+        assert_eq!(pipe.nominal(48_000).unwrap(), vec![0, 0, 0, 0, 6, 0, 0, 0]);
+        assert_eq!(pipe.nominal(44_100).unwrap(), vec![0x33, 0x33, 0x33, 0x83, 5, 0, 0, 0]);
+        assert!(pipe.nominal(0).is_err());
+        assert!(pipe.nominal(u32::MAX).is_ok());
+        assert!(FeedforwardEndpoint { full_speed: true, ..pipe }.nominal(48_000).is_err());
+        for interval in [1, 4, 16] {
+            assert_eq!(FeedforwardEndpoint { interval, service_us: 125 << (interval - 1), ..pipe }
+                .nominal(44_100), pipe.nominal(44_100));
+        }
+        assert!(validate_feedforward_capacity(pipe, 48_000, 196, 1000, 4).is_ok());
+        assert!(validate_feedforward_capacity(pipe, 48_000, 191, 1000, 4).is_err());
+        assert!(validate_enhanced_feedback_shape(2, 0x82, TransferType::Isochronous,
+            SyncType::NoSync, UsageType::Feedback).is_ok());
+        assert!(validate_enhanced_feedback_shape(0x82, 2, TransferType::Isochronous,
+            SyncType::NoSync, UsageType::Feedback).is_ok());
+        for (report, transfer, sync, usage) in [
+            (0x83, TransferType::Isochronous, SyncType::NoSync, UsageType::Feedback),
+            (2, TransferType::Isochronous, SyncType::NoSync, UsageType::Feedback),
+            (0x82, TransferType::Interrupt, SyncType::NoSync, UsageType::Feedback),
+            (0x82, TransferType::Isochronous, SyncType::Adaptive, UsageType::Feedback),
+            (0x82, TransferType::Isochronous, SyncType::NoSync, UsageType::Data),
+        ] {
+            assert!(validate_enhanced_feedback_shape(2, report, transfer, sync, usage).is_err());
+        }
+        let descriptor = [7, 5, 2, 0x11, 8, 0, 4];
+        for speed in [Speed::Super, Speed::SuperPlus] {
+            assert!(validate_feedforward_descriptor(&descriptor, speed).is_ok());
+            assert!(feedback_packet_bytes_supported(speed, 8));
+            assert!(feedback_packet_bytes_supported(speed, 4));
+        }
+        for speed in [Speed::Full, Speed::High, Speed::Unknown] {
+            assert!(validate_feedforward_descriptor(&descriptor, speed).is_err());
+        }
+    }
+
     #[test]
     fn adaptive_implicit_inventory_is_duplex_only_and_never_hides_extra_endpoints() {
         let full = wire::FunctionProfile::Full;

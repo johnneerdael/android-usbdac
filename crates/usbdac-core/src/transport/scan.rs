@@ -55,15 +55,14 @@ fn structural_feedback_interfaces(
                     ep.usage_type(),
                     UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
                 )
-                || !valid_implicit_packet_capacity(ep.max_packet_size(), speed)
-                || find_feedback_endpoint(&out, ep.synch_address(), ep.sync_type(), speed).is_some()
-                || explicit_feedback_ambiguous(&out, ep.synch_address(), ep.sync_type())
+                || !valid_standard_implicit_capacity(&ep, speed)
+                || !matches!(checked_standard_feedback(&out, ep.address(), ep.synch_address(), ep.sync_type(), speed), Ok(None))
             {
                 continue;
             }
-            let interval = service_interval_micros(speed, ep.interval());
+            let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else { continue; };
             let stride = usize::from(format.channels) * usize::from(format.subslot_size);
-            if stride == 0 {
+            if stride == 0 || capacity < stride {
                 continue;
             }
             let mut rates = Vec::new();
@@ -104,7 +103,7 @@ fn structural_feedback_interfaces(
                             &format.sample_rate_ranges,
                             rate,
                         ))
-                        || effective_iso_packet_bytes(ep.max_packet_size(), speed)
+                        || capacity
                             < required_max_packet_bytes(rate, interval, stride)
                     {
                         continue;
@@ -182,7 +181,7 @@ fn implicit_source_inventory(
     handle: &DeviceHandle<Context>,
     speed: Speed,
 ) -> Vec<ImplicitSourceCandidate> {
-    if !matches!(speed, Speed::Full | Speed::High) {
+    if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
         return Vec::new();
     }
     let Some(raw) = read_active_configuration_bytes(handle, config) else {
@@ -226,12 +225,12 @@ fn implicit_source_inventory(
                     || ep.transfer_type() != TransferType::Isochronous
                     || ep.sync_type() != SyncType::Asynchronous
                     || !(1..=16).contains(&ep.interval())
-                    || !valid_implicit_packet_capacity(ep.max_packet_size(), speed)
+                    || !valid_standard_implicit_capacity(&ep, speed)
                     || !matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
                 {
                     continue;
                 }
-                let capacity = effective_iso_packet_bytes(ep.max_packet_size(), speed);
+                let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else { continue; };
                 if capacity < stride {
                     continue;
                 }
@@ -241,7 +240,7 @@ fn implicit_source_inventory(
                         alt_setting: alt.setting_number(),
                         address: ep.address(),
                         bytes_per_frame: stride,
-                        service_interval_us: service_interval_micros(speed, ep.interval()),
+                        service_interval_us: interval,
                         max_packet_bytes: capacity,
                     },
                     control_interface: *control,
@@ -708,30 +707,29 @@ pub(super) fn build_usb_capability_model(
                     continue;
                 }
 
-                let service_interval_us = service_interval_micros(speed, endpoint.interval());
-                let max_packet_bytes =
-                    effective_iso_packet_bytes(endpoint.max_packet_size(), speed);
+                let Ok((max_packet_bytes, service_interval_us)) =
+                    standard_endpoint_geometry(&endpoint, speed) else { continue; };
 
-                if explicit_feedback_ambiguous(
+                let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
-                    endpoint.synch_address(),
-                    endpoint.sync_type(),
-                ) {
-                    continue;
-                }
-                let discovered_feedback = find_feedback_endpoint(
-                    &descriptor,
+                    endpoint.address(),
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
-                );
+                ) else { continue; };
                 let feedback_address = discovered_feedback.map(|feedback| feedback.address);
+                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) {
+                    capacity_limited_rates(&sample_rate_ranges, max_packet_bytes, service_interval_us,
+                        usize::from(stream_format.channels) * usize::from(stream_format.subslot_size))
+                } else {
+                    (sample_rate_ranges.clone(), sample_rates.clone())
+                };
                 let implicit = if discovered_feedback.is_none()
                     && endpoint.sync_type() == SyncType::Asynchronous
                     && !stream_format.is_uac1
                     && stream_format.format_tag == FORMAT_TAG_PCM
                 {
-                    sample_rates.iter().find_map(|rate| {
+                    endpoint_rates.iter().find_map(|rate| {
                         resolve_implicit_source(
                             &implicit_sources,
                             &config_descriptor,
@@ -745,7 +743,7 @@ pub(super) fn build_usb_capability_model(
                             descriptor.protocol_code() == 0x20
                                 && standard_implicit_pcm_format(&stream_format)
                                 && (1..=16).contains(&endpoint.interval())
-                                && valid_implicit_packet_capacity(endpoint.max_packet_size(), speed)
+                                && valid_standard_implicit_capacity(&endpoint, speed)
                                 && max_packet_bytes >= required_max_packet_bytes(
                                     *rate,
                                     service_interval_us,
@@ -758,6 +756,12 @@ pub(super) fn build_usb_capability_model(
                     None
                 }
                 .filter(|source| claimed_interfaces.contains(&source.interface_number));
+                if let Some(source) = implicit.filter(|_| matches!(speed, Speed::Super | Speed::SuperPlus)) {
+                    (endpoint_ranges, endpoint_rates) = capacity_limited_rates(
+                        &endpoint_ranges, source.max_packet_bytes, source.service_interval_us,
+                        source.bytes_per_frame,
+                    );
+                }
                 let pacing = if let Some(source) = implicit {
                     Some(crate::capabilities::Pacing::ImplicitFeedback {
                         interface_number: source.interface_number,
@@ -778,8 +782,7 @@ pub(super) fn build_usb_capability_model(
                         settings().allow_unsynchronized_async(),
                     )
                 };
-                supported_sample_rates.extend(sample_rates.iter().copied());
-                alt_settings.push(AltSetting {
+                let base_alt = AltSetting {
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
                     endpoint_address: endpoint.address(),
@@ -787,7 +790,7 @@ pub(super) fn build_usb_capability_model(
                     channels: stream_format.channels,
                     subslot_bytes: stream_format.subslot_size,
                     valid_bits: stream_format.bit_resolution,
-                    rate_ranges: sample_rate_ranges
+                    rate_ranges: endpoint_ranges
                         .iter()
                         .map(|range| RateRange {
                             min_hz: range.min,
@@ -795,7 +798,7 @@ pub(super) fn build_usb_capability_model(
                             step_hz: range.res,
                         })
                         .collect(),
-                    sample_rates: sample_rates.clone(),
+                    sample_rates: endpoint_rates.clone(),
                     sync_type: sync_kind(endpoint.sync_type()),
                     feedback_endpoint: feedback_address,
                     max_packet_bytes,
@@ -810,17 +813,40 @@ pub(super) fn build_usb_capability_model(
                     refresh: endpoint.refresh(),
                     synch_address: endpoint.synch_address(),
                     pacing,
-                });
+                };
+                let superspeed = matches!(speed, Speed::Super | Speed::SuperPlus);
+                if !superspeed || sample_rate_ranges.is_empty() || !endpoint_ranges.is_empty() {
+                    supported_sample_rates.extend(endpoint_rates.iter().copied());
+                    alt_settings.push(base_alt.clone());
+                }
                 if let Some(profile) = stream_format.native_dsd {
-                    let mut native = alt_settings.last().unwrap().clone();
+                    let mut native = base_alt.clone();
                     native.format = AltFormat::Dsd;
                     native.subslot_bytes = profile.word_bytes;
                     native.valid_bits = 1;
+                    if superspeed {
+                        let (mut ranges, mut rates) = capacity_limited_rates(
+                            &sample_rate_ranges, max_packet_bytes, service_interval_us,
+                            usize::from(stream_format.channels) * usize::from(profile.word_bytes),
+                        );
+                        if let Some(source) = implicit {
+                            (ranges, rates) = capacity_limited_rates(
+                                &ranges, source.max_packet_bytes, source.service_interval_us,
+                                source.bytes_per_frame,
+                            );
+                        }
+                        if !sample_rate_ranges.is_empty() && ranges.is_empty() { continue; }
+                        native.rate_ranges = ranges.iter().map(|range| RateRange {
+                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
+                        }).collect();
+                        native.sample_rates = rates;
+                        supported_sample_rates.extend(native.sample_rates.iter().copied());
+                    }
                     alt_settings.push(native);
                 }
                 if playback_designs_dop {
                     // This exact alternate is excluded by the native resolver.
-                    let mut dop = alt_settings.last().unwrap().clone();
+                    let mut dop = base_alt.clone();
                     dop.format = AltFormat::Dop;
                     dop.subslot_bytes = 3;
                     dop.valid_bits = 24;
@@ -1026,28 +1052,21 @@ pub(super) fn select_stream_candidate(
                     endpoint.interval(),
                     service_interval_micros(speed, endpoint.interval())
                 );
-                let service_interval_us = service_interval_micros(speed, endpoint.interval());
-                let max_packet_bytes =
-                    effective_iso_packet_bytes(endpoint.max_packet_size(), speed);
-                if explicit_feedback_ambiguous(
+                let Ok((max_packet_bytes, service_interval_us)) =
+                    standard_endpoint_geometry(&endpoint, speed) else { continue; };
+                let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
-                    endpoint.synch_address(),
-                    endpoint.sync_type(),
-                ) {
-                    continue;
-                }
-                let discovered_feedback = find_feedback_endpoint(
-                    &descriptor,
+                    endpoint.address(),
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
-                );
+                ) else { continue; };
                 let discovered_implicit = if endpoint.sync_type() == SyncType::Asynchronous
                     && discovered_feedback.is_none()
                     && !stream_format.is_uac1
                     && stream_format.format_tag == FORMAT_TAG_PCM
                     && (1..=16).contains(&endpoint.interval())
-                    && valid_implicit_packet_capacity(endpoint.max_packet_size(), speed)
+                    && valid_standard_implicit_capacity(&endpoint, speed)
                 {
                     resolve_implicit_source(
                         &implicit_sources,
@@ -1323,6 +1342,138 @@ pub(super) fn log_iso_endpoint_descriptors(
             }
         }
     }
+}
+
+fn valid_standard_endpoint_address(address: u8) -> bool {
+    address & 0x70 == 0 && address & 0x0f != 0
+}
+
+/// SuperSpeed payload and cadence belong to the endpoint companion, never
+/// the high-speed transaction bits in wMaxPacketSize.
+fn standard_endpoint_geometry(
+    endpoint: &rusb::EndpointDescriptor,
+    speed: Speed,
+) -> Result<(usize, u32), String> {
+    if matches!(speed, Speed::Super | Speed::SuperPlus) {
+        if !valid_standard_endpoint_address(endpoint.address()) {
+            return Err("invalid SuperSpeed endpoint address".into());
+        }
+        super::endpoint_geometry::ss_endpoint_geometry(
+            endpoint.max_packet_size(), endpoint.interval(), endpoint.extra().unwrap_or(&[]), speed,
+            endpoint.transfer_type() == TransferType::Isochronous,
+        ).map(|(capacity, interval, _)| (capacity, interval))
+    } else {
+        Ok((effective_iso_packet_bytes(endpoint.max_packet_size(), speed),
+            service_interval_micros(speed, endpoint.interval())))
+    }
+}
+
+fn valid_standard_implicit_capacity(endpoint: &rusb::EndpointDescriptor, speed: Speed) -> bool {
+    if matches!(speed, Speed::Super | Speed::SuperPlus) {
+        standard_endpoint_geometry(endpoint, speed).is_ok()
+    } else {
+        valid_implicit_packet_capacity(endpoint.max_packet_size(), speed)
+    }
+}
+
+/// Preserve the legacy selector for FS/HS and ADC3. Inspect advertised SS
+/// feedback before its legacy size/interval filters can hide malformed reports.
+fn checked_standard_feedback(
+    descriptor: &rusb::InterfaceDescriptor,
+    data_address: u8,
+    address: u8,
+    sync: SyncType,
+    speed: Speed,
+) -> Result<Option<FeedbackEndpoint>, String> {
+    if !matches!(speed, Speed::Super | Speed::SuperPlus) {
+        if explicit_feedback_ambiguous(descriptor, address, sync) {
+            return Err("ambiguous explicit feedback".into());
+        }
+        return Ok(find_feedback_endpoint(descriptor, address, sync, speed));
+    }
+    if !valid_standard_endpoint_address(data_address)
+        || data_address & 0x80 != 0
+        || (address != 0 && (!valid_standard_endpoint_address(address) || address & 0x80 == 0))
+    {
+        return Err("invalid SuperSpeed data or feedback association address".into());
+    }
+    let advertised: Vec<_> = descriptor.endpoint_descriptors().filter(|ep| {
+        ep.direction() == Direction::In && if address != 0 {
+            ep.address() == address && ep.usage_type() != UsageType::FeedbackData
+        } else {
+            sync == SyncType::Asynchronous && ep.usage_type() == UsageType::Feedback
+        }
+    }).collect();
+    let endpoint = match advertised.as_slice() {
+        [] => return Ok(None),
+        [endpoint] => endpoint,
+        _ => return Err("ambiguous explicit feedback".into()),
+    };
+    if !valid_standard_endpoint_address(endpoint.address()) {
+        return Err("invalid SuperSpeed feedback endpoint address".into());
+    }
+    if !matches!(endpoint.transfer_type(), TransferType::Isochronous | TransferType::Interrupt) {
+        return Err("invalid explicit feedback transfer type".into());
+    }
+    let (max_packet_bytes, service_interval_us, _) =
+        super::endpoint_geometry::ss_feedback_geometry(
+            endpoint.max_packet_size(), endpoint.interval(), endpoint.extra().unwrap_or(&[]),
+            endpoint.transfer_type() == TransferType::Isochronous,
+        )?;
+    if !standard_ss_feedback_shape(
+        max_packet_bytes, endpoint.transfer_type(), endpoint.usage_type(),
+        endpoint.sync_type(), sync,
+        address == 0 || address == endpoint.address(),
+        (data_address, endpoint.address()),
+    ) {
+        return Err("invalid SuperSpeed explicit feedback association or endpoint shape".into());
+    }
+    Ok(Some(FeedbackEndpoint {
+        address: endpoint.address(), transfer_type: endpoint.transfer_type(),
+        interval: endpoint.interval(), refresh: endpoint.refresh(),
+        service_interval_us, max_packet_bytes,
+    }))
+}
+
+/// Q32.32 reports use the standard isochronous feedback endpoint shape.
+/// Keep the established four-byte compatibility route's admission unchanged.
+fn standard_ss_feedback_shape(
+    report_bytes: usize,
+    transfer: TransferType,
+    usage: UsageType,
+    feedback_sync: SyncType,
+    sink_sync: SyncType,
+    associated: bool,
+    addresses: (u8, u8),
+) -> bool {
+    match report_bytes {
+        4 => true,
+        8 => transfer == TransferType::Isochronous
+            && usage == UsageType::Feedback
+            && feedback_sync == SyncType::NoSync
+            && sink_sync == SyncType::Asynchronous
+            && associated
+            && (addresses.0 & 0x0f) == (addresses.1 & 0x0f),
+        _ => false,
+    }
+}
+
+/// Descriptor rates are USB sample/word rates, including native DSD. Clip
+/// ranges to whole frames per service interval without converting DSD to bits.
+fn capacity_limited_rates(
+    ranges: &[SamplingFrequencySubrange], capacity: usize, interval: u32, stride: usize,
+) -> (Vec<SamplingFrequencySubrange>, Vec<u32>) {
+    if stride == 0 || interval == 0 { return (Vec::new(), Vec::new()); }
+    let ceiling = ((capacity / stride) as u64 * 1_000_000 / u64::from(interval))
+        .min(u64::from(u32::MAX)) as u32;
+    let clipped: Vec<_> = ranges.iter().filter_map(|range| {
+        let mut max = range.max.min(ceiling);
+        if range.min > max { return None; }
+        if range.res != 0 { max -= (max - range.min) % range.res; }
+        Some(SamplingFrequencySubrange { min: range.min, max, res: range.res })
+    }).collect();
+    let rates = representative_sample_rates_from_ranges(&clipped);
+    (clipped, rates)
 }
 
 pub(super) fn explicit_feedback_ambiguous(
@@ -2157,5 +2308,78 @@ mod duplex_claim_tests {
         assert!(validate_duplex_capture_claims(&[0, 1, 3], &[0, 2], &[3]).is_err());
         assert!(validate_duplex_capture_claims(&[0, 1, 2], &[0, 2], &[3]).is_err());
         assert!(validate_duplex_capture_claims(&[0, 1], &[0], &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod standard_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn superspeed_endpoint_addresses_reject_default_endpoint_and_reserved_bits() {
+        for address in [0, 0x80, 0x11, 0x91, 0x71, 0xf1] {
+            assert!(!valid_standard_endpoint_address(address));
+        }
+        for address in [1, 15, 0x81, 0x8f] {
+            assert!(valid_standard_endpoint_address(address));
+        }
+    }
+
+    #[test]
+    fn superspeed_q32_reports_require_standard_feedback_and_async_association() {
+        let valid = |transfer, usage, feedback_sync, sink_sync, associated| {
+            standard_ss_feedback_shape(8, transfer, usage, feedback_sync, sink_sync, associated, (0x01, 0x81))
+        };
+        assert!(valid(TransferType::Isochronous, UsageType::Feedback,
+            SyncType::NoSync, SyncType::Asynchronous, true));
+        assert!(!valid(TransferType::Interrupt, UsageType::Feedback,
+            SyncType::NoSync, SyncType::Asynchronous, true));
+        for usage in [UsageType::Data, UsageType::FeedbackData, UsageType::Reserved] {
+            assert!(!valid(TransferType::Isochronous, usage,
+                SyncType::NoSync, SyncType::Asynchronous, true));
+        }
+        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
+            SyncType::Asynchronous, SyncType::Asynchronous, true));
+        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
+            SyncType::NoSync, SyncType::Synchronous, true));
+        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
+            SyncType::NoSync, SyncType::Asynchronous, false));
+        assert!(standard_ss_feedback_shape(4, TransferType::Interrupt, UsageType::Data,
+            SyncType::NoSync, SyncType::Asynchronous, true, (0x01, 0x82)));
+        // A declared bSynchAddress cannot override standard endpoint-number association.
+        assert!(!standard_ss_feedback_shape(8, TransferType::Isochronous, UsageType::Feedback,
+            SyncType::NoSync, SyncType::Asynchronous, true, (0x01, 0x82)));
+    }
+
+    #[test]
+    fn companion_capacity_clips_word_rates_without_dsd_bit_conversion() {
+        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 768_000, res: 0 }];
+        // Stereo 32-bit words: 192 bytes each 125us carries at most 192k words/s.
+        let (clipped, rates) = capacity_limited_rates(&ranges, 192, 125, 8);
+        assert_eq!(clipped[0].min, 44_100);
+        assert_eq!(clipped[0].max, 192_000);
+        assert!(rates.contains(&192_000));
+        assert!(rates.iter().all(|rate| required_max_packet_bytes(*rate, 125, 8) <= 192));
+    }
+
+    #[test]
+    fn native_word_width_is_clipped_independently_of_descriptor_pcm_width() {
+        let ranges = [SamplingFrequencySubrange { min: 192_000, max: 384_000, res: 192_000 }];
+        assert!(capacity_limited_rates(&ranges, 96, 125, 8).0.is_empty());
+        let (native, rates) = capacity_limited_rates(&ranges, 96, 125, 2);
+        assert_eq!(native[0].max, 384_000);
+        assert!(rates.contains(&192_000));
+        assert!(rates.contains(&384_000));
+        assert!(capacity_limited_rates(&ranges, 24, 125, 2).0.is_empty());
+    }
+
+    #[test]
+    fn companion_capacity_preserves_discrete_rate_alignment_and_rejects_too_small() {
+        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 176_400, res: 44_100 }];
+        let (clipped, _) = capacity_limited_rates(&ranges, 96, 125, 8);
+        assert_eq!(clipped[0].max, 88_200);
+        assert_eq!(clipped[0].res, 44_100);
+        assert!(capacity_limited_rates(&ranges, 1, 125, 8).0.is_empty());
+        assert!(capacity_limited_rates(&ranges, 96, 125, 0).0.is_empty());
     }
 }

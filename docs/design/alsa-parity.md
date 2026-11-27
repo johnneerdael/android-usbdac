@@ -332,6 +332,30 @@ descriptors require a separate validated contract.
 [libusb SuperSpeed endpoint companion fields](https://libusb.sourceforge.io/api-1.0/structlibusb__ss__endpoint__companion__descriptor.html),
 [USB 3.2 specification §9.6.7](https://e2e.ti.com/cfs-file/__key/communityserver-discussions-components-files/138/USB-3.2-Revision-1.1.pdf)
 
+### Shared SuperSpeed transport and feedback
+
+Use the validated periodic endpoint companion on both standard USB Audio
+and ADC3 paths. Playback rates, capture and duplex endpoint admission,
+and implicit-feedback claims use the actual bytes supported per service
+interval. Asynchronous implicit pairing still requires matching IN and
+OUT cadence and proven clock topology.
+
+Select the Enhanced SuperSpeed explicit feedback format from the
+validated eight-byte endpoint. Decode little-endian unsigned Q32.32
+as frames per 125 µs USB bus interval and convert to frames per OUT
+service interval. Full ADC3 adaptive capture sends its nominal feedback
+using the same representation on a verified eight-byte OUT pipe.
+The established three- and four-byte paths retain their existing
+decoding. An advertised malformed feedback endpoint prevents timing
+fallback. [USB 3.2 §4.4.8.4.1 and §9.6.6–9.6.8](https://www.usb.org/document-library/usb-32-revision-11-june-2022)
+
+Rust workspace tests, Android arm64 NDK, Kotlin unit tests and the Android
+AAR and sample builds passed. All four native libraries in the AAR match
+the sample. The AAR SHA-256 is
+`3531dcd8dd6b5f66968a7e4e080288b2ab0f9050bb2f2db6ee90fe5a75d019e3`.
+Live SuperSpeed playback and capture checks remain in final hardware
+acceptance.
+
 ## Sixth validation checkpoint
 
 Full ADC3 playback can fall back to a verified alternative clock on a
