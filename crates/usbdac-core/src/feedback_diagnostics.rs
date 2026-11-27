@@ -125,6 +125,7 @@ pub struct ExplicitFeedbackDiagnostics {
     pub feedback_service_interval_us: u32,
     pub feedback_max_packet_bytes: usize,
     pub requested_packet_bytes: usize,
+    pub transfer_slots: usize,
     pub packets_per_transfer: usize,
     pub transfer_timeout_ms: u32,
     pub per_service_interval_quirk: bool,
@@ -140,6 +141,8 @@ pub struct ExplicitFeedbackDiagnostics {
     pub transfer_status_counts: [u64; 8],
     pub packet_status_counts: [u64; 8],
     pub accepted_reports: u64,
+    pub empty_polls: u64,
+    pub rejected_reports: u64,
     pub(crate) samples: [Option<ExplicitFeedbackPacket>; 9],
 }
 
@@ -332,11 +335,11 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
             f,
             concat!(
                 "feedback ep=0x{:02x} {} {} if={} alt={} bInterval={} refresh={} poll={}us ",
-                "request={}B x{} descriptor={}B timeout={}ms out=0x{:02x} {}us ",
+                "request={}B x{} slots={} descriptor={}B timeout={}ms out=0x{:02x} {}us ",
                 "capacity={}B stride={}B nominal={}Hz clock_readback={:?} ",
                 "timebase={:?} inferred={} reused={} per_service_quirk={} ",
                 "submits={} submit_failures={} last_submit_error={:?} ",
-                "transfer_statuses={:?} packet_statuses={:?} accepted={}"
+                "transfer_statuses={:?} packet_statuses={:?} accepted={} empty={} rejected={}"
             ),
             self.endpoint,
             self.transfer_type,
@@ -348,6 +351,7 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
             self.feedback_service_interval_us,
             self.requested_packet_bytes,
             self.packets_per_transfer,
+            self.transfer_slots,
             self.feedback_max_packet_bytes,
             self.transfer_timeout_ms,
             self.out_endpoint,
@@ -366,6 +370,8 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
             self.transfer_status_counts,
             self.packet_status_counts,
             self.accepted_reports,
+            self.empty_polls,
+            self.rejected_reports,
         )?;
         for packet in self.packet_samples() {
             write!(

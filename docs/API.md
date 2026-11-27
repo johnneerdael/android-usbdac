@@ -220,7 +220,9 @@ completed transfers for every geometry, and a stream is stopped after about
 6 ms of consecutive lossy transfers (never fewer than three), whatever their
 size. For an isochronous explicit endpoint, the polling batch targets a window
 of `min(16 ms, bus_queue_ms)`, rounded down to whole intervals and clamped to
-one to 32 packets. The log line
+one to 32 packets. When the window fits two batches, the driver splits it
+between two transfers so the endpoint can keep polling while the worker
+processes the previous completion. The log line
 `[USB] Isochronous queue:` states the resulting geometry.
 
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,

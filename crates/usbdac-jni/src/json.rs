@@ -221,6 +221,7 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "feedback_service_interval_us": diag.feedback_service_interval_us,
         "feedback_max_packet_bytes": diag.feedback_max_packet_bytes,
         "requested_packet_bytes": diag.requested_packet_bytes,
+        "transfer_slots": diag.transfer_slots,
         "packets_per_transfer": diag.packets_per_transfer,
         "transfer_timeout_ms": diag.transfer_timeout_ms,
         "per_service_interval_quirk": diag.per_service_interval_quirk,
@@ -234,6 +235,8 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "transfer_status_counts": diag.transfer_status_counts,
         "packet_status_counts": diag.packet_status_counts,
         "accepted_reports": diag.accepted_reports,
+        "empty_polls": diag.empty_polls,
+        "rejected_reports": diag.rejected_reports,
         "packet_samples": diag.packet_samples().map(explicit_feedback_packet).collect::<Vec<_>>(),
     }));
     let entries: Vec<_> = trace.entries.iter().map(|entry| {
