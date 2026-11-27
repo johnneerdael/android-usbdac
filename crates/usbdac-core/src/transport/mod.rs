@@ -167,6 +167,7 @@ mod stream_open;
 mod standard_feedforward;
 mod types;
 mod uac2_live_alternate;
+mod uac1_status;
 mod usbfs;
 pub(crate) mod volume_hw;
 #[cfg(test)]

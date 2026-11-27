@@ -713,6 +713,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     thread::sleep(Duration::from_millis(50));
 
     let mut adc3_status_clock_proven = false;
+    let mut uac1_status_rate = None;
     if let Some(route) = adc3_route.as_ref() {
         if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
@@ -780,6 +781,14 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             playback_format.sample_rate, reported_sample_rate, profile,
             playback_format.dsd_transport == DsdTransportMode::None,
         );
+        // Tag only this activation's exact readback from an explicitly
+        // controllable endpoint. Descriptor and host-paced admission never
+        // authorize a later sampling-frequency CUR claim.
+        if profile.sampling_control == Some(true) && clock_verification_passed
+            && playback_format.sample_rate > 0
+            && reported_sample_rate == Some(playback_format.sample_rate) {
+            uac1_status_rate = Some(playback_format.sample_rate);
+        }
         set_clock_verification(clock_control_attempted, clock_control_succeeded,
             clock_verification_passed, reported_sample_rate);
         let message = format!(
@@ -1171,6 +1180,25 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     let status_targets = (|| -> Result<Vec<audio_status::StreamStatusTarget>, Error> {
         let mut targets = Vec::new();
         if vendor_profile.is_none() {
+            if candidate.is_uac1 {
+                // Cached descriptor discovery is optional: missing or
+                // ambiguous collection ownership leaves playback unchanged.
+                if let Some(config) = claimed_handle.handle.device().active_config_descriptor().ok() {
+                    let standard = config.interfaces().flat_map(|i| i.descriptors()).any(|alt|
+                        alt.interface_number() == candidate.interface_number
+                            && alt.setting_number() == candidate.alt_setting
+                            && alt.class_code() == USB_CLASS_AUDIO
+                            && alt.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+                            && alt.protocol_code() == 0);
+                    if let Some(control) = uac1_status::collection_owner(&config,
+                        candidate.interface_number).filter(|control| standard
+                            && claimed_handle.claimed_interfaces.contains(control)) {
+                        targets.push(audio_status::StreamStatusTarget::uac1(control,
+                            candidate.interface_number, candidate.alt_setting,
+                            candidate.endpoint_address, uac1_status_rate, candidate.terminal_link));
+                    }
+                }
+            }
             if let Some((_, choice)) = clock_choice.as_ref().filter(|_| !candidate.is_uac1) {
                 // AS status remains useful without frequency evidence, but a
                 // nominal/ignored/fallback rate must never become a CUR claim.

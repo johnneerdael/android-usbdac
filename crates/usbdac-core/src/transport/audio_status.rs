@@ -1,7 +1,8 @@
-//! UAC2/full-ADC3 in-stream status notifications, scoped to the owning AC endpoint.
+//! In-stream audio status notifications, scoped to the owning AC endpoint.
 
 use super::alternate_controls::advertised_controls;
 use super::iso::InterruptTransferSlot;
+use super::uac1_status::{StreamWatch, Uac1Status};
 use super::usbfs::{ClaimedHandle, UsbfsControlTransfer, USBDEVFS_CONTROL};
 use super::{ClockChoice, Direction, Error, TransferType, UsageType};
 use crate::clock_resolution::{ClockHopKind, ClockResolution};
@@ -22,6 +23,7 @@ pub(super) struct StreamStatusTarget {
     streaming: Vec<(u8, u8)>,
     reads: Vec<ExpectedRead>,
     data_endpoints: Vec<(u8, u8, u8)>,
+    uac1_stream: Option<(Option<u32>, Option<u8>)>,
 }
 
 impl StreamStatusTarget {
@@ -38,6 +40,7 @@ impl StreamStatusTarget {
             streaming: vec![(interface, alternate)],
             reads: Vec::new(),
             data_endpoints: Vec::new(),
+            uac1_stream: None,
         };
         if let Some((choice, rate)) = clock.filter(|(choice, _)| {
             choice.resolution == ClockResolution::Resolved && choice.control_interface == control
@@ -80,6 +83,24 @@ impl StreamStatusTarget {
             }
         }
         target
+    }
+
+    pub(super) fn uac1(
+        control: u8,
+        interface: u8,
+        alternate: u8,
+        address: u8,
+        expected_rate: Option<u32>,
+        terminal: Option<u8>,
+    ) -> Self {
+        Self {
+            protocol: 0,
+            control,
+            streaming: vec![(interface, alternate)],
+            reads: Vec::new(),
+            data_endpoints: vec![(interface, alternate, address)],
+            uac1_stream: Some((expected_rate, terminal)),
+        }
     }
 
     pub(super) fn add_streaming_alt(&mut self, interface: u8, alternate: u8) {
@@ -204,6 +225,7 @@ struct EndpointStatus {
     slot: InterruptTransferSlot,
     reads: Vec<ExpectedRead>,
     faults: Vec<EndpointFault>,
+    uac1: Option<Uac1Status>,
 }
 
 pub(super) struct AudioStatus {
@@ -221,7 +243,7 @@ impl AudioStatus {
     ) -> Result<Self, Error> {
         let targets: Vec<_> = targets
             .iter()
-            .filter(|target| matches!(target.protocol, 0x20 | 0x30))
+            .filter(|target| matches!(target.protocol, 0 | 0x20 | 0x30))
             .collect();
         if targets.is_empty() {
             return Ok(Self {
@@ -264,6 +286,138 @@ impl AudioStatus {
             let Some(endpoint) = status_endpoints.next() else {
                 continue;
             };
+            if target.protocol == 0 {
+                // UAC1 notifications are two-byte status words, with their own
+                // originator semantics and GET_STAT/GET_CUR request formats.
+                // Optional or ambiguous descriptors leave this owner unwatched.
+                if owner
+                    .descriptors()
+                    .filter(|d| d.setting_number() == 0)
+                    .count()
+                    != 1
+                    || status_endpoints.next().is_some()
+                    || !(2..=1024).contains(&endpoint.max_packet_size())
+                    || endpoint.interval() == 0
+                    || !valid_endpoint_address(endpoint.address())
+                {
+                    continue;
+                }
+                // Resolve aliases before arming any slot, including aliases
+                // owned by an AC target encountered later in this loop.
+                let aliases_control = config.interfaces().any(|interface| {
+                    interface.number() != target.control
+                        && interface.descriptors().any(|descriptor| {
+                            descriptor.class_code() == 1
+                                && descriptor.sub_class_code() == 1
+                                && descriptor.setting_number() == 0
+                                && descriptor.endpoint_descriptors().any(|ep| {
+                                    ep.transfer_type() == TransferType::Interrupt
+                                        && ep.direction() == Direction::In
+                                        && ep.address() == endpoint.address()
+                                })
+                        })
+                });
+                let aliases_stream = targets.iter().any(|other| {
+                    other.streaming.iter().any(|&(interface, alternate)| {
+                        config.interfaces().any(|candidate| {
+                            candidate.number() == interface
+                                && candidate.descriptors().any(|descriptor| {
+                                    descriptor.setting_number() == alternate
+                                        && descriptor
+                                            .endpoint_descriptors()
+                                            .any(|ep| ep.address() == endpoint.address())
+                                })
+                        })
+                    })
+                });
+                if aliases_control || aliases_stream {
+                    continue;
+                }
+                let watches = (|| {
+                    let mut watches = Vec::new();
+                    let mut selected = HashSet::new();
+                    for other in targets
+                        .iter()
+                        .filter(|other| other.control == target.control)
+                    {
+                        if other.protocol != 0 {
+                            return None;
+                        }
+                        let (rate, terminal) = other.uac1_stream?;
+                        for &(interface, alternate, address) in &other.data_endpoints {
+                            if !claimed.claimed_interfaces.contains(&interface)
+                                || !selected.insert((interface, alternate, address))
+                            {
+                                return None;
+                            }
+                            let streaming =
+                                config.interfaces().find(|i| i.number() == interface)?;
+                            let mut descriptors = streaming
+                                .descriptors()
+                                .filter(|d| d.setting_number() == alternate);
+                            let descriptor = descriptors.next()?;
+                            if descriptors.next().is_some()
+                                || descriptor.class_code() != 1
+                                || descriptor.sub_class_code() != 2
+                                || descriptor.protocol_code() != 0
+                            {
+                                return None;
+                            }
+                            let mut inventory = Vec::new();
+                            let mut data = None;
+                            for ep in descriptor.endpoint_descriptors() {
+                                if !valid_endpoint_address(ep.address())
+                                    || ep.transfer_type() != TransferType::Isochronous
+                                    || inventory.contains(&ep.address())
+                                {
+                                    return None;
+                                }
+                                inventory.push(ep.address());
+                                if ep.address() == address {
+                                    if !matches!(
+                                        ep.usage_type(),
+                                        UsageType::Data | UsageType::FeedbackData
+                                    ) {
+                                        return None;
+                                    }
+                                    data = Some(ep);
+                                }
+                            }
+                            let data = data?;
+                            watches.push(StreamWatch {
+                                interface,
+                                alternate,
+                                endpoint: address,
+                                rate: rate.filter(|_| {
+                                    uac1_sampling_frequency(data.extra().unwrap_or(&[]))
+                                }),
+                                terminal,
+                                endpoints: inventory,
+                            });
+                        }
+                    }
+                    Some(watches)
+                })();
+                let Some(status) = watches
+                    .and_then(|watches| Uac1Status::new(target.control, ac.extra(), watches))
+                else {
+                    continue;
+                };
+                if addresses.contains(&endpoint.address()) {
+                    continue;
+                }
+                addresses.insert(endpoint.address());
+                let slot = InterruptTransferSlot::new(usize::from(endpoint.max_packet_size()))
+                    .map_err(Error::Transfer)?;
+                endpoints.push(EndpointStatus {
+                    endpoint: endpoint.address(),
+                    slot,
+                    reads: Vec::new(),
+                    faults: Vec::new(),
+                    uac1: Some(status),
+                });
+                continue;
+            }
             let mut reads = Vec::new();
             let mut faults = Vec::new();
             let mut fault_advertisements = HashMap::new();
@@ -394,6 +548,7 @@ impl AudioStatus {
                 slot,
                 reads,
                 faults,
+                uac1: None,
             });
         }
         // Resolve contradictory targets before arming any endpoint.
@@ -438,6 +593,22 @@ impl AudioStatus {
                     "AudioControl status endpoint {:#04x} failed: {status}",
                     endpoint.endpoint
                 )));
+            }
+            if let Some(status) = &endpoint.uac1 {
+                status.poll(bytes, |request_type, request, value, index, length| {
+                    raw_read_control(
+                        claimed,
+                        request_type,
+                        request,
+                        value,
+                        index,
+                        length,
+                        deadline,
+                    )
+                    .map(|(_, response)| response)
+                })?;
+                endpoint.slot.submit(&claimed.handle, endpoint.endpoint)?;
+                continue;
             }
             let pending = triggered_reads(&endpoint.reads, bytes);
             for index in pending {
@@ -514,6 +685,26 @@ fn read_control(
     length: usize,
     deadline: Instant,
 ) -> Result<(usize, Vec<u8>), Error> {
+    raw_read_control(
+        claimed,
+        address.request_type(),
+        CURRENT_ATTRIBUTE,
+        u16::from(address.selector) << 8,
+        address.index(),
+        length,
+        deadline,
+    )
+}
+
+fn raw_read_control(
+    claimed: &ClaimedHandle,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: usize,
+    deadline: Instant,
+) -> Result<(usize, Vec<u8>), Error> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
@@ -522,18 +713,18 @@ fn read_control(
     // must round up instead of becoming an unbounded zero-timeout request.
     let timeout_ms = ((remaining.as_nanos() + 999_999) / 1_000_000) as u32;
     let mut response = vec![0; length];
-    let request = UsbfsControlTransfer {
-        request_type: address.request_type(),
-        request: CURRENT_ATTRIBUTE,
-        value: u16::from(address.selector) << 8,
-        index: address.index(),
+    let transfer = UsbfsControlTransfer {
+        request_type,
+        request,
+        value,
+        index,
         length: response.len() as u16,
         timeout_ms,
         data: response.as_mut_ptr().cast(),
     };
     // Use the owning usbfs fd: synchronous control I/O must not become a second
     // consumer of libusb's isochronous completion queue.
-    let result = unsafe { libc::ioctl(claimed.device_fd, USBDEVFS_CONTROL, &request) };
+    let result = unsafe { libc::ioctl(claimed.device_fd, USBDEVFS_CONTROL, &transfer) };
     if result < 0 {
         let error = std::io::Error::last_os_error();
         if matches!(
@@ -543,8 +734,7 @@ fn read_control(
             return Err(Error::DeviceLost);
         }
         return Err(Error::Control(format!(
-            "Audio status read {:?}: {error}",
-            address
+            "Audio status read ({request_type:#04x}, {request:#04x}, {value:#06x}, {index:#06x}): {error}"
         )));
     }
     if Instant::now() >= deadline {
@@ -572,6 +762,31 @@ fn read_fault(claimed: &ClaimedHandle, address: Address, deadline: Instant) -> R
         ));
     }
     parse_fault(&response)
+}
+
+// UAC1 EP_GENERAL is exactly seven bytes. Duplicate advertisements,
+// including identical copies, do not establish a unique endpoint control.
+fn uac1_sampling_frequency(extra: &[u8]) -> bool {
+    let mut remaining = extra;
+    let mut advertised = None;
+    while !remaining.is_empty() {
+        let length = usize::from(remaining[0]);
+        if length < 2 || length > remaining.len() {
+            return false;
+        }
+        let descriptor = &remaining[..length];
+        if descriptor[1] == 0x25 && descriptor.get(2) == Some(&1) {
+            if advertised.is_some() || length != 7 {
+                return false;
+            }
+            if descriptor[3] & !0x83 != 0 || descriptor[4] > 2 {
+                return false;
+            }
+            advertised = Some(descriptor[3] & 1 != 0);
+        }
+        remaining = &remaining[length..];
+    }
+    advertised == Some(true)
 }
 
 fn valid_endpoint_address(address: u8) -> bool {
@@ -641,6 +856,36 @@ fn verification_expired() -> Error {
 mod tests {
     use super::*;
     use crate::clock_resolution::{ClockHop, ClockHopKind};
+
+    #[test]
+    fn uac1_sampling_readback_needs_one_exact_advertisement() {
+        let frequency = [7, 0x25, 1, 1, 0, 0, 0];
+        assert!(uac1_sampling_frequency(&frequency));
+        assert!(!uac1_sampling_frequency(&[]));
+        assert!(!uac1_sampling_frequency(&[7, 0x25, 1, 0, 0, 0, 0]));
+        assert!(!uac1_sampling_frequency(&[8, 0x25, 1, 1, 0, 0, 0, 0]));
+        assert!(!uac1_sampling_frequency(&frequency.repeat(2)));
+        let mut malformed = frequency.to_vec();
+        malformed.push(0);
+        assert!(!uac1_sampling_frequency(&malformed));
+        assert!(!uac1_sampling_frequency(&frequency[..6]));
+        assert!(!uac1_sampling_frequency(&[7, 0x25, 1, 5, 0, 0, 0]));
+        assert!(!uac1_sampling_frequency(&[7, 0x25, 1, 1, 3, 0, 0]));
+        assert!(uac1_sampling_frequency(&[7, 0x25, 1, 0x83, 2, 0, 0]));
+        // UAC2 EP_GENERAL must never authorize a UAC1 sampling request.
+        assert!(!uac1_sampling_frequency(&general_endpoint(0x20, 1)));
+    }
+
+    #[test]
+    fn uac1_target_keeps_endpoint_rate_and_terminal_separate_from_clock_reads() {
+        let target = StreamStatusTarget::uac1(2, 3, 1, 0x81, Some(48_000), Some(7));
+        assert_eq!(target.protocol, 0);
+        assert_eq!(target.control, 2);
+        assert_eq!(target.streaming, vec![(3, 1)]);
+        assert_eq!(target.data_endpoints, vec![(3, 1, 0x81)]);
+        assert_eq!(target.uac1_stream, Some((Some(48_000), Some(7))));
+        assert!(target.reads.is_empty());
+    }
 
     fn general_endpoint(protocol: u8, bitmap: u32) -> Vec<u8> {
         let mut descriptor = vec![0; if protocol == 0x20 { 8 } else { 10 }];

@@ -1021,7 +1021,23 @@ impl Drop for CaptureUsbOwner {
 /// Build only from the active, strictly resolved capture route after activation.
 pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
     -> Result<Option<audio_status::StreamStatusTarget>, Error> {
-    if endpoint.vendor_pcm.is_some() || !matches!(endpoint.protocol, 0x20 | 0x30) {
+    if endpoint.vendor_pcm.is_some() {
+        return Ok(None);
+    }
+    if endpoint.protocol == 0 {
+        // Standard capture admission already proved this collection and
+        // terminal. Only controllable endpoints required an exact positive
+        // activation readback; fixed and host-paced rates are not CUR proof.
+        if !claimed.claimed_interfaces.contains(&endpoint.control) {
+            return Ok(None);
+        }
+        let rate = endpoint.format.sample_rate();
+        return Ok(Some(audio_status::StreamStatusTarget::uac1(endpoint.control,
+            endpoint.interface, endpoint.alternate, endpoint.address,
+            (endpoint.sampling_control && rate > 0).then_some(rate),
+            Some(endpoint.terminal))));
+    }
+    if !matches!(endpoint.protocol, 0x20 | 0x30) {
         return Ok(None);
     }
     let proven = if let Some(route) = endpoint.adc3_route.as_ref() {

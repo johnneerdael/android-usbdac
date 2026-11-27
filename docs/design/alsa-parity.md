@@ -331,6 +331,30 @@ the four-ABI AAR and sample builds passed. The AAR and sample contain
 identical native libraries for each ABI. The AAR SHA-256 is
 `a091546bd145b265945816580358c1b3941f8baf3245ab099b6c0ee8c466c5aa`.
 
+### UAC1 AudioControl status
+
+Use the optional interrupt IN endpoint only when it belongs to the
+claimed UAC1 AudioControl collection for the active stream. Decode
+two-byte status words and acknowledge a pending status with
+`GET_STAT` on its known originator. Recheck the active alternate and
+any previously verified Sampling Frequency control on the affected
+data endpoint. Multi-rate adaptive capture without that control retains
+its PCM cadence check. Ignore private memory notices because their
+payload layout depends on the device. [USB-IF UAC1 §§3.7.1.2, 4.4.2 and 5.2.4](https://www.usb.org/sites/default/files/audio10.pdf),
+[ALSA UAC1 interrupt handling](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c#L3289-L3367)
+
+The same USB worker handles status for playback, capture and duplex.
+A required readback that fails or contradicts the selected route
+stops the stream. In the final hardware pass, record the status
+word, acknowledgement, and exact readback. Exercise an unrelated
+AudioControl notification, a change affecting one side of duplex,
+an empty `GET_STAT` response, and unplug.
+
+Rust workspace tests and the Android arm64 target check passed. The
+release AAR and sample built with matching native libraries for all
+four ABIs. The AAR SHA-256 is
+`9972b6793f8987f2f2c7c6327ddfa71b33825075388c4ad9a7bcde600db8b3f5`.
+
 ### Device-reported endpoint overrun and underrun
 
 When a selected UAC2 or full UAC3 data endpoint advertises a
