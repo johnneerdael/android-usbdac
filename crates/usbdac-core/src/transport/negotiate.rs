@@ -1,5 +1,29 @@
 use super::*;
 
+// A read made before a clock write cannot establish the clock after that write.
+fn negotiation_reported_rate(
+    attempted: bool,
+    before: Option<u32>,
+    after: Option<u32>,
+) -> Option<u32> {
+    after.filter(|rate| *rate > 0).or_else(|| {
+        (!attempted)
+            .then_some(before)
+            .flatten()
+            .filter(|rate| *rate > 0)
+    })
+}
+
+fn adaptive_rate_verified(
+    attempted: bool,
+    before: Option<u32>,
+    after: Option<u32>,
+    verified_after: bool,
+    actual: u32,
+) -> bool {
+    (!attempted && before == Some(actual)) || (verified_after && after == Some(actual))
+}
+
 /// Programs and verifies the DAC clock for `requested_format` and settles on the
 /// format the DAC will actually run (which differs only when the exact rate is
 /// not available). Runs with the alternate setting at 0 and leaves it there.
@@ -208,7 +232,11 @@ pub(super) fn negotiate_playback_format(
                 clock_attempted = true;
                 clock_succeeded = clock_outcome.set_cur_succeeded || clock_outcome.clock_ok;
                 rate_verified = clock_outcome.rate_verified;
-                reported_rate = clock_outcome.reported_sample_rate.or(current_rate);
+                reported_rate = negotiation_reported_rate(
+                    true,
+                    current_rate,
+                    clock_outcome.reported_sample_rate,
+                );
                 last_message = clock_outcome.message.clone();
                 log::info!(
                     "[USB] NEGOTIATION CLOCK: confirmed={}Hz, clockOk={}, rateVerified={}, clockId={}, iface={}",
@@ -366,9 +394,15 @@ pub(super) fn negotiate_playback_format(
                 } else {
                     DacMode::AdaptiveStreaming
                 };
-                reported_rate = reported_rate.or(current_rate).or(Some(actual_rate));
-                rate_verified =
-                    current_rate == Some(actual_rate) || reported_rate == Some(actual_rate);
+                rate_verified = adaptive_rate_verified(
+                    clock_attempted,
+                    current_rate,
+                    reported_rate,
+                    rate_verified,
+                    actual_rate,
+                );
+                reported_rate =
+                    negotiation_reported_rate(clock_attempted, current_rate, reported_rate);
             } else {
                 if uac2_choice_has_multiplier(clock_choice.as_ref()) {
                     return Err(Error::ClockUnverified {
@@ -382,9 +416,8 @@ pub(super) fn negotiate_playback_format(
                         requested_format.sample_rate
                     )
                 });
-                reported_rate = reported_rate
-                    .or(current_rate)
-                    .or(Some(requested_format.sample_rate));
+                reported_rate =
+                    negotiation_reported_rate(clock_attempted, current_rate, reported_rate);
                 last_message = Some(message);
             }
         } else if candidate.is_uac1 {
@@ -433,7 +466,6 @@ pub(super) fn negotiate_playback_format(
                 "Unable to determine a usable fixed clock rate for requested {} Hz during negotiation; continuing direct USB with assumed stream rate",
                 requested_format.sample_rate
             );
-            reported_rate = Some(requested_format.sample_rate);
             last_message = Some(message);
         }
 
@@ -459,9 +491,6 @@ pub(super) fn negotiate_playback_format(
             if selected.implicit_feedback != candidate.implicit_feedback {
                 return Err(Error::ImplicitFeedbackUnsupported);
             }
-        }
-        if !candidate.is_uac1 {
-            reported_rate = reported_rate.or(Some(effective_format.sample_rate));
         }
         set_effective_playback_format(effective_format);
         set_dac_mode(dac_mode);
@@ -788,4 +817,52 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
         },
         playback_format,
     )
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::{adaptive_rate_verified, negotiation_reported_rate};
+
+    #[test]
+    fn attempted_set_never_reports_a_stale_or_synthetic_rate() {
+        assert_eq!(negotiation_reported_rate(true, Some(48_000), None), None);
+        assert_eq!(negotiation_reported_rate(true, Some(48_000), Some(0)), None);
+        assert_eq!(
+            negotiation_reported_rate(true, Some(48_000), Some(44_100)),
+            Some(44_100)
+        );
+        assert_eq!(
+            negotiation_reported_rate(false, Some(48_000), None),
+            Some(48_000)
+        );
+        assert_eq!(negotiation_reported_rate(false, None, None), None);
+        assert!(!adaptive_rate_verified(
+            true,
+            Some(48_000),
+            None,
+            false,
+            48_000
+        ));
+        assert!(!adaptive_rate_verified(
+            true,
+            Some(48_000),
+            Some(48_000),
+            false,
+            48_000
+        ));
+        assert!(adaptive_rate_verified(
+            true,
+            Some(48_000),
+            Some(44_100),
+            true,
+            44_100
+        ));
+        assert!(adaptive_rate_verified(
+            false,
+            Some(48_000),
+            None,
+            false,
+            48_000
+        ));
+    }
 }

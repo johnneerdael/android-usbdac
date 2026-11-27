@@ -38,6 +38,10 @@ interface OutputSource {
     /** True once if the settings or the devices changed since the last time the output was opened. */
     fun takeLookAgain(): Boolean
 
+    /** Last sink position observed on the playback thread, or null after a flush/reconfiguration.
+     * This is an advisory recovery point, not proof of samples audible at the instant of loss. */
+    fun onRecoveryPosition(output: OpenedOutput?, positionUs: Long?) = Unit
+
     /** Android's ducking and the app's own player volume, as a multiplier from 0 to 1. */
     fun setVolumeMultiplier(multiplier: Float)
 }

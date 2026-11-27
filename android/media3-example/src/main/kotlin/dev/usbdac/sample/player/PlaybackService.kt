@@ -45,7 +45,7 @@ class PlaybackService : MediaSessionService() {
             .filterIsInstance<DacEvent.DeviceLost>()
             .onEach {
                 player.pause()
-                outputs.explain("The DAC was unplugged. Playback is paused.")
+                outputs.explain("The DAC was unplugged. Playback is paused; reconnect and seek before resuming.")
             }
             .launchIn(scope)
     }

@@ -24,7 +24,7 @@ Audio travels to the DAC in small packets, and the driver keeps a short queue of
 
 ### A hiccup on the cable no longer ends playback
 
-When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB standard allows. Since 0.1.5 a single packet that fails with nothing delivered, inside a transfer that otherwise completed, is counted the same way. Any other packet error still stops the stream.
+When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB standard allows. Packet and transfer errors are accounted for within the configured recovery limits; see the streaming decision for the current behavior and limitations.
 
 **In plain terms:** a brief stumble between phone and DAC used to stop the music. Now playback carries on, and the library remembers that a sliver of audio was lost, so it will not claim the playback was perfect.
 

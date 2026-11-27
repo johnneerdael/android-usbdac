@@ -142,6 +142,10 @@ pub enum DacEvent {
     /// good rate for a bounded grace period, then fails if reports do not recover.
     /// Emitted once per stale transition after publishing the cleared lock.
     FeedbackStale,
+    /// A host-paced asynchronous stream had an empty producer ring for this
+    /// duration. Once per episode, reset on refill, pause or drain. This is
+    /// not a measurement of the DAC FIFO or clock drift.
+    NominalAsyncHostStarvation { empty_ms: u64 },
     /// A compatibility tier was admitted after the initial OUT queue submitted
     /// successfully. Delivered to DAC and stream listeners, deduplicated when
     /// they are the same callback. Never emitted for a refused/failed startup.

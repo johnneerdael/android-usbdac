@@ -372,6 +372,7 @@ fn counters_accumulate_across_urbs() {
             lost_frames: 3,
             timed_out: false,
             held: false,
+            transport_failed: false,
         },
     );
     tracker.record(
@@ -382,6 +383,7 @@ fn counters_accumulate_across_urbs() {
             lost_frames: 0,
             timed_out: true,
             held: false,
+            transport_failed: false,
         },
     );
     assert_eq!(tracker.short_packets(), 3);
@@ -652,4 +654,40 @@ fn a_timed_out_urb_and_its_resubmission_count_every_frame_once() {
         0,
         "the clean URB after the hold resets the run"
     );
+}
+
+#[test]
+fn sparse_loss_refills_budget_without_erasing_lifetime_evidence() {
+    let mut tracker = LossTracker::new(LossLimits {
+        max_consecutive_lossy_urbs: 3,
+        max_lost_frames: 100,
+    });
+    for i in 0..1000 {
+        let verdict = tracker.record_at(SCHEDULE_FRAMES, lossy_by(1), i * 1_000);
+        assert!(verdict.fatal.is_none());
+        tracker.record_at(SCHEDULE_FRAMES, UrbLoss::default(), i * 1_000 + 1);
+    }
+    assert_eq!(tracker.lost_frames(), 1000);
+    assert!(tracker.is_latched());
+    assert!(tracker
+        .record_at(SCHEDULE_FRAMES, lossy_by(101), 1_001_000)
+        .fatal
+        .is_some());
+}
+
+#[test]
+fn persistent_transfer_failures_stop_without_inventing_timeouts() {
+    let mut tracker = LossTracker::new(LossLimits {
+        max_consecutive_lossy_urbs: 3,
+        max_lost_frames: u64::MAX,
+    });
+    let failed = UrbLoss::default().with_transport_failure(true);
+    for _ in 0..3 {
+        assert!(tracker.record(0, failed).fatal.is_none());
+    }
+    assert!(matches!(
+        tracker.record(0, failed).fatal,
+        Some(LossLimit::ConsecutiveLossyUrbs { .. })
+    ));
+    assert_eq!(tracker.data_urb_timeouts(), 0);
 }

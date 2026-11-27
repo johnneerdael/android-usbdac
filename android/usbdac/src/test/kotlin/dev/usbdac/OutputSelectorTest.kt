@@ -30,6 +30,123 @@ private fun OutputDecision.rejected(kind: OutputKind): Rejection =
 
 class OutputSelectorTest {
 
+    @Test
+    fun prepared_dac_transfers_the_same_session_to_first_track() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val selector = selector(platform)
+        val prepared = selector.prepareUsb(dac)
+        assertSame(dac, prepared.device)
+        assertNull(prepared.volume) // fake link has no volume object
+        assertEquals(1, link.openCount)
+        assertTrue(link.negotiated.isEmpty())
+        expectError(DacErrorCode.INVALID_STATE) { selector.select(PCM_96_24) }
+        val output = selector.open(PCM_96_24)
+        assertEquals(1, link.openCount)
+        assertSame(dac, output.decision.dac)
+        assertEquals(1, link.streams.size)
+        prepared.close() // transferred: cannot close the playing session
+        assertEquals(0, link.closeCount)
+        output.close()
+        assertEquals(1, link.closeCount)
+    }
+
+    @Test
+    fun preparation_exposes_volume_and_transfers_the_same_control() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        var state = VolumeState(-40.0, 0.5, false)
+        val backend = object : dev.usbdac.internal.VolumeBackend {
+            override fun get() = state
+            override fun setDb(db: Double): VolumeState = state.copy(db = db).also { state = it }
+            override fun setFraction(fraction: Double): VolumeState = state.copy(fraction = fraction).also { state = it }
+            override fun step(direction: Int, steps: Int) = state
+            override fun setMute(muted: Boolean): VolumeState = state.copy(muted = muted).also { state = it }
+            override fun originalDb(): Double? = 0.0
+            override fun handBack() = true
+        }
+        val volume = DacVolume(backend, VolumeRange(-80.0, 0.0, 1.0), true, state,
+            StartupVolumeReport(listOf(0.0), listOf(-40.0), 0.0, true, false, -40.0),
+            java.util.concurrent.Executor { it.run() }) { throw it }
+        val routed = object : dev.usbdac.internal.OutputPlatform by platform {
+            override fun openDac(dac: DacDeviceInfo, config: DacConfig): dev.usbdac.internal.DirectLink {
+                val opened = platform.openDac(dac, config)
+                return object : dev.usbdac.internal.DirectLink by opened { override val volume = volume }
+            }
+        }
+        val selector = OutputSelector(routed, OutputPolicy())
+        val prepared = selector.prepareUsb(dac)
+        assertSame(volume, prepared.volume)
+        prepared.volume!!.setDb(-20.0)
+        assertEquals(-20.0, prepared.volume!!.refresh().db, 0.0)
+        val output = selector.open(PCM_96_24)
+        assertSame(volume, output.volume)
+        assertEquals(1, link.openCount)
+        output.close()
+        assertEquals(1, link.closeCount)
+    }
+
+    @Test
+    fun prepared_dac_cancel_is_idempotent_and_selector_can_be_reused() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val selector = selector(platform)
+        val prepared = selector.prepareUsb(dac)
+        prepared.close()
+        prepared.close()
+        assertEquals(1, link.closeCount)
+        selector.open(PCM_96_24).close()
+        assertEquals(2, link.openCount)
+    }
+
+    @Test
+    fun prepared_dac_failure_closes_once_without_fallback() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val selector = selector(platform)
+        val prepared = selector.prepareUsb(dac)
+        link.onNegotiate = { throw unsupported() }
+        expectError(DacErrorCode.UNSUPPORTED) { selector.open(PCM_96_24) }
+        prepared.close()
+        assertEquals(1, link.closeCount)
+        assertTrue(platform.managed.isEmpty())
+        assertTrue(platform.offers.isEmpty())
+    }
+
+    @Test
+    fun prepared_dac_does_not_follow_a_detached_or_unpermitted_device() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val selector = selector(platform)
+        val prepared = selector.prepareUsb(dac)
+        platform.dacs = emptyList()
+        expectError(DacErrorCode.DEVICE_LOST) { selector.open(PCM_96_24) }
+        prepared.close()
+        assertEquals(1, link.closeCount)
+        platform.dacs = listOf(dac)
+        platform.permitted.clear()
+        expectError(DacErrorCode.PERMISSION_DENIED) { selector.prepareUsb(dac) }
+        assertEquals(1, link.openCount)
+    }
+
+    @Test
+    fun prepared_dac_stream_open_failure_releases_session() {
+        val platform = FakePlatform()
+        val dac = fakeDac()
+        val link = platform.attach(dac)
+        val selector = selector(platform)
+        val prepared = selector.prepareUsb(dac)
+        link.openStreamError = unsupported()
+        expectError(DacErrorCode.UNSUPPORTED) { selector.open(PCM_96_24) }
+        prepared.close()
+        assertEquals(1, link.closeCount)
+    }
+
     // ---- 1. direct USB ----
 
     @Test

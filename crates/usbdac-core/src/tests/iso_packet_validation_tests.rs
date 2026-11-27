@@ -125,15 +125,11 @@ fn test_zero_length_packets_are_counted_not_rejected() {
 }
 
 #[test]
-fn test_per_packet_errors_are_rejected_even_when_lengths_match() {
+fn test_unrecoverable_packet_errors_are_rejected_even_when_lengths_match() {
     let acceptance = PacketAcceptance::new(44_100, 125, 4);
     for (status, label) in [
-        (LIBUSB_TRANSFER_TIMED_OUT, "timed_out"),
-        (LIBUSB_TRANSFER_STALL, "stall"),
         (LIBUSB_TRANSFER_NO_DEVICE, "no_device"),
-        (LIBUSB_TRANSFER_OVERFLOW, "overflow"),
         (LIBUSB_TRANSFER_CANCELLED, "cancelled"),
-        (LIBUSB_TRANSFER_ERROR, "error"),
         (99, "unknown"),
     ] {
         let mut descriptors = completed_packets(&[24]);
@@ -175,11 +171,7 @@ fn test_failed_packet_recovery_accounts_every_known_empty_request() {
     packets[2].status = LIBUSB_TRANSFER_COMPLETED;
     packets[2].actual_length = 24;
 
-    for status in [
-        LIBUSB_TRANSFER_NO_DEVICE,
-        LIBUSB_TRANSFER_STALL,
-        LIBUSB_TRANSFER_CANCELLED,
-    ] {
+    for status in [LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_CANCELLED] {
         packets[0].status = status;
         assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
     }
@@ -207,12 +199,16 @@ fn test_empty_error_bursts_retain_exact_loss_for_each_packet() {
         assert_eq!(stats.lost_bytes, 96);
         assert_eq!(stats.lost_ring_frames(4), 24);
         packets[0].actual_length = 4;
-        assert!(validate_iso_packet_descriptors(
-            &schedule,
-            &packets,
-            PacketAcceptance::new(48_000, 125, 4)
-        )
-        .is_err());
+        assert_eq!(
+            validate_iso_packet_descriptors(
+                &schedule,
+                &packets,
+                PacketAcceptance::new(48_000, 125, 4)
+            )
+            .unwrap()
+            .lost_bytes,
+            96
+        );
     }
 }
 
@@ -490,4 +486,15 @@ fn tx_length_prefix_is_not_audio_or_lost_frames() {
     );
     packets[0].actual_length = 3;
     assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
+}
+
+#[test]
+fn stalled_partial_packet_is_charged_without_crediting_unconfirmed_bytes() {
+    let mut packets = completed_packets(&[24, 24]);
+    packets[0].status = LIBUSB_TRANSFER_STALL;
+    packets[0].actual_length = 12;
+    let stats =
+        validate_iso_packet_descriptors(&[24, 24], &packets, PacketAcceptance::new(48_000, 125, 4))
+            .unwrap();
+    assert_eq!(stats.lost_bytes, 24);
 }

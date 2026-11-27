@@ -693,7 +693,7 @@ fn valid_uac1_rate(rate: u32) -> bool {
     (1..=0x7f_ffff).contains(&rate)
 }
 
-fn decode_uac1_rate(data: [u8; 3], transferred: usize) -> Result<u32, String> {
+pub(super) fn decode_uac1_rate(data: [u8; 3], transferred: usize) -> Result<u32, String> {
     if transferred != 3 {
         return Err(format!(
             "UAC1 GET_CUR returned {transferred} bytes, expected 3"
@@ -868,9 +868,6 @@ pub(super) fn get_sampling_frequency(
     interface_number: u8,
     clock_id: u8,
 ) -> Result<u32, String> {
-    if settings().has(crate::Quirk::SkipSampleRateReadback) {
-        return Err("frequency GET_CUR omitted by exact source-backed identity rule; clock remains unverified".into());
-    }
     let request_type = USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE;
     let value = UAC2_CLOCK_SOURCE_SAM_FREQ_CONTROL;
     let index = (interface_number as u16) | ((clock_id as u16) << 8);

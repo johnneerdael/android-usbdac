@@ -489,6 +489,7 @@ mod transport_loss_tests {
                 short_packets: 0,
                 zero_packets: 0,
                 held: false,
+                transport_failed: false,
             },
         );
         tracker.record(
@@ -499,6 +500,7 @@ mod transport_loss_tests {
                 short_packets: 2,
                 zero_packets: 1,
                 held: false,
+                transport_failed: false,
             },
         );
         publish_transport_loss(&stats, &tracker);

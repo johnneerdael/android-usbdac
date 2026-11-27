@@ -131,6 +131,7 @@ impl IsoQueueGeometry {
 #[derive(Debug, Clone)]
 pub(crate) struct IsoPacketScheduler {
     sample_rate: u32,
+    verified_clock: bool,
     service_interval_us: u32,
     nominal_remainder: u64,
     bytes_per_frame: usize,
@@ -160,6 +161,7 @@ impl IsoPacketScheduler {
     ) -> Self {
         Self {
             sample_rate,
+            verified_clock: true,
             service_interval_us,
             nominal_remainder: 0,
             bytes_per_frame,
@@ -169,6 +171,11 @@ impl IsoPacketScheduler {
             feedback_remainder: 0.0,
             packet_pattern: None,
         }
+    }
+
+    pub(crate) fn with_verified_clock(mut self, verified: bool) -> Self {
+        self.verified_clock = verified;
+        self
     }
 
     /// Configure the dedicated explicit-feedback path without changing phase.
@@ -233,7 +240,12 @@ impl IsoPacketScheduler {
         }
 
         let nominal = self.nominal_frames_per_packet().max(0.001);
-        !(frames_per_packet < nominal * 0.875 || frames_per_packet > nominal * 1.5)
+        let (lower, upper) = if self.verified_clock {
+            (0.875, 1.5)
+        } else {
+            (0.97, 1.03)
+        };
+        !(frames_per_packet < nominal * lower || frames_per_packet > nominal * upper)
     }
 
     pub(crate) fn lock_to_nominal_packet_timing(&mut self) {
@@ -301,7 +313,7 @@ impl AdaptiveQueue {
             }
             self.last_loss_ms = now_ms;
             self.losses = self.losses.saturating_add(lossy_completions);
-            if self.losses >= 3 {
+            if self.losses >= 1 {
                 // Count coalesced losses, but grow only once per worker batch.
                 self.slots = (self.slots + 2).min(self.max_slots);
                 self.losses = 0;
@@ -321,9 +333,7 @@ mod adaptive_tests {
     fn loss_bursts_deepen_and_quiet_periods_shrink_without_changing_packets() {
         let g = IsoQueueGeometry::default_for(125);
         let mut queue = AdaptiveQueue::new(g, true);
-        for at in [0, 10, 20] {
-            queue.observe(at, 1);
-        }
+        queue.observe(20, 1);
         assert_eq!(queue.slots, 10);
         assert!(!queue.observe(29_999, 0));
         assert!(queue.observe(30_020, 0));
@@ -333,6 +343,14 @@ mod adaptive_tests {
         }
         assert_eq!(queue.slots, 15);
         assert!(queue.slots * g.packets_per_transfer < PACKET_FLIGHT_LIMIT);
+    }
+    #[test]
+    fn unverified_clock_rejects_adjacent_rate_family() {
+        let scheduler = IsoPacketScheduler::new(44_100, 4, 1000).with_verified_clock(false);
+        assert!(scheduler.feedback_rate_is_plausible(44.1));
+        assert!(!scheduler.feedback_rate_is_plausible(48.0));
+        let verified = scheduler.with_verified_clock(true);
+        assert!(verified.feedback_rate_is_plausible(48.0));
     }
     #[test]
     fn fixed_policy_and_capacity_cannot_deepen() {
@@ -375,18 +393,18 @@ pub(crate) struct NominalStarvation {
     reported: bool,
 }
 impl NominalStarvation {
-    pub(crate) fn observe(&mut self, now_ms: u64, buffered: usize, active: bool) -> bool {
+    pub(crate) fn observe(&mut self, now_ms: u64, buffered: usize, active: bool) -> Option<u64> {
         if !active || buffered > 0 {
             self.empty_since_ms = None;
             self.reported = false;
-            return false;
+            return None;
         }
         let since = *self.empty_since_ms.get_or_insert(now_ms);
         if !self.reported && now_ms.saturating_sub(since) >= 5_000 {
             self.reported = true;
-            return true;
+            return Some(now_ms.saturating_sub(since));
         }
-        false
+        None
     }
 }
 #[cfg(test)]
@@ -396,14 +414,17 @@ mod nominal_starvation_tests {
     fn topped_up_producer_is_never_called_drift_or_starvation() {
         let mut guard = NominalStarvation::default();
         for ms in (0..120_000).step_by(2) {
-            assert!(!guard.observe(ms, 48_000, true));
+            assert!(guard.observe(ms, 48_000, true).is_none());
         }
-        assert!(!guard.observe(120_001, 0, true));
-        assert!(!guard.observe(125_000, 0, true));
-        assert!(guard.observe(125_001, 0, true));
-        assert!(!guard.observe(130_001, 0, true));
-        assert!(!guard.observe(130_002, 1, true));
-        assert!(!guard.observe(130_003, 0, true));
-        assert!(guard.observe(135_003, 0, true));
+        assert!(guard.observe(120_001, 0, true).is_none());
+        assert!(guard.observe(125_000, 0, true).is_none());
+        assert_eq!(guard.observe(125_001, 0, true), Some(5_000));
+        assert!(guard.observe(130_001, 0, true).is_none());
+        assert!(guard.observe(130_002, 1, true).is_none());
+        assert!(guard.observe(130_003, 0, true).is_none());
+        assert_eq!(guard.observe(135_003, 0, true), Some(5_000));
+        assert!(guard.observe(135_004, 0, false).is_none());
+        assert!(guard.observe(140_000, 0, true).is_none());
+        assert_eq!(guard.observe(145_001, 0, true), Some(5_001));
     }
 }

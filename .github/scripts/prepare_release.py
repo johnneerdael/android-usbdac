@@ -81,12 +81,14 @@ def set_version(old, new, last_release):
             path.write_text(updated)
 
 
-def select_automatic(run_id):
+def select_automatic(run_id, source):
     marker = f"Release-Run: {run_id}"
     for _ in range(4):
         git("fetch", "--quiet", "--tags", "origin", "main")
         head = git("rev-parse", "FETCH_HEAD")
         reserved = git("log", head, "-1", "--format=%H", f"--grep=^{marker}$")
+        if not reserved and head != source:
+            raise SystemExit("main advanced since this workflow started; the newer push will run its own release")
         git("checkout", "--detach", "--quiet", reserved or head)
         if reserved:
             # A re-run must use the original commit, even if a registry
@@ -129,13 +131,16 @@ def select_automatic(run_id):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source", help="triggering commit for automatic reservation")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--run-id", type=int)
     mode.add_argument("--version")
     args = parser.parse_args()
 
     if args.run_id is not None:
-        version = select_automatic(args.run_id)
+        if not args.source:
+            parser.error("--source is required with --run-id")
+        version = select_automatic(args.run_id, args.source)
     else:
         version = args.version
         version_tuple(version)

@@ -22,6 +22,7 @@ pub fn exercise(input: &[u8]) {
         }
     }
     crate::transport::fuzz_transport_bytes(input);
+    crate::scarlett::fuzz_reply(input);
 }
 fn parse_descriptor(data: &[u8]) {
     macro_rules! parse { ($($parser:path),+ $(,)?) => { $(let _ = $parser(data);)+ }; }

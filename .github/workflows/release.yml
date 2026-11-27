@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  # Prepare from the current main tip after the preceding release finishes.
+  # Serialize reservations and publications; an advanced main gets its own run.
   group: usbdac-release
   cancel-in-progress: false
 
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'push' && 'main' || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Select and verify the release source
@@ -53,14 +53,23 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = push ]; then
-            python3 .github/scripts/prepare_release.py --run-id "$GITHUB_RUN_ID" --output "$GITHUB_OUTPUT"
+            python3 .github/scripts/prepare_release.py --run-id "$GITHUB_RUN_ID" --source "$GITHUB_SHA" --output "$GITHUB_OUTPUT"
           else
             python3 .github/scripts/prepare_release.py --version "$RELEASE_VERSION" --output "$GITHUB_OUTPUT"
           fi
 
+  release-gates:
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.commit }}
+    permissions:
+      contents: read
+
   package:
     name: Build, test and publish the package
-    needs: prepare
+    needs: [prepare, release-gates]
     if: needs.prepare.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 60

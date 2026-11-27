@@ -688,6 +688,25 @@ fn decode_reply(
     decode_reply_mode(command, sequence, size, bytes, false)
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn fuzz_reply(data: &[u8]) {
+    for fcp in [false, true] {
+        // Vary the expected size independently of the supplied packet length.
+        for size in [
+            0,
+            data.len().saturating_sub(HEADER),
+            data.first().copied().unwrap_or(0) as usize,
+        ] {
+            let _ = decode_reply_mode(Command::Mux, 1, size, data, fcp);
+        }
+    }
+    let model = ReadModel {
+        candidate: CandidateModel::Scarlett18i20Gen2,
+        firmware: 1,
+    };
+    let _ = decode_mux(model, data);
+}
+
 fn decode_reply_mode(
     command: Command,
     sequence: u16,

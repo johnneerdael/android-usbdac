@@ -42,6 +42,11 @@ public sealed interface DacEvent {
     /** The explicit feedback endpoint stopped producing valid reports. */
     public data object FeedbackStale : DacEvent
 
+    /** The producer ring was empty for [emptyMs] on nominal asynchronous output.
+     * Emitted once per episode; refill, pause, or drain resets it. This does not measure DAC FIFO drift.
+     */
+    public data class NominalAsyncHostStarvation(val emptyMs: Long) : DacEvent
+
     /** The stream failed. [StateChanged] with [StreamState.FAILED] follows; close the stream. */
     public data class StreamFailed(val error: DacException) : DacEvent
 
@@ -79,6 +84,7 @@ internal object EventType {
     const val ERROR = 6
     const val DEVICE_LOST = 7
     const val COMPATIBILITY_FALLBACK = 8
+    const val NOMINAL_ASYNC_HOST_STARVATION = 9
 }
 
 /** Converts one native `onEvent` call into a [DacEvent]. */
@@ -95,6 +101,7 @@ internal fun decodeEvent(type: Int, a: Long, b: Double, message: String?): DacEv
                 ?: VolumeState(db = b, fraction = Double.NaN, muted = if (a < 0) null else a != 0L),
         )
         EventType.FEEDBACK_STALE -> DacEvent.FeedbackStale
+        EventType.NOMINAL_ASYNC_HOST_STARVATION -> DacEvent.NominalAsyncHostStarvation(a)
         EventType.ERROR -> DacEvent.StreamFailed(
             parseNativeError(message) ?: DacException(DacErrorCode.UNKNOWN, message ?: "error code $a"),
         )

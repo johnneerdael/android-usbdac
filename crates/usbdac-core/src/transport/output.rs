@@ -765,6 +765,7 @@ pub(super) fn run_usb_output_loop(
         candidate.service_interval_us,
         geometry,
     );
+    scheduler = scheduler.with_verified_clock(super::session::stream_verdicts().clock_verified);
     if candidate.sync_type == SyncType::Asynchronous
         && candidate.feedback_endpoint.is_some()
         && candidate.implicit_feedback.is_none()
@@ -774,7 +775,12 @@ pub(super) fn run_usb_output_loop(
     // Implicit feedback owns a matched IN/OUT pool and must retain its geometry.
     let mut adaptive_queue = crate::iso_packet_scheduler::AdaptiveQueue::new(
         geometry,
-        bus_config.adaptive_queue && candidate.implicit_feedback.is_none(),
+        bus_config.adaptive_queue
+            && candidate.implicit_feedback.is_none()
+            && bus_config.transfers_in_flight
+                == crate::iso_packet_scheduler::DEFAULT_TRANSFERS_IN_FLIGHT
+            && bus_config.bus_queue_ms == crate::iso_packet_scheduler::DEFAULT_BUS_QUEUE_MS
+            && bus_config.transfer_period_us.is_none(),
     );
     let transfer_slot_count = adaptive_queue.slots;
     let allocated_slot_count = adaptive_queue.max_slots;
@@ -1455,6 +1461,7 @@ pub(super) fn run_usb_output_loop(
         // taken once, so lock proof cannot start application data mid-batch.
         let batch_lock_pending = lock_gate.pending();
 
+        let event_wait_started = Instant::now();
         if let Err(error) = context.handle_events(Some(if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
         } else {
@@ -1465,6 +1472,7 @@ pub(super) fn run_usb_output_loop(
             break;
         }
 
+        let event_wait_duration = event_wait_started.elapsed();
         if usb_stop_requested(&stop) {
             break;
         }
@@ -1631,6 +1639,7 @@ pub(super) fn run_usb_output_loop(
         let now = Instant::now();
         let gap_us = now
             .saturating_duration_since(previous_worker_at)
+            .saturating_sub(event_wait_duration)
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         previous_worker_at = now;
@@ -1649,15 +1658,21 @@ pub(super) fn run_usb_output_loop(
         }
         // Ring occupancy describes the producer, not the DAC FIFO. A full
         // ring is normal and must never terminate nominal playback.
-        if nominal_guarded
-            && nominal_starvation.observe(
-                stream_started_at.elapsed().as_millis() as u64,
+        if nominal_guarded {
+            if let Some(empty_ms) = nominal_starvation.observe(
+                stream_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
                 runtime_stats.buffered_samples.load(Ordering::Acquire),
                 !runtime_stats.paused.load(Ordering::Acquire)
                     && !runtime_stats.draining.load(Ordering::Acquire),
-            )
-        {
-            log_warn!("[USB] Nominal asynchronous producer ring empty for 5 seconds; DAC FIFO drift is unobservable from host occupancy");
+            ) {
+                log_warn!("[USB] Nominal asynchronous host ring empty for {} ms; DAC FIFO drift is unobservable", empty_ms);
+                shared
+                    .events
+                    .emit_stream(crate::events::DacEvent::NominalAsyncHostStarvation { empty_ms });
+            }
         }
         let mut batch_lossy_completions = 0u32;
         let mut latest_playback_completion = None;
@@ -1782,21 +1797,25 @@ pub(super) fn run_usb_output_loop(
             let completed_music_frames = slot.queued_music_frames as u64;
             let completed_epoch = slot.queued_epoch;
             // A single timed-out isochronous URB is a lost slot, not a broken
-            // device, so the stream keeps going. Its audio is gone though: it is
-            // counted as lost (never as consumed) and the stream is bounded by
+            // device, so the stream keeps going. Unconfirmed audio is charged
+            // without crediting it as consumed, and the stream is bounded by
             // `loss_tracker` below.
             let timed_out = status == LIBUSB_TRANSFER_TIMED_OUT;
+            let transfer_failed = matches!(
+                status,
+                LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_OVERFLOW | LIBUSB_TRANSFER_STALL
+            );
             let transfer_result = match status {
                 LIBUSB_TRANSFER_COMPLETED => slot.validate_packets(acceptance),
-                LIBUSB_TRANSFER_TIMED_OUT => Ok(slot.account_timeout(acceptance)),
-                LIBUSB_TRANSFER_STALL => Err("isochronous transfer stalled".to_string()),
+                LIBUSB_TRANSFER_TIMED_OUT => slot.account_timeout(acceptance),
+                LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_OVERFLOW | LIBUSB_TRANSFER_STALL => {
+                    slot.account_failed(acceptance)
+                }
                 LIBUSB_TRANSFER_NO_DEVICE => {
                     device_lost = true;
                     Err("USB DAC disconnected".to_string())
                 }
-                LIBUSB_TRANSFER_OVERFLOW => Err("isochronous transfer overflow".to_string()),
                 LIBUSB_TRANSFER_CANCELLED => Err("isochronous transfer cancelled".to_string()),
-                LIBUSB_TRANSFER_ERROR => Err("isochronous transfer failed".to_string()),
                 other => Err(format!(
                     "isochronous transfer returned status {} ({})",
                     other,
@@ -1866,11 +1885,19 @@ pub(super) fn run_usb_output_loop(
             }
 
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
-                .with_held(completed_held);
+                .with_held(completed_held)
+                .with_transport_failure(transfer_failed);
             if urb_loss.lost_frames > 0 {
                 batch_lossy_completions = batch_lossy_completions.saturating_add(1);
             }
-            let verdict = loss_tracker.record(queued_frame_count, urb_loss);
+            let verdict = loss_tracker.record_at(
+                queued_frame_count,
+                urb_loss,
+                stream_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
             if verdict.lossy || urb_loss.short_packets > 0 || urb_loss.zero_packets > 0 {
                 publish_transport_loss(&runtime_stats, &loss_tracker);
             }
