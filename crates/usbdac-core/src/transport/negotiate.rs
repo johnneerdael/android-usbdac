@@ -467,8 +467,8 @@ pub(super) fn transport_compatibility_penalty(
     playback_format: PlaybackFormat,
 ) -> u32 {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    let fmt_ok = stream_format.format_tag == FORMAT_TAG_PCM
-        || (is_native_dsd && stream_format.format_tag == FORMAT_TAG_DSD);
+    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM };
+    let fmt_ok = stream_format.format_tag == required_format;
     if !fmt_ok {
         return u32::MAX;
     }
@@ -511,6 +511,7 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
     transport_compatibility_penalty(
         &StreamingInterfaceFormat {
             format_tag: candidate.format_tag,
+            uac2_formats: None,
             channels: candidate.channels,
             subslot_size: candidate.subslot_size,
             bit_resolution: candidate.bit_resolution,
