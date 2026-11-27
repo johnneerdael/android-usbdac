@@ -434,6 +434,18 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
         ),
         ("max_worker_gap_us".into(), json!(stats.max_worker_gap_us)),
         (
+            "max_worker_loop_gap_us".into(),
+            json!(stats.max_worker_loop_gap_us),
+        ),
+        (
+            "max_event_pump_elapsed_us".into(),
+            json!(stats.max_event_pump_elapsed_us),
+        ),
+        (
+            "max_event_pump_timeout_overrun_us".into(),
+            json!(stats.max_event_pump_timeout_overrun_us),
+        ),
+        (
             "adaptive_queue_changes".into(),
             json!(stats.adaptive_queue_changes),
         ),

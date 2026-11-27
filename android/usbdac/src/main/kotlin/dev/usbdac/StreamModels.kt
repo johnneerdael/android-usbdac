@@ -221,11 +221,11 @@ public data class DacStreamStats(
     val implicitInvalidPackets: Long = 0,
     val implicitMeasuredFrames: Long = 0,
     val implicitScheduledFrames: Long = 0,
-    /** Worker wakeup intervals longer than 10 ms. */
+    /** Checkpoint intervals excluding event-pump time, longer than 10 ms. */
     val workerGapOver10ms: Long = 0,
-    /** Worker wakeup intervals longer than 50 ms. */
+    /** Checkpoint intervals excluding event-pump time, longer than 50 ms. */
     val workerGapOver50ms: Long = 0,
-    /** Longest measured output-worker wakeup interval, in microseconds. */
+    /** Longest checkpoint interval excluding event-pump time, in microseconds. */
     val maxWorkerGapUs: Long = 0,
     /** Adaptive USB queue depth changes since the stream started. */
     val adaptiveQueueChanges: Long = 0,
@@ -233,5 +233,10 @@ public data class DacStreamStats(
     val adaptiveQueueSlots: Long = 0,
     /** Current adaptive USB queue target, in microseconds. */
     val adaptiveQueueUs: Long = 0,
-
+    /** Longest checkpoint interval including event-pump time, in microseconds. */
+    val maxWorkerLoopGapUs: Long = 0,
+    /** Longest event-pump call including callbacks and scheduling, in microseconds. */
+    val maxEventPumpElapsedUs: Long = 0,
+    /** Largest event-pump elapsed time beyond its requested timeout, in microseconds. */
+    val maxEventPumpTimeoutOverrunUs: Long = 0,
 )

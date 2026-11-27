@@ -117,9 +117,16 @@ pub struct StreamStats {
     pub max_turnaround_us: u64,
     pub last_submit_gap_us: u64,
     pub max_submit_gap_us: u64,
+    /// Checkpoint gaps excluding the most recent event-pump elapsed time.
     pub worker_gap_over_10ms: u64,
     pub worker_gap_over_50ms: u64,
     pub max_worker_gap_us: u64,
+    /// Longest checkpoint-to-checkpoint interval, including the event pump.
+    pub max_worker_loop_gap_us: u64,
+    /// Longest time inside the event pump, including callbacks and scheduling.
+    pub max_event_pump_elapsed_us: u64,
+    /// Largest event-pump elapsed time beyond its requested timeout.
+    pub max_event_pump_timeout_overrun_us: u64,
     pub adaptive_queue_changes: u64,
     pub adaptive_queue_slots: u64,
     pub adaptive_queue_us: u64,
@@ -599,6 +606,11 @@ impl DacStream {
             worker_gap_over_10ms: stats.worker_gap_over_10ms.load(Relaxed),
             worker_gap_over_50ms: stats.worker_gap_over_50ms.load(Relaxed),
             max_worker_gap_us: stats.max_worker_gap_us.load(Relaxed),
+            max_worker_loop_gap_us: stats.max_worker_loop_gap_us.load(Relaxed),
+            max_event_pump_elapsed_us: stats.max_event_pump_elapsed_us.load(Relaxed),
+            max_event_pump_timeout_overrun_us: stats
+                .max_event_pump_timeout_overrun_us
+                .load(Relaxed),
             adaptive_queue_changes: stats.adaptive_queue_changes.load(Relaxed),
             adaptive_queue_slots: stats.adaptive_queue_slots.load(Relaxed),
             adaptive_queue_us: stats.adaptive_queue_us.load(Relaxed),

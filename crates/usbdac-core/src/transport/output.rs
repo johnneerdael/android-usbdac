@@ -67,6 +67,18 @@ pub(super) fn retire_bootstrap_completion(
     result.map(|()| Some(completed))
 }
 
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn worker_gap_us(total: Duration, pump: Duration) -> (u64, u64) {
+    (duration_us(total), duration_us(total.saturating_sub(pump)))
+}
+
+fn worker_gap_thresholds(gap_us: u64) -> (bool, bool) {
+    (gap_us > 10_000, gap_us > 50_000)
+}
+
 // This remains a conservative submission-time estimate, not a USB-frame clock.
 // Inspect only the queue that survived retirement of the complete event batch;
 // a fresh submission must never extend an already exhausted continuity deadline.
@@ -1480,20 +1492,28 @@ pub(super) fn run_usb_output_loop(
         // taken once, so lock proof cannot start application data mid-batch.
         let batch_lock_pending = lock_gate.pending();
 
-        let event_wait_started = Instant::now();
-        if let Err(error) = context.handle_events(Some(if audio_status.is_revalidating() {
+        let event_timeout = if audio_status.is_revalidating() {
             Duration::from_millis(1)
         } else if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
         } else {
             Duration::from_millis(50)
-        })) {
+        };
+        let event_wait_started = Instant::now();
+        let event_result = context.handle_events(Some(event_timeout));
+        let event_wait_duration = event_wait_started.elapsed();
+        runtime_stats
+            .max_event_pump_elapsed_us
+            .fetch_max(duration_us(event_wait_duration), Ordering::Relaxed);
+        runtime_stats.max_event_pump_timeout_overrun_us.fetch_max(
+            duration_us(event_wait_duration.saturating_sub(event_timeout)),
+            Ordering::Relaxed,
+        );
+        if let Err(error) = event_result {
             device_lost = error == rusb::Error::NoDevice;
             fatal_error = Some(format!("libusb_handle_events failed: {}", error));
             break;
         }
-
-        let event_wait_duration = event_wait_started.elapsed();
         if usb_stop_requested(&stop) {
             break;
         }
@@ -1685,21 +1705,24 @@ pub(super) fn run_usb_output_loop(
         }
 
         let now = Instant::now();
-        let gap_us = now
-            .saturating_duration_since(previous_worker_at)
-            .saturating_sub(event_wait_duration)
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
+        let (loop_gap_us, gap_us) = worker_gap_us(
+            now.saturating_duration_since(previous_worker_at),
+            event_wait_duration,
+        );
         previous_worker_at = now;
+        runtime_stats
+            .max_worker_loop_gap_us
+            .fetch_max(loop_gap_us, Ordering::Relaxed);
         runtime_stats
             .max_worker_gap_us
             .fetch_max(gap_us, Ordering::Relaxed);
-        if gap_us > 10_000 {
+        let (over_10ms, over_50ms) = worker_gap_thresholds(gap_us);
+        if over_10ms {
             runtime_stats
                 .worker_gap_over_10ms
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if gap_us > 50_000 {
+        if over_50ms {
             runtime_stats
                 .worker_gap_over_50ms
                 .fetch_add(1, Ordering::Relaxed);
@@ -2613,6 +2636,31 @@ mod duplex_failure_tests {
 #[cfg(test)]
 mod implicit_out_coverage_tests {
     use super::*;
+
+    #[test]
+    fn worker_timing_includes_pump_once_and_saturates() {
+        assert_eq!(
+            worker_gap_us(Duration::from_millis(70), Duration::from_millis(50)),
+            (70_000, 20_000)
+        );
+        assert_eq!(
+            worker_gap_us(Duration::from_millis(10), Duration::from_millis(50)),
+            (10_000, 0)
+        );
+        assert_eq!(duration_us(Duration::from_secs(u64::MAX)), u64::MAX);
+        assert_eq!(worker_gap_thresholds(10_000), (false, false));
+        assert_eq!(worker_gap_thresholds(10_001), (true, false));
+        assert_eq!(worker_gap_thresholds(50_000), (true, false));
+        assert_eq!(worker_gap_thresholds(50_001), (true, true));
+        assert_eq!(
+            duration_us(Duration::from_millis(51).saturating_sub(Duration::from_millis(50))),
+            1_000
+        );
+        assert_eq!(
+            duration_us(Duration::from_millis(49).saturating_sub(Duration::from_millis(50))),
+            0
+        );
+    }
 
     #[test]
     fn expired_existing_coverage_blocks_a_potential_new_submission() {

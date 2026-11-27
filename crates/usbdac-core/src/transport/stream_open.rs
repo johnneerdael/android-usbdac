@@ -1663,8 +1663,13 @@ fn start_stream_inner_with_capture(
         && candidate.feedback_endpoint.is_none()
         && candidate.implicit_feedback.is_none();
     if unsynchronized_async {
+        let admission = if settings().allow_unsynchronized_async() {
+            "explicit allow_unsynchronized_async"
+        } else {
+            "full-speed UAC1 default policy"
+        };
         log_warn!(
-            "[USB] Streaming an asynchronous endpoint without a feedback endpoint at the nominal rate (allow_unsynchronized_async); the stream is not bit-perfect"
+            "[USB] Streaming an asynchronous endpoint without feedback at the nominal rate ({admission}); device FIFO timing is unobserved and the stream is not bit-perfect"
         );
     }
     set_unsynchronized_async(unsynchronized_async);
