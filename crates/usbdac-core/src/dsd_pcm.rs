@@ -284,9 +284,9 @@ mod tests {
         let response = |f: f64| {
             let mut re = 0.0;
             let mut im = 0.0;
-            for j in 0..HISTORY {
+            for (j, table) in c.table.iter().enumerate() {
                 for bit in 0..8 {
-                    let coeff = (c.table[j][1 << bit] - c.table[j][0]) / 2.0;
+                    let coeff = (table[1 << bit] - table[0]) / 2.0;
                     let angle = 2.0 * std::f64::consts::PI * f * (j * 8 + bit) as f64;
                     re += coeff * angle.cos();
                     im -= coeff * angle.sin();
