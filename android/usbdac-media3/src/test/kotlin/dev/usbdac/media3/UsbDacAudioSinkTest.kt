@@ -6,6 +6,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.exoplayer.audio.AudioSink
 import dev.usbdac.DacErrorCode
 import dev.usbdac.DacException
+import dev.usbdac.*
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -189,13 +190,44 @@ class UsbDacAudioSinkTest {
     }
 
     @Test
-    fun declinesWhatItCannotPlayExactly() {
-        val sink = UsbDacAudioSink(FakeOutputSource())
+    fun supportUsesCachedSourceVerdictAndLeavesUnknownConservative() {
+        val fake = FakeOutputSource()
+        var support = OutputFormatSupport.DIRECT
+        var queries = 0
+        val source = object : OutputSource by fake {
+            override fun formatSupport(request: StreamRequest): OutputSupport {
+                queries++
+                return OutputSupport(support, request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
         val float = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_RAW).setPcmEncoding(C.ENCODING_PCM_FLOAT)
             .setSampleRate(44_100).setChannelCount(2).build()
         assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(float))
         assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(pcm(16, channels = 6)))
-        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY, sink.getFormatSupport(pcm(24)))
+        val compressed = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_MPEG).setSampleRate(44_100).setChannelCount(2).build()
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(compressed))
+        support = OutputFormatSupport.WITH_TRANSCODING
+        assertEquals(AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING, sink.getFormatSupport(pcm(24)))
+        support = OutputFormatSupport.UNSUPPORTED
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, sink.getFormatSupport(float))
+        assertEquals(AudioSink.SINK_FORMAT_UNSUPPORTED, UsbDacAudioSink(fake).getFormatSupport(pcm(16)))
+        assertEquals(3, queries)
+        assertTrue(fake.opened.isEmpty())
+    }
+
+    @Test
+    fun directSessionSupportUsesMatchingAlternatesAndReportsWidening() {
+        val alt = AltSetting(1, 1, 1, AltFormat.PCM, 2, 4, 24, emptyList(), listOf(48_000),
+            SyncType.ASYNCHRONOUS, 0x81, 1024, 125, UacVersion.V2, Pacing.ExplicitFeedback(0x81))
+        val pcm24 = StreamRequest.pcm(48_000, 2, 24)
+        val pcm16 = StreamRequest.pcm(48_000, 2, 16)
+        assertEquals(OutputFormatSupport.DIRECT, directSessionSupport(listOf(alt), pcm24, true).support)
+        assertEquals(OutputFormatSupport.WITH_TRANSCODING, directSessionSupport(listOf(alt), pcm16, true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), pcm16, false).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), pcm24.copy(sampleRate = 96_000), true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), StreamRequest.pcmFloat32(48_000, 2), true).support)
+        assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt.copy(pacing = null)), pcm24, true).support)
     }
     @Test
     fun trimsDelayAndPaddingWithoutChangingIntegerPrecisionAcrossGaplessTracks() {

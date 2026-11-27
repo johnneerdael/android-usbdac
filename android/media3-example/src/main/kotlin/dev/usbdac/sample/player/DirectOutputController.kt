@@ -38,6 +38,8 @@ class DirectOutputController(
 ) : OutputSource {
     private val lock = Any()
     private val selectors = MutableStateFlow(OutputSelector(context, settings.toPolicy()))
+    @Volatile
+    private var supportSnapshot = selectors.value.managedPcmFallbackSnapshot()
     private var current: OpenedOutput? = null
     private var watching: Job? = null
     private var multiplier = 1f
@@ -69,16 +71,26 @@ class DirectOutputController(
 
     /** Takes effect at the next flush or format change, never in the middle of a track. */
     fun apply(settings: DirectOutputSettings) {
-        selectors.value = OutputSelector(context, settings.toPolicy())
+        val selector = OutputSelector(context, settings.toPolicy())
+        selectors.value = selector
+        supportSnapshot = selector.managedPcmFallbackSnapshot()
         lookAgain = true
     }
 
     /** Call when [changes] fires. */
     fun onChanged() {
+        supportSnapshot = selectors.value.managedPcmFallbackSnapshot()
         lookAgain = true
     }
 
     override fun takeLookAgain(): Boolean = lookAgain.also { lookAgain = false }
+
+    override fun formatSupport(request: StreamRequest): OutputSupport =
+        if (supportSnapshot.supports(request)) {
+            // The selector can choose a direct converter before this managed fallback.
+            OutputSupport(OutputFormatSupport.WITH_TRANSCODING, request, null,
+                "managed PCM fallback is available; a higher-priority route may process samples")
+        } else OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no cached compatible fallback")
     // endregion
 
     // region controller-open

@@ -147,6 +147,10 @@ public class OutputSelector internal constructor(
     public constructor(context: Context, policy: OutputPolicy = OutputPolicy()) :
         this(AndroidOutputPlatform(context), policy)
 
+    /** Capture a read-only managed PCM fallback rule without opening or probing an output. */
+    public fun managedPcmFallbackSnapshot(): ManagedPcmFallbackSnapshot =
+        ManagedPcmFallbackSnapshot(platform.apiLevel, policy.force, policy.downstreamLimits != null)
+
     private val lock = Any()
     private val active = AtomicReference<SelectedOutput?>(null)
     private class Preparation(val link: DirectLink, val handle: PreparedUsbOutput)
@@ -1047,4 +1051,16 @@ public class OutputSelector internal constructor(
             RejectionReason.FAILED -> DacErrorCode.UNKNOWN
         }
     }
+}
+
+/** Immutable preflight facts for the selector's standard Android PCM fallback. */
+public class ManagedPcmFallbackSnapshot internal constructor(
+    private val apiLevel: Int,
+    private val forced: OutputKind?,
+    private val hasDownstreamLimits: Boolean,
+) {
+    /** Whether policy permits the managed fallback and the framework can carry this input layout. */
+    public fun supports(request: StreamRequest): Boolean =
+        !hasDownstreamLimits && (forced == null || forced == OutputKind.ANDROID_STANDARD) &&
+            AndroidManagedOutput.carryProblem(request, apiLevel) == null
 }

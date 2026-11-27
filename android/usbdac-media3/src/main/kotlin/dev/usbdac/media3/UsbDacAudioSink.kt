@@ -90,12 +90,23 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     // region sink-support
     override fun supportsFormat(format: Format): Boolean = getFormatSupport(format) != AudioSink.SINK_FORMAT_UNSUPPORTED
 
-    override fun getFormatSupport(format: Format): Int =
-        if (format.sampleMimeType == MimeTypes.AUDIO_RAW && bitDepthOf(format.pcmEncoding) != null && format.channelCount in 1..2) {
-            AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
-        } else {
-            AudioSink.SINK_FORMAT_UNSUPPORTED // more than two channels, unsupported layouts, compressed audio
+    override fun getFormatSupport(format: Format): Int {
+        val bits = bitDepthOf(format.pcmEncoding)
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW || bits == null ||
+            format.channelCount !in 1..2 || format.sampleRate <= 0) return AudioSink.SINK_FORMAT_UNSUPPORTED
+        val request = requestOf(format, bits)
+        return when (outputs.formatSupport(request).support) {
+            OutputFormatSupport.UNSUPPORTED -> AudioSink.SINK_FORMAT_UNSUPPORTED
+            OutputFormatSupport.DIRECT -> AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY
+            OutputFormatSupport.WITH_TRANSCODING -> AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
         }
+    }
+
+    private fun requestOf(format: Format, bits: Int): StreamRequest = when (format.pcmEncoding) {
+        C.ENCODING_PCM_8BIT -> StreamRequest.pcmU8(format.sampleRate, format.channelCount)
+        C.ENCODING_PCM_FLOAT -> StreamRequest.pcmFloat32(format.sampleRate, format.channelCount)
+        else -> StreamRequest.pcm(format.sampleRate, format.channelCount, bits)
+    }
 
     private fun bitDepthOf(pcmEncoding: Int): Int? = when (pcmEncoding) {
         C.ENCODING_PCM_8BIT -> 8
@@ -128,11 +139,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         trimBuffer = null
         pendingFormat = format
         // Nothing is opened here. The output opens in handleBuffer, after the one in use has played out.
-        wanted = Wanted(format, when (format.pcmEncoding) {
-            C.ENCODING_PCM_8BIT -> StreamRequest.pcmU8(format.sampleRate, format.channelCount)
-            C.ENCODING_PCM_FLOAT -> StreamRequest.pcmFloat32(format.sampleRate, format.channelCount)
-            else -> StreamRequest.pcm(format.sampleRate, format.channelCount, bits)
-        })
+        wanted = Wanted(format, requestOf(format, bits))
     }
     // endregion
 

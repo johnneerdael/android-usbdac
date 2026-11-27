@@ -21,11 +21,29 @@ class OpenedOutput(
 /** A drained track's replacement, including a usable restored old format on rollback. */
 class OutputReconfiguration(val opened: OpenedOutput, val rollbackCause: DacException? = null)
 
+/** Result from a cached, side-effect-free output capability snapshot. */
+enum class OutputFormatSupport { UNSUPPORTED, DIRECT, WITH_TRANSCODING }
+
+/** The accepted producer format and, when known, the resulting target format. */
+data class OutputSupport(
+    val support: OutputFormatSupport,
+    val source: StreamRequest,
+    val target: StreamRequest? = null,
+    val reason: String = "",
+)
+
 /**
  * What the audio sink needs from the app. The sink is written against this and [PcmOutput], so a test
  * can give it a fake output and no DAC.
  */
 interface OutputSource {
+    /**
+     * Consult cached capabilities only. Do not open, negotiate, or probe here. Custom sources must
+     * override this method to opt in; unknown sources are conservatively unsupported.
+     */
+    fun formatSupport(request: StreamRequest): OutputSupport =
+        OutputSupport(OutputFormatSupport.UNSUPPORTED, request, reason = "no capability snapshot")
+
     /** Opens the best output for [request]. Blocks for 100 ms or more: the sink calls it off the main thread. */
     fun open(request: StreamRequest): OpenedOutput
 
