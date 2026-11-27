@@ -788,7 +788,13 @@ pub(super) fn candidate_rates_from_supported_ranges(
         if range.min > range.max {
             continue;
         }
-        if range.res == 0 || range.min == range.max {
+        if range.res == 0 {
+            if range.min == range.max {
+                candidates.push(range.min);
+            }
+            continue;
+        }
+        if range.min == range.max {
             candidates.push(range.min);
             continue;
         }
@@ -998,6 +1004,26 @@ mod evidence_tests {
         let mut rates = candidate_rates_from_supported_ranges(&ranges, 192_000);
         rank_sample_rates(&mut rates, 192_000);
         assert_eq!(rates[0], 96_000);
+    }
+
+    #[test]
+    fn zero_resolution_is_only_a_single_fixed_rate() {
+        let ranges = [
+            SamplingFrequencySubrange {
+                min: 44_100,
+                max: 44_100,
+                res: 0,
+            },
+            SamplingFrequencySubrange {
+                min: 48_000,
+                max: 96_000,
+                res: 0,
+            },
+        ];
+        assert_eq!(
+            candidate_rates_from_supported_ranges(&ranges, 88_200),
+            vec![44_100]
+        );
     }
 
     #[test]
