@@ -56,10 +56,11 @@ Use the iBasso DC04 Ultra for the first Android USB-C run, including native DSD 
 
 ### Android hardware evidence
 
-The OnePlus CPH2747 captures on 27 November 2026 reported successful USB delivery and session close for these stereo paths. The DoP results cover the carrier, with decoder lock unobserved.
+The OnePlus CPH2747 captures on 27 November 2026 reported successful USB delivery and session close for these stereo paths. These captures exercised the playback matrix. Standard admission probes require a fresh run. The DoP results cover the carrier, with decoder lock unobserved.
 
 | USB product | VID:PID and bcdDevice | PCM tested | Native DSD tested | DoP carriers tested |
 | --- | --- | --- | --- | --- |
 | iBasso DC04 Ultra | `0661:0883`, `0x0001` | 16, 24 and 32 bit through 768 kHz | DSD64 through DSD512 and corresponding 48 kHz-family bit rates | 176.4, 352.8 and 705.6 kHz |
 | SMSL USB AUDIO | `152a:85dd`, `0x0315` | 24 and 32 bit through 768 kHz | DSD64 through DSD512 and corresponding 48 kHz-family bit rates | 176.4, 352.8 and 705.6 kHz |
 | Schiit Unison Modius E | `30be:101a`, `0x0100` | 16, 24 and 32 bit through 192 kHz | No admitted cases | 176.4 kHz |
+| Hidizs AP80 Pro-X | `c502:0072`, `0xffff` | 16, 24 and 32 bit from 32 to 384 kHz | DSD64, DSD128 and DSD256 | 176.4 and 352.8 kHz |
