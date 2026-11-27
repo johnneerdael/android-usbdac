@@ -4,7 +4,7 @@ How to add bit-perfect USB output to an audio app with usbdac. This page is the 
 
 The [getting started](getting-started.md) page is the tutorial for the first hour: dependency, manifest, a working stream. This guide is for the days after: making it part of a real player.
 
-**Status.** Direct USB PCM has played on a OnePlus 15 in Flick with an iBasso DC04U and in the SDK sample with a Hidizs AP80 Pro-X. Coverage for the selector, managed and AAudio outputs is automated. Use the [integration test plan](integration-app.md#testing-your-integration) for your own device and app coverage. [Evidence](evidence.md#hardware-status)
+**Status.** Direct USB PCM has played on a OnePlus 15 in Flick with an iBasso DC04U and in the SDK sample with a Hidizs AP80 Pro-X, which also played native DSD, and the DC04U played in the SDK sample. Implicit feedback, UAC3, capture and duplex, DoP, the selector, the managed output and AAudio have automated coverage only. Use the [integration test plan](integration-app.md#testing-your-integration) for your own device and app coverage. [Evidence](evidence.md#hardware-status)
 
 ## What you are taking on
 

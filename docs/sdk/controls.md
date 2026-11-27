@@ -122,6 +122,7 @@ Build one with `StreamRequest.pcm(rate, channels, bits)`, `StreamRequest.dop(dsd
 | `state` | `StateFlow<StreamState>` | `BUFFERING`, `PLAYING`, `PAUSED`, `DRAINING`, `DRAINED`, `CLOSED`, `FAILED` | None |
 | `format` | `StreamFormat` | What goes on the wire: encoding, rate, channels, bits, slot size, interface, alternate setting, synchronisation, whether feedback is used, and the clock and pacing diagnostics ([below](#diagnostics-the-clock-and-the-pacing)) | None |
 | `setSoftwareGain(gain)` | `Float` (1.0) | Scales the samples in the library. Refused for DoP and native DSD | Any value other than exactly 1.0 stops the stream being bit-perfect (blocker `SOFTWARE_GAIN`). Prefer the DAC's volume |
+| `setHostProcessing(active)` | `Boolean` | Tells the stream that the app processes the audio (an equaliser, DSP, crossfade) before `write`, so `writableBytes` asks for the shallow `processingBufferTargetMs` instead of `bufferTargetMs`. Nothing is flushed when the target changes. DoP and native DSD ignore it | None. It is a buffering hint: it changes no sample and does not report what the app did |
 | `close()` | | Stops the stream and releases it (about 100 ms). The session and the volume stay | None |
 
 `position = startTime + playedFrames / format.counterRateHz`, with `startTime` set at each flush.
@@ -323,6 +324,24 @@ fun idleRelease(scope: CoroutineScope, session: DacSession, request: StreamReque
 ```
 
 Call `idle.onPaused()` when playback pauses and `idle.onResumed()` when it resumes; the latter returns the stream to write to, the same one or a new one. Reopening costs 100 ms or more (negotiate and open), so the first audio after a long pause is late by that much. `idle.isReleased` is a `StateFlow<Boolean>`. Bit-perfect impact: none; a reopened stream is verified again from scratch.
+
+## Capture, duplex and routing
+
+These are separate from playback and from `OutputSelector`, which chooses playback outputs only.
+
+| Call | What it does |
+|---|---|
+| `UsbDac.attachedCaptureDevices(context)`, `UsbDac.describeCapture(device)` | Lists USB devices that have a PCM IN interface, including input-only ones |
+| `UsbDac.openCapture(context, device, config, configurationId)` | Opens a `DacCaptureSession` that holds the IN and AudioControl claims only. It opens no playback and does no output-volume setup. Android applies its microphone permission and privacy rules, and the library requests no permission itself |
+| `DacCaptureSession.openCapture(CaptureRequest, capacityFrames = 8192)` | Starts exact PCM capture. `CaptureRequest` is a rate, a channel count, valid bits and an optional channel map. There is no rate substitution, conversion or channel remix: the request is met or it fails |
+| `UsbDac.openDuplex(...)`, then `DacSession.openDuplex(format, request, capacityFrames = 48_000)` | Claims playback and input together, then opens both on one USB worker after the output has been negotiated. Closing either direction closes both. Two directions on one clock must use the same rate |
+| `DacCaptureStream.read(buffer)`, `availableFrames`, `state`, `stats()`, `close()` | `read` fills whole interleaved frames in `format` and returns 0 when the stream is active and empty. A slow reader loses the oldest frames |
+| `configurationId` argument of `open`, `openCapture` and `openDuplex` | Selects one advertised USB configuration before the claims, verifies it by reading it back, and restores the original after the transfers have retired. Failures are `CONFIGURATION_UNAVAILABLE`, `CONFIGURATION_SELECTION_FAILED` and `CONFIGURATION_RESTORE_FAILED` |
+| `session.routing` (`DacRouting`) | Standard UAC selectors and mixer crosspoints on an idle session: `discover()` returns a snapshot, `read` reads one control, and `apply` writes up to 32 edits, each with its expected value, verifies them and rolls back on failure. `powered = true` wakes UAC3 power domains for the call. A failure is a `RoutingException` with a `kind`; after `DRIFT`, discover again |
+
+`CaptureStats` keeps three causes of missing input apart: `missingFrames` and the failed, short and malformed packet counters are loss on the bus, `overrunFrames` is audio the reader was too slow to take, and `contentionFrames` is audio dropped because a duplex reader held the buffer. `devicePositionFrames` is a lower bound of the device position.
+
+The `pioneer` and `scarlett` members of `routing`, and the `...WithVendorRouting` calls of `UsbDac`, are in the API and are switched off in 0.1.5: they fail with an unsupported error.
 
 ## Library-level
 

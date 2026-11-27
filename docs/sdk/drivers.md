@@ -58,6 +58,6 @@ Every claim that rests on a hardware run says so and names the device. A claim t
 | Flick, `feat/usb-dac-unified` | `86ffa87f` | 2026-11-26 | The extraction point named in `NOTICE` |
 | Mornye | `af9a4d642` | 2026-11-24 | Source and commit history |
 | BitChord | `21356206` | 2026-11-21 | Source, the port commit `06628ed1`, issue #1485 |
-| usbdac, `main` | `b309a08` (`v0.1.0-alpha.6`) | 2026-11-26 | What usbdac does |
+| usbdac, `main` | `353e039` (`v0.1.5`) | 2026-11-27 | What usbdac does. The decision pages were first written at `b309a08` (`v0.1.0-alpha.6`, 2026-11-26) |
 
-These are all young codebases that change quickly. A statement here is true of the revision named; check the current source before relying on it.
+These are all young codebases that change quickly. A statement here is true of the revision named; check the current source before relying on it. The statements about Flick, Mornye and BitChord were not read again for usbdac 0.1.5. They describe the revisions in this table, and later changes to those projects are not reflected.

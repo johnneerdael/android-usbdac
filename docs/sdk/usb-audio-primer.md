@@ -20,13 +20,14 @@ Software does not send packets one at a time. It builds a **transfer**, a batch 
 
 ## The DAC's clock and the host's clock
 
-A DAC has its own oscillator. In **asynchronous** mode, which many hi-fi DACs use, that oscillator is the reference, and the phone has to follow it. The DAC tells the host how many samples it needs per (micro)frame on a second, small endpoint, the **feedback endpoint**. The value is a fixed-point number: 10.14 (ten integer bits, fourteen fractional) on a full-speed link and 16.16 on a high-speed one, according to the USB 2.0 specification. The host reads it and adjusts how many samples go into the following packets ([decision 7](decisions-clock.md#feedback)).
+A DAC has its own oscillator. In **asynchronous** mode, which many hi-fi DACs use, that oscillator is the reference, and the phone has to follow it. The DAC tells the host how many samples it needs per (micro)frame on a second, small endpoint, the **feedback endpoint**. The value is a fixed-point number: 10.14 (ten integer bits, fourteen fractional) on a full-speed link and 16.16 on a high-speed one, according to the USB 2.0 specification. On a SuperSpeed link an eight-byte report carries a 32.32 count of samples per 125 microsecond bus interval. The host reads it and adjusts how many samples go into the following packets ([decision 7](decisions-clock.md#feedback)).
 
 Some asynchronous devices communicate timing through the number of frames in
-each packet of an IN audio stream. This is **implicit feedback**. usbdac 0.1.1
-can use it when a UAC2 input stream shares the playback clock, wire rate and
-USB service interval. The driver uses packet lengths for timing. Apps continue
-to supply the playback samples. [Implicit feedback](decisions-clock.md#implicit-feedback)
+each packet of an IN audio stream. This is **implicit feedback**. usbdac can
+use it when an input stream of the same audio function (UAC2, or UAC3 with a
+marked input) shares the playback clock, wire rate and USB service interval.
+The driver uses packet lengths for timing. Apps continue to supply the
+playback samples. [Implicit feedback](decisions-clock.md#implicit-feedback)
 
 In **synchronous** mode the DAC derives its clock from the bus. In **adaptive**
 mode it follows the host's packet sizes.
@@ -35,7 +36,7 @@ mode it follows the host's packet sizes.
 
 A USB device describes itself with **descriptors**. A USB Audio Class device has an **AudioControl** interface and one or more **AudioStreaming** interfaces. An AudioStreaming interface has several **alternate settings**: alternate 0 has no endpoints (the stream is off), and each other one is a combination of channels, bit depth, slot size and rates, with the endpoint that carries it.
 
-The AudioControl interface describes a small graph of **entities**: an input terminal where the USB stream enters, a **Feature Unit** that holds the volume and mute controls, an output terminal, and, in USB Audio Class 2.0, **clock entities**. A **Clock Source** produces a sample rate. A **Clock Selector** chooses between several clocks. A **Clock Multiplier** derives one clock from another. The terminal says which clock entity drives it, and the sample rate has to be set on the Clock Source at the end of that chain ([decision 6](decisions-clock.md#clock-path)). USB Audio Class 1.0 has no clock entities and sets the rate on the endpoint.
+The AudioControl interface describes a small graph of **entities**: an input terminal where the USB stream enters, a **Feature Unit** that holds the volume and mute controls, an output terminal, and, in USB Audio Class 2.0, **clock entities**. A **Clock Source** produces a sample rate. A **Clock Selector** chooses between several clocks. A **Clock Multiplier** derives one clock from another. The terminal says which clock entity drives it, and the sample rate has to be set on the Clock Source at the end of that chain ([decision 6](decisions-clock.md#clock-path)). USB Audio Class 1.0 has no clock entities and sets the rate on the endpoint. USB Audio Class 3.0 keeps the same idea with its own descriptors, adds power domains that must be awake before a stream runs, and defines BADD, a small profile with a fixed 48 kHz format and a topology the driver infers from the endpoints.
 
 The slot a sample occupies on the wire may be larger than the sample: 24-bit audio is often carried in 3 bytes, and sometimes in 4, left-justified. The [native API document](native-api.html#4-sample-layouts) tables the layouts.
 
@@ -45,7 +46,7 @@ A Feature Unit's volume is a 16-bit signed number in steps of 1/256 dB, with a r
 
 ## DSD
 
-DSD is a one-bit stream at a very high rate (2.8224 MHz for DSD64). It can reach a DAC two ways. **DoP** (DSD over PCM) packs 16 DSD bits into the low 16 bits of a 24-bit PCM sample and uses the top byte as a marker that alternates between `0x05` and `0xFA`, so a DAC can recognise the stream; DSD64 travels as 24-bit PCM at 176.4 kHz. **Native DSD** uses a DSD alternate setting whose byte order and slot size depend on the DAC, and the Linux kernel keeps a list of devices for this reason ([decision 5](decisions-stream.md#dsd)).
+DSD is a one-bit stream at a very high rate (2.8224 MHz for DSD64). It can reach a DAC two ways. **DoP** (DSD over PCM) packs 16 DSD bits into the low 16 bits of a 24-bit PCM sample and uses the top byte as a marker that alternates between `0x05` and `0xFA`, so a DAC can recognise the stream; DSD64 travels as 24-bit PCM at 176.4 kHz. **Native DSD** on UAC3 is a standard format with 64-bit words. On older classes it uses a DSD alternate setting whose byte order and slot size depend on the DAC, and the Linux kernel keeps a list of devices for this reason ([decision 5](decisions-stream.md#dsd)).
 
 ## What "bit-perfect" can and cannot mean
 

@@ -98,7 +98,13 @@ dac.set_listener(Option<Arc<dyn DacListener>>)     // device-level events
 dac.close(self) -> Result<()>                      // also on drop
 dac.close_with(self, CloseVolume) -> Result<()>    // decide the volume hand-back at close
 dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD byte order, subslot
+dac.feedback_trace() -> Option<FeedbackTrace>      // the last stream's support capture
+Dac::feedback_preflight(fd, &DeviceInfo) -> Result<(u8, Vec<u8>)>   // see section 2
+Dac::await_usb_retirement(Duration) -> bool        // after a close that timed out
 ```
+
+Capture, duplex and routing have their own entry points; they are listed under
+"Capture, duplex and routing" after the `DacStream` section.
 
 - `open` scans the descriptors, finds the hardware volume control, records the
   DAC's level and lowers it (`DacConfig::startup_volume`, see section 8). It does
@@ -245,7 +251,7 @@ Pro; Fosi Audio DS2), both verified in the project this was extracted from.
 
 ```rust
 Capabilities {
-    uac_version: UacVersion,          // V1 | V2 | Unknown
+    uac_version: UacVersion,          // V1 | V2 | V3 | Unknown (the highest version among the alternate settings)
     link_speed: LinkSpeed,            // Low | Full | High | Super | SuperPlus | Unknown
     alt_settings: Vec<AltSetting>,
     pcm_sample_rates: Vec<u32>,       // union over PCM alternate settings
@@ -261,7 +267,7 @@ Capabilities {
     has_hardware_volume: bool,        // volume.is_some(): a usable control exists
     has_mute: bool,
 }
-AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat /*Pcm|Dsd|Other*/,
+AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat /*Pcm|Dop|Dsd|Other*/,
              channels, subslot_bytes, valid_bits, rate_ranges: Vec<RateRange>, sample_rates,
              sync_type: SyncKind, feedback_endpoint: Option<u8>, max_packet_bytes,
              service_interval_us, uac_version,
@@ -307,7 +313,8 @@ Pacing::{ ExplicitFeedback { endpoint: u8 },
           Adaptive, Synchronous, Unsynchronized }
 ClockChoice { control_interface: u8, source_id: u8, path: Vec<ClockHop>, resolution: ClockResolution }
 ClockHop { id: u8, kind: ClockHopKind }
-ClockHopKind::{ Terminal, Selector { selected_pin: u8, pin_count: u8 }, Multiplier, Source }
+ClockHopKind::{ Terminal, Selector { selected_pin: u8, pin_count: u8 }, Multiplier,
+                RateMultiplier { numerator: u16, denominator: u16 }, Source }
 ClockResolution::{ Resolved, FallbackFirstSource }
 ```
 
@@ -316,7 +323,8 @@ as resolved by `negotiate`, and how it was reached. `control_interface` is the
 AudioControl interface the clock requests go to and `source_id` the Clock Source
 entity ID. `path` is the walk in the order followed: the stream's terminal
 (`Terminal`, its terminal ID), then each clock entity (a `Selector` with the 1-based
-pin that is active out of `pin_count`, a `Multiplier`), ending at the `Source`
+pin that is active out of `pin_count`, a `Multiplier`, or a `RateMultiplier` when the
+exact ratio was read back from the device), ending at the `Source`
 (its `id` is `source_id`). A selector with a single input reports pin 1 of 1 and is
 not asked; with several, the pin is what the device reported. `resolution` is
 `Resolved` when the walk succeeded and `FallbackFirstSource` when it could not (no
@@ -441,7 +449,10 @@ increasing. Frame counters are in `counter_rate_hz()` units, except implicit
 `implicit_measured_frames` and `implicit_scheduled_frames`, which count USB
 wire frames. Implicit timing stats also report FIFO depth and high-water mark,
 waits, empty OUT queue events, overruns, IN completions, out-of-order
-completions and invalid IN packets.
+completions and invalid IN packets (`implicit_fifo_depth`,
+`implicit_fifo_high_water`, `implicit_waits`, `implicit_empty_bus`,
+`implicit_overruns`, `implicit_in_transfers`, `implicit_out_of_order`,
+`implicit_invalid_packets`).
 
 ### `Error`
 
@@ -467,9 +478,11 @@ completions and invalid IN packets.
 An asynchronous OUT endpoint runs on the DAC's own clock. Explicit feedback
 reports that rate on a dedicated IN endpoint. For UAC2 implicit feedback, the
 driver uses whole-frame counts from an associated IN audio endpoint with the
-same resolved clock source, wire rate and service interval. It primes the IN
-transfer queue before submitting playback. IN samples are unavailable to apps.
-On Android, the SDK returns capture-only claims when the session closes.
+same resolved clock source, wire rate and service interval (UAC2, or UAC3 with a
+marked input). It primes the IN transfer queue before submitting playback. A
+playback-only session does not give the IN samples to the app; a duplex stream
+hands them to its capture reader from the same transfers. On Android, the SDK
+returns capture-only claims when the session closes.
 
 By default `negotiate` and `open_stream` refuse an asynchronous route without
 usable feedback with `Error::ImplicitFeedbackUnsupported` when it is the only way to
@@ -542,10 +555,71 @@ For an in-app capture flow and Kotlin and Rust export examples, see
 
 ### Descriptor parsing
 
-`usbdac_core::descriptors` exposes the UAC 1.0/2.0 descriptor parsers the
+`usbdac_core::descriptors` exposes the UAC 1.0, 2.0 and 3.0 descriptor parsers the
 transport uses (`AudioControlParser`, `AudioStreamingParser`, `DescriptorIter`,
 `parse_*` functions and the descriptor types). They work on byte slices and need
 no device. They are lower level than the rest and may change before 1.0.
+
+### Capture, duplex and routing
+
+Standalone and paired PCM capture, and standard routing controls, are separate from
+`Dac::open` and `open_stream`. Each takes its own claims from the host.
+
+```rust
+Dac::capture_preflight(fd, &DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>)>   // (configuration, control interfaces, input interfaces)
+Dac::open_capture_device(fd, DeviceInfo, DacConfig) -> Result<Dac>          // input only, no playback claim, no volume step
+dac.open_capture(&CaptureRequest, capacity_frames) -> Result<DacCaptureStream>
+
+Dac::open_duplex_device(fd, DeviceInfo, DacConfig) -> Result<Dac>           // playback claims plus every input and control interface of capture_preflight
+dac.open_duplex(&StreamFormat, &CaptureRequest, capacity_frames, listener) -> Result<(DacStream, DacCaptureStream)>
+
+CaptureRequest { sample_rate, channels, valid_bits, channel_map: Option<ChannelMap> }
+CaptureFormat::{ sample_rate(), valid_bits(), subslot_bytes(), channel_map(), channels(), bytes_per_frame() }
+capture.read(&mut [u8]) -> Result<usize>     // whole interleaved frames; 0 when active and empty
+capture.available_frames() / stats() / state() / last_error() / close()
+```
+
+- A capture request is exact linear PCM: the rate, the channel count and the valid
+  bits must match what the DAC offers, and an optional `ChannelMap` must match too.
+  There is no rate substitution, conversion or remix. The returned format carries the
+  device's own slot size, so padding bytes pass through unchanged.
+- `ChannelMap` is the ordered channel identity (`ChannelPosition`) from the
+  descriptors: the terminal's channel configuration for UAC 1.0, the AS channel
+  cluster for UAC 2.0, the high-capability cluster for UAC 3.0. Unnamed channels keep
+  their zero-based wire index. Nothing is reordered.
+- `CaptureStats` keeps the causes of missing input apart: `missing_frames` and the
+  failed, short, empty and malformed packet counters describe the bus,
+  `overrun_frames` is audio dropped because the reader was too slow,
+  `contention_frames` is audio dropped while a duplex reader held the buffer, and
+  `device_position_frames()` is a lower bound of the device's position.
+  `CaptureState` is `Active`, `Stopped` or `Failed`.
+- In duplex, one USB worker runs both directions. Closing either direction stops
+  both. Two directions on one clock must use the same rate; directions on separately
+  proven clocks keep their own rates and counters. When the playback uses implicit
+  feedback from an IN stream that capture also reads, they share one transfer pool.
+- While a standalone capture stream is open, concurrent playback, duplex and routing
+  changes are refused.
+
+```rust
+dac.routing_discover() -> Result<RoutingSnapshot, RoutingSessionError>
+dac.routing_read(&RoutingSnapshot, ControlKey) -> Result<RouteValue, RoutingSessionError>
+dac.routing_apply(&RoutingSnapshot, &[RouteEdit]) -> Result<RouteReport, RoutingSessionError>
+dac.routing_discover_powered() / routing_read_powered(..) / routing_apply_powered(..)
+```
+
+- Routing covers the standard UAC selector units and mixer crosspoints of the claimed
+  AudioControl interfaces in the active configuration (`usbdac_core::routing`). Every pin
+  and channel is one-based, in wire order. A mixer crosspoint is a gain in 1/256 dB,
+  and `i16::MIN` is silence.
+- It works only on an idle DAC. Each edit carries the expected current value, so a stale
+  edit fails before anything is written; every write is read back and a failed
+  transaction restores what it changed. Rediscover after a selector edit. The configured
+  `HandBack` policy decides whether routes are restored on close.
+- The `_powered` variants wake the affected UAC 3.0 power domains for the call, and put
+  the checked original power state back afterwards. The plain variants never wake a domain.
+- Vendor routing (`djm_routing_*`, `scarlett_*`, `fcp_routing_*`) is in the crate for
+  source compatibility. In 0.1.5 its calls return `RoutingSessionError::UnsupportedTopology`
+  or report no capability. Vendor PCM profiles are switched off in the same way.
 
 ## 4. Sample layouts
 
@@ -694,7 +768,7 @@ means volume must be the DAC's hardware control, not software gain.
 ## 8. Volume
 
 `dac.volume()` returns a `VolumeControl` when the DAC's Feature Unit has a
-writable volume (UAC 1.0 or 2.0, master control or all channels). It works with
+writable volume (UAC 1.0, 2.0 or 3.0, master control or all channels). It works with
 or without a stream, as long as the `Dac` is open: closing a stream, or a stream
 that failed, leaves the control, its ranges and the cached level and mute in
 place, and a write that is in flight is not failed by the stream stopping. The
@@ -864,16 +938,24 @@ interface NativeListener {
 object Native {
     init { System.loadLibrary("usbdac") }
 
+    // Library
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)            // 0 off .. 5 trace; logcat tag "usbdac"
 
+    // Device: preflight, open, close, capabilities, negotiation, events, feedback capture
     @JvmStatic external fun dacFeedbackPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun dacCapturePreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun dacOpenCaptureDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
+    @JvmStatic external fun dacOpenDuplexDevice(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
+    @JvmStatic external fun dacAwaitRetirement(): Boolean
     @JvmStatic external fun dacCapabilities(dac: Long): String
+    @JvmStatic external fun dacFeedbackTrace(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)
 
+    // Playback stream
     @JvmStatic external fun streamOpen(dac: Long, formatId: Long, listener: Any): Long
     @JvmStatic external fun streamClose(stream: Long)
     @JvmStatic external fun streamWrite(stream: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
@@ -889,7 +971,17 @@ object Native {
     @JvmStatic external fun streamStats(stream: Long): String
     @JvmStatic external fun streamIsBitPerfect(stream: Long): Boolean
     @JvmStatic external fun streamSetSoftwareGain(stream: Long, gain: Float)
+    @JvmStatic external fun streamSetHostProcessing(stream: Long, active: Boolean)
 
+    // Capture and duplex
+    @JvmStatic external fun duplexOpen(dac: Long, formatId: Long, requestJson: String, capacityFrames: Int, listener: Any): String
+    @JvmStatic external fun captureOpen(dac: Long, requestJson: String, capacityFrames: Int): Long
+    @JvmStatic external fun captureFormat(capture: Long): String
+    @JvmStatic external fun captureStats(capture: Long): String
+    @JvmStatic external fun captureRead(capture: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
+    @JvmStatic external fun captureClose(capture: Long)
+
+    // Hardware volume
     @JvmStatic external fun volumeRange(dac: Long): String?     // null: no hardware volume
     @JvmStatic external fun volumeGet(dac: Long): String
     @JvmStatic external fun volumeSetDb(dac: Long, db: Double): String
@@ -899,6 +991,32 @@ object Native {
     @JvmStatic external fun volumeOriginalDb(dac: Long): Double  // NaN: none recorded
     @JvmStatic external fun volumeHandBack(dac: Long): Boolean
     @JvmStatic external fun volumeStartup(dac: Long): String?   // null: no hardware volume
+
+    // Standard routing
+    @JvmStatic external fun routingDiscoverPowered(dac: Long): String
+    @JvmStatic external fun routingReadPowered(dac: Long, snapshot: Long, keyJson: String): String
+    @JvmStatic external fun routingApplyPowered(dac: Long, snapshot: Long, editsJson: String): String
+    @JvmStatic external fun routingDiscover(dac: Long): String
+    @JvmStatic external fun routingRead(dac: Long, snapshot: Long, keyJson: String): String
+    @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String
+
+    // Vendor controls (switched off in 0.1.5)
+    @JvmStatic external fun dacVendorPcmPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun dacVendorPcmClaimsPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun pioneerDjmDiscover(dac: Long): String
+    @JvmStatic external fun pioneerDjmApply(dac: Long, editJson: String): String
+    @JvmStatic external fun scarlettPreflight(fd: Int, deviceInfoJson: String): String
+    @JvmStatic external fun scarlettCapability(dac: Long): String
+    @JvmStatic external fun scarlettRead(dac: Long): String
+    @JvmStatic external fun scarlettGen1Read(dac: Long): String
+    @JvmStatic external fun scarlettGen1ReadSnapshot(dac: Long): String
+    @JvmStatic external fun scarlettGen1Apply(dac: Long, snapshot: Long, editsJson: String): String
+    @JvmStatic external fun fcpRead(dac: Long): String
+    @JvmStatic external fun fcpReadSnapshot(dac: Long): String
+    @JvmStatic external fun fcpApply(dac: Long, snapshot: Long, editsJson: String): String
+    @JvmStatic external fun scarlettMuxRead(dac: Long): String
+    @JvmStatic external fun scarlettMuxApply(dac: Long, snapshot: Long, editsJson: String): String
+    @JvmStatic external fun scarlettMixApply(dac: Long, editJson: String): String
 }
 ```
 
@@ -910,6 +1028,21 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 - `dacFeedbackPreflight` returns the active configuration ID and candidate
   implicit feedback interfaces without starting audio. The Kotlin SDK uses
   the result before `dacOpen`.
+- `dacCapturePreflight` returns `{ "configuration_id", "control_interfaces",
+  "input_interfaces" }` for the active configuration, and `dacOpenCaptureDevice`
+  and `dacOpenDuplexDevice` register a device opened for capture only or for
+  playback with capture. `captureOpen` returns a capture handle, `duplexOpen`
+  returns `{ "playback": <stream handle>, "capture": <capture handle> }`, and
+  `captureFormat` and `captureStats` return JSON. `captureRead` takes a direct
+  buffer and returns the bytes copied, whole frames only, 0 when the stream is
+  active and empty.
+- `dacAwaitRetirement` returns true when every USB transfer of the session has
+  retired. The host must keep its connection and claims until it does.
+- `streamSetHostProcessing` is the buffering hint of `set_host_processing`.
+- The routing functions take and return JSON; a snapshot is an opaque id that
+  belongs to one open DAC, and at most eight are kept. The vendor functions
+  (`pioneer*`, `scarlett*`, `fcp*`, `dacVendorPcm*`) are present and fail with an
+  unsupported error or report no capability in 0.1.5.
 - `streamWrite` takes a **direct** `ByteBuffer` (`ByteBuffer.allocateDirect`),
   reads `count` bytes from `offset` (the buffer's position and limit are
   ignored and not moved) and returns the bytes taken, as in section 3.
@@ -976,9 +1109,9 @@ The preflight response is `{ "configuration_id": 1, "interfaces": [2] }`.
   "processing_buffer_target_ms": 100, "require_verified_rate": true,
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
   "padded_24bit": true, "allow_unsynchronized_async": false, "disable_feedback": false,
-  "realtime_priority": true,
+  "realtime_priority": true, "capture_feedback_trace": false,
   "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
-  "cancel_in_flight_on_flush": true,
+  "transfer_period_us": null, "cancel_in_flight_on_flush": true,
   "startup_volume": "attenuate", "startup_volume_max_db": -40.0, "require_hardware_volume": true,
   "quirks": [ { "vendor_id": 1, "product_id": 2, "name_contains": "Foo",
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
@@ -1023,8 +1156,8 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
       "pacing": { "mode": "explicit_feedback", "feedback_endpoint": 129, "implicit_feedback": null } } ] }
 ```
 
-`uac_version`: `v1`, `v2`, `unknown`. `link_speed`: `low`, `full`, `high`,
-`super`, `super_plus`, `unknown`. `format`: `pcm`, `dsd`, `other`. `sync_type`:
+`uac_version`: `v1`, `v2`, `v3`, `unknown`. `link_speed`: `low`, `full`, `high`,
+`super`, `super_plus`, `unknown`. `format`: `pcm`, `dop`, `dsd`, `other`. `sync_type`:
 `asynchronous`, `adaptive`, `synchronous`, `none`. An alternate setting's `pacing`
 is a pacing object (below), or `null` when the library would not stream it with
 this configuration. It is an additive key: documents from earlier versions lack it.
@@ -1060,7 +1193,8 @@ entities; otherwise `resolution` is `resolved` or `fallback_first_source`, `path
 lists the hops in the order followed (terminal first, Clock Source last, whose `id`
 equals `source_id`), and a hop's `kind` is `terminal`, `selector`, `multiplier` or
 `source`. `selected_pin` (1-based) and `pin_count` are set for `selector` hops and
-`null` for the others. A reader should treat an unknown `mode`, `resolution` or
+`null` for the others. A `multiplier` hop whose ratio was read back also carries
+`numerator` and `denominator`. A reader should treat an unknown `mode`, `resolution` or
 `kind` as "unknown", not as an error.
 
 **Stream statistics** (`streamStats`) includes the `StreamStats` fields in
@@ -1093,11 +1227,15 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
   tracked in the [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
   See the
   [integration surface](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#reference-integration-surface).
+- Vendor PCM profiles, vendor routing and device-specific feedback and DSD
+  rules are written and tested on the host and switched off in 0.1.5; the
+  device profiles that are active are the two built-in quirks and the
+  AP80 Pro-X native DSD profile.
 - Direct PCM and legacy native DSD have limited physical coverage on the
-  OnePlus 15 / AP80 Pro-X, with additional PCM evidence from Flick. New
-  parity paths remain subject to the documented physical acceptance cases;
-  the virtual playback check covers synchronous UAC1 PCM through Linux usbfs.
-  See [evidence and status](sdk/evidence.md).
+  OnePlus 15 / AP80 Pro-X, with additional PCM evidence from the DC04U and
+  from Flick. New parity paths remain subject to the documented physical
+  acceptance cases; the virtual playback check covers synchronous UAC1 PCM
+  through Linux usbfs. See [evidence and status](sdk/evidence.md).
 - The AAudio output (section 13) is not part of the Rust API of `usbdac-core`; it
   lives in the JNI crate, is Android only, and has never opened a stream on a
   device.

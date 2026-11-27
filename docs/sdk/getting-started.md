@@ -156,7 +156,7 @@ UsbDac.hotplug(this).onEach { refreshDevices() }.launchIn(scope)
 
 Opening also protects the ears: a DAC keeps the level it had, and many default to full scale, so `UsbDac.open` lowers every channel of the DAC's hardware volume to at most -40 dB (`DacConfig.startupVolume`), never raising one, and verifies it by reading it back. The level the DAC had is recorded first and `close()` restores it. If the DAC has no usable hardware volume, or the attenuation cannot be verified, `session.volume` is `null` and `openStream` fails with `VOLUME_UNAVAILABLE` until the app opens the session again with `DacConfig(requireHardwareVolume = false)`: show what the DAC offers, ask the user to allow a fixed volume, and reopen (the sample does it with a checkbox). See [volume](controls.md#start-up-volume-protection).
 
-Every failure is a `DacException` with a typed `code` (see [troubleshooting](troubleshooting.md)). A `DacSession` keeps the USB connection and the claimed interfaces until you call `close()`. The SDK also handles eligible IN interface claims for UAC2 implicit feedback. Closing hands the DAC back to Android.
+Every failure is a `DacException` with a typed `code` (see [troubleshooting](troubleshooting.md)). A `DacSession` keeps the USB connection and the claimed interfaces until you call `close()`. The SDK also handles eligible IN interface claims for implicit feedback. Closing hands the DAC back to Android.
 
 ## 4. Read what the DAC can do
 

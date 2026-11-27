@@ -20,10 +20,10 @@ The library opens the USB device, claims the audio interfaces away from Android'
 
 - **Exclusive.** While a `DacSession` is open the DAC belongs to your app. System sounds, notifications and other apps cannot use it (they fall back to the phone's speaker or another route), and the system volume does not reach it. `DacSession.close()` hands the DAC back to Android and asks it to take its USB audio driver back.
 - **Verified.** The library knows the format on the wire, whether the DAC confirmed its clock, whether any frame was lost, and what is in the packets. It reports `BitPerfectState.Verified` or the reason it is not.
-- **Feedback.** A dedicated endpoint can report the playback rate. Version
-  0.1.1 validates each report and bounds recovery if reports stop. For
-  compatible UAC2 implicit feedback, packet frame counts from an IN stream
-  on the same clock and service interval pace playback. The SDK handles
+- **Feedback.** A dedicated endpoint can report the playback rate. The driver
+  validates each report and bounds recovery if reports stop. For implicit
+  feedback, packet frame counts from an IN stream of the same audio function,
+  on the same clock and service interval, pace playback. The SDK handles
   eligible IN interface claims and releases them on session close. Inspect
   `format.pacing` and `stats().feedbackLocked`.
   [Clock and pacing](decisions-clock.md#feedback)

@@ -20,6 +20,7 @@ One `DacSession` can be open in a process: a second `UsbDac.open` throws `BUSY`.
 - **Close it when playback ends for good.** `SelectedOutput.close()` or `DacSession.close()` hands the DAC back to Android and puts the DAC's volume back to what it was ([decision 11](decisions-volume.md#startup-volume)). While paused, to save power, close only the stream and keep the session: `DacIdleRelease`, 30 s by default. A paused session that is never closed holds the DAC, so other apps get no sound through it. A host that wants to give the DAC back sooner closes the session.
 - **A foreground media service is yours.** The library needs no foreground service and no `RECORD_AUDIO`. A player that continues in the background needs the usual media service, with its notification, so that Android keeps the process and the writer thread alive.
 - **Audio focus is yours.** The library does no audio-focus handling. Request focus as any player does, and pause (`output.pause()`) when you lose it. On a direct stream the focus has no effect on the audio itself, because nothing goes through Android's mixer: you have to act on it.
+- **Let `OutputHandoff` do the track change and the reconnect, if you want it.** It drains the old output, closes it, opens the next and keeps the media position, and it reopens only a uniquely identified USB device after a reconnect ([automatic output](automatic-output.md#route-handoff-and-usb-reconnect)). It has not run on hardware.
 - **Keep the writer in the process that holds the media service.** If the writer stops, for example because the process is killed, the ring runs dry and the DAC receives silence.
 
 An outline of a service that owns the output, and what it does when the DAC goes away:
@@ -139,7 +140,7 @@ Two rules behind the table.
 - **Do not fall back to the speaker silently.** A listener who chose a DAC and hears the phone speaker will not forgive it. Mornye's README: "A failure after direct-USB preparation never redirects to the speaker." Fall back to another output only when the listener's settings say it is acceptable, and when you do, show the reason.
 - **Decide fallback at a track boundary, not in the middle.** The selector cannot move a playing stream. A failure that ends the stream is a pause in which you may choose again.
 
-One more failure is not an exception: **a per-packet transfer error ends the stream** (a transfer that completes with one packet in error), as in the three drivers studied. It is reported as `StreamFailed` with code `TRANSFER`. BitChord issue #1485 describes a phone where it happens often; usbdac has no data on how often it happens elsewhere ([decision 3](decisions-stream.md#loss-handling)). If your listeners hit it, the error message carries the packet diagnostics.
+One more failure is not an exception: **a packet error inside a completed transfer** ends the stream, as in the three drivers studied, except in one case. A single packet that failed with `LIBUSB_TRANSFER_ERROR`, nothing delivered and the submitted length matching, is counted as lost audio and playback goes on with `LOST_FRAMES` set (0.1.5). Any other packet status, or a second failed packet, ends the stream as `StreamFailed` with code `TRANSFER`. BitChord issue #1485 describes a phone where these errors are frequent; usbdac has no data on how often they happen elsewhere ([decision 3](decisions-stream.md#loss-handling)). If your listeners hit it, the error message carries the packet diagnostics.
 
 ## Diagnostics and bug reports
 
@@ -169,14 +170,14 @@ One more failure is not an exception: **a per-packet transfer error ends the str
 | A DAC with no volume control | `VOLUME_UNAVAILABLE`, then the fixed-level path after the listener agrees |
 | Bluetooth connected | The selector chooses standard output, not direct USB |
 | Software gain or processing on | The indicator turns off with the right reason |
-| DSD or DoP, if your player offers it, on a DAC that takes it | The right byte order, no noise, markers keep alternating through a pause and a seek. Not run on a DAC by this project |
+| DSD or DoP, if your player offers it, on a DAC that takes it | The right byte order, no noise, markers keep alternating through a pause and a seek. Native DSD has run on the AP80 Pro-X with test data; DoP and standard UAC3 DSD have not run on a DAC |
 
 Send what you find, with the log, to [the issue tracker](https://github.com/johnneerdael/android-usbdac/issues).
 
 ## Release checklist {#release}
 
 - minSdk 26. The library needs Android 8.0 or later; 24-bit and 32-bit integer PCM through the managed and AAudio outputs need Android 12; the bit-perfect mixer needs Android 14.
-- `abiFilters` and the AAR: the library carries arm64-v8a, armeabi-v7a, x86_64 and x86 (about 1.9 MB uncompressed for arm64-v8a). Do not publish an app built from an AAR made with `-Pusbdac.abis` or `-Pusbdac.skipNative=true`.
+- `abiFilters` and the AAR: the library carries arm64-v8a, armeabi-v7a, x86_64 and x86 (about 3.5 MB uncompressed for arm64-v8a). Do not publish an app built from an AAR made with `-Pusbdac.abis` or `-Pusbdac.skipNative=true`.
 - R8: the library ships consumer rules that keep `Native`, `AAudioNative` and `NativeListener`. Keep them if you replace the rules.
 - The manifest merges `android.hardware.usb.host` with `required="false"`, so your app is still offered on phones without host mode (the managed output works there).
 - Say in your own release notes which phones, DACs, formats and output paths you verified.

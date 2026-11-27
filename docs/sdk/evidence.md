@@ -4,28 +4,30 @@ This page collects the data points that the [design decisions](decisions.md) res
 
 ## Hardware status {#hardware-status}
 
-Direct USB PCM has been tested on a OnePlus 15 (CPH2747, Android 16) with an
-iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the
-SDK sample using main's universal feedback detection. The parity build
-with main integrated passed native DSD64, DSD128 and DSD256 followed by
-16-, 24- and 32-bit PCM on the AP80 Pro-X using the same detection.
+Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 16) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
+
+The usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. Code added after those commits has host tests only, and no physical result has been recorded on a 0.1.5 build.
 
 | Area | Status | Source |
 |---|---|---|
-| PCM playback through the Rust driver, 24-bit at 44.1 kHz | Played on the OnePlus 15 and DC04U in a Flick build | [index](index.md#status), Flick PR #400 |
+| PCM playback through the Rust driver, 24-bit at 44.1 kHz, in Flick | Played on the OnePlus 15 and DC04U in a Flick build | [index](index.md#status), Flick PR #400 |
+| Direct USB PCM in the SDK sample on the DC04U | Built from `97e614b` (2026-11-26): stereo 44.1 kHz, `PLAYING` and `Verified` at 297,672 delivered frames, zero underruns and lost frames, explicit feedback on endpoint `0x83` at about 44,099.3 Hz, terminal 3 resolved to clock source 1. The phone is not named in the record | [parity ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#direct-usb-pcm-on-ibasso-dc04u) |
 | 16 packets x 8 transfers (the default at 125 us) | The geometry sweep and benchmark runs played cleanly at 44.1 kHz, judged from the app log. The listening checks (cold start, five minutes without a dropout, 48 and 96 kHz, pause, seek, unplug and replug, 192 to 384 kHz at up to 32-bit) were made on the earlier 8 x 16 build and "have not been repeated" on 16 x 8 | Flick PR #400 |
-| Loss tolerance and exact loss accounting | Fault injection on the OnePlus 15 and DC04U with a test-only build, on 8 x 16. Not repeated on 16 x 8. What loss sounds like was not judged | Flick PR #406 |
-| Full-speed (1 ms interval) DACs | Not tested | Flick PR #400 |
-| Native DSD | DSD64, DSD128 and DSD256 reported bit-perfect transport on OnePlus 15 / AP80 Pro-X using universal feedback calibration, followed by PCM | [AP80 native DSD transition](#ap80-native-dsd-transition) |
+| Loss tolerance and exact loss accounting | Fault injection on the OnePlus 15 and DC04U with a test-only build, on 8 x 16. Not repeated on 16 x 8. What loss sounds like was not judged. The isolated packet-error recovery of 0.1.5 has host tests only | Flick PR #406 |
+| Full-speed (1 ms interval) DACs | Not tested on a DAC. A virtual full-speed UAC1 device in QEMU played synchronous PCM through usbfs | [release validation scope](#release-validation-scope) |
+| Native DSD | DSD64, DSD128 and DSD256 reported bit-perfect transport on the OnePlus 15 and AP80 Pro-X using universal feedback detection, followed by PCM. The probe sent balanced DSD data and PCM silence or a one-bit variation, not music. Not tested: any other DAC, standard UAC3 DSD | [AP80 native DSD transition](#ap80-native-dsd-transition) |
 | DoP | Host tests only. Not run on a DAC | [decision 5](decisions-stream.md#dsd) |
-| Clock selectors and multipliers, range check | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
-| Explicit feedback | Universal detection verified with direct PCM and native DSD on the AP80 Pro-X. Host tests cover report validation, packet-size limits, lock loss and bounded recovery | [decision 7](decisions-clock.md#feedback) |
-| UAC2 implicit feedback in 0.1.1 | Host tests for source pairing, packet sizing and ordering, and Android claim planning and diagnostics. Hardware validation pending | [decision 8](decisions-clock.md#implicit-feedback) |
-| Hardware volume, start-up attenuation, hand-back, volume keys, system panel, idle release | Host tests only | [decisions 9 to 12](decisions-volume.md) |
-| Kotlin SDK and sample app, direct USB PCM | Verified at 44.1 kHz / 16 bit on the OnePlus 15 and AP80 Pro-X | [AP80 Pro-X feedback units](#ap80-pro-x-feedback-units) |
+| Clock selectors and multipliers, alternate-input selection, live alternate-setting and AudioControl notification checks | Host tests on synthetic descriptors only | [decision 6](decisions-clock.md#clock-path) |
+| Explicit feedback | Lock and unit detection verified with direct PCM and native DSD on the AP80 Pro-X, and lock on the DC04U, using one feedback transfer at a time. Stale-report recovery and the deadline were not provoked on a DAC. The two queued polls (0.1.3) and the SuperSpeed Q32.32 report have host tests only | [decision 7](decisions-clock.md#feedback) |
+| Implicit feedback, UAC2 and UAC3 | Host tests for source pairing, rate ranges, packet sizing and ordering, duplex sharing, and Android claim planning and diagnostics. No run on a DAC | [decision 8](decisions-clock.md#implicit-feedback) |
+| UAC3 and BADD playback, capture, duplex | Host tests only | [release validation scope](#release-validation-scope) |
+| Standard routing controls | Host tests only | [release validation scope](#release-validation-scope) |
+| Hardware volume, start-up attenuation, hand-back, volume keys, system panel, idle release | Host tests only. The AP80 Pro-X runs used its own volume setting because it exposes no USB hardware volume control, and the DC04U record does not include a volume read-back | [decisions 9 to 12](decisions-volume.md) |
+| Kotlin SDK and sample app, direct USB PCM | Verified at 44.1 kHz / 16 bit on the OnePlus 15 and AP80 Pro-X, and at 44.1 kHz on the DC04U | [AP80 Pro-X feedback units](#ap80-pro-x-feedback-units) |
 | Android-managed output (Android 14 bit-perfect mixer request) | Host tests only | [transports](transports.md) |
 | AAudio exclusive output on a player with an internal DAC | Host tests only. No digital audio player tried | [automatic output](automatic-output.md#what-is-not-verified) |
-| `OutputSelector` | Host tests against a fake device. Nothing on hardware | [automatic output](automatic-output.md#what-is-not-verified) |
+| `OutputSelector` and `OutputHandoff` | Host tests against a fake device. Nothing on hardware | [automatic output](automatic-output.md#what-is-not-verified) |
+| Vendor PCM profiles, vendor routing, device-specific feedback and DSD rules | Written and host-tested, and switched off in 0.1.5. No hardware | [release validation scope](#release-validation-scope) |
 | Other phones and DACs | Hardware validation pending | |
 
 **Reporting a problem.** Set the native log level (`UsbDac.setLogLevel`) and send the logcat of the tag `usbdac`, with the Android version, the phone, the DAC, and the source format. [Troubleshooting](troubleshooting.md) has the error codes.
@@ -86,16 +88,21 @@ delivery, clock changes and the transition on this device.
 
 ## Release validation scope {#release-validation-scope}
 
-The parity additions cover UAC3 and BADD, capture and duplex, channel
-layouts, clock selection and restoration, standard routing, and native
-DSD and DoP capability handling. This release carries forward the
-device profiles already published in 0.1.3. Additional vendor
-profiles are candidates for a future release. The
+Version 0.1.5 carries the shared USB Audio implementation: UAC1, UAC2 and UAC3 (BADD and full ADC3) playback, PCM capture and duplex, channel layouts, clock selection and restoration, standard routing, explicit and implicit feedback, and native DSD and DoP capability handling. The
 [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md) records software checks
 and their artifacts by implementation batch. These include Rust protocol,
 control and packet tests, Kotlin tests, Android target checks and four-ABI
-AAR and sample builds. Those earlier results apply to their recorded
-revisions; the merged release must pass its required build and test gates.
+AAR and sample builds. Those results apply to their recorded
+revisions. [The tests section](#tests) has the counts taken at 0.1.5.
+
+**Written, tested on the host, and switched off in 0.1.5.** Each of these is behind a constant in the code, so no SDK call reaches it. Some calls exist for source compatibility and fail with an unsupported error.
+
+- Proprietary vendor PCM streams: the fixed-rate Pioneer DJM, DDJ and Roland OCTO-CAPTURE and QUAD-CAPTURE profiles, with their rate commands.
+- Vendor routing: the Pioneer DJM options and the Focusrite Scarlett, Clarett and FCP controls. `session.routing.pioneer`, `session.routing.scarlett` and the `...WithVendorRouting` open calls return an unsupported error.
+- Device-specific feedback rules: the TEAC UD-H01 and T+A DAC 8 report correction, the Playback Designs startup skip, and fixed endpoint pairings for implicit feedback.
+- Legacy native DSD tables (Amanero, ITF mode commands, Playback Designs DoP alternates, vendor RAW_DATA families). Only the AP80 Pro-X profile, the Dawn Pro quirk and explicit host settings admit a legacy native layout.
+
+The device profiles that are active are the two built-in quirks (MOONDROP Dawn Pro, Fosi Audio DS2) and the AP80 Pro-X native DSD profile. The ledger and the [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md) list what a later release could enable.
 
 QEMU 10.1.3 exposed a full-speed UAC1 interface on emulated xHCI with a
 null audio backend. In an Alpine arm64 Linux guest, a probe built from
@@ -107,13 +114,13 @@ streaming alternate to zero, released both interface claims, and
 restored volume. The virtual device rounded the startup attenuation
 request. Stream opening rediscovered the control at the lower level.
 The [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md)
-records the guest setup and validation scope.
+records the guest setup and validation scope. This was a virtual device on a Linux
+guest. It says nothing about a phone, a real DAC or any other transfer mode.
 
-This release preparation adds no physical streaming hardware checks.
-The OnePlus 15 / AP80 Pro-X and Flick results above remain historical
-hardware evidence. New UAC3/BADD streaming, capture and duplex, routing
-controls, vendor mode changes and broader device compatibility still need
-physical acceptance. Use the
+The OnePlus 15, AP80 Pro-X and DC04U results above and the Flick results remain the only
+hardware evidence. UAC3 and BADD streaming, capture and duplex, standard routing
+controls, implicit feedback, DoP and broader device compatibility still need physical
+acceptance. Use the
 [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md)
 to choose that follow-up work.
 
@@ -182,20 +189,22 @@ These are not usbdac's measurements. Each is a record in another project's repos
 
 ## Tests {#tests}
 
-Counted for usbdac `main` at `b309a08` (`v0.1.0-alpha.6`):
+Counted for usbdac `main` at `353e039` (`v0.1.5`), on a Mac:
 
 | Suite | Count | What it covers |
 |---|---|---|
-| `usbdac-core` unit tests | 396 | Descriptor parsing, clock resolution, packet scheduling and validation, loss accounting, ring and ring targets, position, flush cancellation, volume curves, start-up attenuation, bit-perfect blockers, conversion, and the transport against a fake DAC (`transport/fake_dac.rs`) |
-| `usbdac-core` integration tests | 17 | The public API surface, the conversion API, and a test that conversion does not allocate in its loop |
-| `usbdac-jni` unit tests | 72 | The JNI and JSON layer, the AAudio engine logic and ring |
+| `usbdac-core` unit tests | 805 | Descriptor parsing (UAC1, UAC2, UAC3), clock resolution and selection, packet scheduling and validation, loss accounting, ring and ring targets, position, flush cancellation, explicit and implicit feedback, capture and duplex, standard routing, native DSD, volume curves, start-up attenuation, bit-perfect blockers, conversion, and the transport against a fake DAC (`transport/fake_dac.rs`) |
+| `usbdac-core` integration tests | 17 | The public API surface (10), the conversion API (5), and a test that conversion does not allocate in its loop (2) |
+| `usbdac-jni` unit tests | 94 | The JNI and JSON layer, the routing bridges, the AAudio engine logic and ring |
 | Rust doctests | 2 | The README example and the crate example |
-| **Rust total** | **487** | `cargo test --workspace`, run on a Mac for this page: 487 passed, 0 failed |
-| Kotlin unit tests | 237 | Counted by their `@Test` annotations in `android/usbdac/src/test`: the output selector (58), AAudio output (33), model parsing (26), conversion (38), volume (24), controls (17), events, routes, interfaces. Run in CI with `./gradlew :usbdac:testDebugUnitTest`; not run for this page |
+| **Rust total** | **918** | `cargo test --workspace --locked`: 918 passed, 0 failed |
+| Kotlin unit tests | 276 | `./gradlew :usbdac:testDebugUnitTest -Pusbdac.skipNative=true`, run without the build cache: 276 passed, 0 failed, the same as the number of `@Test` annotations in `android/usbdac/src/test`. The output selector (57), model parsing (37), AAudio output (33), converting output (18), volume (14), interface claims (14), conversion plans (12), errors, events, the volume write queue (10 each), the output handoff (9), controls (9) and the rest |
 
-None of these runs touches a DAC. They test the logic: what is decided, in what order, with what numbers. They cannot say that a DAC will play.
+The Kotlin count was taken with the native build skipped, because the unit tests do not load `libusbdac.so`. The sample and the AAR build were not rerun for this page.
 
-To reproduce: `cargo test --workspace` (host), `cargo test -p usbdac-core quality -- --nocapture` (the resampler's measured quality), `cargo run --release -p usbdac-core --example convert_bench` (its cost), and `python3 -I .github/scripts/check_docs_snippets.py` (that the guide's code is the sample's code).
+None of these runs touches a DAC. They test the logic: what is decided, in what order, with what numbers. They cannot say that a DAC will play. The earlier count, at `b309a08` (`v0.1.0-alpha.6`), was 487 Rust tests and 237 Kotlin tests.
+
+To reproduce: `cargo test --workspace --locked` (host), `cargo test -p usbdac-core quality -- --nocapture` (the resampler's measured quality), `cargo run --release -p usbdac-core --example convert_bench` (its cost), and `python3 -I .github/scripts/check_docs_snippets.py` (that the guide's code is the sample's code).
 
 ## Numbers computed for these pages {#computed-numbers}
 

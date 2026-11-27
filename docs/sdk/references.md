@@ -1,6 +1,6 @@
 # Public references
 
-Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. The original links were fetched on 2026-11-26; the UAC3 format reference was added on 2026-11-27. Each excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
+Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. The original links were fetched on 2026-11-26; the UAC3 format reference was added on 2026-11-27. The USB 3.2 entry was added for 0.1.5 without fetching the document and has no excerpt. Every other excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
 
 ## Standards
 
@@ -11,6 +11,14 @@ Every source the [design decisions](decisions.md) cite, with what it was used fo
 - **Feedback format, section 5.12.4.2.** A full-speed endpoint reports "an unsigned 10.10 (K=10) format" left-justified in three bytes "so that it has a 10.14 format"; a high-speed endpoint "an unsigned 12.13 (K=13) format which fits into four bytes", aligned "so that it has a 16.16 format". The lower 4 (full speed) and 3 (high speed) bits are optional extra precision.
 - **No retry, section 5.6 and 8.5.5.** "In the case of a delivery failure due to error, no retrying of the attempt to deliver the data"; "Isochronous transactions do not support a handshake phase or retry capability."
 - Used in [decisions 1, 3, 7 and 8](decisions.md).
+
+### USB 3.2 specification {#ref-usb32}
+
+[usb.org document library, USB 3.2 Revision 1.1](https://www.usb.org/document-library/usb-32-revision-11-june-2022).
+
+- **Enhanced SuperSpeed feedback, section 4.4.8.4.1.** An eight-byte report, read by usbdac as an unsigned Q32.32 count of samples per 125 microsecond bus interval. The endpoint companion descriptor (section 9.6.7) gives the bytes per service interval that usbdac uses as packet capacity.
+- These section numbers are the ones the code comments and the implementation ledger give. This page's text was not fetched for this guide.
+- Used in [decision 7](decisions-clock.md#feedback).
 
 ### USB Audio Class 1.0 {#ref-uac1}
 
@@ -164,6 +172,7 @@ The usbdac commits behind the decisions, such as [`eada7d7`](https://github.com/
 - **The USB Audio 2.0 text does not state the feedback format.** It sends the reader to the USB 2.0 specification (section 5.12.4.2).
 - **The MQA article does not say where the signalling is.** usbdac makes no claim about it.
 - **The xHCI sources do not explain the 256-packet stall.** The explanation is a hypothesis.
+- **The USB 3.2 section numbers are not checked against the PDF.** They come from the code and the ledger.
 - **The Dither paper supports "first and second moments independent", not "fully independent".**
 - **The "UAC 2.0 RAW_DATA" format is not cited.** The audio data format document that defines it was not fetched; legacy native DSD is cited through the Linux quirks; standard UAC3 DSD is cited through `Frmts30.pdf` above.
 - A third-party mirror of Alan Stern's `snd-usb-audio` URB rework, cited in Flick PR #400, redirected to a sign-in page and was not used.

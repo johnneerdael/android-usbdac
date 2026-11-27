@@ -27,6 +27,17 @@ SECTIONS = [
         ("index", "Overview"),
         ("improvements", "What usbdac improves"),
     ]),
+    ("Integrate", [
+        ("guide-kotlin", "Kotlin guide"),
+        ("guide-rust", "Rust guide"),
+        ("integration", "Integration guide"),
+        ("integration-player", "The player engine"),
+        ("integration-app", "App, service and settings"),
+        ("support-diagnostics", "Collect a support report"),
+        ("getting-started", "Getting started"),
+        ("automatic-output", "Automatic output"),
+        ("media3", "Media3 integration"),
+    ]),
     ("Design decisions", [
         ("decisions", "All decisions at a glance"),
         ("decisions-stream", "Streaming and buffering"),
@@ -38,15 +49,6 @@ SECTIONS = [
     ("How it works", [
         ("architecture", "Architecture"),
         ("usb-audio-primer", "USB audio in a page"),
-    ]),
-    ("Integrate", [
-        ("integration", "Integration guide"),
-        ("integration-player", "The player engine"),
-        ("integration-app", "App, service and settings"),
-        ("support-diagnostics", "Collect a support report"),
-        ("getting-started", "Getting started"),
-        ("automatic-output", "Automatic output"),
-        ("media3", "Media3 integration"),
     ]),
     ("Use", [
         ("controls", "Controls and configuration"),

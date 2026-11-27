@@ -6,7 +6,7 @@ Each entry says what changed, then what that means **in plain terms**.
 
 Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used. Each change has a longer entry in [the design decisions](decisions.md), with what each of the three drivers does, the evidence and the public references.
 
-Every item is covered by automated tests. Direct USB PCM has played on a OnePlus 15 with two DACs. [Hardware status](evidence.md#hardware-status)
+Every item is covered by automated tests. Direct USB PCM has played on a OnePlus 15 with two DACs, and native DSD on one of them. Most of what was added after 0.1.0 has been tested without a DAC only. [Hardware status](evidence.md#hardware-status)
 
 ## Sound that does not drop out
 
@@ -24,7 +24,7 @@ Audio travels to the DAC in small packets, and the driver keeps a short queue of
 
 ### A hiccup on the cable no longer ends playback
 
-When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB standard allows.
+When a batch of packets is not confirmed in time, usbdac sends the next batch and counts exactly how much audio was affected, up to a limit. The original stopped the stream on the first such event, and also rejected some packet sizes that the USB standard allows. Since 0.1.5 a single packet that fails with nothing delivered, inside a transfer that otherwise completed, is counted the same way. Any other packet error still stops the stream.
 
 **In plain terms:** a brief stumble between phone and DAC used to stop the music. Now playback carries on, and the library remembers that a sliver of audio was lost, so it will not claim the playback was perfect.
 
@@ -36,26 +36,50 @@ usbdac keeps a quarter of a second of audio ready (the original kept a tenth). T
 
 ### USB playback follows the DAC's clock {#usb-playback-follows-the-dacs-clock}
 
-**Explicit feedback.** Version 0.1.1 uses the newest valid rate report in each
-poll batch. A later empty or malformed packet leaves the valid report usable.
-The driver checks that the largest packet the rate calls for fits the
-playback endpoint. If valid reports stop, it can briefly hold the last good
-rate. Stale feedback clears bit-perfect verification and a persistent outage
-ends the stream with a transfer error.
+**Explicit feedback.** The driver keeps two polls of the DAC's rate endpoint
+queued, so the endpoint is never left unpolled while the output thread works
+(it was one at a time before 0.1.3). It uses the newest valid rate report of
+each completed poll. A later empty or malformed packet leaves the valid report
+usable. The driver checks that the largest packet the rate calls for fits the
+playback endpoint, and it works out the report's units for DACs that use a
+different timebase than the standard one. If valid reports stop, it can
+briefly hold the last good rate. Stale feedback clears bit-perfect
+verification and a persistent outage ends the stream with a transfer error.
+SuperSpeed devices that report in the USB 3 format are decoded too.
 
-**Implicit feedback.** On compatible UAC2 devices, the driver checks that an IN
-stream shares the playback clock, wire rate and service interval. It starts
-that stream first and uses its USB packet frame counts to schedule output.
-The playback sample path stays the same. When an asynchronous route has no
-usable source, the app can fall back to Android output. Nominal timing is an
-opt-in and gives up bit-perfect verification.
+**Implicit feedback.** On compatible UAC2 and UAC3 devices, the driver checks
+that an IN stream shares the playback clock, wire rate and service interval.
+It starts that stream first and uses its USB packet frame counts to schedule
+output. The playback sample path stays the same. When an asynchronous route
+has no usable source, the app can fall back to Android output. Nominal timing
+is an opt-in and gives up bit-perfect verification.
 
 **In plain terms.** Your app can play directly on compatible USB audio
 interfaces that convey timing through their input stream. On a DAC with a
 dedicated feedback endpoint, an invalid report no longer hides an earlier good
-one in the same batch. Your app can see when timing goes stale and handle
-playback failure if the device stops sending valid timing.
+one in the same batch, and a slow moment in the app no longer leaves the
+endpoint unpolled. Your app can see when timing goes stale and handle
+playback failure if the device stops sending valid timing. Explicit feedback
+has run on two DACs. Implicit feedback has not run on a DAC yet.
 See [clock and pacing](decisions-clock.md#feedback).
+
+### More kinds of DAC and the right clock on them
+
+The driver reads UAC 3.0 devices (including the fixed BADD profile) as well as 1.0 and 2.0. It converts the rate exactly through a clock multiplier, can select another clock input when the current one cannot run the rate, checks the alternate setting and the clock again once the stream is switched on, and, when the DAC has a status endpoint, watches its notifications while the stream plays. Native DSD in the standard UAC3 format is supported, and the Hidizs AP80 Pro-X's native DSD alternate has its own profile. SuperSpeed (USB 3) endpoints get their real packet capacity from the endpoint companion descriptor.
+
+**In plain terms:** more DACs open at the rate you asked for, and if a DAC with a status endpoint reports a change of its clock or its alternate setting during playback, and the driver's read-back disagrees with what it set, the driver stops with an error instead of playing at the wrong speed. These paths have tests that replay descriptors and control traffic. None has run on a DAC.
+
+### Recording, and playing and recording together
+
+PCM capture from a DAC or an audio interface is a separate API, alone or paired with playback on one USB worker. A capture request names an exact rate, width and channel count and gets the device's own sample bytes with the channel order the descriptors give. Counters keep apart audio lost on the bus, audio the reader was too slow to take, and audio dropped while a duplex reader held the buffer.
+
+**In plain terms:** an app can record from a DAC's input without Android's audio stack changing the samples, and the report says why a recording has a gap. It has been tested without a DAC only.
+
+### Standard routing controls and a way to collect a support report
+
+On an idle session an app can list and change the DAC's standard selector and mixer controls (which input feeds which output, and the mixer gains), with read-back and rollback. A support capture records the feedback timing of one stream, with the raw reports, so a developer can see why a DAC did not lock; the sample has a switch and a copy button for it ([support report guide](support-diagnostics.md)).
+
+**In plain terms:** routing changes are checked against what the DAC says afterwards, and a listener with a problem can send you a file instead of describing it.
 
 ## Controls that respond at once
 
@@ -118,7 +142,7 @@ A helper closes the audio stream after 30 seconds of pause while keeping hold of
 
 "Bit-perfect" means the DAC receives exactly the numbers that are in the music file, with nothing resampled, rounded or scaled on the way.
 
-usbdac reports this as a fact it checks, not a promise. The flag is true only when the DAC's clock was confirmed at the file's sample rate, the outgoing data passed its own inspection, no audio was lost, and no software volume or conversion is active. Whenever it is false, the library names the reason.
+usbdac reports this as a fact it checks, not a promise. The flag is true only when the DAC's clock was confirmed at the file's sample rate, the host is following the DAC's feedback where the route needs it, the outgoing data passed its own inspection, no audio was lost, and no software volume or conversion is active. Whenever it is false, the library names the reason.
 
 **In plain terms:** an app can show a "bit-perfect" light that actually goes out when something compromises the sound, and can tell the listener why.
 
@@ -163,8 +187,9 @@ A Kotlin API for Android, a sample app that the guide's code is taken from, auto
 ## What it does not do yet
 
 - **One DAC at a time** per app.
-- **Playback only**, for USB Audio Class 1 and 2 devices.
-- **Limited hardware coverage.** PCM has played through Flick on the iBasso DC04U and through the SDK sample on the AP80 Pro-X. [Hardware status](evidence.md#hardware-status)
+- **Capture is PCM only**, in the device's own format. There is no DSD or float capture and no conversion on that path, and the output selector chooses playback only.
+- **No vendor-specific controls yet.** Code for fixed-rate vendor PCM streams, the Pioneer DJM and Focusrite routing controls and per-device feedback corrections is in the repository and switched off in 0.1.5. Standard USB Audio Class controls only.
+- **Limited hardware coverage.** PCM has played through Flick on the iBasso DC04U, through the SDK sample on the DC04U and on the AP80 Pro-X, and native DSD on the AP80 Pro-X. [Hardware status](evidence.md#hardware-status)
 
 ## Where it came from
 
