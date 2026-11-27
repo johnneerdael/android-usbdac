@@ -238,6 +238,9 @@ impl Attachment {
             return Ok(true);
         }
         if self.shared_implicit {
+            if self.endpoint.adc3_route.is_none() {
+                capture_stream::verify_standard_capture(claimed, &self.endpoint)?;
+            }
             // Playback owns both programming and activation of this IN source.
             // Its existing clock transaction has already selected the wire rate.
             let choice = input_clock(claimed, &self.endpoint);

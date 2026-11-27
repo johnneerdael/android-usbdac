@@ -661,6 +661,15 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
     }
+    if let Some(capture) = attachment.as_ref().filter(|capture| capture.shared_implicit
+        && capture.endpoint.vendor_pcm.is_none() && capture.endpoint.adc3_route.is_none()) {
+        // Playback activated the shared IN source. Reprove its pinned capture
+        // contract after both SET_INTERFACE operations, before publishing it.
+        if let Err(error) = capture_stream::verify_standard_capture(&claimed_handle, &capture.endpoint) {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
+        }
+    }
     if vendor_profile.is_some() && attachment.is_none() {
         if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
             .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed after activation".into()) }) {

@@ -1033,13 +1033,36 @@ pub(super) fn read_active_configuration_bytes(
     handle: &DeviceHandle<Context>,
     config: &ConfigDescriptor,
 ) -> Option<Vec<u8>> {
+    read_active_configuration_bytes_checked(handle, config).ok()
+}
+
+/// Preserve transport failures so capture can distinguish detach from bad data.
+pub(super) fn read_active_configuration_bytes_checked(
+    handle: &DeviceHandle<Context>,
+    config: &ConfigDescriptor,
+) -> Result<Vec<u8>, Error> {
+    let transport_error = |error: rusb::Error| {
+        if error == rusb::Error::NoDevice {
+            Error::DeviceLost
+        } else {
+            Error::Control(format!("cannot read active configuration: {error}"))
+        }
+    };
     let device = handle.device();
-    let count = device.device_descriptor().ok()?.num_configurations();
-    let index = (0..count).find(|index| {
-        device
-            .config_descriptor(*index)
-            .ok()
-            .is_some_and(|c| c.number() == config.number())
+    let count = device.device_descriptor().map_err(transport_error)?.num_configurations();
+    let mut selected_index = None;
+    for index in 0..count {
+        match device.config_descriptor(index) {
+            Ok(descriptor) if descriptor.number() == config.number() => {
+                selected_index = Some(index);
+                break;
+            }
+            Err(rusb::Error::NoDevice) => return Err(Error::DeviceLost),
+            _ => {}
+        }
+    }
+    let index = selected_index.ok_or_else(|| {
+        Error::Control("requested USB configuration is no longer available".into())
     })?;
     let mut header = [0u8; 9];
     let n = itf_timed_read_control(handle,
@@ -1050,13 +1073,13 @@ pub(super) fn read_active_configuration_bytes(
             &mut header,
             Duration::from_secs(1),
         )
-        .ok()?;
+        .map_err(transport_error)?;
     if n != header.len() || header[5] != config.number() {
-        return None;
+        return Err(Error::Control("active configuration header is short or changed".into()));
     }
     let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
     if length < header.len() {
-        return None;
+        return Err(Error::Control("active configuration length is too short".into()));
     }
     let mut bytes = vec![0u8; length];
     let n = itf_timed_read_control(handle,
@@ -1067,8 +1090,11 @@ pub(super) fn read_active_configuration_bytes(
             &mut bytes,
             Duration::from_secs(1),
         )
-        .ok()?;
-    (n == length && bytes[5] == config.number()).then_some(bytes)
+        .map_err(transport_error)?;
+    if n != length || bytes[5] != config.number() {
+        return Err(Error::Control("active configuration data is short or changed".into()));
+    }
+    Ok(bytes)
 }
 
 /// Strict implicit proof never uses the playback path's sparse-source fallback.

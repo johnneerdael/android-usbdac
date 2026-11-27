@@ -18,6 +18,7 @@ pub(crate) struct CaptureEndpoint {
     pub(super) terminal: u8,
     pub(super) control: u8,
     pub(super) control_descriptors: Vec<u8>,
+    endpoint_descriptors: Vec<u8>,
     sampling_control: bool,
     fixed_rate: bool,
     pub(super) vendor_pcm: Option<vendor_pcm::VendorPcm>,
@@ -378,6 +379,12 @@ pub(super) fn capture_candidates(
                     .filter(|d| d[1] == USB_DT_CS_INTERFACE)
                     .flat_map(|d| d.iter().copied())
                     .collect(),
+                endpoint_descriptors: interface.descriptors[index..]
+                    .iter()
+                    .take(1)
+                    .chain(interface.descriptors[index + 1..].iter().take_while(|d| d[1] != 5))
+                    .flat_map(|d| d.iter().copied())
+                    .collect(),
                 sampling_control,
                 fixed_rate,
                 adc3_route: None,
@@ -386,6 +393,68 @@ pub(super) fn capture_candidates(
         }
     }
     Ok(candidates)
+}
+
+/// Rebuild the selected standard pipe from fresh wire descriptors, including
+/// records whose malformed duplicates would otherwise disappear during parsing.
+fn reprove_standard_capture(
+    raw: &[u8],
+    speed: Speed,
+    candidate: &CaptureEndpoint,
+) -> Result<(), Error> {
+    if raw.len() < 9 || raw[0] != 9 || raw[1] != 2
+        || usize::from(u16::from_le_bytes([raw[2], raw[3]])) != raw.len()
+        || raw[5] != candidate.configuration
+    {
+        return Err(Error::InvalidState("standard capture configuration header changed".into()));
+    }
+    let interfaces = raw_interfaces(raw).map_err(Error::Control)?;
+    let mut selected = interfaces.iter().filter(|interface|
+        interface.number == candidate.interface && interface.alternate == candidate.alternate);
+    let interface = selected.next().ok_or_else(||
+        Error::InvalidState("standard capture alternate disappeared".into()))?;
+    if selected.next().is_some()
+        || interfaces.iter().filter(|interface|
+            interface.number == candidate.control && interface.alternate == 0).count() != 1
+        || interface.descriptors.iter().filter(|d|
+            d.len() >= 3 && d[1] == 5 && d[2] == candidate.address).count() != 1
+    {
+        return Err(Error::InvalidState("standard capture descriptors are ambiguous".into()));
+    }
+    let rebuilt = capture_candidates(raw, candidate.configuration, speed, candidate.format.sample_rate())
+        .map_err(Error::Control)?;
+    let mut matching = rebuilt.iter().filter(|endpoint|
+        endpoint.interface == candidate.interface && endpoint.alternate == candidate.alternate
+            && endpoint.address == candidate.address);
+    if matching.next() != Some(candidate) || matching.next().is_some() {
+        return Err(Error::InvalidState("standard capture descriptor profile changed".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_standard_capture(
+    claimed: &ClaimedHandle,
+    candidate: &CaptureEndpoint,
+) -> Result<(), Error> {
+    if candidate.vendor_pcm.is_some() || candidate.adc3_route.is_some()
+        || !matches!(candidate.protocol, 0 | 0x20)
+    {
+        return Ok(());
+    }
+    claimed.ensure_interface_claimed(candidate.interface).map_err(Error::Claim)?;
+    claimed.ensure_interface_claimed(candidate.control).map_err(Error::Claim)?;
+    let map_control_error = |e: rusb::Error| if e == rusb::Error::NoDevice { Error::DeviceLost }
+        else { Error::Control(e.to_string()) };
+    let active = claimed.handle.active_configuration().map_err(map_control_error)?;
+    let config = claimed.handle.device().active_config_descriptor().map_err(map_control_error)?;
+    if active != candidate.configuration || config.number() != candidate.configuration {
+        return Err(Error::InvalidState("standard capture configuration changed".into()));
+    }
+    let raw = clock::read_active_configuration_bytes_checked(&claimed.handle, &config)?;
+    if claimed.handle.active_configuration().map_err(map_control_error)? != candidate.configuration {
+        return Err(Error::InvalidState("standard capture configuration changed during reproof".into()));
+    }
+    reprove_standard_capture(&raw, resolve_device_speed(&claimed.handle.device()), candidate)
 }
 
 /// Resolve active-configuration candidates while the caller owns USB claims.
@@ -444,6 +513,7 @@ fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm, ra
         address: profile.input.address, service_us: profile.input.service_us,
         packet_bytes: profile.input.max_packet_bytes, format, protocol: 0xff,
         terminal: 0, control: profile.input_interface_number, control_descriptors: vec![],
+        endpoint_descriptors: vec![],
         sampling_control: false, fixed_rate: !profile.rate_control, adc3_route: None, vendor_pcm: Some(profile),
     })
 }
@@ -505,6 +575,7 @@ fn adc3_capture_endpoint(
         terminal: candidate.terminal_link.unwrap_or(0),
         control: route.control,
         control_descriptors: vec![],
+        endpoint_descriptors: vec![],
         sampling_control: false,
         fixed_rate: route.clock.is_none(),
         adc3_route: Some(route),
@@ -710,6 +781,7 @@ pub(super) fn configure_capture_endpoint_guarded(
     candidate: &CaptureEndpoint,
     expected_source: Option<(&ClockChoice, u32)>,
 ) -> Result<bool, Error> {
+    verify_standard_capture(claimed, candidate)?;
     if let Some(profile) = candidate.vendor_pcm.as_ref() {
         verify_vendor_capture(claimed, candidate)?;
         for interface in profile.claimed_interfaces() {
@@ -964,6 +1036,7 @@ pub(super) fn configure_capture_endpoint_guarded(
             return Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported });
         }
     }
+    verify_standard_capture(claimed, candidate)?;
     Ok(true)
 }
 
@@ -1184,6 +1257,7 @@ pub(crate) fn open_capture(
         );
         capture_queue_bytes(endpoint.packet_bytes, geometry)?;
         if standard_uac2 {
+            verify_standard_capture(owner.claimed(), &endpoint)?;
             let mut route = None;
             let result = clock::select_capture_clock_route(
                 owner.claimed(), endpoint.interface, endpoint.alternate,
@@ -2094,6 +2168,92 @@ mod tests {
         let length = raw.len() as u16;
         raw[2..4].copy_from_slice(&length.to_le_bytes());
         raw
+    }
+
+    fn update_configuration_length(raw: &mut [u8]) {
+        let length = raw.len() as u16;
+        raw[2..4].copy_from_slice(&length.to_le_bytes());
+    }
+
+    #[test]
+    fn standard_capture_reproof_rejects_stale_same_alternate_profiles() {
+        for protocol in [0, 0x20] {
+            let raw = configuration(protocol);
+            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+            assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
+            let ep = raw.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
+            let format = raw.windows(4).position(|w| w == if protocol == 0 {
+                [11, 0x24, 2, 1]
+            } else { [6, 0x24, 2, 1] }).unwrap();
+            let owner = raw.windows(4).position(|w| w == if protocol == 0 {
+                [12, 0x24, 2, 1]
+            } else { [8, 0x24, 10, 10] }).unwrap();
+            let mut changed_sync = raw.clone();
+            changed_sync[ep + 3] ^= 0x08; // Still isochronous, with different synchronization.
+            let changed_endpoint = capture_candidates(&changed_sync, 1, Speed::Full, 48_000)
+                .unwrap().remove(0);
+            assert_eq!(changed_endpoint.packet_bytes, endpoint.packet_bytes);
+            assert_eq!(changed_endpoint.service_us, endpoint.service_us);
+            assert!(reprove_standard_capture(&changed_sync, Speed::Full, &endpoint).is_err());
+            let channel_map = if protocol == 0 { owner + 8 } else {
+                raw.windows(4).position(|w| w == [16, 0x24, 1, 3]).unwrap() + 11
+            };
+            // Preserve interface, alternate, address and valid packet capacity.
+            for offset in [ep + 3, ep + 4, ep + 7, ep + 9 + 3, format + 5, owner + 6, channel_map] {
+                let mut changed = raw.clone();
+                changed[offset] ^= 1;
+                assert!(reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err(),
+                    "accepted changed standard capture byte {offset} for protocol {protocol}");
+            }
+            for offset in [0, 1, 2, 5] {
+                let mut changed = raw.clone();
+                changed[offset] ^= 1;
+                assert!(reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn standard_capture_reproof_rejects_filtered_duplicate_records() {
+        for protocol in [0, 0x20] {
+            let raw = configuration(protocol);
+            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+            // A malformed endpoint with this address is filtered by geometry.
+            let mut duplicate = raw.clone();
+            duplicate.extend_from_slice(&[7, 5, 0x81, 0, 0, 0, 0]);
+            update_configuration_length(&mut duplicate);
+            assert_eq!(capture_candidates(&duplicate, 1, Speed::Full, 48_000).unwrap().len(), 1);
+            assert!(reprove_standard_capture(&duplicate, Speed::Full, &endpoint).is_err());
+            // A duplicate AS claim is filtered by its wrong class/protocol.
+            let mut duplicate = raw.clone();
+            duplicate.extend_from_slice(&[9, 4, 1, 1, 0, 0xff, 0, 0xff, 0]);
+            update_configuration_length(&mut duplicate);
+            assert_eq!(capture_candidates(&duplicate, 1, Speed::Full, 48_000).unwrap().len(), 1);
+            assert!(reprove_standard_capture(&duplicate, Speed::Full, &endpoint).is_err());
+            // Duplicate the owner's identity with an otherwise ineligible record.
+            let mut duplicate = raw.clone();
+            duplicate.extend_from_slice(&[9, 4, 0, 0, 0, 0xff, 0, 0xff, 0]);
+            update_configuration_length(&mut duplicate);
+            assert!(reprove_standard_capture(&duplicate, Speed::Full, &endpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn standard_capture_reproof_preserves_superspeed_endpoint_extras() {
+        for protocol in [0, 0x20] {
+            let raw = superspeed_configuration(protocol, 1024, &[6, 0x30, 1, 1, 0, 16]);
+            let endpoint = capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().remove(0);
+            assert!(reprove_standard_capture(&raw, Speed::Super, &endpoint).is_ok());
+            let companion = raw.windows(2).position(|w| w == [6, 0x30]).unwrap();
+            let mut changed = raw.clone();
+            changed[companion + 2] = 2;
+            assert!(reprove_standard_capture(&changed, Speed::Super, &endpoint).is_err());
+            // Unknown endpoint extras also form part of the selected wire snapshot.
+            let mut changed = raw.clone();
+            changed.extend_from_slice(&[3, 0x26, 1]);
+            update_configuration_length(&mut changed);
+            assert!(reprove_standard_capture(&changed, Speed::Super, &endpoint).is_err());
+        }
     }
 
     #[test]

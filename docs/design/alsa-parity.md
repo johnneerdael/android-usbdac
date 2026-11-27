@@ -164,6 +164,29 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `17d6867fd905cf605a9602f3b102907d525ca9af073aa8dd672c26f408afee4c`.
 
+### Standard capture descriptor revalidation
+
+Keep the selected UAC1 or UAC2 IN endpoint descriptor and its extra
+records from discovery. During setup, re-read the active configuration
+and reconstruct the same claimed route at the requested rate. Require
+one matching alternate and endpoint with the same controlling
+interface, terminal, PCM layout, packet geometry, and endpoint control
+descriptors. Check again after activation, before handing the endpoint
+to the capture worker. Shared implicit capture also verifies its
+capture descriptor when playback activates the pinned IN alternate.
+[USB-IF UAC1 §4.6](https://www.usb.org/sites/default/files/audio10.pdf),
+[USB-IF UAC2 §§3.13.1.1 and 4.10](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf)
+
+For hardware acceptance, exercise normal capture and shared
+implicit duplex, then change or reset the configuration during setup.
+Verify that changed descriptors are reported before capture data is
+delivered and that unplug is reported as device loss.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `f6ed06a0adcf3e031b26d4442ff2743212ddf047c189d305d854742377dd81e1`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a
