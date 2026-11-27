@@ -12,9 +12,9 @@ opened and what it could verify.
   USB access themselves. [Crate on crates.io](https://crates.io/crates/usbdac-core)
 
 The shared USB Audio implementation now includes UAC3 and BADD, PCM capture
-and duplex, channel layouts, verified clock selection and restoration,
-standard routing controls and guarded device-specific controls. Native DSD
-uses standard UAC3 packing or a resolved legacy layout; DoP capability reports
+and duplex, channel layouts, verified clock selection and restoration, and
+standard routing controls. Native DSD uses standard UAC3 packing or a
+resolved legacy layout; DoP capability reports
 a feasible PCM carrier. See the [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md),
 [release validation scope](evidence.md#release-validation-scope) and
 [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).

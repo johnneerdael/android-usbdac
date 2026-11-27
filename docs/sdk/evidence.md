@@ -87,8 +87,10 @@ delivery, clock changes and the transition on this device.
 ## Release validation scope {#release-validation-scope}
 
 The parity additions cover UAC3 and BADD, capture and duplex, channel
-layouts, clock selection and restoration, standard routing, guarded
-vendor controls, and native DSD and DoP capability handling. The
+layouts, clock selection and restoration, standard routing, and native
+DSD and DoP capability handling. This release carries forward the
+device profiles already published in 0.1.3. Additional vendor
+profiles are candidates for a future release. The
 [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md) records software checks
 and their artifacts by implementation batch. These include Rust protocol,
 control and packet tests, Kotlin tests, Android target checks and four-ABI

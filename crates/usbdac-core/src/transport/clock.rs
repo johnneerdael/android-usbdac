@@ -630,6 +630,7 @@ pub(super) fn get_clock_validity(
 
 // ALSA's exact MOTU identities need bounded settling after programming. Do
 // not make read-only source discovery wait or convert transfer errors to retry.
+#[cfg(test)]
 fn retry_programmed_clock_validity(
     slow: bool, mut read: impl FnMut() -> Result<bool, String>, mut wait: impl FnMut(),
 ) -> Result<bool, String> {
@@ -646,12 +647,9 @@ fn retry_programmed_clock_validity(
 pub(super) fn get_programmed_clock_validity(
     handle: &DeviceHandle<Context>, control: u8, source: u8,
 ) -> Result<bool, String> {
-    let slow = handle.device().device_descriptor().is_ok_and(|d| {
-        d.vendor_id() == 0x07fd && matches!(d.product_id(), 0x0004 | 0x0005)
-    });
-    retry_programmed_clock_validity(slow,
-        || get_clock_validity(handle, control, source),
-        || thread::sleep(Duration::from_millis(100)))
+    // Shared-parity release keeps standard validity checking without the
+    // unpublished MOTU identity-specific programmed-clock settling loop.
+    get_clock_validity(handle, control, source)
 }
 
 pub(super) fn get_sampling_frequency_ranges(

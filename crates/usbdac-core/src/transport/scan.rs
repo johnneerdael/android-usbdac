@@ -281,8 +281,8 @@ fn implicit_source_inventory(
     result
 }
 
-/// Exact playback rules from Linux sound/usb/implicit.c's fixed endpoint
-/// table. These identify a pipe, never waive standard UAC2/function/clock proof.
+/// Internal implicit-source ranking rules. Device-specific fixed/skip rules
+/// remain deferred; they never waive standard UAC2/function/clock proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaybackImplicitProfile {
     Generic,
@@ -290,25 +290,10 @@ enum PlaybackImplicitProfile {
     Skip,
 }
 
-fn playback_implicit_profile(vendor: u16, product: u16) -> PlaybackImplicitProfile {
-    use PlaybackImplicitProfile::{Fixed, Generic, Skip};
-    match (vendor, product) {
-        (0x0763, 0x2030 | 0x2031) => Fixed { address: 0x81, interface: 3 },
-        (0x0763, 0x2080 | 0x2081)
-        | (0x2466, 0x8010)
-        | (0x31e9, 0x0001 | 0x0002)
-        | (0x0499, 0x172f)
-        | (0x0d9a, 0x00df) => Fixed { address: 0x81, interface: 2 },
-        (0x19f7, 0x000a) => Fixed { address: 0x84, interface: 3 },
-        (0x22f0, 0x0006) => Fixed { address: 0x81, interface: 3 },
-        (0x1686, 0xf029) => Fixed { address: 0x82, interface: 2 },
-        (0x2466, 0x8003) | (0x0499, 0x172a) => Fixed { address: 0x86, interface: 2 },
-        // MicroBook IIc's standard-audio entry in implicit.c; the vendor
-        // protocol entry is deliberately outside this UAC2-only resolver.
-        // DIYINHK: quirks.c QUIRK_FLAG_SKIP_IMPLICIT_FB, exact product only.
-        (0x07fd, 0x0004) | (0x20b1, 0x2009) => Skip,
-        _ => Generic,
-    }
+fn playback_implicit_profile(_vendor: u16, _product: u16) -> PlaybackImplicitProfile {
+    // Shared-parity release: device-specific fixed pipes and exclusions remain
+    // deferred. Descriptor/function/clock-based generic discovery stays active.
+    PlaybackImplicitProfile::Generic
 }
 
 /// Apply the identity rule only after a sink's explicit-feedback path has been
@@ -781,7 +766,11 @@ pub(super) fn build_usb_capability_model(
             let ap80_dsd = matches_ap80_raw_dsd(
                 usb_id, config_descriptor.number(), &descriptor, &stream_format,
             );
-            stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
+            stream_format.native_dsd = if ap80_dsd {
+                ap80_native_dsd_profile(&settings())
+            } else {
+                resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
+            };
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             let standard_grid = descriptor.protocol_code() == 0x20
                 && standard_implicit_pcm_format(&stream_format)
@@ -1183,7 +1172,11 @@ pub(super) fn select_stream_candidates(
             let ap80_dsd = matches_ap80_raw_dsd(
                 usb_id, config_descriptor.number(), &descriptor, &stream_format,
             );
-            stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
+            stream_format.native_dsd = if ap80_dsd {
+                ap80_native_dsd_profile(&settings())
+            } else {
+                resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
+            };
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
             apply_playback_designs_dop(&mut stream_format, playback_format, playback_designs_dop);
             if playback_format.dsd_transport == DsdTransportMode::Native {
@@ -2026,6 +2019,17 @@ pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
 
 const UAC2_RAW_DATA: u32 = 1 << 31;
 
+// Preserve the shipped AP80 default and the existing explicit width/order
+// overrides after the exact route/endpoint predicate has admitted this layout.
+fn ap80_native_dsd_profile(policy: &crate::settings::Settings) -> Option<NativeDsdProfile> {
+    let word_bytes = policy.native_dsd_policy(0xc502, 0x0072, 4)
+        .map(|(width, _, _)| width).unwrap_or(4);
+    if !matches!(word_bytes, 1 | 2 | 4) { return None; }
+    let (big_endian, bit_reverse) = policy.native_dsd_order(0xc502, 0x0072, true);
+    Some(NativeDsdProfile { word_bytes, big_endian, bit_reverse,
+        origin: NativeDsdOrigin::DeviceCompatibility })
+}
+
 fn ap80_native_dsd_clock_rates(ranges: &[SamplingFrequencySubrange]) -> Vec<SamplingFrequencySubrange> {
     // DSD64, DSD128 and DSD256 in 32-bit words. The shared clock also
     // lists PCM rates, which are not native DSD modes on this player.
@@ -2501,7 +2505,7 @@ mod implicit_discovery_tests {
 
     #[test]
     fn fixed_profiles_require_standard_wire_proof_and_rate_without_restricting_generic() {
-        let fixed = playback_implicit_profile(0x19f7, 0x000a);
+        let fixed = PlaybackImplicitProfile::Fixed { address: 0x84, interface: 3 };
         assert!(implicit_profile_proven(fixed, true, true, true));
         assert!(!implicit_profile_proven(fixed, false, true, true));
         assert!(!implicit_profile_proven(fixed, true, false, true));
@@ -2511,7 +2515,7 @@ mod implicit_discovery_tests {
     }
 
     #[test]
-    fn exact_fixed_profiles_preserve_every_linux_pipe() {
+    fn shared_release_does_not_activate_fixed_profiles_or_exclusions() {
         for (vendor, product, address, interface) in [
             (0x0763, 0x2030, 0x81, 3), (0x0763, 0x2031, 0x81, 3),
             (0x0763, 0x2080, 0x81, 2), (0x0763, 0x2081, 0x81, 2),
@@ -2521,11 +2525,11 @@ mod implicit_discovery_tests {
             (0x22f0, 0x0006, 0x81, 3), (0x1686, 0xf029, 0x82, 2),
             (0x2466, 0x8003, 0x86, 2), (0x0499, 0x172a, 0x86, 2),
         ] {
-            assert_eq!(playback_implicit_profile(vendor, product),
-                PlaybackImplicitProfile::Fixed { address, interface });
+            let _deferred_pipe = (address, interface);
+            assert_eq!(playback_implicit_profile(vendor, product), PlaybackImplicitProfile::Generic);
         }
         for identity in [(0x0763, 0x9999), (0x9999, 0x2030),
-            (0x20b1, 0x200a), (0x07fd, 0x0005), (0, 0)] {
+            (0x20b1, 0x200a), (0x07fd, 0x0005), (0x07fd, 0x0004), (0x20b1, 0x2009), (0, 0)] {
             assert_eq!(playback_implicit_profile(identity.0, identity.1),
                 PlaybackImplicitProfile::Generic);
         }
@@ -2533,7 +2537,7 @@ mod implicit_discovery_tests {
 
     #[test]
     fn fixed_profile_uses_only_exact_pipe_and_refuses_conflicting_sync_address() {
-        let profile = playback_implicit_profile(0x19f7, 0x000a);
+        let profile = PlaybackImplicitProfile::Fixed { address: 0x84, interface: 3 };
         let fixed = source(3, 7, 0x84, 288);
         // Fixed-source alternates need not match the sink's alternate.
         assert_eq!(implicit_source_rank(profile, fixed, false, 1, 1, 0), Some(0));
@@ -2549,8 +2553,8 @@ mod implicit_discovery_tests {
     #[test]
     fn standard_audio_skip_profiles_veto_linked_and_marked_implicit_sources() {
         for identity in [(0x07fd, 0x0004), (0x20b1, 0x2009)] {
-            let profile = playback_implicit_profile(identity.0, identity.1);
-            assert_eq!(profile, PlaybackImplicitProfile::Skip);
+            let _deferred_identity = identity;
+            let profile = PlaybackImplicitProfile::Skip;
             for linked in [0, 0x81] {
                 assert_eq!(implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, linked), None);
             }
@@ -2755,6 +2759,19 @@ mod ap80_raw_data_tests {
         let pcm = parse_streaming_extra(0x20, &extra).unwrap();
         assert_eq!(alt_format(pcm.format_tag), AltFormat::Pcm);
         assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &pcm));
+    }
+
+    #[test]
+    fn ap80_preserves_shipped_big_endian_and_explicit_host_overrides() {
+        use crate::{config::DacConfig, settings::Settings};
+        let mut policy = Settings::default();
+        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (4, true, false));
+        policy.config = DacConfig { dsd_subslot: Some(2), ..DacConfig::default() };
+        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (2, true, false));
+        policy.config.dsd_big_endian = Some(false);
+        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (2, false, false));
+        policy.config.dsd_subslot = Some(3);
+        assert!(ap80_native_dsd_profile(&policy).is_none());
     }
 
     #[test]

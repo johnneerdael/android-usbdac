@@ -1081,14 +1081,16 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
   returns `PlatformUnsupported`.
 - UAC 1.0, 2.0 and 3.0 playback include PCM and native DSD; standard
   UAC3 DSD has a fixed 8-byte transport word. PCM capture and duplex use
-  explicit input APIs and claims. Standard routing and supported vendor
-  controls require verified topology and device capabilities. See the
+  explicit input APIs and claims. Standard routing requires verified
+  topology and device capabilities. Additional vendor controls are
+  tracked in the [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
+  See the
   [integration surface](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md#reference-integration-surface).
 - Direct PCM and legacy native DSD have limited physical coverage on the
   OnePlus 15 / AP80 Pro-X, with additional PCM evidence from Flick. New
   parity paths remain subject to the documented physical acceptance cases;
-  software coverage and virtual enumeration do not establish streaming on
-  additional hardware. See [evidence and status](sdk/evidence.md).
+  the virtual playback check covers synchronous UAC1 PCM through Linux usbfs.
+  See [evidence and status](sdk/evidence.md).
 - The AAudio output (section 13) is not part of the Rust API of `usbdac-core`; it
   lives in the JNI crate, is Android only, and has never opened a stream on a
   device.

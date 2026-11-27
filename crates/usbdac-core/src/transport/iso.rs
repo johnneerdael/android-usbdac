@@ -444,7 +444,7 @@ impl InterruptTransferSlot {
     }
 }
 
-/// Built-in rules are bound to the opened descriptor and selected explicit pipe.
+/// Private deferred compatibility state; release construction is neutral.
 #[derive(Default, Debug)]
 pub(super) struct FeedbackCompatibility {
     tenor_nominal_q16: Option<u32>,
@@ -453,24 +453,15 @@ pub(super) struct FeedbackCompatibility {
 
 impl FeedbackCompatibility {
     pub(super) fn for_device(
-        vendor: u16,
-        product: u16,
-        speed: Speed,
-        endpoint: FeedbackEndpoint,
-        sample_rate: u32,
+        _vendor: u16,
+        _product: u16,
+        _speed: Speed,
+        _endpoint: FeedbackEndpoint,
+        _sample_rate: u32,
     ) -> Self {
-        let explicit_isoc_in = endpoint.transfer_type == TransferType::Isochronous
-            && endpoint.address & 0x80 != 0;
-        let tenor = explicit_isoc_in
-            && endpoint.max_packet_bytes == 4
-            && speed == Speed::High
-            && matches!((vendor, product), (0x0644, 0x8038) | (0x1852, 0x5034));
-        // ALSA rounds samples per 125-us microframe to the nearest Q16.16 value.
-        let nominal_q16 = (u64::from(sample_rate) * 1024 + 62) / 125;
-        Self {
-            tenor_nominal_q16: tenor.then_some(nominal_q16).and_then(|nominal| u32::try_from(nominal).ok()),
-            startup_packets_remaining: if explicit_isoc_in && vendor == 0x23ba { 4 } else { 0 },
-        }
+        // Shared-parity release keeps universal feedback/timebase handling.
+        // Tenor correction and Playback Designs startup skipping are deferred.
+        Self::default()
     }
 
     fn skip_packet(&mut self) -> bool {
@@ -1439,30 +1430,14 @@ mod explicit_feedback_tests {
     }
 
     #[test]
-    fn tenor_correction_is_exact_identity_pipe_and_bus_scoped() {
-        let pipe = feedback_pipe();
-        for (vendor, product) in [(0x0644, 0x8038), (0x1852, 0x5034)] {
-            let mut compatibility = FeedbackCompatibility::for_device(vendor, product, Speed::High, pipe, 48_000);
-            for raw in [0x60000 - 0xf000, 0x60000, 0x60000 + 0xf000] {
-                assert_eq!(compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility),
-                    Some((6.0, 48_000.0)));
-            }
-        }
-        for (vendor, product) in [(0x0644, 0x8037), (0x0644, 0x8039), (0x1852, 0x5035), (0x1853, 0x5034)] {
-            let mut compatibility = FeedbackCompatibility::for_device(vendor, product, Speed::High, pipe, 48_000);
+    fn shared_release_keeps_device_specific_feedback_profiles_inactive() {
+        for (vendor, product) in [(0x0644, 0x8038), (0x1852, 0x5034), (0x23ba, 1)] {
+            let mut compatibility = FeedbackCompatibility::for_device(vendor, product,
+                Speed::High, feedback_pipe(), 48_000);
             assert!(compatibility.tenor_nominal_q16.is_none());
-            assert!(compatible_report(&q16(6.9375), 125, 7, false, &mut compatibility).is_none());
-        }
-        for speed in [Speed::Full, Speed::Super, Speed::SuperPlus, Speed::Unknown] {
-            assert!(FeedbackCompatibility::for_device(0x0644, 0x8038, speed, pipe, 48_000)
-                .tenor_nominal_q16.is_none());
-        }
-        for disabled_pipe in [FeedbackEndpoint { max_packet_bytes: 3, ..pipe },
-            FeedbackEndpoint { max_packet_bytes: 8, ..pipe },
-            FeedbackEndpoint { address: 1, ..pipe },
-            FeedbackEndpoint { transfer_type: TransferType::Interrupt, ..pipe }] {
-            let compatibility = FeedbackCompatibility::for_device(0x0644, 0x8038, Speed::High, disabled_pipe, 48_000);
-            assert!(compatibility.tenor_nominal_q16.is_none());
+            assert_eq!(compatibility.startup_packets_remaining, 0);
+            assert_eq!(compatible_report(&q16(6.0), 125, 7, false, &mut compatibility),
+                Some((6.0, 48_000.0)));
         }
     }
 
@@ -1475,8 +1450,7 @@ mod explicit_feedback_tests {
         assert_eq!(correct_tenor_feedback(0x68001, 0x60000), Some(0x59001));
         assert_eq!(correct_tenor_feedback(1, 0x7fff), None); // nominal bound underflow
         assert_eq!(correct_tenor_feedback(u32::MAX, u32::MAX), None); // nominal bound overflow
-        let mut compatibility = FeedbackCompatibility::for_device(0x0644, 0x8038,
-            Speed::High, feedback_pipe(), 48_000);
+        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: Some(0x60000), startup_packets_remaining: 0 };
         for raw in [0, 1, 0xf0060000, 0x80000] {
             assert!(compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility).is_none());
         }
@@ -1493,8 +1467,7 @@ mod explicit_feedback_tests {
 
     #[test]
     fn universal_inference_cannot_bypass_tenor_correction_or_playback_startup() {
-        let mut tenor = FeedbackCompatibility::for_device(0x0644, 0x8038,
-            Speed::High, feedback_pipe(), 48_000);
+        let mut tenor = FeedbackCompatibility { tenor_nominal_q16: Some(0x60000), startup_packets_remaining: 0 };
         let mut counters = FeedbackCounters {
             infer_service_interval: true, cached_service_interval: true, ..Default::default()
         };
@@ -1505,8 +1478,7 @@ mod explicit_feedback_tests {
             &mut tenor).is_none());
         assert!(counters.selected_timebase.is_none());
 
-        let mut playback = FeedbackCompatibility::for_device(0x23ba, 1,
-            Speed::High, feedback_pipe(), 48_000);
+        let mut playback = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
         let mut counters = FeedbackCounters {
             infer_service_interval: true, ..Default::default()
         };
@@ -1528,8 +1500,7 @@ mod explicit_feedback_tests {
 
     #[test]
     fn playback_designs_skips_four_completed_bus_opportunities_across_batches() {
-        let mut compatibility = FeedbackCompatibility::for_device(0x23ba, 0xffff,
-            Speed::High, feedback_pipe(), 48_000);
+        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
         let mut counters = FeedbackCounters::default();
         let prior_lock = Instant::now();
         counters.last_report_at = Some(prior_lock);
@@ -1557,14 +1528,13 @@ mod explicit_feedback_tests {
             &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).unwrap();
         assert!((selected.0 - 6.01).abs() < 1.0 / 65536.0);
         assert_eq!(counters.rejected, 1);
-        let fresh = FeedbackCompatibility::for_device(0x23ba, 1, Speed::Full, feedback_pipe(), 48_000);
+        let fresh = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
         assert_eq!(fresh.startup_packets_remaining, 4);
     }
 
     #[test]
     fn playback_startup_keeps_malformed_safety_and_non_iso_semantics() {
-        let mut compatibility = FeedbackCompatibility::for_device(0x23ba, 1,
-            Speed::High, feedback_pipe(), 48_000);
+        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
         let mut counters = FeedbackCounters::default();
         assert!(select_feedback_report_with_compatibility(&[0; 16],
             [(0, 4, 5), (0, 4, 2), (0, 4, 0), (LIBUSB_TRANSFER_ERROR, 4, 4)],
@@ -1694,8 +1664,7 @@ mod explicit_feedback_tests {
     #[test]
     fn ordered_dual_polls_share_one_playback_startup_skip_budget() {
         let endpoint = FeedbackEndpoint { service_interval_us: 1000, ..feedback_pipe() };
-        let compatibility = FeedbackCompatibility::for_device(0x23ba, 1,
-            Speed::High, endpoint, 48_000);
+        let compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
         let mut transfers = FeedbackTransfers::new(endpoint, 4, compatibility).unwrap();
         assert_eq!(transfers.slots.len(), 2);
         assert_eq!(transfers.slots[0].packet_count, 2);

@@ -1,7 +1,8 @@
 //! Independently implemented compatibility data from Linux v7.0 quirks.c,
 //! snd_usb_interface_dsd_format_quirks (028ef9c96e96197026887c0f092424679298aae8).
 //! Alt-only upstream records require a unique eligible playback layout here.
-//! Exact ITF mode transactions run only under the exclusive stream owner.
+//! Legacy tables and ITF transactions remain compatibility evidence only.
+//! Release activation is limited to shipped profiles and explicit host policy.
 //! Source evidence is not a claim
 //! that these devices have been physically tested with this transport.
 use super::*;
@@ -36,6 +37,7 @@ struct UsbIdentity {
 
 // Facts only: exact product IDs, alternate numbers and word order. No chipset
 // matching, product substring guesses, or implicit vendor mode transitions.
+#[cfg(test)]
 fn builtin_layout(id: UsbIdentity) -> Option<(u8, bool)> {
     match (id.vendor, id.product) {
         (0x16d0, 0x071a) => match id.revision {
@@ -61,6 +63,7 @@ fn builtin_layout(id: UsbIdentity) -> Option<(u8, bool)> {
 // c03c1a14507dfaf8b856c2608f9ac216021fc222, lines 2426-2646.
 // Upstream stops at the first exact row, even when that row omits RAW_DATA.
 // These defaults interpret descriptors; explicit host policy remains separate.
+#[cfg(test)]
 fn raw_data_device(id: UsbIdentity) -> bool {
     match (id.vendor, id.product) {
         (0x152a, 0x880a) // NeuralDSP Quad Cortex
@@ -89,6 +92,7 @@ fn raw_data_device(id: UsbIdentity) -> bool {
         | 0xc502)
 }
 
+#[cfg(test)]
 fn playback_designs_layout(id: UsbIdentity, alt: u8) -> Option<u8> {
     if id.vendor != 0x23ba || id.product >= 0x0110 { return None; }
     match alt {
@@ -99,6 +103,7 @@ fn playback_designs_layout(id: UsbIdentity, alt: u8) -> Option<u8> {
     }
 }
 
+#[cfg(test)]
 fn playback_designs_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFormat,
                             eligible_alts: usize) -> Option<NativeDsdProfile> {
     let width = playback_designs_layout(id, alt)?;
@@ -110,6 +115,7 @@ fn playback_designs_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfac
 
 // Legacy alt 1 has two DSD payload bytes plus one DoP marker on the wire.
 // Linux quirks.c:1988-2000, endpoint.c:1111-1121 and pcm.c's DoP writer.
+#[cfg(test)]
 fn playback_designs_dop_profile(id: UsbIdentity, alt: u8,
                                 format: &StreamingInterfaceFormat, count: usize) -> bool {
     id.vendor == 0x23ba && id.product < 0x0110 && alt == 1 && count == 1
@@ -117,30 +123,11 @@ fn playback_designs_dop_profile(id: UsbIdentity, alt: u8,
         && matches!((format.subslot_size, format.bit_resolution), (2, 16) | (3, 24))
 }
 
-pub(super) fn resolve_playback_designs_dop(device: &Device<Context>, config: &ConfigDescriptor,
-                                          alt: &rusb::InterfaceDescriptor,
-                                          format: &StreamingInterfaceFormat) -> bool {
-    let Some(id) = identity(device) else { return false; };
-    if !playback_designs_dop_profile(id, alt.setting_number(), format, 1) { return false; }
-    let eligible = |d: &rusb::InterfaceDescriptor| {
-        if d.class_code() != USB_CLASS_AUDIO || d.sub_class_code() != USB_SUBCLASS_AUDIOSTREAMING
-            || d.setting_number() != 1 || !matches!(d.protocol_code(), 0 | 0x20) { return false; }
-        let Some(f) = parse_android_streaming_interface_format(d) else { return false; };
-        if !playback_designs_dop_profile(id, 1, &f, 1) { return false; }
-        let mut outs = 0;
-        for ep in d.endpoint_descriptors() {
-            if ep.direction() == Direction::Out {
-                if ep.transfer_type() != TransferType::Isochronous
-                    || !matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
-                    || !(1..=16).contains(&ep.interval())
-                    || !itf_packet_geometry(ep.max_packet_size(), device.speed())
-                    || ep.max_packet_size() & 0x07ff < 6 { return false; }
-                outs += 1;
-            }
-        }
-        outs == 1
-    };
-    eligible(alt) && config.interfaces().flat_map(|i| i.descriptors()).filter(eligible).count() == 1
+pub(super) fn resolve_playback_designs_dop(_device: &Device<Context>, _config: &ConfigDescriptor,
+                                          _alt: &rusb::InterfaceDescriptor,
+                                          _format: &StreamingInterfaceFormat) -> bool {
+    // The legacy Playback Designs carrier is not admitted in this release.
+    false
 }
 
 pub(super) fn playback_designs_dop_capacity(max_bytes: usize, interval_us: u32, rate: u32) -> bool {
@@ -159,6 +146,7 @@ pub(super) fn apply_playback_designs_dop(format: &mut StreamingInterfaceFormat,
     }
 }
 
+#[cfg(test)]
 fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat,
                     eligible_alts: usize) -> Option<NativeDsdProfile> {
     // Exact compatibility rules remain authoritative even when their layout
@@ -174,6 +162,7 @@ fn raw_data_profile(id: UsbIdentity, format: &StreamingInterfaceFormat,
 
 // Exact model data and mockable mode transactions. No mode readback request is
 // documented by the pinned source; hand-back therefore restores PCM-safe mode.
+#[cfg(test)]
 mod itf {
     use super::*;
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +249,7 @@ mod itf {
 
 /// The descriptor plan is read-only. Executing it additionally requires the
 /// claimed-handle transaction path, which is never called from discovery.
+#[cfg(test)]
 fn itf_descriptor_recipe(device: &Device<Context>, config: &ConfigDescriptor,
                          descriptor: &rusb::InterfaceDescriptor,
                          format: &StreamingInterfaceFormat, mode: itf::Mode) -> Option<itf::Recipe> {
@@ -297,6 +287,7 @@ fn itf_descriptor_recipe(device: &Device<Context>, config: &ConfigDescriptor,
     itf::recipe(id, descriptor.interface_number(), descriptor.setting_number(), &numbers, format, mode)
 }
 
+#[cfg(test)]
 fn itf_packet_geometry(raw: u16, speed: Speed) -> bool {
     let base = raw & 0x07ff;
     if raw & 0xe000 != 0 || base == 0 || base > 1024 || (raw >> 11) & 3 == 3 { return false; }
@@ -307,18 +298,21 @@ fn itf_packet_geometry(raw: u16, speed: Speed) -> bool {
     matches!(speed, Speed::Full | Speed::High | Speed::Unknown)
 }
 
+#[cfg(test)]
 fn raw_packet_geometry(raw: u16, speed: Speed) -> bool {
     itf_packet_geometry(raw, speed) && raw & 0x07ff >= 8
 }
 
 /// Every operation is explicit so ordering and rollback can be proved without
 /// USB hardware. A successful zero-alt is mandatory before every vendor write.
+#[cfg(test)]
 trait ItfModeIo {
     fn zero_alt(&mut self, interface: u8) -> Result<(), String>;
     fn write_mode(&mut self, command: itf::VendorWrite) -> Result<(), String>;
     fn delay(&mut self, milliseconds: u16);
 }
 
+#[cfg(test)]
 fn itf_sequence(io: &mut impl ItfModeIo, recipe: itf::Recipe, restore: bool) -> Result<(), String> {
     io.zero_alt(recipe.reset_interface_to_alt_zero)?;
     if recipe.conditions.interface_delay { io.delay(50); }
@@ -328,6 +322,7 @@ fn itf_sequence(io: &mut impl ItfModeIo, recipe: itf::Recipe, restore: bool) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn itf_switch(io: &mut impl ItfModeIo, recipe: itf::Recipe) -> Result<(), String> {
     if let Err(error) = itf_sequence(io, recipe, false) {
         // SET_INTERFACE failure means no mode write is permitted. The restore
@@ -340,125 +335,23 @@ fn itf_switch(io: &mut impl ItfModeIo, recipe: itf::Recipe) -> Result<(), String
     Ok(())
 }
 
-struct UsbfsItfIo { fd: RawFd }
-impl ItfModeIo for UsbfsItfIo {
-    fn zero_alt(&mut self, interface: u8) -> Result<(), String> {
-        let setting = UsbfsSetInterface { interface: u32::from(interface), altsetting: 0 };
-        if unsafe { libc::ioctl(self.fd, USBDEVFS_SETINTERFACE, &setting) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        Ok(())
-    }
-    fn write_mode(&mut self, command: itf::VendorWrite) -> Result<(), String> {
-        let control = UsbfsControlTransfer { request_type: command.request_type, request: command.request,
-            value: command.value, index: command.index, length: command.payload_bytes,
-            timeout_ms: 1000, data: std::ptr::null_mut() };
-        let result = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &control) };
-        if result < 0 { return Err(std::io::Error::last_os_error().to_string()); }
-        if result != 0 { return Err("ITF mode command returned unexpected data length".into()); }
-        Ok(())
-    }
-    fn delay(&mut self, milliseconds: u16) {
-        thread::sleep(Duration::from_millis(u64::from(milliseconds)));
-    }
-}
-
-/// Owned before libusb handle fields. Normal teardown calls restore only after
-/// OUT/feedback transfers retire. Drop covers failed setup/unwinding and always
-/// confirms zero-alt first, so detach/reset failures suppress the vendor write.
-pub(super) struct ItfModeLease {
-    fd: RawFd,
-    pending: Mutex<Option<itf::Recipe>>,
-}
+// Preserve the ownership call sites without activating unpublished ITF mode
+// transactions, recovery writes, or PCM-facing delays in this release.
+pub(super) struct ItfModeLease;
 impl ItfModeLease {
-    pub(super) fn new(fd: RawFd) -> Self { Self { fd, pending: Mutex::new(None) } }
-    pub(super) fn disarm(&self) { *self.pending.lock() = None; }
-    pub(super) fn restore(&self) -> Result<(), String> {
-        let mut pending = self.pending.lock();
-        let Some(recipe) = *pending else { return Ok(()); };
-        // Consume before I/O: a failed zero-alt or detach must never cause a
-        // second, uncontrolled vendor-write attempt from Drop.
-        *pending = None;
-        itf_sequence(&mut UsbfsItfIo { fd: self.fd }, recipe, true)
-    }
-}
-impl Drop for ItfModeLease {
-    fn drop(&mut self) {
-        if let Err(error) = self.restore() {
-            log_warn!("[USB] ITF PCM recovery failed during hand-back: {error}");
-        }
-    }
+    pub(super) fn new(_fd: RawFd) -> Self { Self }
+    pub(super) fn disarm(&self) {}
+    pub(super) fn restore(&self) -> Result<(), String> { Ok(()) }
 }
 
-/// Called only inside an exclusively owned, transfer-free negotiation/open.
-/// Read-only capability and selection paths never reach vendor controls.
-pub(super) fn apply_itf_mode(claimed: &ClaimedHandle, candidate: &IsoStreamCandidate,
-                             mode: DsdTransportMode) -> Result<(), String> {
-    // Standard ADC3 DSD is descriptor-defined and never needs a legacy
-    // VID-based ITF mode transaction, even on a matching vendor/product.
-    if candidate.native_dsd.is_some_and(|profile| profile.origin == NativeDsdOrigin::StandardAdc3) {
-        return Ok(());
-    }
-    let device = claimed.handle.device();
-    let Some(id) = identity(&device) else { return Err("cannot read actual device identity for mode selection".into()); };
-    if itf::model(id).is_none() { return Ok(()); }
-    if candidate.interface_number != 1 { return Ok(()); }
-    if SESSION_STATE.lock().as_ref().is_some_and(|state| state.device.fd == claimed.device_fd && state.stream_active) {
-        return Err("ITF mode change refused while a stream is active".into());
-    }
-    claimed.ensure_interface_claimed(1)?;
-    if !claimed.active_interfaces.lock().is_empty() {
-        return Err("ITF mode change refused while an alternate remains active".into());
-    }
-    let config = device.active_config_descriptor().map_err(|e| e.to_string())?;
-    let descriptor = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
-        d.interface_number() == candidate.interface_number && d.setting_number() == candidate.alt_setting)
-        .ok_or_else(|| "ITF selected alternate disappeared".to_string())?;
-    let format = parse_android_streaming_interface_format(&descriptor)
-        .ok_or_else(|| "ITF selected format is malformed".to_string())?;
-    let requested_mode = if mode == DsdTransportMode::Native { itf::Mode::NativeDsd } else { itf::Mode::PcmOrDop };
-    let Some(recipe) = itf_descriptor_recipe(&device, &config, &descriptor, &format, requested_mode) else {
-        // Unknown/sibling layouts retain the existing PCM path, but do not
-        // receive a guessed vendor command or newly enabled native support.
-        if mode != DsdTransportMode::Native { return Ok(()); }
-        return Err("ITF mode change requires the exact supported interface/alternate layout".into());
-    };
-    let matching_endpoint = descriptor.endpoint_descriptors().any(|ep| ep.direction() == Direction::Out
-        && ep.address() == candidate.endpoint_address && ep.interval() == candidate.endpoint_interval
-        && effective_iso_packet_bytes(ep.max_packet_size(), candidate.usb_speed) == candidate.max_packet_bytes);
-    if !matching_endpoint { return Err("ITF selected endpoint changed".into()); }
-    if mode == DsdTransportMode::Native && candidate.native_dsd.map(|p| p.signature()) != Some(recipe.native_profile.signature()) {
-        return Err("ITF native mode requires the proven U32 big-endian wire profile".into());
-    }
-    log::debug!("[USB] ITF mode transaction interface=1 alt={} native={} forceReset={}",
-        candidate.alt_setting, mode == DsdTransportMode::Native, recipe.conditions.force_interface_reset);
-    // Every transaction issues SET_INTERFACE, including models requiring a
-    // forced re-prepare after stop; no cached-alt fast path can suppress it.
-    // Arm before the write: a control error can follow a device-side change.
-    *claimed.itf_mode.pending.lock() = Some(recipe);
-    match itf_switch(&mut UsbfsItfIo { fd: claimed.device_fd }, recipe) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // itf_switch already attempted bounded rollback. Prevent duplicate
-            // writes from cleanup/Drop if the device detached during rollback.
-            *claimed.itf_mode.pending.lock() = None;
-            Err(error)
-        }
-    }
+pub(super) fn apply_itf_mode(_claimed: &ClaimedHandle, _candidate: &IsoStreamCandidate,
+                             _mode: DsdTransportMode) -> Result<(), String> {
+    Ok(())
 }
 
-/// Device-specific class-control settle guard used by the clock/control layer.
-pub(super) fn itf_class_control_delay(handle: &DeviceHandle<Context>) {
-    if identity(&handle.device()).is_some_and(|id| itf::model(id).is_some()) {
-        thread::sleep(Duration::from_millis(20));
-    }
-}
+pub(super) fn itf_class_control_delay(_handle: &DeviceHandle<Context>) {}
 
-pub(super) fn itf_interface_delay(device: &Device<Context>, interface: u8) {
-    if interface == 1 && identity(device).and_then(itf::model).is_some_and(|m| m.interface_delay) {
-        thread::sleep(Duration::from_millis(50));
-    }
-}
+pub(super) fn itf_interface_delay(_device: &Device<Context>, _interface: u8) {}
 
 fn identity(device: &Device<Context>) -> Option<UsbIdentity> {
     let d = device.device_descriptor().ok()?;
@@ -471,11 +364,13 @@ fn identity(device: &Device<Context>) -> Option<UsbIdentity> {
     })
 }
 
+#[cfg(test)]
 fn eligible(format: &StreamingInterfaceFormat) -> bool {
     !format.is_uac1 && format.channels == 2 && format.subslot_size == 4
         && format.bit_resolution > 0 && format.bit_resolution <= 32
 }
 
+#[cfg(test)]
 fn compatibility_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFormat,
                          eligible_alts: usize) -> Option<NativeDsdProfile> {
     let (target_alt, big_endian) = builtin_layout(id)?;
@@ -484,19 +379,13 @@ fn compatibility_profile(id: UsbIdentity, alt: u8, format: &StreamingInterfaceFo
         origin: NativeDsdOrigin::DeviceCompatibility })
 }
 
-/// Resolve once per alternate, identically for capability reporting and selection.
-/// Standard RAW_DATA (bit 31) alone is deliberately insufficient evidence.
-pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescriptor,
+/// Admit the shipped Dawn Pro dialect and explicit host policy identically
+/// for capability reporting and selection. RAW_DATA alone is insufficient.
+pub(super) fn resolve_native_dsd(device: &Device<Context>, _config: &ConfigDescriptor,
                                 alt: &rusb::InterfaceDescriptor,
                                 format: &StreamingInterfaceFormat) -> Option<NativeDsdProfile> {
     let id = identity(device)?;
-    if itf::model(id).is_some() {
-        // A host hint cannot bypass this family's required mode protocol.
-        return itf_descriptor_recipe(device, config, alt, format, itf::Mode::NativeDsd)
-            .map(|recipe| recipe.native_profile);
-    }
-    if (format.is_uac1 && playback_designs_layout(id, alt.setting_number()).is_none())
-        || alt.setting_number() == 0 || format.channels == 0
+    if format.is_uac1 || alt.setting_number() == 0 || format.channels == 0
         || format.bit_resolution == 0 || format.subslot_size == 0
         || format.bit_resolution > format.subslot_size.saturating_mul(8) { return None; }
     let out_count = |d: &rusb::InterfaceDescriptor| d.endpoint_descriptors().filter(|ep|
@@ -504,74 +393,16 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
         && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
         && (1..=16).contains(&ep.interval()) && ep.max_packet_size() & 0x07ff > 0).count();
     if out_count(alt) != 1 { return None; }
-    // A host native hint cannot reinterpret this source-backed DoP alternate.
-    if id.vendor == 0x23ba && id.product < 0x0110 && alt.setting_number() == 1 {
-        return None;
-    }
-    let settings = settings();
-    let playback_designs = playback_designs_layout(id, alt.setting_number()).and_then(|width| {
-        let count = config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
-            d.class_code() == USB_CLASS_AUDIO && d.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
-            && d.setting_number() == alt.setting_number() && out_count(d) == 1
-            && parse_android_streaming_interface_format(d).is_some_and(|f|
-                f.channels == 2 && f.subslot_size == width && f.bit_resolution > 0
-                && f.bit_resolution <= width * 8)).count();
-        playback_designs_profile(id, alt.setting_number(), format, count)
-    });
-    if let Some(mut profile) = playback_designs {
-        if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, profile.word_bytes) {
-            if !matches!(width, 1 | 2 | 4) { return None; }
-            profile.word_bytes = width;
-            profile.origin = NativeDsdOrigin::HostPolicy;
-        }
-        let (big_endian, bit_reverse) = settings.native_dsd_order(id.vendor, id.product, profile.big_endian);
-        profile.big_endian = big_endian;
-        profile.bit_reverse |= bit_reverse;
-        return Some(profile);
-    }
-    if let Some((target_alt, _)) = builtin_layout(id) {
-        let count = config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
-            d.class_code() == USB_CLASS_AUDIO && d.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
-            && d.setting_number() == target_alt && out_count(d) == 1
-            && parse_android_streaming_interface_format(d).is_some_and(|f| eligible(&f))).count();
-        if let Some(mut profile) = compatibility_profile(id, alt.setting_number(), format, count) {
-            if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, format.subslot_size) {
-                if !matches!(width, 1 | 2 | 4) { return None; }
-                profile.word_bytes = width;
-                profile.origin = NativeDsdOrigin::HostPolicy;
-            }
-            (profile.big_endian, profile.bit_reverse) = settings.native_dsd_order(id.vendor, id.product, profile.big_endian);
-            return Some(profile);
-        }
-    }
-    // A vendor RAW_DATA rule supplies no interface identity. Require a unique
-    // UAC2 playback layout at this alternate and capacity for a whole stereo
-    // U32 frame. Maximum packet size is a ceiling, not a frame-length promise.
-    let raw_out_count = |d: &rusb::InterfaceDescriptor| d.endpoint_descriptors().filter(|ep|
-        ep.direction() == Direction::Out && ep.transfer_type() == TransferType::Isochronous
-        && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
-        && (1..=16).contains(&ep.interval())
-        && raw_packet_geometry(ep.max_packet_size(), device.speed())).count();
-    if alt.protocol_code() == 0x20 && raw_out_count(alt) == 1 {
-        let count = config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
-            d.class_code() == USB_CLASS_AUDIO && d.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
-            && d.protocol_code() == 0x20 && d.setting_number() == alt.setting_number()
-            && raw_out_count(d) == 1
-            && parse_android_streaming_interface_format(d).is_some_and(|f|
-                raw_data_profile(id, &f, 1).is_some())).count();
-        if let Some(mut profile) = raw_data_profile(id, format, count) {
-            if let Some((width, _, _)) = settings.native_dsd_policy(id.vendor, id.product, profile.word_bytes) {
-                if !matches!(width, 1 | 2 | 4) { return None; }
-                profile.word_bytes = width;
-                profile.origin = NativeDsdOrigin::HostPolicy;
-            }
-            (profile.big_endian, profile.bit_reverse) = settings.native_dsd_order(id.vendor, id.product, profile.big_endian);
-            return Some(profile);
-        }
-    }
-    // Existing Dawn Pro and explicit host policy retain their private dialect.
-    // Bit 3 is A-law in standard UAC2; only scoped policy may reinterpret it.
-    let (word_bytes, big_endian, bit_reverse) = settings.native_dsd_policy(id.vendor, id.product, format.subslot_size)?;
+    release_native_dsd_policy(id, format, &settings())
+}
+
+// AP80 admission is handled by scan's exact shipped configuration/interface/alt
+// and endpoint predicate. Standard ADC3 D5 is descriptor-defined in the parser.
+// Compatibility tables alone do not authorize another legacy profile here.
+fn release_native_dsd_policy(id: UsbIdentity, format: &StreamingInterfaceFormat,
+                             policy: &crate::settings::Settings) -> Option<NativeDsdProfile> {
+    let (word_bytes, big_endian, bit_reverse) =
+        policy.native_dsd_policy(id.vendor, id.product, format.subslot_size)?;
     let raw_or_private = format.uac2_formats.is_some_and(|bits| bits & (0x8000_0000 | 8) != 0)
         || format.format_tag == FORMAT_TAG_DSD;
     if !raw_or_private || !matches!(word_bytes, 1 | 2 | 4) { return None; }
@@ -604,6 +435,42 @@ mod tests {
             channels: 2, subslot_size: 4, bit_resolution: 32, terminal_link: None,
             is_uac1: false, sample_rate_ranges: vec![] }
     }
+    #[test]
+    fn release_admission_keeps_shipped_policy_and_defers_legacy_tables() {
+        use crate::{capabilities::DeviceInfo, config::DacConfig, settings::Settings};
+        let mut raw = format();
+        raw.uac2_formats = Some(0x8000_0000);
+        // Pure source compatibility remains testable, but it is not release
+        // admission: builtin, vendor RAW, Playback Designs and ITF families.
+        for (vendor, product) in [(0x16d0, 0x071a), (0x2622, 0x0061),
+            (0x22e8, 0xca10), (0x32bb, 0x0004), (0x20b1, 0x9999),
+            (0x23ba, 0x010f), (0x0644, 0x8044), (0x154e, 0x3005),
+            (0xc502, 0x0072), (0x262a, 0x0001)] {
+            let id = UsbIdentity { vendor, product, revision: 0x019b };
+            let policy = Settings::for_device(DacConfig::default(),
+                &DeviceInfo::new(vendor, product, "legacy compatibility device"));
+            assert!(release_native_dsd_policy(id, &raw, &policy).is_none());
+        }
+        let dawn_id = UsbIdentity { vendor: 0x2fc6, product: 0xf06a, revision: 0 };
+        let dawn = Settings::for_device(DacConfig::default(),
+            &DeviceInfo::new(dawn_id.vendor, dawn_id.product, "MOONDROP Dawn Pro"));
+        let mut private = format();
+        private.uac2_formats = Some(8);
+        assert_eq!(release_native_dsd_policy(dawn_id, &private, &dawn).unwrap().signature(),
+            (4, true, false));
+        assert!(release_native_dsd_policy(UsbIdentity { product: 0xffff, ..dawn_id },
+            &private, &dawn).is_none());
+        // Explicit host configuration is preserved even for a deferred family,
+        // and provides no authorization for a vendor mode write.
+        let mut host = Settings::default();
+        host.config = DacConfig { dsd_subslot: Some(2),
+            dsd_big_endian: Some(false), ..DacConfig::default() };
+        let teac = UsbIdentity { vendor: 0x0644, product: 0x8044, revision: 0 };
+        assert_eq!(release_native_dsd_policy(teac, &raw, &host).unwrap().signature(),
+            (2, false, false));
+        assert!(release_native_dsd_policy(teac, &format(), &host).is_none());
+    }
+
     #[test]
     fn v73_raw_exact_rows_override_vendor_defaults() {
         let mut raw = format(); raw.uac2_formats = Some(0x8000_0000);

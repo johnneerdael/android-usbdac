@@ -52,6 +52,14 @@ link checks passed. The AAR and sample contain matching native
 libraries for all four ABIs. The local pre-release AAR SHA-256 is
 `d77919bb30b00ad1fa21b7fcf600ede1100d6c1b38aa3a4b32090539417ed2c2`.
 
+For the shared release, only the device profiles from 0.1.3 can be
+admitted. Standard discovery and host-supplied configuration use the
+shared transport. The [candidate list](device-compatibility-candidates.md)
+records device profiles scheduled for later selection. Rust workspace
+tests, Kotlin unit tests, the four-ABI Android and Maven staging builds,
+and SDK local link checks passed after scoping the release. The scoped
+local AAR SHA-256 is `4eca42bce0cafbc9be2baa4eb1b36164c3b39f6f1b58b6ebad524e81f9fb7621`.
+
 | Area | usbdac 0.1.1 | Implementation target | Acceptance evidence |
 |---|---|---|---|
 | Native DSD | Native and DoP packetization exist. Discovery truncates UAC2 format bits to 16 and applies current byte/bit order quirks globally. | Exact built-in device and firmware rules, endpoint-local native layouts, raw Type I detection, and typed known-device mode transitions. Preserve independently usable PCM and DoP alternatives. | Compare format negotiation and emitted wire bytes across DSD word and URB boundaries. Verify matching and nonmatching revisions, hardware mode transitions and PCM restoration. |

@@ -126,7 +126,7 @@ that path is not directly portable to an Android USB audio session.
 
 Released 0.1.3 already contains standard USB PCM/DoP/native transport machinery,
 explicit feedback handling, and the existing MOONDROP Dawn Pro
-`2fc6:f09a` and Fosi DS2 `262a:0001` built-ins. The parity branch adds the
+`2fc6:f06a` and Fosi DS2 `262a:0001` built-ins. The parity branch adds the
 following model-specific coverage. A physical evidence gap below is a later
 acceptance task, not an unimplemented device profile.
 

@@ -51,7 +51,7 @@ technically, and in plain terms. In short:
 | Honesty | Bit-perfect flag with a named reason when false; chosen clock and pacing reported | An indicator that goes out when the sound is compromised, and says why |
 | Outputs | Direct USB, Android-managed, and AAudio exclusive behind one interface | One integration serves phones with dongles and players with built-in DACs |
 | Capture and duplex | Explicit PCM input APIs, shared endpoint ownership, channel layouts and separate loss/overrun reporting | Record input alone or alongside playback without stalling USB pacing |
-| Hardware routing | Session-bound standard controls and guarded exact-model vendor operations, with readback and rollback | Expose the controls the device can prove it supports |
+| Hardware routing | Session-bound USB Audio Class controls with readback and rollback | Expose the controls the device can prove it supports |
 | Output choice | An `OutputSelector` that detects the DAC, permission, route and what the platform grants, and returns one ready output with the reason and the guarantee | The app asks for the best way to play and is told what it got and why |
 | Conversion | Optional resampling, bit-depth and mono-to-stereo, always labelled | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
 | Packaging | Rust core, Kotlin API, sample app, tests, published builds | A dependency and a few dozen lines instead of writing a USB driver |

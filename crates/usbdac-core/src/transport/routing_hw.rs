@@ -1,4 +1,4 @@
-//! Session-bound standard UAC routing and explicitly selected vendor controls.
+//! Session-bound standard UAC routing with dormant unpublished vendor controls.
 
 use super::*;
 use crate::error::OrControl;
@@ -8,6 +8,19 @@ use crate::routing::{
     TransactionError, MAX_ROUTE_CHANGES,
 };
 use std::collections::BTreeMap;
+
+// Release boundary: vendor routing was not shipped by the shared ALSA baseline.
+// This private compile-time fence has no feature, host-claim or runtime opt-in.
+const VENDOR_ROUTING_RELEASED: bool = false;
+const VENDOR_ROUTING_UNAVAILABLE: &str = "proprietary vendor routing is not available in this release";
+
+fn require_vendor_routing_release() -> Result<(), RoutingSessionError> {
+    if VENDOR_ROUTING_RELEASED {
+        Ok(())
+    } else {
+        Err(RoutingSessionError::UnsupportedTopology(VENDOR_ROUTING_UNAVAILABLE.into()))
+    }
+}
 
 const MAX_TOPOLOGY_DEPTH: usize = 16;
 const MAX_RECORDED_ROUTES: usize = 1024;
@@ -121,6 +134,7 @@ fn djm_route_identity(
 
 pub(crate) fn djm_discover(shared: &crate::dac::DacShared)
     -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     shared.ensure_open().map_err(RoutingSessionError::Session)?;
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
@@ -139,6 +153,7 @@ pub(crate) fn djm_apply(
     key: crate::pioneer::DjmControlKey,
     option: u8,
 ) -> Result<(), RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     shared.ensure_open().map_err(RoutingSessionError::Session)?;
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
@@ -186,6 +201,7 @@ pub(super) fn scarlett_claim_interface(
     vendor: u16,
     product: u16,
 ) -> Option<u8> {
+    if !VENDOR_ROUTING_RELEASED { return None; }
     scarlett_endpoint(config, vendor, product).map(|(interface, _)| interface)
 }
 
@@ -194,6 +210,7 @@ pub(crate) fn scarlett_preflight(
     fd: RawFd,
     info: &crate::DeviceInfo,
 ) -> Result<Option<crate::scarlett::ReadCapability>, Error> {
+    if !VENDOR_ROUTING_RELEASED { return Ok(None); }
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         return Err(Error::PlatformUnsupported);
     }
@@ -323,6 +340,7 @@ fn scarlett_capability(
 /// Descriptor-only read capability; does not initialize the vendor protocol.
 pub(crate) fn scarlett_discover(
 ) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
+    if !VENDOR_ROUTING_RELEASED { return Ok(None); }
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -341,11 +359,13 @@ struct UsbScarlettIo<'a> {
 impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
     type Error = String;
     fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         self.device
             .feature_unit_control(0xa1, 0, 0, u16::from(self.interface), bytes)
             .map_err(|e| e.to_string())
     }
     fn prepare_notifications(&mut self) -> Result<(), String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         let deadline = Instant::now() + Duration::from_millis(20);
         // Drain outstanding ACKs before either initialization request. The
         // synchronous interrupt helper owns/retires its transfer before return.
@@ -369,6 +389,7 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
         Err("Scarlett notification drain exceeded its bounded packet budget".into())
     }
     fn send_request(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett request refused".into());
         }
@@ -382,11 +403,13 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
         bytes: &mut [u8; 8],
         timeout: Duration,
     ) -> Result<usize, String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         self.handle
             .read_interrupt(self.endpoint, bytes, timeout.max(Duration::from_millis(1)))
             .map_err(|e| e.to_string())
     }
     fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett response refused".into());
         }
@@ -399,6 +422,7 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
 /// Explicit vendor read: initialize only the already claimed, exact candidate,
 /// then admit firmware and read mux-zero/mixer state. Never SET_MUX/SET_MIX.
 pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -484,6 +508,7 @@ fn with_scarlett_io<T>(
 
 /// Read only firmware-defined FCP topology on a proven, explicitly claimed idle owner.
 pub(crate) fn fcp_read() -> Result<crate::scarlett::FcpReadback, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -571,6 +596,7 @@ struct UsbGen1Io<'a> { device: &'a UsbDevice, interface: u8 }
 impl crate::scarlett::Gen1Io for UsbGen1Io<'_> {
     type Error = String;
     fn read(&mut self, entity: u8, value: u16) -> Result<i16, String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         let mut data = [0u8; 2];
         let n = self.device.feature_unit_control(0xa1, 1, value,
             (u16::from(entity) << 8) | u16::from(self.interface), &mut data)
@@ -579,6 +605,7 @@ impl crate::scarlett::Gen1Io for UsbGen1Io<'_> {
         Ok(i16::from_le_bytes(data))
     }
     fn write(&mut self, entity: u8, value: u16, data: i16) -> Result<(), String> {
+        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
         let mut bytes = data.to_le_bytes();
         let n = self.device.feature_unit_control(0x21, 1, value,
             (u16::from(entity) << 8) | u16::from(self.interface), &mut bytes)
@@ -636,6 +663,7 @@ fn check_gen1_after(device: &UsbDevice, configuration: u8, descriptors: &[u8])
 }
 
 pub(crate) fn scarlett_gen1_read() -> Result<crate::scarlett::Gen1Readback, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -676,6 +704,7 @@ fn merge_gen1_provenance(original: &crate::scarlett::Gen1Readback,
 
 pub(crate) fn scarlett_gen1_apply(expected: &crate::scarlett::Gen1Readback,
     edits: &[crate::scarlett::Gen1Edit]) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -772,6 +801,7 @@ pub(crate) fn fcp_apply(
     routes: &[crate::scarlett::FcpRouteEdit],
     mixes: &[crate::scarlett::FcpMixEdit],
 ) -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -892,6 +922,7 @@ fn finish_fcp_hand_back() {
 pub(crate) fn scarlett_mix_apply(
     edit: &crate::scarlett::MixRowEdit,
 ) -> Result<crate::scarlett::MixWriteReport, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -957,6 +988,7 @@ pub(crate) fn scarlett_mix_apply(
 /// Explicit capability probe and complete per-bank read; legacy reads do not
 /// invoke these optional commands, so unsupported replies leave those usable.
 pub(crate) fn scarlett_mux_read() -> Result<crate::scarlett::MuxSnapshot, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -978,6 +1010,7 @@ pub(crate) fn scarlett_mux_read() -> Result<crate::scarlett::MuxSnapshot, Routin
 pub(crate) fn scarlett_mux_apply(
     edit: &crate::scarlett::MuxEdit,
 ) -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+    require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -1038,6 +1071,12 @@ pub(crate) fn scarlett_mux_apply(
 }
 
 fn finish_scarlett_hand_back() {
+    if !VENDOR_ROUTING_RELEASED {
+        ORIGINAL_GEN1.lock().take();
+        ORIGINAL_FCP.lock().take();
+        ORIGINAL_SCARLETT.lock().take();
+        return;
+    }
     finish_gen1_hand_back();
     finish_fcp_hand_back();
     let Some(record) = ORIGINAL_SCARLETT.lock().take() else {
@@ -2273,6 +2312,21 @@ pub(super) fn finish_routing_hand_back() {
 mod tests {
     use super::*;
     use crate::routing::Entity;
+
+    #[test]
+    fn shared_release_refuses_vendor_reads_before_usb_session_access() {
+        assert!(!VENDOR_ROUTING_RELEASED);
+        assert!(matches!(require_vendor_routing_release(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        assert!(scarlett_discover().unwrap().is_none());
+        // A deliberately invalid fd proves Android/native preflight does not
+        // wrap or inspect a device before refusing the unpublished capability.
+        let info = crate::DeviceInfo::new(0x1235, 0x8211, "Scarlett");
+        assert!(scarlett_preflight(-1, &info).unwrap().is_none());
+        assert!(matches!(scarlett_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        assert!(matches!(fcp_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        assert!(matches!(scarlett_gen1_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        assert!(matches!(scarlett_mux_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
+    }
 
     #[test]
     fn routing_power_hand_back_preserves_transaction_and_rollback_failures() {

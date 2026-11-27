@@ -1,5 +1,20 @@
-//! Source-proven Pioneer and Roland PCM profiles and narrowly scoped DJM rate programming.
+//! Dormant Pioneer and Roland PCM models; this release admits standard UAC only.
 use super::*;
+
+// Release boundary: these models were not shipped by the shared ALSA baseline.
+// Keep the source models for offline work, with no feature/runtime opt-in.
+const VENDOR_PCM_RELEASED: bool = false;
+
+fn require_vendor_pcm_release() -> Result<(), Error> {
+    if VENDOR_PCM_RELEASED {
+        Ok(())
+    } else {
+        Err(Error::Unsupported {
+            reason: "proprietary vendor PCM is not available in this release".into(),
+            offered: vec![],
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VendorEndpoint {
@@ -177,6 +192,7 @@ fn prove_roland(outputs: u16, inputs: u16, speed: Speed, alts: &[AlternateShape]
 }
 
 pub(super) fn discover(handle: &DeviceHandle<Context>, config: &ConfigDescriptor, speed: Speed) -> Result<Option<VendorPcm>, String> {
+    if !VENDOR_PCM_RELEASED { return Ok(None); }
     let identity = handle.device().device_descriptor().map_err(|e| e.to_string())?;
     if pioneer_model(identity.vendor_id(), identity.product_id()).is_none()
         && roland_channels(identity.vendor_id(), identity.product_id()).is_none() { return Ok(None); }
@@ -229,6 +245,7 @@ impl VendorPcm {
 }
 
 pub(super) fn for_candidate(handle: &DeviceHandle<Context>, candidate: &IsoStreamCandidate) -> Result<Option<VendorPcm>, String> {
+    if !VENDOR_PCM_RELEASED { return Ok(None); }
     let device = handle.device();
     let config = device.active_config_descriptor().map_err(|e| e.to_string())?;
     let Some(profile) = discover(handle, &config, resolve_device_speed(&device))? else { return Ok(None); };
@@ -271,6 +288,7 @@ fn rate_request(profile: &VendorPcm, rate: u32) -> Result<(u8, u8, u16, u16, [u8
 /// Program only the five source-proven DJM clocks after their active stream is owned.
 /// Successful programming is not clock verification: the caller must observe IN cadence.
 pub(super) fn program_rate(claimed: &ClaimedHandle, profile: &VendorPcm, rate: u32) -> Result<(), Error> {
+    require_vendor_pcm_release()?;
     let (request_type, request, value, index, bytes) = rate_request(profile, rate)?;
     if !profile.claims_match(&claimed.claimed_interfaces) {
         return Err(Error::Claim("vendor PCM requires exactly its proven interface claims".into()));
@@ -302,6 +320,12 @@ pub(super) fn program_rate(claimed: &ClaimedHandle, profile: &VendorPcm, rate: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_release_does_not_admit_or_program_vendor_pcm() {
+        assert!(!VENDOR_PCM_RELEASED);
+        assert!(matches!(require_vendor_pcm_release(), Err(Error::Unsupported { .. })));
+    }
 
     const PROGRAMMED_MIXERS: &[(u16, u16, u16, u16, u8, u8)] = &[
         (0x2b73, 0x000a, 10, 12, 1, 0x82),

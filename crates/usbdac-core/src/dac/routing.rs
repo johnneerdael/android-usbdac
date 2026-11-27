@@ -4,6 +4,8 @@ use crate::routing::{
 };
 use crate::transport::routing_hw;
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
 impl Dac {
     /// Discover source-backed DJM choices on an exact, idle vendor PCM session.
     /// Discovery leaves the mixer's routing intact.
@@ -14,6 +16,8 @@ impl Dac {
         routing_hw::djm_discover(&self.shared)
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Send one explicitly selected DJM option after fresh model, configuration,
     /// claim and idle-alternate proof. `option` is a listed zero-based option ID.
     /// Success confirms USB acknowledgement. The mixer's current routing
@@ -29,6 +33,8 @@ impl Dac {
         routing_hw::djm_apply(&self.shared, model, configuration, key, option)
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Read source-backed first-generation Focusrite controls using the already
     /// claimed AudioControl interface while idle. No vendor claim or probe write.
     /// Hardware behavior remains physically unvalidated.
@@ -37,6 +43,8 @@ impl Dac {
         routing_hw::scarlett_gen1_read()
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Apply bounded typed Gen1 controls against a fresh readback on the live DAC.
     /// Verify each write and restore attempted controls on failure. Configured
     /// hand-back preserves external edits; no clock, preamp or persistent writes.
@@ -46,6 +54,8 @@ impl Dac {
         routing_hw::scarlett_gen1_apply(expected, edits)
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Inspect the exact Scarlett read candidate and required vendor claim,
     /// without initializing its protocol or reading proprietary state.
     pub fn scarlett_routing_capability(
@@ -57,6 +67,8 @@ impl Dac {
         routing_hw::scarlett_discover()
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Initialize and read source-backed Scarlett routing while idle. Requires
     /// the host's explicit vendor-interface claim. Exact-model firmware and live geometry
     /// guards apply before mux/mix controls become available. No route, volume or persistent setting
@@ -70,6 +82,8 @@ impl Dac {
         routing_hw::scarlett_read()
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Read firmware-defined modern Focusrite FCP pins, mux banks and mix rows.
     /// Requires idle ownership and an explicit exact-model vendor-interface claim.
     /// Does not send persistent configuration commands.
@@ -78,6 +92,8 @@ impl Dac {
         routing_hw::fcp_read()
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Apply typed firmware pin routes and mixer coefficients against a fresh readback.
     /// Requires idle ownership and explicit vendor claim. Verify every affected target,
     /// restore attempted targets on failure, and preserve external edits at hand-back.
@@ -89,6 +105,8 @@ impl Dac {
         routing_hw::fcp_apply(expected, routes, mixes)
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Apply bounded half-dB replacements to one complete Scarlett mixer row.
     /// Requires fresh expected raw coefficients, idle ownership and the explicit
     /// vendor claim. Verifies the whole row and attempts verified restoration
@@ -105,6 +123,8 @@ impl Dac {
         routing_hw::scarlett_mix_apply(edit)
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Probe optional per-bank support and read every raw bank including padding.
     /// An unsupported response never enables writes; legacy reads remain usable.
     pub fn scarlett_mux_read(&self) -> Result<crate::scarlett::MuxSnapshot, RoutingSessionError> {
@@ -112,6 +132,8 @@ impl Dac {
         routing_hw::scarlett_mux_read()
     }
 
+    /// Unavailable in this release; retained for source compatibility.
+    ///
     /// Apply explicit bank edits only after a fresh complete capability/geometry
     /// read equals the expected snapshot. Restore each attempted raw bank after
     /// any uncertain write. Configured hand-back preserves external edits.
