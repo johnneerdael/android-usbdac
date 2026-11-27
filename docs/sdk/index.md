@@ -36,7 +36,7 @@ and [how to inspect the selected pacing](controls.md#diagnostics-the-clock-and-t
 
 ## Status
 
-This guide covers usbdac 0.1.2.
+This guide covers usbdac 0.1.3.
 
 - **Automated checks pass.** Rust and Kotlin tests cover the feedback changes without a DAC. CI builds the library and sample app for four processor types. [Evidence and status](evidence.md) records hardware coverage.
 - **Direct USB PCM has played on a OnePlus 15.** The iBasso DC04U ran in Flick. The Hidizs AP80 Pro-X ran in a development build of the Kotlin SDK sample. The AP80 Pro-X also verified native DSD64, DSD128 and DSD256 and a return to PCM. DoP, implicit feedback, Android-managed output and AAudio remain covered by automation. [Hardware status](evidence.md#hardware-status)
