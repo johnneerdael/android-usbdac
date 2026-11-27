@@ -120,6 +120,18 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 - Playback only; UAC 1.0/2.0; no UAC 3.0.
 - The host owns USB permission, `claimInterface` and the file descriptor.
 
+## Releases
+
+Library changes merged to `main` start the Release workflow. It advances the
+patch version, builds and tests a versioned commit, publishes the Rust crate
+and Android AAR, and creates the GitHub Release with its downloads. A merge
+that declares a higher version can select the next minor or major release.
+Documentation-only changes deploy through the Docs workflow.
+
+Use **Actions → Release → Run workflow** to build an explicit version, or
+rerun the original Actions run to retry an automatic release from its
+reserved commit.
+
 ## Build
 
 ```sh
