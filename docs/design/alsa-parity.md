@@ -122,6 +122,33 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `58db622e5667fd815c70297eb7c2f10f83f537b2faef8a5ac40d2c6f27865129`.
 
+### Sample-rate proof after endpoint activation
+
+For UAC1, configure advertised endpoint sampling controls after
+activating the selected alternate and read the current rate back.
+Acknowledging the write can also mean the device rounded the request.
+A positive mismatch refuses playback. An explicitly uncontrolled PCM
+endpoint can instead use an exact fixed descriptor rate or an eligible
+host-paced rate. Report a device rate only when the endpoint actually
+returns it. UAC1 Type I continuous descriptors provide inclusive
+integer-Hz rate ranges. [USB-IF UAC1 §§4.6.1.2 and 5.2.3.2.3.1](https://www.usb.org/sites/default/files/audio10.pdf), [ALSA UAC1 sample-rate control](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L464-L519)
+
+For full UAC3 playback, the verified post-activation root clock also
+supplies the expectation for live AudioControl notifications on
+synchronous, adaptive, and implicit-feedback routes. Explicit-feedback
+timebase calibration retains its own eligibility conditions.
+
+For hardware acceptance, record UAC1 activation, the acknowledged
+sampling-frequency request, and the device's current rate before ISO
+audio starts. Exercise an exact reply and a rounded reply. On a full
+UAC3 device, change the root clock during synchronous or adaptive
+playback and verify the existing notification-based failure path.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `e3a11ce4b524cb82a9c3cc3d81b0cc86162665bbcf24d961621c7ca6fbc3bcf3`.
+
 ## Channel layout and hardware routing
 
 Expose descriptor channel labels alongside count and preserve wire order in capture and playback. Distinguish spatial positions from unnamed channels. Treat unsupported conversion requests as typed failures. Model class selectors and mixer crosspoints as typed nodes and writable edges. Probe control readability and writability before exposing them, use protocol-specific CUR/RANGE encodings, verify writes and roll back partially applied route sets where supported. Device topology and vendor routing are distinct capabilities. Start vendor integration with known device/firmware identities and read-only route discovery, then implement verified changes for supported models. ALSA's Scarlett Gen 2–4 families encode generation/model differences, hardware ports, mixer/mux data and control transactions. Plan per-family implementations with exact evidence rather than forwarding arbitrary messages through the public API. [ALSA USB mixer](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer.c), [ALSA Scarlett controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_scarlett2.c)

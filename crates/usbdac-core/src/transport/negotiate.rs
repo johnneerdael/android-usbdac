@@ -94,7 +94,7 @@ pub(super) fn negotiate_playback_format(
         apply_itf_mode(&claimed_handle, &candidate, requested_format.dsd_transport)
             .map_err(Error::Transfer)?;
 
-        if adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)?.is_some() {
+        if !candidate.is_uac1 && adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)?.is_some() {
             let route = negotiate_adc3_clock(&claimed_handle, &candidate, requested_format.sample_rate)
                 .map_err(Error::Transfer)?;
             clock_choice = route.choice.clone();
@@ -105,11 +105,17 @@ pub(super) fn negotiate_playback_format(
             set_clock_verification(true, true, true, Some(requested_format.sample_rate));
             return Ok(requested_format);
         }
-        select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
-            .map_err(Error::Transfer)?;
-        let clock = candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
-            .map_err(Error::Transfer)?
-            .map(|(clock, choice)| { clock_choice = Some(choice); clock });
+        // UAC1 owns endpoint rate controls, even in a configuration that also
+        // contains UAC2 functions. Never bind another function's clock leaf.
+        let clock = if candidate.is_uac1 {
+            None
+        } else {
+            select_requested_clock_route(&claimed_handle, &candidate, requested_format.sample_rate)
+                .map_err(Error::Transfer)?;
+            candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
+                .map_err(Error::Transfer)?
+                .map(|(clock, choice)| { clock_choice = Some(choice); clock })
+        };
 
         let mut effective_format = requested_format;
         let mut dac_mode = DacMode::FullControl;
@@ -265,45 +271,14 @@ pub(super) fn negotiate_playback_format(
                 last_message = Some(message);
             }
         } else if candidate.is_uac1 {
-            match set_uac1_sampling_frequency(
-                &claimed_handle.handle,
-                candidate.interface_number,
+            // UAC1 rate control belongs to the active streaming endpoint.
+            // Negotiation neither writes it nor claims a live rate readback.
+            dac_mode = DacMode::FixedClock;
+            set_clock_status(Some(ClockStatus { reported_sample_rate: None }));
+            last_message = Some(format!(
+                "UAC 1.0 device: endpoint 0x{:02x} rate evidence awaits streaming alternate activation",
                 candidate.endpoint_address,
-                requested_format.sample_rate,
-            ) {
-                Ok(()) => {
-                    dev_eprintln!(
-                        "[USB] UAC1 SET_CUR: endpoint=0x{:02x} rate={}Hz",
-                        candidate.endpoint_address,
-                        requested_format.sample_rate
-                    );
-                    dac_mode = DacMode::FixedClock;
-                    reported_rate = Some(requested_format.sample_rate);
-                    last_message = Some(format!(
-                        "UAC 1.0 device: set sampling frequency to {} Hz on endpoint 0x{:02x}",
-                        requested_format.sample_rate, candidate.endpoint_address
-                    ));
-                }
-                Err(e) => {
-                    dev_eprintln!(
-                        "[USB] UAC1 SET_CUR failed for endpoint=0x{:02x}: {}",
-                        candidate.endpoint_address,
-                        e
-                    );
-                    // Defer the verdict: many UAC1 DACs (FiiO BR13) STALL every
-                    // SET_CUR encoding while the streaming alt setting is
-                    // inactive (alt 0). The stream-open path re-issues SET_CUR
-                    // after the alt setting is live and refuses there if it
-                    // still fails — bailing here would abort before the only
-                    // attempt that can succeed.
-                    dac_mode = DacMode::AdaptiveStreaming;
-                    reported_rate = Some(requested_format.sample_rate);
-                    last_message = Some(format!(
-                        "UAC 1.0 device: rate set on endpoint 0x{:02x} deferred ({}); retrying after alt setting is active",
-                        candidate.endpoint_address, e
-                    ));
-                }
-            }
+            ));
         } else if let Some(actual_rate) = choose_adaptive_sample_rate(
             requested_format.sample_rate,
             None,
@@ -366,7 +341,9 @@ pub(super) fn negotiate_playback_format(
                 return Err(Error::ImplicitFeedbackUnsupported);
             }
         }
-        reported_rate = reported_rate.or(Some(effective_format.sample_rate));
+        if !candidate.is_uac1 {
+            reported_rate = reported_rate.or(Some(effective_format.sample_rate));
+        }
         set_effective_playback_format(effective_format);
         set_dac_mode(dac_mode);
         set_clock_verification(

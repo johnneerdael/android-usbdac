@@ -304,23 +304,156 @@ pub(super) fn set_sampling_frequency(
     Ok(())
 }
 
+/// Descriptor evidence is independent of whether a legacy SET_CUR is ACKed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Uac1PlaybackRateProfile {
+    pub(super) sampling_control: Option<bool>,
+    pub(super) fixed_at_request: bool,
+    pub(super) host_paced_at_request: bool,
+}
+
+pub(super) fn uac1_playback_rate_profile(
+    claimed: &ClaimedHandle,
+    candidate: &IsoStreamCandidate,
+    rate: u32,
+) -> Result<Uac1PlaybackRateProfile, String> {
+    if !candidate.is_uac1 || !claimed.claimed_interfaces.contains(&candidate.interface_number) {
+        return Err("UAC1 playback rate interface is not claimed".into());
+    }
+    // Cached descriptors only: do not introduce control IO into evidence lookup.
+    let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
+    if config.number() != candidate.configuration_number {
+        return Err("UAC1 playback configuration changed".into());
+    }
+    for interface in config.interfaces() {
+        for alt in interface.descriptors() {
+            if alt.interface_number() != candidate.interface_number || alt.setting_number() != candidate.alt_setting {
+                continue;
+            }
+            if alt.class_code() != USB_CLASS_AUDIO || alt.sub_class_code() != 2 || alt.protocol_code() != 0 {
+                return Err("UAC1 playback alternate no longer describes AudioStreaming 1.0".into());
+            }
+            let format = parse_android_streaming_interface_format(&alt);
+            let matching_format = format.as_ref().filter(|format| format.is_uac1
+                && format.format_tag == candidate.format_tag && format.channels == candidate.channels
+                && format.subslot_size == candidate.subslot_size && format.bit_resolution == candidate.bit_resolution);
+            for ep in alt.endpoint_descriptors() {
+                if ep.address() != candidate.endpoint_address { continue; }
+                if ep.direction() != Direction::Out || ep.transfer_type() != TransferType::Isochronous
+                    || !matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
+                    || ep.sync_type() != candidate.sync_type {
+                    return Err("UAC1 playback endpoint is not the selected isochronous OUT endpoint".into());
+                }
+                // A truncated frequency list must not turn a multi-rate alt into
+                // apparently fixed-rate evidence. Use the original AS ranges,
+                // never candidate.sample_rates (which selection may have filled).
+                let ranges = if uac1_complete_rate_descriptor(alt.extra()) {
+                    matching_format.map(|format| format.sample_rate_ranges.as_slice()).unwrap_or(&[])
+                } else { &[] };
+                return Ok(uac1_rate_profile(ep.extra().unwrap_or(&[]), ep.sync_type(), ranges, rate));
+            }
+            return Err("UAC1 playback endpoint disappeared".into());
+        }
+    }
+    Err("UAC1 playback alternate disappeared".into())
+}
+
+fn uac1_complete_rate_descriptor(extra: &[u8]) -> bool {
+    let mut formats = 0;
+    let mut generals = 0;
+    let mut at = 0;
+    while at < extra.len() {
+        if extra.len() - at < 2 || extra[at] < 2 || usize::from(extra[at]) > extra.len() - at { return false; }
+        let d = &extra[at..at + usize::from(extra[at])];
+        if d.get(1) == Some(&USB_DT_CS_INTERFACE) && d.get(2) == Some(&UAC2_AS_GENERAL) {
+            if d.len() != 7 { return false; }
+            generals += 1;
+        }
+        if d.get(1) == Some(&USB_DT_CS_INTERFACE) && d.get(2) == Some(&UAC2_FORMAT_TYPE) {
+            if d.get(3) != Some(&UAC2_FORMAT_TYPE_I) || d.len() < 8 { return false; }
+            if d[4] == 0 || !(1..=4).contains(&d[5]) || d[6] == 0 || u16::from(d[6]) > u16::from(d[5]) * 8 { return false; }
+            let expected = if d[7] == 0 { 14 } else { 8 + usize::from(d[7]) * 3 };
+            if d.len() != expected { return false; }
+            formats += 1;
+        }
+        at += d.len();
+    }
+    formats == 1 && generals == 1
+}
+
+fn uac1_rate_profile(extra: &[u8], sync: SyncType, ranges: &[SamplingFrequencySubrange], rate: u32) -> Uac1PlaybackRateProfile {
+    let mut sampling_control = None;
+    let mut at = 0;
+    let mut seen = false;
+    while at < extra.len() {
+        if extra.len() - at < 2 || extra[at] < 2 || usize::from(extra[at]) > extra.len() - at {
+            sampling_control = None;
+            break;
+        }
+        let d = &extra[at..at + usize::from(extra[at])];
+        if d[1] == 0x25 && d.get(2) == Some(&1) {
+            // Audio 1.0 4.6.1.2 EP_GENERAL is exactly seven bytes; D0
+            // advertises Sampling Frequency Control. D1 is Pitch Control.
+            if seen || d.len() != 7 { sampling_control = None; break; }
+            seen = true;
+            sampling_control = Some(d[3] & 1 != 0);
+        }
+        at += d.len();
+    }
+    // UAC1 continuous descriptors describe inclusive integer-Hz intervals.
+    // Accept historical res=0 and the parser's canonical res=1 locally;
+    // do not change UAC2 RANGE singleton semantics.
+    let valid = !ranges.is_empty() && ranges.iter().all(|r|
+        r.res <= 1 && valid_uac1_rate(r.min) && valid_uac1_rate(r.max) && r.min <= r.max);
+    let supported = valid && valid_uac1_rate(rate) && ranges.iter().any(|r| rate >= r.min && rate <= r.max);
+    Uac1PlaybackRateProfile {
+        sampling_control,
+        fixed_at_request: supported && ranges.iter().all(|r| r.min == rate && r.max == rate),
+        host_paced_at_request: supported && matches!(sync, SyncType::Adaptive | SyncType::Synchronous),
+    }
+}
+
+pub(super) fn uac1_playback_rate_verified(requested: u32, reported: Option<u32>, profile: Uac1PlaybackRateProfile, pcm: bool) -> bool {
+    if !valid_uac1_rate(requested) { return false; }
+    match reported {
+        Some(rate) => valid_uac1_rate(rate) && rate == requested,
+        None => pcm && profile.sampling_control == Some(false)
+            && (profile.fixed_at_request || profile.host_paced_at_request),
+    }
+}
+
+fn valid_uac1_rate(rate: u32) -> bool { (1..=0x7f_ffff).contains(&rate) }
+
+fn decode_uac1_rate(data: [u8; 3], transferred: usize) -> Result<u32, String> {
+    if transferred != 3 { return Err(format!("UAC1 GET_CUR returned {transferred} bytes, expected 3")); }
+    let rate = u32::from_le_bytes([data[0], data[1], data[2], 0]);
+    if !valid_uac1_rate(rate) { return Err(format!("UAC1 GET_CUR returned invalid positive Hz {rate}")); }
+    Ok(rate)
+}
+
+fn check_uac1_write(transferred: usize) -> Result<(), String> {
+    if transferred != 3 { return Err(format!("UAC1 SET_CUR transferred {transferred} bytes, expected 3")); }
+    Ok(())
+}
+
 pub(super) fn set_uac1_sampling_frequency(
     handle: &DeviceHandle<Context>,
     interface_number: u8,
     endpoint_address: u8,
     sample_rate: u32,
 ) -> Result<(), String> {
+    if !valid_uac1_rate(sample_rate) { return Err(format!("Invalid UAC1 sampling frequency {sample_rate}")); }
     let data = [
         (sample_rate & 0xFF) as u8,
         ((sample_rate >> 8) & 0xFF) as u8,
         ((sample_rate >> 16) & 0xFF) as u8,
     ];
 
-    // UAC1 5.2.3.2.3.2: SAM_FREQ_CONTROL SET_CUR is an endpoint request
+    // UAC1 5.2.3.2.3.1: SAM_FREQ_CONTROL SET_CUR is an endpoint request
     // (bmRequestType 0x22, wValue 0x0100, 3-byte LE rate). Real hardware
-    // disagrees on wIndex: the spec form is (interface << 8) | endpoint, but
-    // Linux snd-usb-audio sends the endpoint address alone, and some legacy
-    // firmware only accepts the interface-recipient hybrid. A control STALL
+    // disagrees on wIndex: Linux snd-usb-audio sends the endpoint address
+    // alone, while some devices require the interface in the high byte;
+    // some legacy firmware only accepts the interface-recipient hybrid. A control STALL
     // is auto-cleared before the next SETUP, so failing forms can be tried
     // in sequence. Some devices (FiiO BR13) STALL every form while the
     // streaming alt setting is inactive — the stream-open path retries after
@@ -334,7 +467,7 @@ pub(super) fn set_uac1_sampling_frequency(
         (
             USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_ENDPOINT,
             ((interface_number as u16) << 8) | endpoint_address as u16,
-            "endpoint+interface (spec)",
+            "endpoint+interface (compatibility)",
         ),
         (
             USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
@@ -353,7 +486,8 @@ pub(super) fn set_uac1_sampling_frequency(
             &data,
             Duration::from_secs(1),
         ) {
-            Ok(_) => {
+            Ok(transferred) => {
+                check_uac1_write(transferred)?;
                 dev_eprintln!(
                     "[USB] UAC1 SET_CUR: endpoint=0x{:02x} rate={}Hz accepted wIndex=0x{:04x} ({})",
                     endpoint_address,
@@ -364,6 +498,7 @@ pub(super) fn set_uac1_sampling_frequency(
                 return Ok(());
             }
             Err(error) => {
+                if error == rusb::Error::NoDevice { return Err("UAC1 SET_CUR: no device".into()); }
                 dev_eprintln!(
                     "[USB] UAC1 SET_CUR wIndex=0x{:04x} ({}) stalled: {}",
                     index,
@@ -392,7 +527,7 @@ pub(super) fn get_uac1_sampling_frequency(
         (
             USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_ENDPOINT,
             ((interface_number as u16) << 8) | endpoint_address as u16,
-            "endpoint+interface (spec)",
+            "endpoint+interface (compatibility)",
         ),
     ];
 
@@ -406,8 +541,11 @@ pub(super) fn get_uac1_sampling_frequency(
             &mut data,
             Duration::from_secs(1),
         ) {
-            Ok(transferred) if transferred == data.len() => {
-                let rate = u32::from_le_bytes([data[0], data[1], data[2], 0]);
+            Ok(transferred) => {
+                let rate = match decode_uac1_rate(data, transferred) {
+                    Ok(rate) => rate,
+                    Err(error) => { last_error = format!("{error} (wIndex=0x{index:04x}, {label})"); continue; }
+                };
                 dev_eprintln!(
                     "[USB] UAC1 GET_CUR: endpoint=0x{:02x} reports {}Hz via wIndex=0x{:04x} ({})",
                     endpoint_address,
@@ -417,13 +555,8 @@ pub(super) fn get_uac1_sampling_frequency(
                 );
                 return Ok(rate);
             }
-            Ok(transferred) => {
-                last_error = format!(
-                    "GET_CUR returned {} bytes, expected 3 (wIndex=0x{:04x}, {})",
-                    transferred, index, label
-                );
-            }
             Err(error) => {
+                if error == rusb::Error::NoDevice { return Err("UAC1 GET_CUR: no device".into()); }
                 dev_eprintln!(
                     "[USB] UAC1 GET_CUR wIndex=0x{:04x} ({}) failed: {}",
                     index,
@@ -1769,5 +1902,86 @@ mod uac2_multiplier_control_tests {
         assert_eq!(projected[0].min, 72000);
         assert_eq!(projected[0].max, 144000);
         assert_eq!(projected[0].res, 72000);
+    }
+}
+
+#[cfg(test)]
+mod uac1_playback_rate_tests {
+    use super::*;
+
+    fn fixed() -> Vec<SamplingFrequencySubrange> {
+        vec![SamplingFrequencySubrange { min: 48_000, max: 48_000, res: 0 }]
+    }
+    fn endpoint(control: u8) -> [u8; 7] { [7, 0x25, 1, control, 0, 0, 0] }
+
+    #[test]
+    fn uac1_control_bit_is_endpoint_local_and_exact() {
+        assert_eq!(uac1_rate_profile(&endpoint(0), SyncType::Asynchronous, &fixed(), 48_000).sampling_control, Some(false));
+        assert_eq!(uac1_rate_profile(&endpoint(1), SyncType::Asynchronous, &fixed(), 48_000).sampling_control, Some(true));
+        // Pitch Control D1 does not imply Sampling Frequency Control D0.
+        assert_eq!(uac1_rate_profile(&endpoint(2), SyncType::Asynchronous, &fixed(), 48_000).sampling_control, Some(false));
+        for extra in [vec![], vec![6, 0x25, 1, 0, 0, 0], vec![7, 0x25, 1, 0],
+            [endpoint(0), endpoint(1)].concat(), vec![7, 0x25, 1, 0, 0, 0, 0, 1]] {
+            assert_eq!(uac1_rate_profile(&extra, SyncType::Synchronous, &fixed(), 48_000).sampling_control, None);
+        }
+    }
+
+    #[test]
+    fn uac1_wire_control_requires_exact_positive_signed_24_bit_hz() {
+        assert_eq!(decode_uac1_rate([0x80, 0xbb, 0], 3).unwrap(), 48_000);
+        assert_eq!(decode_uac1_rate([0xff, 0xff, 0x7f], 3).unwrap(), 0x7f_ffff);
+        for bytes in [[0, 0, 0], [0, 0, 0x80], [0xff, 0xff, 0xff]] {
+            assert!(decode_uac1_rate(bytes, 3).is_err());
+        }
+        for length in [0, 1, 2, 4] {
+            assert!(decode_uac1_rate([0x80, 0xbb, 0], length).is_err());
+            assert!(check_uac1_write(length).is_err());
+        }
+        assert!(check_uac1_write(3).is_ok());
+    }
+
+    #[test]
+    fn uac1_readback_overrides_descriptor_evidence_and_ack_is_not_evidence() {
+        let fixed = uac1_rate_profile(&endpoint(0), SyncType::Asynchronous, &fixed(), 48_000);
+        assert!(uac1_playback_rate_verified(48_000, None, fixed, true));
+        assert!(!uac1_playback_rate_verified(48_000, None, fixed, false));
+        assert!(!uac1_playback_rate_verified(48_000, Some(44_100), fixed, true));
+        assert!(!uac1_playback_rate_verified(48_000, Some(0), fixed, true));
+        for sampling_control in [None, Some(true)] {
+            let profile = Uac1PlaybackRateProfile { sampling_control, ..fixed };
+            assert!(!uac1_playback_rate_verified(48_000, None, profile, true));
+            assert!(uac1_playback_rate_verified(48_000, Some(48_000), profile, true));
+        }
+        assert!(!uac1_playback_rate_verified(0, Some(0), fixed, true));
+    }
+
+    #[test]
+    fn uac1_host_pacing_requires_declared_supported_rate() {
+        for res in [0, 1] {
+            let ranges = [SamplingFrequencySubrange { min: 44_100, max: 96_000, res }];
+            for sync in [SyncType::Synchronous, SyncType::Adaptive] {
+                let profile = uac1_rate_profile(&endpoint(0), sync, &ranges, 48_000);
+                assert!(!profile.fixed_at_request);
+                assert!(profile.host_paced_at_request);
+                assert!(uac1_playback_rate_verified(48_000, None, profile, true));
+            }
+            assert!(!uac1_rate_profile(&endpoint(0), SyncType::Asynchronous, &ranges, 48_000).host_paced_at_request);
+            assert!(!uac1_rate_profile(&endpoint(0), SyncType::Synchronous, &ranges, 192_000).host_paced_at_request);
+        }
+        assert!(!uac1_rate_profile(&endpoint(0), SyncType::Synchronous, &[], 48_000).host_paced_at_request);
+    }
+
+    #[test]
+    fn uac1_partial_or_nonstandard_as_descriptors_cannot_prove_fixed_rate() {
+        let general = [7, 0x24, 1, 1, 0, 1, 0];
+        let single = [11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0];
+        assert!(uac1_complete_rate_descriptor(&[general.as_slice(), single.as_slice()].concat()));
+        let mut truncated_list = single;
+        truncated_list[7] = 2;
+        assert!(!uac1_complete_rate_descriptor(&[general.as_slice(), truncated_list.as_slice()].concat()));
+        assert!(!uac1_complete_rate_descriptor(&single));
+        assert!(!uac1_complete_rate_descriptor(&[general.as_slice(), general.as_slice(), single.as_slice()].concat()));
+        let continuous = [14, 0x24, 2, 1, 2, 2, 16, 0, 0x44, 0xac, 0, 0, 0x77, 1];
+        assert!(uac1_complete_rate_descriptor(&[general.as_slice(), continuous.as_slice()].concat()));
     }
 }

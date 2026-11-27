@@ -1982,11 +1982,13 @@ pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<Stream
                             if extra.len() >= 14 {
                                 let min = u32::from_le_bytes([extra[8], extra[9], extra[10], 0]);
                                 let max = u32::from_le_bytes([extra[11], extra[12], extra[13], 0]);
-                                sample_rate_ranges.push(SamplingFrequencySubrange {
-                                    min,
-                                    max,
-                                    res: 0,
-                                });
+                                if min > 0 && min <= max {
+                                    sample_rate_ranges.push(SamplingFrequencySubrange {
+                                        min,
+                                        max,
+                                        res: u32::from(min != max),
+                                    });
+                                }
                             }
                         } else {
                             for i in 0..sam_freq_type as usize {
@@ -2061,14 +2063,6 @@ pub(super) fn sync_type_label(sync_type: SyncType) -> &'static str {
         SyncType::Synchronous => "synchronous",
         SyncType::NoSync => "none",
     }
-}
-
-// A failed UAC1 SET_CUR is only tolerable when the endpoint is host-paced
-// (adaptive/synchronous). Asynchronous runs its own clock; NoSync free-runs
-// (FiiO BR13) — either way the DAC rate stays unknown and direct streaming
-// would be pitched wrong.
-pub(super) fn uac1_set_cur_failure_tolerable(sync_type: SyncType) -> bool {
-    matches!(sync_type, SyncType::Adaptive | SyncType::Synchronous)
 }
 
 pub(super) fn usage_type_label(usage_type: UsageType) -> &'static str {
@@ -2246,6 +2240,40 @@ pub(super) fn first_playback_stream(device: &Device<Context>) -> Option<(u8, u8,
 #[cfg(test)]
 mod implicit_discovery_tests {
     use super::*;
+    #[test]
+    fn uac1_continuous_rates_preserve_interior_hz_and_endpoint_capacity() {
+        let parse = |min: u32, max: u32| {
+            let min = min.to_le_bytes();
+            let max = max.to_le_bytes();
+            parse_streaming_extra(0, &[
+                7, 0x24, 1, 1, 0, 1, 0,
+                14, 0x24, 2, 1, 2, 3, 24, 0,
+                min[0], min[1], min[2], max[0], max[1], max[2],
+            ]).unwrap().sample_rate_ranges
+        };
+        let ranges = parse(32_001, 96_003);
+        assert_eq!((ranges[0].min, ranges[0].max, ranges[0].res), (32_001, 96_003, 1));
+        for rate in [32_001, 44_117, 48_123, 96_003] {
+            assert!(sampling_frequency_ranges_support_rate(&ranges, rate));
+        }
+        for rate in [0, 32_000, 96_004] {
+            assert!(!sampling_frequency_ranges_support_rate(&ranges, rate));
+        }
+        let (clipped, _) = capacity_limited_rates(&ranges, 294, 1000, 6);
+        assert!(sampling_frequency_ranges_support_rate(&clipped, 48_123));
+        assert!(sampling_frequency_ranges_support_rate(&clipped, 49_000));
+        assert!(!sampling_frequency_ranges_support_rate(&clipped, 49_001));
+        // The public capability representation retains the integer-Hz step.
+        let range = RateRange { min_hz: clipped[0].min, max_hz: clipped[0].max, step_hz: clipped[0].res };
+        assert_eq!((range.min_hz, range.max_hz, range.step_hz), (32_001, 49_000, 1));
+        let singleton = parse(44_117, 44_117);
+        assert_eq!(singleton[0].res, 0);
+        assert!(sampling_frequency_ranges_support_rate(&singleton, 44_117));
+        assert!(!sampling_frequency_ranges_support_rate(&singleton, 44_118));
+        assert!(parse(0, 48_000).is_empty());
+        assert!(parse(48_000, 44_100).is_empty());
+    }
+
     #[test]
     fn implicit_clock_proof_compares_exact_ratios_and_shared_raw_hops() {
         use crate::clock_resolution::{ClockHop, ClockHopKind, ClockResolution};

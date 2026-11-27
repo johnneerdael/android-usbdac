@@ -197,7 +197,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             current.requested_playback_format = Some(requested_playback_format);
         }
     }
-    let adc3_route = match if vendor_profile.is_some() { Ok(None) } else { adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) } {
+    let adc3_route = match if vendor_profile.is_some() || candidate.is_uac1 { Ok(None) } else { adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) } {
         Ok(route) => route,
         Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
     };
@@ -206,7 +206,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::InvalidState(error));
         }
     }
-    let clock_choice = if vendor_profile.is_some() { None } else if let Some(route) = adc3_route.as_ref() {
+    let clock_choice = if vendor_profile.is_some() || candidate.is_uac1 { None } else if let Some(route) = adc3_route.as_ref() {
         route.choice.clone().map(|choice| (AudioControlClock {
             interface_number: choice.control_interface, clock_id: choice.source_id,
         }, choice))
@@ -292,7 +292,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(error);
     }
-    set_clock_status((clock.is_some() || adc3_route.as_ref().and_then(|route| route.choice.as_ref()).is_some())
+    set_clock_status((candidate.is_uac1 || clock.is_some() || adc3_route.as_ref().and_then(|route| route.choice.as_ref()).is_some())
         .then(|| ClockStatus {
         reported_sample_rate: state
             .clock_status
@@ -387,7 +387,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(error));
     }
-    if let Err(error) = if vendor_profile.is_some() { Ok(()) } else { verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) } {
+    if let Err(error) = if vendor_profile.is_some() || candidate.is_uac1 { Ok(()) } else { verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) } {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::InvalidState(error));
     }
@@ -591,77 +591,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         reported_sample_rate = if profile.rate_control { None } else { Some(playback_format.sample_rate) };
         set_clock_verification(false, false, clock_verification_passed, reported_sample_rate);
     } else if candidate.is_uac1 {
-        // UAC1 has no UAC2 clock entity; the sample rate is set endpoint-level
-        // via SET_CUR (UAC1_SAM_FREQ_CONTROL 0x0100) on the streaming endpoint.
-        // Re-issue it here because the alt-setting reset to 0 above may have
-        // cleared device state, then trust the endpoint-level set. UAC1
-        // endpoints are set-only (no GET_CUR readback for sample rate), so
-        // clock "verification" is structurally impossible — a successful
-        // SET_CUR is the strongest evidence available and is what the UAC1
-        // spec defines as the rate-setting mechanism.
-        match set_uac1_sampling_frequency(
-            &claimed_handle.handle,
-            candidate.interface_number,
-            candidate.endpoint_address,
-            playback_format.sample_rate,
-        ) {
-            Ok(()) => {
-                clock_control_attempted = true;
-                clock_control_succeeded = true;
-                clock_verification_passed = true;
-                reported_sample_rate = Some(playback_format.sample_rate);
-                set_dac_mode(DacMode::FixedClock);
-                set_clock_verification(
-                    clock_control_attempted,
-                    clock_control_succeeded,
-                    clock_verification_passed,
-                    reported_sample_rate,
-                );
-                let message = format!(
-                    "[clock-diag] UAC1: SET_CUR {}Hz on endpoint 0x{:02x} succeeded — trusting endpoint-level rate (no UAC2 clock entity)",
-                    playback_format.sample_rate, candidate.endpoint_address
-                );
-                dev_eprintln!("{}", message);
-                set_last_error(Some(message));
-            }
-            Err(e) => {
-                clock_control_attempted = true;
-                clock_control_succeeded = false;
-                // Only adaptive/synchronous UAC1 endpoints are host-paced, so a
-                // rejected SET_CUR is tolerable there. Asynchronous endpoints run
-                // their own clock and NoSync endpoints free-run entirely (FiiO
-                // BR13: NoSync, stays locked at 48/96 kHz while we stream at the
-                // file rate -> chipmunk), so a failed rate set leaves the DAC rate
-                // unknown: refuse.
-                if uac1_set_cur_failure_tolerable(candidate.sync_type) {
-                    clock_verification_passed = true;
-                    reported_sample_rate = Some(playback_format.sample_rate);
-                    set_dac_mode(DacMode::AdaptiveStreaming);
-                    set_clock_verification(
-                        true,
-                        false,
-                        true,
-                        Some(playback_format.sample_rate),
-                    );
-                    let message = format!(
-                        "[clock-diag] UAC1 SET_CUR {}Hz on endpoint 0x{:02x} failed: {} — tolerable for {:?} endpoint, trusting host-driven rate",
-                        playback_format.sample_rate, candidate.endpoint_address, e, candidate.sync_type,
-                    );
-                    dev_eprintln!("{}", message);
-                    set_last_error(Some(message));
-                } else {
-                    clock_verification_passed = false;
-                    reported_sample_rate = None;
-                    set_clock_verification(true, false, false, None);
-                    let message = format!(
-                        "[clock-diag] UAC1 SET_CUR {}Hz on endpoint 0x{:02x} failed: {} — will refuse ({:?} endpoint is not host-paced)",
-                        playback_format.sample_rate, candidate.endpoint_address, e, candidate.sync_type,
-                    );
-                    dev_eprintln!("{}", message);
-                    set_last_error(Some(message));
-                }
-            }
-        }
+        // No live endpoint rate evidence survives SET_INTERFACE. Populate it
+        // only after the playback alternate has been activated below.
+        clock_control_attempted = false;
+        clock_control_succeeded = false;
+        clock_verification_passed = false;
+        reported_sample_rate = None;
+        set_clock_verification(false, false, false, None);
     } else {
         let message = format!(
             "[clock-diag] Cannot verify {}Hz: no clock entity for alt {} — will refuse",
@@ -767,80 +703,70 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
     thread::sleep(Duration::from_millis(50));
 
+    let mut adc3_status_clock_proven = false;
     if let Some(route) = adc3_route.as_ref() {
         if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Transfer(error));
         }
+        adc3_status_clock_proven = route.clock.is_some();
     }
 
-    // UAC1: endpoint SET_CUR is only reliable once the streaming alt setting
-    // is active. Re-issue it; success here upgrades the clock verdict even if
-    // the pre-alt attempt was rejected.
+    // A UAC1 SET_CUR ACK may round to a supported rate. Read the active
+    // endpoint even when SET stalls: an exact positive CUR also proves a
+    // read-only clock. Explicitly absent controls use only descriptor evidence.
     if candidate.is_uac1 {
-        match set_uac1_sampling_frequency(
-            &claimed_handle.handle,
-            candidate.interface_number,
-            candidate.endpoint_address,
-            playback_format.sample_rate,
-        ) {
-            Ok(()) => {
-                clock_control_attempted = true;
-                clock_control_succeeded = true;
-                clock_verification_passed = true;
-                reported_sample_rate = Some(playback_format.sample_rate);
-                set_dac_mode(DacMode::FixedClock);
-                set_clock_verification(true, true, true, reported_sample_rate);
-                let message = format!(
-                    "[clock-diag] UAC1: post-alt SET_CUR {}Hz on endpoint 0x{:02x} succeeded — DAC locked to requested rate",
-                    playback_format.sample_rate, candidate.endpoint_address
-                );
-                dev_eprintln!("{}", message);
-                set_last_error(Some(message));
+        let profile = match uac1_playback_rate_profile(&claimed_handle, &candidate, playback_format.sample_rate) {
+            Ok(profile) => profile,
+            Err(error) => {
+                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                return Err(if crate::error::is_device_gone(&error) { Error::DeviceLost } else { Error::Control(error) });
             }
-            Err(e) => {
-                // SET_CUR stalled even with the alt setting active. Probe
-                // GET_CUR: some UAC1 firmware auto-locks the rate and only
-                // reports it read-only, in which case a matching readback is
-                // sufficient verification.
-                match get_uac1_sampling_frequency(
-                    &claimed_handle.handle,
-                    candidate.interface_number,
-                    candidate.endpoint_address,
-                ) {
-                    Ok(reported) if reported == playback_format.sample_rate => {
-                        clock_control_attempted = true;
-                        clock_control_succeeded = false;
-                        clock_verification_passed = true;
-                        reported_sample_rate = Some(reported);
-                        set_dac_mode(DacMode::FixedClock);
-                        set_clock_verification(true, false, true, reported_sample_rate);
-                        let message = format!(
-                            "[clock-diag] UAC1: post-alt SET_CUR failed but GET_CUR reports requested {}Hz — trusting readback",
-                            reported
-                        );
-                        dev_eprintln!("{}", message);
-                        set_last_error(Some(message));
+        };
+        if profile.sampling_control != Some(false) {
+            clock_control_attempted = true;
+            let set_result = set_uac1_sampling_frequency(
+                &claimed_handle.handle, candidate.interface_number,
+                candidate.endpoint_address, playback_format.sample_rate,
+            );
+            clock_control_succeeded = set_result.is_ok();
+            if let Err(error) = set_result {
+                if crate::error::is_device_gone(&error) {
+                    set_clock_verification(true, false, false, None);
+                    duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                    return Err(Error::DeviceLost);
+                }
+                dev_eprintln!("[clock-diag] UAC1 post-alt SET_CUR failed: {}", error);
+            }
+            match get_uac1_sampling_frequency(
+                &claimed_handle.handle, candidate.interface_number, candidate.endpoint_address,
+            ) {
+                Ok(rate) => reported_sample_rate = (rate > 0).then_some(rate),
+                Err(error) => {
+                    if crate::error::is_device_gone(&error) {
+                        set_clock_verification(clock_control_attempted, clock_control_succeeded, false, None);
+                        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                        return Err(Error::DeviceLost);
                     }
-                    Ok(reported) => {
-                        let message = format!(
-                            "[clock-diag] UAC1: post-alt SET_CUR failed ({}) and GET_CUR reports {}Hz, requested {}Hz — keeping prior verdict",
-                            e, reported, playback_format.sample_rate
-                        );
-                        dev_eprintln!("{}", message);
-                        set_last_error(Some(message));
-                    }
-                    Err(readback_error) => {
-                        let message = format!(
-                            "[clock-diag] UAC1: post-alt SET_CUR failed: {} — keeping prior verdict (GET_CUR probe: {})",
-                            e, readback_error
-                        );
-                        dev_eprintln!("{}", message);
-                        set_last_error(Some(message));
-                    }
+                    dev_eprintln!("[clock-diag] UAC1 post-alt GET_CUR unavailable: {}", error);
+                    reported_sample_rate = None;
                 }
             }
         }
+        set_dac_mode(if profile.host_paced_at_request { DacMode::AdaptiveStreaming } else { DacMode::FixedClock });
+        clock_verification_passed = uac1_playback_rate_verified(
+            playback_format.sample_rate, reported_sample_rate, profile,
+            playback_format.dsd_transport == DsdTransportMode::None,
+        );
+        set_clock_verification(clock_control_attempted, clock_control_succeeded,
+            clock_verification_passed, reported_sample_rate);
+        let message = format!(
+            "[clock-diag] UAC1 post-alt endpoint=0x{:02x}: requested={}Hz reported={:?}Hz attempted={} succeeded={} verified={}",
+            candidate.endpoint_address, playback_format.sample_rate, reported_sample_rate,
+            clock_control_attempted, clock_control_succeeded, clock_verification_passed,
+        );
+        dev_eprintln!("{}", message);
+        set_last_error(Some(message));
     }
 
     if !claimed_handle
@@ -1017,12 +943,6 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 Err(error) => log_warn!("[USB] ADC3 post-alt clock readback unavailable for feedback inference: {}", error),
             }
         }
-    } else if candidate.is_uac1 && playback_format.dsd_transport != DsdTransportMode::None {
-        reported_sample_rate = get_uac1_sampling_frequency(
-            &claimed_handle.handle, candidate.interface_number, candidate.endpoint_address,
-        ).ok();
-        clock_verification_passed = reported_sample_rate == Some(playback_format.sample_rate);
-        set_clock_verification(clock_control_attempted, clock_control_succeeded, clock_verification_passed, reported_sample_rate);
     }
 
     dev_eprintln!(
@@ -1040,9 +960,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         speed,
     );
 
-    // Hard-abort: if the clock is unverified or mismatched, refuse to
-    // stream. Sending audio at the wrong sample rate causes chipmunk /
-    // distorted playback.  There is NO "continue anyway" path.
+    // Missing PCM clock evidence may use the explicit unverified-rate opt-in.
+    // UAC1 positive mismatches and DSD still require exact live evidence.
     if !clock_verification_passed && !programmed_vendor_rate {
         // Check if this device has the SkipClockValidation quirk.
         // Some DACs (e.g. Fosi DS2 / Savitech bridge) have broken UAC2 clock
@@ -1050,7 +969,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         // silently. Skip verification and trust the SET_CUR.
         let skip_clock_validation = settings().skip_clock_validation();
 
-        if skip_clock_validation && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
+        if skip_clock_validation && !candidate.is_uac1 && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
             dev_eprintln!(
                 "[USB] Clock verification failed but SkipClockValidation quirk is active — trusting SET_CUR for {}Hz",
                 playback_format.sample_rate,
@@ -1078,7 +997,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 clock_control_attempted,
                 clock_control_succeeded,
             );
-            if settings().require_verified_rate() || multiplied_clock {
+            if settings().require_verified_rate() || multiplied_clock
+                || (candidate.is_uac1 && (playback_format.dsd_transport != DsdTransportMode::None
+                    || reported_sample_rate.is_some_and(|rate| rate > 0 && rate != playback_format.sample_rate))) {
                 dev_eprintln!("[USB] {}", refusal);
                 set_last_error(Some(refusal.clone()));
                 set_direct_mode_refusal_reason(Some(refusal.clone()));
@@ -1099,13 +1020,13 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
 
     if let Some(rate) = reported_sample_rate {
-        if rate != playback_format.sample_rate {
+        if rate != playback_format.sample_rate && (!candidate.is_uac1 || rate > 0) {
             // Check if this device has the IgnoreInvalidSampleRate quirk.
             // Some DACs (e.g. Fosi DS2) always report 0Hz via GET_CUR even
             // when operating correctly at the requested rate.
             let ignore_invalid_rate = settings().ignore_invalid_sample_rate();
 
-            if ignore_invalid_rate && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
+            if ignore_invalid_rate && !candidate.is_uac1 && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
                 dev_eprintln!(
                     "[USB] DAC reported {}Hz (expected {}Hz) but IgnoreInvalidSampleRate quirk is active — continuing",
                     rate, playback_format.sample_rate,
@@ -1232,7 +1153,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 // AS status remains useful without frequency evidence, but a
                 // nominal/ignored/fallback rate must never become a CUR claim.
                 let proven_clock = if clock_verification_passed
-                    && post_alt_readback_hz == Some(playback_format.sample_rate)
+                    && (if adc3_route.is_some() { adc3_status_clock_proven }
+                        else { post_alt_readback_hz == Some(playback_format.sample_rate) })
                     && choice.resolution == crate::clock_resolution::ClockResolution::Resolved {
                     let source_rate = if let Some(route) = adc3_route.as_ref() {
                         route.source_rate(playback_format.sample_rate).map_err(Error::Control)?

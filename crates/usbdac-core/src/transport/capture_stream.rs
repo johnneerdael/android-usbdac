@@ -749,20 +749,28 @@ pub(super) fn configure_capture_endpoint_guarded(
             .set_alternate_setting(candidate.interface, candidate.alternate)
             .map_err(Error::Claim)?;
         if candidate.sampling_control {
-            set_uac1_sampling_frequency(
+            if let Err(Error::DeviceLost) = set_uac1_sampling_frequency(
                 &claimed.handle,
                 candidate.interface,
                 candidate.address,
                 rate,
             )
-            .map_err(Error::Control)?;
-            let reported = get_uac1_sampling_frequency(
+            .or_control() {
+                return Err(Error::DeviceLost);
+            }
+            // A read-only endpoint may stall SET_CUR. Its active rate still
+            // needs an exact positive readback before capture can proceed.
+            let reported = match get_uac1_sampling_frequency(
                 &claimed.handle,
                 candidate.interface,
                 candidate.address,
             )
-            .ok();
-            if reported != Some(rate) {
+            .or_control() {
+                Ok(reported) => Some(reported),
+                Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                Err(_) => None,
+            };
+            if rate == 0 || reported != Some(rate) {
                 return Err(Error::ClockUnverified {
                     requested_hz: rate,
                     reported_hz: reported,
