@@ -12,3 +12,4 @@ rusb = { version = "0.9", features = ["vendored"] }
 serde_json = "1"
 log = "0.4"
 libc = "0.2"
+base64 = "0.22"
