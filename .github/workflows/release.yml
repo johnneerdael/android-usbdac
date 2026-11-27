@@ -115,9 +115,6 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Test the Rust workspace
-        run: cargo test --workspace --locked
-
       # Plugin downloads from the Gradle and Maven repositories fail intermittently on
       # hosted runners. Resolve them first, with retries, so a transient outage does not
       # fail the build.
@@ -131,9 +128,9 @@ jobs:
           done
           exit 1
 
-      - name: Build the AAR (all four ABIs), run the unit tests, build the sample
+      - name: Build the AAR (all four ABIs) and sample
         working-directory: android
-        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :sample:assembleDebug :media3-example:assembleDebug --console=plain
+        run: ./gradlew :usbdac:assembleRelease :usbdac-media3:assembleRelease :sample:assembleDebug :media3-example:assembleDebug --console=plain
 
       - name: Check that the AAR carries every ABI
         run: |

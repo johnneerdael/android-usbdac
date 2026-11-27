@@ -70,7 +70,7 @@ dependencies {
 tasks.withType<Test>().configureEach {
     val hostJni = providers.environmentVariable("USBDAC_TEST_HOST_JNI")
     inputs.property("usbdacHostJniPath", hostJni.orElse(""))
-    inputs.files(hostJni.map { file(it) }).withPropertyName("usbdacHostJniLibrary")
+    inputs.files(hostJni.map { listOf(file(it)) }.orElse(emptyList())).withPropertyName("usbdacHostJniLibrary")
 }
 
 // ---- native library ---------------------------------------------------------
