@@ -1059,9 +1059,10 @@ pub(super) fn build_usb_capability_model(
         supported_sample_rates.extend(rates.iter().copied());
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
-            endpoint_address: candidate.endpoint_address, format: AltFormat::Pcm,
+            endpoint_address: candidate.endpoint_address,
+            format: if candidate.native_dsd.is_some() { AltFormat::Dsd } else { AltFormat::Pcm },
             channels: candidate.channels, subslot_bytes: candidate.subslot_size,
-            valid_bits: candidate.bit_resolution,
+            valid_bits: if candidate.native_dsd.is_some() { 1 } else { candidate.bit_resolution },
             rate_ranges: ranges.iter().map(|r| RateRange { min_hz:r.min,max_hz:r.max,step_hz:r.res }).collect(),
             sample_rates:rates, sync_type:sync_kind(candidate.sync_type),
             feedback_endpoint:candidate.feedback_endpoint.map(|f|f.address),
@@ -1404,16 +1405,9 @@ pub(super) fn select_stream_candidates(
         }
     }
 
-    if playback_format.dsd_transport == DsdTransportMode::None {
+    if matches!(playback_format.dsd_transport, DsdTransportMode::None | DsdTransportMode::Native) {
         for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces) {
-            let format = StreamingInterfaceFormat { format_tag:FORMAT_TAG_PCM,uac2_formats:None,native_dsd:None,
-                channels:candidate.channels,subslot_size:candidate.subslot_size,bit_resolution:candidate.bit_resolution,
-                terminal_link:candidate.terminal_link,is_uac1:false,sample_rate_ranges:vec![] };
-            if transport_compatibility_penalty(&format,playback_format) == u32::MAX { continue; }
-            let supported = sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate);
-            if supported && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
-                playback_format.sample_rate, source.service_interval_us, source.bytes_per_frame))
-                && candidate.max_packet_bytes >= required_max_packet_bytes(playback_format.sample_rate,candidate.service_interval_us,usize::from(candidate.channels)*usize::from(candidate.subslot_size)) {
+            if adc3::adc3_candidate_matches_ranges(&candidate, &ranges, playback_format) {
                 candidates.push(candidate);
             }
         }
@@ -1421,11 +1415,9 @@ pub(super) fn select_stream_candidates(
     let dsd_bit_rate = playback_format.dsd_bit_rate;
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
     candidates.sort_by_key(|candidate| {
-        let candidate_rate = if is_native_dsd && dsd_bit_rate > 0 {
-            dsd_bit_rate / (8 * u32::from(candidate.subslot_size.max(1)))
-        } else {
-            playback_format.sample_rate
-        };
+        // Admission already requires an exact native word cadence.
+        let candidate_rate = native_wire_rate(playback_format, candidate.subslot_size)
+            .expect("selected candidate has an exact wire rate");
         let required_bytes = required_max_packet_bytes(
             candidate_rate,
             candidate.service_interval_us,
@@ -1450,7 +1442,7 @@ pub(super) fn select_stream_candidates(
     });
 
     let label_rate = if is_native_dsd && dsd_bit_rate > 0 {
-        format!("DSD{}@{}Hz", dsd_bit_rate, dsd_bit_rate / 32)
+        format!("DSD {} bit/s", dsd_bit_rate)
     } else {
         format!("{} Hz", playback_format.sample_rate)
     };

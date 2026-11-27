@@ -1,4 +1,4 @@
-//! Active-configuration ADC3 PCM playback and capture. No configuration changes or clock guesses.
+//! Active-configuration ADC3 PCM/native DSD playback and PCM capture. No configuration changes or clock guesses.
 use super::*;
 use super::endpoint_geometry::{ss_endpoint_geometry, ss_feedback_geometry};
 #[cfg(test)]
@@ -27,6 +27,7 @@ pub(super) struct Adc3Route {
     companions: Vec<(u8, [u8; 6])>,
     extended_companions: Vec<(u8, [u8; 8])>,
     pcm: (u16, u8, u8),
+    native_dsd: Option<NativeDsdProfile>,
     frequency_limits: Vec<(u32, u32)>,
     cluster: Option<wire::Cluster>,
     header: Option<wire::AsHeader>,
@@ -43,13 +44,13 @@ impl Adc3Route {
         self.implicit.as_deref()
     }
 
-    /// Only exposed read-only Format controls participate in the active PCM proof.
-    pub(super) fn active_pcm_format_interfaces(&self) -> impl Iterator<Item = u8> + '_ {
+    /// Prove the selected encoding independently for each retained interface.
+    pub(super) fn active_format_expectations(&self) -> impl Iterator<Item = (u8, u64)> + '_ {
         std::iter::once(self).chain(self.implicit.as_deref()).filter_map(|route| {
             if route.profile != wire::FunctionProfile::Full { return None; }
             route.header.as_ref().filter(|header|
                 header.controls.access(3) == wire::ControlAccess::ReadOnly)
-                .map(|_| route.interface)
+                .map(|_| (route.interface, if route.native_dsd.is_some() { 1 << 5 } else { 1 }))
         })
     }
 
@@ -135,21 +136,53 @@ fn validate_adc3_format_control(header: &wire::AsHeader) -> Result<(), String> {
         _ => Err("ADC3 AS Format control is reserved or writable".into()),
     }
 }
+// USB-IF Frmts30 section 2.3.1.6.5 / Table A-2 assigns D5 to DSD;
+// D6 is unrelated RAW_DATA. DSD carries one 64-bit word per channel.
+fn adc3_standard_encoding(header: &wire::AsHeader, capture: bool) -> Result<Option<NativeDsdProfile>, String> {
+    if header.auxiliary_protocols != 0 || header.control_size != 0 {
+        return Err("ADC3 auxiliary/control payload is unsupported".into());
+    }
+    if !capture && header.formats & (1 << 5) != 0
+        && header.subslot_size == 8 && header.bit_resolution == 64 {
+        return Ok(Some(NativeDsdProfile { word_bytes: 8, big_endian: false,
+            bit_reverse: false, origin: NativeDsdOrigin::StandardAdc3 }));
+    }
+    if header.formats & 1 != 0 && matches!(header.subslot_size, 2..=4)
+        && matches!(header.bit_resolution, 16 | 24 | 32) {
+        return Ok(None);
+    }
+    Err("ADC3 alternate has no implemented standard encoding/geometry".into())
+}
+
+// `rate` is already the selected USB word clock, including native DSD /64.
+fn adc3_playback_format(route: &Adc3Route, rate: u32) -> Result<PlaybackFormat, String> {
+    let native = route.native_dsd;
+    let bit_rate = match native {
+        Some(profile) => rate.checked_mul(8 * u32::from(profile.word_bytes))
+            .ok_or("ADC3 native DSD bit rate overflows")?,
+        None => 0,
+    };
+    Ok(PlaybackFormat { sample_rate: rate, channels: route.pcm.0,
+        bit_depth: if native.is_some() { 1 } else { route.pcm.2 }, is_dop: false,
+        dsd_transport: if native.is_some() { DsdTransportMode::Native } else { DsdTransportMode::None },
+        dsd_bit_rate: bit_rate })
+}
+
 fn verify_adc3_active_formats_with(route: &Adc3Route,
     mut read: impl FnMut(u8, u8, u8, u8, &mut [u8; 8]) -> Result<usize, String>) -> Result<(), String> {
     for member in std::iter::once(route).chain(route.implicit.as_deref()) {
         if member.profile != wire::FunctionProfile::Full { continue; }
         if let Some(header) = &member.header { validate_adc3_format_control(header)?; }
     }
-    for interface in route.active_pcm_format_interfaces() {
+    for (interface, expected) in route.active_format_expectations() {
         let mut bytes = [0; 8];
         // Interface recipient, entity zero, AS_FORMAT_CONTROL, CUR.
         let width = read(interface, 0, 3, 1, &mut bytes)?;
         if width != bytes.len() {
             return Err("ADC3 active Format response has wrong width".into());
         }
-        if u64::from_le_bytes(bytes) != 1 {
-            return Err("ADC3 active format is not one-hot PCM; renegotiate".into());
+        if u64::from_le_bytes(bytes) != expected {
+            return Err("ADC3 active format differs from selected one-hot encoding; renegotiate".into());
         }
     }
     Ok(())
@@ -767,10 +800,16 @@ pub(super) fn adc3_route_for_candidate(
     let plan = saved.as_ref().filter(|r| r.config == config.number()
         && r.interface == candidate.interface_number && r.alt == candidate.alt_setting)
         .and_then(|r| r.plan.as_ref());
-    let (_, mut route, _) = adc3_pair_for_source(
+    let (reconstructed, mut route, _) = adc3_pair_for_source(
         adc3_alternate_pairs(&config, handle, &alt, candidate.usb_speed, false, plan)?,
         candidate.implicit_feedback)
         .ok_or("ADC3 implicit source changed since selection")?;
+    if reconstructed.format_tag != candidate.format_tag
+        || reconstructed.native_dsd != candidate.native_dsd
+        || (reconstructed.channels, reconstructed.subslot_size, reconstructed.bit_resolution)
+            != (candidate.channels, candidate.subslot_size, candidate.bit_resolution) {
+        return Err("ADC3 selected encoding changed since selection".into());
+    }
     route.clock_context = saved.as_ref().filter(|saved| saved.plan.as_ref() == route.plan.as_ref())
         .and_then(|saved| saved.clock_context.clone());
     route.live_alternate = saved.as_ref().is_some_and(|saved| saved.config == route.config
@@ -1031,6 +1070,7 @@ fn adc3_alternate_base(
             .map(|_| (ep.address(), ep.extra().unwrap()[6..14].try_into().unwrap()))
             .into_iter().collect(),
         pcm: (0, 0, 0),
+        native_dsd: None,
         frequency_limits: if profile == wire::FunctionProfile::Full {
             wire::parse_as_frequency_ranges(alt.extra()).map_err(|e| e.to_string())?
         } else { vec![] },
@@ -1091,14 +1131,7 @@ fn adc3_alternate_base(
             };
             let h = wire::parse_as_header(h).map_err(|e| e.to_string())?;
             validate_adc3_format_control(&h)?;
-            if h.formats & 1 == 0
-                || h.auxiliary_protocols != 0
-                || h.control_size != 0
-                || !matches!(h.subslot_size, 2..=4)
-                || !matches!(h.bit_resolution, 16 | 24 | 32)
-            {
-                return Err("ADC3 alternate has no implemented standard PCM shape".into());
-            }
+            route.native_dsd = adc3_standard_encoding(&h, capture)?;
             let c = cluster(handle, control, h.cluster_id)?;
             if c.channels.is_empty() {
                 return Err("ADC3 cluster has no channels".into());
@@ -1140,9 +1173,9 @@ fn adc3_alternate_base(
         max_packet_bytes: packet_bytes,
         sync_type: ep.sync_type(),
         usage_type: ep.usage_type(),
-        format_tag: FORMAT_TAG_PCM,
+        format_tag: if route.native_dsd.is_some() { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM },
         uac2_formats: None,
-        native_dsd: None,
+        native_dsd: route.native_dsd,
         channels,
         subslot_size: subslot,
         bit_resolution: bits,
@@ -2375,6 +2408,7 @@ fn adc3_live_route_compatible(expected: &Adc3Route, actual: &Adc3Route) -> bool 
     expected.profile == wire::FunctionProfile::Full && actual.profile == expected.profile
         && (actual.config, actual.control, actual.first, actual.count, actual.interface, actual.terminal)
             == (expected.config, expected.control, expected.first, expected.count, expected.interface, expected.terminal)
+        && actual.native_dsd == expected.native_dsd
         && (actual.pcm.0, actual.pcm.2) == (expected.pcm.0, expected.pcm.2)
         && same_clock(expected, actual)
         && match (expected.implicit.as_deref(), actual.implicit.as_deref()) {
@@ -2382,6 +2416,7 @@ fn adc3_live_route_compatible(expected: &Adc3Route, actual: &Adc3Route) -> bool 
                 == (right.config, right.control, right.first, right.count)
                 && (left.interface, left.endpoint.0, left.endpoint.1, left.terminal)
                     == (right.interface, right.endpoint.0, right.endpoint.1, right.terminal)
+                && left.native_dsd == right.native_dsd
                 && same_clock(left, right),
             (None, None) => true,
             _ => false,
@@ -2398,8 +2433,7 @@ fn adc3_live_alternate(claimed: &ClaimedHandle, route: Adc3Route, speed: Speed, 
         return Ok(route);
     }
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
-    let requested = PlaybackFormat { sample_rate: rate, channels: route.pcm.0, bit_depth: route.pcm.2,
-        is_dop: false, dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
+    let requested = adc3_playback_format(&route, rate)?;
     let mut options = Vec::new();
     for alt in config.interfaces().flat_map(|i| i.descriptors()).filter(|alt|
         alt.interface_number() == route.interface && alt.setting_number() != 0
@@ -2486,7 +2520,7 @@ pub(super) fn negotiate_adc3_clock(claimed: &ClaimedHandle, candidate: &IsoStrea
     let alt = config.interfaces().flat_map(|i| i.descriptors()).find(|d|
         d.interface_number() == candidate.interface_number && d.setting_number() == candidate.alt_setting)
         .ok_or("ADC3 alternate disappeared")?;
-    let requested = PlaybackFormat { sample_rate: rate, channels: candidate.channels, bit_depth: candidate.bit_resolution, is_dop: false, dsd_transport: DsdTransportMode::None, dsd_bit_rate: 0 };
+    let requested = adc3_playback_format(&route, rate)?;
     for (alternative, route) in adc3_alternative_routes(claimed, &config, &alt, candidate.usb_speed, requested)? {
         if alternative.implicit_feedback != candidate.implicit_feedback { continue; }
         match apply_adc3_clock_plan(claimed, &route, rate) {
@@ -2562,7 +2596,7 @@ pub(super) fn select_owned_stream_candidate(
         }
         return initial;
     }
-    if requested.dsd_transport != DsdTransportMode::None {
+    if requested.dsd_transport == DsdTransportMode::DoP {
         return initial;
     }
     let mut refusal = None;
@@ -2627,23 +2661,21 @@ fn adc3_candidate_matches(
     let ranges = adc3_wire_ranges(handle, route).unwrap_or_default();
     adc3_candidate_matches_ranges(candidate, &ranges, requested)
 }
-fn adc3_candidate_matches_ranges(candidate: &IsoStreamCandidate, ranges: &[SamplingFrequencySubrange], requested: PlaybackFormat) -> bool {
-    if requested.dsd_transport != DsdTransportMode::None
-        || requested.channels != candidate.channels
-        || requested.bit_depth != candidate.bit_resolution
-    {
-        return false;
-    }
-    let supported = sampling_frequency_ranges_support_rate(ranges, requested.sample_rate);
-    supported
+pub(super) fn adc3_candidate_matches_ranges(candidate: &IsoStreamCandidate, ranges: &[SamplingFrequencySubrange], requested: PlaybackFormat) -> bool {
+    let rate = match (requested.dsd_transport, candidate.native_dsd) {
+        (DsdTransportMode::Native, Some(profile)) if requested.bit_depth == 1 => {
+            let Some(rate) = native_wire_rate(requested, profile.word_bytes) else { return false; };
+            rate
+        }
+        (DsdTransportMode::None, None) if requested.bit_depth == candidate.bit_resolution => requested.sample_rate,
+        _ => return false,
+    };
+    requested.channels == candidate.channels
+        && sampling_frequency_ranges_support_rate(ranges, rate)
         && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
-            requested.sample_rate, source.service_interval_us, source.bytes_per_frame))
-        && candidate.max_packet_bytes
-            >= required_max_packet_bytes(
-                requested.sample_rate,
-                candidate.service_interval_us,
-                usize::from(candidate.channels) * usize::from(candidate.subslot_size),
-            )
+            rate, source.service_interval_us, source.bytes_per_frame))
+        && candidate.max_packet_bytes >= required_max_packet_bytes(rate,
+            candidate.service_interval_us, usize::from(candidate.channels) * usize::from(candidate.subslot_size))
 }
 
 pub(super) fn adc3_badd_volume_topology(
@@ -3227,6 +3259,7 @@ mod tests {
             companions: vec![],
             extended_companions: vec![],
             pcm: (2, 2, 16),
+            native_dsd: None,
             frequency_limits: vec![],
             cluster: Some(wire::Cluster {
                 id: 1,
@@ -3267,13 +3300,92 @@ mod tests {
         route
     }
 
+    fn native_header() -> wire::AsHeader {
+        wire::AsHeader { terminal_link: 1, controls: wire::Controls(1 << 4),
+            cluster_id: 1, formats: 1 << 5, subslot_size: 8, bit_resolution: 64,
+            auxiliary_protocols: 0, control_size: 0 }
+    }
+
+    #[test]
+    fn standard_dsd_requires_d5_exact_word_geometry_and_playback() {
+        let header = native_header();
+        let profile = adc3_standard_encoding(&header, false).unwrap().unwrap();
+        assert_eq!(profile, NativeDsdProfile { word_bytes: 8, big_endian: false,
+            bit_reverse: false, origin: NativeDsdOrigin::StandardAdc3 });
+        assert!(adc3_standard_encoding(&header, true).is_err());
+        for mutation in 0..5 {
+            let mut bad = native_header();
+            match mutation {
+                0 => bad.formats = 1 << 6,
+                1 => bad.subslot_size = 4,
+                2 => bad.bit_resolution = 32,
+                3 => bad.auxiliary_protocols = 1,
+                _ => bad.control_size = 1,
+            }
+            assert!(adc3_standard_encoding(&bad, false).is_err());
+        }
+        let mut pcm = native_header();
+        pcm.formats = 1 | (1 << 6); pcm.subslot_size = 4; pcm.bit_resolution = 32;
+        assert_eq!(adc3_standard_encoding(&pcm, true).unwrap(), None);
+        assert_eq!(adc3_standard_encoding(&pcm, false).unwrap(), None);
+    }
+
+    #[test]
+    fn standard_dsd_uses_word_clock_capacity_and_cannot_match_pcm() {
+        let mut candidate = pcm_candidate();
+        candidate.native_dsd = adc3_standard_encoding(&native_header(), false).unwrap();
+        candidate.subslot_size = 8; candidate.bit_resolution = 64;
+        candidate.max_packet_bytes = 720;
+        let requested = PlaybackFormat { sample_rate: 88_200, channels: 2, bit_depth: 1,
+            is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 2_822_400 };
+        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 44_100, res: 0 }];
+        assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges,
+            PlaybackFormat { dsd_bit_rate: 2_822_401, ..requested }));
+        candidate.max_packet_bytes = 719;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        candidate.max_packet_bytes = 720;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, PlaybackFormat {
+            sample_rate: 44_100, bit_depth: 64, dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0, ..requested }));
+        candidate.native_dsd = None;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+    }
+
+    #[test]
+    fn active_native_format_proof_retains_independent_pcm_peer_expectation() {
+        let mut route = format_control_route(1);
+        route.header = Some(native_header());
+        route.native_dsd = adc3_standard_encoding(route.header.as_ref().unwrap(), false).unwrap();
+        route.pcm = (2, 8, 64);
+        let mut peer = format_control_route(1); peer.interface = 7;
+        route.implicit = Some(Box::new(peer));
+        assert_eq!(route.active_format_expectations().collect::<Vec<_>>(), vec![(5, 1 << 5), (7, 1)]);
+        verify_adc3_active_formats_with(&route, |interface, _, _, _, bytes| {
+            *bytes = if interface == 5 { 1u64 << 5 } else { 1u64 }.to_le_bytes(); Ok(8)
+        }).unwrap();
+        for wrong in [1u64, 1 << 6, (1 << 5) | 1] {
+            assert!(verify_adc3_active_formats_with(&route, |interface, _, _, _, bytes| {
+                *bytes = if interface == 5 { wrong } else { 1 }.to_le_bytes(); Ok(8)
+            }).is_err());
+        }
+        assert!(verify_adc3_active_formats_with(&route, |_, _, _, _, bytes| {
+            *bytes = (1u64 << 5).to_le_bytes(); Ok(8)
+        }).is_err());
+        let pcm = live_test_route();
+        let mut same_shape = pcm.clone(); same_shape.native_dsd = route.native_dsd;
+        assert!(!adc3_live_route_compatible(&pcm, &same_shape));
+        assert!(!adc3_live_route_compatible(&same_shape, &pcm));
+        assert_eq!(adc3_playback_format(&route, 44_100).unwrap().dsd_bit_rate, 2_822_400);
+    }
+
     #[test]
     fn active_format_proof_addresses_selected_and_retained_implicit_interfaces() {
         let mut route = format_control_route(1);
         let mut peer = format_control_route(1);
         peer.interface = 7;
         route.implicit = Some(Box::new(peer));
-        assert_eq!(route.active_pcm_format_interfaces().collect::<Vec<_>>(), vec![5, 7]);
+        assert_eq!(route.active_format_expectations().collect::<Vec<_>>(), vec![(5, 1), (7, 1)]);
         let mut commands = Vec::new();
         verify_adc3_active_formats_with(&route, |interface, entity, selector, request, bytes| {
             commands.push((0xa1, request, u16::from(selector) << 8,
@@ -3324,7 +3436,7 @@ mod tests {
         let mut peer = format_control_route(3);
         peer.profile = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
         route.implicit = Some(Box::new(peer));
-        assert!(route.active_pcm_format_interfaces().next().is_none());
+        assert!(route.active_format_expectations().next().is_none());
         verify_adc3_active_formats_with(&route, |_, _, _, _, _|
             panic!("absent and BADD controls must not be read")).unwrap();
     }

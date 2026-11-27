@@ -8,6 +8,7 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeDsdOrigin {
+    StandardAdc3,
     DeviceCompatibility,
     HostPolicy,
 }
@@ -393,6 +394,11 @@ impl Drop for ItfModeLease {
 /// Read-only capability and selection paths never reach vendor controls.
 pub(super) fn apply_itf_mode(claimed: &ClaimedHandle, candidate: &IsoStreamCandidate,
                              mode: DsdTransportMode) -> Result<(), String> {
+    // Standard ADC3 DSD is descriptor-defined and never needs a legacy
+    // VID-based ITF mode transaction, even on a matching vendor/product.
+    if candidate.native_dsd.is_some_and(|profile| profile.origin == NativeDsdOrigin::StandardAdc3) {
+        return Ok(());
+    }
     let device = claimed.handle.device();
     let Some(id) = identity(&device) else { return Err("cannot read actual device identity for mode selection".into()); };
     if itf::model(id).is_none() { return Ok(()); }
@@ -575,7 +581,7 @@ pub(super) fn resolve_native_dsd(device: &Device<Context>, config: &ConfigDescri
 
 pub(super) fn native_wire_rate(format: PlaybackFormat, word_bytes: u8) -> Option<u32> {
     if format.dsd_transport != DsdTransportMode::Native { return Some(format.sample_rate); }
-    if !matches!(word_bytes, 1 | 2 | 4) { return None; }
+    if !matches!(word_bytes, 1 | 2 | 4 | 8) { return None; }
     let bits = 8 * u32::from(word_bytes);
     (format.dsd_bit_rate > 0 && format.dsd_bit_rate % bits == 0)
         .then_some(format.dsd_bit_rate / bits)
@@ -711,11 +717,12 @@ mod tests {
     fn wire_clock_uses_word_width_and_refuses_fractional_words() {
         let mut f = PlaybackFormat { sample_rate: 88_200, bit_depth: 1, channels: 2,
             is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 2_822_400 };
-        for (width, rate) in [(1, 352_800), (2, 176_400), (4, 88_200)] {
+        for (width, rate) in [(1, 352_800), (2, 176_400), (4, 88_200), (8, 44_100)] {
             assert_eq!(native_wire_rate(f, width), Some(rate));
         }
         f.dsd_bit_rate += 1;
         assert_eq!(native_wire_rate(f, 4), None);
+        assert_eq!(native_wire_rate(f, 8), None);
     }
     #[test]
     fn parser_retains_raw_mask_and_separates_private_short_dialect() {

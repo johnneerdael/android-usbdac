@@ -30,6 +30,24 @@ mod dsd_bitperfect_tests {
     }
 
     #[test]
+    fn standard_adc3_dsd_le64_reverses_each_channel_word_without_reversing_bits() {
+        // Chronological MSB-first bytes, alternating left and right channels.
+        let input = [0x01, 0x81, 0x02, 0x82, 0x03, 0x83, 0x04, 0x84,
+                     0x05, 0x85, 0x06, 0x86, 0x07, 0x87, 0x08, 0x88];
+        let mut out = [0; 16];
+        encode_usb_pcm_slots(
+            &input, &mut out, 8, 64, DsdTransportMode::Native, 2, false, false,
+        ).unwrap();
+        assert_eq!(out, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+                         0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81]);
+        let mut partial = [0xaa; 14];
+        assert!(encode_usb_pcm_slots(
+            &input[..14], &mut partial, 8, 64, DsdTransportMode::Native, 2, false, false,
+        ).is_err());
+        assert_eq!(partial, [0xaa; 14]);
+    }
+
+    #[test]
     fn native_dsd_bit_reverse_flips_each_byte() {
         let mut out = [0u8; 8];
         encode_usb_pcm_slots(
@@ -1183,6 +1201,52 @@ mod push_stream_tests {
         assert_eq!(rig.shared.write_bytes(&[0xFF; 8]).unwrap(), 8);
         rig.shared.ring.lock().pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
         assert_eq!(out, [255; 8]);
+    }
+
+    #[test]
+    fn native_dsd_u64_admission_counts_bytes_and_rejects_partial_words() {
+        let rig = Rig::new(8, 64, 2, DsdTransportMode::Native);
+        assert_eq!(rig.shared.wire_frame_bytes(), 16);
+        assert_eq!(rig.shared.write_bytes(&[0xff; 15]).unwrap(), 0);
+        assert_eq!(rig.shared.write_samples(&[0x81; 15]).unwrap(), 0);
+        assert_eq!(rig.shared.write_bytes(&[0xff; 31]).unwrap(), 16);
+        assert_eq!(rig.shared.write_samples(&[0x81; 17]).unwrap(), 16);
+        assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 32);
+        assert_eq!(rig.shared.stats.producer_frames.load(Ordering::Relaxed), 16);
+        let mut out = [0; 32];
+        rig.shared.ring.lock().pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
+        assert_eq!(&out[..16], &[255; 16]);
+        assert_eq!(&out[16..], &[0x81; 16]);
+
+        // Free capacity smaller than a wire frame must not admit half a word.
+        let mut ring = PcmRing::new(24, 2);
+        assert_eq!(ring.push_bytes(&[1; 32], 8, true), 16);
+        assert_eq!(ring.push_bytes(&[2; 16], 8, true), 0);
+        ring.clear();
+        assert_eq!(ring.len_samples(), 0);
+        assert_eq!(ring.push_bytes(&[3; 16], 8, true), 16);
+    }
+
+    #[test]
+    fn native_dsd_u64_drain_padding_and_flush_keep_byte_frame_counters() {
+        let mut rig = Rig::new(8, 64, 2, DsdTransportMode::Native);
+        assert_eq!(rig.shared.write_bytes(&[0x81; 16]).unwrap(), 16);
+        rig.shared.drain();
+        let payload = rig.prepare();
+        assert_eq!(payload.music_frames, 8); // byte frames, not 64-bit wire words
+        assert_eq!(payload.frame_count, payload.transfer_buffer.len() / 2);
+        assert_eq!(&payload.transfer_buffer[..16], &[0x81; 16]);
+        assert!(payload.transfer_buffer[16..].iter().all(|byte| *byte == 0x69));
+        assert_eq!(rig.shared.stats.inflight_music_frames.load(Ordering::Relaxed), 8);
+        rig.shared.flush();
+        assert_eq!(rig.shared.stats.inflight_music_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(rig.shared.write_bytes(&[0x02; 16]).unwrap(), 16);
+        rig.shared.drain();
+        let fresh = rig.prepare();
+        assert_eq!(fresh.epoch, payload.epoch + 1);
+        assert_eq!(&fresh.transfer_buffer[..16], &[0x02; 16]);
+        assert!(fresh.transfer_buffer[16..].iter().all(|byte| *byte == 0x69));
     }
 
     #[test]

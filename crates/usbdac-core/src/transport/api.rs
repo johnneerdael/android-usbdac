@@ -147,11 +147,8 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     Ok(StreamFormat {
         request: *request,
         encoding: request.encoding,
-        sample_rate: if native && candidate.subslot_size > 0 {
-            effective.dsd_bit_rate / (8 * u32::from(candidate.subslot_size))
-        } else {
-            effective.sample_rate
-        },
+        sample_rate: native_wire_rate(effective, candidate.subslot_size)
+            .ok_or_else(|| Error::InvalidState("selected transport has no exact wire rate".into()))?,
         channels: candidate.channels,
         channel_map,
         valid_bits: if native { 1 } else { candidate.bit_resolution },

@@ -8,7 +8,15 @@ pub(super) fn for_candidate(
     if vendor_pcm::for_candidate(handle, candidate)?.is_some() {
         return unnamed(candidate.channels);
     }
-    // RAW_DATA has transport channels, without a PCM speaker assignment.
+    // Standard ADC3 DSD carries the HC Cluster's declared channel identities.
+    // Reconstruct the route before exposing its map, just as at stream open.
+    if candidate.native_dsd.is_some_and(|profile|
+        profile.origin == native_dsd::NativeDsdOrigin::StandardAdc3) {
+        let route = adc3_route_for_candidate(device, handle, candidate)?
+            .ok_or("standard ADC3 DSD channel route disappeared")?;
+        return adc3::capture_channel_map(&route);
+    }
+    // Legacy RAW_DATA has transport channels, without a PCM speaker assignment.
     if candidate.format_tag == FORMAT_TAG_DSD {
         return unnamed(candidate.channels);
     }

@@ -151,8 +151,8 @@ pub(super) fn encode_usb_pcm_slots(
         if ch == 0 {
             return Err("channels is zero".to_string());
         }
-        if !matches!(ss, 1 | 2 | 4) || input.len() % (ss * ch) != 0 {
-            return Err("native DSD requires complete 1-, 2- or 4-byte channel words".into());
+        if !matches!(ss, 1 | 2 | 4 | 8) || input.len() % (ss * ch) != 0 {
+            return Err("native DSD requires complete 1-, 2-, 4- or 8-byte channel words".into());
         }
         if output.len() != input.len() {
             return Err(format!(
@@ -178,6 +178,9 @@ pub(super) fn encode_usb_pcm_slots(
                         let in_idx = in_base + chan + b * ch;
                         let raw = (input[in_idx] & 0xFF) as u8;
                         let dsd_byte = if bit_reverse { raw.reverse_bits() } else { raw };
+                        // ADC3 DSD uses LE64: oldest bit D63, newest D0.
+                        // The input is chronological MSB-first bytes, so little
+                        // endian reverses bytes within a word, never its bits.
                         let out_b = if big_endian { b } else { ss - 1 - b };
                         let out_idx = out_base + chan * ss + out_b;
                         output[out_idx] = dsd_byte;

@@ -1828,20 +1828,20 @@ pub(super) fn log_stream_debug_preview(
         .map(|packet| packet / (candidate.subslot_size as usize * candidate.channels as usize))
         .collect();
     let sample_preview: Vec<i32> = packet_samples.iter().take(10).copied().collect();
-    let byte_decoded_preview: Vec<i32> = transfer_buffer
+    let byte_decoded_preview: Vec<i64> = transfer_buffer
         .chunks_exact(candidate.subslot_size as usize)
         .take(10)
         .map(|chunk| {
-            let mut bytes = [0u8; 4];
-            for (index, byte) in chunk.iter().enumerate() {
+            let mut bytes = [0u8; 8];
+            for (index, byte) in chunk.iter().take(bytes.len()).enumerate() {
                 bytes[index] = *byte;
             }
-            if candidate.subslot_size < 4 && chunk.last().copied().unwrap_or_default() & 0x80 != 0 {
+            if candidate.subslot_size < 8 && chunk.last().copied().unwrap_or_default() & 0x80 != 0 {
                 for byte in bytes.iter_mut().skip(candidate.subslot_size as usize) {
                     *byte = 0xff;
                 }
             }
-            i32::from_le_bytes(bytes)
+            i64::from_le_bytes(bytes)
         })
         .collect();
     let first_bytes_preview: Vec<String> = transfer_buffer

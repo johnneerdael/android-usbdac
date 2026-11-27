@@ -161,12 +161,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     } else if candidate.sync_type == SyncType::Asynchronous {
         crate::capabilities::Pacing::Unsynchronized
     } else { expected.pacing };
-    let selected_rate = if playback_format.dsd_transport == DsdTransportMode::Native {
-        playback_format.dsd_bit_rate / (8 * u32::from(candidate.subslot_size).max(1))
-    } else { playback_format.sample_rate };
+    let selected_rate = native_wire_rate(playback_format, candidate.subslot_size);
     if expected.interface_number != candidate.interface_number || expected.alt_setting != candidate.alt_setting
         || expected.endpoint_address != candidate.endpoint_address || expected.pacing != selected_pacing
-        || expected.sample_rate != selected_rate || expected.subslot_bytes != candidate.subslot_size
+        || Some(expected.sample_rate) != selected_rate || expected.subslot_bytes != candidate.subslot_size
         || expected.channels != candidate.channels || expected.channel_map != channel_map
         || expected.service_interval_us != candidate.service_interval_us
         || expected.native_dsd_signature != (if playback_format.dsd_transport == DsdTransportMode::Native {
@@ -178,8 +176,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     if playback_format.dsd_transport == DsdTransportMode::Native {
         // Native DSD clock frames contain subslot_size bytes per channel.
         // The producer still supplies interleaved byte-rate samples.
-        if !matches!(candidate.subslot_size, 1 | 2 | 4)
-            || playback_format.dsd_bit_rate == 0 {
+        let standard_adc3 = candidate.native_dsd.is_some_and(|profile|
+            profile.origin == native_dsd::NativeDsdOrigin::StandardAdc3
+                && profile.word_bytes == 8 && candidate.subslot_size == 8
+                && candidate.bit_resolution == 64);
+        if (!matches!(candidate.subslot_size, 1 | 2 | 4) && !standard_adc3)
+            || selected_rate.is_none() {
             let error = "USB native DSD refused: invalid subslot or source bit rate".to_string();
             set_last_error(Some(error.clone()));
             set_direct_mode_refusal_reason(Some(error.clone()));
@@ -189,7 +191,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 offered: offered_alt_settings(),
             });
         }
-        let wire_rate = playback_format.dsd_bit_rate / (8 * u32::from(candidate.subslot_size));
+        let wire_rate = selected_rate.expect("validated native word cadence");
         playback_format.sample_rate = wire_rate;
         requested_playback_format.sample_rate = wire_rate;
         if let Some(current) = SESSION_STATE.lock().as_mut() {
@@ -1234,8 +1236,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     choice.control_interface, candidate.interface_number, candidate.alt_setting,
                     proven_clock);
                 if let Some(route) = adc3_route.as_ref() {
-                    for interface in route.active_pcm_format_interfaces() {
-                        target.add_adc3_pcm_format(interface);
+                    for (interface, expected_mask) in route.active_format_expectations() {
+                        target.add_adc3_active_format(interface, expected_mask);
                     }
                 }
                 target.add_data_endpoint(candidate.interface_number, candidate.alt_setting,

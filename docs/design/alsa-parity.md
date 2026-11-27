@@ -39,6 +39,35 @@ ALSA separates three concerns. A raw transport flag indicates a possible wire fo
 
 **Follow-on built-ins.** Audit Playback Designs per-alt DoP, bit-reversed eight- and sixteen-bit native formats, ALSA's device-scoped RAW_DATA profiles and ITF vendor mode families. Use typed mode recipes with explicit target shape, zero-bandwidth precondition, verified result when a readback exists and PCM recovery on failure/close. Keep mode recipes inactive on sibling firmware and unrelated interfaces. Exercise DSD-to-PCM, PCM-to-DSD, failed open and detach. [ALSA mode switch](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L1888-L1920)
 
+### Standard full UAC3 native DSD
+
+Use the dedicated Type I DSD bit D5 and the required eight-byte,
+64-bit subslot. The USB clock, feedback and packet scheduler count
+one transport sample per 64 DSD bits per channel. For example, DSD64
+at 2,822,400 bits per second uses a 44,100 Hz transport clock. D6
+RAW_DATA remains a separate format with its own compatibility
+evidence. [USB-IF Audio Data Formats 3.0 §2.3.1.6.5 and Table A-2](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/commit/4762eed5fd4d612bef1a5a43ee87f4f4047bdbe5/Frmts30.pdf)
+
+The host supplies chronological, channel-interleaved DSD bytes with
+the oldest bit in each byte at the MSB. Pack eight bytes per channel
+as a little-endian word with the oldest bit at D63, following USB-IF's
+later explicit wire convention. Validate the active D5 format when
+the alternate exposes the Audio Data Format control. An implicit
+timing source still proves its own PCM format and capacity. [USB-IF Audio 4.0 and errata, DSD Format](https://www.usb.org/document-library/usb-audio-devices-release-40-and-adopters-agreement),
+[USB-IF ADC3 §5.2.2.1.3](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=130)
+
+For final hardware acceptance, select a device with the standard D5
+alternate. Confirm its transport clock, active format reply and
+stereo on-wire byte order. Exercise a rate switch, underrun or flush
+silence, and PCM hand-back.
+
+Rust workspace tests covered descriptor admission, 64-bit stereo
+packing, exact frame alignment, rate and capacity, flush and active
+format verification. The Android arm64 target check, release AAR and
+sample build passed with matching native libraries across all four
+ABIs. The AAR SHA-256 is
+`dc84a60f40269cc20ca1b62af146334dc32b268312d078f298ae7189385d85e1`.
+
 ## Clock selection and shared ownership
 
 Resolve a terminal's graph under the selected AudioControl function. A reachable source path includes the selector ID and pin at each branch, multiplier ratio where known and source identity. Extend planning to enumerate alternatives with path-local cycle detection and reject invalid IDs, excessive depth and unsupported ratios. Prefer the current route. Probe its validity and sampling rate through the actual source. For alternative selection, honor the selector's readable/writable flags and verify each 1-based selector value through GET_CUR after SET_CUR. Leave valid paths untouched and keep changes transactional. Save original pins, validate after committing a path, restore on failures and at hand-back where safe, and invalidate negotiation if the path changes unexpectedly. Keep separate support for the existing malformed-descriptor fallback, which cannot prove a selectable source or duplex clock equality. [UAC2](https://usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), [ALSA clock selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L329-L435)

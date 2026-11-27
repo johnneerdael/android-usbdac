@@ -379,7 +379,16 @@ impl PcmRing {
     /// per ring sample. Takes whole wire frames (`subslot * channels` bytes)
     /// only and returns the bytes consumed.
     pub(super) fn push_bytes(&mut self, bytes: &[u8], subslot: usize, native_dsd: bool) -> usize {
-        let subslot = subslot.clamp(1, 4);
+        // Native DSD has byte-valued ring entries even for 64-bit words.
+        // Keep PCM limited to its i32 container independently.
+        let subslot = if native_dsd {
+            if !matches!(subslot, 1 | 2 | 4 | 8) {
+                return 0;
+            }
+            subslot
+        } else {
+            subslot.clamp(1, 4)
+        };
         let wire_frame_bytes = subslot * self.channels;
         let bytes_per_sample = if native_dsd { 1 } else { subslot };
         let room_samples = self.capacity_samples.saturating_sub(self.len_samples);

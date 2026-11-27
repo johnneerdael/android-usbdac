@@ -1056,8 +1056,8 @@ pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
     let mut target = audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
         endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)));
     if let Some(route) = endpoint.adc3_route.as_ref() {
-        for interface in route.active_pcm_format_interfaces() {
-            target.add_adc3_pcm_format(interface);
+        for (interface, expected_mask) in route.active_format_expectations() {
+            target.add_adc3_active_format(interface, expected_mask);
         }
     }
     target.add_data_endpoint(endpoint.interface, endpoint.alternate, endpoint.address);

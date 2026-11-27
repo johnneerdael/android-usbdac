@@ -109,12 +109,12 @@ impl StreamStatusTarget {
         }
     }
 
-    /// Register an advertised ADC3 format control already confirmed as PCM at activation.
-    pub(super) fn add_adc3_pcm_format(&mut self, interface: u8) {
+    /// Register an advertised ADC3 active format already confirmed at activation.
+    pub(super) fn add_adc3_active_format(&mut self, interface: u8, expected_mask: u64) {
         if self.protocol == 0x30 {
             // ADC3 5.2.2.1.3 and Table A-38: AS_AUDIO_DATA_FORMAT_CONTROL
-            // selects the eight-byte active format bitmap; PCM is bit zero.
-            let mut read = ExpectedRead::new(interface, 0, 3, &1u64.to_le_bytes());
+            // selects the eight-byte active format bitmap.
+            let mut read = ExpectedRead::new(interface, 0, 3, &expected_mask.to_le_bytes());
             read.recheck_on_alternate_change = true;
             self.reads.push(read);
         }
@@ -1032,27 +1032,34 @@ mod tests {
     }
 
     #[test]
-    fn adc3_pcm_format_registration_is_protocol_scoped_and_exact() {
+    fn adc3_active_format_registration_is_protocol_scoped_and_exact() {
         for protocol in [0, 0x20, 0x30] {
-            let mut target = StreamStatusTarget::new(protocol, 1, 3, 2, None);
-            target.add_adc3_pcm_format(3);
-            if protocol != 0x30 {
-                assert!(target.reads.is_empty());
-                continue;
+            for mask in [1u64, 1 << 5] {
+                let mut target = StreamStatusTarget::new(protocol, 1, 3, 2, None);
+                target.add_adc3_active_format(3, mask);
+                if protocol != 0x30 {
+                    assert!(target.reads.is_empty());
+                    continue;
+                }
+                assert_eq!(target.reads.len(), 1);
+                let read = &target.reads[0];
+                assert_eq!(read.address, ExpectedRead::new(3, 0, 3, &[]).address);
+                assert_eq!(read.address.request_type(), 0xa1);
+                assert_eq!(read.address.index(), 3);
+                assert_eq!(read.expected, mask.to_le_bytes());
+                // Format and alternate notifications retain the exact DSD/PCM
+                // mask selected for this interface, including a PCM sync peer.
+                for selector in [1, 2, 3] {
+                    assert_eq!(triggered_reads(&target.reads, &[0, 1, 0, selector, 3, 0]), vec![0]);
+                }
             }
-            assert_eq!(target.reads.len(), 1);
-            let read = &target.reads[0];
-            assert_eq!(read.address, ExpectedRead::new(3, 0, 3, &[]).address);
-            assert_eq!(read.address.request_type(), 0xa1);
-            assert_eq!(read.address.index(), 3);
-            assert_eq!(read.expected, [1, 0, 0, 0, 0, 0, 0, 0]);
         }
     }
 
     #[test]
     fn adc3_format_notifications_recheck_pcm_and_alternate_changes() {
         let mut target = StreamStatusTarget::new(0x30, 1, 3, 2, None);
-        target.add_adc3_pcm_format(3);
+        target.add_adc3_active_format(3, 1);
         target.reads.push(ExpectedRead::new(3, 0, 1, &[2]));
         for selector in [1, 2, 3] {
             let record = [0, 1, 0, selector, 3, 0];
@@ -1087,7 +1094,7 @@ mod tests {
     #[test]
     fn merged_adc3_format_proofs_retain_alternate_invalidation() {
         let mut target = StreamStatusTarget::new(0x30, 1, 3, 2, None);
-        target.add_adc3_pcm_format(3);
+        target.add_adc3_active_format(3, 1);
         let mut reads = vec![ExpectedRead::new(3, 0, 3, &1u64.to_le_bytes())];
         add_read(&mut reads, target.reads[0].clone()).unwrap();
         assert_eq!(reads.len(), 1);
