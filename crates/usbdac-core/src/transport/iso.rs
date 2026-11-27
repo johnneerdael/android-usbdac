@@ -378,7 +378,7 @@ impl FeedbackTransfers {
         &mut self, handle: &DeviceHandle<Context>, counters: &mut FeedbackCounters,
     ) -> Result<(), FeedbackFault> {
         for index in 0..self.slots.len() {
-            self.submit(index, handle, counters, true)?;
+            self.submit(index, handle, counters, index == 0)?;
         }
         Ok(())
     }
