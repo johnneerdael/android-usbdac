@@ -43,6 +43,16 @@ impl Adc3Route {
         self.implicit.as_deref()
     }
 
+    /// Only exposed read-only Format controls participate in the active PCM proof.
+    pub(super) fn active_pcm_format_interfaces(&self) -> impl Iterator<Item = u8> + '_ {
+        std::iter::once(self).chain(self.implicit.as_deref()).filter_map(|route| {
+            if route.profile != wire::FunctionProfile::Full { return None; }
+            route.header.as_ref().filter(|header|
+                header.controls.access(3) == wire::ControlAccess::ReadOnly)
+                .map(|_| route.interface)
+        })
+    }
+
     fn ratio(&self) -> Result<RateRatio, String> {
         match &self.choice {
             Some(choice) => adc3_choice_ratio(choice),
@@ -117,6 +127,39 @@ pub(super) fn verify_adc3_rate_route(handle: &DeviceHandle<Context>, route: &Adc
         }
     }
     Ok(())
+}
+// ADC3 AS Format control is read-only or absent (AS_GENERAL D5..4).
+fn validate_adc3_format_control(header: &wire::AsHeader) -> Result<(), String> {
+    match header.controls.access(3) {
+        wire::ControlAccess::Absent | wire::ControlAccess::ReadOnly => Ok(()),
+        _ => Err("ADC3 AS Format control is reserved or writable".into()),
+    }
+}
+fn verify_adc3_active_formats_with(route: &Adc3Route,
+    mut read: impl FnMut(u8, u8, u8, u8, &mut [u8; 8]) -> Result<usize, String>) -> Result<(), String> {
+    for member in std::iter::once(route).chain(route.implicit.as_deref()) {
+        if member.profile != wire::FunctionProfile::Full { continue; }
+        if let Some(header) = &member.header { validate_adc3_format_control(header)?; }
+    }
+    for interface in route.active_pcm_format_interfaces() {
+        let mut bytes = [0; 8];
+        // Interface recipient, entity zero, AS_FORMAT_CONTROL, CUR.
+        let width = read(interface, 0, 3, 1, &mut bytes)?;
+        if width != bytes.len() {
+            return Err("ADC3 active Format response has wrong width".into());
+        }
+        if u64::from_le_bytes(bytes) != 1 {
+            return Err("ADC3 active format is not one-hot PCM; renegotiate".into());
+        }
+    }
+    Ok(())
+}
+/// Prove the selected alternate and its retained implicit peer after activation.
+pub(super) fn verify_adc3_active_formats(handle: &DeviceHandle<Context>, route: &Adc3Route) -> Result<(), String> {
+    verify_adc3_active_formats_with(route, |interface, entity, selector, request, bytes| {
+        read_exact(handle, interface, entity, selector, request, bytes)?;
+        Ok(bytes.len())
+    })
 }
 fn adc3_project_ranges(choice: &ClockChoice, ranges: &[SamplingFrequencySubrange])
     -> Result<Vec<SamplingFrequencySubrange>, String> {
@@ -1047,6 +1090,7 @@ fn adc3_alternate_base(
                 return Err("ADC3 AS header missing or ambiguous".into());
             };
             let h = wire::parse_as_header(h).map_err(|e| e.to_string())?;
+            validate_adc3_format_control(&h)?;
             if h.formats & 1 == 0
                 || h.auxiliary_protocols != 0
                 || h.control_size != 0
@@ -3211,6 +3255,78 @@ mod tests {
             clock_context: None,
             live_alternate: false,
         }
+    }
+
+    fn format_control_route(access: u32) -> Adc3Route {
+        let mut route = live_test_route();
+        route.header = Some(wire::AsHeader {
+            terminal_link: 1, controls: wire::Controls(access << 4), cluster_id: 1,
+            formats: 3, subslot_size: 2, bit_resolution: 16,
+            auxiliary_protocols: 0, control_size: 0,
+        });
+        route
+    }
+
+    #[test]
+    fn active_format_proof_addresses_selected_and_retained_implicit_interfaces() {
+        let mut route = format_control_route(1);
+        let mut peer = format_control_route(1);
+        peer.interface = 7;
+        route.implicit = Some(Box::new(peer));
+        assert_eq!(route.active_pcm_format_interfaces().collect::<Vec<_>>(), vec![5, 7]);
+        let mut commands = Vec::new();
+        verify_adc3_active_formats_with(&route, |interface, entity, selector, request, bytes| {
+            commands.push((0xa1, request, u16::from(selector) << 8,
+                u16::from(interface) | (u16::from(entity) << 8), bytes.len()));
+            *bytes = 1u64.to_le_bytes();
+            Ok(8)
+        }).unwrap();
+        assert_eq!(commands, vec![(0xa1, 1, 0x0300, 5, 8), (0xa1, 1, 0x0300, 7, 8)]);
+        assert!(verify_adc3_active_formats_with(&route, |interface, _, _, _, bytes| {
+            *bytes = if interface == 7 { 2u64 } else { 1u64 }.to_le_bytes();
+            Ok(8)
+        }).is_err());
+    }
+
+    #[test]
+    fn active_format_proof_rejects_non_pcm_multi_bit_and_wrong_width_replies() {
+        let route = format_control_route(1);
+        for formats in [0u64, 2, 3, 1 << 63] {
+            assert!(verify_adc3_active_formats_with(&route, |_, _, _, _, bytes| {
+                *bytes = formats.to_le_bytes(); Ok(8)
+            }).is_err());
+        }
+        for width in [0, 7, 9] {
+            assert!(verify_adc3_active_formats_with(&route, |_, _, _, _, bytes| {
+                *bytes = 1u64.to_le_bytes(); Ok(width)
+            }).is_err());
+        }
+        assert!(verify_adc3_active_formats_with(&route, |_, _, _, _, _|
+            Err("read failed".into())).is_err());
+    }
+
+    #[test]
+    fn active_format_control_admission_rejects_reserved_and_writable_advertisements() {
+        for access in [2, 3] {
+            let route = format_control_route(access);
+            assert!(validate_adc3_format_control(route.header.as_ref().unwrap()).is_err());
+            assert!(verify_adc3_active_formats_with(&route, |_, _, _, _, _|
+                panic!("invalid control must not be read")).is_err());
+        }
+        for access in [0, 1] {
+            assert!(validate_adc3_format_control(format_control_route(access).header.as_ref().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn absent_and_badd_format_controls_issue_no_reads() {
+        let mut route = format_control_route(0);
+        let mut peer = format_control_route(3);
+        peer.profile = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
+        route.implicit = Some(Box::new(peer));
+        assert!(route.active_pcm_format_interfaces().next().is_none());
+        verify_adc3_active_formats_with(&route, |_, _, _, _, _|
+            panic!("absent and BADD controls must not be read")).unwrap();
     }
 
     #[test]

@@ -1055,6 +1055,11 @@ pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
     // new startup gate. The completed configuration owns initial verification.
     let mut target = audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
         endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)));
+    if let Some(route) = endpoint.adc3_route.as_ref() {
+        for interface in route.active_pcm_format_interfaces() {
+            target.add_adc3_pcm_format(interface);
+        }
+    }
     target.add_data_endpoint(endpoint.interface, endpoint.alternate, endpoint.address);
     Ok(Some(target))
 }
@@ -1198,6 +1203,7 @@ pub(super) fn configure_capture_endpoint_guarded(
                 "ADC3 capture route changed during activation".into(),
             ));
         }
+        adc3::verify_adc3_active_formats(&claimed.handle, &actual).or_control()?;
         adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate).map_err(Error::Control)?;
     } else {
         let config = claimed

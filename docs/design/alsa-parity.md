@@ -97,6 +97,31 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `db66d83e3d184cad25cda11c1c39315c290bb51f1cd353908d09d678c9d042e4`.
 
+### Full ADC3 active PCM format
+
+The AS descriptor lists every format an alternate can carry. If it
+advertises the read-only Audio Data Format control, read the active
+format after the alternate is selected and the clock is configured.
+Require an exact eight-byte reply with the PCM bit alone. Do this for
+playback, direct capture, and the IN endpoint used for implicit
+playback feedback. BADD continues to derive its fixed PCM format from
+the profile. [USB-IF ADC3 §§4.7.2 and 5.2.2.1.3, Table A-38](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/branch/master/Audio30.pdf#page=130)
+
+When a monitored AudioControl interrupt reports a format or alternate
+change, read the active format again before delivering data or
+refilling USB transfers. If the read fails or the active format
+differs, stop the stream and retire its USB transfers. For final
+hardware acceptance, trace the format read on a multi-format
+alternate and change its active encoding while playback or capture
+runs. Verify that a format change on an implicit IN source stops
+playback as well.
+
+Rust workspace tests covered control addressing, rejection of non-PCM
+and malformed replies, and notification filtering. The Android arm64
+target check, release AAR and sample build passed. All four ABIs
+contain matching native libraries in both packages. The AAR SHA-256
+is `a0fd9e77b1b70b8fe49e3c3193d7623eec28463bdfbb6ed61af80c27746b4153`.
+
 ### UAC2 playback alternate selection at a verified rate
 
 After the UAC2 clock verifies the requested PCM rate, check the

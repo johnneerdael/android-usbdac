@@ -719,7 +719,21 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(Error::Transfer(error));
         }
+        // Both OUT and any embedded implicit IN alternate are active now.
+        // Prove their advertised live PCM format before publishing the stream.
+        if let Err(error) = adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control() {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
+        }
         adc3_status_clock_proven = route.clock.is_some();
+    }
+    if let Some(route) = attachment.as_ref().filter(|capture| !capture.shared_implicit)
+        .and_then(|capture| capture.endpoint.adc3_route.as_ref()) {
+        // Final OUT activation/programming can affect independently activated IN.
+        if let Err(error) = adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control() {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
+        }
     }
 
     // A UAC1 SET_CUR ACK may round to a supported rate. Read the active
@@ -1219,6 +1233,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 let mut target = audio_status::StreamStatusTarget::new(protocol,
                     choice.control_interface, candidate.interface_number, candidate.alt_setting,
                     proven_clock);
+                if let Some(route) = adc3_route.as_ref() {
+                    for interface in route.active_pcm_format_interfaces() {
+                        target.add_adc3_pcm_format(interface);
+                    }
+                }
                 target.add_data_endpoint(candidate.interface_number, candidate.alt_setting,
                     candidate.endpoint_address);
                 if let Some(source) = candidate.implicit_feedback {

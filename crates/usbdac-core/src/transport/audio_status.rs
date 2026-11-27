@@ -108,6 +108,17 @@ impl StreamStatusTarget {
             self.streaming.push((interface, alternate));
         }
     }
+
+    /// Register an advertised ADC3 format control already confirmed as PCM at activation.
+    pub(super) fn add_adc3_pcm_format(&mut self, interface: u8) {
+        if self.protocol == 0x30 {
+            // ADC3 5.2.2.1.3 and Table A-38: AS_AUDIO_DATA_FORMAT_CONTROL
+            // selects the eight-byte active format bitmap; PCM is bit zero.
+            let mut read = ExpectedRead::new(interface, 0, 3, &1u64.to_le_bytes());
+            read.recheck_on_alternate_change = true;
+            self.reads.push(read);
+        }
+    }
     pub(super) fn add_data_endpoint(&mut self, interface: u8, alternate: u8, address: u8) {
         self.add_streaming_alt(interface, alternate);
         if !self
@@ -170,6 +181,7 @@ impl Address {
 struct ExpectedRead {
     address: Address,
     expected: Vec<u8>,
+    recheck_on_alternate_change: bool,
 }
 
 impl ExpectedRead {
@@ -182,6 +194,7 @@ impl ExpectedRead {
                 selector,
             },
             expected: expected.to_vec(),
+            recheck_on_alternate_change: false,
         }
     }
 
@@ -194,12 +207,19 @@ impl ExpectedRead {
                         selector: 2,
                         ..self.address
                     })
+            || (self.recheck_on_alternate_change
+                && matches!(address.selector, 1 | 2)
+                && address
+                    == Address {
+                        selector: address.selector,
+                        ..self.address
+                    })
     }
 }
 
 fn add_read(reads: &mut Vec<ExpectedRead>, read: ExpectedRead) -> Result<(), Error> {
     if let Some(previous) = reads
-        .iter()
+        .iter_mut()
         .find(|previous| previous.address == read.address)
     {
         if previous.expected != read.expected {
@@ -208,6 +228,7 @@ fn add_read(reads: &mut Vec<ExpectedRead>, read: ExpectedRead) -> Result<(), Err
                 read.address
             )));
         }
+        previous.recheck_on_alternate_change |= read.recheck_on_alternate_change;
     } else {
         reads.push(read);
     }
@@ -1008,6 +1029,70 @@ mod tests {
         }
         packet.push(0);
         assert!(triggered_reads(&reads, &packet).is_empty());
+    }
+
+    #[test]
+    fn adc3_pcm_format_registration_is_protocol_scoped_and_exact() {
+        for protocol in [0, 0x20, 0x30] {
+            let mut target = StreamStatusTarget::new(protocol, 1, 3, 2, None);
+            target.add_adc3_pcm_format(3);
+            if protocol != 0x30 {
+                assert!(target.reads.is_empty());
+                continue;
+            }
+            assert_eq!(target.reads.len(), 1);
+            let read = &target.reads[0];
+            assert_eq!(read.address, ExpectedRead::new(3, 0, 3, &[]).address);
+            assert_eq!(read.address.request_type(), 0xa1);
+            assert_eq!(read.address.index(), 3);
+            assert_eq!(read.expected, [1, 0, 0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn adc3_format_notifications_recheck_pcm_and_alternate_changes() {
+        let mut target = StreamStatusTarget::new(0x30, 1, 3, 2, None);
+        target.add_adc3_pcm_format(3);
+        target.reads.push(ExpectedRead::new(3, 0, 1, &[2]));
+        for selector in [1, 2, 3] {
+            let record = [0, 1, 0, selector, 3, 0];
+            assert_eq!(
+                triggered_reads(&target.reads, &record.repeat(2)),
+                if selector == 3 { vec![0] } else { vec![0, 1] }
+            );
+        }
+        // A format selector on an endpoint, other interface/entity, non-CUR
+        // attribute, or malformed notification cannot invalidate this proof.
+        for record in [
+            [2, 1, 0, 3, 3, 0],
+            [2, 1, 0, 1, 3, 0],
+            [0, 1, 0, 3, 4, 0],
+            [0, 1, 0, 3, 3, 1],
+            [0, 2, 0, 3, 3, 0],
+            [0, 1, 1, 3, 3, 0],
+            [0, 1, 0, 4, 3, 0],
+        ] {
+            assert!(triggered_reads(&target.reads, &record).is_empty());
+        }
+        assert!(triggered_reads(&target.reads, &[0, 1, 0, 3, 3]).is_empty());
+
+        // Generic selector 3 reads (including UAC2's distinct namespace)
+        // never acquire ADC3 alternate-change invalidation implicitly.
+        let generic = [ExpectedRead::new(3, 0, 3, &1u64.to_le_bytes())];
+        for selector in [1, 2] {
+            assert!(triggered_reads(&generic, &[0, 1, 0, selector, 3, 0]).is_empty());
+        }
+    }
+
+    #[test]
+    fn merged_adc3_format_proofs_retain_alternate_invalidation() {
+        let mut target = StreamStatusTarget::new(0x30, 1, 3, 2, None);
+        target.add_adc3_pcm_format(3);
+        let mut reads = vec![ExpectedRead::new(3, 0, 3, &1u64.to_le_bytes())];
+        add_read(&mut reads, target.reads[0].clone()).unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(triggered_reads(&reads, &[0, 1, 0, 1, 3, 0]), vec![0]);
+        assert!(add_read(&mut reads, ExpectedRead::new(3, 0, 3, &2u64.to_le_bytes())).is_err());
     }
 
     #[test]
