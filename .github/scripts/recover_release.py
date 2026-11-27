@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from prepare_release import STABLE_VERSION, VERSION_FILES, git
+from prepare_release import STABLE_VERSION, version_files, git
 
 GATES = {
     "release-gates / Guide code samples",
@@ -110,7 +110,8 @@ def main():
     parents = git("show", "-s", "--format=%P", candidate).split()
     parent = one(parents, "reserved commit parent")
     versions = []
-    for path, (pattern, count) in VERSION_FILES.items():
+    has_validator = subprocess.run(["git", "cat-file", "-e", f"{candidate}:crates/usbdac-validator/Cargo.toml"], check=False).returncode == 0
+    for path, (pattern, count) in version_files(has_validator).items():
         content = git("show", f"{candidate}:{path}")
         values = [match[2] for match in pattern.finditer(content)]
         if len(values) != count:
