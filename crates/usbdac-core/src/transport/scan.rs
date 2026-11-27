@@ -3019,7 +3019,7 @@ pub(super) fn prepare_direct_usb_libusb() {
     });
 }
 
-pub(super) fn current_lock_requested_for_fd(device_fd: RawFd) -> bool {
+pub(super) fn current_lock_requested_for_fd(device_fd: DeviceKey) -> bool {
     SESSION_STATE
         .lock()
         .as_ref()

@@ -2739,14 +2739,16 @@ fn validate_adc3_clock(
 /// One lease per exclusive USB owner. Repeated domains share its lifetime and
 /// are restored in reverse acquisition order only after transfer retirement.
 pub(super) struct Adc3PowerLease {
-    fd: RawFd,
+    fd: DeviceKey,
+    handle: Option<Arc<DeviceHandle<Context>>>,
     pending: Mutex<Vec<(u8, u8, u8)>>,
     clock: Mutex<Option<(Adc3Route, ClockPlan, FrequencySnapshot, Vec<u8>)>>,
 }
 impl Adc3PowerLease {
-    pub(super) fn new(fd: RawFd) -> Self {
+    pub(super) fn new(fd: DeviceKey, handle: Option<Arc<DeviceHandle<Context>>>) -> Self {
         Self {
             fd,
+            handle,
             pending: Mutex::new(vec![]),
             clock: Mutex::new(None),
         }
@@ -2761,15 +2763,10 @@ impl Adc3PowerLease {
             timeout_ms: 1000,
             data: state.as_mut_ptr().cast(),
         };
-        let n = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &request) };
-        let failure = (n < 0).then(std::io::Error::last_os_error);
+        let result = source_control(self.fd, self.handle.as_deref(), &request);
         class_control_delay();
-        if n != 1 {
-            return Err(if let Some(error) = failure {
-                error.to_string()
-            } else {
-                "ADC3 power control width mismatch".into()
-            });
+        if result.map_err(|error| error.to_string())? != 1 {
+            return Err("ADC3 power control width mismatch".into());
         }
         Ok(())
     }
@@ -2824,8 +2821,9 @@ impl Adc3PowerLease {
             timeout_ms: 1000,
             data: alternate.as_mut_ptr().cast(),
         };
-        let n = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &request) };
-        verify_idle_reply(n, alternate[0])
+        let n =
+            source_control(self.fd, self.handle.as_deref(), &request).map_err(|e| e.to_string())?;
+        verify_idle_reply(n as i32, alternate[0])
     }
     pub(super) fn disarm(&self) {
         self.pending.lock().clear();
@@ -2865,13 +2863,10 @@ impl Adc3LeaseClockIo<'_> {
             timeout_ms: 1000,
             data: pin.as_mut_ptr().cast(),
         };
-        let n = unsafe { libc::ioctl(self.lease.fd, USBDEVFS_CONTROL, &request) };
-        let failure = (n < 0).then(std::io::Error::last_os_error);
+        let result = source_control(self.lease.fd, self.lease.handle.as_deref(), &request);
         class_control_delay();
-        if let Some(error) = failure {
-            return Err(format!("ADC3 clock control failed: {error}"));
-        }
-        if n != pin.len() as i32 {
+        let n = result.map_err(|error| format!("ADC3 clock control failed: {error}"))?;
+        if n != pin.len() {
             return Err(format!(
                 "ADC3 clock control transferred {n}, expected {}",
                 pin.len()

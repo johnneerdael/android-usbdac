@@ -133,8 +133,10 @@ pub(super) fn control() -> HardwareVolumeControl {
 
 pub(crate) fn device() -> UsbDevice {
     UsbDevice {
-        fd: FD,
-        _fd_owner: Arc::new(OwnedUsbFd(FD)),
+        fd: DeviceKey::Usbfs(FD),
+        #[cfg(target_os = "macos")]
+        darwin: None,
+        _fd_owner: Some(Arc::new(OwnedUsbFd(FD))),
         claimed_interfaces: Arc::from(vec![INTERFACE]),
         vendor_id: 0x1234,
         product_id: 0x5678,

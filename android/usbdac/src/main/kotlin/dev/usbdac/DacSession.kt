@@ -328,6 +328,23 @@ public class DacSession private constructor(
         failure?.let { throw it }
     }
 
+    /** USB ownership evidence for the in-repository validator. */
+    @Synchronized
+    public fun validatorClaimEvidenceJson(): String {
+        checkOpen()
+        return JSONObject().put("configuration_id", configurationSelection.selected.id)
+            .put("claimed_interface_ids", org.json.JSONArray(claims.ids))
+            .put("claim_force", true).toString()
+    }
+
+    /** Internal integration point for the in-repository validator. */
+    @Synchronized
+    public fun runValidator(captureDirectory: String): String {
+        checkOpen()
+        check(stream == null && duplex == null) { "validator requires an idle session" }
+        return Native.validatorRun(dac, captureDirectory)
+    }
+
     private fun checkOpen() {
         if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "the session is closed")
     }

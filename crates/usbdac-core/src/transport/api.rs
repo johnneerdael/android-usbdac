@@ -435,6 +435,22 @@ pub(crate) fn open_device(fd: RawFd, info: &crate::capabilities::DeviceInfo) -> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn register_darwin_device(
+    device: UsbDevice,
+    info: &crate::DeviceInfo,
+) -> Result<(), Error> {
+    validate_registration_handoff(
+        &device,
+        info.configuration_id,
+        &info.unavailable_feedback_interfaces,
+    )
+    .map_err(Error::Claim)?;
+    register_device(device)?;
+    discover_idle_volume_control();
+    Ok(())
+}
+
 /// Register both directions through the native capture proof, preserving playback startup.
 pub(crate) fn open_duplex_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(), Error> {
     if !cfg!(any(target_os = "linux", target_os = "android")) {

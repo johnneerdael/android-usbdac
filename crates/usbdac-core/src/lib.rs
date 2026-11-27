@@ -47,6 +47,8 @@ mod capabilities;
 mod clock_resolution;
 mod config;
 mod dac;
+#[cfg(target_os = "macos")]
+pub mod darwin_discovery;
 mod endpoint;
 mod error;
 mod events;
@@ -93,7 +95,7 @@ pub use config::{
     QuirkOverride, StartupVolume, UsbQueueProfile,
 };
 pub use dac::{Dac, StreamReconfiguration, UsbRetirement};
-pub use error::{Error, Result};
+pub use error::{Error, HostUsbFailureKind, Result};
 pub use events::{CompatibilityFallbackTier, DacEvent, DacListener, StreamState};
 pub use fake::{PlaybackDevice, PlaybackStream};
 pub use feedback_diagnostics::{

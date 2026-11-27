@@ -448,7 +448,7 @@ fn itf_switch(io: &mut impl ItfModeIo, recipe: itf::Recipe) -> Result<(), String
 // transactions, recovery writes, or PCM-facing delays in this release.
 pub(super) struct ItfModeLease;
 impl ItfModeLease {
-    pub(super) fn new(_fd: RawFd) -> Self {
+    pub(super) fn new() -> Self {
         Self
     }
     pub(super) fn disarm(&self) {}

@@ -95,6 +95,7 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
     workingDir = repoRoot
     onlyIf { !skipNative.get() }
 
+    inputs.property("validatorEnabled", gradle.startParameter.taskNames.any { it.contains("validator", ignoreCase = true) } || providers.gradleProperty("usbdac.validator").orNull == "true")
     inputs.property("abis", abis)
     inputs.property("ndkVersion", ndkVersionPin)
     inputs.files(
@@ -113,6 +114,7 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
         val arguments = mutableListOf("cargo", "ndk")
         abis.get().forEach { arguments += listOf("-t", it) }
         arguments += listOf("-o", jniLibsDir.asFile.absolutePath, "build", "-p", "usbdac-jni", "--release")
+        if (gradle.startParameter.taskNames.any { it.contains("validator", ignoreCase = true) } || providers.gradleProperty("usbdac.validator").orNull == "true") arguments += listOf("--features", "validator")
         commandLine(arguments)
     }
 }

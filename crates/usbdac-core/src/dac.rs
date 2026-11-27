@@ -314,6 +314,47 @@ impl Dac {
         Self::open_playback_device(fd, info, config, false)
     }
 
+    /// Open a fresh macOS libusb attachment for direct playback. When
+    /// `allow_capture` is true libusb may take the whole USB device away from
+    /// its kernel driver, subject to macOS authorization.
+    #[cfg(target_os = "macos")]
+    pub fn open_darwin(
+        attachment: crate::darwin_discovery::Attachment,
+        config: DacConfig,
+        allow_capture: bool,
+    ) -> Result<Dac> {
+        config.validate()?;
+        let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve_darwin(attachment.device())?;
+        let _scope = context.enter();
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
+        let (device, info) = transport::usbfs::open_darwin_device(&attachment, allow_capture)?;
+        settings::install(Settings::for_device(config.clone(), &info));
+        if let Err(error) = transport::api::register_darwin_device(device, &info) {
+            settings::reset();
+            return Err(error);
+        }
+        context.admit();
+        let events = EventHub::start();
+        if let Some(state) = transport::volume_hw::startup_lowered_volume() {
+            events.emit_dac_or_hold(crate::events::DacEvent::VolumeChanged(state));
+        }
+        Ok(Dac {
+            shared: Arc::new(DacShared {
+                context: transport::context::current(),
+                events,
+                info,
+                config,
+                closed: AtomicBool::new(false),
+                control_guard: Mutex::new(()),
+                stream: Mutex::new(None),
+                last_feedback_stream: Mutex::new(None),
+            }),
+        })
+    }
+
     /// Explicit duplex registration. Claim the base playback interfaces and all
     /// IN/control interfaces returned by capture_preflight for the same configuration.
     /// Ordinary playback registration retains its narrower optional-IN policy.

@@ -754,8 +754,10 @@ pub(crate) fn test_pcm_format() -> PlaybackFormat {
 pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionState {
     SessionState {
         device: UsbDevice {
-            fd: -1,
-            _fd_owner: Arc::new(OwnedUsbFd(-1)),
+            fd: DeviceKey::Usbfs(-1),
+            #[cfg(target_os = "macos")]
+            darwin: None,
+            _fd_owner: Some(Arc::new(OwnedUsbFd(-1))),
             claimed_interfaces: Arc::from(Vec::<u8>::new()),
             vendor_id: 0,
             product_id: 0,
