@@ -65,6 +65,18 @@ public class SelectedOutput internal constructor(
     }
 }
 
+/** A pre-track USB session. Close it to release the DAC unless ownership has moved to an output.
+ * [volume] is the session's hardware volume, or null when unavailable. Once transferred, use
+ * [SelectedOutput.volume]; closing this handle no longer closes the output.
+ */
+public class PreparedUsbOutput internal constructor(
+    public val device: DacDeviceInfo,
+    public val volume: DacVolume?,
+    private val release: () -> Unit,
+) : java.io.Closeable {
+    override fun close(): Unit = release()
+}
+
 /**
  * Looks at the device and gives the app one ready [PcmOutput], with the reason for it and the
  * guarantee that applies, so the app does not have to choose between [DacStream],
@@ -129,6 +141,52 @@ public class OutputSelector internal constructor(
 
     private val lock = Any()
     private val active = AtomicReference<SelectedOutput?>(null)
+    private class Preparation(val link: DirectLink, val handle: PreparedUsbOutput)
+    private var preparation: Preparation? = null
+
+    /**
+     * Open an explicitly chosen, already permitted DAC before the first track, to control its
+     * hardware volume. Blocks and claims the device; no permission prompt is shown. The next [open]
+     * uses this exact session for direct playback. A failed negotiation or open closes the session
+     * and reports the error; it never falls back to another output. Close the returned handle to
+     * cancel, or close the resulting [SelectedOutput] after ownership transfers.
+     */
+    public fun prepareUsb(dac: DacDeviceInfo): PreparedUsbOutput = synchronized(lock) {
+        requireIdle()
+        if (!policy.allowDirectUsb || (policy.force != null && policy.force != OutputKind.DIRECT_USB)) {
+            throw DacException(DacErrorCode.INVALID_STATE, "direct USB conflicts with output policy")
+        }
+        if (platform.activeRoute().any { it.kind == RouteKind.WIRELESS }) {
+            throw DacException(DacErrorCode.INVALID_STATE, "direct USB conflicts with the wireless route")
+        }
+        if (platform.attachedDacs().none { (it.device === dac.device || it.device == dac.device) && it.deviceName == dac.deviceName &&
+                it.vendorId == dac.vendorId && it.productId == dac.productId }) {
+            throw DacException(DacErrorCode.DEVICE_LOST, "the selected DAC is no longer attached")
+        }
+        if (!platform.hasPermission(dac)) {
+            throw DacException(DacErrorCode.PERMISSION_DENIED, "no USB permission for ${dac.productName}")
+        }
+        val link = platform.openDac(dac, policy.dacConfig)
+        try {
+            if (policy.dacConfig.requireHardwareVolume && !link.hasUsableVolume) {
+                throw DacException(DacErrorCode.VOLUME_UNAVAILABLE, "the selected DAC has no usable hardware volume")
+            }
+            lateinit var handle: PreparedUsbOutput
+            handle = PreparedUsbOutput(dac, link.volume) {
+                synchronized(lock) {
+                    if (preparation?.handle === handle) {
+                        preparation = null
+                        link.close()
+                    }
+                }
+            }
+            preparation = Preparation(link, handle)
+            handle
+        } catch (error: Throwable) {
+            try { link.close() } catch (close: Throwable) { error.addSuppressed(close) }
+            throw error
+        }
+    }
 
     /**
      * Changes that may make another output the best one: a DAC attached, detached or given its USB
@@ -177,8 +235,31 @@ public class OutputSelector internal constructor(
      * @throws DacException as [select].
      */
     public fun open(request: StreamRequest): SelectedOutput = synchronized(lock) {
-        requireIdle()
-        openResolved(resolve(request, keep = true))
+        val prepared = preparation
+        if (prepared == null) {
+            requireIdle()
+            openResolved(resolve(request, keep = true))
+        } else {
+            // The selector owns the link until commit succeeds; then SelectedOutput owns it.
+            try {
+                val dac = prepared.handle.device
+                if (platform.activeRoute().any { it.kind == RouteKind.WIRELESS } ||
+                    platform.attachedDacs().none { (it.device === dac.device || it.device == dac.device) && it.deviceName == dac.deviceName &&
+                        it.vendorId == dac.vendorId && it.productId == dac.productId } ||
+                    !platform.hasPermission(dac) || prepared.link.session?.state?.value?.let { it != DacState.READY } == true) {
+                    throw DacException(DacErrorCode.DEVICE_LOST, "the prepared DAC is no longer available for direct playback")
+                }
+                val pass = Pass(request, RouteView(platform.activeRoute()), null)
+                val candidate = directCandidate(request, dac, prepared.link, negotiate(prepared.link, request))
+                val resolved = Resolution(decisionOf(candidate, pass, emptyList()), candidate.commit())
+                preparation = null
+                openResolved(resolved)
+            } catch (error: Throwable) {
+                preparation = null
+                try { prepared.link.close() } catch (close: Throwable) { error.addSuppressed(close) }
+                throw error
+            }
+        }
     }
 
     internal fun openMatchingUsb(request: StreamRequest, matches: (DacDeviceInfo) -> Boolean): SelectedOutput =
@@ -216,10 +297,10 @@ public class OutputSelector internal constructor(
     }
 
     private fun requireIdle() {
-        if (active.get() != null) {
+        if (active.get() != null || preparation != null) {
             throw DacException(
                 DacErrorCode.INVALID_STATE,
-                "close the output this selector opened before selecting again: it holds the device the look needs",
+                "close the output or prepared DAC this selector owns before selecting again",
             )
         }
     }
