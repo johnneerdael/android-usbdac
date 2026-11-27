@@ -30,6 +30,29 @@ pub(super) fn retire_bootstrap_completion(slot: &mut IsoTransferSlot, acceptance
     result.map(|()| Some(completed))
 }
 
+// This remains a conservative submission-time estimate, not a USB-frame clock.
+// Inspect only the queue that survived retirement of the complete event batch;
+// a fresh submission must never extend an already exhausted continuity deadline.
+fn implicit_out_queue_failure(
+    now: Instant,
+    last_valid: Instant,
+    active_slots: usize,
+    pending_submissions: impl Iterator<Item = Instant>,
+    geometry: &IsoQueueGeometry,
+) -> Option<&'static str> {
+    if active_slots == 0 {
+        return Some("implicit feedback observed an empty OUT bus queue");
+    }
+    let coverage = pending_submissions
+        .map(|at| (at + Duration::from_micros(geometry.transfer_us())).saturating_duration_since(now))
+        .max().unwrap_or_default();
+    if now.saturating_duration_since(last_valid) > Duration::from_micros(geometry.queued_us())
+        && coverage <= Duration::from_micros(u64::from(geometry.service_interval_us)) {
+        return Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)");
+    }
+    None
+}
+
 pub(super) fn prepare_iso_transfer_payload(
     scheduler: &mut IsoPacketScheduler,
     pcm_buffer: &Arc<Mutex<PcmRing>>,
@@ -1126,24 +1149,9 @@ pub(super) fn run_usb_output_loop(
             if bootstrap[slot.slot_index] {
                 match retire_bootstrap(slot, acceptance) {
                     Ok(true) => {
-                        bootstrap[slot.slot_index] = false;
+                        // Preserve the bootstrap marker until promotion succeeds.
+                        // Refill only after every completion in this batch retires.
                         active_slots = active_slots.saturating_sub(1);
-                        if !usb_stop_requested(&stop) {
-                            let pattern = implicit.as_mut().and_then(|engine| engine.take_pattern(&runtime_stats));
-                            let Some(pattern) = pattern else {
-                                implicit_feedback_fault = true;
-                                fatal_error = Some("PLAYBACK_FIRST promotion lost measured timing".into()); break;
-                            };
-                            scheduler.set_packet_pattern(pattern);
-                            match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
-                                &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
-                                dsd_bit_reverse, &mut logged_transfer_preview, &mut logged_usb_encode_format,
-                                &mut underrun_count, &shared, &mut was_underrun) {
-                                Ok(true) => active_slots += 1,
-                                Ok(false) => { implicit_feedback_fault = true; fatal_error = Some("empty PLAYBACK_FIRST promotion".into()); break; }
-                                Err(error) => { device_lost = matches!(classify_stream_failure(Some(&error), false, None), Some(Error::DeviceLost)); implicit_feedback_fault = true; fatal_error = Some(error); break; }
-                            }
-                        }
                     }
                     Ok(false) => (),
                     Err(error) => { device_lost = error == Error::DeviceLost; implicit_feedback_fault = true; fatal_error = Some(error.to_string()); break; }
@@ -1516,34 +1524,52 @@ pub(super) fn run_usb_output_loop(
         }
         if fatal_error.is_none() && !usb_stop_requested(&stop) {
             if let Some(engine) = implicit.as_mut() {
-                if active_slots == 0 {
+                let now = Instant::now();
+                if let Some(error) = implicit_out_queue_failure(now, engine.last_valid, active_slots,
+                    slots.iter().filter(|slot| slot.in_flight).filter_map(|slot| slot.submitted_at),
+                    &geometry) {
                     runtime_stats.implicit_empty_bus.fetch_add(1, Ordering::Relaxed);
                     implicit_feedback_fault = true;
-                    fatal_error = Some("implicit feedback observed an empty OUT bus queue".into());
+                    fatal_error = Some(error.into());
                     break;
                 }
                 for slot in slots.iter_mut().filter(|slot| !slot.in_flight) {
                     if usb_stop_requested(&stop) { break; }
+                    let promoting_bootstrap = bootstrap[slot.slot_index];
                     let Some(pattern) = engine.take_pattern(&runtime_stats) else {
-                        runtime_stats.implicit_waits.fetch_add(1, Ordering::Relaxed); break;
+                        if promoting_bootstrap {
+                            implicit_feedback_fault = true;
+                            fatal_error = Some("PLAYBACK_FIRST promotion lost measured timing".into());
+                        } else {
+                            runtime_stats.implicit_waits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        break;
                     };
                     scheduler.set_packet_pattern(pattern);
                     match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
                         &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
                         dsd_bit_reverse, &mut logged_transfer_preview, &mut logged_usb_encode_format,
                         &mut underrun_count, &shared, &mut was_underrun) {
-                        Ok(true) => { active_slots += 1; }
-                        Ok(false) => {}
-                        Err(error) => { fatal_error = Some(error); break; }
+                        Ok(true) => {
+                            active_slots += 1;
+                            bootstrap[slot.slot_index] = false;
+                        }
+                        Ok(false) => {
+                            if promoting_bootstrap {
+                                implicit_feedback_fault = true;
+                                fatal_error = Some("empty PLAYBACK_FIRST promotion".into());
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            if promoting_bootstrap {
+                                device_lost = matches!(classify_stream_failure(Some(&error), false, None), Some(Error::DeviceLost));
+                                implicit_feedback_fault = true;
+                            }
+                            fatal_error = Some(error);
+                            break;
+                        }
                     }
-                }
-                let coverage = slots.iter().filter(|slot| slot.in_flight).filter_map(|slot| slot.submitted_at)
-                    .map(|at| (at + Duration::from_micros(geometry.transfer_us())).saturating_duration_since(Instant::now()))
-                    .max().unwrap_or_default();
-                if active_slots == 0 || (engine.last_valid.elapsed() > Duration::from_micros(geometry.queued_us()) && coverage <= Duration::from_micros(u64::from(candidate.service_interval_us))) {
-                    runtime_stats.implicit_empty_bus.fetch_add(1, Ordering::Relaxed);
-                    implicit_feedback_fault = true;
-                    fatal_error = Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)".into());
                 }
                 runtime_stats.transfer_queue_depth.store(active_slots, Ordering::Relaxed);
             }
@@ -1737,6 +1763,62 @@ mod duplex_failure_tests {
         assert_eq!(classify_stream_failure(Some(&typed.to_string()), false, Some(typed.clone())), Some(typed));
         assert_eq!(classify_stream_failure(Some("capture completion failed"), false, Some(Error::DeviceLost)), Some(Error::DeviceLost));
         assert_eq!(classify_stream_failure(None, false, None), None);
+    }
+}
+
+#[cfg(test)]
+mod implicit_out_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn expired_existing_coverage_blocks_a_potential_new_submission() {
+        let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
+        let now = Instant::now();
+        let last_valid = now - Duration::from_micros(geometry.queued_us() + 1);
+        let existing_submission = now - Duration::from_micros(geometry.transfer_us());
+        let failure = implicit_out_queue_failure(now, last_valid, 1,
+            [existing_submission].into_iter(), &geometry);
+        assert_eq!(failure, Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)"));
+        // The old post-refill check would see this fresh timestamp and miss it.
+        assert_eq!(implicit_out_queue_failure(now, last_valid, 2,
+            [existing_submission, now].into_iter(), &geometry), None);
+    }
+
+    #[test]
+    fn observed_empty_queue_fails_even_with_fresh_feedback_and_promotable_slots() {
+        let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
+        let now = Instant::now();
+        assert_eq!(implicit_out_queue_failure(now, now, 0,
+            std::iter::empty(), &geometry),
+            Some("implicit feedback observed an empty OUT bus queue"));
+    }
+
+    #[test]
+    fn healthy_existing_coverage_allows_refill_or_fifo_wait() {
+        let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
+        let now = Instant::now();
+        let stale = now - Duration::from_micros(geometry.queued_us() + 1);
+        // Stale feedback alone does not fail while existing OUT coverage remains.
+        assert_eq!(implicit_out_queue_failure(now, stale, 1,
+            [now].into_iter(), &geometry), None);
+        // The age threshold is strict; at its boundary the FIFO can still wait.
+        let boundary = now - Duration::from_micros(geometry.queued_us());
+        let exhausted = now - Duration::from_micros(geometry.transfer_us());
+        assert_eq!(implicit_out_queue_failure(now, boundary, 1,
+            [exhausted].into_iter(), &geometry), None);
+    }
+
+    #[test]
+    fn stale_feedback_fails_at_one_service_interval_of_existing_coverage() {
+        let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
+        let now = Instant::now();
+        let stale = now - Duration::from_micros(geometry.queued_us() + 1);
+        let submission = now - Duration::from_micros(geometry.transfer_us() - 125);
+        assert!(implicit_out_queue_failure(now, stale, 1,
+            [submission].into_iter(), &geometry).is_some());
+        let submission = submission + Duration::from_micros(1);
+        assert_eq!(implicit_out_queue_failure(now, stale, 1,
+            [submission].into_iter(), &geometry), None);
     }
 }
 

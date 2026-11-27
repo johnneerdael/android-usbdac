@@ -49,6 +49,46 @@ pub(super) fn capture_pattern(packets: impl Iterator<Item = (i32, usize, usize)>
     Ok(!empty)
 }
 
+/// Admit the complete source schedule before using its lengths for OUT timing
+/// or publishing the shared IN payload to a duplex reader.
+fn inspect_implicit_pattern(slot: &IsoTransferSlot, status: i32,
+    source: &ImplicitFeedbackSource, out_stride: usize, max_out: usize,
+    packets: &mut [crate::capture::CapturePacket], pattern: &mut [usize],
+) -> Result<bool, String> {
+    // Removal metadata takes priority over other transfer failures. Only read
+    // the descriptor allocation when its count matches the owned schedule.
+    let transfer = unsafe { slot.transfer.as_ref() };
+    if transfer.num_iso_packets == packets.len() as i32 {
+        let descriptors = unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), packets.len()) };
+        if descriptors.iter().any(|packet| packet.status == LIBUSB_TRANSFER_NO_DEVICE) {
+            return Err("USB DAC disconnected (implicit feedback)".into());
+        }
+    }
+    let (data, detached) = capture_stream::inspect_slot(slot, status, packets)
+        .map_err(|error| if error == Error::DeviceLost {
+            "USB DAC disconnected (implicit feedback)".into()
+        } else { error.to_string() })?;
+    if detached { return Err("USB DAC disconnected (implicit feedback)".into()); }
+    if slot.submitted_endpoint != source.address || slot.packet_sizes.len() != packets.len() {
+        return Err("implicit capture source geometry changed".into());
+    }
+    let mut span = 0usize;
+    for (packet, &submitted) in packets.iter().zip(&slot.packet_sizes) {
+        if submitted != source.max_packet_bytes || packet.requested_bytes != submitted {
+            return Err("implicit capture packet geometry changed".into());
+        }
+        span = span.checked_add(submitted).ok_or("implicit capture packet span overflow")?;
+        if span > data.len() { return Err("implicit capture packet exceeds submitted buffer".into()); }
+    }
+    if span != slot.submitted_bytes {
+        return Err("implicit capture packet span changed".into());
+    }
+    capture_pattern(packets.iter().map(|packet| (
+        if packet.succeeded { LIBUSB_TRANSFER_COMPLETED } else { LIBUSB_TRANSFER_ERROR },
+        packet.actual_bytes, packet.requested_bytes)),
+        source.bytes_per_frame, out_stride, max_out, pattern)
+}
+
 fn rate_window_valid(frames: u64, service_us: u64, rate: u32) -> bool {
     let expected = f64::from(rate) * service_us as f64 / 1_000_000.0;
     (frames as f64 - expected).abs() <= expected * 0.02 + 1.0
@@ -161,35 +201,35 @@ impl ImplicitFeedback {
                     slot: Some(index), status, actual_bytes,
                 });
             }
+            // Retire every consumed callback before any validation can fail.
+            self.slots[index].mark_completed();
             self.order.pop_front(); self.out_of_order_seen[index] = false;
             stats.implicit_in_transfers.fetch_add(1, Ordering::Relaxed);
-            let capture_result = self.capture.as_ref().map(|capture|
-                capture.ingest(&self.slots[index], status, &mut self.capture_scratch)).transpose();
-            let result = if status == LIBUSB_TRANSFER_COMPLETED {
+            if status == LIBUSB_TRANSFER_COMPLETED {
                 let transfer = unsafe { self.slots[index].transfer.as_ref() };
-                let descriptors = if transfer.num_iso_packets != self.scratch.len() as i32 {
-                    self.slots[index].mark_completed();
-                    return Err("implicit capture packet descriptor count changed".into());
-                } else { unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), self.scratch.len()) } };
-                if let Some(trace) = &stats.feedback_trace {
-                    for (index, descriptor) in descriptors.iter().enumerate() {
-                        trace.record(crate::FeedbackTraceEvent::ImplicitPacket {
-                            index, status: descriptor.status, requested_bytes: descriptor.length as usize,
-                            actual_bytes: descriptor.actual_length as usize,
-                        });
+                // A changed count cannot safely be used to read descriptors.
+                if transfer.num_iso_packets == self.scratch.len() as i32 {
+                    let descriptors = unsafe { std::slice::from_raw_parts(
+                        transfer.iso_packet_desc.as_ptr(), self.scratch.len()) };
+                    if let Some(trace) = &stats.feedback_trace {
+                        for (index, descriptor) in descriptors.iter().enumerate() {
+                            trace.record(crate::FeedbackTraceEvent::ImplicitPacket {
+                                index, status: descriptor.status, requested_bytes: descriptor.length as usize,
+                                actual_bytes: descriptor.actual_length as usize,
+                            });
+                        }
                     }
                 }
-                capture_pattern(descriptors.iter().map(|p| (p.status, p.actual_length as usize, p.length as usize)),
-                    self.source.bytes_per_frame, self.out_stride, self.max_out, &mut self.scratch)
-            } else {
-                if status == LIBUSB_TRANSFER_NO_DEVICE {
-                    self.slots[index].mark_completed();
-                    return Err("USB DAC disconnected (implicit feedback)".into());
-                }
-                if status == LIBUSB_TRANSFER_TIMED_OUT { stats.feedback_timeouts.fetch_add(1, Ordering::Relaxed); }
-                Err(format!("implicit capture transfer status {}", status))
-            };
-            self.slots[index].mark_completed();
+            }
+            if status == LIBUSB_TRANSFER_TIMED_OUT { stats.feedback_timeouts.fetch_add(1, Ordering::Relaxed); }
+            let result = inspect_implicit_pattern(&self.slots[index], status, &self.source,
+                self.out_stride, self.max_out, &mut self.capture_scratch, &mut self.scratch);
+            // Failed transfers contain no presentable payload. Completed URBs
+            // must pass the entire timing contract first, including packet gaps.
+            let capture_result = if result.is_ok() || status != LIBUSB_TRANSFER_COMPLETED {
+                self.capture.as_ref().map(|capture|
+                    capture.ingest(&self.slots[index], status, &mut self.capture_scratch)).transpose()
+            } else { Ok(None) };
             match result {
                 Ok(true) => {
                     let last_report_ms = record_valid_completion(&mut self.last_valid, completed_at, stats.started_at);
@@ -279,6 +319,64 @@ impl ImplicitFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn source_slot() -> (ImplicitFeedbackSource, IsoTransferSlot) {
+        let source = ImplicitFeedbackSource { interface_number: 1, alt_setting: 1,
+            address: 0x81, bytes_per_frame: 4, service_interval_us: 1_000,
+            max_packet_bytes: 12 };
+        let mut slot = IsoTransferSlot::new(0, 2, 24).unwrap();
+        slot.packet_sizes.fill(12);
+        slot.submitted_bytes = 24;
+        slot.submitted_endpoint = source.address;
+        unsafe {
+            let transfer = slot.transfer.as_mut();
+            transfer.endpoint = source.address;
+            transfer.length = 24;
+            transfer.buffer = (*slot.user_data).buffer.as_mut_ptr();
+            transfer.num_iso_packets = 2;
+            for descriptor in std::slice::from_raw_parts_mut(transfer.iso_packet_desc.as_mut_ptr(), 2) {
+                descriptor.length = 12;
+                descriptor.actual_length = 8;
+                descriptor.status = LIBUSB_TRANSFER_COMPLETED;
+            }
+        }
+        (source, slot)
+    }
+    fn inspect_source(source: &ImplicitFeedbackSource, slot: &IsoTransferSlot, status: i32) -> Result<bool, String> {
+        let mut packets = [crate::capture::CapturePacket {
+            requested_bytes: 0, actual_bytes: 0, succeeded: false }; 2];
+        inspect_implicit_pattern(slot, status, source, 8, 24, &mut packets, &mut [0; 2])
+    }
+    #[test] fn implicit_source_admission_uses_immutable_submission_geometry() {
+        let (source, mut slot) = source_slot();
+        assert_eq!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED), Ok(true));
+        unsafe {
+            let descriptor = &mut *slot.transfer.as_mut().iso_packet_desc.as_mut_ptr();
+            descriptor.length = 16;
+            descriptor.actual_length = 16;
+        }
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).is_err());
+        unsafe {
+            let descriptor = &mut *slot.transfer.as_mut().iso_packet_desc.as_mut_ptr();
+            descriptor.length = 12;
+            descriptor.actual_length = 8;
+            slot.transfer.as_mut().endpoint = 0x82;
+        }
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).is_err());
+        unsafe { slot.transfer.as_mut().endpoint = source.address; slot.transfer.as_mut().length = 28; }
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).is_err());
+        unsafe { slot.transfer.as_mut().length = 24; slot.transfer.as_mut().buffer = std::ptr::null_mut(); }
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).is_err());
+        unsafe { slot.transfer.as_mut().buffer = (*slot.user_data).buffer.as_mut_ptr(); }
+        slot.packet_sizes[1] = 8;
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).is_err());
+    }
+    #[test] fn implicit_source_packet_disconnect_needs_no_duplex_attachment() {
+        let (source, mut slot) = source_slot();
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).status = LIBUSB_TRANSFER_NO_DEVICE; }
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_COMPLETED).unwrap_err().contains("disconnected"));
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_NO_DEVICE).unwrap_err().contains("disconnected"));
+        assert!(inspect_source(&source, &slot, LIBUSB_TRANSFER_TIMED_OUT).unwrap_err().contains("disconnected"));
+    }
     #[test] fn delayed_callbacks_preserve_observed_freshness_and_monotonicity() {
         let started_at = Instant::now();
         let mut last_valid = started_at;

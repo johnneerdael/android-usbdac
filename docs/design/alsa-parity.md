@@ -16,9 +16,10 @@ compatibility. Use the following order for the remaining work.
    power-domain hand-back. Resolve optional burst admission against
    descriptor or hardware evidence.
 4. Check the shared native DSD and DoP wire paths and PCM hand-back.
-   Use the physical acceptance matrix for each supported class behavior.
 5. Resume model-specific formats, clock commands, routing and firmware
-   rules after the shared work is validated.
+   rules after the shared implementation and automated checks pass.
+6. Run the physical acceptance matrix after the software work is complete,
+   including the additional desktop DACs.
 
 | Area | usbdac 0.1.1 | Implementation target | Acceptance evidence |
 |---|---|---|---|
@@ -305,11 +306,18 @@ asynchronous cancellation deadline to implicit-only flushes. A terminal
 feedback error clears the lock and records the stale transition in the
 support trace.
 
+Retire the current OUT callback batch, then check coverage from the
+remaining submissions before refilling any implicit-paced OUT slot.
+This includes promotion from startup silence. A new submission cannot
+extend the coverage estimate for a queue that already ran out. Accept
+IN timing only after verifying the original submission and packet spans.
+An IN packet that reports device loss follows the device-loss path.
+
 Rust tests, the Android arm64 NDK check, Kotlin unit tests, and the
 four-ABI AAR and sample builds passed. The AAR SHA-256 is
-`604219168244a82a1b8464e84c03bf853b67b102eb2e671bd736988ccc131f8e`.
-Live validation of delayed implicit callbacks and flush still requires
-an implicit-feedback device.
+`a346493d93fc2a53d921d432d6ce1753687499a6822d03fa96466a104e6b92e2`.
+Live implicit feedback and flush checks are scheduled for final hardware
+acceptance.
 
 ### SuperSpeed capacity evidence
 
