@@ -126,6 +126,8 @@ public data class OutputPolicy @JvmOverloads constructor(
     val dopSupport: DopSupport = DopSupport.UNCONFIRMED,
     /** Resampling, dither and source-layout options. Headroom is applied only when resampling. */
     val conversionOptions: ConversionOptions = ConversionOptions(headroomDb = -3.5),
+    /** Permit unpacking explicit DoP input for lossy PCM conversion, when allowConversion is also true. */
+    val allowDopPcmConversion: Boolean = false,
 ) {
     init {
         require(!(force == OutputKind.DIRECT_USB && !allowDirectUsb)) {

@@ -430,11 +430,80 @@ public class OutputSelector internal constructor(
             return sequenceOf(reject(kind, RejectionReason.POLICY,
                 "the platform output cannot verify the configured downstream decoder limits"))
         }
+        if (kind != OutputKind.DIRECT_USB && pass.request.encoding in listOf(StreamEncoding.DSD_NATIVE, StreamEncoding.DOP)) {
+            return androidDsdAttempts(kind, pass)
+        }
         return when (kind) {
         OutputKind.DIRECT_USB -> directAttempts(pass)
         OutputKind.ANDROID_BIT_PERFECT -> sequence { yield(bitPerfectAttempt(pass)) }
         OutputKind.AAUDIO_EXCLUSIVE -> sequence { yield(aaudioAttempt(pass)) }
         OutputKind.ANDROID_STANDARD -> sequence { yield(standardAttempt(pass)) }
+        }
+    }
+
+    /** PCM targets are finite and lower-first around the DSD intermediate rate. */
+    private fun androidDsdAttempts(kind: OutputKind, pass: Pass): Sequence<Attempt> = sequence {
+        val source = pass.request
+        val bitRate = source.dsdBitRate
+        if (!canConvertDsd(source)) {
+            yield(reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED,
+                "DSD-to-PCM conversion requires supported source format and explicit conversion consent"))
+            return@sequence
+        }
+        val rate = checkNotNull(bitRate)
+        val rates = listOf(44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600)
+        for (targetRate in platform.rankRates(rate / 16, rates)) {
+            val floatTarget = kind == OutputKind.AAUDIO_EXCLUSIVE && policy.aaudioConfig.floatSamples
+            val target = StreamRequest.pcm(targetRate, source.channels, if (floatTarget) 32 else 16)
+            val targetPass = Pass(target, pass.route, pass.matchesUsb)
+            val attempt = when (kind) {
+                OutputKind.ANDROID_BIT_PERFECT -> bitPerfectAttempt(targetPass)
+                OutputKind.AAUDIO_EXCLUSIVE -> aaudioAttempt(targetPass, requireStreamMatch = true)
+                OutputKind.ANDROID_STANDARD -> standardAttempt(targetPass)
+                OutputKind.DIRECT_USB -> error("direct output has its own negotiation")
+            }
+            if (attempt !is Attempt.Ready) {
+                yield(attempt)
+                continue
+            }
+            val candidate = attempt.candidate
+            val gain = if (targetRate == rate / 16) 0.0 else policy.conversionOptions.headroomDb
+            val description = "${if (source.encoding == StreamEncoding.DOP) "DoP unpacked" else "Native DSD"} converted to PCM at $targetRate Hz; resampling gain $gain dB"
+            val sourceRate = if (source.encoding == StreamEncoding.DOP) rate / 16 else rate / 8
+            val written = if (source.encoding == StreamEncoding.DOP)
+                WriteFormat(sourceRate, source.channels, 3, 24, sourceRate, StreamEncoding.DOP)
+            else WriteFormat(sourceRate, source.channels, 1, 8, sourceRate, StreamEncoding.DSD_NATIVE)
+            yield(Attempt.Ready(Candidate(
+                kind = kind,
+                guarantee = Guarantee.NONE,
+                reason = "${candidate.reason} $description; the result is not bit-perfect.",
+                processing = OutputConversion(description, false),
+                commit = {
+                    val opened = candidate.commit()
+                    try {
+                        val options = policy.conversionOptions.copy(headroomDb = gain, sourceLayout = null)
+                        val converted = DsdPcmOutput(opened.output, rate, source.channels, targetRate,
+                            source.channels, if (floatTarget) PcmLayout.FLOAT_32 else PcmLayout.PCM_16, options)
+                        val output = if (source.encoding == StreamEncoding.DOP) DopInputOutput(converted, source.channels, 3) else converted
+                        Opened(output, written, opened.session, opened.stream, opened.volume, opened.releaseSession)
+                    } catch (error: Throwable) {
+                        try { opened.output.close() } catch (closeError: Throwable) { error.addSuppressed(closeError) }
+                        throw error
+                    }
+                },
+                release = candidate.release,
+            )))
+        }
+    }
+
+    private fun canConvertDsd(source: StreamRequest): Boolean {
+        val rate = source.dsdBitRate ?: return false
+        if (!policy.allowConversion || source.channels !in 1..8 ||
+            rate !in listOf(2_822_400, 5_644_800, 11_289_600)) return false
+        return when (source.encoding) {
+            StreamEncoding.DSD_NATIVE -> source.sampleRate == 0 && source.bitDepth == 0
+            StreamEncoding.DOP -> policy.allowDopPcmConversion && source.sampleRate == rate / 16 && source.bitDepth == 24
+            else -> false
         }
     }
 
@@ -551,7 +620,7 @@ public class OutputSelector internal constructor(
                     if (error.code != DacErrorCode.UNSUPPORTED) throw error
                 }
             }
-            if (policy.allowConversion && bitRate in listOf(2_822_400, 5_644_800, 11_289_600)) {
+            if (canConvertDsd(request)) {
                 try {
                     val pcm = negotiate(link, StreamRequest.pcm(bitRate / 16, request.channels, 24))
                     if (pcm.format.encoding == StreamEncoding.PCM) return Negotiated(pcm.format, null, if (request.encoding == StreamEncoding.DOP) DsdFallback.DOP_PCM else DsdFallback.PCM)
@@ -741,6 +810,9 @@ public class OutputSelector internal constructor(
                 "the bit-perfect mixer behavior needs Android 14 (API 34); this is API ${platform.apiLevel}",
             )
         }
+        AndroidManagedOutput.carryProblem(request, platform.apiLevel)?.let {
+            return reject(kind, RejectionReason.REQUEST_NOT_SUPPORTED, it)
+        }
         pass.route.wireless?.let { wireless ->
             return reject(
                 kind,
@@ -781,7 +853,7 @@ public class OutputSelector internal constructor(
 
     // ---- 3. an exclusive AAudio stream ----
 
-    private fun aaudioAttempt(pass: Pass): Attempt {
+    private fun aaudioAttempt(pass: Pass, requireStreamMatch: Boolean = false): Attempt {
         val kind = OutputKind.AAUDIO_EXCLUSIVE
         val request = pass.request
         val config = policy.aaudioConfig.copy(requireExclusive = policy.requireExclusiveForAAudio)
@@ -825,6 +897,16 @@ public class OutputSelector internal constructor(
         }
         val grant = offer.grant
         val exclusive = grant.isExclusive
+        val expectedFormat = when {
+            request.bitDepth == 16 -> AAudioSampleFormat.PCM_16
+            request.bitDepth == 24 -> AAudioSampleFormat.PCM_24_PACKED
+            config.floatSamples -> AAudioSampleFormat.FLOAT_32
+            else -> AAudioSampleFormat.PCM_32
+        }
+        if (requireStreamMatch && (grant.sampleRate != request.sampleRate || grant.channels != request.channels || grant.format != expectedFormat)) {
+            offer.closeQuietly()
+            return reject(kind, RejectionReason.NOT_AS_REQUESTED, "AAudio granted a different PCM input layout")
+        }
         if (!exclusive && policy.requireExclusiveForAAudio) {
             offer.closeQuietly()
             return reject(kind, RejectionReason.EXCLUSIVE_NOT_GRANTED, "the platform granted a shared stream, not an exclusive one. ${grant.reason}")

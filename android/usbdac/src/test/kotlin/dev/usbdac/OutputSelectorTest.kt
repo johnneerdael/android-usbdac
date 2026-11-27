@@ -327,7 +327,7 @@ class OutputSelectorTest {
             fakeFormat(request.sampleRate, request.bitDepth, request.bitDepth / 8)
         }
         val source = StreamRequest.dop(2_822_400, 2)
-        val decision = selector(platform).select(source)
+        val decision = selector(platform, OutputPolicy(allowDopPcmConversion = true)).select(source)
         assertEquals(StreamEncoding.PCM, decision.wireFormat!!.encoding)
         assertEquals(source, decision.source)
         assertTrue(decision.processing!!.description.contains("DoP unpacked"))
@@ -348,6 +348,72 @@ class OutputSelectorTest {
         assertEquals(false, decision.processing!!.preservesBitPerfect)
         assertEquals(Guarantee.NONE, decision.guarantee)
         assertTrue(link.negotiated.none { it.encoding == StreamEncoding.DOP })
+    }
+
+    @Test
+    fun dop_pcm_conversion_requires_both_permissions() {
+        for (policy in listOf(OutputPolicy(force = OutputKind.ANDROID_STANDARD),
+            OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowConversion = false, allowDopPcmConversion = true))) {
+            expectError(DacErrorCode.UNSUPPORTED) { selector(FakePlatform(), policy).select(StreamRequest.dop(2_822_400, 2)) }
+        }
+        val direct = FakePlatform()
+        val link = direct.attach(fakeDac())
+        link.onNegotiate = { request ->
+            if (request.encoding != StreamEncoding.PCM) throw unsupported()
+            fakeFormat(request.sampleRate, request.bitDepth, request.bitDepth / 8)
+        }
+        expectError(DacErrorCode.UNSUPPORTED) {
+            selector(direct, OutputPolicy(force = OutputKind.DIRECT_USB)).select(StreamRequest.dop(2_822_400, 2))
+        }
+        assertTrue(link.negotiated.none { it.encoding == StreamEncoding.PCM })
+        val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowDopPcmConversion = true)
+        val source = StreamRequest.dop(2_822_400, 2)
+        val decision = selector(FakePlatform(), policy).select(source)
+        assertEquals(source, decision.source)
+        assertNull(decision.wireFormat)
+        assertEquals(Guarantee.NONE, decision.guarantee)
+        assertFalse(decision.processing!!.preservesBitPerfect)
+    }
+
+    @Test
+    fun android_dsd_pcm_preview_preserves_source_and_finite_managed_rate() {
+        val source = StreamRequest.dsdNative(11_289_600, 2)
+        val decision = selector(FakePlatform(), OutputPolicy(force = OutputKind.ANDROID_STANDARD)).select(source)
+        assertEquals(source, decision.source)
+        assertEquals(Guarantee.NONE, decision.guarantee)
+        assertNull(decision.wireFormat)
+        assertTrue(decision.processing!!.description.contains("176400 Hz"))
+        assertNull(AndroidManagedOutput.carryProblem(StreamRequest.pcm(192_000, 2, 16), 34))
+        assertNotNull(AndroidManagedOutput.carryProblem(StreamRequest.pcm(192_001, 2, 16), 34))
+    }
+
+    @Test
+    fun android_dsd_pcm_preview_covers_mixer_and_aaudio_targets() {
+        val source = StreamRequest.dsdNative(2_822_400, 2)
+        val mixer = FakePlatform().apply { route = listOf(USB_ROUTE) }
+        val mixerDecision = selector(mixer, OutputPolicy(force = OutputKind.ANDROID_BIT_PERFECT)).select(source)
+        assertEquals(Guarantee.NONE, mixerDecision.guarantee)
+        assertNull(mixerDecision.wireFormat)
+        assertFalse(mixerDecision.processing!!.preservesBitPerfect)
+
+        val audio = FakePlatform().apply {
+            grant = fakeGrant().copy(sampleRate = 176_400, channels = 2, format = AAudioSampleFormat.PCM_16)
+        }
+        val audioDecision = selector(audio, OutputPolicy(force = OutputKind.AAUDIO_EXCLUSIVE)).select(source)
+        assertEquals(Guarantee.NONE, audioDecision.guarantee)
+        assertNull(audioDecision.wireFormat)
+        assertEquals(source, audioDecision.source)
+        assertTrue(audio.offers.single().closed)
+    }
+
+    @Test
+    fun unsupported_dsd_conversion_is_refused_before_any_android_open() {
+        val platform = FakePlatform()
+        val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD)
+        expectError(DacErrorCode.UNSUPPORTED) { selector(platform, policy).open(StreamRequest.dsdNative(22_579_200, 2)) }
+        assertTrue(platform.managed.isEmpty())
+        expectError(DacErrorCode.UNSUPPORTED) { selector(platform, policy).open(StreamRequest.dsdNative(2_822_400, 9)) }
+        assertTrue(platform.managed.isEmpty())
     }
 
     // ---- 1. direct USB ----
