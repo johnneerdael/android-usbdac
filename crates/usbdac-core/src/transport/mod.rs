@@ -187,4 +187,5 @@ use usbfs::*;
 use volume_hw::*;
 
 mod implicit;
+mod implicit_ranges;
 use implicit::*;

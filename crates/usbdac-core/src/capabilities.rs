@@ -177,7 +177,7 @@ pub struct RateRange {
 }
 
 /// One playback configuration on an isochronous OUT alternate.
-/// A UAC3 OUT alternate can appear with several implicit-feedback IN
+/// A UAC2 or UAC3 OUT alternate can appear with several implicit-feedback IN
 /// alternates. Each entry's rates apply to the input named by its pacing.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

@@ -29,7 +29,7 @@ public data class RateRange(val minHz: Int, val maxHz: Int, val stepHz: Int)
 
 /**
  * One playback configuration on an isochronous OUT alternate.
- * A UAC3 OUT alternate can have several entries with different implicit-feedback IN
+ * A UAC2 or UAC3 OUT alternate can have several entries with different implicit-feedback IN
  * alternates. The rates on each entry apply to the input named by [pacing].
  */
 public data class AltSetting(

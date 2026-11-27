@@ -155,6 +155,28 @@ and the four-ABI AAR and sample builds passed. The AAR and sample contain
 identical native libraries for each ABI. The AAR SHA-256 is
 `63c377472bddb2ee39d59eb8e2b57d29041c69a65254e2993341a9db3e7f7260`.
 
+### UAC2 implicit feedback capability ranges
+
+Build capability ranges for standard UAC2 PCM pairs from the proven
+shared clock. Clip the ranges to whole frames per service interval on
+both the playback and timing endpoints at each USB speed. Preserve
+clock rate steps and apply endpoint preference at each range boundary.
+When two physical feedback pipes tie at a rate, that rate has no proven
+implicit-feedback route. [USB-IF UAC2 §4.10.1](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), [ALSA feedback format selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/implicit.c#L365-L454)
+
+Android claim preflight uses the same ranges as capability discovery.
+Each capability entry names the IN alternate that exact negotiation
+selects for the rates in that entry. The opt-in nominal diagnostic
+mode can expose the gaps separately when the endpoint allows nominal
+fallback. For hardware acceptance, compare
+advertised and negotiated formats at the packet-capacity boundary of
+each IN alternate, including the next clock step above each boundary.
+
+Rust workspace and Kotlin unit tests, the Android arm64 target check,
+and the four-ABI AAR and sample builds passed. The AAR and sample
+contain identical native libraries for each ABI. The AAR SHA-256 is
+`b434a3713d8129afb53d6d8d8713cca93f34642f43a4ff400a7715d723e428eb`.
+
 ## Transport integration sequence
 
 1. **DSD wire formats and identity.** Establish one resolver shared by capabilities and negotiation. Record a transport representation independently of the USB encoding bitmap. Raise `Unsupported` before opening an alternate if a raw layout is ambiguous. Install reviewed built-in profiles first. Validate existing nominal/feedback paths and separate exact protocol verification from physical playability.

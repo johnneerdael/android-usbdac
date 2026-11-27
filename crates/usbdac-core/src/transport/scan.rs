@@ -31,7 +31,7 @@ fn structural_feedback_interfaces(
         return Vec::new();
     }
 
-    let inventory = implicit_source_inventory(config, handle, speed);
+    let inventory = implicit_source_inventory(config, handle, speed, Some(claimed));
     let mut interfaces = Vec::new();
     for out in config.interfaces().flat_map(|i| i.descriptors()) {
         if out.class_code() != USB_CLASS_AUDIO
@@ -63,6 +63,28 @@ fn structural_feedback_interfaces(
             let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else { continue; };
             let stride = usize::from(format.channels) * usize::from(format.subslot_size);
             if stride == 0 || capacity < stride {
+                continue;
+            }
+            if out.protocol_code() == 0x20 && standard_implicit_pcm_format(&format)
+                && format.sample_rate_ranges.is_empty()
+            {
+                if let Some(clock) = standard_output_clock(config, handle, out.interface_number(), format.terminal_link, claimed) {
+                    let ranges = get_wire_frequency_ranges(handle, AudioControlClock {
+                        interface_number: clock.control_interface, clock_id: clock.source_id,
+                    }, Some(&clock)).unwrap_or_default();
+                    if !ranges.is_empty() {
+                        interfaces.extend(standard_implicit_routes(&inventory, config, handle, &out, &ep,
+                            &format, &clock, &ranges, capacity, interval)
+                            .routes.into_iter().map(|(source, _)| source.interface_number));
+                        continue;
+                    }
+                }
+                // Live RANGE unavailable: retain the read-only structural claim fallback.
+                if let Some(source) = resolve_implicit_source(&inventory, config, handle,
+                    out.interface_number(), out.setting_number(), format.terminal_link,
+                    ep.synch_address(), interval, None, true) {
+                    interfaces.push(source.interface_number);
+                }
                 continue;
             }
             let mut rates = Vec::new();
@@ -180,6 +202,7 @@ fn implicit_source_inventory(
     config: &ConfigDescriptor,
     handle: &DeviceHandle<Context>,
     speed: Speed,
+    claimed_controls: Option<&[u8]>,
 ) -> Vec<ImplicitSourceCandidate> {
     if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
         return Vec::new();
@@ -216,6 +239,7 @@ fn implicit_source_inventory(
             let [(control, ids)] = matching.as_slice() else {
                 continue;
             };
+            if claimed_controls.is_some_and(|claimed| !claimed.contains(control)) { continue; }
             let Some(clock) = strict_implicit_clock(config, handle, *control, format.terminal_link)
             else {
                 continue;
@@ -323,13 +347,13 @@ fn implicit_profile_proven(
     profile: PlaybackImplicitProfile,
     standard_sink: bool,
     standard_source: bool,
-    sample_rate: Option<u32>,
+    rate_proven: bool,
 ) -> bool {
     match profile {
         PlaybackImplicitProfile::Skip => false,
         PlaybackImplicitProfile::Generic => true,
         PlaybackImplicitProfile::Fixed { .. } => {
-            standard_sink && standard_source && sample_rate.is_some()
+            standard_sink && standard_source && rate_proven
         }
     }
 }
@@ -346,62 +370,90 @@ fn resolve_implicit_source(
     sample_rate: Option<u32>,
     standard_sink: bool,
 ) -> Option<ImplicitFeedbackSource> {
-    // The actual libusb descriptor is authoritative, not Android handoff IDs.
-    // Fail closed when identity cannot be read: otherwise a skip/fixed product
-    // could accidentally enter the generic path.
-    let identity = handle.device().device_descriptor().ok()?;
-    let profile = playback_implicit_profile(identity.vendor_id(), identity.product_id());
     let mut matching = Vec::new();
-    for source in inventory {
-        if !implicit_profile_proven(profile, standard_sink, source.standard_pcm, sample_rate) {
-            continue;
-        }
-        let Some(rank) = implicit_source_rank(
-            profile, source.source, source.marked, out_interface, out_alt, linked_address,
-        ) else {
-            continue;
-        };
-        if !source.function_interfaces.contains(&out_interface)
-            || (source.source.interface_number == out_interface
-                && source.source.alt_setting != out_alt)
-            || source.source.service_interval_us != service_interval_us
-        {
-            continue;
-        }
-        let Some(out_clock) =
-            strict_implicit_clock(config, handle, source.control_interface, out_terminal)
-        else {
-            continue;
-        };
-        if !implicit_clocks_compatible(&out_clock, &source.clock) {
-            continue;
-        }
+    for (source, rank) in associated_implicit_sources(
+        inventory, config, handle, out_interface, out_alt, out_terminal,
+        linked_address, service_interval_us, sample_rate.is_some(), standard_sink, None,
+    ) {
         if let Some(sample_rate) = sample_rate {
             let rates = if source.rates.is_empty() {
                 get_wire_frequency_ranges(
                     handle,
                     AudioControlClock { interface_number: source.control_interface, clock_id: source.clock.source_id },
                     Some(&source.clock),
-                )
-                .unwrap_or_default()
-            } else {
-                source.rates.clone()
-            };
+                ).unwrap_or_default()
+            } else { source.rates.clone() };
             if rates.is_empty()
                 || !sampling_frequency_ranges_support_rate(&rates, sample_rate)
-                || source.source.max_packet_bytes
-                    < required_max_packet_bytes(
-                        sample_rate,
-                        service_interval_us,
-                        source.source.bytes_per_frame,
-                    )
-            {
-                continue;
-            }
+                || source.source.max_packet_bytes < required_max_packet_bytes(
+                    sample_rate, service_interval_us, source.source.bytes_per_frame,
+                ) { continue; }
         }
         matching.push((source.source, rank));
     }
     choose_implicit_source(matching, out_alt)
+}
+
+/// Share association proof between exact selection and full-grid publication.
+/// Capacity and rate selection deliberately happen after this predicate.
+fn associated_implicit_sources<'a>(
+    inventory: &'a [ImplicitSourceCandidate], config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>, out_interface: u8, out_alt: u8,
+    out_terminal: Option<u8>, linked_address: u8, interval: u32,
+    rate_proven: bool, standard_sink: bool, known_clock: Option<&ClockChoice>,
+) -> Vec<(&'a ImplicitSourceCandidate, u8)> {
+    let Ok(identity) = handle.device().device_descriptor() else { return Vec::new(); };
+    let profile = playback_implicit_profile(identity.vendor_id(), identity.product_id());
+    let mut clocks = std::collections::HashMap::new();
+    let mut matching = Vec::new();
+    for source in inventory {
+        if !implicit_profile_proven(profile, standard_sink, source.standard_pcm, rate_proven) {
+            continue;
+        }
+        let Some(rank) = implicit_source_rank(profile, source.source, source.marked,
+            out_interface, out_alt, linked_address) else { continue; };
+        if !source.function_interfaces.contains(&out_interface)
+            || (source.source.interface_number == out_interface && source.source.alt_setting != out_alt)
+            || source.source.service_interval_us != interval { continue; }
+        let clock = if let Some(clock) = known_clock {
+            Some(clock)
+        } else {
+            clocks.entry(source.control_interface).or_insert_with(||
+                strict_implicit_clock(config, handle, source.control_interface, out_terminal)).as_ref()
+        };
+        if clock.is_some_and(|clock| implicit_clocks_compatible(clock, &source.clock)) {
+            matching.push((source, rank));
+        }
+    }
+    matching
+}
+
+/// Resolve only the unique IAD-owned OUT clock, never a global terminal-ID lookup.
+fn standard_output_clock(
+    config: &ConfigDescriptor, handle: &DeviceHandle<Context>, interface: u8,
+    terminal: Option<u8>, claimed: &[u8],
+) -> Option<ClockChoice> {
+    let raw = read_active_configuration_bytes(handle, config)?;
+    let functions = audio_functions(&raw);
+    let matching: Vec<_> = functions.iter().filter(|(_, ids)| ids.contains(&interface)).collect();
+    let [(control, _)] = matching.as_slice() else { return None; };
+    if !claimed.contains(control) { return None; }
+    strict_implicit_clock(config, handle, *control, terminal)
+}
+
+fn standard_implicit_routes(
+    inventory: &[ImplicitSourceCandidate], config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
+    out: &rusb::InterfaceDescriptor, endpoint: &rusb::EndpointDescriptor,
+    format: &StreamingInterfaceFormat, clock: &ClockChoice,
+    ranges: &[SamplingFrequencySubrange], capacity: usize, interval: u32,
+) -> super::implicit_ranges::ImplicitRatePlan {
+    let ranges = capacity_limited_rates(ranges, capacity, interval,
+        usize::from(format.channels) * usize::from(format.subslot_size)).0;
+    let associated = associated_implicit_sources(inventory, config, handle,
+        out.interface_number(), out.setting_number(), format.terminal_link, endpoint.synch_address(),
+        interval, !ranges.is_empty(), true, Some(clock));
+    let matching: Vec<_> = associated.into_iter().map(|(candidate, rank)| (candidate.source, rank)).collect();
+    super::implicit_ranges::implicit_rate_routes(&ranges, &matching, out.setting_number())
 }
 
 pub(super) fn uac2_choice_has_multiplier(choice: Option<&ClockChoice>) -> bool {
@@ -425,13 +477,13 @@ fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool
     })
 }
 
-fn choose_implicit_source(
+pub(super) fn choose_implicit_source(
     mut matching: Vec<(ImplicitFeedbackSource, u8)>,
     out_alt: u8,
 ) -> Option<ImplicitFeedbackSource> {
     let rank = matching.iter().map(|(_, rank)| *rank).min()?;
     matching.retain(|(_, r)| *r == rank);
-    matching.sort_by_key(|(s, _)| (s.alt_setting != out_alt, s.max_packet_bytes, s.alt_setting));
+    matching.sort_by_key(|(s, _)| super::implicit_ranges::implicit_source_preference(s, out_alt));
     let first = matching.first()?.0;
     if matching
         .iter()
@@ -459,7 +511,7 @@ pub(super) fn candidate_audio_control_clock_choice(
         }, choice)));
     }
     if let Some(source) = candidate.implicit_feedback {
-        let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed);
+        let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed, None);
         let source = inventory.iter().find(|entry| entry.source == source)
             .ok_or_else(|| "implicit feedback source clock proof disappeared".to_string())?;
         let clock = strict_implicit_clock(
@@ -655,12 +707,15 @@ pub(super) fn build_usb_capability_model(
     let implicit_sources = if settings().disable_feedback() {
         Vec::new()
     } else {
-        implicit_source_inventory(&config_descriptor, handle, speed)
+        implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces))
     };
     let mut alt_settings = Vec::new();
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
+    let mut standard_grid_cache = std::collections::HashMap::<
+        (u8, Option<u8>), Option<(ClockChoice, Vec<SamplingFrequencySubrange>)>,
+    >::new();
     let mut effective_speed = speed;
 
     for interface in config_descriptor.interfaces() {
@@ -677,7 +732,24 @@ pub(super) fn build_usb_capability_model(
             };
             stream_format.native_dsd = resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format);
             let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
-            let sample_rate_ranges = stream_rate_cache
+            let standard_grid = descriptor.protocol_code() == 0x20
+                && standard_implicit_pcm_format(&stream_format)
+                && stream_format.sample_rate_ranges.is_empty()
+                && stream_format.native_dsd.is_none() && !playback_designs_dop
+                && !settings().disable_feedback();
+            let only_standard_implicit = standard_grid && !settings().allow_unsynchronized_async()
+                && matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus)
+                && descriptor.endpoint_descriptors()
+                .filter(|endpoint| endpoint.direction() == Direction::Out
+                    && endpoint.transfer_type() == TransferType::Isochronous)
+                .all(|endpoint| endpoint.sync_type() == SyncType::Asynchronous
+                    && (1..=16).contains(&endpoint.interval())
+                    && valid_standard_implicit_capacity(&endpoint, speed)
+                    && standard_endpoint_geometry(&endpoint, speed).is_ok()
+                    && matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
+                    && matches!(checked_standard_feedback(&descriptor, endpoint.address(),
+                        endpoint.synch_address(), endpoint.sync_type(), speed), Ok(None)));
+            let sample_rate_ranges = if only_standard_implicit { Vec::new() } else { stream_rate_cache
                 .entry((descriptor.interface_number(), stream_format.terminal_link))
                 .or_insert_with(|| {
                     discover_candidate_rate_ranges(
@@ -690,7 +762,7 @@ pub(super) fn build_usb_capability_model(
                         &stream_format.sample_rate_ranges,
                     )
                 })
-                .clone();
+                .clone() };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
             let speed = if speed == Speed::Unknown {
@@ -724,7 +796,32 @@ pub(super) fn build_usb_capability_model(
                 } else {
                     (sample_rate_ranges.clone(), sample_rates.clone())
                 };
-                let implicit = if discovered_feedback.is_none()
+                let standard_routes = if standard_grid && discovered_feedback.is_none()
+                    && endpoint.sync_type() == SyncType::Asynchronous
+                    && matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
+                    && (1..=16).contains(&endpoint.interval())
+                    && valid_standard_implicit_capacity(&endpoint, speed)
+                {
+                    let grid = standard_grid_cache.entry((descriptor.interface_number(), stream_format.terminal_link))
+                        .or_insert_with(|| {
+                            let clock = standard_output_clock(&config_descriptor, handle,
+                                descriptor.interface_number(), stream_format.terminal_link, claimed_interfaces)?;
+                            let ranges = get_wire_frequency_ranges(handle, AudioControlClock {
+                                interface_number: clock.control_interface, clock_id: clock.source_id,
+                            }, Some(&clock)).unwrap_or_default();
+                            (!ranges.is_empty()).then_some((clock, ranges))
+                        });
+                    let plan = grid.as_ref().map(|(clock, ranges)| standard_implicit_routes(
+                        &implicit_sources, &config_descriptor, handle, &descriptor, &endpoint,
+                        &stream_format, clock, ranges, max_packet_bytes, service_interval_us));
+                    // Diagnostic fallback retains its historical discovery policy only
+                    // when no shared wire grid can be proved.
+                    if plan.is_some() || settings().allow_unsynchronized_async() { plan }
+                    else { Some(super::implicit_ranges::ImplicitRatePlan {
+                        routes: Vec::new(), without_source: Vec::new(),
+                    }) }
+                } else { None };
+                let implicit = if standard_routes.is_none() && discovered_feedback.is_none()
                     && endpoint.sync_type() == SyncType::Asynchronous
                     && !stream_format.is_uac1
                     && stream_format.format_tag == FORMAT_TAG_PCM
@@ -815,7 +912,47 @@ pub(super) fn build_usb_capability_model(
                     pacing,
                 };
                 let superspeed = matches!(speed, Speed::Super | Speed::SuperPlus);
-                if !superspeed || sample_rate_ranges.is_empty() || !endpoint_ranges.is_empty() {
+                if let Some(plan) = standard_routes {
+                    let mut published = false;
+                    let output_claimed = claimed_interfaces.contains(&descriptor.interface_number());
+                    // Rank/ambiguity was resolved against every physical candidate before
+                    // claims are considered; an unavailable preferred pipe cannot be replaced.
+                    for (source, ranges) in plan.routes {
+                        if !output_claimed || !claimed_interfaces.contains(&source.interface_number) { continue; }
+                        let mut alt = base_alt.clone();
+                        alt.rate_ranges = ranges.iter().map(|range| RateRange {
+                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
+                        }).collect();
+                        alt.sample_rates = representative_sample_rates_from_ranges(&ranges);
+                        alt.pacing = Some(crate::capabilities::Pacing::ImplicitFeedback {
+                            interface_number: source.interface_number, alt_setting: source.alt_setting,
+                            endpoint: source.address,
+                        });
+                        supported_sample_rates.extend(alt.sample_rates.iter().copied());
+                        alt_settings.push(alt);
+                        published = true;
+                    }
+                    if output_claimed && settings().allow_unsynchronized_async() && endpoint.synch_address() == 0
+                        && !plan.without_source.is_empty()
+                    {
+                        let mut nominal = base_alt.clone();
+                        nominal.rate_ranges = plan.without_source.iter().map(|range| RateRange {
+                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
+                        }).collect();
+                        nominal.sample_rates = representative_sample_rates_from_ranges(&plan.without_source);
+                        nominal.pacing = Some(admitted_pacing(endpoint.sync_type(), None));
+                        supported_sample_rates.extend(nominal.sample_rates.iter().copied());
+                        alt_settings.push(nominal);
+                        published = true;
+                    }
+                    if !published {
+                        let mut descriptor_only = base_alt.clone();
+                        descriptor_only.rate_ranges.clear();
+                        descriptor_only.sample_rates.clear();
+                        descriptor_only.pacing = None;
+                        alt_settings.push(descriptor_only);
+                    }
+                } else if !superspeed || sample_rate_ranges.is_empty() || !endpoint_ranges.is_empty() {
                     supported_sample_rates.extend(endpoint_rates.iter().copied());
                     alt_settings.push(base_alt.clone());
                 }
@@ -936,7 +1073,7 @@ pub(super) fn select_stream_candidate(
         }
         return Ok(profile.candidate(config_descriptor.number()));
     }
-    let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed);
+    let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces));
     let mut refused_unsynchronized = false;
     let mut refused_claim = None;
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
@@ -2182,12 +2319,12 @@ mod implicit_discovery_tests {
     #[test]
     fn fixed_profiles_require_standard_wire_proof_and_rate_without_restricting_generic() {
         let fixed = playback_implicit_profile(0x19f7, 0x000a);
-        assert!(implicit_profile_proven(fixed, true, true, Some(48_000)));
-        assert!(!implicit_profile_proven(fixed, false, true, Some(48_000)));
-        assert!(!implicit_profile_proven(fixed, true, false, Some(48_000)));
-        assert!(!implicit_profile_proven(fixed, true, true, None));
-        assert!(implicit_profile_proven(PlaybackImplicitProfile::Generic, false, false, None));
-        assert!(!implicit_profile_proven(PlaybackImplicitProfile::Skip, true, true, Some(48_000)));
+        assert!(implicit_profile_proven(fixed, true, true, true));
+        assert!(!implicit_profile_proven(fixed, false, true, true));
+        assert!(!implicit_profile_proven(fixed, true, false, true));
+        assert!(!implicit_profile_proven(fixed, true, true, false));
+        assert!(implicit_profile_proven(PlaybackImplicitProfile::Generic, false, false, false));
+        assert!(!implicit_profile_proven(PlaybackImplicitProfile::Skip, true, true, true));
     }
 
     #[test]
