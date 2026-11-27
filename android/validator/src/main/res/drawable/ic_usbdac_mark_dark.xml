@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- usbdac mark (dark surfaces), cropped from branding/logos/usbdac-mark-dark.svg. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="890"
+    android:viewportHeight="890">
+    <group android:translateX="-55" android:translateY="-50.5">
+        <path android:fillColor="#F3F5F7" android:pathData="M920 60L710 183Q700 190 700 202V390Q700 403 686 411L528 503L746 630L878 554Q920 530 920 480Z" />
+        <path android:fillColor="#F3F5F7" android:pathData="M80 601L470 826L318 914Q292 929 266 914L126 832Q80 805 80 752Z" />
+        <path android:fillColor="#65A9FF" android:pathData="M80 60L290 183Q300 190 300 202V390Q300 403 314 411L746 662Q760 670 773 662L920 578V822Q920 846 898 859L800 916Q774 931 752 918L126 556Q80 530 80 480Z" />
+    </group>
+</vector>
