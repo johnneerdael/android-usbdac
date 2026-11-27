@@ -112,3 +112,6 @@ pub use volume::{
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeDoctests;
+
+/// Explicit lossy native DSD to PCM conversion.
+pub mod dsd_pcm;

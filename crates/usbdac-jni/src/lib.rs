@@ -16,6 +16,7 @@ mod aaudio;
 mod capture;
 mod capture_json;
 mod convert;
+mod dsd_pcm;
 mod json;
 mod listener;
 mod pioneer;

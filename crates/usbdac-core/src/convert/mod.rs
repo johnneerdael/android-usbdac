@@ -23,7 +23,8 @@
 //!
 //! ### What is not converted
 //!
-//! DoP and native DSD are never converted ([`ConvertError::Unsupported`]), nor is any channel
+//! This PCM converter refuses DoP and native DSD ([`ConvertError::Unsupported`]); the separate
+//! [`crate::dsd_pcm`] module explicitly converts native DSD to PCM. No channel
 //! layout other than mono to stereo.
 
 mod converter;
