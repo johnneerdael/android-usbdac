@@ -4,7 +4,7 @@ This page collects the data points that the [design decisions](decisions.md) res
 
 ## Hardware status {#hardware-status}
 
-Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 16) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
+Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 17) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
 
 The usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. Code added after those commits has host tests only, and no physical result has been recorded on a 0.1.5 build.
 
@@ -126,7 +126,7 @@ to choose that follow-up work.
 
 ## The geometry sweep {#the-geometry-sweep}
 
-From Flick pull request #400. A test-only Flick build (not part of that pull request or of usbdac) read the transfer geometry from a system property so each shape could be run from adb without a rebuild. OnePlus 15 (CPH2747, Android 16) and iBasso DC04U, 24-bit at 44.1 kHz, 10 to 20 seconds per run, and the shapes marked "x2" or "x3" were repeated with the same result. Shapes are written packets per transfer x transfers in flight.
+From Flick pull request #400. A test-only Flick build (not part of that pull request or of usbdac) read the transfer geometry from a system property so each shape could be run from adb without a rebuild. OnePlus 15 (CPH2747, Android 17) and iBasso DC04U, 24-bit at 44.1 kHz, 10 to 20 seconds per run, and the shapes marked "x2" or "x3" were repeated with the same result. Shapes are written packets per transfer x transfers in flight.
 
 | Packets in flight | Played | Stalled about 1 s after the start (the table's words) |
 |---|---|---|
