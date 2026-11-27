@@ -24,14 +24,23 @@ compatibility. Use the following order for the remaining work.
    a future device pass.
 
 QEMU 10.1.3 presented its virtual USB Audio Interface (`46f4:0002`)
-through an emulated xHCI bus. An Alpine arm64 Linux guest enumerated
-the device at full speed and read its 131 descriptor bytes, including a
-UAC1 stereo 16-bit PCM OUT alternate at 48 kHz. The guest image lacked
-the ALSA USB audio module. This check establishes guest enumeration.
-Linux `dummy_hcd` can exercise descriptor and control handling and
-rejects isochronous transfers. Use the Rust protocol and packet tests
-for the affected release paths unless a suitable virtual device
-can exercise them end to end. [QEMU USB emulation](https://www.qemu.org/docs/master/system/devices/usb.html),
+through an emulated xHCI bus with the null audio backend. A static
+probe built from `ff6d616` used the public `Dac` API and Linux usbfs
+in an Alpine arm64 guest to play synchronous full-speed UAC1 PCM at
+48 kHz, stereo, 16 bits. During two seconds, the driver reported 95,808
+played frames, 998 completed isochronous transfers, and zero underruns,
+packet losses, short packets, or timeouts. The driver verified the USB
+payload. After close, `GET_INTERFACE` returned alternate zero, both USB
+claims were released, and the original raw volume values were restored.
+The guest powered off and the probe exited successfully.
+
+The virtual device rounded the startup attenuation request. The
+initial capability scan marked volume unavailable. Stream opening
+rediscovered the control at the lower level and playback succeeded.
+This check covers synchronous PCM through Linux usbfs. Use the Rust
+protocol and packet tests for other release paths. Linux `dummy_hcd`
+supports descriptor and control testing and rejects isochronous
+transfers. [QEMU USB emulation](https://www.qemu.org/docs/master/system/devices/usb.html),
 [Linux `dummy_hcd` transfer handling](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/udc/dummy_hcd.c#L1854-L1869)
 
 The integration against main at `b516d75` retains continuous explicit

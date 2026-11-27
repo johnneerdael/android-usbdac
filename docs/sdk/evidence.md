@@ -95,11 +95,17 @@ control and packet tests, Kotlin tests, Android target checks and four-ABI
 AAR and sample builds. Those earlier results apply to their recorded
 revisions; the merged release must pass its required build and test gates.
 
-QEMU 10.1.3 exposed its virtual USB Audio Interface to an Alpine arm64
-Linux guest on an emulated xHCI bus. The guest enumerated the full-speed
-UAC1 device and read its 48 kHz stereo 16-bit PCM OUT descriptors. Its
-image lacked the ALSA USB audio module, so this establishes enumeration
-only. It does not establish isochronous streaming or Android USB ownership.
+QEMU 10.1.3 exposed a full-speed UAC1 interface on emulated xHCI with a
+null audio backend. In an Alpine arm64 Linux guest, a probe built from
+`ff6d616` opened usbdac through Linux usbfs and played synchronous PCM
+at 48 kHz, stereo, 16 bits. The driver reported 95,808 played frames
+and 998 completed isochronous transfers over two seconds, with verified
+USB payloads and zero underruns or packet losses. Close reset the
+streaming alternate to zero, released both interface claims, and
+restored volume. The virtual device rounded the startup attenuation
+request. Stream opening rediscovered the control at the lower level.
+The [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md)
+records the guest setup and validation scope.
 
 This release preparation adds no physical streaming hardware checks.
 The OnePlus 15 / AP80 Pro-X and Flick results above remain historical
