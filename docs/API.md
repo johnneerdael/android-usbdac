@@ -6,7 +6,7 @@ sample layouts, the threading rules and the conditions for bit-perfect output.
 Direct USB PCM has played through Flick on one phone and DAC combination.
 
 Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core) to use
-the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.1`,
+the USB driver from Rust on Android or Linux. Run `cargo add usbdac-core@0.1.2`,
 then follow the lifecycle below to open the device and stream decoded audio.
 The [Rust API reference](https://docs.rs/usbdac-core)
 covers individual types and methods.
