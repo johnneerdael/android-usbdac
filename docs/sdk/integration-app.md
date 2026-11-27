@@ -13,7 +13,7 @@ USB permission is per device and asked at run time. The library never shows a di
 
 ## Who owns the session {#lifecycle}
 
-One `DacSession` can be open in a process: a second `UsbDac.open` throws `BUSY`. The session holds the USB connection and the claimed interfaces, which keeps Android's own audio stack away from the DAC, until `close()`.
+Each physical attachment can have one owner: a second owner of that attachment throws `BUSY`. Distinct attachments can have independent sessions. The session holds the USB connection and the claimed interfaces, which keeps Android's own audio stack away from the DAC, until `close()`.
 
 - **Let the playback service own it, not an activity.** The activity goes away when the listener swipes the app off the recents list and the music should not. Mornye's README says the same of its engine: "the engine, not the Activity, owns the connection".
 - **Open the output at the start of a track and keep it across tracks** that have the same format. Closing and opening costs 100 ms or more, programs the DAC's clock again, and puts a gap between gapless tracks.
@@ -140,7 +140,7 @@ Two rules behind the table.
 - **Do not fall back to the speaker silently.** A listener who chose a DAC and hears the phone speaker will not forgive it. Mornye's README: "A failure after direct-USB preparation never redirects to the speaker." Fall back to another output only when the listener's settings say it is acceptable, and when you do, show the reason.
 - **Decide fallback at a track boundary, not in the middle.** The selector cannot move a playing stream. A failure that ends the stream is a pause in which you may choose again.
 
-One more failure is not an exception: **a packet error inside a completed transfer** ends the stream, as in the three drivers studied, except in one case. A single packet that failed with `LIBUSB_TRANSFER_ERROR`, nothing delivered and the submitted length matching, is counted as lost audio and playback goes on with `LOST_FRAMES` set (0.1.5). Any other packet status, or a second failed packet, ends the stream as `StreamFailed` with code `TRANSFER`. BitChord issue #1485 describes a phone where these errors are frequent; usbdac has no data on how often they happen elsewhere ([decision 3](decisions-stream.md#loss-handling)). If your listeners hit it, the error message carries the packet diagnostics.
+Failed packets and transfers are charged conservatively: bytes reported by a failed packet are not credited as delivered. The decaying loss budget and consecutive-failure limit bound recovery; malformed geometry or unsupported statuses remain terminal. `LOST_FRAMES` stays latched after music loss. See [loss handling](decisions-stream.md#loss-handling); these rules are software evidence, not a new phone measurement.
 
 ## Diagnostics and bug reports
 
@@ -161,7 +161,7 @@ One more failure is not an exception: **a packet error inside a completed transf
 | 44.1, 48, 96 kHz and the highest rate the DAC offers, 16 and 24 bit | No clock refusal, no timeouts, `format.clock` and `pacing` as expected |
 | Rate change between tracks | The output reopens, a gap of about 100 ms or more, the right rate on the DAC |
 | Gapless in one format | No gap, no click, `playedFrames` continuous |
-| Pause, resume, seek while playing and while paused | The sound stops and starts at once, no old audio after a seek, the DAC stays locked on silence |
+| Pause, resume, seek while playing and while paused | Observe acoustic response, queued audio and whether the DAC remains locked on silence |
 | Skip tracks quickly | No stale audio, no stuck state |
 | A long pause (over 30 s) with `DacIdleRelease` | The stream closes, the session stays, play reopens it |
 | Unplug during playback, then replug | Pause with a message, no sound on the speaker, play opens the DAC again |

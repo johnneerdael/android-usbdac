@@ -64,6 +64,7 @@ def set_version(old, new, last_release):
         "README.md": ["usbdac-core@{version}"],
         "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
         "docs/API.md": ["usbdac-core@{version}"],
+        "docs/sdk/guide-rust.md": ["usbdac-core@{version}"],
         "docs/sdk/index.md": ["This guide covers usbdac {version}."],
         "docs/sdk/getting-started.md": [
             "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",

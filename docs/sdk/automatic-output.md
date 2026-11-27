@@ -69,7 +69,7 @@ The first output in this list that works for the request is chosen.
 3. **Exclusive AAudio** (`AAUDIO_EXCLUSIVE`), when audio is not routed to Bluetooth or a cast device and the platform grants an exclusive stream at exactly the request's rate, channel count and sample format, with the hardware agreeing (Android 14 and later report it). The stream is opened to read the grant and not started, so nothing is heard and nothing is converted; `open` keeps that very stream. When audio is routed to a USB device this step is tried only if `allowDirectUsb` is on, because an exclusive stream keeps the DAC from other apps.
 4. **Standard output** (`ANDROID_STANDARD`), an ordinary `AudioTrack`, for PCM that Android can carry. A Bluetooth or cast route goes straight here, and the decision says so.
 
-DSD and DoP can only be carried by the direct output. If no output can carry the request, `select` and `open` throw a `DacException` with code `UNSUPPORTED` that lists every rejection.
+Raw DSD and DoP require a direct bitstream path. When policy permits, eligible DSD can be converted to PCM for a direct or Android-managed output; explicit DoP input also needs `allowDopPcmConversion`. If no output can carry the request, `select` and `open` throw a `DacException` with code `UNSUPPORTED` that lists every rejection.
 
 Some examples of what that gives, on devices as they are usually met:
 
@@ -122,16 +122,16 @@ The intent filter in [getting started](getting-started.md#2-the-manifest) makes 
 
 ## Conversion
 
-**Default behavior change:** automatic output permits PCM conversion and bit-exact widening by default. A player must show `decision.source`, `decision.wireFormat` and `decision.processing` in its signal path. Resampling applies -3.5 dB headroom by default; `output.clippedSamples` reports converter clipping. Direct `DacSession` negotiation remains exact by default.
+**Default behavior change:** automatic output permits PCM conversion and bit-exact widening by default. A player must show `decision.source`, `decision.wireFormat` and `decision.processing` in its signal path. Resampling applies -3.5 dB headroom by default; the selector uses unity when the target equals the DSD intermediate PCM rate. This default covers a measured PCM square-wave fixture, not every signal; `output.clippedSamples` counts post-dither integer-quantizer saturation, including rounding or dither clamps without resampling. Direct `DacSession` negotiation remains exact by default.
 
 By default the direct output may convert when a DAC cannot run the request exactly, using the library's own converter. The decision carries the `ConversionPlan`; set `allowConversion = false` to refuse lossy conversion and `allowWidening = false` to refuse widening:
 
 - Exact first. The same rate at another depth is next, then the highest available integer divisor, the highest lower same-family rate, the highest other lower rate, and finally the lowest higher rate.
 - A **widening** (16-bit to 24-bit, 24 in 3 bytes to 24 in 4) keeps every sample value: the guarantee stays `VERIFIED_BY_LIBRARY`.
 - Anything else changes the audio (a new rate, fewer bits, mono to stereo): the guarantee is `NONE` and the output's `bitPerfect` says what was done. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) has the classification.
-- Native DSD can be framed as DoP only when the downstream decoder is confirmed to support it. Otherwise native DSD or validated DoP can be converted to PCM, with the conversion reported as lossy. See [DSD conversion](decisions-dsd-conversion.md).
+- Native DSD can be framed as DoP only when the downstream decoder is confirmed to support it. Native DSD can be converted to PCM when `allowConversion` permits it; unpacking explicit DoP additionally requires `allowDopPcmConversion = true` and valid markers. Both conversions are reported as lossy. See [DSD conversion](decisions-dsd-conversion.md).
 
-The output then takes the **source** format: `output.format` is the request's layout, and `playedFrames` counts source frames, so the position arithmetic does not change.
+The converting output takes the **source** layout and reports position in source units. `decision.wireFormat` describes a negotiated direct USB target when known; Android platform output does not expose its downstream wire format. DSD-to-PCM accepts DSD64, DSD128 and DSD256 with one to eight channels. The host owns downstream limits and the process-local `DownstreamBinding` association. Closing or invalidating its bound endpoint retires streams that depend on it; route/attachment changes require re-selection and renewed proof. No whole-service or physical-route acceptance follows from host tests. See [DSD conversion](decisions-dsd-conversion.md).
 
 ## When to look again
 

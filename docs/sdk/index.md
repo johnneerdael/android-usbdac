@@ -87,7 +87,7 @@ The API reference is generated from the KDoc. The Rust API, the JNI contract and
 - Android 8.0 (API 26) or later. The library is built with Kotlin 2.4 at language level 2.2, and its only dependency is `kotlinx-coroutines-core`.
 - Direct USB needs USB host support on the device and a compatible USB Audio Class 1.0, 2.0 or 3.0 device (UAC3 includes the BADD profiles). Capture and duplex use explicit input APIs and claims; `OutputSelector` selects PCM playback outputs.
 - `libusbdac.so` is built for arm64-v8a, armeabi-v7a, x86_64 and x86 (about 3.5 MB uncompressed for arm64-v8a at 0.1.5, measured on a local `cargo ndk` release build). The arm64-v8a build links only against the system's `liblog`, `libdl`, `libm` and `libc` (AAudio is opened at run time with `dlopen`, so there is no link-time dependency on `libaaudio`), and its segments are aligned for 16 KB pages.
-- One open `DacSession` per process in this version.
+- One owner per physical attachment; separate attachments can have independent sessions.
 
 ## The guide
 
@@ -104,7 +104,7 @@ The pages come in six groups, in the navigation order.
 5. [Collect a USB playback support report](support-diagnostics.md) covers the listener flow and Kotlin and Rust export APIs.
 6. [Getting started](getting-started.md): the dependency, the manifest, and the quickest way to audio; then permission, open, negotiate, the write loop, pause and seek by hand.
 7. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, when to look again, and the handoff helper.
-8. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
+8. [Media3](media3.md): the optional `usbdac-media3` artifact and its `AudioSink` integration.
 
 **Design decisions.** [All decisions at a glance](decisions.md), then five pages with the question, what Flick, Mornye and BitChord do, what usbdac does, the evidence, the trade-off and the public references for each: [streaming and buffering](decisions-stream.md), [clock and pacing](decisions-clock.md), [volume](decisions-volume.md), [reporting and conversion](decisions-reporting.md), [DSD conversion](decisions-dsd-conversion.md), [outputs and library shape](decisions-library.md).
 

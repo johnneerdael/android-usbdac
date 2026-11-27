@@ -8,7 +8,7 @@ The module targets Media3 1.11.1's `AudioSink.AudioSinkConfig` API. It deliberat
 
 | Operation | Behavior |
 |---|---|
-| Format support | Mono/stereo raw signed integer PCM at 16, 24 or 32 bits, unsigned8 and IEEE float32; compressed formats rejected |
+| Format support | A cached source capability query reports direct support, transcoding or rejection for raw signed integer PCM, unsigned8 and IEEE float32; compressed formats are rejected |
 | Configure | Retain track delay/padding metadata; open nothing until PCM arrives |
 | Handle buffer | Skip encoder delay, retain trailing padding, write remaining integer bytes with backpressure |
 | Same-format track | Discard previous track's held padding and retain the existing stream |
@@ -23,6 +23,10 @@ The module targets Media3 1.11.1's `AudioSink.AudioSinkConfig` API. It deliberat
 `OpenedOutput.format` must keep sample rate, channel count and counter rate equal to the request, with at least its bit precision and slot size. Wider slots are filled with zero low bytes (24-bit in four bytes becomes `00 LL MM HH`). Narrowing and resampling cannot be hidden behind a changed sink layout. An output owner that intentionally uses a converting `PcmOutput` reports the source write layout and exposes its conversion/guarantee separately.
 
 The sink holds at most one bounded staging buffer plus encoder padding (at most 16 MiB). It does not discard malformed partial frames. It retains a partly accepted input buffer until Media3 retries it and maps DAC failures to Media3 write/initialization exceptions.
+
+## Capability migration
+
+`OutputSource.formatSupport(request)` must use a cached, side-effect-free capability snapshot. It returns `OutputSupport` with `UNSUPPORTED`, `DIRECT` or `WITH_TRANSCODING` and the source and known target. Custom `OutputSource` implementations that only supplied `open` must override this method: its default is conservatively unsupported, so the sink will otherwise reject formats before opening. Do not negotiate or open a device during this query. The bundled `DacSessionOutputSource` supplies its own snapshot.
 
 ## Volume and lifetime
 

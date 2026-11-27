@@ -42,8 +42,8 @@ Contents
   callback into the host on the audio path.
 - **Handle-based.** `Dac` is the device, `DacStream` the output stream,
   `VolumeControl` the hardware volume. Every process-wide static of the
-  implementation sits behind these handles. v0.1 supports one open `Dac` per
-  process; a second `Dac::open` returns `Error::Busy`.
+  implementation sits behind these handles. One owner is allowed per physical
+  attachment; distinct attachments can have independent owners.
 - **Honest reporting.** `is_bit_perfect()` is false whenever the library cannot
   vouch for the path, and stays false after audio was lost on the bus.
 
@@ -344,15 +344,13 @@ opens, on the same terminal; a DAC whose selector is switched between the two ca
 | Asynchronous, shared-clock IN stream resolved | `ImplicitFeedback { interface_number, alt_setting, endpoint }` (the capture source supplies frame counts) |
 | Adaptive | `Adaptive` (a declared feedback endpoint is ignored) |
 | Synchronous | `Synchronous` (likewise) |
-| Asynchronous, no feedback endpoint, streamed because `allow_unsynchronized_async` is on | `Unsynchronized` (also the `UnsynchronizedAsync` blocker; never bit-perfect) |
+| Asynchronous, no feedback endpoint, admitted by the narrow default policy or the broader `allow_unsynchronized_async` opt-in | `Unsynchronized` (also the `UnsynchronizedAsync` blocker; never bit-perfect) |
 | Declares no synchronisation | `Unsynchronized` (nominal rate; not a bit-perfect blocker today) |
 
 It is a label, not a mode selector: no pacing is added or chosen by it. On
 `StreamFormat` it is what the stream uses; on `AltSetting` it is what a stream on
 that alternate setting would use, and `None` when the library would not stream it
-with this configuration (an asynchronous endpoint without feedback while
-`allow_unsynchronized_async` is off, or a declared feedback endpoint that cannot be
-resolved).
+with this configuration (an asynchronous endpoint without usable feedback and without an applicable nominal policy, or a declared feedback endpoint that cannot be resolved).
 
 `Pacing`, `ClockResolution` and `ClockHopKind` are `#[non_exhaustive]`; each has a
 `code()` with the stable lower-case identifier the JSON uses.
@@ -396,9 +394,7 @@ stream.host_processing() -> bool
   audio. `play()` is only needed after `pause()`.
 - `pause()` sends wire-correct silence (zero for PCM, the idle pattern for DSD,
   DoP markers keep alternating) so the DAC stays locked, and does not consume
-  the ring. Transfers already queued on the bus (eight of them, about
-  `bus_queue_ms` = 16 ms at every service interval and for every encoding) still
-  play out first.
+  the ring. Submitted transfers may still play first. The default starts at eight slots and about 16 ms; adaptive queue depth can change.
   `play()` continues exactly where the ring was.
 - `flush()` drops everything in the ring, resets `played_frames()` to 0
   immediately, clears a pending `drain()`, and holds silence until the ring has
@@ -436,14 +432,13 @@ stream.host_processing() -> bool
 `buffer_target_ms`, `active_target_ms` (the depth `writable_bytes()` asks for
 now), `buffer_capacity_ms`, `transfer_queue_depth`,
 `last_turnaround_us`, `max_turnaround_us`, `last_submit_gap_us`,
-`max_submit_gap_us`, `effective_rate_hz`, `feedback_active`,
+`max_submit_gap_us`, `max_worker_gap_us`, `max_worker_loop_gap_us`, `max_event_pump_elapsed_us`, `max_event_pump_timeout_overrun_us`, `effective_rate_hz`, `feedback_active`,
 `feedback_locked`, `feedback_empty`, `feedback_reports`, `feedback_timeouts`, `feedback_errors`,
 `feedback_rejected`, `feedback_age_ms`, `feedback_rate_hz`, `feedback_stale`,
 `stable` (lossless transfers for about 256 ms, no underrun, no lost audio),
-`clock_verified` (the DAC confirmed the sampling frequency, or the device quirk
-trusts its `SET_CUR`), `payload_verified` (the wire payload audit passes) and
+`clock_verified` (the clock has current verified evidence; an acknowledged `SET_CUR` alone is not proof), `payload_verified` (the wire payload audit passes) and
 `payload_constant_for_ms` (how long the payload has been failing the audit, while
-it does). `feedback_locked` and `feedback_active` report live lock for either
+it does). `max_worker_gap_us` and the 10/50 ms worker-gap counters measure work outside the event pump. `max_worker_loop_gap_us` is observed elapsed loop time; `max_event_pump_elapsed_us` measures event-pump duration, and `max_event_pump_timeout_overrun_us` records time beyond its requested wait. These observations do not identify OS scheduling as the cause. `feedback_locked` and `feedback_active` report live lock for either
 feedback mode. A successful empty explicit poll increments `feedback_empty`
 and leaves the last accepted rate and timestamp unchanged. Report age keeps
 increasing. Frame counters are in `counter_rate_hz()` units, except implicit
@@ -459,7 +454,7 @@ completions and invalid IN packets (`implicit_fifo_depth`,
 
 | Variant | `code()` | When |
 |---|---|---|
-| `Busy` | `busy` | Another `Dac` is open in this process, or one is still shutting down. |
+| `Busy` | `busy` | This attachment already has an owner, or its previous owner is still shutting down. |
 | `PlatformUnsupported` | `platform_unsupported` | Not Linux or Android. |
 | `Claim(String)` | `claim` | Bad descriptor, interfaces not claimed as required, libusb could not take the descriptor. |
 | `Unsupported { reason, offered }` | `unsupported` | No alternate setting carries the request; `offered` lists what the DAC has. |
@@ -485,11 +480,7 @@ playback-only session does not give the IN samples to the app; a duplex stream
 hands them to its capture reader from the same transfers. On Android, the SDK
 returns capture-only claims when the session closes.
 
-By default `negotiate` and `open_stream` refuse an asynchronous route without
-usable feedback with `Error::ImplicitFeedbackUnsupported` when it is the only way to
-carry the request (a DAC that also offers a synchronised alternate setting for
-the same format uses that one). With `DacConfig::allow_unsynchronized_async` the
-stream runs at the nominal rate, host-paced. The format reports
+By default, full-speed UAC1 PCM without a declared feedback pipe may use host-paced nominal timing. `AsyncFallbackPolicy::Forbid` disables this narrow case; `DacConfig::allow_unsynchronized_async` separately opts into a broader eligible fallback. Other unsupported routes are refused with `Error::ImplicitFeedbackUnsupported`. The format reports
 `sync_type == Asynchronous` and `pacing == Pacing::Unsynchronized`, and
 `is_bit_perfect()` is false with `bit_perfect_blocker() ==
 Some(UnsynchronizedAsync)` for the whole stream. An endpoint that declares a
@@ -668,9 +659,7 @@ bit is D63, and the word is emitted little-endian (LE64), so the eight
 chronological input bytes of each channel appear in reverse byte order on the
 wire. Legacy native DSD uses 1-, 2- or 4-byte words and retains its device
 quirks and `dsd_big_endian`/`dsd_subslot` overrides, including optional bit
-reversal; those controls do not change the standard UAC3 layout. DSF files
-store the least significant bit first, so a host reading DSF must reverse the
-bits of each byte before writing. Request it with
+reversal; those controls do not change the standard UAC3 layout. DSF field `1` is LSB-first and needs per-byte reversal; field `8` is MSB-first and does not. Deblock each channel, interleave channels chronologically and trim to the declared sample count. Raw DSDIFF Channel Bytes are MSB-first in Channels Chunk order; exclude IFF padding and reject unsupported compression. DSF field `1` byte `0x01`, DSF field `8` byte `0x80`, and raw DSDIFF byte `0x80` carry the same chronological bits. Request it with
 `StreamRequest::dsd_native(bit_rate, channels)`. The counters count DSD
 "frames" of one byte per channel (8 DSD bits per channel), at `bit_rate / 8`.
 
@@ -740,8 +729,7 @@ else). A panic in a listener is caught and logged.
    clears the flag for the life of the stream.
 3. The format on the wire matches the request.
 4. Live feedback has locked when the stream uses explicit or implicit feedback.
-5. The DAC's sampling frequency was verified by readback or trusted through
-   its `SkipClockValidation` quirk.
+5. The DAC's sampling frequency has current verified readback or another proven clock condition. An acknowledged SET with unusable readback remains unverified, including when a compatibility quirk permits it.
 6. Software gain is exactly 1.0.
 7. The endpoint uses valid pacing. An asynchronous route opened with the
    nominal-timing opt-in remains unverified.
@@ -1118,6 +1106,8 @@ The preflight response is `{ "configuration_id": 1, "interfaces": [2] }`.
   "clock_settle_delay_ms": 20, "dsd_big_endian": true, "dsd_subslot": 4,
   "padded_24bit": true, "allow_unsynchronized_async": false, "disable_feedback": false,
   "realtime_priority": true, "capture_feedback_trace": false,
+  "feedback_smoothing": "direct", "adaptive_queue": true, "quirk_policy": "verified_only",
+  "async_fallback_policy": "full_speed_uac1", "clock_readback_policy": "require_verified",
   "hand_back": "restore_original", "bus_queue_ms": 16, "transfers_in_flight": 8,
   "transfer_period_us": null, "cancel_in_flight_on_flush": true,
   "startup_volume": "attenuate", "startup_volume_max_db": -40.0, "require_hardware_volume": true,
@@ -1125,13 +1115,12 @@ The preflight response is `{ "configuration_id": 1, "interfaces": [2] }`.
                 "quirks": ["skip_clock_validation", {"settle_delay_ms": 80}] } ] }
 ```
 
-`hand_back` is `restore_original` or `keep`. `startup_volume` is `attenuate`
+`feedback_smoothing` is `direct` or `ewma`; `quirk_policy` is `verified_only` or `source_backed`. `async_fallback_policy` is `full_speed_uac1` or `forbid`; `clock_readback_policy` is `require_verified` or `allow_unusable_after_successful_set`. Unknown values are rejected. The source-backed tier imports only implemented, scoped facts and does not establish physical verification. `hand_back` is `restore_original` or `keep`. `startup_volume` is `attenuate`
 (default; `startup_volume_max_db` is its ceiling, -40.0 when absent) or `keep`
 (which ignores the ceiling); a `startup_volume_max_db` alone means `attenuate`. Flag quirks:
 `skip_clock_validation`, `ignore_invalid_sample_rate`, `require_verified_rate`,
 `prefer_padded_24bit_transport`, `dsd_big_endian`, `dsd_bit_reverse`,
-`explicit_feedback_per_service_interval`; valued
-quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}`.
+`explicit_feedback_per_service_interval`, `set_interface_first`, `playback_urb_fixup`, `skip_sample_rate_readback`, `skip_implicit_feedback`, `mixer_playback_min_mute`, `mixer_playback_linear_volume`, `raw_dsd32_be`, `fixed_rate`, `implicit_silence_on_empty`, `skip_clock_selector_writes`, and `ignore_optional_control_errors`. Valued quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"control_message_delay_us": n}`, `{"interface_delay_ms": n}`, and `{"dsd_subslot_size": n}`. Generic host overrides `tx_length_prefix` and `playback_first` are rejected; their scoped source-backed profiles have separate admission. Unknown quirks are rejected.
 
 **Stream request** (`dacNegotiate`):
 
@@ -1141,7 +1130,7 @@ quirks are one-entry objects: `{"settle_delay_ms": n}`, `{"dsd_subslot_size": n}
 { "encoding": "dsd_native", "dsd_bit_rate": 2822400, "channels": 2, "rate_policy": "nearest" }
 ```
 
-`encoding` is `pcm` (default), `dop` or `dsd_native`; `rate_policy` is `exact`
+`encoding` is `pcm` (default), `pcm_u8`, `pcm_float32`, `dop` or `dsd_native`; `rate_policy` is `exact`
 (default) or `nearest`. For `dop`, `dsd_bit_rate` derives the carrier rate (rate
 / 16, 24-bit); an explicit `sample_rate` or `bit_depth` overrides it.
 
@@ -1222,9 +1211,7 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
 
 ## 12. Limits of v0.1
 
-- One open `Dac` per process (a second `open` is `Busy`). The session state is a
-  process-wide slot behind the handles; moving it into the `Dac` later changes
-  no signature.
+- One owner per physical attachment (a second owner is `Busy`); distinct attachments can have independent owners.
 - Linux and Android only (usbfs through libusb's wrap-by-descriptor call). On
   other hosts the crate builds and its logic is unit-tested, but `Dac::open`
   returns `PlatformUnsupported`.
@@ -1547,7 +1534,7 @@ tested), at most 1.5 steps. The generator is a xorshift64*, seeded by
 `dither_seed`: the same seed gives the same output, and `reset` rewinds it.
 
 Integer outputs **saturate at full scale and never wrap**, and `clipped_samples()`
-counts the saturations. A non-finite float input sample is replaced by silence.
+counts post-dither integer-quantizer saturations, including rounding or dither clamps even without resampling. A non-finite float input sample is replaced by silence.
 Whether a resampled signal clips depends on the signal: a band-limited
 reconstruction can exceed its input's peak. Measured: a full-scale 1 kHz square
 wave resampled from 44.1 to 48 kHz peaks at 1.41 (+3.0 dB), and clips; a

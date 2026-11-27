@@ -1,12 +1,12 @@
 # usbdac-core
 
 Drive a USB DAC directly from a Rust audio application on Android or Linux.
-`usbdac-core` handles USB Audio Class 1.0 and 2.0 playback over usbfs so your
+`usbdac-core` handles USB Audio Class 1.0, 2.0 and 3.0 playback over usbfs so your
 app can feed PCM, DoP or native DSD to the DAC and control its hardware volume.
 The stream reports whether it can verify bit-perfect output and identifies
 what prevented verification.
 
-Version 0.1.1 supports implicit feedback on compatible UAC2 devices. It uses
+The driver supports implicit feedback on compatible UAC2 and UAC3 devices. It uses
 whole-frame counts from a matching IN stream to pace playback. Explicit
 feedback selects the newest valid report in each batch, checks packet capacity
 and gives the device a bounded recovery window when reports stop. Read
@@ -33,8 +33,8 @@ cargo add usbdac-core@0.1.10
 
 Your app supplies the decoded audio. Optional PCM conversion helpers handle
 sample rate, bit depth and mono-to-stereo when your source format needs to change.
-The direct USB stream supports one open DAC per process in 0.1. Direct USB
-PCM has played on one phone and DAC combination. Test your target devices
+Each physical attachment has one owner; distinct attachments can be owned independently.
+Direct USB PCM and native DSD have limited device-specific physical evidence. Test your target devices
 and formats before relying on it in production.
 
 - [Rust API reference](https://docs.rs/usbdac-core)
@@ -54,7 +54,7 @@ Existing blocking calls remain available. Accepted writes are not cancelled by
 dropping their future.
 
 `fake::FakeDac` implements the same public `PlaybackDevice`/`PlaybackStream`
-application boundary as real playback. It supports deterministic PCM queue
+application boundary as real playback. It supports deterministic signed PCM, unsigned 8-bit and float32 queue
 progress, pause/drain/flush, injected loss, and unplug without hardware; it is
 not a protocol emulator or a bit-perfect hardware verification claim. See the
 [Rust SDK guide](https://johnneerdael.github.io/android-usbdac/sdk/guide-rust/) for

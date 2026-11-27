@@ -16,9 +16,9 @@ Playback minimum-is-mute and linear-amplitude quirks retain raw range lattices, 
 
 | Source flag | Behavior or remaining scope |
 |---|---|
-| `GET_SAMPLE_RATE` | implemented; source-backed opt-in, hardware unverified |
+| `GET_SAMPLE_RATE` | UAC1-only source-backed opt-in; an unusable reply may permit an explicitly unverified tier, not proof of rate |
 | `SHARE_MEDIA_DEVICE` | Linux kernel media-controller ownership; no equivalent in this userspace driver |
-| `ALIGN_TRANSFER` | already enforced by complete frame alignment; capture fragments are rejected |
+| `ALIGN_TRANSFER` | complete-frame alignment is enforced; capture fragments are rejected rather than silently aligned |
 | `TX_LENGTH` | implemented for exact Zoom standard UAC1 PCM playback interface1: four-byte LE audio-length prefix, capacity and loss exclude header |
 | `PLAYBACK_FIRST` | implemented only with a proven implicit PCM IN/OUT pair; bounded existing nominal-silence bootstrap |
 | `SKIP_CLOCK_SELECTOR` | implemented: preserve selector reads and current route; refuse any selector-changing write |
@@ -28,7 +28,7 @@ Playback minimum-is-mute and linear-amplitude quirks retain raw range lattices, 
 | `CTL_MSG_DELAY_1M` | implemented; source-backed opt-in, hardware unverified |
 | `CTL_MSG_DELAY_5M` | implemented; source-backed opt-in, hardware unverified |
 | `IFACE_DELAY` | implemented; source-backed opt-in, hardware unverified |
-| `VALIDATE_RATES` | already enforced by descriptor/range and exact readback admission |
+| `VALIDATE_RATES` | descriptor/range checks and exact readback admission apply; explicit unusable-readback policy remains unverified |
 | `DISABLE_AUTOSUSPEND` | Linux kernel runtime-PM policy; app cannot disable kernel autosuspend through audio-class controls |
 | `IGNORE_CTL_ERROR` | implemented only for optional mixer discovery; mandatory attenuation, rate, SET and live readback failures remain visible |
 | `DSD_RAW` | implemented only for exact identity, unambiguous stereo UAC2 RAW_DATA and 4-byte words; no vendor-wide activation |
@@ -52,9 +52,9 @@ Playback minimum-is-mute and linear-amplitude quirks retain raw range lattices, 
 
 ## Transport evidence and limits
 
-Empty ERROR/TIMEOUT/OVERFLOW packet bursts on completed OUT transfers are recovered only with matching submitted descriptors. Every known-empty request is charged as loss; a neighboring legal packet cannot erase it. Ambiguous nonzero error packets, malformed descriptors, removal and endpoint halt remain terminal. Whole-transfer timeout accounting retains its existing separate conservative contract. Existing loss budgets and first-loss bit-perfect clearing remain unchanged.
+Supported ERROR/TIMEOUT/OVERFLOW/STALL packet statuses on completed OUT transfers can be charged in full when submitted geometry is valid. Reported bytes from failed packets are unconfirmed and never credited; a neighboring legal packet cannot erase the charge. Malformed descriptors, removal, cancellation and unsupported statuses remain terminal. Whole-transfer timeout accounting retains its existing separate conservative contract. Existing loss budgets and first-loss bit-perfect clearing remain unchanged.
 
-Adaptive queuing changes the active URB count after three loss-bearing OUT completions within one second (including coalesced callbacks, with at most one growth per worker batch) and lowers it after thirty quiet seconds. It preserves packets per URB, the 255-packet ceiling, sixteen-slot ceiling and 64 ms queue ceiling. Paired implicit-feedback pools retain their proven fixed geometry. The PLAYBACK_URB_FIXUP source rule requests a deeper twelve-URB starting geometry while retaining all caps. TX_LENGTH is limited to the exact Zoom standard UAC1 PCM playback profile on interface 1: each packet has a four-byte little-endian audio-byte-count prefix, reserved in wire capacity and excluded from payload audit, played frames and loss budgets. One bounded implicit silence pattern may reuse a previously measured, locked cadence; it consumes no application frames, contributes no rate evidence and never renews source health. Fresh source proof is required before another concealment. Source-backed PLAYBACK_FIRST uses the existing bounded OUT-silence bootstrap only for a proven implicit PCM source pair.
+Adaptive queuing changes the active URB count after a loss-bearing OUT completion (including coalesced callbacks, with at most one growth per worker batch) and lowers it after thirty quiet seconds. It preserves packets per URB, the 255-packet ceiling, sixteen-slot ceiling and 64 ms queue ceiling. Paired implicit-feedback pools retain their proven fixed geometry. The PLAYBACK_URB_FIXUP source rule requests a deeper twelve-URB starting geometry while retaining all caps. TX_LENGTH is limited to the exact Zoom standard UAC1 PCM playback profile on interface 1: each packet has a four-byte little-endian audio-byte-count prefix, reserved in wire capacity and excluded from payload audit, played frames and loss budgets. One bounded implicit silence pattern may reuse a previously measured, locked cadence; it consumes no application frames, contributes no rate evidence and never renews source health. Fresh source proof is required before another concealment. Source-backed PLAYBACK_FIRST uses the existing bounded OUT-silence bootstrap only for a proven implicit PCM source pair.
 
 Feedback accepts 7/8 through 3/2 nominal before endpoint capacity checks. Direct fractional timing is the default; explicit `FeedbackSmoothing::Ewma` retains the legacy alpha-0.2 filter. Unit rediscovery requires an exact post-alt clock cross-check and three new completions. Diagnostics retain unsmoothed min/max/mean/population variance; opt-in trace observations separately record the policy and actual applied scheduler rate. The audible smoothing trade-off has not been measured.
 
@@ -62,7 +62,7 @@ A narrow default nominal tier admits full-speed UAC1 PCM without a feedback pipe
 
 Clock fallback requires a successful SET and unusable readback under host policy. Positive mismatches, failed SET, multiplied routes and DSD retain strict proof. Three unusable replies are learned only for the current opened device session and exact control interface/clock entity; later attempts still read GET_CUR and readable values clear the suggestion. No learned rule survives close.
 
-Worker diagnostics record loop gaps above 10 ms and 50 ms and the maximum gap. These are observed worker gaps, including event-pump waiting, not an attribution to OS scheduling alone. No screen-off, Doze or OEM hardware claim follows from host tests.
+Worker 10 ms and 50 ms counters and `maxWorkerGapUs` record gaps outside the event pump. `maxWorkerLoopGapUs` records observed loop elapsed time, `maxEventPumpElapsedUs` measures pump duration, and `maxEventPumpTimeoutOverrunUs` measures pump time beyond the requested wait. None alone attributes a delay to OS scheduling. No screen-off, Doze or OEM hardware claim follows from host tests.
 
 
 Successful compatibility admission emits typed `CompatibilityFallback`

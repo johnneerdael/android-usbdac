@@ -72,6 +72,8 @@ delivery, clock changes and the transition on this device.
 
 ## Release validation scope {#release-validation-scope}
 
+For v0.1.10, the five required release gates ran on the reserved release source. Packaging failed before publication; recovery checked the original evidence and rebuilt the same tagged source. That is source-level assurance, not proof that the rebuilt binaries were the exact gate-built bytes. The bounded v0.1.10 defensive gate and the earlier three-hour v0.1.7 fuzz run are separate software evidence. Neither establishes physical-device behavior.
+
 The shared USB Audio implementation includes: UAC1, UAC2 and UAC3 (BADD and full ADC3) playback, PCM capture and duplex, channel layouts, clock selection and restoration, standard routing, explicit and implicit feedback, and native DSD and DoP capability handling. The
 [implementation ledger](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/alsa-parity.md) records software checks
 and their artifacts by implementation batch. These include Rust protocol,

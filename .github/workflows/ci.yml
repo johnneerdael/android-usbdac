@@ -208,7 +208,9 @@ jobs:
         if: failure()
         with:
           name: unit-test-reports
-          path: android/usbdac/build/reports/tests
+          path: |
+            android/usbdac/build/reports/tests
+            android/usbdac-media3/build/reports/tests
           retention-days: 7
 
   defensive-fuzz:

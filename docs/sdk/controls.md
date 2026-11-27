@@ -4,7 +4,7 @@ Every option and control of the SDK, with its type, its default, what it does an
 
 ## Session configuration: `DacConfig`
 
-Pass a `DacConfig` to `UsbDac.open(context, device, config)`. `DacConfig()` is what the transport was tuned with; change a value only for a reason. The native library validates the combination and throws `INVALID_ARGUMENT`.
+Pass a `DacConfig` to `UsbDac.open(context, device, config)`. `DacConfig()` supplies the defaults; change a value only for a reason. The native library validates the combination and throws `INVALID_ARGUMENT`.
 
 ### Buffering
 
@@ -15,7 +15,7 @@ Pass a `DacConfig` to `UsbDac.open(context, device, config)`. `DacConfig()` is w
 | `startThresholdMs` | `Int` | 100 | Audio the ring must hold before a new stream starts, and before a flushed ring resumes. At least 1; keep it at or below `bufferTargetMs` | None |
 | `processingBufferTargetMs` | `Int` | 100 | The recommended depth while software gain is not 1.0, so a host that processes audio hears its changes sooner. 1 to `bufferCapacityMs` | None |
 
-A deep ring costs nothing in responsiveness if you `flush()` on every seek, stop and track change: the flush drops the ring at once, and the transfers already on the bus are cancelled (`cancelInFlightOnFlush`), so the old position stops within a couple of milliseconds. A shallow ring lowers memory and latency and makes underruns likelier (an underrun pads the wire with silence and sends `DacEvent.Underrun`).
+A flush drops the ring and can request cancellation of submitted transfers (`cancelInFlightOnFlush`). Cancellation is asynchronous and audio already submitted or buffered downstream can still affect the audible result; no seek-latency guarantee follows. A shallow ring lowers memory and latency and makes underruns likelier (an underrun pads the wire with silence and sends `DacEvent.Underrun`).
 
 ### The bus queue
 
@@ -24,7 +24,7 @@ A deep ring costs nothing in responsiveness if you `flush()` on every seek, stop
 | `busQueueMs` | `Int` | 16 | Audio kept queued on the USB bus, 4 to 64: what a `pause()` still plays out and the headroom against a late output thread. The same for every service interval and encoding | None |
 | `transfersInFlight` | `Int` | 8 | Isochronous slots, 2 to 16. Acts as a ceiling when `transferPeriodUs` is set | None |
 | `transferPeriodUs` | `Int?` | null | Target duration for a single transfer, 125 to 32,000 µs. With no period, each transfer carries about `busQueueMs / transfersInFlight` | None |
-| `cancelInFlightOnFlush` | `Boolean` | `true` | `flush()` also cancels the transfers already on the bus, so a seek is heard at once instead of after `busQueueMs`. Off: they play out. See [flush](#the-stream-dacstream-and-pcmoutput) | None: cancelled transfers are not lost audio |
+| `cancelInFlightOnFlush` | `Boolean` | `true` | `flush()` also requests cancellation of submitted transfers. Off: they play out; actual audible latency is not measured. See [flush](#the-stream-dacstream-and-pcmoutput) | None: cancelled transfers are not lost audio |
 
 `DacConfig.withUsbQueueProfile` configures the USB bus queue without changing the player ring.
 
@@ -44,20 +44,20 @@ one packet per transfer and two slots. The driver derives the slot count from
 the queue target and applies the selected slot ceiling. The log records the
 actual packets per transfer, slots and duration for the negotiated endpoint.
 
-The packets in flight never reach 256, and at most 32 go in a transfer. Where the configured depth would break either limit the cap wins and less is queued: `busQueueMs = 64` with eight transfers at a 125 us service interval queues 31 ms, not 64. A DAC with a 1 ms service interval used to queue 128 ms and DSD at 125 us 256 packets (one more than the measured stall point); both now queue 16 ms like every other case. A shorter queue makes a pause or a stop sound sooner and leaves less headroom for a late output thread; leave the defaults unless a DAC underruns (deepen) or a host needs the shortest pause (shorten). See [the bus queue](../API.md#the-bus-queue).
+The packets in flight never reach 256, and at most 32 go in a transfer. Where the configured depth would break either limit the cap wins and less is queued: `busQueueMs = 64` with eight transfers at a 125 us service interval queues 31 ms, not 64. At default geometry, a 1 ms service interval and DSD at 125 us initially target about 16 ms. Adaptive depth can grow within the slot, time and packet caps; a custom queue or period fixes the requested depth. A shorter queue makes a pause or a stop sound sooner and leaves less headroom for a late output thread; leave the defaults unless a DAC underruns (deepen) or a host needs the shortest pause (shorten). See [the bus queue](../API.md#the-bus-queue).
 
 ### Clock and format
 
 | Option | Type | Default | Effect | Bit-perfect impact |
 |---|---|---|---|---|
-| `requireVerifiedRate` | `Boolean` | `true` | Refuse to stream unless the DAC confirms the sampling frequency it was told (`CLOCK_UNVERIFIED`). Off, a DAC with a broken readback plays | Off: the stream is never reported bit-perfect (blocker `CLOCK_UNVERIFIED`) unless a quirk vouches for the DAC |
+| `requireVerifiedRate` | `Boolean` | `true` | Refuse to stream unless the DAC confirms the sampling frequency it was told (`CLOCK_UNVERIFIED`). Off, a DAC with a broken readback plays | An unverified rate remains blocked from bit-perfect reporting; an acknowledged write alone is not confirmation |
 | `clockSettleDelayMs` | `Long?` | `null` | Wait after programming the clock. `null`: the device's quirk, else 20 ms | None |
 | `padded24Bit` | `Boolean?` | `null` | Prefer the 4-byte slot for 24-bit PCM. `null`: the device's quirk, else off | None on the samples. It changes the wire layout (`StreamFormat.subslotBytes` becomes 4 and the 24-bit sample sits in the upper three bytes), and you write what the format says |
 | `dsdBigEndian` | `Boolean?` | `null` | Native DSD byte order on the wire. `null`: the device's quirk, else little-endian | None; wrong order is noise from the DAC, which the library cannot detect |
 | `dsdSubslot` | `Int?` | `null` | Slot size (1, 2 or 4) for native DSD alternate settings. `null`: the device's quirk, else the descriptor | None |
 | `asyncFallbackPolicy` | `AsyncFallbackPolicy` | `FULL_SPEED_UAC1` | Permit nominal timing only for the full-speed UAC1 PCM compatibility case; `FORBID` disables that case | Nominal asynchronous output is never bit-perfect |
 | `clockReadbackPolicy` | `ClockReadbackPolicy` | `REQUIRE_VERIFIED` | `ALLOW_UNUSABLE_AFTER_SUCCESSFUL_SET` permits zero/unavailable PCM clock readback after successful SET; positive mismatches still fail | An accepted unusable readback remains unverified |
-| `adaptiveQueue` | `Boolean` | `true` | Adapt the USB queue within native bounds after measured worker stalls | Changes transport buffering, not sample values |
+| `adaptiveQueue` | `Boolean` | `true` | Adapt the USB queue within native bounds after loss-bearing completions | Changes transport buffering, not sample values |
 | `allowUnsynchronizedAsync` | `Boolean` | `false` | Permit an otherwise valid asynchronous route without usable feedback to play at the nominal rate. The host and DAC clocks can drift apart | Never bit-perfect while in use (blocker `UNSYNCHRONIZED_ASYNC`) |
 | `disableFeedback` | `Boolean` | `false` | Disable explicit and implicit feedback for this session. An asynchronous route still needs an applicable nominal-timing policy | The same blocker applies if the route uses nominal asynchronous timing |
 | `feedbackSmoothing` | `FeedbackSmoothing` | `DIRECT` | Explicit feedback uses each accepted selected report directly. `EWMA` preserves the legacy filter with alpha 0.2. Implicit vectors and nominal pacing are unaffected | None; the same timing validation and bit-perfect conditions apply |
@@ -65,12 +65,12 @@ The packets in flight never reach 256, and at most 32 go in a transfer. Where th
 
 ### Quirks
 
-`quirks` is a `List<QuirkOverride>` (default empty). Each entry names a vendor id, a product id, optionally a text the product name must contain, and a list of `DacQuirk`s. They are added to the library's built-in table, which holds two entries (MOONDROP Dawn Pro, Fosi Audio DS2). Config fields set explicitly (`clockSettleDelayMs`, `dsdBigEndian`, `dsdSubslot`, `padded24Bit`) win over quirks.
+`quirkPolicy` defaults to `VERIFIED_ONLY`; `SOURCE_BACKED` adds scoped, implemented source facts that are not hardware verification. Some imported flags are data-only or explicitly unsupported; see [source-backed compatibility](source-backed-quirks.md). `quirks` is a `List<QuirkOverride>` (default empty). Each entry names a vendor id, a product id, optionally a text the product name must contain, and a list of `DacQuirk`s. They are added to the library's built-in table, which holds two entries (MOONDROP Dawn Pro, Fosi Audio DS2). Config fields set explicitly (`clockSettleDelayMs`, `dsdBigEndian`, `dsdSubslot`, `padded24Bit`) win over quirks.
 
 | Quirk | Effect | Bit-perfect impact |
 |---|---|---|
-| `SkipClockValidation` | The DAC's clock readback is unreliable (it returns 0 or fails). Trust the acknowledgement of the set request for PCM and skip verification | The clock counts as verified, on the DAC's word |
-| `IgnoreInvalidSampleRate` | The DAC reports a rate that differs from the one just set (some report 0 Hz) but plays correctly: do not refuse. PCM only | As above |
+| `SkipClockValidation` | The DAC's clock readback is unreliable (it returns 0 or fails). Trust the acknowledgement of the set request for PCM and skip verification | An acknowledged write with unusable readback remains unverified; a different reported rate is not accepted as proof |
+| `IgnoreInvalidSampleRate` | For an applicable PCM compatibility case, permit unusable readback such as zero after an acknowledged SET; a positive mismatched rate still fails | As above |
 | `RequireVerifiedRate` | Refuse to stream unless the rate is confirmed, even when `requireVerifiedRate` is off | None |
 | `SettleDelayMs(ms)` | Wait this long after programming the clock | None |
 | `PreferPadded24BitTransport` | The 4-byte slot for 24-bit PCM, as `padded24Bit` | None on the samples |
@@ -171,6 +171,8 @@ reports. Check `pacing` to identify an implicit route.
 | `feedbackAgeMs`, `feedbackRateHz` | Age of the last valid report or IN pattern, and the latest rate estimate when available |
 | `feedbackEmpty`, `feedbackRejected` | Empty polls or IN patterns, and rejected feedback. An empty explicit poll leaves the rate and last report timestamp in place |
 | `feedbackStale` | The timing source has gone stale. For explicit feedback, the last good rate is held only during the bounded recovery window |
+| `maxWorkerGapUs`, 10/50 ms worker-gap counters | Observed work gaps outside the event pump |
+| `maxWorkerLoopGapUs`, `maxEventPumpElapsedUs`, `maxEventPumpTimeoutOverrunUs` | Maximum observed loop elapsed time, event-pump duration, and pump time beyond its requested wait. None alone attributes a delay to OS scheduling |
 | `implicitFifoDepth`, `implicitWaits`, `implicitInvalidPackets` | Whether IN patterns are ready for each playback transfer, how often playback waits for them, and whether IN packets failed validation |
 
 See [feedback troubleshooting](troubleshooting.md#feedback-lock-and-dropouts)
@@ -305,7 +307,7 @@ Bit-perfect impact of all of the above: none. They change the DAC's volume, not 
 
 ## Idle release
 
-A paused direct stream keeps the output thread running and sends silence so the DAC stays locked. `DacIdleRelease` closes the stream after a continuous pause and reopens it on resume, with a lambda you supply. The session and the DAC volume stay open meanwhile.
+A paused direct stream keeps the output thread running and schedules silence; physical DAC lock remains device-dependent. `DacIdleRelease` closes the stream after a continuous pause and reopens it on resume, with a lambda you supply. The session and the DAC volume stay open meanwhile.
 
 | Parameter | Type | Default | Effect |
 |---|---|---|---|
@@ -327,9 +329,9 @@ fun idleRelease(scope: CoroutineScope, session: DacSession, request: StreamReque
 }
 ```
 
-Closing discards any queued audio the DAC has not played. Record the audible position when pausing. `idle.resume()` returns `IdleResume(output, reopened)` atomically: if `reopened` is true, flush/rebase the host's counters and seek its decoder to that saved audible position before supplying PCM. If false, keep the existing stream and queue without reseeking. `DacIdleRelease` cannot perform the decoder seek itself.
+Closing discards queued audio. Record the best available playback position when pausing; transport counters do not prove the exact acoustic cursor. `idle.resume()` returns `IdleResume(output, reopened)` atomically: if `reopened` is true, flush/rebase the host's counters and seek its decoder to the chosen saved position before supplying PCM. If false, keep the existing stream and queue without reseeking. `DacIdleRelease` cannot perform the decoder seek itself.
 
-Call `idle.onPaused()` when playback pauses and `idle.onResumed()` when it resumes; the latter returns the stream to write to, the same one or a new one. Reopening costs 100 ms or more (negotiate and open), so the first audio after a long pause is late by that much. `idle.isReleased` is a `StateFlow<Boolean>`. Bit-perfect impact: none; a reopened stream is verified again from scratch.
+Call `idle.onPaused()` when playback pauses and use `idle.resume()` when decoder cursor recovery matters. `onResumed()` returns an output but does not tell the caller whether reopening discarded the queue. Reopening requires negotiation and open; actual startup time depends on the device. `idle.isReleased` is a `StateFlow<Boolean>`. Bit-perfect impact: none; a reopened stream is verified again from scratch.
 
 ## Capture, duplex and routing
 
@@ -347,7 +349,7 @@ These are separate from playback and from `OutputSelector`, which chooses playba
 
 `CaptureStats` distinguishes known device loss (`missingFrames`), packet classifications, host overflow (`overrunFrames`), and valid startup or rate-proof frames withheld from presentation (`proofSuppressedFrames`). `contentionFrames` remains for compatibility. `devicePositionFrames` is a lower bound from configuration and includes suppressed frames; the presentation timeline starts after that initial suppressed region.
 
-The `pioneer` and `scarlett` members of `routing`, and the `...WithVendorRouting` calls of `UsbDac`, are in the API and are switched off in 0.1.5: they fail with an unsupported error.
+Routing edits are explicit; starting a stream does not silently apply them. The Rust routing snapshot retains a `hand_back_report()` after close with per-control restoration, drift, unreadable or uncertain outcomes. Vendor routing entry points remain disabled and fail unsupported. Any future admitted vendor edit is a live routing change without issuing a settings-save command; persistence across replug or power cycle requires separate exact-firmware evidence.
 
 ## Library-level
 

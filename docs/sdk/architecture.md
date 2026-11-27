@@ -30,7 +30,7 @@ the phone's USB host controller, the cable, the DAC
 
 The Rust core knows nothing about Android except usbfs and the file descriptor it is handed. The Kotlin layer knows nothing about USB packets. Between them the JNI layer is deliberately thin: a handle is a number in a registry (a stale number gives an `invalid_argument` error and cannot crash the process), a structured value is JSON with snake_case keys, and an event is one method call, `onEvent(type, a, b, message)`, made on the library's event thread. The full contract is in the [native API document](native-api.html#10-jni-contract).
 
-The core talks to the DAC through usbfs, so it works on Android and Linux. On any other host (the tests were run on a Mac) `Dac::open` returns `PlatformUnsupported`, and everything that does not need a DAC (parsing, scheduling, accounting, conversion, and the transport against a fake DAC) still runs. That is what lets 918 Rust tests run on a laptop.
+The core talks to the DAC through usbfs, so it works on Android and Linux. On any other host (the tests were run on a Mac) `Dac::open` returns `PlatformUnsupported`, and everything that does not need a DAC (parsing, scheduling, accounting, conversion, and the transport against a fake DAC) still runs. The historical v0.1.5 run at `353e039` ran 918 Rust tests on a laptop; it is not a current passing-test count.
 
 ## What is in the Rust core
 

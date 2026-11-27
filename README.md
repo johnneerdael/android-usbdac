@@ -40,11 +40,11 @@ technically, and in plain terms. In short:
 |---|---|---|
 | Clock handling | Resolves selectors and multipliers, verifies rates, and restores owned changes | A compatible alternate clock can serve a rate the current clock cannot |
 | USB feedback | Uses the newest valid explicit rate report and supports compatible UAC2 and UAC3 implicit feedback | Playback can follow the device clock through a dedicated rate endpoint or a matching input stream |
-| Transfer queue | Always 16 ms on the bus, never 256 packets | Avoids a stall seen on real hardware; controls feel equally quick on every DAC |
-| Fault handling | Recovers from timed-out transfers and counts lost audio exactly | A brief USB hiccup no longer stops the music |
+| Transfer queue | About 16 ms and eight transfers by default, with bounded adaptive depth | Tunable buffering; the packet cap follows a stall observed on one phone and DAC |
+| Fault handling | Uses a bounded loss budget and conservative accounting for failed transfers | Brief recoverable USB faults can continue with a reported loss |
 | Buffering | 250 ms reserve that shrinks while software volume is active | More protection against gaps without slower controls |
-| Pause and seek | Pause holds the audio and sends silence; flush cancels what is on the bus | Pause stops at once, resume loses nothing, seeks are heard immediately |
-| Position | Counted from what the DAC confirmed | Progress bar and lyrics match what you hear |
+| Pause and seek | Pause holds the audio and sends silence; flush cancels what is on the bus | Previously submitted audio may still play; timing and acoustic output are not measured |
+| Position | Counted from completed transfers | A transport position estimate, not an acoustic measurement |
 | Start-up safety | Volume lowered to at most -40 dB before the first sample; no volume control means no playback unless allowed | Plugging in a DAC cannot blast your ears |
 | Volume | Useful slider range, latest-wins writes, works without a stream, key and system-panel helpers, original level handed back | The volume behaves the way phone volume does, and other apps get the DAC back as it was |
 | Power | Stream released after a long pause | Less battery used while paused |
@@ -74,10 +74,13 @@ acceptance and additional models are tracked in
 crates/usbdac-core/   the driver (Rust): no JNI, no application types
 crates/usbdac-jni/    libusbdac.so, the JNI bindings
 android/usbdac/       the Android library (AAR, Kotlin, package dev.usbdac)
+android/usbdac-media3/ optional Media3 AudioSink integration
 android/sample/       a small app that exercises every feature
 docs/sdk/             the SDK guide (published to the site above)
 docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
 ```
+
+The optional `dev.usbdac:usbdac-media3` artifact integrates the SDK with [Media3](docs/sdk/media3.md); use the same version as the base Android artifact.
 
 Besides direct USB, the library carries two outputs that go through Android:
 an `AudioTrack`-based one that asks Android 14 and later for its bit-perfect
@@ -90,11 +93,13 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   profiles and standard 8-byte UAC3 words). Legacy byte and bit order are
   resolved per alternate, device and applicable firmware.
 - Output: a ring buffer (250 ms target, 500 ms capacity by default) feeds eight
-  isochronous transfers in flight, 16 ms queued on the bus at every service
-  interval and for every encoding, never 256 packets. Explicit rate reports and
+  isochronous transfers initially, targeting about 16 ms. Adaptive depth can
+  grow within 64 ms and 255 packets; explicit custom geometry fixes the depth.
+  Explicit rate reports and
   implicit capture packet counts steer asynchronous playback packet sizes.
 - Flush: `flush()` drops the ring and cancels what is already on the bus (not
-  counted as played, lost or an underrun), so a seek is heard at once.
+  counted as played, lost or an underrun). Cancellation is asynchronous and
+  already submitted audio and downstream buffering affect when a seek is heard.
 - Reporting: played frames and latency counted on completed transfers, lost
   frames (timed-out and short transfers) latched, an audit of the wire payload,
   and `is_bit_perfect()` combining them with the clock verification, with
@@ -105,8 +110,9 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   bit-perfect verdict, and a persistent outage ends the stream. Implicit
   feedback uses frame counts from a compatible UAC2 IN stream that shares the
   playback clock, rate and service interval. An otherwise valid asynchronous
-  route without usable feedback requires
-  `DacConfig::allow_unsynchronized_async` to play at the nominal rate.
+  full-speed UAC1 PCM route without a declared feedback pipe can use nominal
+  pacing by default; the explicit `allow_unsynchronized_async` option permits
+  a broader fallback. Either is unverified.
   See [clock and pacing](docs/sdk/decisions-clock.md#feedback).
 - Volume: the Feature Unit's volume and mute, with read-back verification, a dB
   and a 0..1 view, the level the DAC had before, and a hand-back on close. The
@@ -123,7 +129,7 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 
 ## Limits
 
-- One open DAC per process in v0.1 (`Error::Busy` for a second one).
+- One owner per physical attachment; distinct attachments can have independent owners. A second owner for the same attachment is refused.
 - Linux/Android usbfs only. On other hosts everything compiles and the logic
   tests run, but `Dac::open` returns `Error::PlatformUnsupported`.
 - UAC 1.0/2.0/3.0 playback and PCM capture, including BADD profiles.
