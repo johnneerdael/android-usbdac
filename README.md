@@ -1,32 +1,107 @@
-# usbdac
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/marketing/usbdac-readme-dark.svg">
+    <img src="branding/marketing/usbdac-readme-light.svg" alt="usbdac. Direct USB audio. Clear evidence." width="100%">
+  </picture>
+</p>
 
-Add direct USB DAC playback to an Android audio app. usbdac sends decoded PCM,
-DoP or native DSD to the DAC through USB, bypassing Android's mixer on the
-direct path. Your app can control the DAC's hardware volume and show whether
-the stream is bit-perfect, with the reason when verification fails.
+<p align="center">
+  <a href="https://github.com/johnneerdael/usbdac/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/johnneerdael/usbdac?style=flat-square&color=2367C9&label=release"></a>
+  <a href="https://crates.io/crates/usbdac-core"><img alt="usbdac-core on crates.io" src="https://img.shields.io/crates/v/usbdac-core?style=flat-square&color=2367C9&label=crates.io"></a>
+  <a href="https://johnneerdael.github.io/usbdac/"><img alt="SDK guide" src="https://img.shields.io/badge/SDK%20guide-online-11151C?style=flat-square"></a>
+  <a href="https://github.com/johnneerdael/usbdac/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/johnneerdael/usbdac/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <img alt="Android 8.0+ and Rust" src="https://img.shields.io/badge/Android%208.0%2B%20%C2%B7%20Rust-11151C?style=flat-square">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-11151C?style=flat-square"></a>
+</p>
 
-The shared USB Audio implementation includes UAC3 and BADD, PCM capture and
-duplex, channel layouts, verified clock selection and restoration, standard
-routing controls and guarded device-specific controls. Native DSD uses a
-standard UAC3 layout or a resolved legacy profile. DoP capability describes
-a feasible PCM carrier; marker decoding still needs device evidence.
-Read the [implementation ledger](docs/design/alsa-parity.md) and
-[release validation scope](docs/sdk/evidence.md#release-validation-scope).
+**usbdac** adds direct USB DAC playback to Android and Rust audio apps. It sends
+decoded PCM, DoP or native DSD straight to the DAC over USB, bypassing Android's
+mixer, follows the DAC's own clock, drives its hardware volume and tells your app
+whether the stream is bit-perfect, with the reason when it is not.
+
+One `OutputSelector` call gives an Android player a single PCM integration that
+uses direct USB, Android-managed audio or AAudio exclusive output as the device
+and permissions allow, and says which route it opened and what it could verify.
+
+<p align="center">
+  <a href="https://johnneerdael.github.io/usbdac/getting-started.html"><b>Quickstart</b></a> &nbsp;·&nbsp;
+  <a href="https://johnneerdael.github.io/usbdac/"><b>SDK guide</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/johnneerdael/usbdac/releases/latest"><b>Download</b></a> &nbsp;·&nbsp;
+  <a href="https://johnneerdael.github.io/usbdac/evidence.html"><b>Evidence</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/johnneerdael/usbdac/issues"><b>Report an issue</b></a>
+</p>
+
+## Pick your path
+
+| You are building | Add | Start with |
+|---|---|---|
+| An Android player in Kotlin (Android 8.0+) | `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles native code for all four Android ABIs. | [Android quickstart](https://johnneerdael.github.io/usbdac/getting-started.html) · [Kotlin guide](https://johnneerdael.github.io/usbdac/guide-kotlin.html) |
+| A Media3 / ExoPlayer app | `dev.usbdac:usbdac-media3`, at the same version as the base artifact | [Media3 integration](https://johnneerdael.github.io/usbdac/media3.html) |
+| A Rust engine on Android or Linux | [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor. | [Rust guide](https://johnneerdael.github.io/usbdac/guide-rust.html) · [docs.rs](https://docs.rs/usbdac-core) |
+| A test of your own DAC | The Android or Apple Silicon macOS validator from the [latest release](https://github.com/johnneerdael/usbdac/releases/latest) | [Validator design](docs/design/dac-validator.md) · [macOS notes](macos/validator/README.md) |
+
+## Why usbdac
+
+- **Bit-perfect, or the reason.** `is_bit_perfect()` combines the payload audit, clock verification and loss counters; `bit_perfect_blocker()` names what stands in the way.
+- **Follows the DAC's clock.** Explicit feedback and compatible UAC2/UAC3 implicit feedback steer packet sizes; stale feedback clears the verdict instead of hiding it.
+- **PCM, DoP and native DSD.** PCM 16/24/32-bit in the DAC's subslot size, DoP carriers, legacy and standard UAC3 native DSD layouts.
+- **Safe start-up volume.** The DAC's hardware volume is lowered to at most -40 dB before the first sample and handed back on close.
+- **One interface, three routes.** Direct USB, Android-managed `AudioTrack` and AAudio exclusive behind `PcmOutput`, chosen by `OutputSelector`.
+- **UAC 1, 2 and 3.** Including BADD, PCM capture and duplex, channel layouts, verified clock selection and standard routing controls.
+- **Honest conversion.** Resampling, bit-depth and mono-to-stereo are always labelled, so a limited DAC still plays and is plainly marked as not bit-perfect.
+
+## Measured on real hardware
+
+On 27 November 2026 the Android validator ran its exact-format playback matrix on
+four DACs with a OnePlus 15. Every case passed USB delivery bit-perfect, with no
+underrun, lost frame, short packet or transfer timeout.
+
+| DAC | VID:PID | Passed | PCM | Native DSD |
+|---|---|---|---|---|
+| iBasso DC04U | `0661:0883` | 44 of 44 | 44.1 to 768 kHz | DSD64 to DSD512 |
+| SMSL USB AUDIO | `152a:85dd` | 34 of 34 | 44.1 to 768 kHz | DSD64 to DSD512 |
+| Hidizs AP80 Pro-X | `c502:0072` | 34 of 34 | 32 to 384 kHz | DSD64 to DSD256 |
+| Schiit Unison Modius E | `30be:101a` | 20 of 20 | 44.1 to 192 kHz | Not admitted |
+
+These are USB transport results. No analog output or DoP decoder lock was
+observed, and native DSD on the DC04U and SMSL used the source-backed quirk
+policy. Earlier builds also played PCM through Flick and the SDK sample. The
+[hardware status](docs/sdk/evidence.md#hardware-status) has the formats and paths,
+the [release validation scope](docs/sdk/evidence.md#release-validation-scope) what
+each release checks, and the [implementation ledger](docs/design/alsa-parity.md)
+what is implemented but not yet run on a device.
+
+**Status: 0.1.** Release preparation adds software validation and PCM playback
+to a virtual QEMU USB audio device, not physical streaming checks. Additional
+models are tracked in [device compatibility candidates](docs/design/device-compatibility-candidates.md).
 For in-app support captures, see [collecting a USB playback support report](docs/sdk/support-diagnostics.md).
 
-| Integrating with | Start here |
-|---|---|
-| Kotlin on Android 8.0+ | Add `dev.usbdac:usbdac` from GitHub Packages. The AAR bundles the native libraries for all four Android ABIs. [Android quickstart](https://johnneerdael.github.io/android-usbdac/getting-started.html) |
-| Rust on Android or Linux | Add [`usbdac-core` from crates.io](https://crates.io/crates/usbdac-core). Your app handles USB access and passes an open file descriptor to the driver. [Rust API reference](https://docs.rs/usbdac-core) |
+## Validators
 
-Use `OutputSelector` when your Android player needs one PCM playback integration
-that can use direct USB, Android-managed audio or AAudio exclusive as the device
-and permissions allow. [SDK guide](https://johnneerdael.github.io/android-usbdac/)
+Each release from 0.1.11 on includes an **Android validator APK** and an
+**Apple Silicon macOS validator ZIP**, built from the same commit as the
+library. Start a capture, connect one DAC, and the app runs the direct USB
+format tests and saves a report ZIP with device details, test outcomes and
+debug logs. The APK is signed with the CI debug key; the macOS app is ad hoc
+signed and not notarized. Remove headphones and mute the amplifier first.
 
-Download the AAR, native libraries and crate archives from
-[GitHub Releases](https://github.com/johnneerdael/android-usbdac/releases).
+<table>
+  <tr>
+    <td width="68%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/screens/macos-validator-dark.png"><img src="docs/site/screens/macos-validator-light.png" alt="The usbdac Validator for macOS: safety callout, capture controls and the worker log"></picture><br><sub><b>macOS.</b> One window: the safety checks, the capture and the worker log.</sub></td>
+    <td width="32%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/screens/android-validator-dark.png"><img src="docs/site/screens/android-validator-light.png" alt="The usbdac Validator for Android: safety card and capture controls"></picture><br><sub><b>Android.</b> Material 3, System, Dark or Light.</sub></td>
+  </tr>
+</table>
 
-The same site has the developer documentation: [design decisions](https://johnneerdael.github.io/android-usbdac/decisions.html) (each compared with what Flick, Mornye and BitChord do, with the evidence and public references), an [architecture](https://johnneerdael.github.io/android-usbdac/architecture.html) page, an [integration guide](https://johnneerdael.github.io/android-usbdac/integration.html) and an [evidence and status](https://johnneerdael.github.io/android-usbdac/evidence.html) page.
+## Learn more
+
+The [SDK guide](https://johnneerdael.github.io/usbdac/) has the developer
+documentation: [design decisions](https://johnneerdael.github.io/usbdac/decisions.html)
+(each compared with what Flick, Mornye and BitChord do, with the evidence and
+public references), the [architecture](https://johnneerdael.github.io/usbdac/architecture.html),
+an [integration guide](https://johnneerdael.github.io/usbdac/integration.html),
+[troubleshooting](https://johnneerdael.github.io/usbdac/troubleshooting.html) and the
+[evidence and status](https://johnneerdael.github.io/usbdac/evidence.html) page.
+The Rust API, JNI contract, JSON schemas and sample layouts are in [docs/API.md](docs/API.md).
 
 ## Where it came from, and what changed
 
@@ -34,7 +109,12 @@ usbdac started from the USB DAC driver of the [Flick](https://github.com/moss-ap
 music player. It is no longer that driver. The code was taken out of the app,
 given a public API, and improved in ways Flick's own driver has not been.
 [What usbdac improves](docs/sdk/improvements.md) explains each change twice:
-technically, and in plain terms. In short:
+technically, and in plain terms. Several of the changes came from studying how
+two other open-source players, Mornye and BitChord, behave with the same DACs.
+No code from either was used.
+
+<details>
+<summary><b>Everything usbdac changed, area by area</b></summary>
 
 | Area | What usbdac adds | In plain terms |
 |---|---|---|
@@ -56,46 +136,18 @@ technically, and in plain terms. In short:
 | Conversion | Resampling, bit-depth and mono-to-stereo, always labelled. `OutputSelector` uses it by default when the DAC cannot run a request; the direct stream never converts on its own | A file still plays on a limited DAC, and is plainly marked as not bit-perfect |
 | Packaging | Rust core, Kotlin API, sample app, tests, published builds | A dependency and a few dozen lines instead of writing a USB driver |
 
-Several of these came from studying how two other open-source players, Mornye
-and BitChord, behave with the same DACs. No code from either was used.
+</details>
 
-**Status: 0.1.** Direct USB PCM has played on a OnePlus 15 with an iBasso DC04U
-in Flick and with a Hidizs AP80 Pro-X in the SDK sample. The AP80 Pro-X also
-verified native DSD64 through DSD256 and the transition back to PCM. On the
-same phone, the Android validator passed every exact format it tried on four
-DACs: the DC04U, the AP80 Pro-X, an SMSL USB AUDIO and a Schiit Unison
-Modius E. Every format was delivered bit-perfect over USB, including PCM up
-to 768 kHz and native DSD512 under the source-backed quirk policy. These are
-USB transport results; no analog output or DoP decoder lock was observed.
-See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
-formats and paths. Release preparation uses software validation and PCM playback to a
-virtual QEMU USB audio device; it adds no physical streaming checks. Broader hardware
-acceptance and additional models are tracked in
-[device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
+## Technical reference
 
-## Layout
+<details>
+<summary><b>What it does</b>: formats, buffering, pacing, volume, rates, conversion and events</summary>
 
-```text
-crates/usbdac-core/   the driver (Rust): no JNI, no application types
-crates/usbdac-jni/    libusbdac.so, the JNI bindings
-crates/usbdac-validator/ the shared physical DAC test suite and report writer
-android/usbdac/       the Android library (AAR, Kotlin, package dev.usbdac)
-android/usbdac-media3/ optional Media3 AudioSink integration
-android/sample/       a small app that exercises every feature
-android/validator/    the Android DAC validator app
-macos/validator/      the Apple Silicon macOS DAC validator app
-fuzz/                 cargo-fuzz target for the descriptor, clock, feedback and control-reply parsers
-docs/sdk/             the SDK guide (published to the site above)
-docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
-```
-
-The optional `dev.usbdac:usbdac-media3` artifact integrates the SDK with [Media3](docs/sdk/media3.md); use the same version as the base Android artifact.
-
-Besides direct USB, the library carries two outputs that go through Android:
-an `AudioTrack`-based one that asks Android 14 and later for its bit-perfect
-mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
-
-## What it does
+The shared USB Audio implementation includes UAC3 and BADD, PCM capture and
+duplex, channel layouts, verified clock selection and restoration, standard
+routing controls and guarded device-specific controls. Native DSD uses a
+standard UAC3 layout or a resolved legacy profile. DoP capability describes
+a feasible PCM carrier; marker decoding still needs device evidence.
 
 - Formats: PCM 16/24/32-bit in the subslot size the DAC advertises, DoP
   (carrier up to what the DAC runs), native DSD (legacy 1-, 2- or 4-byte
@@ -150,7 +202,14 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
 - Events through one library thread: state changes, underruns, lost frames,
   bit-perfect changes, volume changes, stale feedback, errors, device loss.
 
-## Limits
+Besides direct USB, the library carries two outputs that go through Android:
+an `AudioTrack`-based one that asks Android 14 and later for its bit-perfect
+mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
+
+</details>
+
+<details>
+<summary><b>Limits</b></summary>
 
 - One owner per physical attachment; distinct attachments can have independent owners. A second owner for the same attachment is refused.
 - `Dac::open` takes a usbfs file descriptor and works on Linux and Android
@@ -165,52 +224,10 @@ mode, and an AAudio exclusive-mode stream for devices with an internal DAC.
   evidence-backed compatibility work.
 - The host owns USB permission, `claimInterface` and the file descriptor.
 
-## Releases
+</details>
 
-Library changes merged to `main` start the Release workflow. It advances the
-patch version, builds and tests a versioned commit, publishes the Rust crate
-and the `usbdac` and `usbdac-media3` AARs, and creates the GitHub Release with its downloads. A merge
-that declares a higher version can select the next minor or major release.
-For releases from sources containing the validator, the downloads also include
-a versioned Android validator APK and Apple Silicon macOS validator ZIP built
-from that same commit. The APK uses the CI debug signing key; the macOS app is
-ad hoc signed and not notarized. Both are included in `SHA256SUMS.txt`.
-Documentation-only changes deploy through the Docs workflow.
-
-Use **Actions → Release → Run workflow** to build an explicit version, or
-rerun the original Actions run to retry an automatic release from its
-reserved commit.
-
-## Build
-
-```sh
-# host: build and test everything that does not need a DAC
-cargo test --workspace
-
-# Android (needs the NDK; cargo-ndk sets the C toolchain libusb1-sys needs)
-export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/28.2.13676358
-cargo ndk -t arm64-v8a check --workspace
-cargo ndk -t arm64-v8a build -p usbdac-jni --release     # target/aarch64-linux-android/release/libusbdac.so
-```
-
-Plain `cargo check --target aarch64-linux-android` also works once the NDK's
-clang is reachable, because libusb is compiled from source:
-
-```sh
-NDKBIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin   # linux-x86_64 on Linux
-PATH=$NDKBIN:$PATH CC_aarch64_linux_android=aarch64-linux-android26-clang \
-  AR_aarch64_linux_android=llvm-ar cargo check --workspace --target aarch64-linux-android
-```
-
-Add `-t armeabi-v7a`, `x86_64`, ... for other ABIs. `usbdac-core` depends on
-`rusb`, `libusb1-sys`, `parking_lot`, `once_cell`, `crossbeam-channel`, `log`,
-`libc`, `serde`, `serde_json`, `base64` and `flate2` (`base64` and `flate2`
-decode Focusrite FCP data; `serde` and `serde_json` serialize error codes and
-macOS discovery evidence); the JNI crate adds `jni` and, on Android,
-`android_logger`, and links `usbdac-validator` only with its `validator`
-feature.
-
-## Minimal Rust example
+<details>
+<summary><b>Minimal Rust example</b></summary>
 
 Add the core crate with `cargo add usbdac-core@0.1.13`. The example logs
 through the `log` crate.
@@ -254,7 +271,88 @@ callback driving `write()` from its own thread, with pause, seek and position.
 The sample layout of each encoding, the event codes, the JSON schemas and the
 threading rules are in [docs/API.md](docs/API.md).
 
+</details>
+
+<details>
+<summary><b>Repository layout</b></summary>
+
+```text
+crates/usbdac-core/   the driver (Rust): no JNI, no application types
+crates/usbdac-jni/    libusbdac.so, the JNI bindings
+crates/usbdac-validator/ the shared physical DAC test suite and report writer
+android/usbdac/       the Android library (AAR, Kotlin, package dev.usbdac)
+android/usbdac-media3/ optional Media3 AudioSink integration
+android/sample/       a small app that exercises every feature
+android/validator/    the Android DAC validator app
+macos/validator/      the Apple Silicon macOS DAC validator app
+fuzz/                 cargo-fuzz target for the descriptor, clock, feedback and control-reply parsers
+docs/sdk/             the SDK guide (published to the site above)
+docs/site/            the site's stylesheet, script and landing section
+docs/API.md           the Rust API, JNI contract, JSON schemas, sample layouts
+branding/             the usbdac brand kit: logos, artwork, icons, fonts and tokens
+```
+
+The optional `dev.usbdac:usbdac-media3` artifact integrates the SDK with [Media3](docs/sdk/media3.md); use the same version as the base Android artifact.
+
+</details>
+
+<details>
+<summary><b>Build from source</b></summary>
+
+```sh
+# host: build and test everything that does not need a DAC
+cargo test --workspace
+
+# Android (needs the NDK; cargo-ndk sets the C toolchain libusb1-sys needs)
+export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/28.2.13676358
+cargo ndk -t arm64-v8a check --workspace
+cargo ndk -t arm64-v8a build -p usbdac-jni --release     # target/aarch64-linux-android/release/libusbdac.so
+```
+
+Plain `cargo check --target aarch64-linux-android` also works once the NDK's
+clang is reachable, because libusb is compiled from source:
+
+```sh
+NDKBIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin   # linux-x86_64 on Linux
+PATH=$NDKBIN:$PATH CC_aarch64_linux_android=aarch64-linux-android26-clang \
+  AR_aarch64_linux_android=llvm-ar cargo check --workspace --target aarch64-linux-android
+```
+
+Add `-t armeabi-v7a`, `x86_64`, ... for other ABIs. `usbdac-core` depends on
+`rusb`, `libusb1-sys`, `parking_lot`, `once_cell`, `crossbeam-channel`, `log`,
+`libc`, `serde`, `serde_json`, `base64` and `flate2` (`base64` and `flate2`
+decode Focusrite FCP data; `serde` and `serde_json` serialize error codes and
+macOS discovery evidence); the JNI crate adds `jni` and, on Android,
+`android_logger`, and links `usbdac-validator` only with its `validator`
+feature.
+
+The validators build with `./gradlew :validator:assembleDebug` (from `android/`)
+and `macos/validator/build.sh`.
+
+</details>
+
+<details>
+<summary><b>How releases are made</b></summary>
+
+Library changes merged to `main` start the Release workflow. It advances the
+patch version, builds and tests a versioned commit, publishes the Rust crate
+and the `usbdac` and `usbdac-media3` AARs, and creates the GitHub Release with its downloads. A merge
+that declares a higher version can select the next minor or major release.
+For releases from sources containing the validator, the downloads also include
+a versioned Android validator APK and Apple Silicon macOS validator ZIP built
+from that same commit. The APK uses the CI debug signing key; the macOS app is
+ad hoc signed and not notarized. Both are included in `SHA256SUMS.txt`.
+Documentation-only changes deploy through the Docs workflow.
+
+Use **Actions → Release → Run workflow** to build an explicit version, or
+rerun the original Actions run to retry an automatic release from its
+reserved commit.
+
+</details>
+
 ## License
 
 MIT. Copyright (c) 2026 Flick Player Contributors and usbdac contributors. See
-[LICENSE](LICENSE) and [NOTICE](NOTICE).
+[LICENSE](LICENSE) and [NOTICE](NOTICE). The brand fonts in `branding/fonts`
+(Manrope and IBM Plex Mono) are under the SIL Open Font License; their license
+files sit next to them.

@@ -1,6 +1,7 @@
 name: Docs
 
-# The SDK guide (docs/sdk) and the API reference (Dokka) as one static site on GitHub Pages.
+# The SDK guide (docs/sdk) and the API reference (Dokka) as one static site on GitHub Pages,
+# styled with the brand kit (branding/) and docs/site.
 # One-time setup: Settings > Pages > Source: "GitHub Actions".
 
 on:
@@ -8,6 +9,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "branding/**"
       - "android/usbdac/**"
       - "android/usbdac-media3/**"
       - ".github/workflows/docs.yml"
@@ -69,7 +71,7 @@ jobs:
 
       - name: Assemble the site
         run: |
-          python -m pip install "markdown==3.8.2"
+          python -m pip install "markdown==3.8.2" "pygments==2.19.2"
           python .github/scripts/build_site.py \
             --guide docs/sdk \
             --native-api docs/API.md \

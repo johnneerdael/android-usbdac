@@ -580,7 +580,7 @@ the endpoint. It uses the newest valid report in each batch. Empty or rejected
 reports do not extend the feedback deadline. A stale explicit source clears
 live lock and emits `FeedbackStale`. Playback can hold the last valid rate
 until a timely report restores lock or the stream fails with `Error::Transfer`.
-[Timing thresholds](https://johnneerdael.github.io/android-usbdac/decisions-clock.html#feedback)
+[Timing thresholds](https://johnneerdael.github.io/usbdac/decisions-clock.html#feedback)
 
 For four-byte high-speed reports, the driver first tests the USB microframe
 interpretation. If it is outside the nominal-rate tolerance and post-alt

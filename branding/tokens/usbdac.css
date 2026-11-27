@@ -1,0 +1,44 @@
+:root, [data-theme="dark"] {
+ --dac-canvas: #11151C;
+ --dac-surface: #1A212C;
+ --dac-raised: #252F3D;
+ --dac-text: #F3F5F7;
+ --dac-muted: #B2C0D2;
+ --dac-primary: #78B5FF;
+ --dac-onPrimary: #101E32;
+ --dac-primarySoft: #213753;
+ --dac-secondary: #CADCF3;
+ --dac-border: #415169;
+ --dac-controlBorder: #7386A1;
+ --dac-success: #87DFC2;
+ --dac-successSoft: #203D34;
+ --dac-warning: #F1CA83;
+ --dac-warningSoft: #413723;
+ --dac-danger: #FFABB8;
+ --dac-dangerSoft: #442C36;
+ --dac-focus: #A3CDFF;
+ color-scheme: dark;
+}
+[data-theme="light"] {
+ --dac-canvas: #F2F5FA;
+ --dac-surface: #FFFFFF;
+ --dac-raised: #E7EDF5;
+ --dac-text: #152237;
+ --dac-muted: #4E6078;
+ --dac-primary: #2367C9;
+ --dac-onPrimary: #FFFFFF;
+ --dac-primarySoft: #E1EDFF;
+ --dac-secondary: #344E70;
+ --dac-border: #ACB9CA;
+ --dac-controlBorder: #6C809B;
+ --dac-success: #17634D;
+ --dac-successSoft: #DDF4EA;
+ --dac-warning: #76500B;
+ --dac-warningSoft: #FFF0D2;
+ --dac-danger: #A02945;
+ --dac-dangerSoft: #FCE5EC;
+ --dac-focus: #1358B7;
+ color-scheme: light;
+}
+:root {--dac-font: "Manrope", system-ui, sans-serif; --dac-mono: "IBM Plex Mono", monospace; --dac-radius: 8px; --dac-panel-radius:16px; --dac-unit:4px;}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation-duration:0s!important;transition-duration:0s!important}}

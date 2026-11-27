@@ -221,6 +221,13 @@ jobs:
             android/sample/build/outputs/apk/debug/sample-debug.apk
           retention-days: 7
 
+      # The validator APK itself is built by the Release workflow with the validator's native
+      # feature; here its Kotlin and Compose UI only has to compile. Runs last so it cannot
+      # touch the native outputs the staging step above relies on.
+      - name: Compile the validator app
+        working-directory: android
+        run: ./gradlew :validator:compileDebugKotlin -Pusbdac.skipNative=true --console=plain
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
