@@ -41,7 +41,7 @@ For support captures, use the [USB playback report guide](support-diagnostics.md
 
 ## Status
 
-This guide covers usbdac 0.1.10.
+This guide covers usbdac 0.1.11.
 
 - **Software coverage is recorded by revision.** Rust and Kotlin tests cover protocol and control behavior without a DAC; Android checks and builds cover the library and sample for four processor types. See the [release validation scope](evidence.md#release-validation-scope) for the limits of those checks and for the QEMU playback check, which ran in a virtual machine and not on a DAC.
 - **Hardware testing is still limited.** On a OnePlus 15, the Hidizs AP80 Pro-X played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit direct USB PCM, with explicit feedback. The iBasso DC04U played 44.1 kHz PCM with explicit feedback through the SDK sample on an Android host, and earlier in Flick. Those are the only physical streaming results. Implicit feedback, UAC3 and BADD, capture and duplex, routing controls, DoP, the Android-managed output and AAudio have not been run on a device. [Hardware status](evidence.md#hardware-status)
