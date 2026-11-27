@@ -10,6 +10,8 @@ Use the existing Android USB host permission and claim path and the same Rust dr
 
 When a compatible Shizuku service is connected, its optional grant action uses that manager's consent flow and checks whether the service has `MANAGE_USB`. It requests a temporary grant for the selected attachment and this validator. The app verifies the grant through Android's USB host API before claiming the audio interfaces.
 
+On macOS, Start requests administrator approval for a one-shot USB worker before the baseline and attachment prompt; the GUI remains unprivileged. The worker creates its own private system temporary capture directory and both sides verify the local socket peer user ID before transferring progress and a bounded archive. A denial, cancellation or interrupted transfer must leave an exportable partial app-side capture without claiming that worker evidence was received. No persistent privileged helper is installed. The app automatically attempts whole-device capture only after an ordinary claim fails for ownership or access. The standalone worker retains its explicit `--allow-capture` flag.
+
 macOS can already have attached its USB audio driver when the validator sees a device. Record any failed interface claim and device capture separately, with the libusb error and what permission the process had. libusb’s Darwin backend captures the whole USB device when detaching a kernel driver. Prefer an ordinary claim when available and surface explicit authorization requirements for takeover. Verify release of the interface and return of the host route after the run. [libusb macOS FAQ](https://github.com/libusb/libusb/wiki/FAQ#how-can-i-run-libusb-applications-under-macos-if-there-is-already-a-kernel-extension-installed-for-the-device-and-claim-exclusive-access)
 
 ## Automatic playback matrix
@@ -73,3 +75,7 @@ The OnePlus CPH2747 captures on 27 November 2026 reported successful USB deliver
 | SMSL USB AUDIO | `152a:85dd`, `0x0315` | 24 and 32 bit through 768 kHz | DSD64 through DSD512 and corresponding 48 kHz-family bit rates | 176.4, 352.8 and 705.6 kHz |
 | Schiit Unison Modius E | `30be:101a`, `0x0100` | 16, 24 and 32 bit through 192 kHz | No admitted cases | 176.4 kHz |
 | Hidizs AP80 Pro-X | `c502:0072`, `0xffff` | 16, 24 and 32 bit from 32 to 384 kHz | DSD64, DSD128 and DSD256 | 176.4 and 352.8 kHz |
+
+### macOS hardware evidence
+
+An administrator-authorized run on 27 November 2026 with macOS 15.8.3 arm64 and the iBasso DC04 Ultra (`0661:0883`) observed access denial on the ordinary claim. Whole-device capture and reclaim of interfaces 1 and 2 succeeded. The run reported USB delivery for all 50 exact playback cases: 30 PCM, 8 native DSD including DSD512 and 48 kHz-family rates, and 12 DoP carriers. All 188 exact admission probes were expected rejections; 41 converted fallbacks passed USB verification and 159 had no fallback. Session close returned `Ok(())`. DoP decoder lock and analog output were not observed. The capture is `macOS-DC04U-admin-whole-capture-playback.zip`.

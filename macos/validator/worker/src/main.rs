@@ -1,13 +1,18 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::json;
 use std::{
     collections::HashSet,
     env,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, BufReader, Read, Write},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, net::UnixStream},
+    },
     path::PathBuf,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -16,6 +21,7 @@ use usbdac_core::{darwin_discovery, Dac, DacConfig, HandBack, QuirkPolicy, Start
 use usbdac_validator::{Capture, RunOptions};
 
 static CAPTURE: OnceLock<Arc<Capture>> = OnceLock::new();
+static OUTPUT: OnceLock<Mutex<Box<dyn Write + Send>>> = OnceLock::new();
 struct Logger;
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
@@ -44,19 +50,120 @@ fn driver_version() -> &'static str {
         .unwrap_or("unknown")
 }
 fn emit(value: serde_json::Value) {
-    println!("{}", value);
-    let _ = io::stdout().flush();
+    if let Some(output) = OUTPUT.get() {
+        let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(output, "{value}");
+        let _ = output.flush();
+    } else {
+        println!("{value}");
+        let _ = io::stdout().flush();
+    }
 }
+
+/// The privileged worker never accepts an output path from the caller.
+fn private_capture_dir() -> io::Result<PathBuf> {
+    let mut template = b"/private/tmp/usbdac-worker.XXXXXX\0".to_vec();
+    let path = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if path.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(path) };
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+}
+
+fn privileged_channel(args: &[String]) -> io::Result<(UnixStream, PathBuf)> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(io::Error::other("worker is not privileged"));
+    }
+    let socket = args
+        .get(2)
+        .ok_or_else(|| io::Error::other("missing socket"))?;
+    let expected_uid: libc::uid_t = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .filter(|uid| *uid != 0)
+        .ok_or_else(|| io::Error::other("invalid invoking uid"))?;
+    let stream = UnixStream::connect(socket)?;
+    let no_sigpipe: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&no_sigpipe as *const libc::c_int).cast(),
+            std::mem::size_of_val(&no_sigpipe) as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut peer_uid = 0;
+    let mut peer_gid = 0;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if peer_uid != expected_uid {
+        return Err(io::Error::other("socket peer uid mismatch"));
+    }
+    Ok((stream, private_capture_dir()?))
+}
+
+fn send_archive(path: &std::path::Path) -> io::Result<()> {
+    const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_ARCHIVE {
+        return Err(io::Error::other("archive exceeds transfer limit"));
+    }
+    emit(json!({"type":"archive_start", "bytes":length}));
+    let mut buffer = [0u8; 24 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        emit(json!({"type":"archive_chunk", "data":BASE64.encode(&buffer[..count])}));
+    }
+    emit(json!({"type":"archive_end", "bytes":length}));
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let Some(dir) = args.get(1).map(PathBuf::from) else {
-        emit(json!({"type":"fatal", "message":"Missing capture directory"}));
-        return;
+    let privileged = args.get(1).is_some_and(|v| v == "--privileged-socket");
+    let (dir, mut input): (PathBuf, Box<dyn BufRead + Send>) = if privileged {
+        match privileged_channel(&args) {
+            Ok((stream, dir)) => {
+                match stream.try_clone() {
+                    Ok(output) => {
+                        let _ = OUTPUT.set(Mutex::new(Box::new(output)));
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return;
+                    }
+                }
+                (dir, Box::new(BufReader::new(stream)))
+            }
+            Err(error) => {
+                eprintln!("Privileged channel: {error}");
+                return;
+            }
+        }
+    } else {
+        let Some(dir) = args.get(1).map(PathBuf::from) else {
+            emit(json!({"type":"fatal", "message":"Missing capture directory"}));
+            return;
+        };
+        (dir, Box::new(BufReader::new(io::stdin())))
     };
     let capture = match Capture::new(&dir) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             emit(json!({"type":"fatal", "message":format!("Cannot start capture: {e}")}));
+            if privileged {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             return;
         }
     };
@@ -66,9 +173,16 @@ fn main() {
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = cancel.clone();
     thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if line.is_err() || matches!(line.as_deref(), Ok("cancel")) {
-                break;
+        if privileged {
+            // The private protocol has only one client command: any input or
+            // EOF means cancel. Never accumulate an unbounded line from a peer.
+            let mut command = [0u8; 256];
+            let _ = input.read(&mut command);
+        } else {
+            for line in input.lines() {
+                if line.is_err() || matches!(line.as_deref(), Ok("cancel")) {
+                    break;
+                }
             }
         }
         signal.store(true, Ordering::Relaxed);
@@ -84,18 +198,29 @@ fn main() {
         QuirkPolicy::SourceBacked => "source_backed",
     };
     capture.record("compatibility_policy", json!({"quirk_policy":policy_label}));
-    capture.record("host", json!({"os":"macos", "arch":env::consts::ARCH, "app_version":env!("CARGO_PKG_VERSION"), "driver_version":driver_version(), "driver_version_source":"workspace package version", "os_version":Command::new("sw_vers").output().ok().map(|v| String::from_utf8_lossy(&v.stdout).into_owned()), "effective_uid":unsafe { libc::geteuid() }, "allow_device_capture":allow_capture}));
+    capture.record("host", json!({"os":"macos", "arch":env::consts::ARCH, "app_version":env!("CARGO_PKG_VERSION"), "driver_version":driver_version(), "driver_version_source":"workspace package version", "os_version":Command::new("/usr/bin/sw_vers").output().ok().map(|v| String::from_utf8_lossy(&v.stdout).into_owned()), "effective_uid":unsafe { libc::geteuid() }, "allow_device_capture":allow_capture}));
     let device_lost = AtomicBool::new(false);
     let result = run(&capture, &cancel, allow_capture, policy, &device_lost);
     capture.record("terminal", json!({"scope": if result.is_ok() {"run"} else {"host_or_driver"}, "result":match &result { Ok(()) => "completed".to_string(), Err(e) => e.clone() }, "cancelled":cancel.load(Ordering::Relaxed), "termination_reason":if device_lost.load(Ordering::Acquire) { Some("device_lost") } else if cancel.load(Ordering::Relaxed) { Some("cancelled") } else { None }}));
     let zip = dir.join("diagnostics.zip");
     match capture.export_zip(&zip) {
+        Ok(()) if privileged => match send_archive(&zip) {
+            Ok(()) => emit(
+                json!({"type":"finished", "message":result.err().unwrap_or_else(|| "Run complete".into())}),
+            ),
+            Err(error) => {
+                emit(json!({"type":"fatal", "message":format!("Archive transfer failed: {error}")}))
+            }
+        },
         Ok(()) => emit(
             json!({"type":"finished", "path":zip, "message":result.err().unwrap_or_else(|| "Run complete".into())}),
         ),
         Err(e) => {
             emit(json!({"type":"fatal", "message":format!("Could not export diagnostics: {e}")}))
         }
+    }
+    if privileged {
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 fn run(

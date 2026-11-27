@@ -432,6 +432,7 @@ dependencies = [
 name = "usbdac-validator-worker"
 version = "0.1.12"
 dependencies = [
+ "base64",
  "libc",
  "log",
  "rusb",
