@@ -61,7 +61,7 @@ Three choices belong in the app's settings screen, in the listener's words:
 | Setting | In the library | Worded as | Default to |
 |---|---|---|---|
 | Let this app take over the DAC | `OutputPolicy.allowDirectUsb` | "Use the DAC directly. While music plays, other apps and system sounds cannot use it." | On, once the listener has understood the cost. The library cannot decide this for them: a navigation prompt that has to come through the same DAC is lost when direct USB is on |
-| Convert what the DAC cannot play | `OutputPolicy.allowConversion` | "If the DAC cannot play a file as it is, convert it (not bit-perfect)." | Off. Conversion changes the audio |
+| Convert what the DAC cannot play | `OutputPolicy.allowConversion` | "If the DAC cannot play a file as it is, convert it (not bit-perfect)." | On. Show the conversion and whether it changes samples |
 | Allow a DAC with no volume control | `DacConfig.requireHardwareVolume = false` | "Play on a DAC whose volume cannot be lowered, at its own level." | Off, with a warning the first time: the first sound plays at the DAC's own level. Mornye and BitChord ask twice |
 
 Optional, for a "choose the output yourself" screen or a bug report: `OutputPolicy.force`, and `DacConfig` fields such as `cancelInFlightOnFlush` or `allowUnsynchronizedAsync` for DACs that need them ([controls](controls.md)). Do not offer them to everybody.

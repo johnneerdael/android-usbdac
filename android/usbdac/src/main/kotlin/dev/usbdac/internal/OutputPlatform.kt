@@ -2,6 +2,7 @@ package dev.usbdac.internal
 
 import dev.usbdac.AAudioConfig
 import dev.usbdac.AAudioGrant
+import dev.usbdac.ConversionOptions
 import dev.usbdac.ConversionPlan
 import dev.usbdac.DacCapabilities
 import dev.usbdac.DacConfig
@@ -93,6 +94,7 @@ internal interface OutputPlatform {
     // ---- conversion ----
 
     fun plan(source: StreamRequest, target: StreamFormat): ConversionPlan
+    fun plan(source: StreamRequest, target: StreamFormat, options: ConversionOptions): ConversionPlan = plan(source, target)
     fun converting(target: PcmOutput, plan: ConversionPlan): PcmOutput
 
     // ---- changes ----

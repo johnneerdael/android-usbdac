@@ -72,6 +72,9 @@ internal class AndroidOutputPlatform(context: Context) : OutputPlatform {
     override fun plan(source: StreamRequest, target: StreamFormat): ConversionPlan =
         ConversionPlan.between(source, target, ConversionOptions())
 
+    override fun plan(source: StreamRequest, target: StreamFormat, options: ConversionOptions): ConversionPlan =
+        ConversionPlan.between(source, target, options)
+
     override fun converting(target: PcmOutput, plan: ConversionPlan): PcmOutput =
         ConvertingOutput(target, PcmConverter.create(plan))
 

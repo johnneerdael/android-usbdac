@@ -24,7 +24,8 @@ public enum class RatePolicy {
     EXACT,
 
     /**
-     * Pick the nearest rate the DAC runs. The returned [StreamFormat] carries that rate
+     * Prefer the highest integer divisor, then the highest lower rate in the same family, then
+     * the highest other lower rate, then the lowest higher rate. The returned [StreamFormat] carries that rate
      * ([StreamFormat.rateDiffersFromRequest]) and the host must resample; the stream is not
      * bit-perfect with respect to the source.
      */

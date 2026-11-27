@@ -50,8 +50,13 @@ fun outputLine(output: SelectedOutput): String {
         OutputKind.AAUDIO_EXCLUSIVE -> "Exclusive AAudio"
         OutputKind.ANDROID_STANDARD -> "Android output"
     }
-    val format = output.format
-    return "$kind, ${format.sampleRate} Hz, ${format.validBits}-bit, ${if (format.channels == 2) "stereo" else "${format.channels} ch"}"
+    val format = output.decision.wireFormat
+    val layout = output.format
+    val rate = format?.sampleRate ?: layout.sampleRate
+    val bits = format?.validBits ?: layout.validBits
+    val channels = format?.channels ?: layout.channels
+    val conversion = output.decision.processing?.let { "; conversion: ${it.description}" } ?: "; no library conversion"
+    return "$kind, $rate Hz, $bits-bit, ${if (channels == 2) "stereo" else "$channels ch"}$conversion"
 }
 // endregion
 
@@ -70,6 +75,7 @@ fun supportReport(output: SelectedOutput, appVersion: String): String = buildStr
         appendLine(stream.stats().toString())
     }
     appendLine("bit-perfect: ${output.bitPerfect.value}")
+    output.clippedSamples?.let { appendLine("converted samples clipped: $it") }
     output.session?.capabilities?.let { appendLine("DAC: $it") }
 }
 

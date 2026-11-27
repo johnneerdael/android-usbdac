@@ -64,7 +64,7 @@ The first output in this list that works for the request is chosen.
    - a USB DAC is attached and the app holds permission for it;
    - the DAC opens, has a usable hardware volume (unless `DacConfig.requireHardwareVolume` is off) and negotiates the request.
 
-   With `allowConversion`, a request the DAC cannot run as it is goes through a `ConversionPlan` to the nearest format it does run. The decision then says so, and the guarantee drops (see [conversion](#conversion)). If the requested asynchronous route has no usable feedback, the DAC lacks the required hardware volume, another session holds the DAC, or open or negotiation fails, the selection records the typed reason and moves to the next output.
+   With `allowConversion`, a request the DAC cannot run as it is goes through a `ConversionPlan` to a ranked supported format. The decision then says so, and the guarantee drops (see [conversion](#conversion)). If the requested asynchronous route has no usable feedback, the DAC lacks the required hardware volume, another session holds the DAC, or open or negotiation fails, the selection records the typed reason and moves to the next output.
 2. **Android's bit-perfect mixer** (`ANDROID_BIT_PERFECT`), when audio is routed to a USB device, the Android version is 14 or later, and the platform offers its bit-perfect mixer behavior for exactly the request's format on that device. After opening, the library checks that the platform kept the request, and falls through if it did not.
 3. **Exclusive AAudio** (`AAUDIO_EXCLUSIVE`), when audio is not routed to Bluetooth or a cast device and the platform grants an exclusive stream at exactly the request's rate, channel count and sample format, with the hardware agreeing (Android 14 and later report it). The stream is opened to read the grant and not started, so nothing is heard and nothing is converted; `open` keeps that very stream. When audio is routed to a USB device this step is tried only if `allowDirectUsb` is on, because an exclusive stream keeps the DAC from other apps.
 4. **Standard output** (`ANDROID_STANDARD`), an ordinary `AudioTrack`, for PCM that Android can carry. A Bluetooth or cast route goes straight here, and the decision says so.
@@ -122,12 +122,14 @@ The intent filter in [getting started](getting-started.md#2-the-manifest) makes 
 
 ## Conversion
 
-By default a DAC that cannot run the request exactly is rejected and the selection moves on. With `allowConversion` the direct output may convert, using the library's own converter, and the decision carries the `ConversionPlan`:
+**Default behavior change:** automatic output permits PCM conversion and bit-exact widening by default. A player must show `decision.source`, `decision.wireFormat` and `decision.processing` in its signal path. Resampling applies -3.5 dB headroom by default; `output.clippedSamples` reports converter clipping. Direct `DacSession` negotiation remains exact by default.
 
-- Exact first. If the DAC cannot run it, the same rate at another depth is tried (wider first), then the nearest rate at each depth, own depth first.
+By default the direct output may convert when a DAC cannot run the request exactly, using the library's own converter. The decision carries the `ConversionPlan`; set `allowConversion = false` to refuse lossy conversion and `allowWidening = false` to refuse widening:
+
+- Exact first. The same rate at another depth is next, then the highest available integer divisor, the highest lower same-family rate, the highest other lower rate, and finally the lowest higher rate.
 - A **widening** (16-bit to 24-bit, 24 in 3 bytes to 24 in 4) keeps every sample value: the guarantee stays `VERIFIED_BY_LIBRARY`.
 - Anything else changes the audio (a new rate, fewer bits, mono to stereo): the guarantee is `NONE` and the output's `bitPerfect` says what was done. [Bit-perfect output](bit-perfect.md#conversion-is-not-bit-perfect) has the classification.
-- DSD is never converted.
+- Native DSD can be framed as DoP only when the downstream decoder is confirmed to support it. Otherwise native DSD or validated DoP can be converted to PCM, with the conversion reported as lossy. See [DSD conversion](decisions-dsd-conversion.md).
 
 The output then takes the **source** format: `output.format` is the request's layout, and `playedFrames` counts source frames, so the position arithmetic does not change.
 
