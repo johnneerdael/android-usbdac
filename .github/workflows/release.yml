@@ -443,7 +443,7 @@ jobs:
   release:
     name: Create the GitHub Release
     needs: [prepare, package]
-    if: needs.package.result == 'success'
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.package.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
