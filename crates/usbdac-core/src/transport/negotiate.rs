@@ -13,10 +13,11 @@ pub(super) fn negotiate_playback_format(
     use crate::Error;
     clear_adc3_negotiation();
     let device = {
-        let guard = SESSION_STATE.lock();
-        let Some(state) = guard.as_ref() else {
+        let mut guard = SESSION_STATE.lock();
+        let Some(state) = guard.as_mut() else {
             return Ok((requested_format, None));
         };
+        state.negotiated_uac2_alternate = None;
         state.device.clone()
     };
 
@@ -24,6 +25,7 @@ pub(super) fn negotiate_playback_format(
     let lock_requested = current_lock_requested_for_fd(device.fd);
     let mut cleanup_interface: Option<u8> = None;
     let mut clock_choice: Option<ClockChoice> = None;
+    let mut uac2_alternate = None;
     let negotiated = (|| {
         // SessionGuard excludes transfers; restore the preceding negotiation's
         // selector state before discovering this request's candidates.
@@ -188,6 +190,33 @@ pub(super) fn negotiate_playback_format(
                 if clock_outcome.rate_verified
                     && clock_outcome.reported_sample_rate == Some(requested_format.sample_rate)
                 {
+                    if let Some(choice) = clock_choice.as_ref().filter(|choice|
+                        choice.resolution == crate::clock_resolution::ClockResolution::Resolved)
+                    {
+                        uac2_alternate = match super::uac2_live_alternate::select_uac2_live_alternate(
+                            &claimed_handle, &candidate, requested_format, choice,
+                        ) {
+                            Ok(alternate) => alternate,
+                            Err(error) => {
+                                // Multiplied routes already own a complete source
+                                // snapshot in the clock planner's outer rollback.
+                                let restore = if clock_outcome.set_cur_succeeded
+                                    && !uac2_choice_has_multiplier(Some(choice))
+                                {
+                                    restore_uac2_rate_after_alternate_failure(
+                                        &claimed_handle, &candidate, clock, choice, current_rate,
+                                        requested_format.sample_rate,
+                                    )
+                                } else {
+                                    Ok(())
+                                };
+                                return Err(Error::Transfer(match restore {
+                                    Ok(()) => error,
+                                    Err(restore_error) => format!("{error}; UAC2 source rate restoration uncertain: {restore_error}"),
+                                }));
+                            }
+                        };
+                    }
                     dac_mode = DacMode::FullControl;
                     set_effective_playback_format(requested_format);
                     set_dac_mode(dac_mode);
@@ -368,7 +397,57 @@ pub(super) fn negotiate_playback_format(
     if !cleanup_ok && negotiated.is_ok() {
         return Err(Error::Transfer("USB negotiation could not restore a PCM-safe idle state".into()));
     }
+    if negotiated.is_ok() {
+        if let Some(state) = SESSION_STATE.lock().as_mut() {
+            state.negotiated_uac2_alternate = uac2_alternate;
+        }
+    }
     negotiated.map(|format| (format, clock_choice))
+}
+
+/// Roll back only a source whose pre-write cadence and current route are proven.
+/// Never write through a changed selector route or invent a missing old rate.
+fn restore_uac2_rate_after_alternate_failure(
+    claimed: &ClaimedHandle,
+    candidate: &IsoStreamCandidate,
+    clock: AudioControlClock,
+    choice: &ClockChoice,
+    previous_rate: Option<u32>,
+    attempted_rate: u32,
+) -> Result<(), String> {
+    let previous_rate = previous_rate.filter(|rate| *rate != 0)
+        .ok_or("pre-write source rate was not proven; preserving current state")?;
+    let device = claimed.handle.device();
+    let config = device.active_config_descriptor().map_err(|error| error.to_string())?;
+    if config.number() != candidate.configuration_number {
+        return Err("live configuration changed; preserving current state".into());
+    }
+    let live_choice = || strict_implicit_clock(
+        &config, &claimed.handle, choice.control_interface, candidate.terminal_link,
+    );
+    if live_choice().as_ref() != Some(choice) {
+        return Err("live clock choice changed; preserving current state".into());
+    }
+    let live_rate = get_wire_frequency(&claimed.handle, clock, Some(choice))?;
+    if live_choice().as_ref() != Some(choice) {
+        return Err("live clock choice changed during rate proof; preserving current state".into());
+    }
+    if live_rate == previous_rate {
+        return Ok(());
+    }
+    if live_rate != attempted_rate {
+        return Err(format!("live source rate changed externally to {live_rate} Hz; preserving current state"));
+    }
+    let restored = apply_wire_frequency(
+        &claimed.handle, clock, Some(choice), previous_rate, settings().settle_delay_ms(),
+    );
+    if !restored.clock_ok || !restored.rate_verified
+        || restored.reported_sample_rate != Some(previous_rate)
+    {
+        return Err(restored.message.unwrap_or_else(||
+            format!("could not verify restored source rate {previous_rate} Hz")));
+    }
+    Ok(())
 }
 
 pub(super) fn choose_adaptive_sample_rate(

@@ -370,7 +370,26 @@ fn resolve_implicit_source(
     sample_rate: Option<u32>,
     standard_sink: bool,
 ) -> Option<ImplicitFeedbackSource> {
+    resolve_implicit_sources(inventory, config, handle, out_interface, out_alt,
+        out_terminal, linked_address, service_interval_us, sample_rate, standard_sink, false)
+        .into_iter().next()
+}
+
+fn resolve_implicit_sources(
+    inventory: &[ImplicitSourceCandidate],
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    out_interface: u8,
+    out_alt: u8,
+    out_terminal: Option<u8>,
+    linked_address: u8,
+    service_interval_us: u32,
+    sample_rate: Option<u32>,
+    standard_sink: bool,
+    retain_alternates: bool,
+) -> Vec<ImplicitFeedbackSource> {
     let mut matching = Vec::new();
+    let mut standard_sources = Vec::new();
     for (source, rank) in associated_implicit_sources(
         inventory, config, handle, out_interface, out_alt, out_terminal,
         linked_address, service_interval_us, sample_rate.is_some(), standard_sink, None,
@@ -390,8 +409,20 @@ fn resolve_implicit_source(
                 ) { continue; }
         }
         matching.push((source.source, rank));
+        if retain_alternates && source.standard_pcm { standard_sources.push(source.source); }
     }
-    choose_implicit_source(matching, out_alt)
+    if !retain_alternates {
+        return choose_implicit_source(matching, out_alt).into_iter().collect();
+    }
+    let mut sources = ranked_implicit_sources(matching, out_alt, true);
+    // Legacy descriptors keep their original selection. Additional live
+    // alternates require the standard PCM descriptor proof on both sides.
+    if sources.first().is_some_and(|source| standard_sources.contains(source)) {
+        sources.retain(|source| standard_sources.contains(source));
+    } else {
+        sources.truncate(1);
+    }
+    sources
 }
 
 /// Share association proof between exact selection and full-grid publication.
@@ -463,7 +494,7 @@ pub(super) fn uac2_choice_has_multiplier(choice: Option<&ClockChoice>) -> bool {
 }
 
 /// Implicit feedback shares a wire cadence, not just a source entity ID.
-fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool {
+pub(super) fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool {
     use crate::clock_resolution::ClockResolution;
     if output.resolution != ClockResolution::Resolved || input.resolution != ClockResolution::Resolved
         || output.control_interface != input.control_interface || output.source_id != input.source_id {
@@ -478,20 +509,36 @@ fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool
 }
 
 pub(super) fn choose_implicit_source(
-    mut matching: Vec<(ImplicitFeedbackSource, u8)>,
+    matching: Vec<(ImplicitFeedbackSource, u8)>,
     out_alt: u8,
 ) -> Option<ImplicitFeedbackSource> {
-    let rank = matching.iter().map(|(_, rank)| *rank).min()?;
-    matching.retain(|(_, r)| *r == rank);
-    matching.sort_by_key(|(s, _)| super::implicit_ranges::implicit_source_preference(s, out_alt));
-    let first = matching.first()?.0;
-    if matching
-        .iter()
-        .any(|(s, _)| s.interface_number != first.interface_number || s.address != first.address)
-    {
-        return None;
+    ranked_implicit_sources(matching, out_alt, false).into_iter().next()
+}
+
+/// Prove one physical pipe at the best association rank before exposing its
+/// alternates. A lower-ranked declaration can describe another usable alternate
+/// of that pipe, but can never introduce a different pipe or resolve ambiguity.
+fn ranked_implicit_sources(
+    mut matching: Vec<(ImplicitFeedbackSource, u8)>,
+    out_alt: u8,
+    retain_alternates: bool,
+) -> Vec<ImplicitFeedbackSource> {
+    let Some(rank) = matching.iter().map(|(_, rank)| *rank).min() else { return Vec::new(); };
+    let first = matching.iter().find(|(_, r)| *r == rank).unwrap().0;
+    let same_pipe = |source: &ImplicitFeedbackSource| {
+        source.interface_number == first.interface_number && source.address == first.address
+    };
+    if matching.iter().any(|(source, r)| *r == rank && !same_pipe(source)) {
+        return Vec::new();
     }
-    Some(first)
+    matching.retain(|(source, r)| same_pipe(source) && (retain_alternates || *r == rank));
+    matching.sort_by_key(|(source, r)| (*r, super::implicit_ranges::implicit_source_preference(source, out_alt)));
+    let mut sources = Vec::new();
+    for (source, _) in matching {
+        if !sources.contains(&source) { sources.push(source); }
+    }
+    if !retain_alternates { sources.truncate(1); }
+    sources
 }
 
 /// Resolve the selected playback clock within the proven implicit function.
@@ -1053,6 +1100,18 @@ pub(super) fn select_stream_candidate(
     speed: Speed,
     claimed_interfaces: &[u8],
 ) -> Result<IsoStreamCandidate, SelectError> {
+    select_stream_candidates(device, handle, playback_format, speed, claimed_interfaces, false)
+        .map(|candidates| candidates.into_iter().next().expect("nonempty stream candidates"))
+}
+
+pub(super) fn select_stream_candidates(
+    device: &Device<Context>,
+    handle: &DeviceHandle<Context>,
+    playback_format: PlaybackFormat,
+    speed: Speed,
+    claimed_interfaces: &[u8],
+    retain_implicit_alternates: bool,
+) -> Result<Vec<IsoStreamCandidate>, SelectError> {
     let config_descriptor = device.active_config_descriptor().map_err(|error| {
         SelectError::NoMatch(format!(
             "Failed to read active USB config descriptor: {}",
@@ -1071,7 +1130,7 @@ pub(super) fn select_stream_candidate(
             || playback_format.channels != profile.output.channels {
             return Err(SelectError::NoMatch("vendor PCM requires its supported native PCM rate and channel format".into()));
         }
-        return Ok(profile.candidate(config_descriptor.number()));
+        return Ok(vec![profile.candidate(config_descriptor.number())]);
     }
     let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces));
     let mut refused_unsynchronized = false;
@@ -1196,14 +1255,14 @@ pub(super) fn select_stream_candidate(
                     endpoint.sync_type(),
                     speed,
                 ) else { continue; };
-                let discovered_implicit = if endpoint.sync_type() == SyncType::Asynchronous
+                let discovered_implicit_sources = if endpoint.sync_type() == SyncType::Asynchronous
                     && discovered_feedback.is_none()
                     && !stream_format.is_uac1
                     && stream_format.format_tag == FORMAT_TAG_PCM
                     && (1..=16).contains(&endpoint.interval())
                     && valid_standard_implicit_capacity(&endpoint, speed)
                 {
-                    resolve_implicit_source(
+                    resolve_implicit_sources(
                         &implicit_sources,
                         &config_descriptor,
                         handle,
@@ -1215,10 +1274,16 @@ pub(super) fn select_stream_candidate(
                         Some(effective_sample_rate),
                         descriptor.protocol_code() == 0x20
                             && standard_implicit_pcm_format(&stream_format),
+                        retain_implicit_alternates
+                            && descriptor.protocol_code() == 0x20
+                            && standard_implicit_pcm_format(&stream_format)
+                            && playback_format.dsd_transport == DsdTransportMode::None
+                            && !playback_format.is_dop,
                     )
                 } else {
-                    None
+                    Vec::new()
                 };
+                let discovered_implicit = discovered_implicit_sources.first().copied();
                 let implicit_feedback = if settings().disable_feedback() {
                     None
                 } else {
@@ -1301,31 +1366,40 @@ pub(super) fn select_stream_candidate(
                     }
                 }
 
-                candidates.push(IsoStreamCandidate {
-                    configuration_number: config_descriptor.number(),
-                    interface_number: descriptor.interface_number(),
-                    alt_setting: descriptor.setting_number(),
-                    endpoint_address: endpoint.address(),
-                    endpoint_interval: endpoint.interval(),
-                    service_interval_us,
-                    usb_speed: speed,
-                    max_packet_bytes,
-                    sync_type: endpoint.sync_type(),
-                    usage_type: endpoint.usage_type(),
-                    format_tag: stream_format.format_tag,
-                    uac2_formats: stream_format.uac2_formats,
-                    native_dsd: stream_format.native_dsd,
-                    channels: stream_format.channels,
-                    subslot_size: stream_format.subslot_size,
-                    bit_resolution: stream_format.bit_resolution,
-                    sample_rates: sample_rates.clone(),
-                    refresh: endpoint.refresh(),
-                    synch_address: endpoint.synch_address(),
-                    feedback_endpoint,
-                    implicit_feedback,
-                    terminal_link: stream_format.terminal_link,
-                    is_uac1: stream_format.is_uac1,
-                });
+                // Claims are checked against the chosen physical pipe above, before
+                // expansion; an unclaimed source cannot redirect selection.
+                let implicit_alternates = if implicit_feedback.is_some() {
+                    discovered_implicit_sources.into_iter().map(Some).collect()
+                } else {
+                    vec![None]
+                };
+                for implicit_feedback in implicit_alternates {
+                    candidates.push(IsoStreamCandidate {
+                        configuration_number: config_descriptor.number(),
+                        interface_number: descriptor.interface_number(),
+                        alt_setting: descriptor.setting_number(),
+                        endpoint_address: endpoint.address(),
+                        endpoint_interval: endpoint.interval(),
+                        service_interval_us,
+                        usb_speed: speed,
+                        max_packet_bytes,
+                        sync_type: endpoint.sync_type(),
+                        usage_type: endpoint.usage_type(),
+                        format_tag: stream_format.format_tag,
+                        uac2_formats: stream_format.uac2_formats,
+                        native_dsd: stream_format.native_dsd,
+                        channels: stream_format.channels,
+                        subslot_size: stream_format.subslot_size,
+                        bit_resolution: stream_format.bit_resolution,
+                        sample_rates: sample_rates.clone(),
+                        refresh: endpoint.refresh(),
+                        synch_address: endpoint.synch_address(),
+                        feedback_endpoint,
+                        implicit_feedback,
+                        terminal_link: stream_format.terminal_link,
+                        is_uac1: stream_format.is_uac1,
+                    });
+                }
             }
         }
     }
@@ -1380,21 +1454,20 @@ pub(super) fn select_stream_candidate(
     } else {
         format!("{} Hz", playback_format.sample_rate)
     };
-    candidates.into_iter().next().ok_or_else(|| {
-        if let Some(interface) = refused_claim {
-            return SelectError::Claim(format!("Required implicit feedback interface {interface} was not claimed"));
-        }
-        if refused_unsynchronized {
-            return SelectError::ImplicitFeedback(format!(
-                "The only isochronous OUT endpoints that can carry {} / {}-bit / {} ch are asynchronous without a usable claimed feedback source",
-                label_rate, playback_format.bit_depth, playback_format.channels
-            ));
-        }
-        SelectError::NoMatch(format!(
-            "No isochronous OUT endpoint can carry {} / {}-bit / {} ch",
+    if !candidates.is_empty() { return Ok(candidates); }
+    if let Some(interface) = refused_claim {
+        return Err(SelectError::Claim(format!("Required implicit feedback interface {interface} was not claimed")));
+    }
+    if refused_unsynchronized {
+        return Err(SelectError::ImplicitFeedback(format!(
+            "The only isochronous OUT endpoints that can carry {} / {}-bit / {} ch are asynchronous without a usable claimed feedback source",
             label_rate, playback_format.bit_depth, playback_format.channels
-        ))
-    })
+        )));
+    }
+    Err(SelectError::NoMatch(format!(
+        "No isochronous OUT endpoint can carry {} / {}-bit / {} ch",
+        label_rate, playback_format.bit_depth, playback_format.channels
+    )))
 }
 
 /// Log every descriptor-level endpoint that *could* be a UAC2 feedback source,
@@ -2432,6 +2505,21 @@ mod implicit_discovery_tests {
             None
         );
     }
+    #[test]
+    fn ranked_exact_sources_keep_pipe_alternates_and_best_rank_ambiguity() {
+        let preferred = source(2, 2, 0x81, 400);
+        let alternate = source(2, 1, 0x81, 288);
+        let lower_rank = source(2, 3, 0x81, 400);
+        let other_pipe = source(3, 1, 0x82, 288);
+        let matching = vec![(alternate, 1), (other_pipe, 2), (lower_rank, 2), (preferred, 1)];
+        assert_eq!(ranked_implicit_sources(matching.clone(), 2, true),
+            vec![preferred, alternate, lower_rank]);
+        assert_eq!(ranked_implicit_sources(matching.clone(), 2, false), vec![preferred]);
+        assert_eq!(choose_implicit_source(matching, 2), Some(preferred));
+        assert!(ranked_implicit_sources(vec![(preferred, 1), (other_pipe, 1)], 2, true).is_empty());
+        assert!(ranked_implicit_sources(Vec::new(), 2, true).is_empty());
+    }
+
     #[test]
     fn implicit_capacity_rejects_reserved_and_wrong_speed_encodings() {
         assert!(valid_implicit_packet_capacity(288, Speed::Full));

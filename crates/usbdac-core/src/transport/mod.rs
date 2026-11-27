@@ -164,6 +164,7 @@ pub(crate) mod session;
 pub(crate) mod shared;
 mod stream_open;
 mod types;
+mod uac2_live_alternate;
 mod usbfs;
 pub(crate) mod volume_hw;
 #[cfg(test)]

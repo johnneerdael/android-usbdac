@@ -57,6 +57,8 @@ pub(super) struct SessionState {
     pub(super) device: UsbDevice,
     pub(super) requested_playback_format: Option<PlaybackFormat>,
     pub(super) playback_format: Option<PlaybackFormat>,
+    /// Exact UAC2 alternate proved after the negotiated clock settled.
+    pub(super) negotiated_uac2_alternate: Option<super::uac2_live_alternate::Uac2LiveAlternate>,
     pub(super) lock_requested: bool,
     pub(super) stream_active: bool,
     pub(super) capability_model: Option<CapabilityModel>,

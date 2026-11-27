@@ -2457,6 +2457,13 @@ pub(super) fn select_owned_stream_candidate(
     requested: PlaybackFormat,
     speed: Speed,
 ) -> Result<IsoStreamCandidate, SelectError> {
+    let uac2_alternate = SESSION_STATE.lock().as_ref()
+        .and_then(|state| state.negotiated_uac2_alternate.clone());
+    if let Some(alternate) = uac2_alternate {
+        return super::uac2_live_alternate::rebuild_uac2_live_alternate(
+            claimed, requested, speed, &alternate,
+        );
+    }
     let device = claimed.handle.device();
     let saved = NEGOTIATED.lock().clone();
     if let Some(route) = saved.filter(|r| r.plan.is_some() || r.implicit.is_some() || r.live_alternate) {

@@ -97,6 +97,29 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `db66d83e3d184cad25cda11c1c39315c290bb51f1cd353908d09d678c9d042e4`.
 
+### UAC2 playback alternate selection at a verified rate
+
+After the UAC2 clock verifies the requested PCM rate, check the
+preferred OUT alternate and its implicit feedback IN alternate against
+their live availability controls. A valid bitmap with a clear bit
+permits another compatible alternate on the same terminal and resolved
+clock. Keep the pacing family and, for implicit feedback, the same
+physical IN pipe. Rank only the descriptor-supported pairs that can
+carry the exact rate. Control errors and malformed replies abort the
+check. [USB-IF UAC2 §5.2.6.1.2](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf)
+
+Format negotiation returns the replacement's actual endpoint and
+container. Preserve that selection in the session and revalidate the
+clock and transport before open. Activation performs its own live
+checks. For hardware acceptance, exercise an OUT rejection and a
+same-pipe IN rejection separately, then change the clock or bitmap
+between negotiation and open and check the resulting refusal.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `f01066bee4a35bb7932929e379f2b5ed5f89e3a20a3be9c91503332169740b78`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a
