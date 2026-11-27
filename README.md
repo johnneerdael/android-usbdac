@@ -212,7 +212,7 @@ feature.
 
 ## Minimal Rust example
 
-Add the core crate with `cargo add usbdac-core@0.1.12`. The example logs
+Add the core crate with `cargo add usbdac-core@0.1.13`. The example logs
 through the `log` crate.
 
 ```rust
