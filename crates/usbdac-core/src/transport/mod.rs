@@ -17,7 +17,7 @@ use crate::descriptors::{
 };
 use crate::endpoint::{select_explicit_feedback_endpoint, FeedbackEndpointCandidate};
 use crate::error::Error;
-use crate::events::EventSink;
+use crate::events::{CompatibilityAdmissions, EventSink};
 use crate::flush_cancel::{
     classify_completion, flush_cancel_targets, wait_for_acknowledgements, Completion,
     FLUSH_CANCEL_TIMEOUT,

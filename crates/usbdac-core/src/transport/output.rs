@@ -677,6 +677,7 @@ pub(super) fn run_usb_output_loop(
     post_alt_readback_hz: Option<u32>,
     status_targets: Vec<audio_status::StreamStatusTarget>,
     lock_delay: Option<endpoint_lock::LockDelay>,
+    compatibility_admissions: CompatibilityAdmissions,
 ) {
     let mut lock_gate = endpoint_lock::LockDelayGate::new(lock_delay);
     let pcm_buffer = Arc::clone(&shared.ring);
@@ -1404,6 +1405,11 @@ pub(super) fn run_usb_output_loop(
     }
     min_active_slots = min_active_slots.min(active_slots);
     publish_inflight_music(&slots, &runtime_stats);
+    compatibility_admissions.publish(
+        fatal_error.is_none() && !usb_stop_requested(&stop) && active_slots > 0,
+        &shared.events,
+        runtime_stats.feedback_trace.as_deref(),
+    );
     if active_slots > 0 {
         runtime_stats.started.store(true, Ordering::Release);
         shared.note_bit_perfect();

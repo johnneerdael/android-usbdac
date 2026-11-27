@@ -36,7 +36,7 @@ internal class StreamSignals(private val publish: (DacEvent) -> Unit) : NativeLi
                 bitPerfect.value = directBitPerfectState(event.bitPerfect, if (event.bitPerfect) null else blocker())
             }
             // Device-level events reach the session's own listener; do not publish them twice.
-            is DacEvent.VolumeChanged, DacEvent.DeviceLost -> return
+            is DacEvent.VolumeChanged, is DacEvent.CompatibilityFallback, DacEvent.DeviceLost -> return
             else -> Unit
         }
         publish(event)

@@ -235,6 +235,16 @@ pub enum FeedbackTraceEvent {
         unit: &'static str,
         inferred: bool,
     },
+    CompatibilityFallback {
+        tier: crate::CompatibilityFallbackTier,
+        reason: &'static str,
+    },
+    /// Session-local observation only; never a persisted device rule.
+    ClockReadbackSuggestion {
+        control_interface: u8,
+        clock_entity: u8,
+        strikes: u8,
+    },
 }
 
 /// A record in the trace, timed from stream creation using a monotonic clock.
@@ -281,6 +291,26 @@ impl FeedbackRecorder {
                 recent: VecDeque::with_capacity(RECENT_ENTRIES),
                 failure: None,
             }),
+        }
+    }
+
+    /// Preserve a bounded, deterministic startup snapshot before recent traffic
+    /// can overwrite it. A closed stream's exported trace retains these facts.
+    pub(crate) fn record_clock_readback_suggestions(
+        &self,
+        suggestions: impl IntoIterator<Item = ((u8, u8), u8)>,
+    ) {
+        let mut suggestions: Vec<_> = suggestions
+            .into_iter()
+            .filter(|(_, strikes)| *strikes >= 3)
+            .collect();
+        suggestions.sort_unstable_by_key(|(identity, _)| *identity);
+        for ((control_interface, clock_entity), strikes) in suggestions.into_iter().take(16) {
+            self.record(FeedbackTraceEvent::ClockReadbackSuggestion {
+                control_interface,
+                clock_entity,
+                strikes,
+            });
         }
     }
 
@@ -431,5 +461,50 @@ mod tests {
         );
         assert_eq!(recorder.dropped.load(Ordering::Relaxed), 5);
         assert_eq!(history.failure.as_deref(), Some("feedback deadline"));
+    }
+}
+
+#[cfg(test)]
+mod compatibility_suggestion_trace_tests {
+    use super::*;
+    #[test]
+    fn three_strike_suggestions_stay_bounded_and_survive_recent_history_overwrite() {
+        let recorder = FeedbackRecorder::new(Instant::now());
+        let events = crate::events::EventHub::start();
+        crate::events::CompatibilityAdmissions::new(false, true, true, false, None).publish(
+            true,
+            &events,
+            Some(&recorder),
+        );
+        events.shutdown();
+        let suggestions = (0..32u8).map(|interface| ((interface, 7), 3));
+        recorder.record_clock_readback_suggestions(suggestions.chain([((99, 1), 2)]));
+        for _ in 0..(STARTUP_ENTRIES + RECENT_ENTRIES + 8) {
+            recorder.record(FeedbackTraceEvent::Lock {
+                locked: true,
+                stale: false,
+            });
+        }
+        let history = recorder.history.lock();
+        let suggestions: Vec<_> = history
+            .startup
+            .iter()
+            .filter_map(|entry| match entry.event {
+                FeedbackTraceEvent::ClockReadbackSuggestion {
+                    control_interface,
+                    clock_entity,
+                    strikes,
+                } => Some((control_interface, clock_entity, strikes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            suggestions,
+            (0..16u8)
+                .map(|interface| (interface, 7, 3))
+                .collect::<Vec<_>>()
+        );
+        assert!(history.startup.iter().any(|entry|matches!(entry.event,
+            FeedbackTraceEvent::CompatibilityFallback {tier:crate::CompatibilityFallbackTier::UnverifiedClock,reason} if !reason.is_empty())));
     }
 }

@@ -63,3 +63,13 @@ A narrow default nominal tier admits full-speed UAC1 PCM without a feedback pipe
 Clock fallback requires a successful SET and unusable readback under host policy. Positive mismatches, failed SET, multiplied routes and DSD retain strict proof. Three unusable replies are learned only for the current opened device session and exact control interface/clock entity; later attempts still read GET_CUR and readable values clear the suggestion. No learned rule survives close.
 
 Worker diagnostics record loop gaps above 10 ms and 50 ms and the maximum gap. These are observed worker gaps, including event-pump waiting, not an attribution to OS scheduling alone. No screen-off, Doze or OEM hardware claim follows from host tests.
+
+
+Successful compatibility admission emits typed `CompatibilityFallback`
+notifications after the first healthy OUT submission: `nominal_async` for a
+feedback-free asynchronous pipe and `unverified_clock` for acknowledged SET
+with unusable readback. The event reaches DAC and stream listeners through
+the existing deduplicating path; strict failures emit no admission event.
+Opt-in support traces retain this admission and a bounded, exact
+interface/entity three-strike clock suggestion. See
+[compatibility admission diagnostics](support-diagnostics.md#compatibility-admission).

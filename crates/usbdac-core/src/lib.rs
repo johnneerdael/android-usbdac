@@ -91,7 +91,7 @@ pub use config::{
 };
 pub use dac::{Dac, StreamReconfiguration, UsbRetirement};
 pub use error::{Error, Result};
-pub use events::{DacEvent, DacListener, StreamState};
+pub use events::{CompatibilityFallbackTier, DacEvent, DacListener, StreamState};
 pub use fake::{PlaybackDevice, PlaybackStream};
 pub use feedback_diagnostics::{
     ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket, FeedbackTrace,

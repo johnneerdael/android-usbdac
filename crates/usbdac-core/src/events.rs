@@ -49,6 +49,79 @@ impl StreamState {
     }
 }
 
+/// Compatibility tier actually admitted by a successfully started stream.
+/// This never changes the stream's bit-perfect blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompatibilityFallbackTier {
+    /// An asynchronous OUT endpoint has neither explicit nor proven implicit feedback.
+    NominalAsync,
+    /// Sampling-frequency SET succeeded but usable frequency readback is absent.
+    UnverifiedClock,
+}
+impl CompatibilityFallbackTier {
+    /// Stable tier code used by the JNI compatibility event.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::NominalAsync => 0,
+            Self::UnverifiedClock => 1,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NominalAsync => "nominal_async",
+            Self::UnverifiedClock => "unverified_clock",
+        }
+    }
+}
+
+/// Decisions are captured after all strict startup checks. Publishing remains
+/// deferred until the worker has submitted a healthy initial OUT queue.
+pub(crate) struct CompatibilityAdmissions {
+    nominal_async: bool,
+    acknowledged_unverified_clock: bool,
+}
+impl CompatibilityAdmissions {
+    pub(crate) fn new(
+        nominal_async: bool,
+        standard_set_attempted: bool,
+        set_succeeded: bool,
+        rate_verified: bool,
+        reported_hz: Option<u32>,
+    ) -> Self {
+        Self {
+            nominal_async,
+            acknowledged_unverified_clock: standard_set_attempted
+                && set_succeeded
+                && !rate_verified
+                && reported_hz.map_or(true, |rate| rate == 0),
+        }
+    }
+    pub(crate) fn publish(
+        self,
+        healthy_out_started: bool,
+        events: &EventHub,
+        trace: Option<&crate::feedback_diagnostics::FeedbackRecorder>,
+    ) {
+        if !healthy_out_started {
+            return;
+        }
+        for (admitted,tier,reason) in [
+            (self.nominal_async,CompatibilityFallbackTier::NominalAsync,
+                "asynchronous endpoint has no explicit or proven implicit feedback; nominal timing admitted"),
+            (self.acknowledged_unverified_clock,CompatibilityFallbackTier::UnverifiedClock,
+                "sampling-frequency SET acknowledged but current-frequency readback is unusable; clock remains unverified"),
+        ] {
+            if admitted {
+                events.emit_dac(DacEvent::CompatibilityFallback {tier,reason:reason.into()});
+                if let Some(trace)=trace {
+                    trace.record(crate::FeedbackTraceEvent::CompatibilityFallback {tier,reason});
+                }
+            }
+        }
+    }
+}
+
 /// Something that happened to the DAC or a stream.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -69,6 +142,13 @@ pub enum DacEvent {
     /// good rate for a bounded grace period, then fails if reports do not recover.
     /// Emitted once per stale transition after publishing the cleared lock.
     FeedbackStale,
+    /// A compatibility tier was admitted after the initial OUT queue submitted
+    /// successfully. Delivered to DAC and stream listeners, deduplicated when
+    /// they are the same callback. Never emitted for a refused/failed startup.
+    CompatibilityFallback {
+        tier: CompatibilityFallbackTier,
+        reason: String,
+    },
     /// The stream (or a control request) failed.
     Error(Error),
     /// The device is gone.
@@ -406,5 +486,108 @@ mod tests {
         hub.emit_stream(DacEvent::Underrun);
         hub.emit_dac(DacEvent::DeviceLost);
         hub.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod compatibility_admission_tests {
+    use super::*;
+    fn listener() -> (Arc<dyn DacListener>, std::sync::mpsc::Receiver<DacEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(move |event| {
+                tx.send(event).unwrap();
+            }),
+            rx,
+        )
+    }
+    #[test]
+    fn successful_admission_reaches_both_subscription_scopes_and_preserves_order() {
+        let hub = EventHub::start();
+        let (dac, dac_rx) = listener();
+        let (stream, stream_rx) = listener();
+        hub.set_dac_listener(Some(dac));
+        hub.set_stream_listener(Some(stream));
+        CompatibilityAdmissions::new(true, true, true, false, None).publish(true, &hub, None);
+        hub.shutdown();
+        let dac: Vec<_> = dac_rx.try_iter().collect();
+        let stream: Vec<_> = stream_rx.try_iter().collect();
+        assert_eq!(dac, stream);
+        assert_eq!(dac.len(), 2);
+        assert!(
+            matches!(&dac[0],DacEvent::CompatibilityFallback {tier:CompatibilityFallbackTier::NominalAsync,reason} if !reason.is_empty())
+        );
+        assert!(
+            matches!(&dac[1],DacEvent::CompatibilityFallback {tier:CompatibilityFallbackTier::UnverifiedClock,reason} if !reason.is_empty())
+        );
+    }
+    #[test]
+    fn one_callback_in_both_roles_gets_one_admission_notification() {
+        let hub = EventHub::start();
+        let (both, rx) = listener();
+        hub.set_dac_listener(Some(both.clone()));
+        hub.set_stream_listener(Some(both));
+        CompatibilityAdmissions::new(true, false, false, true, None).publish(true, &hub, None);
+        hub.shutdown();
+        assert_eq!(rx.try_iter().count(), 1);
+    }
+    #[test]
+    fn failed_startup_failed_set_and_readable_clock_are_never_fallback_admissions() {
+        for (healthy, attempted, succeeded, verified, reported) in [
+            (false, true, true, false, None),
+            (true, true, false, false, None),
+            (true, false, true, false, None),
+            (true, true, true, true, None),
+            (true, true, true, false, Some(44_100)),
+            (true, true, true, false, Some(48_000)),
+        ] {
+            let hub = EventHub::start();
+            let (listener, rx) = listener();
+            hub.set_dac_listener(Some(listener));
+            CompatibilityAdmissions::new(!healthy, attempted, succeeded, verified, reported)
+                .publish(healthy, &hub, None);
+            hub.shutdown();
+            assert_eq!(rx.try_iter().count(), 0);
+        }
+    }
+    #[test]
+    fn unverified_clock_admission_is_delivered_without_a_dac_listener() {
+        let hub = EventHub::start();
+        let (listener, rx) = listener();
+        hub.set_stream_listener(Some(listener));
+        let recorder =
+            crate::feedback_diagnostics::FeedbackRecorder::new(std::time::Instant::now());
+        CompatibilityAdmissions::new(false, true, true, false, Some(0)).publish(
+            true,
+            &hub,
+            Some(&recorder),
+        );
+        hub.shutdown();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            DacEvent::CompatibilityFallback {
+                tier: CompatibilityFallbackTier::UnverifiedClock,
+                ..
+            }
+        ));
+        // Recorder retention and serialization are verified in their own modules.
+    }
+}
+
+#[cfg(test)]
+mod vendor_clock_admission_tests {
+    use super::*;
+    #[test]
+    fn vendor_rate_ack_does_not_mean_standard_frequency_readback_fallback() {
+        let hub = EventHub::start();
+        let (tx, rx) = std::sync::mpsc::channel();
+        hub.set_stream_listener(Some(Arc::new(move |event| {
+            tx.send(event).unwrap();
+        })));
+        // The caller supplies standard_set_attempted=false for vendor rate
+        // programming; cadence proof is handled by that protocol separately.
+        CompatibilityAdmissions::new(false, false, true, false, None).publish(true, &hub, None);
+        hub.shutdown();
+        assert_eq!(rx.try_iter().count(), 0);
     }
 }

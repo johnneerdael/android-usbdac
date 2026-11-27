@@ -1756,6 +1756,15 @@ fn start_stream_inner_with_capture(
     set_engine_state(EngineState::UsbReady, None);
     set_software_volume_active(false);
     let channels = playback_format.channels as usize;
+    let compatibility_admissions = CompatibilityAdmissions::new(
+        unsynchronized_async,
+        // Vendor-rate programming has its own cadence proof and wire protocol;
+        // its ACK is never a standard frequency SET/GET_CUR fallback.
+        clock_control_attempted && !programmed_vendor_rate,
+        clock_control_succeeded,
+        clock_verification_passed,
+        reported_sample_rate,
+    );
     let runtime_stats = Arc::new(
         RuntimeStats::new(
             effective_ring_rate(&playback_format),
@@ -1767,6 +1776,15 @@ fn start_stream_inner_with_capture(
         )
         .with_feedback_trace(config.capture_feedback_trace),
     );
+    if let Some(trace) = runtime_stats.feedback_trace.as_ref() {
+        let suggestions: Vec<_> = state
+            .unreadable_clocks
+            .lock()
+            .iter()
+            .map(|(key, strikes)| (*key, *strikes))
+            .collect();
+        trace.record_clock_readback_suggestions(suggestions);
+    }
     runtime_stats
         .implicit_feedback
         .store(candidate.implicit_feedback.is_some(), Ordering::Release);
@@ -1829,6 +1847,7 @@ fn start_stream_inner_with_capture(
                     post_alt_readback_hz,
                     status_targets,
                     lock_delay,
+                    compatibility_admissions,
                 );
             }));
             if let Err(payload) = result {

@@ -229,6 +229,66 @@ fn explicit_feedback_packet(packet: &ExplicitFeedbackPacket) -> Value {
     })
 }
 
+fn feedback_trace_observation(event: &FeedbackTraceEvent) -> Value {
+    match event {
+        FeedbackTraceEvent::Submit { slot, status } => json!({
+            "event": "submit", "slot": slot, "status": status,
+        }),
+        FeedbackTraceEvent::Completion {
+            slot,
+            status,
+            actual_bytes,
+        } => json!({
+            "event": "completion", "slot": slot, "status": status, "actual_bytes": actual_bytes,
+        }),
+        FeedbackTraceEvent::ExplicitPacket { index, sample } => {
+            let mut packet = explicit_feedback_packet(sample);
+            packet["event"] = json!("explicit_packet");
+            packet["index"] = json!(index);
+            packet
+        }
+        FeedbackTraceEvent::ImplicitSource {
+            interface_number,
+            alt_setting,
+            endpoint,
+            service_interval_us,
+            max_packet_bytes,
+            bytes_per_frame,
+        } => json!({
+            "event": "implicit_source", "interface_number": interface_number,
+            "alt_setting": alt_setting, "endpoint": endpoint, "service_interval_us": service_interval_us,
+            "max_packet_bytes": max_packet_bytes, "bytes_per_frame": bytes_per_frame,
+        }),
+        FeedbackTraceEvent::ImplicitPacket {
+            index,
+            status,
+            requested_bytes,
+            actual_bytes,
+        } => json!({
+            "event": "implicit_packet", "index": index, "status": status,
+            "requested_bytes": requested_bytes, "actual_bytes": actual_bytes,
+        }),
+        FeedbackTraceEvent::Lock { locked, stale } => json!({
+            "event": "lock", "locked": locked, "stale": stale,
+        }),
+        FeedbackTraceEvent::Timebase { unit, inferred } => json!({
+            "event": "timebase", "unit": unit, "inferred": inferred,
+        }),
+        FeedbackTraceEvent::CompatibilityFallback { tier, reason } => json!({
+            "event":"compatibility_fallback", "tier":tier.as_str(), "reason":reason,
+        }),
+        FeedbackTraceEvent::ClockReadbackSuggestion {
+            control_interface,
+            clock_entity,
+            strikes,
+        } => json!({
+            "event":"clock_readback_suggestion", "control_interface":control_interface,
+            "clock_entity":clock_entity, "strikes":strikes,
+        }),
+        _ => json!({ "event": "unknown" }),
+    }
+}
+
 pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
     let explicit = trace.explicit.as_ref().map(|diag| json!({
         "endpoint": diag.endpoint,
@@ -269,42 +329,15 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "rejected_reports": diag.rejected_reports,
         "packet_samples": diag.packet_samples().map(explicit_feedback_packet).collect::<Vec<_>>(),
     }));
-    let entries: Vec<_> = trace.entries.iter().map(|entry| {
-        let mut value = match &entry.event {
-            FeedbackTraceEvent::Submit { slot, status } => json!({
-                "event": "submit", "slot": slot, "status": status,
-            }),
-            FeedbackTraceEvent::Completion { slot, status, actual_bytes } => json!({
-                "event": "completion", "slot": slot, "status": status, "actual_bytes": actual_bytes,
-            }),
-            FeedbackTraceEvent::ExplicitPacket { index, sample } => {
-                let mut packet = explicit_feedback_packet(sample);
-                packet["event"] = json!("explicit_packet");
-                packet["index"] = json!(index);
-                packet
-            }
-            FeedbackTraceEvent::ImplicitSource {
-                interface_number, alt_setting, endpoint, service_interval_us, max_packet_bytes, bytes_per_frame,
-            } => json!({
-                "event": "implicit_source", "interface_number": interface_number,
-                "alt_setting": alt_setting, "endpoint": endpoint, "service_interval_us": service_interval_us,
-                "max_packet_bytes": max_packet_bytes, "bytes_per_frame": bytes_per_frame,
-            }),
-            FeedbackTraceEvent::ImplicitPacket { index, status, requested_bytes, actual_bytes } => json!({
-                "event": "implicit_packet", "index": index, "status": status,
-                "requested_bytes": requested_bytes, "actual_bytes": actual_bytes,
-            }),
-            FeedbackTraceEvent::Lock { locked, stale } => json!({
-                "event": "lock", "locked": locked, "stale": stale,
-            }),
-            FeedbackTraceEvent::Timebase { unit, inferred } => json!({
-                "event": "timebase", "unit": unit, "inferred": inferred,
-            }),
-            _ => json!({ "event": "unknown" }),
-        };
-        value["elapsed_us"] = json!(entry.elapsed_us);
-        value
-    }).collect();
+    let entries: Vec<_> = trace
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut value = feedback_trace_observation(&entry.event);
+            value["elapsed_us"] = json!(entry.elapsed_us);
+            value
+        })
+        .collect();
     json!({
         "schema_version": 1,
         "driver_version": env!("CARGO_PKG_VERSION"),
@@ -410,6 +443,7 @@ pub mod event_type {
     pub const FEEDBACK_STALE: i32 = 5;
     pub const ERROR: i32 = 6;
     pub const DEVICE_LOST: i32 = 7;
+    pub const COMPATIBILITY_FALLBACK: i32 = 8;
 }
 
 /// Numeric code of an error, for `onEvent(ERROR, code, ...)`.
@@ -461,6 +495,12 @@ pub fn event(event: &DacEvent) -> (i32, i64, f64, Option<String>) {
             Some(volume_state(state).to_string()),
         ),
         DacEvent::FeedbackStale => (event_type::FEEDBACK_STALE, 0, 0.0, None),
+        DacEvent::CompatibilityFallback { tier, reason } => (
+            event_type::COMPATIBILITY_FALLBACK,
+            i64::from(tier.code()),
+            0.0,
+            Some(reason.clone()),
+        ),
         DacEvent::Error(error) => (
             event_type::ERROR,
             error_code(error),
@@ -1251,5 +1291,51 @@ mod source_quirk_bridge_tests {
                 error.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_admission_bridge_tests {
+    use super::*;
+    use usbdac_core::CompatibilityFallbackTier;
+    #[test]
+    fn typed_fallback_admissions_keep_existing_event_codes_and_use_additive_code_eight() {
+        for (tier, code, name) in [
+            (CompatibilityFallbackTier::NominalAsync, 0, "nominal_async"),
+            (
+                CompatibilityFallbackTier::UnverifiedClock,
+                1,
+                "unverified_clock",
+            ),
+        ] {
+            assert_eq!(
+                event(&DacEvent::CompatibilityFallback {
+                    tier,
+                    reason: "admitted".into()
+                }),
+                (8, code, 0.0, Some("admitted".into()))
+            );
+            let trace = feedback_trace_observation(&FeedbackTraceEvent::CompatibilityFallback {
+                tier,
+                reason: "admitted",
+            });
+            assert_eq!(
+                trace,
+                json!({"event":"compatibility_fallback","tier":name,"reason":"admitted"})
+            );
+        }
+        assert_eq!(event(&DacEvent::FeedbackStale), (5, 0, 0.0, None));
+        assert_eq!(event(&DacEvent::DeviceLost), (7, 0, 0.0, None));
+    }
+    #[test]
+    fn clock_quirk_suggestion_export_has_precise_owner_local_entity_and_strikes() {
+        assert_eq!(
+            feedback_trace_observation(&FeedbackTraceEvent::ClockReadbackSuggestion {
+                control_interface: 2,
+                clock_entity: 9,
+                strikes: 3
+            }),
+            json!({"event":"clock_readback_suggestion","control_interface":2,"clock_entity":9,"strikes":3})
+        );
     }
 }

@@ -62,6 +62,40 @@ Keep media payloads, track names, playlists, account information, USB serial num
 and unrelated system logs out of the bundle. Scrub private paths from app
 errors while preserving their technical details.
 
+## Compatibility admission and clock suggestions {#compatibility-admission}
+
+Subscribe before starting playback. A successful direct stream can raise
+`CompatibilityFallback` with tier `nominal_async` or `unverified_clock` and a
+plain reason. The event is sent only after the first healthy OUT queue has
+submitted, including wire silence for a paused stream; opening a handle or
+negotiating a format alone does not establish admission. A strict refusal,
+failed SET, readable rate mismatch or failed initial submission does not
+raise it. Vendor-specific rate programming and its independent cadence proof
+are separate from standard acknowledged frequency SET/GET_CUR fallback. Both tiers can apply to one stream, producing one event per tier.
+
+Rust exposes `DacEvent::CompatibilityFallback` and
+`CompatibilityFallbackTier`; a DAC listener and a distinct stream listener each
+receive it once. The same listener used in both roles receives one copy.
+Kotlin exposes `DacEvent.CompatibilityFallback` through the existing session
+and stream event flows. These events explain compatibility admission; they do
+not remove `UNSYNCHRONIZED_ASYNC` or `CLOCK_UNVERIFIED` bit-perfect blockers.
+
+Enable the opt-in feedback trace before opening the session. A fallback is
+retained as `compatibility_fallback` with `tier` and `reason`. After three
+unusable acknowledged-clock readbacks, the driver also records a bounded
+`clock_readback_suggestion` startup observation with the exact
+`control_interface`, `clock_entity` and `strikes` (at most sixteen suggestions
+per stream). Include that observation and the corresponding `[USB] Clock
+interface=... entity=...: three unusable GET_CUR replies` log line in the
+support bundle. It suggests investigation of that exact interface/entity;
+it does not install a quirk or authorize a device write.
+
+The observation is copied from the current opened owner's session into the
+stream's startup trace. Closing the owner clears learned behavior, while an
+already captured/exported old trace retains the historical suggestion.
+Readable clock replies clear learning; a known mismatch and a failed SET stay
+failures. Save each leg before replacing a stream, as described above.
+
 ## Kotlin and Android {#kotlin-android}
 
 Apply `captureFeedbackTrace` to the configuration that actually opens the
