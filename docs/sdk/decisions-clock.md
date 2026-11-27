@@ -95,9 +95,11 @@ rediscovery requires fresh post-alternate proof. Two queued polls keep the
 endpoint polled through a slow completion, and cost one more transfer and its
 buffer. The release has automated coverage for the validation and recovery
 rules. No run compares the two policies on a DAC, so which suits a given DAC
-better is not known. The two DACs that locked and played without loss did so
-on builds that still smoothed every report (before `e26dd2d` made Direct the
-default).
+better is not known. The two DACs in the earlier records locked and played
+without loss on builds that still smoothed every report (before `e26dd2d` made
+Direct the default). The [validator runs](evidence.md#validator-2026-11-27) on
+four DACs used a 0.1.10 build, which applies reports directly, and also had no
+loss.
 
 **References.** [UAC 1.0 and USB 2.0 feedback format](references.md#ref-uac1), [USB 2.0 §5.12.4.2](references.md#ref-usb2), [UAC 2.0 formats §2.3.1.1 packet sizes](references.md#ref-uac2-formats), [USB 3.2 feedback format](references.md#ref-usb32), [Linux `endpoint.c`](references.md#ref-linux-endpoint), [Mornye commits](references.md#ref-mornye-commits).
 
