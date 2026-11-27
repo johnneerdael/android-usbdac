@@ -141,6 +141,29 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `8ea3d569d29d111e096dd0b727e091107a8d857e8dc81707c411528ccf4063c5`.
 
+### Duplex capture alternate selection
+
+Keep the negotiated playback format and its clock route fixed. When
+an independent UAC2 or full UAC3 capture alternate is excluded by a
+valid live bitmap, restore the attempted input rate before trying a
+matching alternate on the same input interface, AudioControl function,
+and terminal. Recheck compatibility with the playback clock before
+the retry. A malformed reply, failed activation, or uncertain clock
+restoration aborts the attempt. Shared implicit capture uses the exact
+IN alternate already selected by playback. [USB-IF UAC2 §5.2.6.1.2](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[USB-IF ADC3 §5.2.2.1.2 via IEC](https://webstore.iec.ch/en/publication/63921)
+
+The final capture choice owns the buffer, startup lock delay, and
+AudioControl status targets. For hardware acceptance, reject the
+preferred independent IN alternate after its clock is configured.
+Verify the original input rate is restored before the replacement
+is tried and confirm the negotiated OUT alternate is used throughout.
+
+Rust workspace tests, the Android arm64 target check, Kotlin unit
+tests, and the four-ABI AAR and sample builds passed. Both Android
+packages contain identical native libraries for each ABI. The AAR
+SHA-256 is `17d6867fd905cf605a9602f3b102907d525ca9af073aa8dd672c26f408afee4c`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a

@@ -224,7 +224,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         return Err(Error::InvalidState("clock route changed since negotiation".into()));
     }
     // Select and validate the complete pair while all streaming alternates are idle.
-    let attachment = match capture.map(|(request, capacity)|
+    let mut attachment = match capture.map(|(request, capacity)|
         duplex::prepare(&claimed_handle, &candidate, expected, request, capacity)).transpose() {
         Ok(value) => value,
         Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(error); }
@@ -615,8 +615,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(message));
     }
 
-    if let Some(capture) = attachment.as_ref().filter(|_| vendor_profile.is_none()) {
-        if let Err(error) = capture.configure(&claimed_handle, &candidate, expected) {
+    if let Some(capture) = attachment.as_mut().filter(|_| vendor_profile.is_none()) {
+        if let Err(error) = duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
         }
     }
@@ -670,8 +670,8 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
     if let Some(profile) = vendor_profile.as_ref() {
         let verification = (|| {
-            if let Some(capture) = attachment.as_ref() {
-                capture.configure(&claimed_handle, &candidate, expected)?;
+            if let Some(capture) = attachment.as_mut() {
+                duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected)?;
             } else {
                 capture_stream::verify_vendor_interface_alternate(&claimed_handle, profile.interface_number, profile.alt_setting)?;
                 if profile.input_interface_number != profile.interface_number {

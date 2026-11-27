@@ -200,12 +200,26 @@ impl ClaimedHandle {
         interface_number: u8,
         alternate_setting: u8,
     ) -> Result<(), String> {
+        if self.try_set_alternate_setting(interface_number, alternate_setting)? {
+            Ok(())
+        } else {
+            Err(format!(
+                "requested alternate {alternate_setting} is not currently valid"
+            ))
+        }
+    }
+
+    /// Return false only for a validated clear availability bit, before SET.
+    /// Control errors and failures after attempting SET remain hard errors.
+    pub(super) fn try_set_alternate_setting(
+        &self,
+        interface_number: u8,
+        alternate_setting: u8,
+    ) -> Result<bool, String> {
         let (controls, available) =
             self.inspect_alternate_availability(interface_number, alternate_setting)?;
         if !available {
-            return Err(format!(
-                "requested alternate {alternate_setting} is not currently valid"
-            ));
+            return Ok(false);
         }
         let request = UsbfsSetInterface {
             interface: interface_number.into(),
@@ -236,7 +250,7 @@ impl ClaimedHandle {
             )?;
             alternate_controls::validate_active_alt(&response[..length], alternate_setting)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Inspect live availability without selecting an alternate setting.

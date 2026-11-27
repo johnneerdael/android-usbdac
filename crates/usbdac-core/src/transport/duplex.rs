@@ -13,6 +13,9 @@ pub(super) struct Attachment {
     retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
+    rate_uncertain: AtomicBool,
+    retry_endpoints: Vec<CaptureEndpoint>,
+    capacity: usize,
     lock_delay: Option<endpoint_lock::LockDelay>,
 }
 
@@ -128,6 +131,39 @@ fn uac2_source_rate(choice: Option<&ClockChoice>, wire_rate: u32) -> Result<u32,
     })
 }
 
+fn retryable_capture(endpoint: &CaptureEndpoint) -> bool {
+    endpoint.vendor_pcm.is_none() && (endpoint.protocol == 0x20
+        || (endpoint.protocol == 0x30 && endpoint.adc3_route.as_ref().is_some_and(|route| route.choice.is_some())))
+}
+
+/// Retry only descriptor alternatives of the originally selected input route.
+fn same_retry_route(primary: &CaptureEndpoint, candidate: &CaptureEndpoint) -> bool {
+    retryable_capture(candidate)
+        && (primary.configuration, primary.protocol, primary.interface, primary.control, primary.terminal)
+            == (candidate.configuration, candidate.protocol, candidate.interface, candidate.control, candidate.terminal)
+}
+
+fn prepare_endpoint(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
+    expected: &crate::StreamFormat, endpoint: CaptureEndpoint, capacity: usize) -> Result<Attachment, Error> {
+    let shared = validate_alternates(playback, &endpoint)?;
+    if !shared {
+        let geometry = IsoQueueGeometry::for_stream(endpoint.service_us,
+            settings().config.bus_queue_ms, settings().config.transfers_in_flight);
+        capture_stream::capture_queue_bytes(endpoint.packet_bytes, geometry)?;
+    }
+    validate_clocks(claimed, playback, expected, &endpoint)?;
+    let delay = if shared || endpoint.vendor_pcm.is_some() { None } else {
+        endpoint_lock::selected_delay(claimed, endpoint.interface, endpoint.alternate,
+            endpoint.address, true).or_control()?
+    };
+    let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
+        .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
+    let mut attachment = Attachment::new(endpoint, shared, buffer);
+    attachment.lock_delay = delay;
+    attachment.capacity = capacity;
+    Ok(attachment)
+}
+
 pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, request: &CaptureRequest, capacity: usize) -> Result<Arc<Attachment>, Error> {
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
@@ -136,28 +172,15 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         && claimed.claimed_interfaces.contains(&endpoint.interface)
         && claimed.claimed_interfaces.contains(&endpoint.control));
     endpoints.sort_by_key(|e| (e.format.subslot_bytes(), e.interface, e.alternate, e.address));
+    let mut endpoints = endpoints.into_iter();
     let mut refusal = None;
-    for endpoint in endpoints {
-        let pair = (|| {
-            let shared = validate_alternates(playback, &endpoint)?;
-            if !shared {
-                let geometry = IsoQueueGeometry::for_stream(endpoint.service_us,
-                    settings().config.bus_queue_ms, settings().config.transfers_in_flight);
-                capture_stream::capture_queue_bytes(endpoint.packet_bytes, geometry)?;
-            }
-            validate_clocks(claimed, playback, expected, &endpoint)?;
-            let delay = if shared || endpoint.vendor_pcm.is_some() { None } else {
-                endpoint_lock::selected_delay(claimed, endpoint.interface, endpoint.alternate,
-                    endpoint.address, true).or_control()?
-            };
-            let buffer = CaptureBuffer::new(endpoint.format.clone(), capacity)
-                .map_err(|e| Error::InvalidArgument(format!("capture buffer: {e:?}")))?;
-            Ok((shared, buffer, delay))
-        })();
-        match pair {
-            Ok((shared_implicit, buffer, delay)) => {
-                let mut attachment = Attachment::new(endpoint, shared_implicit, buffer);
-                attachment.lock_delay = delay;
+    while let Some(endpoint) = endpoints.next() {
+        match prepare_endpoint(claimed, playback, expected, endpoint, capacity) {
+            Ok(mut attachment) => {
+                if !attachment.shared_implicit && retryable_capture(&attachment.endpoint) {
+                    attachment.retry_endpoints = endpoints.filter(|candidate|
+                        same_retry_route(&attachment.endpoint, candidate)).collect();
+                }
                 return Ok(Arc::new(attachment));
             },
             Err(Error::DeviceLost) => return Err(Error::DeviceLost),
@@ -167,14 +190,42 @@ pub(super) fn prepare(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     Err(refusal.unwrap_or_else(|| Error::Unsupported { reason: "no claimed PCM capture alternate matches the duplex request".into(), offered: vec![] }))
 }
 
+/// Publish each attempted attachment before any clock/alternate mutation so
+/// stream-open cleanup always owns that attempt's rollback snapshot.
+pub(super) fn configure_with_retry(attachment: &mut Arc<Attachment>, claimed: &ClaimedHandle,
+    playback: &IsoStreamCandidate, expected: &crate::StreamFormat) -> Result<(), Error> {
+    let mut alternatives = None;
+    let capacity = attachment.capacity;
+    let input = if attachment.retry_endpoints.is_empty() { None } else { input_clock(claimed, &attachment.endpoint) };
+    loop {
+        if attachment.configure(claimed, playback, expected)? { return Ok(()); }
+        if !attachment.restore_rate(claimed) {
+            return Err(Error::Control("capture clock rollback failed before alternate retry".into()));
+        }
+        let endpoint = alternatives.get_or_insert_with(|| attachment.retry_endpoints.clone().into_iter())
+            .next().ok_or_else(|| Error::Unsupported {
+            reason: "no matching duplex PCM IN alternate is currently available at the verified capture rate".into(),
+            offered: vec![],
+        })?;
+        // Playback and its implicit source remain pinned. Recheck the live
+        // pairing before allocating or publishing the next independent IN plan.
+        if validate_alternates(playback, &endpoint)? || input_clock(claimed, &endpoint) != input {
+            return Err(Error::Unsupported { reason: "duplex retry changed the selected capture clock or implicit endpoint".into(), offered: vec![] });
+        }
+        let next = prepare_endpoint(claimed, playback, expected, endpoint, capacity)?;
+        *attachment = Arc::new(next);
+    }
+}
+
 impl Attachment {
     pub(super) fn new(endpoint: CaptureEndpoint, shared_implicit: bool, buffer: CaptureBuffer) -> Self {
         Self { endpoint, shared_implicit, buffer: Arc::new(Mutex::new(buffer)),
             error: Arc::new(Mutex::new(None)), retired: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None), lock_delay: None }
+            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None), rate_uncertain: AtomicBool::new(false),
+            retry_endpoints: Vec::new(), capacity: 0, lock_delay: None }
     }
-    pub(super) fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
-        expected: &crate::StreamFormat) -> Result<(), Error> {
+    fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
+        expected: &crate::StreamFormat) -> Result<bool, Error> {
         validate_clocks(claimed, playback, expected, &self.endpoint)?;
         if self.endpoint.vendor_pcm.is_some() {
             // Playback has activated both exact alternates; capture joins the
@@ -184,7 +235,7 @@ impl Attachment {
                 capture_stream::verify_vendor_interface_alternate(claimed, profile.interface_number, profile.alt_setting)?;
             }
             capture_stream::verify_vendor_capture_alternate(claimed, &self.endpoint, self.endpoint.alternate)?;
-            return Ok(());
+            return Ok(true);
         }
         if self.shared_implicit {
             // Playback owns both programming and activation of this IN source.
@@ -211,23 +262,33 @@ impl Attachment {
             if let Some(clock) = input_clock(claimed, &self.endpoint) {
                 let original = get_sampling_frequency(&claimed.handle, clock.control_interface, clock.source_id).map_err(Error::Control)?;
                 let target = capture_source_rate(&self.endpoint, Some(&clock))?;
+                let shared_root = expected.clock.as_ref().is_some_and(|output|
+                    (output.control_interface, output.source_id) == (clock.control_interface, clock.source_id));
+                if shared_root && original != target {
+                    return Err(Error::InvalidState("shared duplex capture source changed from the committed playback rate".into()));
+                }
                 if self.endpoint.adc3_route.is_none() {
                     verify_uac2_clock_factors(&claimed.handle, &clock).map_err(Error::Control)?;
+                }
+                if self.endpoint.adc3_route.is_none() || shared_root {
                     expected_source = Some((clock.clone(), original));
                 }
-                if original != target {
+                if !shared_root && original != target {
                     *self.original_rate.lock() = Some((clock, original, target));
                 }
             }
-            capture_stream::configure_capture_endpoint_guarded(claimed, &self.endpoint,
-                expected_source.as_ref().map(|(choice, original)| (choice, *original)))?;
+            if !capture_stream::configure_capture_endpoint_guarded(claimed, &self.endpoint,
+                expected_source.as_ref().map(|(choice, original)| (choice, *original)))? {
+                return Ok(false);
+            }
         }
         let current = candidate_audio_control_clock_choice(&claimed.handle.device(), &claimed.handle, playback)
             .map_err(Error::Control)?;
         if current.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
             return Err(Error::InvalidState("playback clock route changed while configuring duplex capture".into()));
         }
-        validate_clocks(claimed, playback, expected, &self.endpoint)
+        validate_clocks(claimed, playback, expected, &self.endpoint)?;
+        Ok(true)
     }
     pub(super) fn reader(&self, stop: Arc<AtomicBool>) -> CaptureHandle {
         CaptureHandle { endpoint: self.endpoint.clone(), buffer: self.buffer.clone(), error: self.error.clone(), stop, worker: None, paired: true, retired: Some(self.retired.clone()), deferred: Some(self.deferred.clone()) }
@@ -284,7 +345,9 @@ impl Attachment {
     pub(super) fn failure(&self) -> Option<Error> { self.error.lock().clone() }
     pub(super) fn retirement_guard(&self) -> Retirement { Retirement(self.retired.clone()) }
     fn restore_rate(&self, claimed: &ClaimedHandle) -> bool {
-        let Some((clock, rate, target)) = self.original_rate.lock().take() else { return true; };
+        let Some((clock, rate, target)) = self.original_rate.lock().clone() else {
+            return !self.rate_uncertain.load(Ordering::Acquire);
+        };
         // Only a distinct source can have a saved rate. Retire callbacks and
         // reset its alternate before restoring that source, while still awake.
         let result = claimed.set_alternate_setting(self.endpoint.interface, 0)
@@ -327,11 +390,13 @@ impl Attachment {
         if let Err(error) = result {
             // Keep the owning ADC3 function awake when a distinct capture
             // source could not be handed back after callback retirement.
+            self.rate_uncertain.store(true, Ordering::Release);
             claimed.adc3_power.disarm();
             set_last_error(Some(format!("capture clock rollback failed: {error}")));
             return false;
         }
-        true
+        *self.original_rate.lock() = None;
+        !self.rate_uncertain.load(Ordering::Acquire)
     }
     pub(super) fn reordered(&self) {
         self.deferred.record(crate::capture::CaptureStats {

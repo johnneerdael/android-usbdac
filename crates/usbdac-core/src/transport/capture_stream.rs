@@ -709,7 +709,7 @@ pub(super) fn configure_capture_endpoint_guarded(
     claimed: &ClaimedHandle,
     candidate: &CaptureEndpoint,
     expected_source: Option<(&ClockChoice, u32)>,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     if let Some(profile) = candidate.vendor_pcm.as_ref() {
         verify_vendor_capture(claimed, candidate)?;
         for interface in profile.claimed_interfaces() {
@@ -730,7 +730,7 @@ pub(super) fn configure_capture_endpoint_guarded(
         if profile.rate_control {
             vendor_pcm::program_rate(claimed, profile, candidate.format.sample_rate())?;
         }
-        return Ok(());
+        return Ok(true);
     }
     claimed
         .ensure_interface_claimed(candidate.control)
@@ -796,10 +796,35 @@ pub(super) fn configure_capture_endpoint_guarded(
                 "ADC3 capture route changed; negotiate again".into(),
             ));
         }
-        adc3::configure_adc3(&claimed.handle, route, rate).map_err(Error::Control)?;
-        claimed
-            .set_alternate_setting(candidate.interface, candidate.alternate)
-            .map_err(Error::Claim)?;
+        if let Some((expected, expected_raw_rate)) = expected_source {
+            if actual.choice.as_ref() != Some(expected)
+                || route.source_rate(rate).map_err(Error::Control)? != expected_raw_rate {
+                return Err(Error::InvalidState(
+                    "ADC3 capture clock differs from the proven playback source".into(),
+                ));
+            }
+            // A shared playback source is already proven and active. Verify it
+            // read-only before IN activation instead of programming its rate.
+            adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate)
+                .map_err(Error::Control)?;
+        } else {
+            adc3::configure_adc3(&claimed.handle, route, rate).map_err(Error::Control)?;
+        }
+        // Full ADC3 owns an explicit clock choice; BADD retains its existing
+        // activation/error contract and must not authorize a retry.
+        if route.choice.is_some() {
+            if !claimed
+                .try_set_alternate_setting(candidate.interface, candidate.alternate)
+                .map_err(|error| if crate::error::is_device_gone(&error) {
+                    Error::DeviceLost
+                } else { Error::Claim(error) })? {
+                return Ok(false);
+            }
+        } else {
+            claimed
+                .set_alternate_setting(candidate.interface, candidate.alternate)
+                .map_err(Error::Claim)?;
+        }
         let actual = adc3::adc3_capture_route_for_endpoint(
             claimed,
             &config,
@@ -858,7 +883,9 @@ pub(super) fn configure_capture_endpoint_guarded(
         }
         let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
         if reported != Some(rate) {
-            if source[5] & 3 != 3 {
+            // A caller that already proved the target source rate expects a
+            // read-only verification during activation.
+            if expected_source.is_some_and(|(_, proven)| proven == source_rate) || source[5] & 3 != 3 {
                 return Err(Error::ClockUnverified {
                     requested_hz: rate,
                     reported_hz: reported,
@@ -906,9 +933,13 @@ pub(super) fn configure_capture_endpoint_guarded(
                 reported_hz: reported,
             });
         }
-        claimed
-            .set_alternate_setting(candidate.interface, candidate.alternate)
-            .map_err(Error::Claim)?;
+        if !claimed
+            .try_set_alternate_setting(candidate.interface, candidate.alternate)
+            .map_err(|error| if crate::error::is_device_gone(&error) {
+                Error::DeviceLost
+            } else { Error::Claim(error) })? {
+            return Ok(false);
+        }
         // Re-read route after activation; no fallback clock can authorize IN.
         if strict_implicit_clock(
             &config,
@@ -933,7 +964,7 @@ pub(super) fn configure_capture_endpoint_guarded(
             return Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported });
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn verify_capture_wire_rate(rate: u32, reported: Option<u32>) -> Result<(), Error> {
@@ -1173,8 +1204,15 @@ pub(crate) fn open_capture(
         }
         break (buffer, geometry);
     };
-    configure_capture_endpoint_guarded(owner.claimed(), &endpoint,
-        owner.clock_route.as_ref().map(|route| route.expected_active_source()))?;
+    if !configure_capture_endpoint_guarded(owner.claimed(), &endpoint,
+        owner.clock_route.as_ref().map(|route| route.expected_active_source()))? {
+        // The owner still holds the clock lease and retires it normally. A
+        // late clean rejection does not start a worker or retry another route.
+        return Err(Error::Unsupported {
+            reason: "the selected PCM IN alternate became unavailable before capture activation".into(),
+            offered: vec![],
+        });
+    }
     let error = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let worker_buffer = buffer.clone();
