@@ -110,27 +110,44 @@ pub fn parse_request(text: &str) -> Result<CaptureRequest, BadRequest> {
                 if !matches!(label, "adc3_information" | "adc3_ambisonic")
                     && entry.get("topology").is_some_and(|v| !v.is_null())
                 {
-                    return Err(BadRequest("unexpected ADC3 topology for channel label".into()));
+                    return Err(BadRequest(
+                        "unexpected ADC3 topology for channel label".into(),
+                    ));
                 }
                 let topology = &entry["topology"];
-                let field = |name: &str| topology[name].as_u64().and_then(|v|u8::try_from(v).ok()).ok_or_else(||BadRequest(format!("ADC3 channel {name} must be a byte")));
-                let position = if label == "adc3_information" && topology["type"] == "adc3Information" {
-                    ChannelPosition::Adc3Information {purpose:field("purpose")?,relationship:field("relationship")?,group:field("group")?}
-                } else if label == "adc3_ambisonic" && topology["type"] == "adc3Ambisonic" {
-                    ChannelPosition::Adc3Ambisonic {ordering:field("ordering")?,acn:field("acn")?,normalization:field("normalization")?,group:field("group")?}
-                } else if label == "unspecified" {
-                    ChannelPosition::Unspecified {
-                        index: index as u16,
-                    }
-                } else {
-                    POSITIONS
-                        .iter()
-                        .find(|(name, _)| *name == label)
-                        .map(|(_, position)| *position)
-                        .ok_or_else(|| {
-                            BadRequest(format!("unknown capture channel label {label}"))
-                        })?
+                let field = |name: &str| {
+                    topology[name]
+                        .as_u64()
+                        .and_then(|v| u8::try_from(v).ok())
+                        .ok_or_else(|| BadRequest(format!("ADC3 channel {name} must be a byte")))
                 };
+                let position =
+                    if label == "adc3_information" && topology["type"] == "adc3Information" {
+                        ChannelPosition::Adc3Information {
+                            purpose: field("purpose")?,
+                            relationship: field("relationship")?,
+                            group: field("group")?,
+                        }
+                    } else if label == "adc3_ambisonic" && topology["type"] == "adc3Ambisonic" {
+                        ChannelPosition::Adc3Ambisonic {
+                            ordering: field("ordering")?,
+                            acn: field("acn")?,
+                            normalization: field("normalization")?,
+                            group: field("group")?,
+                        }
+                    } else if label == "unspecified" {
+                        ChannelPosition::Unspecified {
+                            index: index as u16,
+                        }
+                    } else {
+                        POSITIONS
+                            .iter()
+                            .find(|(name, _)| *name == label)
+                            .map(|(_, position)| *position)
+                            .ok_or_else(|| {
+                                BadRequest(format!("unknown capture channel label {label}"))
+                            })?
+                    };
                 positions.push(position);
             }
             Some(
@@ -180,8 +197,17 @@ mod tests {
         let map = ChannelMap::from_positions(vec![
             ChannelPosition::FrontRight,
             ChannelPosition::Unspecified { index: 1 },
-            ChannelPosition::Adc3Information {purpose:0x91,relationship:0x83,group:7},
-            ChannelPosition::Adc3Ambisonic {ordering:2,acn:3,normalization:1,group:9},
+            ChannelPosition::Adc3Information {
+                purpose: 0x91,
+                relationship: 0x83,
+                group: 7,
+            },
+            ChannelPosition::Adc3Ambisonic {
+                ordering: 2,
+                acn: 3,
+                normalization: 1,
+                group: 9,
+            },
         ])
         .unwrap();
         let request = json!({ "sample_rate": 48000, "channels": 4, "valid_bits": 24, "channel_map": channel_map(&map) });

@@ -1229,7 +1229,7 @@ mod tests {
             raw_words: vec![128 << 12 | 256, 0],
         };
         assert_eq!(
-            validate_banks(&sources, &destinations, &[valid.clone()]),
+            validate_banks(&sources, &destinations, std::slice::from_ref(&valid)),
             Ok(())
         );
         for words in [

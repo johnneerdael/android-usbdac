@@ -1,0 +1,14 @@
+#!/bin/sh
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+modprobe xhci-pci
+/bin/busybox sleep 2
+/bin/busybox timeout 12 /qemu_smoke
+single=$?
+echo SINGLE_PROBE_EXIT=$single
+/bin/busybox timeout 15 /two_dac_smoke
+two=$?
+echo TWO_PROBE_EXIT=$two
+/bin/busybox poweroff -f

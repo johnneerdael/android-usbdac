@@ -103,7 +103,9 @@ fn isolated_failed_packet_latches_loss_and_keeps_the_stream_running() {
     assert_eq!(tracker.lost_frames(), 6);
     assert_eq!(tracker.zero_packets(), 1);
     assert_eq!(tracker.data_urb_timeouts(), 0);
-    assert!(tracker.record(SCHEDULE_FRAMES, lossless()).counts_as_successful_transfer());
+    assert!(tracker
+        .record(SCHEDULE_FRAMES, lossless())
+        .counts_as_successful_transfer());
     assert!(tracker.is_latched());
     for _ in 0..3 {
         assert_eq!(tracker.record(SCHEDULE_FRAMES, loss).fatal, None);
@@ -504,7 +506,10 @@ fn held_silence_the_dac_did_not_take_is_not_lost_audio() {
     let verdict = tracker.record(SCHEDULE_FRAMES, held(lossy_by(10)));
 
     assert!(!verdict.newly_latched);
-    assert!(!tracker.is_latched(), "no music was lost, so bit-perfect stands");
+    assert!(
+        !tracker.is_latched(),
+        "no music was lost, so bit-perfect stands"
+    );
     assert_eq!(tracker.lost_frames(), 0);
     assert_eq!(tracker.held_lost_frames(), 10);
     // The DAC still did not take those wire frames.
@@ -522,7 +527,11 @@ fn a_held_urb_that_times_out_is_a_timeout_but_not_lost_audio() {
         held(timed_out_loss(&SCHEDULE, &descriptors)),
     );
 
-    assert_eq!(tracker.data_urb_timeouts(), 1, "the timeout is still counted");
+    assert_eq!(
+        tracker.data_urb_timeouts(),
+        1,
+        "the timeout is still counted"
+    );
     assert_eq!(tracker.held_lost_frames(), SCHEDULE_FRAMES);
     assert_eq!(tracker.lost_frames(), 0);
     assert!(!tracker.is_latched());
@@ -537,7 +546,10 @@ fn held_silence_does_not_spend_the_lost_audio_budget() {
     });
     // Far more than the budget, but all of it silence.
     for _ in 0..50 {
-        assert_eq!(tracker.record(SCHEDULE_FRAMES, held(lossy_by(40))).fatal, None);
+        assert_eq!(
+            tracker.record(SCHEDULE_FRAMES, held(lossy_by(40))).fatal,
+            None
+        );
         // A healthy URB between them keeps the consecutive counter out of it.
         assert_eq!(tracker.record(SCHEDULE_FRAMES, lossless()).fatal, None);
     }
@@ -576,7 +588,11 @@ fn music_lost_after_a_hold_still_latches_and_is_counted() {
     let verdict = tracker.record(SCHEDULE_FRAMES, lossy_by(7));
     assert!(verdict.newly_latched);
     assert!(tracker.is_latched());
-    assert_eq!(tracker.lost_frames(), 7, "only the music loss is audio loss");
+    assert_eq!(
+        tracker.lost_frames(),
+        7,
+        "only the music loss is audio loss"
+    );
     assert_eq!(tracker.held_lost_frames(), 10);
 }
 
@@ -586,9 +602,16 @@ fn a_timed_out_urb_and_its_resubmission_count_every_frame_once() {
     // the next frames from the ring. Over the whole sequence each queued frame
     // is either consumed or lost, exactly once, whatever the URBs carried.
     let mut tracker = LossTracker::new(lenient_limits());
-    let timed_out = timed_out_loss(&SCHEDULE, &descriptors(&SCHEDULE, &[20, 24, 0, 0, 0, 0, 0, 0]));
+    let timed_out = timed_out_loss(
+        &SCHEDULE,
+        &descriptors(&SCHEDULE, &[20, 24, 0, 0, 0, 0, 0, 0]),
+    );
     let partial_loss = timed_out.lost_frames;
-    assert_eq!(partial_loss, SCHEDULE_FRAMES - 11, "two packets went out whole");
+    assert_eq!(
+        partial_loss,
+        SCHEDULE_FRAMES - 11,
+        "two packets went out whole"
+    );
 
     let sequence = [
         (lossless(), 0u64),
@@ -612,8 +635,16 @@ fn a_timed_out_urb_and_its_resubmission_count_every_frame_once() {
         wire_lost += lost;
     }
 
-    assert_eq!(consumed + wire_lost, queued, "no frame counted twice or missed");
-    assert_eq!(tracker.lost_frames(), partial_loss, "audio loss: the timed-out URB only");
+    assert_eq!(
+        consumed + wire_lost,
+        queued,
+        "no frame counted twice or missed"
+    );
+    assert_eq!(
+        tracker.lost_frames(),
+        partial_loss,
+        "audio loss: the timed-out URB only"
+    );
     assert_eq!(tracker.held_lost_frames(), 22);
     assert_eq!(tracker.data_urb_timeouts(), 1);
     assert_eq!(

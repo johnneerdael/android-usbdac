@@ -5,6 +5,12 @@ public enum class StreamEncoding {
     /** Linear PCM. */
     PCM,
 
+    /** Type I unsigned 8-bit PCM; one byte per sample and silence 0x80. */
+    PCM_U8,
+
+    /** Type I IEEE-754 binary32 PCM, exact little-endian bits including NaN payloads. */
+    PCM_FLOAT32,
+
     /** DSD over PCM: DSD bits carried in 24-bit PCM words with alternating marker bytes. */
     DOP,
 
@@ -48,6 +54,14 @@ public data class StreamRequest(
             bitDepth: Int,
             ratePolicy: RatePolicy = RatePolicy.EXACT,
         ): StreamRequest = StreamRequest(sampleRate, channels, bitDepth, StreamEncoding.PCM, null, ratePolicy)
+
+        /** Type I unsigned 8-bit PCM. */
+        public fun pcmU8(sampleRate: Int, channels: Int, ratePolicy: RatePolicy = RatePolicy.EXACT): StreamRequest =
+            StreamRequest(sampleRate, channels, 8, StreamEncoding.PCM_U8, null, ratePolicy)
+
+        /** Type I IEEE-754 binary32 PCM; the exact byte path performs no numeric conversion. */
+        public fun pcmFloat32(sampleRate: Int, channels: Int, ratePolicy: RatePolicy = RatePolicy.EXACT): StreamRequest =
+            StreamRequest(sampleRate, channels, 32, StreamEncoding.PCM_FLOAT32, null, ratePolicy)
 
         /**
          * A DoP stream. The carrier is 24-bit PCM at `dsdBitRate / 16`, so DSD64 needs a DAC
@@ -206,5 +220,17 @@ public data class DacStreamStats(
     val implicitInvalidPackets: Long = 0,
     val implicitMeasuredFrames: Long = 0,
     val implicitScheduledFrames: Long = 0,
+    /** Worker wakeup intervals longer than 10 ms. */
+    val workerGapOver10ms: Long = 0,
+    /** Worker wakeup intervals longer than 50 ms. */
+    val workerGapOver50ms: Long = 0,
+    /** Longest measured output-worker wakeup interval, in microseconds. */
+    val maxWorkerGapUs: Long = 0,
+    /** Adaptive USB queue depth changes since the stream started. */
+    val adaptiveQueueChanges: Long = 0,
+    /** Current adaptive USB transfer slot target. */
+    val adaptiveQueueSlots: Long = 0,
+    /** Current adaptive USB queue target, in microseconds. */
+    val adaptiveQueueUs: Long = 0,
 
 )

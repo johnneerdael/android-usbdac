@@ -689,12 +689,12 @@ fn read_expected(
     deadline: Instant,
 ) -> Result<(), Error> {
     let (result, response) = read_control(claimed, read.address, read.expected.len(), deadline)?;
-    if result as usize != read.expected.len() || response[..read.expected.len()] != read.expected {
+    if result != read.expected.len() || response[..read.expected.len()] != read.expected {
         return Err(Error::Control(format!(
             "Audio status changed or invalid readback for {:?}: expected {:?}, received {:?}",
             read.address,
             read.expected,
-            &response[..(result as usize).min(response.len())]
+            &response[..result.min(response.len())]
         )));
     }
     Ok(())
@@ -732,7 +732,7 @@ fn raw_read_control(
         .ok_or_else(verification_expired)?;
     // usbfs takes integer milliseconds: a positive sub-millisecond remainder
     // must round up instead of becoming an unbounded zero-timeout request.
-    let timeout_ms = ((remaining.as_nanos() + 999_999) / 1_000_000) as u32;
+    let timeout_ms = remaining.as_nanos().div_ceil(1_000_000) as u32;
     let mut response = vec![0; length];
     let transfer = UsbfsControlTransfer {
         request_type,
@@ -1050,7 +1050,10 @@ mod tests {
                 // Format and alternate notifications retain the exact DSD/PCM
                 // mask selected for this interface, including a PCM sync peer.
                 for selector in [1, 2, 3] {
-                    assert_eq!(triggered_reads(&target.reads, &[0, 1, 0, selector, 3, 0]), vec![0]);
+                    assert_eq!(
+                        triggered_reads(&target.reads, &[0, 1, 0, selector, 3, 0]),
+                        vec![0]
+                    );
                 }
             }
         }

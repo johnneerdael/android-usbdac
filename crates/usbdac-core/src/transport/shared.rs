@@ -10,6 +10,7 @@ pub(crate) struct StreamShared {
     pub(crate) stats: Arc<RuntimeStats>,
     pub(crate) events: EventSink,
     pub(crate) dsd_transport: DsdTransportMode,
+    pcm_encoding: PcmEncoding,
     pub(crate) subslot_bytes: usize,
     pub(crate) channels: usize,
 }
@@ -32,6 +33,7 @@ impl StreamShared {
             stats,
             events,
             dsd_transport: playback_format.dsd_transport,
+            pcm_encoding: playback_format.pcm_encoding,
             subslot_bytes: usize::from(subslot_size).max(1),
         }
     }
@@ -75,16 +77,26 @@ impl StreamShared {
         self.ensure_writable()?;
         let taken = {
             let mut ring = self.ring.lock();
-            let taken = ring.push_bytes(bytes, self.subslot_bytes, self.native_dsd());
+            let taken = ring.push_bytes_encoding(
+                bytes,
+                self.subslot_bytes,
+                self.native_dsd(),
+                self.pcm_encoding == PcmEncoding::Unsigned8,
+            );
             self.stats
                 .buffered_samples
                 .store(ring.len_samples(), Ordering::Release);
             taken
         };
-        let ring_samples = if self.native_dsd() { taken } else { taken / self.subslot_bytes };
-        self.stats
-            .producer_frames
-            .fetch_add((ring_samples / self.channels.max(1)) as u64, Ordering::Relaxed);
+        let ring_samples = if self.native_dsd() {
+            taken
+        } else {
+            taken / self.subslot_bytes
+        };
+        self.stats.producer_frames.fetch_add(
+            (ring_samples / self.channels.max(1)) as u64,
+            Ordering::Relaxed,
+        );
         Ok(taken)
     }
 
@@ -92,6 +104,12 @@ impl StreamShared {
     /// the samples taken: whole wire frames only.
     pub(crate) fn write_samples(&self, samples: &[i32]) -> Result<usize, Error> {
         self.ensure_writable()?;
+        if self.pcm_encoding != PcmEncoding::Signed {
+            return Err(Error::Unsupported {
+                reason: "unsigned8/float32 require exact wire-byte write, not write_i32".into(),
+                offered: vec![],
+            });
+        }
         let granule = self.wire_frame_samples();
         let taken = {
             let mut ring = self.ring.lock();
@@ -127,7 +145,11 @@ impl StreamShared {
         if !needs_refill(queued, target) {
             return 0;
         }
-        let bytes_per_sample = if self.native_dsd() { 1 } else { self.subslot_bytes };
+        let bytes_per_sample = if self.native_dsd() {
+            1
+        } else {
+            self.subslot_bytes
+        };
         (target - queued) * bytes_per_sample / self.wire_frame_bytes() * self.wire_frame_bytes()
     }
 
@@ -147,9 +169,8 @@ impl StreamShared {
     }
 
     pub(crate) fn is_drained(&self) -> bool {
-        self.stats.draining.load(Ordering::Acquire)
-            && self.stats.started.load(Ordering::Acquire)
-            && self.stats.is_drained()
+        // An empty stream that never primed has no music on the bus and is already drained.
+        self.stats.draining.load(Ordering::Acquire) && self.stats.is_drained()
     }
 
     pub(crate) fn set_software_gain(&self, gain: f32) -> Result<(), Error> {
@@ -158,12 +179,17 @@ impl StreamShared {
                 "software gain must be a finite value between 0.0 and 16.0".into(),
             ));
         }
-        if gain != 1.0 && self.dsd_transport != DsdTransportMode::None {
+        if gain != 1.0
+            && (self.dsd_transport != DsdTransportMode::None
+                || self.pcm_encoding != PcmEncoding::Signed)
+        {
             return Err(Error::InvalidState(
-                "software gain would corrupt a DSD bitstream; it is PCM only".into(),
+                "software gain is supported only for signed integer PCM; exact unsigned8/float32/DSD bytes are preserved".into(),
             ));
         }
-        self.stats.gain_bits.store(gain.to_bits(), Ordering::Release);
+        self.stats
+            .gain_bits
+            .store(gain.to_bits(), Ordering::Release);
         set_software_volume_active(gain != 1.0);
         self.note_bit_perfect();
         Ok(())

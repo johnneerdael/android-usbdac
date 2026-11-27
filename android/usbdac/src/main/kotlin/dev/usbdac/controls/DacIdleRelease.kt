@@ -33,6 +33,14 @@ import kotlin.coroutines.CoroutineContext
  * // when the player resumes:  stream = idle.onResumed()   // same stream, or a reopened one
  * ```
  *
+ * Closing discards queued audio that the DAC has not played. Before resuming a decoder-backed player,
+ * save the audible media position (not the decoder/write position). Use [resume] to learn atomically
+ * whether a new output was opened. Only when its [IdleResume.reopened] is true, flush/rebase the
+ * player's counters and seek the decoder to that saved position before supplying PCM. A reopened
+ * stream starts at zero played frames; continuing with the decoder's next buffer would skip the
+ * discarded queue. A short pause returns the original output with its queue intact and requires no
+ * reseek. This class does not own the decoder and cannot perform that reseek.
+ *
  * It is generic over [PcmOutput], so it works for any output, though only a direct USB stream
  * has anything to gain.
  *
@@ -65,8 +73,8 @@ public class DacIdleRelease<T : PcmOutput>(
             timer?.cancel()
             timer = null
             current = output
+            mutableReleased.value = false
         }
-        mutableReleased.value = false
     }
 
     /** Playback paused: starts the timer. Does nothing if it is already running or nothing is attached. */
@@ -81,8 +89,13 @@ public class DacIdleRelease<T : PcmOutput>(
                     val output = synchronized(lock) { current } ?: return@withLock
                     withContext(NonCancellable + closeContext) {
                         runCatching { output.close() }
-                        synchronized(lock) { current = null }
-                        mutableReleased.value = true
+                        synchronized(lock) {
+                            // attach may replace the output while a blocking close finishes.
+                            if (current === output) {
+                                current = null
+                                mutableReleased.value = true
+                            }
+                        }
                     }
                 }
             }
@@ -94,15 +107,30 @@ public class DacIdleRelease<T : PcmOutput>(
      * or, if it was released, a new one from the [reopen] lambda. May take 100 ms or more when it
      * reopens; the reopen failing throws what the lambda throws and leaves the output released.
      */
-    public suspend fun onResumed(): T {
+    public suspend fun onResumed(): T = resume().output
+
+    /** Resume with an atomic indication of whether idleness discarded the old output and queue. */
+    public suspend fun resume(): IdleResume<T> {
         synchronized(lock) {
             timer?.cancel()
             timer = null
         }
         return transition.withLock {
-            synchronized(lock) { current } ?: reopen().also {
-                synchronized(lock) { current = it }
-                mutableReleased.value = false
+            val existing = synchronized(lock) { current }
+            if (existing != null) IdleResume(existing, false) else {
+                val opened = reopen()
+                val attached = synchronized(lock) {
+                    val attached = current
+                    if (attached == null) {
+                        current = opened
+                        mutableReleased.value = false
+                    }
+                    attached
+                }
+                if (attached != null) {
+                    withContext(NonCancellable + closeContext) { opened.close() }
+                    IdleResume(attached, false)
+                } else IdleResume(opened, true)
             }
         }
     }
@@ -121,3 +149,11 @@ public class DacIdleRelease<T : PcmOutput>(
         public const val DEFAULT_TIMEOUT_MS: Long = 30_000
     }
 }
+
+/** A resumed output and whether its old queued audio was discarded by idle release. */
+public data class IdleResume<T : PcmOutput>(
+    /** The output playback should now use. */
+    public val output: T,
+    /** True only when this resume opened a replacement output; reseek the decoder in that case. */
+    public val reopened: Boolean,
+)

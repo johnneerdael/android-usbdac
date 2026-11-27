@@ -18,17 +18,28 @@ fn valid_native_dsd_bit_rate(bit_rate: u32) -> bool {
     bit_rate >= MIN_NATIVE_DSD_BIT_RATE && bit_rate % 32 == 0
 }
 
-fn native_dsd_minimum_fits(capacity: usize, interval_us: u32, channels: u16, word_bytes: u8) -> bool {
+fn native_dsd_minimum_fits(
+    capacity: usize,
+    interval_us: u32,
+    channels: u16,
+    word_bytes: u8,
+) -> bool {
     if !(1..=32).contains(&channels) || !matches!(word_bytes, 1 | 2 | 4) || interval_us == 0 {
         return false;
     }
     let wire_rate = MIN_NATIVE_DSD_BIT_RATE / (u32::from(word_bytes) * 8);
-    capacity >= required_max_packet_bytes(wire_rate, interval_us,
-        usize::from(channels) * usize::from(word_bytes))
+    capacity
+        >= required_max_packet_bytes(
+            wire_rate,
+            interval_us,
+            usize::from(channels) * usize::from(word_bytes),
+        )
 }
 
 fn native_dsd_bit_rate(wire_rate: u32, word_bytes: u8) -> Option<u32> {
-    wire_rate.checked_mul(8)?.checked_mul(u32::from(word_bytes))
+    wire_rate
+        .checked_mul(8)?
+        .checked_mul(u32::from(word_bytes))
         .filter(|bit_rate| valid_native_dsd_bit_rate(*bit_rate))
 }
 
@@ -41,14 +52,21 @@ pub(crate) fn playback_format_from_request(
         return invalid("channels must be between 1 and 32");
     }
     let format = match request.encoding {
-        Encoding::Pcm => {
+        Encoding::Pcm | Encoding::PcmU8 | Encoding::PcmFloat32 => {
             if request.sample_rate < 8_000 || request.sample_rate > 1_536_000 {
                 return invalid("sample_rate must be between 8000 and 1536000 Hz");
             }
-            if !matches!(request.bit_depth, 16 | 24 | 32) {
-                return invalid("PCM bit_depth must be 16, 24 or 32");
+            let pcm_encoding = match request.encoding {
+                Encoding::Pcm => PcmEncoding::Signed,
+                Encoding::PcmU8 if request.bit_depth == 8 => PcmEncoding::Unsigned8,
+                Encoding::PcmFloat32 if request.bit_depth == 32 => PcmEncoding::Float32,
+                _ => return invalid("unsigned PCM requires 8 bits; IEEE float requires 32 bits"),
+            };
+            if pcm_encoding == PcmEncoding::Signed && !matches!(request.bit_depth, 16 | 24 | 32) {
+                return invalid("signed PCM bit_depth must be 16, 24 or 32");
             }
             PlaybackFormat {
+                pcm_encoding,
                 sample_rate: request.sample_rate,
                 bit_depth: request.bit_depth,
                 channels: request.channels,
@@ -65,6 +83,7 @@ pub(crate) fn playback_format_from_request(
                 return invalid("DoP bit_depth must be 24 or 32");
             }
             PlaybackFormat {
+                pcm_encoding: crate::transport::PcmEncoding::Signed,
                 sample_rate: request.sample_rate,
                 bit_depth: request.bit_depth,
                 channels: request.channels,
@@ -78,6 +97,7 @@ pub(crate) fn playback_format_from_request(
                 return invalid("the native DSD bit_rate must be a DSD rate (at least 2822400)");
             }
             PlaybackFormat {
+                pcm_encoding: crate::transport::PcmEncoding::Signed,
                 // The wire rate for a 4-byte subslot; the real one follows from
                 // the alternate setting that gets chosen.
                 sample_rate: bit_rate / 32,
@@ -159,7 +179,9 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
         });
     let restored = cleanup_claimed_handle(handle, None, lock_requested);
     if !restored {
-        return Err(Error::Control("playback descriptor probe could not restore USB ownership/power".into()));
+        return Err(Error::Control(
+            "playback descriptor probe could not restore USB ownership/power".into(),
+        ));
     }
     let (candidate, channel_map) = selected?;
 
@@ -167,8 +189,9 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     Ok(StreamFormat {
         request: *request,
         encoding: request.encoding,
-        sample_rate: native_wire_rate(effective, candidate.subslot_size)
-            .ok_or_else(|| Error::InvalidState("selected transport has no exact wire rate".into()))?,
+        sample_rate: native_wire_rate(effective, candidate.subslot_size).ok_or_else(|| {
+            Error::InvalidState("selected transport has no exact wire rate".into())
+        })?,
         channels: candidate.channels,
         channel_map,
         valid_bits: if native { 1 } else { candidate.bit_resolution },
@@ -195,7 +218,11 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
             },
         ),
         clock,
-        native_dsd_signature: if native { candidate.native_dsd.map(|p| p.signature()) } else { None },
+        native_dsd_signature: if native {
+            candidate.native_dsd.map(|p| p.signature())
+        } else {
+            None
+        },
     })
 }
 
@@ -242,6 +269,21 @@ pub(crate) fn open_stream(format: &StreamFormat, events: EventSink) -> Result<St
         }
     }
     start_stream(events, format)
+}
+
+pub(crate) fn volume_route_signature() -> Option<HardwareVolumeControl> {
+    SESSION_STATE
+        .lock()
+        .as_ref()
+        .and_then(|state| state.hardware_volume_control.clone())
+}
+
+/// The exact libusb owner retained after a normal lock-requested stream retires.
+pub(crate) fn retained_usb_handle_identity() -> Option<usize> {
+    IDLE_LOCK
+        .lock()
+        .as_ref()
+        .map(|lock| lock.handle.as_raw() as usize)
 }
 
 /// The DAC's capabilities, from the descriptor scan done at open.
@@ -295,22 +337,29 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
         .filter(|alt| matches!(alt.format, AltFormat::Pcm | AltFormat::Dop))
         .filter(|alt| alt.valid_bits >= 24 && alt.pacing.is_some())
         .flat_map(|alt| {
-            DOP_CARRIER_RATES
-                .iter()
-                .copied()
-                .filter(move |rate| supports(alt, *rate)
-                    && alt.max_packet_bytes >= required_max_packet_bytes(*rate,
-                        alt.service_interval_us, usize::from(alt.channels) * usize::from(alt.subslot_bytes))
-                    && (alt.format != AltFormat::Dop || playback_designs_dop_capacity(
-                        alt.max_packet_bytes, alt.service_interval_us, *rate)))
+            DOP_CARRIER_RATES.iter().copied().filter(move |rate| {
+                supports(alt, *rate)
+                    && alt.max_packet_bytes
+                        >= required_max_packet_bytes(
+                            *rate,
+                            alt.service_interval_us,
+                            usize::from(alt.channels) * usize::from(alt.subslot_bytes),
+                        )
+                    && (alt.format != AltFormat::Dop
+                        || playback_designs_dop_capacity(
+                            alt.max_packet_bytes,
+                            alt.service_interval_us,
+                            *rate,
+                        ))
+            })
         })
         .max();
     let mut native_dsd_bit_rates: Vec<u32> = dsd
         .iter()
         .flat_map(|alt| {
-            alt.sample_rates.iter().filter_map(move |rate| {
-                native_dsd_bit_rate(*rate, alt.subslot_bytes)
-            })
+            alt.sample_rates
+                .iter()
+                .filter_map(move |rate| native_dsd_bit_rate(*rate, alt.subslot_bytes))
         })
         .collect();
     native_dsd_bit_rates.sort_unstable();
@@ -336,11 +385,18 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
         supports_pcm: !pcm.is_empty(),
         supports_dop: dop_max_carrier.is_some(),
         dop_max_dsd_bit_rate: dop_max_carrier.map(|carrier| carrier * 16),
-        supports_native_dsd: !native_dsd_bit_rates.is_empty() || dsd.iter().any(|alt|
-            alt.uac_version != UacVersion::V3 && alt.rate_ranges.is_empty()
-                && alt.sample_rates.is_empty()
-                && native_dsd_minimum_fits(alt.max_packet_bytes, alt.service_interval_us,
-                    alt.channels, alt.subslot_bytes)),
+        supports_native_dsd: !native_dsd_bit_rates.is_empty()
+            || dsd.iter().any(|alt| {
+                alt.uac_version != UacVersion::V3
+                    && alt.rate_ranges.is_empty()
+                    && alt.sample_rates.is_empty()
+                    && native_dsd_minimum_fits(
+                        alt.max_packet_bytes,
+                        alt.service_interval_us,
+                        alt.channels,
+                        alt.subslot_bytes,
+                    )
+            }),
         native_dsd_bit_rates,
         has_explicit_feedback: alts.iter().any(|alt| alt.feedback_endpoint.is_some()),
         volume: control.map(|control| crate::volume::VolumeRange {
@@ -381,12 +437,23 @@ pub(crate) fn open_device(fd: RawFd, info: &crate::capabilities::DeviceInfo) -> 
 
 /// Register both directions through the native capture proof, preserving playback startup.
 pub(crate) fn open_duplex_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(), Error> {
-    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
-    if !info.unavailable_feedback_interfaces.is_empty() {
-        return Err(Error::Claim("duplex requires a complete combined claim plan".into()));
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Err(Error::PlatformUnsupported);
     }
-    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id,
-        info.product_name.clone(), info.device_name.clone(), info.claimed_interfaces.clone()).map_err(Error::Claim)?;
+    if !info.unavailable_feedback_interfaces.is_empty() {
+        return Err(Error::Claim(
+            "duplex requires a complete combined claim plan".into(),
+        ));
+    }
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        info.claimed_interfaces.clone(),
+    )
+    .map_err(Error::Claim)?;
     super::session::register_duplex_device(device, info.configuration_id)?;
     discover_idle_volume_control();
     Ok(())
@@ -398,45 +465,97 @@ pub(crate) fn open_capture_device(fd: RawFd, info: &crate::DeviceInfo) -> Result
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         return Err(Error::PlatformUnsupported);
     }
-    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id,
-        info.product_name.clone(), info.device_name.clone(), info.claimed_interfaces.clone())
-        .map_err(Error::Claim)?;
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        info.claimed_interfaces.clone(),
+    )
+    .map_err(Error::Claim)?;
     if !info.unavailable_feedback_interfaces.is_empty() {
-        return Err(Error::Claim("capture registration does not accept playback feedback claim metadata".into()));
+        return Err(Error::Claim(
+            "capture registration does not accept playback feedback claim metadata".into(),
+        ));
     }
     register_capture_device(device, info.configuration_id)
 }
 
 /// Descriptor-only vendor profile proof before any host claims.
-pub(crate) fn vendor_pcm_preflight(fd: RawFd, info: &crate::DeviceInfo) -> Result<Option<(u8, u8)>, Error> {
-    vendor_pcm_claims_preflight(fd, info).map(|profile| profile.and_then(|(configuration, interfaces)| {
-        (interfaces.len() == 1).then(|| (configuration, interfaces[0]))
-    }))
+pub(crate) fn vendor_pcm_preflight(
+    fd: RawFd,
+    info: &crate::DeviceInfo,
+) -> Result<Option<(u8, u8)>, Error> {
+    vendor_pcm_claims_preflight(fd, info).map(|profile| {
+        profile.and_then(|(configuration, interfaces)| {
+            (interfaces.len() == 1).then(|| (configuration, interfaces[0]))
+        })
+    })
 }
 
-pub(crate) fn vendor_pcm_claims_preflight(fd: RawFd, info: &crate::DeviceInfo) -> Result<Option<(u8, Vec<u8>)>, Error> {
-    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
-    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(),
-        info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
+pub(crate) fn vendor_pcm_claims_preflight(
+    fd: RawFd,
+    info: &crate::DeviceInfo,
+) -> Result<Option<(u8, Vec<u8>)>, Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Err(Error::PlatformUnsupported);
+    }
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        Vec::new(),
+    )
+    .map_err(Error::Claim)?;
     let wrapped = wrap_android_usb_handle(&device).map_err(Error::Claim)?;
     let usb = wrapped.handle.device();
-    let identity = usb.device_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
+    let identity = usb
+        .device_descriptor()
+        .map_err(|e| Error::Claim(e.to_string()))?;
     if identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id {
-        return Err(Error::Claim("USB identity changed before vendor PCM preflight".into()));
+        return Err(Error::Claim(
+            "USB identity changed before vendor PCM preflight".into(),
+        ));
     }
-    let config = usb.active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
-    if info.configuration_id.is_some_and(|id| id != config.number()) {
-        return Err(Error::Claim("USB configuration changed before vendor PCM preflight".into()));
+    let config = usb
+        .active_config_descriptor()
+        .map_err(|e| Error::Claim(e.to_string()))?;
+    if info
+        .configuration_id
+        .is_some_and(|id| id != config.number())
+    {
+        return Err(Error::Claim(
+            "USB configuration changed before vendor PCM preflight".into(),
+        ));
     }
     vendor_pcm::discover(&wrapped.handle, &config, resolve_device_speed(&usb))
-        .map(|profile| profile.map(|p| (config.number(), p.claimed_interfaces()))).map_err(Error::Claim)
+        .map(|profile| profile.map(|p| (config.number(), p.claimed_interfaces())))
+        .map_err(Error::Claim)
 }
 
-pub(crate) fn capture_preflight_device(fd: RawFd, info: &crate::DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>), Error> {
-    if !cfg!(any(target_os = "linux", target_os = "android")) { return Err(Error::PlatformUnsupported); }
-    let device = UsbDevice::try_new(fd, info.vendor_id, info.product_id, info.product_name.clone(),
-        info.device_name.clone(), Vec::new()).map_err(Error::Claim)?;
-    capture_stream::capture_claim_preflight(&device).map_err(|reason| Error::Unsupported { reason, offered: vec![] })
+pub(crate) fn capture_preflight_device(
+    fd: RawFd,
+    info: &crate::DeviceInfo,
+) -> Result<(u8, Vec<u8>, Vec<u8>), Error> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return Err(Error::PlatformUnsupported);
+    }
+    let device = UsbDevice::try_new(
+        fd,
+        info.vendor_id,
+        info.product_id,
+        info.product_name.clone(),
+        info.device_name.clone(),
+        Vec::new(),
+    )
+    .map_err(Error::Claim)?;
+    capture_stream::capture_claim_preflight(&device).map_err(|reason| Error::Unsupported {
+        reason,
+        offered: vec![],
+    })
 }
 
 /// Closes the DAC: settles the original volume level as `action` says, stops the
@@ -496,5 +615,4 @@ mod dsd_summary_tests {
         assert!(!native_dsd_minimum_fits(1023, 0, 2, 1));
         assert!(!native_dsd_minimum_fits(1023, 1000, 2, 0));
     }
-
 }

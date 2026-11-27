@@ -159,11 +159,15 @@ pub enum EndpointUsage {
 pub enum AltFormat {
     /// Linear PCM (also the carrier for DoP).
     Pcm,
+    /// Type I unsigned 8-bit PCM.
+    PcmU8,
+    /// Type I IEEE-754 binary32 PCM.
+    PcmFloat32,
     /// DoP only, using a source-backed carrier even without advertised PCM.
     Dop,
     /// Native DSD (format tag DSD).
     Dsd,
-    /// Anything else (float, PCM8, ...); never selected.
+    /// Other formats, including unsupported Type II/III compressed transports.
     Other,
 }
 
@@ -271,3 +275,27 @@ mod tests {
         assert_eq!(info.manufacturer_name.as_deref(), Some("Acme"));
     }
 }
+
+/// Authoritative shipped API boundaries used by the generated SDK status page.
+/// Update together with implementation when enabling another transport tier.
+#[derive(Debug, Clone, Copy)]
+pub struct ShippedSupport {
+    pub uac_versions: &'static [UacVersion],
+    pub playback: bool,
+    pub pcm_capture: bool,
+    pub duplex: bool,
+    /// None means no process-wide cap; each physical attachment has one owner.
+    pub max_open_devices: Option<usize>,
+    pub vendor_protocols: bool,
+    pub type_i_formats: &'static [&'static str],
+}
+
+pub const SHIPPED_SUPPORT: ShippedSupport = ShippedSupport {
+    uac_versions: &[UacVersion::V1, UacVersion::V2, UacVersion::V3],
+    playback: true,
+    pcm_capture: true,
+    duplex: true,
+    max_open_devices: None,
+    vendor_protocols: false,
+    type_i_formats: &["signed_pcm", "unsigned_pcm8", "float32"],
+};

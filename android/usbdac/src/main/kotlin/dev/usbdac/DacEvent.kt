@@ -2,6 +2,23 @@ package dev.usbdac
 
 import dev.usbdac.internal.parseVolumeState
 
+/** The compatibility admission a successfully started stream used, separate from its verdict. */
+public enum class CompatibilityFallbackTier(public val wireName: String) {
+    /** Host-paced asynchronous output without usable feedback; never bit-perfect while used. */
+    NOMINAL_ASYNC("nominal_async"),
+
+    /** A successful clock SET was accepted with unusable readback; the clock remains unverified. */
+    UNVERIFIED_CLOCK("unverified_clock");
+
+    internal companion object {
+        fun fromCode(code: Long): CompatibilityFallbackTier? = when (code) {
+            0L -> NOMINAL_ASYNC
+            1L -> UNVERIFIED_CLOCK
+            else -> null
+        }
+    }
+}
+
 /**
  * Something that happened to a session or its stream. Events are delivered from a library
  * thread, never from the audio path, in order; see [DacSession.events].
@@ -31,6 +48,19 @@ public sealed interface DacEvent {
     /** The device is gone. The session stays open until [DacSession.close]. */
     public data object DeviceLost : DacEvent
 
+    /**
+     * Successful stream startup used an explicitly allowed compatibility tier. Emitted after the
+     * first healthy OUT submission, never for a strict refusal or failed worker startup.
+     * [reason] explains admission; it does not verify the stream. Existing
+     * [BitPerfectBlocker.UNSYNCHRONIZED_ASYNC] and [BitPerfectBlocker.CLOCK_UNVERIFIED] verdicts remain.
+     * Device and stream listeners may both receive the native event; [DacSession.events] publishes
+     * it once through the device listener.
+     */
+    public data class CompatibilityFallback(
+        val tier: CompatibilityFallbackTier,
+        val reason: String,
+    ) : DacEvent
+
     /** A volume write requested through [DacVolume] failed; the call that asked had already returned. */
     public data class VolumeWriteFailed(val error: DacException) : DacEvent
 
@@ -48,6 +78,7 @@ internal object EventType {
     const val FEEDBACK_STALE = 5
     const val ERROR = 6
     const val DEVICE_LOST = 7
+    const val COMPATIBILITY_FALLBACK = 8
 }
 
 /** Converts one native `onEvent` call into a [DacEvent]. */
@@ -68,5 +99,8 @@ internal fun decodeEvent(type: Int, a: Long, b: Double, message: String?): DacEv
             parseNativeError(message) ?: DacException(DacErrorCode.UNKNOWN, message ?: "error code $a"),
         )
         EventType.DEVICE_LOST -> DacEvent.DeviceLost
+        EventType.COMPATIBILITY_FALLBACK -> CompatibilityFallbackTier.fromCode(a)?.let { tier ->
+            DacEvent.CompatibilityFallback(tier, message ?: "compatibility fallback ${tier.wireName}")
+        } ?: DacEvent.Unknown("compatibility fallback tier $a: ${message.orEmpty()}")
         else -> DacEvent.Unknown(message ?: "event type $type")
     }

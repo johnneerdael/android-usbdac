@@ -197,7 +197,7 @@ impl MixerUnit {
         if cells > 256 {
             return Err(InvalidRoute::TooManyCrosspoints);
         }
-        let bitmap_len = (cells + 7) / 8;
+        let bitmap_len = cells.div_ceil(8);
         if bytes.len() != 13 + pins + bitmap_len {
             return Err(InvalidRoute::MalformedDescriptor);
         }
@@ -289,7 +289,7 @@ impl MixerUnit {
         {
             return Err(InvalidRoute::TooManyCrosspoints);
         }
-        let count = (cells + 7) / 8;
+        let count = cells.div_ceil(8);
         let (base, start) = if protocol == RoutingProtocol::Adc3 {
             (13, 7)
         } else {

@@ -12,13 +12,16 @@ use std::collections::BTreeMap;
 // Release boundary: vendor routing was not shipped by the shared ALSA baseline.
 // This private compile-time fence has no feature, host-claim or runtime opt-in.
 const VENDOR_ROUTING_RELEASED: bool = false;
-const VENDOR_ROUTING_UNAVAILABLE: &str = "proprietary vendor routing is not available in this release";
+const VENDOR_ROUTING_UNAVAILABLE: &str =
+    "proprietary vendor routing is not available in this release";
 
 fn require_vendor_routing_release() -> Result<(), RoutingSessionError> {
     if VENDOR_ROUTING_RELEASED {
         Ok(())
     } else {
-        Err(RoutingSessionError::UnsupportedTopology(VENDOR_ROUTING_UNAVAILABLE.into()))
+        Err(RoutingSessionError::UnsupportedTopology(
+            VENDOR_ROUTING_UNAVAILABLE.into(),
+        ))
     }
 }
 
@@ -103,21 +106,36 @@ fn djm_route_identity(
 ) -> Result<(crate::pioneer::DjmModel, u8), RoutingSessionError> {
     let usb = idle.handle.device();
     let identity = usb.device_descriptor().map_err(djm_usb_error)?;
-    if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id
-        || identity.vendor_id() != info.vendor_id || identity.product_id() != info.product_id
+    if identity.vendor_id() != device.vendor_id
+        || identity.product_id() != device.product_id
+        || identity.vendor_id() != info.vendor_id
+        || identity.product_id() != info.product_id
     {
-        return Err(RoutingSessionError::Drift("DJM host and live USB identities differ".into()));
+        return Err(RoutingSessionError::Drift(
+            "DJM host and live USB identities differ".into(),
+        ));
     }
     let model = crate::pioneer::DjmModel::from_usb_id(identity.vendor_id(), identity.product_id())
-        .ok_or_else(|| RoutingSessionError::UnsupportedTopology("no supported DJM routing model".into()))?;
+        .ok_or_else(|| {
+            RoutingSessionError::UnsupportedTopology("no supported DJM routing model".into())
+        })?;
     let configuration = idle.handle.active_configuration().map_err(djm_usb_error)?;
     let config = usb.active_config_descriptor().map_err(djm_usb_error)?;
-    if config.number() != configuration || info.configuration_id.is_some_and(|id| id != configuration) {
-        return Err(RoutingSessionError::Drift("DJM selected and active configurations differ".into()));
+    if config.number() != configuration
+        || info.configuration_id.is_some_and(|id| id != configuration)
+    {
+        return Err(RoutingSessionError::Drift(
+            "DJM selected and active configurations differ".into(),
+        ));
     }
     let profile = vendor_pcm::discover(&idle.handle, &config, resolve_device_speed(&usb))
-        .or_control().map_err(RoutingSessionError::Session)?
-        .ok_or_else(|| RoutingSessionError::UnsupportedTopology("DJM routing requires a proven vendor PCM configuration".into()))?;
+        .or_control()
+        .map_err(RoutingSessionError::Session)?
+        .ok_or_else(|| {
+            RoutingSessionError::UnsupportedTopology(
+                "DJM routing requires a proven vendor PCM configuration".into(),
+            )
+        })?;
     if profile.configuration_number != configuration
         || !profile.claims_match(&device.claimed_interfaces)
         || !profile.claims_match(&idle.claimed_interfaces)
@@ -127,23 +145,36 @@ fn djm_route_identity(
         )));
     }
     if idle.handle.active_configuration().map_err(djm_usb_error)? != configuration {
-        return Err(RoutingSessionError::Drift("DJM active configuration changed during proof".into()));
+        return Err(RoutingSessionError::Drift(
+            "DJM active configuration changed during proof".into(),
+        ));
     }
     Ok((model, configuration))
 }
 
-pub(crate) fn djm_discover(shared: &crate::dac::DacShared)
-    -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
+pub(crate) fn djm_discover(
+    shared: &crate::dac::DacShared,
+) -> Result<crate::pioneer::DjmRoutingProfile, RoutingSessionError> {
     require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     shared.ensure_open().map_err(RoutingSessionError::Session)?;
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let idle = IDLE_LOCK.lock();
-    let idle = idle.as_ref().filter(|idle| idle.device_fd == device.fd)
-        .ok_or_else(|| RoutingSessionError::Session(Error::InvalidState("DJM routing requires the idle USB owner".into())))?;
+    let idle = idle
+        .as_ref()
+        .filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState(
+                "DJM routing requires the idle USB owner".into(),
+            ))
+        })?;
     let (model, configuration) = djm_route_identity(&device, idle, &shared.info)?;
-    Ok(crate::pioneer::DjmRoutingProfile { model, configuration, controls: model.controls() })
+    Ok(crate::pioneer::DjmRoutingProfile {
+        model,
+        configuration,
+        controls: model.controls(),
+    })
 }
 
 pub(crate) fn djm_apply(
@@ -159,21 +190,40 @@ pub(crate) fn djm_apply(
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let idle = IDLE_LOCK.lock();
-    let idle = idle.as_ref().filter(|idle| idle.device_fd == device.fd)
-        .ok_or_else(|| RoutingSessionError::Session(Error::InvalidState("DJM routing requires the idle USB owner".into())))?;
+    let idle = idle
+        .as_ref()
+        .filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState(
+                "DJM routing requires the idle USB owner".into(),
+            ))
+        })?;
     let actual = djm_route_identity(&device, idle, &shared.info)?;
     if actual != (model, configuration) {
-        return Err(RoutingSessionError::Drift("DJM model or configuration changed; rediscover routing".into()));
+        return Err(RoutingSessionError::Drift(
+            "DJM model or configuration changed; rediscover routing".into(),
+        ));
     }
     let (value, index) = model.request(key, option).ok_or_else(|| {
-        RoutingSessionError::Session(Error::InvalidArgument("unsupported DJM control or option ID".into()))
+        RoutingSessionError::Session(Error::InvalidArgument(
+            "unsupported DJM control or option ID".into(),
+        ))
     })?;
     // Every admitted DJM has exactly interface 0; derive the interface set from
     // fresh streaming proof rather than adding a vendor/Android claim.
     for interface in idle.claimed_interfaces.iter().copied() {
         let mut alternate = [0u8];
-        let read = idle.handle.read_control(0x81, 0x0a, 0, u16::from(interface),
-            &mut alternate, Duration::from_millis(500)).map_err(djm_usb_error)?;
+        let read = idle
+            .handle
+            .read_control(
+                0x81,
+                0x0a,
+                0,
+                u16::from(interface),
+                &mut alternate,
+                Duration::from_millis(500),
+            )
+            .map_err(djm_usb_error)?;
         if read != 1 || alternate[0] != 0 {
             return Err(RoutingSessionError::Session(Error::InvalidState(
                 "DJM routing requires verified idle alternate zero".into(),
@@ -181,11 +231,15 @@ pub(crate) fn djm_apply(
         }
     }
     if idle.handle.active_configuration().map_err(djm_usb_error)? != configuration {
-        return Err(RoutingSessionError::Drift("DJM configuration changed before option write".into()));
+        return Err(RoutingSessionError::Drift(
+            "DJM configuration changed before option write".into(),
+        ));
     }
     shared.ensure_open().map_err(RoutingSessionError::Session)?;
-    let written = idle.handle.write_control(0x40, 0x03, value, index, &[],
-        Duration::from_millis(500)).map_err(djm_usb_error)?;
+    let written = idle
+        .handle
+        .write_control(0x40, 0x03, value, index, &[], Duration::from_millis(500))
+        .map_err(djm_usb_error)?;
     if written != 0 {
         return Err(RoutingSessionError::Session(Error::Control(
             "DJM option request returned an unexpected payload length".into(),
@@ -201,7 +255,9 @@ pub(super) fn scarlett_claim_interface(
     vendor: u16,
     product: u16,
 ) -> Option<u8> {
-    if !VENDOR_ROUTING_RELEASED { return None; }
+    if !VENDOR_ROUTING_RELEASED {
+        return None;
+    }
     scarlett_endpoint(config, vendor, product).map(|(interface, _)| interface)
 }
 
@@ -210,7 +266,9 @@ pub(crate) fn scarlett_preflight(
     fd: RawFd,
     info: &crate::DeviceInfo,
 ) -> Result<Option<crate::scarlett::ReadCapability>, Error> {
-    if !VENDOR_ROUTING_RELEASED { return Ok(None); }
+    if !VENDOR_ROUTING_RELEASED {
+        return Ok(None);
+    }
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         return Err(Error::PlatformUnsupported);
     }
@@ -340,7 +398,9 @@ fn scarlett_capability(
 /// Descriptor-only read capability; does not initialize the vendor protocol.
 pub(crate) fn scarlett_discover(
 ) -> Result<Option<crate::scarlett::ReadCapability>, RoutingSessionError> {
-    if !VENDOR_ROUTING_RELEASED { return Ok(None); }
+    if !VENDOR_ROUTING_RELEASED {
+        return Ok(None);
+    }
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
@@ -359,13 +419,17 @@ struct UsbScarlettIo<'a> {
 impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
     type Error = String;
     fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         self.device
             .feature_unit_control(0xa1, 0, 0, u16::from(self.interface), bytes)
             .map_err(|e| e.to_string())
     }
     fn prepare_notifications(&mut self) -> Result<(), String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         let deadline = Instant::now() + Duration::from_millis(20);
         // Drain outstanding ACKs before either initialization request. The
         // synchronous interrupt helper owns/retires its transfer before return.
@@ -389,7 +453,9 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
         Err("Scarlett notification drain exceeded its bounded packet budget".into())
     }
     fn send_request(&mut self, bytes: &[u8]) -> Result<usize, String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett request refused".into());
         }
@@ -403,13 +469,17 @@ impl crate::scarlett::ReadIo for UsbScarlettIo<'_> {
         bytes: &mut [u8; 8],
         timeout: Duration,
     ) -> Result<usize, String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         self.handle
             .read_interrupt(self.endpoint, bytes, timeout.max(Duration::from_millis(1)))
             .map_err(|e| e.to_string())
     }
     fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         if bytes.len() < 16 || bytes.len() > 16 + self.max_payload {
             return Err("unbounded Scarlett response refused".into());
         }
@@ -439,14 +509,15 @@ pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, Routin
     Ok(readback)
 }
 
-struct RecordedScarlett {
+pub(super) struct RecordedScarlett {
     device: UsbDevice,
     configuration: u8,
     descriptors: Vec<u8>,
     rows: BTreeMap<u8, (crate::scarlett::MixReadback, crate::scarlett::MixReadback)>,
     mux: Option<(crate::scarlett::MuxSnapshot, crate::scarlett::MuxSnapshot)>,
 }
-static ORIGINAL_SCARLETT: Mutex<Option<RecordedScarlett>> = Mutex::new(None);
+static ORIGINAL_SCARLETT: context::ScopedMutex<Option<RecordedScarlett>> =
+    context::ScopedMutex::new(|context| context.scarlett.clone());
 
 /// The caller owns session/volume serialization. Recheck exact claim and USB
 /// identity for every operation, including configured hand-back.
@@ -469,7 +540,10 @@ fn with_scarlett_io<T>(
     device: &UsbDevice,
     configuration: u8,
     fcp: bool,
-    operation: impl FnOnce(UsbScarlettIo<'_>, crate::scarlett::CandidateModel) -> Result<T, RoutingSessionError>,
+    operation: impl FnOnce(
+        UsbScarlettIo<'_>,
+        crate::scarlett::CandidateModel,
+    ) -> Result<T, RoutingSessionError>,
 ) -> Result<T, RoutingSessionError> {
     let capability = scarlett_capability(device, configuration)?.ok_or_else(|| {
         RoutingSessionError::UnsupportedTopology("no exact Scarlett candidate".into())
@@ -501,7 +575,11 @@ fn with_scarlett_io<T>(
         handle: &idle.handle,
         interface: capability.interface,
         endpoint: capability.notification_endpoint,
-        max_payload: if fcp { crate::scarlett::FCP_MAX_PAYLOAD } else { crate::scarlett::MAX_PAYLOAD },
+        max_payload: if fcp {
+            crate::scarlett::FCP_MAX_PAYLOAD
+        } else {
+            crate::scarlett::MAX_PAYLOAD
+        },
     };
     operation(io, capability.candidate)
 }
@@ -518,7 +596,9 @@ pub(crate) fn fcp_read() -> Result<crate::scarlett::FcpReadback, RoutingSessionE
     })?;
     let (after, raw) = active_descriptors(&device)?;
     if configuration != after || descriptors != raw {
-        return Err(RoutingSessionError::Drift("configuration changed during FCP routing read".into()));
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during FCP routing read".into(),
+        ));
     }
     Ok(readback)
 }
@@ -526,91 +606,181 @@ pub(crate) fn fcp_read() -> Result<crate::scarlett::FcpReadback, RoutingSessionE
 // Gen1 uses standard two-byte class CUR controls on the already claimed AC
 // interface. Never infer a vendor-interface claim from the product identity.
 fn gen1_interface(raw: &[u8], claims: &[u8]) -> Result<u8, RoutingSessionError> {
-    let fail = || RoutingSessionError::UnsupportedTopology(
-        "Gen1 requires one claimed UAC2 AC alt0 with an owning streaming function".into());
+    let fail = || {
+        RoutingSessionError::UnsupportedTopology(
+            "Gen1 requires one claimed UAC2 AC alt0 with an owning streaming function".into(),
+        )
+    };
     // Validate configuration framing before inspecting ownership descriptors.
     routing_interfaces(raw, claims)?;
     let framed = framed(raw)?;
-    let controls: Vec<_> = framed.iter().filter(|b| b[1] == 4 && b.len() == 9
-        && b[3] == 0 && b[5] == 1 && b[6] == 1).collect();
-    if controls.len() != 1 { return Err(fail()); }
+    let controls: Vec<_> = framed
+        .iter()
+        .filter(|b| b[1] == 4 && b.len() == 9 && b[3] == 0 && b[5] == 1 && b[6] == 1)
+        .collect();
+    if controls.len() != 1 {
+        return Err(fail());
+    }
     let ac = controls[0][2];
-    if controls[0][7] != 0x20 || !claims.contains(&ac) { return Err(fail()); }
-    if framed.iter().any(|b| b[1] == 11 && b.len() != 8) {return Err(fail());}
-    let associations: Vec<_> = framed.iter().filter(|b| b[1] == 11 && b.len() == 8
-        && ac >= b[2]
-        && u16::from(ac) < u16::from(b[2]) + u16::from(b[3])).copied().collect();
-    if associations.len() > 1 { return Err(fail()); }
+    if controls[0][7] != 0x20 || !claims.contains(&ac) {
+        return Err(fail());
+    }
+    if framed.iter().any(|b| b[1] == 11 && b.len() != 8) {
+        return Err(fail());
+    }
+    let associations: Vec<_> = framed
+        .iter()
+        .filter(|b| {
+            b[1] == 11
+                && b.len() == 8
+                && ac >= b[2]
+                && u16::from(ac) < u16::from(b[2]) + u16::from(b[3])
+        })
+        .copied()
+        .collect();
+    if associations.len() > 1 {
+        return Err(fail());
+    }
     let iad = associations.first().copied();
-    if iad.is_some_and(|b| b[4] != 1 || b[6] != 0x20) {return Err(fail());}
+    if iad.is_some_and(|b| b[4] != 1 || b[6] != 0x20) {
+        return Err(fail());
+    }
     let interfaces = routing_interfaces(raw, claims)?;
     let entities = &interfaces.get(&ac).ok_or_else(fail)?.1;
-    let headers: Vec<_> = entities.iter().filter(|b| b.len() >= 3 && b[2] == 1).collect();
-    if headers.len() != 1 || headers[0].len() != 9
+    let headers: Vec<_> = entities
+        .iter()
+        .filter(|b| b.len() >= 3 && b[2] == 1)
+        .collect();
+    if headers.len() != 1
+        || headers[0].len() != 9
         || headers[0][3..5] != [0, 2]
         || usize::from(u16::from_le_bytes([headers[0][6], headers[0][7]]))
-            != entities.iter().map(|b| b.len()).sum::<usize>() { return Err(fail()); }
+            != entities.iter().map(|b| b.len()).sum::<usize>()
+    {
+        return Err(fail());
+    }
     let mut entity_ids = BTreeMap::new();
     for b in entities.iter().filter(|b| b.len() >= 3 && b[2] != 1) {
-        if b.len() < 4 || b[3] == 0 || entity_ids.insert(b[3], ()).is_some()
-            || (b[2] == 2 && b.len() != 17) || (b[2] == 3 && b.len() != 12) {
+        if b.len() < 4
+            || b[3] == 0
+            || entity_ids.insert(b[3], ()).is_some()
+            || (b[2] == 2 && b.len() != 17)
+            || (b[2] == 3 && b.len() != 12)
+        {
             return Err(fail());
         }
     }
-    let terminals: Vec<_> = entities.iter().filter(|b| b.len() >= 4
-        && matches!(b[2], 2 | 3) && b[4..6] == [1, 1]).map(|b| b[3]).collect();
-    if terminals.is_empty() { return Err(fail()); }
+    let terminals: Vec<_> = entities
+        .iter()
+        .filter(|b| b.len() >= 4 && matches!(b[2], 2 | 3) && b[4..6] == [1, 1])
+        .map(|b| b[3])
+        .collect();
+    if terminals.is_empty() {
+        return Err(fail());
+    }
     let mut stream = None;
     let mut linked_terminal = None;
     let mut linked = false;
     for b in &framed {
         if b[1] == 4 {
             linked_terminal = None;
-            stream = if b.len() == 9 && b[3] != 0 && b[4] != 0
-                && b[5] == 1 && b[6] == 2 && b[7] == 0x20
-                && iad.map_or(true, |iad| b[2] >= iad[2]
-                    && u16::from(b[2]) < u16::from(iad[2]) + u16::from(iad[3])) {
+            stream = if b.len() == 9
+                && b[3] != 0
+                && b[4] != 0
+                && b[5] == 1
+                && b[6] == 2
+                && b[7] == 0x20
+                && iad.map_or(true, |iad| {
+                    b[2] >= iad[2] && u16::from(b[2]) < u16::from(iad[2]) + u16::from(iad[3])
+                }) {
                 Some(b[2])
-            } else { None };
-        } else if b[1] == 0x24 && b.len() == 16 && b[2] == 1 && stream.is_some()
-            && terminals.contains(&b[3]) {
+            } else {
+                None
+            };
+        } else if b[1] == 0x24
+            && b.len() == 16
+            && b[2] == 1
+            && stream.is_some()
+            && terminals.contains(&b[3])
+        {
             let number = stream.unwrap();
-            let owners: Vec<_> = framed.iter().filter(|d| d[1] == 11 && d.len() == 8
-                && number >= d[2] && u16::from(number) < u16::from(d[2]) + u16::from(d[3])).copied().collect();
-            if owners.len() > 1 || owners.first().is_some_and(|owner|
-                iad.map_or(true, |iad| *owner != iad)) {return Err(fail());}
-            linked_terminal = entities.iter().find(|d| d.len() >= 6 && d[3] == b[3]
-                && matches!(d[2], 2 | 3)).map(|d| d[2]);
-        } else if b[1] == 5 && matches!(b.len(), 7 | 9) && b[2] & 0x0f != 0
-            && b[3] & 3 == 1 && b[3] & 0x30 == 0 {
-            if linked_terminal.is_some_and(|subtype| (b[2] & 0x80 != 0) == (subtype == 3)) {
-                linked = true;
+            let owners: Vec<_> = framed
+                .iter()
+                .filter(|d| {
+                    d[1] == 11
+                        && d.len() == 8
+                        && number >= d[2]
+                        && u16::from(number) < u16::from(d[2]) + u16::from(d[3])
+                })
+                .copied()
+                .collect();
+            if owners.len() > 1 || owners.first().is_some_and(|owner| iad != Some(*owner)) {
+                return Err(fail());
             }
+            linked_terminal = entities
+                .iter()
+                .find(|d| d.len() >= 6 && d[3] == b[3] && matches!(d[2], 2 | 3))
+                .map(|d| d[2]);
+        } else if b[1] == 5
+            && matches!(b.len(), 7 | 9)
+            && b[2] & 0x0f != 0
+            && b[3] & 3 == 1
+            && b[3] & 0x30 == 0
+            && linked_terminal.is_some_and(|subtype| (b[2] & 0x80 != 0) == (subtype == 3))
+        {
+            linked = true;
         }
     }
-    if !linked { return Err(fail()); }
+    if !linked {
+        return Err(fail());
+    }
     Ok(ac)
 }
 
-struct UsbGen1Io<'a> { device: &'a UsbDevice, interface: u8 }
+struct UsbGen1Io<'a> {
+    device: &'a UsbDevice,
+    interface: u8,
+}
 impl crate::scarlett::Gen1Io for UsbGen1Io<'_> {
     type Error = String;
     fn read(&mut self, entity: u8, value: u16) -> Result<i16, String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         let mut data = [0u8; 2];
-        let n = self.device.feature_unit_control(0xa1, 1, value,
-            (u16::from(entity) << 8) | u16::from(self.interface), &mut data)
+        let n = self
+            .device
+            .feature_unit_control(
+                0xa1,
+                1,
+                value,
+                (u16::from(entity) << 8) | u16::from(self.interface),
+                &mut data,
+            )
             .map_err(|e| e.to_string())?;
-        if n != 2 { return Err("short Gen1 CUR read".into()); }
+        if n != 2 {
+            return Err("short Gen1 CUR read".into());
+        }
         Ok(i16::from_le_bytes(data))
     }
     fn write(&mut self, entity: u8, value: u16, data: i16) -> Result<(), String> {
-        if !VENDOR_ROUTING_RELEASED { return Err(VENDOR_ROUTING_UNAVAILABLE.into()); }
+        if !VENDOR_ROUTING_RELEASED {
+            return Err(VENDOR_ROUTING_UNAVAILABLE.into());
+        }
         let mut bytes = data.to_le_bytes();
-        let n = self.device.feature_unit_control(0x21, 1, value,
-            (u16::from(entity) << 8) | u16::from(self.interface), &mut bytes)
+        let n = self
+            .device
+            .feature_unit_control(
+                0x21,
+                1,
+                value,
+                (u16::from(entity) << 8) | u16::from(self.interface),
+                &mut bytes,
+            )
             .map_err(|e| e.to_string())?;
-        if n != 2 { return Err("short Gen1 CUR write".into()); }
+        if n != 2 {
+            return Err("short Gen1 CUR write".into());
+        }
         Ok(())
     }
 }
@@ -621,42 +791,72 @@ struct Gen1Binding {
     configuration: u8,
     descriptors: Vec<u8>,
 }
-struct RecordedGen1 {
+pub(super) struct RecordedGen1 {
     binding: Gen1Binding,
     original: crate::scarlett::Gen1Readback,
     last: crate::scarlett::Gen1Readback,
     uncertain: bool,
 }
-static ORIGINAL_GEN1: Mutex<Option<RecordedGen1>> = Mutex::new(None);
+static ORIGINAL_GEN1: context::ScopedMutex<Option<RecordedGen1>> =
+    context::ScopedMutex::new(|context| context.gen1.clone());
 
-fn gen1_target(device: &UsbDevice, descriptors: &[u8])
-    -> Result<(crate::scarlett::Gen1Model, u8), RoutingSessionError> {
+fn gen1_target(
+    device: &UsbDevice,
+    descriptors: &[u8],
+) -> Result<(crate::scarlett::Gen1Model, u8), RoutingSessionError> {
     let idle = IDLE_LOCK.lock();
-    let idle = idle.as_ref().filter(|idle| idle.device_fd == device.fd).ok_or_else(||
-        RoutingSessionError::Session(Error::InvalidState("Gen1 requires the idle USB owner".into())))?;
-    let identity = idle.handle.device().device_descriptor()
+    let idle = idle
+        .as_ref()
+        .filter(|idle| idle.device_fd == device.fd)
+        .ok_or_else(|| {
+            RoutingSessionError::Session(Error::InvalidState(
+                "Gen1 requires the idle USB owner".into(),
+            ))
+        })?;
+    let identity = idle
+        .handle
+        .device()
+        .device_descriptor()
         .map_err(|e| RoutingSessionError::Session(Error::Control(e.to_string())))?;
     if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
-        return Err(RoutingSessionError::Drift("Gen1 host and actual USB identities differ".into()));
+        return Err(RoutingSessionError::Drift(
+            "Gen1 host and actual USB identities differ".into(),
+        ));
     }
     let model = crate::scarlett::Gen1Model::recognize(identity.vendor_id(), identity.product_id())
         .ok_or_else(|| RoutingSessionError::UnsupportedTopology("no exact Gen1 model".into()))?;
-    Ok((model, gen1_interface(descriptors, &device.claimed_interfaces)?))
+    Ok((
+        model,
+        gen1_interface(descriptors, &device.claimed_interfaces)?,
+    ))
 }
-fn check_gen1_binding(binding: &Gen1Binding, device: &UsbDevice, configuration: u8,
-    descriptors: &[u8]) -> Result<(), RoutingSessionError> {
+fn check_gen1_binding(
+    binding: &Gen1Binding,
+    device: &UsbDevice,
+    configuration: u8,
+    descriptors: &[u8],
+) -> Result<(), RoutingSessionError> {
     if !Arc::ptr_eq(&binding.device._fd_owner, &device._fd_owner)
-        || binding.configuration != configuration || binding.descriptors != descriptors {
-        return Err(RoutingSessionError::Drift("Gen1 attachment or configuration changed".into()));
+        || binding.configuration != configuration
+        || binding.descriptors != descriptors
+    {
+        return Err(RoutingSessionError::Drift(
+            "Gen1 attachment or configuration changed".into(),
+        ));
     }
     gen1_interface(descriptors, &device.claimed_interfaces)?;
     Ok(())
 }
-fn check_gen1_after(device: &UsbDevice, configuration: u8, descriptors: &[u8])
-    -> Result<(), RoutingSessionError> {
+fn check_gen1_after(
+    device: &UsbDevice,
+    configuration: u8,
+    descriptors: &[u8],
+) -> Result<(), RoutingSessionError> {
     let (after, raw) = active_descriptors(device)?;
     if after != configuration || raw != descriptors {
-        return Err(RoutingSessionError::Drift("Gen1 configuration changed during control access".into()));
+        return Err(RoutingSessionError::Drift(
+            "Gen1 configuration changed during control access".into(),
+        ));
     }
     gen1_target(device, &raw)?;
     Ok(())
@@ -669,13 +869,24 @@ pub(crate) fn scarlett_gen1_read() -> Result<crate::scarlett::Gen1Readback, Rout
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
     let (model, interface) = gen1_target(&device, &descriptors)?;
-    let readback = crate::scarlett::read_gen1(&mut UsbGen1Io {device: &device, interface}, model)
-        .map_err(RoutingSessionError::Gen1Read);
+    let readback = crate::scarlett::read_gen1(
+        &mut UsbGen1Io {
+            device: &device,
+            interface,
+        },
+        model,
+    )
+    .map_err(RoutingSessionError::Gen1Read);
     let after = check_gen1_after(&device, configuration, &descriptors);
     match readback {
-        Ok(readback) => {after?; Ok(readback)}
+        Ok(readback) => {
+            after?;
+            Ok(readback)
+        }
         Err(error) => {
-            if let Err(drift) = after {log_warn!("[USB] Gen1 read also lost binding: {drift}");}
+            if let Err(drift) = after {
+                log_warn!("[USB] Gen1 read also lost binding: {drift}");
+            }
             Err(error)
         }
     }
@@ -683,65 +894,98 @@ pub(crate) fn scarlett_gen1_read() -> Result<crate::scarlett::Gen1Readback, Rout
 
 // Keep independently owned controls even when a later read contains external
 // changes to them. Such external values must never become a restore target.
-fn merge_gen1_provenance(original: &crate::scarlett::Gen1Readback,
-    last: &crate::scarlett::Gen1Readback, before: &crate::scarlett::Gen1Readback,
-    verified: &crate::scarlett::Gen1Readback)
-    -> (crate::scarlett::Gen1Readback, crate::scarlett::Gen1Readback) {
+fn merge_gen1_provenance(
+    original: &crate::scarlett::Gen1Readback,
+    last: &crate::scarlett::Gen1Readback,
+    before: &crate::scarlett::Gen1Readback,
+    verified: &crate::scarlett::Gen1Readback,
+) -> (crate::scarlett::Gen1Readback, crate::scarlett::Gen1Readback) {
     let mut saved = before.clone();
     let mut recent = verified.clone();
     for (index, control) in before.controls.iter().enumerate() {
         if let (Some(old), Some(previous)) = (
             original.controls.iter().find(|c| c.key == control.key),
-            last.controls.iter().find(|c| c.key == control.key)) {
+            last.controls.iter().find(|c| c.key == control.key),
+        ) {
             if old != previous {
-                saved.controls[index] = old.clone();
-                if control == &verified.controls[index] { recent.controls[index] = previous.clone(); }
+                saved.controls[index] = *old;
+                if control == &verified.controls[index] {
+                    recent.controls[index] = *previous;
+                }
             }
         }
     }
     (saved, recent)
 }
 
-pub(crate) fn scarlett_gen1_apply(expected: &crate::scarlett::Gen1Readback,
-    edits: &[crate::scarlett::Gen1Edit]) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
+pub(crate) fn scarlett_gen1_apply(
+    expected: &crate::scarlett::Gen1Readback,
+    edits: &[crate::scarlett::Gen1Edit],
+) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
     require_vendor_routing_release()?;
     let _gate = USB_SESSION_GATE.lock();
     let _controls = HARDWARE_VOLUME_MUTEX.lock();
     let device = idle_device()?;
     let (configuration, descriptors) = active_descriptors(&device)?;
     let (model, interface) = gen1_target(&device, &descriptors)?;
-    let binding = Gen1Binding {device: device.clone(), configuration, descriptors: descriptors.clone()};
+    let binding = Gen1Binding {
+        device: device.clone(),
+        configuration,
+        descriptors: descriptors.clone(),
+    };
     if expected.model != model {
-        return Err(RoutingSessionError::Drift("Gen1 readback belongs to another model".into()));
+        return Err(RoutingSessionError::Drift(
+            "Gen1 readback belongs to another model".into(),
+        ));
     }
     let mut records = ORIGINAL_GEN1.lock();
     if let Some(record) = records.as_ref() {
         check_gen1_binding(&record.binding, &device, configuration, &descriptors)?;
         if record.uncertain || !crate::scarlett::same_gen1_layout(&record.last, expected) {
-            return Err(RoutingSessionError::Drift("Gen1 layout or rollback state changed".into()));
+            return Err(RoutingSessionError::Drift(
+                "Gen1 layout or rollback state changed".into(),
+            ));
         }
         for control in &expected.controls {
             if edits.iter().any(|e| e.key == control.key) {
                 if let (Some(old), Some(last)) = (
-                    record.original.controls.iter().find(|c| c.key == control.key),
-                    record.last.controls.iter().find(|c| c.key == control.key)) {
+                    record
+                        .original
+                        .controls
+                        .iter()
+                        .find(|c| c.key == control.key),
+                    record.last.controls.iter().find(|c| c.key == control.key),
+                ) {
                     if old != last && control != last {
-                        return Err(RoutingSessionError::Drift("Gen1 control differs from last verified write".into()));
+                        return Err(RoutingSessionError::Drift(
+                            "Gen1 control differs from last verified write".into(),
+                        ));
                     }
                 }
             }
         }
     }
-    let result = crate::scarlett::apply_gen1(&mut UsbGen1Io {device: &device, interface}, model,
-        expected, edits);
+    let result = crate::scarlett::apply_gen1(
+        &mut UsbGen1Io {
+            device: &device,
+            interface,
+        },
+        model,
+        expected,
+        edits,
+    );
     // Invalidate on attempted transactions, including errors and uncertain rollback.
     invalidate_route_caches();
     let report = match result {
         Ok(report) => report,
         Err(failure) => {
             if !failure.rollback.is_empty() {
-                let record = records.get_or_insert_with(|| RecordedGen1 {binding: binding.clone(),
-                    original: expected.clone(), last: expected.clone(), uncertain: true});
+                let record = records.get_or_insert_with(|| RecordedGen1 {
+                    binding: binding.clone(),
+                    original: expected.clone(),
+                    last: expected.clone(),
+                    uncertain: true,
+                });
                 record.uncertain = true;
             }
             // Recheck actual USB identity/config even on transaction errors.
@@ -752,10 +996,18 @@ pub(crate) fn scarlett_gen1_apply(expected: &crate::scarlett::Gen1Readback,
         }
     };
     if report.original != report.verified {
-        let record = records.get_or_insert_with(|| RecordedGen1 {binding: binding.clone(),
-            original: report.original.clone(), last: report.verified.clone(), uncertain: false});
-        let (original, last) = merge_gen1_provenance(&record.original, &record.last,
-            &report.original, &report.verified);
+        let record = records.get_or_insert_with(|| RecordedGen1 {
+            binding: binding.clone(),
+            original: report.original.clone(),
+            last: report.verified.clone(),
+            uncertain: false,
+        });
+        let (original, last) = merge_gen1_provenance(
+            &record.original,
+            &record.last,
+            &report.original,
+            &report.verified,
+        );
         record.original = original;
         record.last = last;
     }
@@ -764,29 +1016,47 @@ pub(crate) fn scarlett_gen1_apply(expected: &crate::scarlett::Gen1Readback,
 }
 
 fn finish_gen1_hand_back() {
-    let Some(record) = ORIGINAL_GEN1.lock().take() else {return;};
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal {return;}
-    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {return;};
+    let Some(record) = ORIGINAL_GEN1.lock().take() else {
+        return;
+    };
+    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+        return;
+    }
+    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
+        return;
+    };
     let restore = || -> Result<(), RoutingSessionError> {
         let (configuration, descriptors) = active_descriptors(&device)?;
         check_gen1_binding(&record.binding, &device, configuration, &descriptors)?;
         let (model, interface) = gen1_target(&device, &descriptors)?;
-        let result = crate::scarlett::restore_gen1(&mut UsbGen1Io {device: &device, interface}, model,
-            &record.last, &record.original).map_err(RoutingSessionError::Gen1);
+        let result = crate::scarlett::restore_gen1(
+            &mut UsbGen1Io {
+                device: &device,
+                interface,
+            },
+            model,
+            &record.last,
+            &record.original,
+        )
+        .map_err(RoutingSessionError::Gen1);
         invalidate_route_caches();
         let after = check_gen1_after(&device, configuration, &descriptors);
         match result {
             Ok(()) => after,
             Err(error) => {
-                if let Err(drift) = after {log_warn!("[USB] Gen1 restoration also lost binding: {drift}");}
+                if let Err(drift) = after {
+                    log_warn!("[USB] Gen1 restoration also lost binding: {drift}");
+                }
                 Err(error)
             }
         }
     };
-    if let Err(error) = restore() {log_warn!("[USB] Original Gen1 controls not restored: {error}");}
+    if let Err(error) = restore() {
+        log_warn!("[USB] Original Gen1 controls not restored: {error}");
+    }
 }
 
-struct RecordedFcp {
+pub(super) struct RecordedFcp {
     device: UsbDevice,
     configuration: u8,
     descriptors: Vec<u8>,
@@ -794,7 +1064,8 @@ struct RecordedFcp {
     last: crate::scarlett::FcpReadback,
     uncertain: bool,
 }
-static ORIGINAL_FCP: Mutex<Option<RecordedFcp>> = Mutex::new(None);
+static ORIGINAL_FCP: context::ScopedMutex<Option<RecordedFcp>> =
+    context::ScopedMutex::new(|context| context.fcp.clone());
 
 pub(crate) fn fcp_apply(
     expected: &crate::scarlett::FcpReadback,
@@ -809,32 +1080,51 @@ pub(crate) fn fcp_apply(
     let mut records = ORIGINAL_FCP.lock();
     if let Some(record) = records.as_ref() {
         if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner)
-            || record.configuration != configuration || record.descriptors != descriptors
-            || record.uncertain || !crate::scarlett::same_fcp_layout(&record.last, expected)
+            || record.configuration != configuration
+            || record.descriptors != descriptors
+            || record.uncertain
+            || !crate::scarlett::same_fcp_layout(&record.last, expected)
         {
-            return Err(RoutingSessionError::Drift("FCP attachment/configuration or rollback state changed".into()));
+            return Err(RoutingSessionError::Drift(
+                "FCP attachment/configuration or rollback state changed".into(),
+            ));
         }
         for bank in &expected.banks {
-            if routes.iter().any(|edit|edit.bank == bank.bank) {
-                if let (Some(original),Some(last)) = (record.original.banks.iter().find(|b|b.bank==bank.bank),record.last.banks.iter().find(|b|b.bank==bank.bank)) {
+            if routes.iter().any(|edit| edit.bank == bank.bank) {
+                if let (Some(original), Some(last)) = (
+                    record.original.banks.iter().find(|b| b.bank == bank.bank),
+                    record.last.banks.iter().find(|b| b.bank == bank.bank),
+                ) {
                     if original != last && bank != last {
-                        return Err(RoutingSessionError::Drift("FCP bank differs from last verified library write".into()));
+                        return Err(RoutingSessionError::Drift(
+                            "FCP bank differs from last verified library write".into(),
+                        ));
                     }
                 }
             }
         }
         for row in &expected.mixes {
-            if mixes.iter().any(|edit|edit.output == row.output) {
-                if let (Some(original),Some(last)) = (record.original.mixes.iter().find(|r|r.output==row.output),record.last.mixes.iter().find(|r|r.output==row.output)) {
+            if mixes.iter().any(|edit| edit.output == row.output) {
+                if let (Some(original), Some(last)) = (
+                    record
+                        .original
+                        .mixes
+                        .iter()
+                        .find(|r| r.output == row.output),
+                    record.last.mixes.iter().find(|r| r.output == row.output),
+                ) {
                     if original != last && row != last {
-                        return Err(RoutingSessionError::Drift("FCP row differs from last verified library write".into()));
+                        return Err(RoutingSessionError::Drift(
+                            "FCP row differs from last verified library write".into(),
+                        ));
                     }
                 }
             }
         }
     }
     let report = match with_scarlett_io(&device, configuration, true, |io, candidate| {
-        crate::scarlett::apply_fcp(io, candidate, expected, routes, mixes).map_err(RoutingSessionError::Fcp)
+        crate::scarlett::apply_fcp(io, candidate, expected, routes, mixes)
+            .map_err(RoutingSessionError::Fcp)
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -842,8 +1132,12 @@ pub(crate) fn fcp_apply(
                 invalidate_route_caches();
                 if !failure.rollback.is_empty() {
                     let record = records.get_or_insert_with(|| RecordedFcp {
-                        device: device.clone(), configuration, descriptors: descriptors.clone(),
-                        original: expected.clone(), last: expected.clone(), uncertain: true,
+                        device: device.clone(),
+                        configuration,
+                        descriptors: descriptors.clone(),
+                        original: expected.clone(),
+                        last: expected.clone(),
+                        uncertain: true,
                     });
                     record.uncertain = true;
                     log_warn!("[USB] FCP rollback uncertain; configured hand-back will preserve targets differing from prior verified state");
@@ -855,16 +1149,27 @@ pub(crate) fn fcp_apply(
     if report.original != report.verified {
         invalidate_route_caches();
         let record = records.get_or_insert_with(|| RecordedFcp {
-            device: device.clone(), configuration, descriptors: descriptors.clone(),
-            original: report.original.clone(), last: report.verified.clone(), uncertain: false,
+            device: device.clone(),
+            configuration,
+            descriptors: descriptors.clone(),
+            original: report.original.clone(),
+            last: report.verified.clone(),
+            uncertain: false,
         });
-        let (original, last) = merge_fcp_provenance(&record.original, &record.last, &report.original, &report.verified);
+        let (original, last) = merge_fcp_provenance(
+            &record.original,
+            &record.last,
+            &report.original,
+            &report.verified,
+        );
         record.original = original;
         record.last = last;
     }
     let (after, raw) = active_descriptors(&device)?;
     if configuration != after || descriptors != raw {
-        return Err(RoutingSessionError::Drift("configuration changed during FCP routing write".into()));
+        return Err(RoutingSessionError::Drift(
+            "configuration changed during FCP routing write".into(),
+        ));
     }
     Ok(report)
 }
@@ -872,24 +1177,36 @@ pub(crate) fn fcp_apply(
 // Preserve per-target first-before/last-verified pairs. A later read may contain
 // unrelated external edits; those must never become owned hand-back changes.
 fn merge_fcp_provenance(
-    original: &crate::scarlett::FcpReadback, last: &crate::scarlett::FcpReadback,
-    before: &crate::scarlett::FcpReadback, verified: &crate::scarlett::FcpReadback,
+    original: &crate::scarlett::FcpReadback,
+    last: &crate::scarlett::FcpReadback,
+    before: &crate::scarlett::FcpReadback,
+    verified: &crate::scarlett::FcpReadback,
 ) -> (crate::scarlett::FcpReadback, crate::scarlett::FcpReadback) {
     let mut merged_original = before.clone();
     let mut merged_last = verified.clone();
     for (index, bank) in before.banks.iter().enumerate() {
-        if let (Some(old), Some(previous)) = (original.banks.iter().find(|b|b.bank==bank.bank), last.banks.iter().find(|b|b.bank==bank.bank)) {
+        if let (Some(old), Some(previous)) = (
+            original.banks.iter().find(|b| b.bank == bank.bank),
+            last.banks.iter().find(|b| b.bank == bank.bank),
+        ) {
             if old != previous {
                 merged_original.banks[index] = old.clone();
-                if bank == &verified.banks[index] { merged_last.banks[index] = previous.clone(); }
+                if bank == &verified.banks[index] {
+                    merged_last.banks[index] = previous.clone();
+                }
             }
         }
     }
     for (index, row) in before.mixes.iter().enumerate() {
-        if let (Some(old), Some(previous)) = (original.mixes.iter().find(|r|r.output==row.output), last.mixes.iter().find(|r|r.output==row.output)) {
+        if let (Some(old), Some(previous)) = (
+            original.mixes.iter().find(|r| r.output == row.output),
+            last.mixes.iter().find(|r| r.output == row.output),
+        ) {
             if old != previous {
                 merged_original.mixes[index] = old.clone();
-                if row == &verified.mixes[index] { merged_last.mixes[index] = previous.clone(); }
+                if row == &verified.mixes[index] {
+                    merged_last.mixes[index] = previous.clone();
+                }
             }
         }
     }
@@ -897,26 +1214,38 @@ fn merge_fcp_provenance(
 }
 
 fn finish_fcp_hand_back() {
-    let Some(record) = ORIGINAL_FCP.lock().take() else { return; };
-    if settings().config.hand_back != crate::HandBack::RestoreOriginal { return; }
+    let Some(record) = ORIGINAL_FCP.lock().take() else {
+        return;
+    };
+    if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+        return;
+    }
     if record.uncertain {
         log_warn!("[USB] FCP rollback uncertain; hand-back will restore only targets matching prior verified values");
     }
-    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else { return; };
+    let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
+        return;
+    };
     let restore = || -> Result<(), RoutingSessionError> {
         if !Arc::ptr_eq(&record.device._fd_owner, &device._fd_owner) {
-            return Err(RoutingSessionError::Drift("FCP attachment changed before hand-back".into()));
+            return Err(RoutingSessionError::Drift(
+                "FCP attachment changed before hand-back".into(),
+            ));
         }
         let (number, raw) = active_descriptors(&device)?;
         if number != record.configuration || raw != record.descriptors {
-            return Err(RoutingSessionError::Drift("FCP configuration changed before hand-back".into()));
+            return Err(RoutingSessionError::Drift(
+                "FCP configuration changed before hand-back".into(),
+            ));
         }
         with_scarlett_io(&device, number, true, |io, candidate| {
             crate::scarlett::restore_fcp(io, candidate, &record.last, &record.original)
                 .map_err(RoutingSessionError::Fcp)
         })
     };
-    if let Err(error) = restore() { log_warn!("[USB] Original FCP routing not restored: {error}"); }
+    if let Err(error) = restore() {
+        log_warn!("[USB] Original FCP routing not restored: {error}");
+    }
 }
 
 pub(crate) fn scarlett_mix_apply(
@@ -1171,7 +1500,7 @@ fn validate_protocol_request(
     let valid_length = if request.request == 1 {
         matches!(length, 1 | 2)
     } else {
-        input && length >= 2 && length <= 2 + routing::MAX_GAIN_RANGES * 6 && (length - 2) % 6 == 0
+        input && (2..=2 + routing::MAX_GAIN_RANGES * 6).contains(&length) && (length - 2) % 6 == 0
     };
     if request.request_type != if input { 0xa1 } else { 0x21 }
         || !matches!(request.request, 1 | 2)
@@ -1988,9 +2317,11 @@ fn routing_clusters(
                 _ => None,
             };
             if let Some(id) = id {
-                if !clusters.contains_key(&(interface, id)) {
+                if let std::collections::btree_map::Entry::Vacant(e) =
+                    clusters.entry((interface, id))
+                {
                     let cluster = query_routing_cluster(&idle.handle, interface, id)?;
-                    clusters.insert((interface, id), cluster);
+                    e.insert(cluster);
                 }
             }
         }
@@ -2125,13 +2456,14 @@ pub(crate) fn read_with_power(
 }
 
 #[derive(Debug)]
-struct RecordedRouting {
+pub(super) struct RecordedRouting {
     snapshot: RoutingSnapshot,
     // Original and last library-written value for each edited control.
     values: BTreeMap<ControlKey, (RouteValue, RouteValue)>,
     powered: bool,
 }
-static ORIGINAL_ROUTING: Mutex<Option<RecordedRouting>> = Mutex::new(None);
+static ORIGINAL_ROUTING: context::ScopedMutex<Option<RecordedRouting>> =
+    context::ScopedMutex::new(|context| context.routing.clone());
 
 pub(crate) fn apply(
     snapshot: &RoutingSnapshot,
@@ -2315,29 +2647,51 @@ mod tests {
 
     #[test]
     fn shared_release_refuses_vendor_reads_before_usb_session_access() {
-        assert!(!VENDOR_ROUTING_RELEASED);
-        assert!(matches!(require_vendor_routing_release(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        const _: () = assert!(!VENDOR_ROUTING_RELEASED);
+        assert!(matches!(
+            require_vendor_routing_release(),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
         assert!(scarlett_discover().unwrap().is_none());
         // A deliberately invalid fd proves Android/native preflight does not
         // wrap or inspect a device before refusing the unpublished capability.
         let info = crate::DeviceInfo::new(0x1235, 0x8211, "Scarlett");
         assert!(scarlett_preflight(-1, &info).unwrap().is_none());
-        assert!(matches!(scarlett_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
-        assert!(matches!(fcp_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
-        assert!(matches!(scarlett_gen1_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
-        assert!(matches!(scarlett_mux_read(), Err(RoutingSessionError::UnsupportedTopology(_))));
+        assert!(matches!(
+            scarlett_read(),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
+        assert!(matches!(
+            fcp_read(),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
+        assert!(matches!(
+            scarlett_gen1_read(),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
+        assert!(matches!(
+            scarlett_mux_read(),
+            Err(RoutingSessionError::UnsupportedTopology(_))
+        ));
     }
 
     #[test]
     fn routing_power_hand_back_preserves_transaction_and_rollback_failures() {
-        let key = ControlKey::Selector(Entity { interface: 3, id: 8 });
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 8,
+        });
         let operation = Err::<(), _>(RoutingSessionError::Transaction(TransactionError {
             failed_change: Some(2),
             cause: RoutingError::Io("write".into()),
             rollback_failures: vec![(key, RoutingError::Io("route restore".into()))],
         }));
         let error = finish_routing_power(operation, Err("power restore".into())).unwrap_err();
-        let RoutingSessionError::PowerRestore { operation: Some(operation), detail } = error else {
+        let RoutingSessionError::PowerRestore {
+            operation: Some(operation),
+            detail,
+        } = error
+        else {
             panic!("expected both routing and power failures");
         };
         assert_eq!(detail, "power restore");
@@ -2346,8 +2700,10 @@ mod tests {
         };
         assert_eq!(transaction.failed_change, Some(2));
         assert_eq!(transaction.cause, RoutingError::Io("write".into()));
-        assert_eq!(transaction.rollback_failures,
-            vec![(key, RoutingError::Io("route restore".into()))]);
+        assert_eq!(
+            transaction.rollback_failures,
+            vec![(key, RoutingError::Io("route restore".into()))]
+        );
     }
 
     #[test]
@@ -2356,9 +2712,11 @@ mod tests {
         assert!(matches!(finish_routing_power::<()>(
             Err(RoutingSessionError::Drift("changed".into())), Ok(())),
             Err(RoutingSessionError::Drift(detail)) if detail == "changed"));
-        assert!(matches!(finish_routing_power(Ok(()), Err("power restore".into())),
+        assert!(
+            matches!(finish_routing_power(Ok(()), Err("power restore".into())),
             Err(RoutingSessionError::PowerRestore { operation: None, detail })
-                if detail == "power restore"));
+                if detail == "power restore")
+        );
     }
 
     fn terminal(id: u8, channels: u8, locations: u32) -> Vec<u8> {
@@ -2765,10 +3123,32 @@ mod fcp_provenance_tests {
     #[test]
     fn unrelated_external_values_never_become_hand_back_changes() {
         let original = FcpReadback {
-            model: CandidateModel::Scarlett16i16Gen4, firmware: 1,
-            mixer_inputs: 1, mixer_outputs: 2, sources: vec![], destinations: vec![],
-            banks: vec![FcpBank {bank:0,raw_words:vec![1]},FcpBank {bank:1,raw_words:vec![2]}],
-            mixes: vec![MixReadback {output:1,coefficients:vec![3]},MixReadback {output:2,coefficients:vec![4]}],
+            model: CandidateModel::Scarlett16i16Gen4,
+            firmware: 1,
+            mixer_inputs: 1,
+            mixer_outputs: 2,
+            sources: vec![],
+            destinations: vec![],
+            banks: vec![
+                FcpBank {
+                    bank: 0,
+                    raw_words: vec![1],
+                },
+                FcpBank {
+                    bank: 1,
+                    raw_words: vec![2],
+                },
+            ],
+            mixes: vec![
+                MixReadback {
+                    output: 1,
+                    coefficients: vec![3],
+                },
+                MixReadback {
+                    output: 2,
+                    coefficients: vec![4],
+                },
+            ],
         };
         let mut last = original.clone();
         last.banks[0].raw_words[0] = 10;
@@ -2778,7 +3158,7 @@ mod fcp_provenance_tests {
         before.mixes[0].coefficients[0] = 31; // External change to an earlier owned target.
         let mut verified = before.clone();
         verified.mixes[1].coefficients[0] = 40;
-        let (saved, recent) = merge_fcp_provenance(&original,&last,&before,&verified);
+        let (saved, recent) = merge_fcp_provenance(&original, &last, &before, &verified);
         assert_eq!(saved.banks[1], recent.banks[1]);
         assert_eq!(saved.banks[1].raw_words, vec![20]);
         assert_eq!(saved.banks[0], original.banks[0]);
@@ -2797,7 +3177,9 @@ mod gen1_transport_tests {
 
     fn topology(iad: bool) -> Vec<u8> {
         let mut raw = vec![9, 2, 0, 0, 2, 1, 0, 0x80, 50];
-        if iad {raw.extend([8, 11, 3, 2, 1, 0, 0x20, 0]);}
+        if iad {
+            raw.extend([8, 11, 3, 2, 1, 0, 0x20, 0]);
+        }
         raw.extend([9, 4, 3, 0, 0, 1, 1, 0x20, 0]);
         raw.extend([9, 0x24, 1, 0, 2, 0, 26, 0, 0]);
         raw.extend([17, 0x24, 2, 1, 1, 1, 0, 9, 2, 3, 0, 0, 0, 0, 0, 0, 0]);
@@ -2809,8 +3191,15 @@ mod gen1_transport_tests {
         raw
     }
     fn device() -> UsbDevice {
-        UsbDevice {fd: -1, _fd_owner: Arc::new(OwnedUsbFd(-1)), claimed_interfaces: vec![3].into(),
-            vendor_id: 0x1235, product_id: 0x8012, product_name: String::new(), device_name: None}
+        UsbDevice {
+            fd: -1,
+            _fd_owner: Arc::new(OwnedUsbFd(-1)),
+            claimed_interfaces: vec![3].into(),
+            vendor_id: 0x1235,
+            product_id: 0x8012,
+            product_name: String::new(),
+            device_name: None,
+        }
     }
     #[test]
     fn gen1_binding_requires_claimed_unique_uac2_function_and_terminal_link() {
@@ -2823,7 +3212,7 @@ mod gen1_transport_tests {
             unlinked[link] = 99;
             assert!(gen1_interface(&unlinked, &[3]).is_err());
             let mut wrong_protocol = raw.clone();
-            let ac_protocol = if iad {24} else {16};
+            let ac_protocol = if iad { 24 } else { 16 };
             wrong_protocol[ac_protocol] = 0;
             assert!(gen1_interface(&wrong_protocol, &[3]).is_err());
         }
@@ -2839,22 +3228,42 @@ mod gen1_transport_tests {
         assert!(gen1_interface(&zero_alt, &[3]).is_err());
         let raw = topology(true);
         let target = device();
-        let binding = Gen1Binding {device: target.clone(), configuration: 1, descriptors: raw.clone()};
+        let binding = Gen1Binding {
+            device: target.clone(),
+            configuration: 1,
+            descriptors: raw.clone(),
+        };
         assert!(check_gen1_binding(&binding, &target, 1, &raw).is_ok());
         assert!(check_gen1_binding(&binding, &device(), 1, &raw).is_err());
         assert!(check_gen1_binding(&binding, &target, 2, &raw).is_err());
-        let mut changed = raw.clone(); changed[8] = 51;
+        let mut changed = raw.clone();
+        changed[8] = 51;
         assert!(check_gen1_binding(&binding, &target, 1, &changed).is_err());
     }
     #[test]
     fn gen1_independent_control_provenance_preserves_external_drift() {
-        let original = Gen1Readback {model: Gen1Model::Scarlett6i6, source_offsets: [0;5],
-            matrix_sources: 0, output_sources: 0, controls: vec![
-                Gen1Control {key: Gen1Key::Output(1), value: 1},
-                Gen1Control {key: Gen1Key::Output(2), value: 2}]};
-        let mut last = original.clone(); last.controls[0].value = 10;
-        let mut before = last.clone(); before.controls[0].value = 11;
-        let mut verified = before.clone(); verified.controls[1].value = 20;
+        let original = Gen1Readback {
+            model: Gen1Model::Scarlett6i6,
+            source_offsets: [0; 5],
+            matrix_sources: 0,
+            output_sources: 0,
+            controls: vec![
+                Gen1Control {
+                    key: Gen1Key::Output(1),
+                    value: 1,
+                },
+                Gen1Control {
+                    key: Gen1Key::Output(2),
+                    value: 2,
+                },
+            ],
+        };
+        let mut last = original.clone();
+        last.controls[0].value = 10;
+        let mut before = last.clone();
+        before.controls[0].value = 11;
+        let mut verified = before.clone();
+        verified.controls[1].value = 20;
         let (saved, recent) = merge_gen1_provenance(&original, &last, &before, &verified);
         assert_eq!(saved.controls, original.controls);
         assert_eq!(recent.controls[0], last.controls[0]);

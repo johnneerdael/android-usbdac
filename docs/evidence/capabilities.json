@@ -1,0 +1,18 @@
+{
+  "duplex": true,
+  "max_open_devices": null,
+  "pcm_capture": true,
+  "playback": true,
+  "schema_version": 1,
+  "type_i_formats": [
+    "signed_pcm",
+    "unsigned_pcm8",
+    "float32"
+  ],
+  "uac_versions": [
+    1,
+    2,
+    3
+  ],
+  "vendor_protocols": false
+}

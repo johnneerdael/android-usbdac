@@ -105,6 +105,9 @@ impl FloatEngine {
     }
 
     /// Encodes `frames` frames of `planar` (from `planar_in` or `planar_out`) into `output`.
+    // Keep explicit geometry and disjoint RNG/output/counter borrows on this
+    // allocation-free codec path rather than bundling them into shared state.
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         planar: &[Vec<f64>],
         frames: usize,

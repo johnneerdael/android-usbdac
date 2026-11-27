@@ -23,6 +23,19 @@ private fun quirkJson(quirk: DacQuirk): Any = when (quirk) {
     DacQuirk.DsdBigEndian -> "dsd_big_endian"
     DacQuirk.DsdBitReverse -> "dsd_bit_reverse"
     DacQuirk.ExplicitFeedbackPerServiceInterval -> "explicit_feedback_per_service_interval"
+    DacQuirk.SetInterfaceFirst -> "set_interface_first"
+    DacQuirk.PlaybackUrbFixup -> "playback_urb_fixup"
+    DacQuirk.SkipSampleRateReadback -> "skip_sample_rate_readback"
+    DacQuirk.SkipImplicitFeedback -> "skip_implicit_feedback"
+    DacQuirk.MixerPlaybackMinMute -> "mixer_playback_min_mute"
+    DacQuirk.MixerPlaybackLinearVolume -> "mixer_playback_linear_volume"
+    DacQuirk.RawDsd32Be -> "raw_dsd32_be"
+    DacQuirk.FixedRate -> "fixed_rate"
+    DacQuirk.ImplicitSilenceOnEmpty -> "implicit_silence_on_empty"
+    DacQuirk.SkipClockSelectorWrites -> "skip_clock_selector_writes"
+    DacQuirk.IgnoreOptionalControlErrors -> "ignore_optional_control_errors"
+    is DacQuirk.ControlMessageDelayUs -> JSONObject().put("control_message_delay_us", quirk.microseconds)
+    is DacQuirk.InterfaceDelayMs -> JSONObject().put("interface_delay_ms", quirk.milliseconds)
     is DacQuirk.SettleDelayMs -> JSONObject().put("settle_delay_ms", quirk.milliseconds)
     is DacQuirk.DsdSubslotSize -> JSONObject().put("dsd_subslot_size", quirk.bytes)
 }
@@ -51,6 +64,10 @@ internal fun DacConfig.toNativeJson(): String =
         .putIfNotNull("dsd_subslot", dsdSubslot)
         .putIfNotNull("padded_24bit", padded24Bit)
         .put("allow_unsynchronized_async", allowUnsynchronizedAsync)
+        .put("async_fallback_policy", asyncFallbackPolicy.wireName)
+        .put("clock_readback_policy", clockReadbackPolicy.wireName)
+        .put("adaptive_queue", adaptiveQueue)
+        .put("quirk_policy", quirkPolicy.wireName)
         .put("disable_feedback", disableFeedback)
         .put("capture_feedback_trace", captureFeedbackTrace)
         .put("realtime_priority", realtimePriority)
@@ -75,6 +92,10 @@ internal fun StreamRequest.toJson(): String {
     when (encoding) {
         StreamEncoding.PCM -> json
             .put("encoding", "pcm")
+            .put("sample_rate", sampleRate)
+            .put("bit_depth", bitDepth)
+        StreamEncoding.PCM_U8, StreamEncoding.PCM_FLOAT32 -> json
+            .put("encoding", if (encoding == StreamEncoding.PCM_U8) "pcm_u8" else "pcm_float32")
             .put("sample_rate", sampleRate)
             .put("bit_depth", bitDepth)
         StreamEncoding.DOP -> json

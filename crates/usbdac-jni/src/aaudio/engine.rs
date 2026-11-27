@@ -282,13 +282,12 @@ mod tests {
         }
     }
 
-    fn open(
-        grant: Grant,
-    ) -> (
+    type Opened = (
         Result<Output, AaudioError>,
         Arc<FakeDevice>,
         Arc<Mutex<Vec<Event>>>,
-    ) {
+    );
+    fn open(grant: Grant) -> Opened {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let shared = Arc::new(Shared::new(

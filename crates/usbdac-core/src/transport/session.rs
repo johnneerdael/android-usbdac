@@ -1,45 +1,57 @@
+use super::context::{ScopedBool, ScopedMutex, ScopedU32, ScopedU64};
 use super::*;
 
-pub(super) static SESSION_STATE: Lazy<Mutex<Option<SessionState>>> =
-    Lazy::new(|| Mutex::new(None));
-pub(super) static IDLE_LOCK: Lazy<Mutex<Option<IdleLock>>> = Lazy::new(|| Mutex::new(None));
-pub(super) static LIFECYCLE_STATE: Lazy<Mutex<LifecycleState>> =
-    Lazy::new(|| Mutex::new(LifecycleState::default()));
+pub(super) static SESSION_STATE: ScopedMutex<Option<SessionState>> =
+    ScopedMutex::new(|context| context.session.clone());
+pub(super) static IDLE_LOCK: ScopedMutex<Option<IdleLock>> =
+    ScopedMutex::new(|context| context.idle.clone());
+pub(super) static LIFECYCLE_STATE: ScopedMutex<LifecycleState> =
+    ScopedMutex::new(|context| context.lifecycle.clone());
 /// Serializes Feature Unit I/O with other volume calls and final device clear.
-pub(super) static HARDWARE_VOLUME_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(super) static HARDWARE_VOLUME_MUTEX: ScopedMutex<()> =
+    ScopedMutex::new(|context| context.volume_io.clone());
 pub(super) static DISCOVERY_DISABLED: Once = Once::new();
-pub(super) static USB_SESSION_CLEAR_PENDING: AtomicBool = AtomicBool::new(false);
-pub(super) static HARDWARE_VOLUME_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(super) static USB_SESSION_CLEAR_PENDING: ScopedBool =
+    ScopedBool::new(|context| &context.clear_pending);
+pub(super) static HARDWARE_VOLUME_GENERATION: ScopedU64 =
+    ScopedU64::new(|context| &context.volume_generation);
 /// The DAC's volume before this library first changed it. Outside SESSION_STATE
 /// so it outlives stream restarts and a `Dac` that is closed with
 /// `HandBack::Keep` and reopened.
-pub(super) static ORIGINAL_HARDWARE_VOLUME: Mutex<OriginalVolumeSlot<HardwareVolumeControl>> =
-    Mutex::new(OriginalVolumeSlot::new());
+pub(super) static ORIGINAL_HARDWARE_VOLUME: ScopedMutex<OriginalVolumeSlot<HardwareVolumeControl>> =
+    ScopedMutex::new(|context| context.original_volume.clone());
 /// What the next device clear does with that level; set by `Dac::close` just
 /// before it.
-pub(super) static ORIGINAL_VOLUME_ACTION: AtomicU32 = AtomicU32::new(ORIGINAL_VOLUME_KEEP);
+pub(super) static ORIGINAL_VOLUME_ACTION: ScopedU32 =
+    ScopedU32::new(|context| &context.original_volume_action);
 pub(super) const ORIGINAL_VOLUME_KEEP: u32 = 0;
 pub(super) const ORIGINAL_VOLUME_RESTORE: u32 = 1;
 pub(super) const ORIGINAL_VOLUME_FORGET: u32 = 2;
 
 /// Only one negotiation or output session can use the claimed interfaces.
 /// Serialize ownership transitions with device clear before the host releases them.
-pub(super) static USB_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-pub(super) static USB_SESSION_GATE: Mutex<()> = Mutex::new(());
+pub(super) static USB_SESSION_ACTIVE: ScopedBool = ScopedBool::new(|context| &context.active);
+pub(super) static USB_SESSION_GATE: ScopedMutex<()> =
+    ScopedMutex::new(|context| context.gate.clone());
 
-pub(super) struct SessionGuard;
+pub(super) struct SessionGuard {
+    context: Arc<context::SessionContext>,
+}
 
 impl SessionGuard {
     // Caller holds USB_SESSION_GATE and has checked that no session is active.
     pub(super) fn start_locked() -> Self {
         USB_STOP_REQUESTED.store(false, Ordering::SeqCst);
         USB_SESSION_ACTIVE.store(true, Ordering::SeqCst);
-        Self
+        Self {
+            context: context::current(),
+        }
     }
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        let _scope = self.context.enter();
         let _session_gate = USB_SESSION_GATE.lock();
         USB_SESSION_ACTIVE.store(false, Ordering::SeqCst);
         complete_pending_clear_locked();
@@ -50,7 +62,7 @@ impl Drop for SessionGuard {
 // `stop` flag, so without this the transfer loop would keep running until the
 // stream is closed or the USB fd dies. Set from the deferred-clear path; reset
 // at session start. A second clear during teardown is harmless (idempotent).
-pub(super) static USB_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub(super) static USB_STOP_REQUESTED: ScopedBool = ScopedBool::new(|context| &context.stop);
 
 /// Combined stop predicate for the render/output loops: bail when either the
 /// backend's local `stop` Arc or the global clear-requested flag is set.
@@ -62,8 +74,8 @@ pub(super) fn payload_audit_latch() -> PayloadAuditLatch {
     PayloadAuditLatch::new(Duration::from_millis(USB_PAYLOAD_FLICKER_GRACE_MS))
 }
 
-pub(super) static USB_DSD_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
-    Lazy::new(|| Mutex::new(payload_audit_latch()));
+pub(super) static USB_DSD_PAYLOAD_LATCH: ScopedMutex<PayloadAuditLatch> =
+    ScopedMutex::new(|context| context.dsd_audit.clone());
 
 pub(super) fn usb_dsd_payload_verified() -> bool {
     USB_DSD_PAYLOAD_LATCH.lock().is_verified()
@@ -74,8 +86,8 @@ pub(super) fn usb_dsd_payload_verified() -> bool {
 #[cfg(test)]
 pub(crate) static PAYLOAD_LATCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
-pub(super) static USB_PCM_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
-    Lazy::new(|| Mutex::new(payload_audit_latch()));
+pub(super) static USB_PCM_PAYLOAD_LATCH: ScopedMutex<PayloadAuditLatch> =
+    ScopedMutex::new(|context| context.pcm_audit.clone());
 
 pub(super) fn usb_pcm_payload_verified() -> bool {
     USB_PCM_PAYLOAD_LATCH.lock().is_verified()
@@ -106,20 +118,27 @@ pub(super) fn observe_pcm_payload_audit(ok: bool) {
     }
 }
 
-pub(super) fn log_payload_audit_transition(transport: &str, verified: bool, constant_for: Option<Duration>) {
+pub(super) fn log_payload_audit_transition(
+    transport: &str,
+    verified: bool,
+    constant_for: Option<Duration>,
+) {
     if verified {
         log_usb_event(format!(
             "[USB-{transport}] wire payload verified: real audio flowing, not a stuck/dead pipeline"
         ));
     } else {
-        let constant_ms = constant_for.map(|duration| duration.as_millis()).unwrap_or(0);
+        let constant_ms = constant_for
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
         log_usb_event(format!(
             "[USB-{transport}] wire payload lost: audit failed for {constant_ms}ms (constant/silent transfer)"
         ));
     }
 }
 
-pub(super) static LAST_BIT_PERFECT_LOGGED: AtomicBool = AtomicBool::new(false);
+pub(super) static LAST_BIT_PERFECT_LOGGED: ScopedBool =
+    ScopedBool::new(|context| &context.last_bit_perfect);
 
 /// Transition evidence line for the bit-perfect claim. Both edges are logged
 /// unconditionally so field reports can show mode flapping without Developer
@@ -201,6 +220,7 @@ pub(super) fn clear_session_state() {
     *SESSION_STATE.lock() = None;
     adc3::clear_adc3_negotiation();
     crate::settings::reset();
+    context::current().release();
 }
 
 // The caller holds USB_SESSION_GATE so the wait API cannot report success while
@@ -226,15 +246,25 @@ pub(crate) fn register_device(device: UsbDevice) -> Result<(), crate::Error> {
 
 /// Explicit IN registration bypasses output discovery and output volume setup.
 /// Its host claim handoff is checked by the dedicated capture validator.
-pub(super) fn register_capture_device(device: UsbDevice, configuration: Option<u8>) -> Result<(), crate::Error> {
+pub(super) fn register_capture_device(
+    device: UsbDevice,
+    configuration: Option<u8>,
+) -> Result<(), crate::Error> {
     register_device_mode(device, RegistrationMode::Capture { configuration })
 }
 
-pub(super) fn register_duplex_device(device: UsbDevice, configuration: Option<u8>) -> Result<(), crate::Error> {
+pub(super) fn register_duplex_device(
+    device: UsbDevice,
+    configuration: Option<u8>,
+) -> Result<(), crate::Error> {
     register_device_mode(device, RegistrationMode::Duplex { configuration })
 }
 
-enum RegistrationMode { Playback, Capture { configuration: Option<u8> }, Duplex { configuration: Option<u8> } }
+enum RegistrationMode {
+    Playback,
+    Capture { configuration: Option<u8> },
+    Duplex { configuration: Option<u8> },
+}
 
 fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(), crate::Error> {
     use crate::Error;
@@ -245,13 +275,21 @@ fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(),
     }
     let capability_model = match mode {
         RegistrationMode::Capture { configuration } => {
-            capture_stream::validate_capture_registration(&device, configuration).map_err(Error::Claim)?;
+            capture_stream::validate_capture_registration(&device, configuration)
+                .map_err(Error::Claim)?;
             None
         }
-        RegistrationMode::Playback => Some(inspect_usb_capabilities(&device).map_err(Error::Claim)?),
-        RegistrationMode::Duplex { configuration } => Some(inspect_duplex_capabilities(&device, configuration).map_err(Error::Claim)?),
+        RegistrationMode::Playback => {
+            Some(inspect_usb_capabilities(&device).map_err(Error::Claim)?)
+        }
+        RegistrationMode::Duplex { configuration } => {
+            Some(inspect_duplex_capabilities(&device, configuration).map_err(Error::Claim)?)
+        }
     };
-    if capability_model.as_ref().is_some_and(|model| model.alt_settings.is_empty()) {
+    if capability_model
+        .as_ref()
+        .is_some_and(|model| model.alt_settings.is_empty())
+    {
         return Err(Error::Unsupported {
             reason: "the device has no isochronous OUT audio streaming interface".to_string(),
             offered: Vec::new(),
@@ -286,6 +324,7 @@ fn register_device_mode(device: UsbDevice, mode: RegistrationMode) -> Result<(),
         startup_volume: None,
         runtime_stats: None,
         service_interval_feedback_routes: Default::default(),
+        unreadable_clocks: Default::default(),
     });
     drop(guard);
     if let Err(error) = ensure_idle_lock() {
@@ -304,7 +343,9 @@ pub(crate) fn clear_device() {
         // Signal the running transfer loop to drain before the host releases
         // the interfaces and lets the platform driver rebind.
         USB_STOP_REQUESTED.store(true, Ordering::SeqCst);
-        dev_eprintln!("USB direct: clear requested while a session is active; stopping the transfer loop");
+        dev_eprintln!(
+            "USB direct: clear requested while a session is active; stopping the transfer loop"
+        );
         return;
     }
 
@@ -370,7 +411,9 @@ pub(super) fn publish_hardware_volume_snapshot(
     volume: crate::volume::VolumeState,
 ) -> Result<(), String> {
     let mut guard = SESSION_STATE.lock();
-    let state = guard.as_mut().filter(|state| state.hardware_volume_generation == generation)
+    let state = guard
+        .as_mut()
+        .filter(|state| state.hardware_volume_generation == generation)
         .ok_or_else(|| "USB volume route changed during control transfer".to_string())?;
     state.hardware_volume_state = Some(volume);
     state.hardware_volume_error = None;
@@ -406,10 +449,7 @@ pub(super) fn set_engine_state(state: EngineState, reason: Option<String>) {
     lifecycle_state.engine_state = state;
     lifecycle_state.reason = reason;
     if previous != state {
-        dev_eprintln!(
-            "USB direct engine state: {:?} -> {:?}",
-            previous, state
-        );
+        dev_eprintln!("USB direct engine state: {:?} -> {:?}", previous, state);
     }
     dev_eprintln!(
         "[USB][STATE] {}{}",
@@ -458,7 +498,11 @@ pub(super) fn invalidate_clock_verification() {
 /// What stands in the way of a bit-perfect claim, if anything. The order is the
 /// order of precedence of the reported reason.
 pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBlocker> {
-    if !state.stream_active || state.runtime_stats.as_ref().is_some_and(|stats| stats.failed.load(Ordering::Acquire) || stats.closed.load(Ordering::Acquire)) {
+    if !state.stream_active
+        || state.runtime_stats.as_ref().is_some_and(|stats| {
+            stats.failed.load(Ordering::Acquire) || stats.closed.load(Ordering::Acquire)
+        })
+    {
         return Some(BitPerfectBlocker::NoStream);
     }
 
@@ -473,7 +517,8 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
         return Some(BitPerfectBlocker::LostFrames);
     }
 
-    let (Some(requested), Some(effective)) = (state.requested_playback_format, state.playback_format)
+    let (Some(requested), Some(effective)) =
+        (state.requested_playback_format, state.playback_format)
     else {
         return Some(BitPerfectBlocker::NoStream);
     };
@@ -489,7 +534,11 @@ pub(super) fn bit_perfect_blocker(state: &SessionState) -> Option<BitPerfectBloc
     {
         return Some(BitPerfectBlocker::FormatChanged);
     }
-    if state.runtime_stats.as_ref().is_some_and(|stats| (stats.implicit_feedback.load(Ordering::Acquire) || stats.feedback_required.load(Ordering::Acquire)) && !stats.feedback_locked.load(Ordering::Acquire)) {
+    if state.runtime_stats.as_ref().is_some_and(|stats| {
+        (stats.implicit_feedback.load(Ordering::Acquire)
+            || stats.feedback_required.load(Ordering::Acquire))
+            && !stats.feedback_locked.load(Ordering::Acquire)
+    }) {
         return Some(BitPerfectBlocker::FeedbackUnlocked);
     }
     if !state.clock_verification_passed {
@@ -646,22 +695,21 @@ pub(super) fn ensure_idle_lock() -> Result<(), String> {
         .as_ref()
         .cloned()
         .ok_or_else(|| "no DAC is open".to_string())?;
-    let claimed_handle = open_claimed_usb_handle(&state.device).map_err(|error| {
+    let claimed_handle = open_claimed_usb_handle(&state.device).inspect_err(|error| {
         set_last_error(Some(error.clone()));
         set_direct_mode_refusal_reason(Some(error.clone()));
         set_engine_state(EngineState::Error, Some(error.clone()));
-        error
     })?;
 
     dev_eprintln!(
         "USB direct idle lock using the host's claims for '{}' interfaces {:?}",
-        state.device.product_name, claimed_handle.claimed_interfaces
+        state.device.product_name,
+        claimed_handle.claimed_interfaces
     );
 
     *IDLE_LOCK.lock() = Some(claimed_handle.into_idle_lock());
     Ok(())
 }
-
 
 /// A registered session without a USB device behind it, for host tests.
 #[cfg(test)]
@@ -692,6 +740,7 @@ impl Drop for TestSession {
 #[cfg(test)]
 pub(crate) fn test_pcm_format() -> PlaybackFormat {
     PlaybackFormat {
+        pcm_encoding: crate::transport::PcmEncoding::Signed,
         sample_rate: 44_100,
         bit_depth: 16,
         channels: 2,
@@ -737,5 +786,6 @@ pub(super) fn test_state(runtime_stats: Option<Arc<RuntimeStats>>) -> SessionSta
         startup_volume: None,
         runtime_stats,
         service_interval_feedback_routes: Default::default(),
+        unreadable_clocks: Default::default(),
     }
 }

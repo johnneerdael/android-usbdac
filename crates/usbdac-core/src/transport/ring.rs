@@ -51,6 +51,12 @@ pub(crate) struct RuntimeStats {
     pub(crate) max_transfer_turnaround_us: AtomicU64,
     pub(crate) last_submit_gap_us: AtomicU64,
     pub(crate) max_submit_gap_us: AtomicU64,
+    pub(crate) worker_gap_over_10ms: AtomicU64,
+    pub(crate) worker_gap_over_50ms: AtomicU64,
+    pub(crate) max_worker_gap_us: AtomicU64,
+    pub(crate) adaptive_queue_changes: AtomicU64,
+    pub(crate) adaptive_queue_slots: AtomicU64,
+    pub(crate) adaptive_queue_us: AtomicU64,
     pub(crate) effective_consumer_rate_milli_hz: AtomicU64,
     pub(crate) feedback_reports: AtomicU64,
     pub(crate) feedback_timeouts: AtomicU64,
@@ -178,6 +184,12 @@ impl RuntimeStats {
             max_transfer_turnaround_us: AtomicU64::new(0),
             last_submit_gap_us: AtomicU64::new(0),
             max_submit_gap_us: AtomicU64::new(0),
+            worker_gap_over_10ms: AtomicU64::new(0),
+            worker_gap_over_50ms: AtomicU64::new(0),
+            max_worker_gap_us: AtomicU64::new(0),
+            adaptive_queue_changes: AtomicU64::new(0),
+            adaptive_queue_slots: AtomicU64::new(0),
+            adaptive_queue_us: AtomicU64::new(0),
             effective_consumer_rate_milli_hz: AtomicU64::new(0),
             feedback_reports: AtomicU64::new(0),
             feedback_timeouts: AtomicU64::new(0),
@@ -220,7 +232,9 @@ impl RuntimeStats {
 
     pub(crate) fn with_feedback_trace(mut self, capture: bool) -> Self {
         if capture {
-            self.feedback_trace = Some(Arc::new(crate::feedback_diagnostics::FeedbackRecorder::new(self.started_at)));
+            self.feedback_trace = Some(Arc::new(
+                crate::feedback_diagnostics::FeedbackRecorder::new(self.started_at),
+            ));
         }
         self
     }
@@ -254,7 +268,11 @@ impl RuntimeStats {
 
     /// The depth `active_target_samples` asks for, in milliseconds.
     pub(crate) fn active_target_ms(&self) -> u32 {
-        samples_to_millis(self.active_target_samples(), self.sample_rate, self.channels)
+        samples_to_millis(
+            self.active_target_samples(),
+            self.sample_rate,
+            self.channels,
+        )
     }
 
     /// Music frames the DAC has taken since the stream started or the ring was
@@ -270,9 +288,12 @@ impl RuntimeStats {
     /// submitted and not yet completed. Transfers carrying held silence or
     /// padding are not music and are not counted.
     pub(crate) fn output_latency_frames(&self) -> u64 {
-        let ring_frames = (self.buffered_samples.load(Ordering::Relaxed) / self.channels.max(1))
-            as u64;
-        output_latency_frames(ring_frames, self.inflight_music_frames.load(Ordering::Relaxed))
+        let ring_frames =
+            (self.buffered_samples.load(Ordering::Relaxed) / self.channels.max(1)) as u64;
+        output_latency_frames(
+            ring_frames,
+            self.inflight_music_frames.load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn output_latency_ms(&self) -> f64 {
@@ -378,7 +399,18 @@ impl PcmRing {
     /// the top, which is what the encoder expects), or for native DSD one byte
     /// per ring sample. Takes whole wire frames (`subslot * channels` bytes)
     /// only and returns the bytes consumed.
+    #[cfg(test)]
     pub(super) fn push_bytes(&mut self, bytes: &[u8], subslot: usize, native_dsd: bool) -> usize {
+        self.push_bytes_encoding(bytes, subslot, native_dsd, false)
+    }
+
+    pub(super) fn push_bytes_encoding(
+        &mut self,
+        bytes: &[u8],
+        subslot: usize,
+        native_dsd: bool,
+        unsigned8: bool,
+    ) -> usize {
         // Native DSD has byte-valued ring entries even for 64-bit words.
         // Keep PCM limited to its i32 container independently.
         let subslot = if native_dsd {
@@ -392,8 +424,8 @@ impl PcmRing {
         let wire_frame_bytes = subslot * self.channels;
         let bytes_per_sample = if native_dsd { 1 } else { subslot };
         let room_samples = self.capacity_samples.saturating_sub(self.len_samples);
-        let take = bytes.len().min(room_samples * bytes_per_sample) / wire_frame_bytes
-            * wire_frame_bytes;
+        let take =
+            bytes.len().min(room_samples * bytes_per_sample) / wire_frame_bytes * wire_frame_bytes;
         if take == 0 {
             return 0;
         }
@@ -403,6 +435,10 @@ impl PcmRing {
             } else {
                 let mut word = [0u8; 4];
                 word[4 - subslot..].copy_from_slice(chunk);
+                // Center U8 around signed zero using bits only; the encoder reverses this mapping.
+                if unsigned8 {
+                    word[3] ^= 0x80;
+                }
                 i32::from_le_bytes(word)
             };
             self.samples[self.write_index] = sample;
@@ -468,14 +504,22 @@ impl PcmRing {
     /// Used while paused (or refilling after `clear`) to keep the isochronous
     /// stream running without consuming audio the user has not heard yet. DoP
     /// markers advance exactly as for real audio.
-    pub(super) fn fill_wire_silence(&mut self, output: &mut [i32], dsd_transport: DsdTransportMode) {
+    pub(super) fn fill_wire_silence(
+        &mut self,
+        output: &mut [i32],
+        dsd_transport: DsdTransportMode,
+    ) {
         output.fill(wire_silence_sample(dsd_transport));
         self.stamp_dop_markers(output, dsd_transport);
     }
 
     // The final USB stream owns marker phase. Decoder restarts and inserted
     // silence must not reset it or give L/R different markers.
-    pub(super) fn stamp_dop_markers(&mut self, output: &mut [i32], dsd_transport: DsdTransportMode) {
+    pub(super) fn stamp_dop_markers(
+        &mut self,
+        output: &mut [i32],
+        dsd_transport: DsdTransportMode,
+    ) {
         if dsd_transport != DsdTransportMode::DoP {
             return;
         }
@@ -513,7 +557,6 @@ pub(super) fn effective_ring_rate(playback_format: &PlaybackFormat) -> u32 {
     }
 }
 
-
 /// Drops everything queued and starts a new flush epoch (the rest of the audio
 /// path notices through the epoch). Returns the samples dropped. The DoP marker
 /// phase survives, so the stream stays continuous across the flush.
@@ -524,7 +567,9 @@ pub(super) fn flush_ring(ring: &Mutex<PcmRing>, stats: &RuntimeStats) -> usize {
         guard.clear();
         // Under the ring lock, so a transfer filled afterwards carries the new
         // epoch and one filled before it the old one.
-        stats.flush_epoch.store(guard.flush_epoch(), Ordering::Release);
+        stats
+            .flush_epoch
+            .store(guard.flush_epoch(), Ordering::Release);
         stats.buffered_samples.store(0, Ordering::Relaxed);
         dropped_samples
     };

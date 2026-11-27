@@ -1,5 +1,24 @@
 //! Configuration of a [`Dac`](crate::Dac) session.
 
+/// Policy for asynchronous endpoints without a proven feedback source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsyncFallbackPolicy {
+    /// Admit only full-speed UAC1 PCM with no declared feedback pipe.
+    #[default]
+    FullSpeedUac1,
+    /// Require explicit or proven implicit feedback.
+    Forbid,
+}
+
+/// Policy for unusable frequency readback after an acknowledged rate write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockReadbackPolicy {
+    #[default]
+    RequireVerified,
+    /// Continue unverified after three unusable reads; never hide a mismatch.
+    AllowUnusableAfterSuccessfulSet,
+}
+
 use crate::error::{Error, Result};
 use crate::iso_packet_scheduler::{DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT};
 use crate::quirk::Quirk;
@@ -119,14 +138,22 @@ pub struct DacConfig {
     pub padded_24bit: Option<bool>,
     /// Quirks added to the built-in table for this session.
     pub quirks: Vec<QuirkOverride>,
+    /// Apply supported exact-identity ALSA facts only when explicitly selected.
+    pub quirk_policy: crate::quirk::QuirkPolicy,
     /// Allow streaming an asynchronous endpoint that has no explicit feedback
-    /// source. By
-    /// default `negotiate` and `open_stream` refuse it with
+    /// source, beyond the narrow default [`AsyncFallbackPolicy`] tier.
+    /// Otherwise `negotiate` and `open_stream` refuse it with
     /// [`Error::ImplicitFeedbackUnsupported`]. Allowed, it streams at the nominal
     /// rate, host-paced, and any drift between the DAC's clock and the host's
     /// timing ends in underruns or overruns on the DAC; the stream is never
     /// bit-perfect (`DacStream::bit_perfect_blocker` says why). Default `false`.
     pub allow_unsynchronized_async: bool,
+    /// Narrow default fallback; never bit-perfect.
+    pub async_fallback_policy: AsyncFallbackPolicy,
+    /// Permit the unverified clock tier only after an acknowledged SET.
+    pub clock_readback_policy: ClockReadbackPolicy,
+    /// Adapt active URB count to loss, bounded by 64 ms and 255 packets.
+    pub adaptive_queue: bool,
     /// Disable explicit and implicit feedback for diagnosis. Default `false`.
     /// Asynchronous nominal playback still requires `allow_unsynchronized_async`.
     pub disable_feedback: bool,
@@ -187,7 +214,11 @@ impl Default for DacConfig {
             dsd_subslot: None,
             padded_24bit: None,
             quirks: Vec::new(),
+            quirk_policy: crate::quirk::QuirkPolicy::VerifiedOnly,
             allow_unsynchronized_async: false,
+            async_fallback_policy: AsyncFallbackPolicy::default(),
+            clock_readback_policy: ClockReadbackPolicy::default(),
+            adaptive_queue: true,
             disable_feedback: false,
             capture_feedback_trace: false,
             realtime_priority: true,
@@ -218,7 +249,11 @@ pub enum UsbQueueProfile {
 impl DacConfig {
     /// Apply the USB queue profile. All other session settings are retained.
     pub fn with_usb_queue_profile(mut self, profile: UsbQueueProfile) -> Self {
-        (self.bus_queue_ms, self.transfers_in_flight, self.transfer_period_us) = match profile {
+        (
+            self.bus_queue_ms,
+            self.transfers_in_flight,
+            self.transfer_period_us,
+        ) = match profile {
             UsbQueueProfile::LowLatency => (8, 8, Some(1_000)),
             UsbQueueProfile::Balanced => (DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT, None),
             UsbQueueProfile::LowCpu => (16, 4, None),
@@ -259,7 +294,10 @@ impl DacConfig {
         if !(2..=16).contains(&self.transfers_in_flight) {
             return bad("transfers_in_flight must be between 2 and 16");
         }
-        if self.transfer_period_us.is_some_and(|period| !(125..=32_000).contains(&period)) {
+        if self
+            .transfer_period_us
+            .is_some_and(|period| !(125..=32_000).contains(&period))
+        {
             return bad("transfer_period_us must be between 125 and 32000");
         }
         Ok(())
@@ -294,14 +332,20 @@ mod tests {
 
     #[test]
     fn validation_rejects_inconsistent_depths() {
-        let mut config = DacConfig::default();
-        config.buffer_target_ms = 600;
+        let config = DacConfig {
+            buffer_target_ms: 600,
+            ..DacConfig::default()
+        };
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
-        let mut config = DacConfig::default();
-        config.dsd_subslot = Some(3);
+        let config = DacConfig {
+            dsd_subslot: Some(3),
+            ..DacConfig::default()
+        };
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
-        let mut config = DacConfig::default();
-        config.buffer_capacity_ms = 0;
+        let config = DacConfig {
+            buffer_capacity_ms: 0,
+            ..DacConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

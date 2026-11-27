@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use usbdac_core::{
-    BitPerfectBlocker, CloseVolume, Dac, DacEvent, DacListener, DacStream, Error, Result, StreamFormat,
-    VolumeControl,
+    BitPerfectBlocker, CloseVolume, Dac, DacEvent, DacListener, DacStream, Error, Result,
+    StreamFormat, VolumeControl,
 };
 
 // region rust-source
@@ -36,7 +36,11 @@ pub struct Tone {
 
 impl Tone {
     pub fn new(rate: u32, channels: u16) -> Self {
-        Self { rate: f64::from(rate), channels: usize::from(channels), phase: 0.0 }
+        Self {
+            rate: f64::from(rate),
+            channels: usize::from(channels),
+            phase: 0.0,
+        }
     }
 }
 
@@ -135,7 +139,9 @@ struct Shared {
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct Player<R: Ring + 'static> {
@@ -150,7 +156,13 @@ impl<R: Ring + 'static> Player<R> {
     /// Starts the writer thread. The stream starts by itself once the ring holds `start_threshold_ms`
     /// of audio (100 ms by default); `play` is only for after a pause.
     pub fn start(ring: Arc<R>, shape: Shape, source: Box<dyn Source>) -> Self {
-        let shared = Arc::new(Mutex::new(Shared { source, chunk: Vec::new(), taken: 0, ended: false, start_seconds: 0.0 }));
+        let shared = Arc::new(Mutex::new(Shared {
+            source,
+            chunk: Vec::new(),
+            taken: 0,
+            ended: false,
+            start_seconds: 0.0,
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (ring, shared, stop) = (Arc::clone(&ring), Arc::clone(&shared), Arc::clone(&stop));
@@ -159,7 +171,13 @@ impl<R: Ring + 'static> Player<R> {
                 .spawn(move || write_loop(&*ring, shape, &shared, &stop))
                 .expect("spawn the writer thread")
         };
-        Self { ring, shape, shared, stop, writer: Some(writer) }
+        Self {
+            ring,
+            shape,
+            shared,
+            stop,
+            writer: Some(writer),
+        }
     }
 
     /// Keep the writer running while paused: it fills the ring to its target and idles, so a resume
@@ -316,7 +334,9 @@ pub fn restore_level(volume: &VolumeControl, remembered_db: Option<f64>) -> Resu
 /// A volume key or a slider. Each call is a USB control transfer (milliseconds, up to a second):
 /// call it from a control thread and not from the writer or a UI thread.
 pub fn nudge(volume: &VolumeControl, up: bool) -> Result<f64> {
-    volume.step(if up { 1 } else { -1 }, 0).map(|state| state.db)
+    volume
+        .step(if up { 1 } else { -1 }, 0)
+        .map(|state| state.db)
 }
 // endregion
 
@@ -340,7 +360,9 @@ fn blocker_text(blocker: BitPerfectBlocker) -> &'static str {
         BitPerfectBlocker::FormatChanged => "the DAC runs another rate than the track has",
         BitPerfectBlocker::ClockUnverified => "the DAC did not confirm its sampling rate",
         BitPerfectBlocker::SoftwareGain => "software gain is on",
-        BitPerfectBlocker::UnsynchronizedAsync => "the DAC has no feedback, so it plays at the nominal rate",
+        BitPerfectBlocker::UnsynchronizedAsync => {
+            "the DAC has no feedback, so it plays at the nominal rate"
+        }
         BitPerfectBlocker::FeedbackUnlocked => "the DAC's timing has not locked yet",
         BitPerfectBlocker::PayloadUnverified => "waiting for real audio",
         BitPerfectBlocker::NoStream => "no stream is running",
@@ -360,9 +382,15 @@ pub fn shutdown(player: Player<DacStream>, dac: Dac, device_lost: bool) -> Resul
     let stream = player.stop(); // joins the writer thread
     let stream_result = match Arc::try_unwrap(stream) {
         Ok(stream) => stream.close(),
-        Err(_) => Err(Error::InvalidState("the stream is still shared".to_string())),
+        Err(_) => Err(Error::InvalidState(
+            "the stream is still shared".to_string(),
+        )),
     };
-    let dac_result = if device_lost { dac.close_with(CloseVolume::Forget) } else { dac.close() };
+    let dac_result = if device_lost {
+        dac.close_with(CloseVolume::Forget)
+    } else {
+        dac.close()
+    };
     if matches!(dac_result, Err(Error::Transfer(_))) {
         // The output thread did not stop in time. Keep every claim and the descriptor until it has.
         while !Dac::await_usb_retirement(Duration::from_secs(1)) {}

@@ -8,6 +8,10 @@ use crate::clock_resolution::ClockChoice;
 pub enum Encoding {
     /// Linear PCM.
     Pcm,
+    /// Type I unsigned 8-bit PCM; silence is 0x80, one byte per sample.
+    PcmU8,
+    /// Type I IEEE-754 binary32 PCM; exact little-endian bits, including NaN payloads.
+    PcmFloat32,
     /// DSD over PCM: 16 DSD bits per channel per PCM frame, with the 0x05/0xFA
     /// marker byte owned by the library. `sample_rate` of the request is the
     /// carrier rate (DSD bit rate / 16: 176400 for DSD64).
@@ -54,6 +58,22 @@ impl StreamRequest {
             bit_depth,
             encoding: Encoding::Pcm,
             rate_policy: RatePolicy::Exact,
+        }
+    }
+
+    /// Unsigned Type I PCM with one byte per channel sample.
+    pub fn pcm_u8(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            encoding: Encoding::PcmU8,
+            ..Self::pcm(sample_rate, channels, 8)
+        }
+    }
+
+    /// IEEE-754 binary32 Type I PCM, retained as exact wire bits.
+    pub fn pcm_float32(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            encoding: Encoding::PcmFloat32,
+            ..Self::pcm(sample_rate, channels, 32)
         }
     }
 
@@ -175,6 +195,9 @@ mod tests {
                 bit_rate: 2_822_400
             }
         );
-        assert_eq!(StreamRequest::pcm(44_100, 2, 16).rate_policy, RatePolicy::Exact);
+        assert_eq!(
+            StreamRequest::pcm(44_100, 2, 16).rate_policy,
+            RatePolicy::Exact
+        );
     }
 }

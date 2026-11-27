@@ -25,15 +25,20 @@ const FORMATS_KEPT: usize = 16;
 struct Gen1Snapshots(Vec<(u64, usbdac_core::scarlett::Gen1Readback)>);
 impl Gen1Snapshots {
     fn remember(&mut self, snapshot: usbdac_core::scarlett::Gen1Readback) -> u64 {
-        let id=next_id();
-        self.0.push((id,snapshot));
-        if self.0.len()>8 { self.0.remove(0); }
+        let id = next_id();
+        self.0.push((id, snapshot));
+        if self.0.len() > 8 {
+            self.0.remove(0);
+        }
         id
     }
     fn get(&self, id: i64) -> Result<usbdac_core::scarlett::Gen1Readback, Error> {
-        let key=u64::try_from(id).map_err(|_|stale("first-generation snapshot",id))?;
-        self.0.iter().find(|(candidate,_)|*candidate==key).map(|(_,v)|v.clone())
-            .ok_or_else(||stale("first-generation snapshot",id))
+        let key = u64::try_from(id).map_err(|_| stale("first-generation snapshot", id))?;
+        self.0
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| stale("first-generation snapshot", id))
     }
 }
 
@@ -62,43 +67,69 @@ impl DacEntry {
 
     /// Snapshots never cross DAC owners and disappear with this entry. Bound retained USB
     /// descriptor memory; callers rediscover when an old snapshot has been evicted.
-    pub fn remember_routing(&self, snapshot: usbdac_core::routing::RoutingSnapshot) -> Result<u64, Error> {
+    pub fn remember_routing(
+        &self,
+        snapshot: usbdac_core::routing::RoutingSnapshot,
+    ) -> Result<u64, Error> {
         // Lock registration through insertion, so close either invalidates this result
         // or has already removed the owner and rejects insertion.
         let dacs = DACS.lock();
-        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
-            return Err(Error::InvalidState("DAC closed during routing discovery".into()));
+        if !dacs
+            .values()
+            .any(|entry| std::ptr::eq(Arc::as_ptr(entry), self))
+        {
+            return Err(Error::InvalidState(
+                "DAC closed during routing discovery".into(),
+            ));
         }
         let id = next_id();
         let mut snapshots = self.routing.lock();
         snapshots.push((id, snapshot));
-        if snapshots.len() > 8 { snapshots.remove(0); }
+        if snapshots.len() > 8 {
+            snapshots.remove(0);
+        }
         Ok(id)
     }
 
     pub fn routing(&self, id: i64) -> Result<usbdac_core::routing::RoutingSnapshot, Error> {
         let id = u64::try_from(id).map_err(|_| stale("routing snapshot", id))?;
-        self.routing.lock().iter().find(|(key, _)| *key == id)
+        self.routing
+            .lock()
+            .iter()
+            .find(|(key, _)| *key == id)
             .map(|(_, snapshot)| snapshot.clone())
             .ok_or_else(|| stale("routing snapshot", id as i64))
     }
 
     /// Retain only native-observed raw banks, scoped to this open DAC owner.
-    pub fn remember_scarlett_mux(&self, snapshot: usbdac_core::scarlett::MuxSnapshot) -> Result<u64, Error> {
+    pub fn remember_scarlett_mux(
+        &self,
+        snapshot: usbdac_core::scarlett::MuxSnapshot,
+    ) -> Result<u64, Error> {
         let dacs = DACS.lock();
-        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
-            return Err(Error::InvalidState("DAC closed during Scarlett mux read".into()));
+        if !dacs
+            .values()
+            .any(|entry| std::ptr::eq(Arc::as_ptr(entry), self))
+        {
+            return Err(Error::InvalidState(
+                "DAC closed during Scarlett mux read".into(),
+            ));
         }
         let id = next_id();
         let mut snapshots = self.scarlett_mux.lock();
         snapshots.push((id, snapshot));
-        if snapshots.len() > 8 { snapshots.remove(0); }
+        if snapshots.len() > 8 {
+            snapshots.remove(0);
+        }
         Ok(id)
     }
 
     pub fn scarlett_mux(&self, id: i64) -> Result<usbdac_core::scarlett::MuxSnapshot, Error> {
         let id = u64::try_from(id).map_err(|_| stale("Scarlett mux snapshot", id))?;
-        self.scarlett_mux.lock().iter().find(|(key, _)| *key == id)
+        self.scarlett_mux
+            .lock()
+            .iter()
+            .find(|(key, _)| *key == id)
             .map(|(_, snapshot)| snapshot.clone())
             .ok_or_else(|| stale("Scarlett mux snapshot", id as i64))
     }
@@ -106,27 +137,44 @@ impl DacEntry {
     /// Retain native-observed FCP state only, bounded to eight snapshots per owner.
     pub fn remember_fcp(&self, snapshot: usbdac_core::scarlett::FcpReadback) -> Result<u64, Error> {
         let dacs = DACS.lock();
-        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
+        if !dacs
+            .values()
+            .any(|entry| std::ptr::eq(Arc::as_ptr(entry), self))
+        {
             return Err(Error::InvalidState("DAC closed during FCP read".into()));
         }
         let id = next_id();
         let mut snapshots = self.fcp.lock();
         snapshots.push((id, snapshot));
-        if snapshots.len() > 8 { snapshots.remove(0); }
+        if snapshots.len() > 8 {
+            snapshots.remove(0);
+        }
         Ok(id)
     }
 
     pub fn fcp(&self, id: i64) -> Result<usbdac_core::scarlett::FcpReadback, Error> {
         let key = u64::try_from(id).map_err(|_| stale("FCP snapshot", id))?;
-        self.fcp.lock().iter().find(|(candidate, _)| *candidate == key)
-            .map(|(_, snapshot)| snapshot.clone()).ok_or_else(|| stale("FCP snapshot", id))
+        self.fcp
+            .lock()
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, snapshot)| snapshot.clone())
+            .ok_or_else(|| stale("FCP snapshot", id))
     }
 
     /// Only explicitly retained first-generation native readback grants an edit token.
-    pub fn remember_gen1(&self, snapshot: usbdac_core::scarlett::Gen1Readback) -> Result<u64, Error> {
+    pub fn remember_gen1(
+        &self,
+        snapshot: usbdac_core::scarlett::Gen1Readback,
+    ) -> Result<u64, Error> {
         let dacs = DACS.lock();
-        if !dacs.values().any(|entry| std::ptr::eq(Arc::as_ptr(entry), self)) {
-            return Err(Error::InvalidState("DAC closed during first-generation read".into()));
+        if !dacs
+            .values()
+            .any(|entry| std::ptr::eq(Arc::as_ptr(entry), self))
+        {
+            return Err(Error::InvalidState(
+                "DAC closed during first-generation read".into(),
+            ));
         }
         Ok(self.gen1.lock().remember(snapshot))
     }
@@ -176,9 +224,16 @@ static CAPTURES: Lazy<Mutex<CaptureTable>> = Lazy::new(|| Mutex::new(HashMap::ne
 
 /// Publish both directions under the owner lock. DAC close either collects
 /// the complete pair or makes this fail, dropping and retiring both workers.
-pub fn insert_duplex(dac: &Arc<DacEntry>, playback: DacStream, capture: DacCaptureStream) -> Result<(u64, u64), Error> {
+pub fn insert_duplex(
+    dac: &Arc<DacEntry>,
+    playback: DacStream,
+    capture: DacCaptureStream,
+) -> Result<(u64, u64), Error> {
     let dacs = DACS.lock();
-    let owner = dacs.iter().find(|(_, entry)| Arc::ptr_eq(entry, dac)).map(|(id, _)| *id)
+    let owner = dacs
+        .iter()
+        .find(|(_, entry)| Arc::ptr_eq(entry, dac))
+        .map(|(id, _)| *id)
         .ok_or_else(|| Error::InvalidState("DAC closed while duplex was opening".into()))?;
     let output = next_id();
     let input = next_id();
@@ -233,6 +288,52 @@ fn stale(kind: &str, id: i64) -> Error {
     Error::InvalidArgument(format!("{kind} handle {id} is not open"))
 }
 
+struct RetirementEntry {
+    owner: u64,
+    token: usbdac_core::UsbRetirement,
+}
+static RETIREMENTS: Lazy<Mutex<HashMap<u64, RetirementEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Allocate at most one retirement token per live owner, atomically with lookup.
+pub fn retirement_token(owner: i64) -> Result<u64, Error> {
+    let owner = u64::try_from(owner).map_err(|_| stale("DAC", owner))?;
+    let dacs = DACS.lock();
+    let entry = dacs.get(&owner).ok_or_else(|| stale("DAC", owner as i64))?;
+    let mut tokens = RETIREMENTS.lock();
+    if let Some((id, _)) = tokens.iter().find(|(_, entry)| entry.owner == owner) {
+        return Ok(*id);
+    }
+    let id = next_id();
+    tokens.insert(
+        id,
+        RetirementEntry {
+            owner,
+            token: entry.dac.retirement(),
+        },
+    );
+    Ok(id)
+}
+fn retirement(token: i64) -> Result<usbdac_core::UsbRetirement, Error> {
+    u64::try_from(token)
+        .ok()
+        .and_then(|id| RETIREMENTS.lock().get(&id).map(|entry| entry.token.clone()))
+        .ok_or_else(|| stale("retirement", token))
+}
+pub fn await_retirement(token: i64) -> Result<bool, Error> {
+    Ok(retirement(token)?.wait(std::time::Duration::from_millis(500)))
+}
+pub fn release_retirement(token: i64) -> Result<(), Error> {
+    if !retirement(token)?.wait(std::time::Duration::ZERO) {
+        return Err(Error::InvalidState("USB owner has not retired".into()));
+    }
+    RETIREMENTS
+        .lock()
+        .remove(&(token as u64))
+        .ok_or_else(|| stale("retirement", token))?;
+    Ok(())
+}
+
 pub fn insert_dac(entry: DacEntry) -> u64 {
     let id = next_id();
     DACS.lock().insert(id, Arc::new(entry));
@@ -263,17 +364,18 @@ pub fn remove_dac(id: i64) -> Result<(Arc<DacEntry>, Vec<Arc<DacStream>>), Error
     Ok((entry, streams))
 }
 
-pub fn insert_stream(dac: &Arc<DacEntry>, stream: DacStream) -> u64 {
-    let id = next_id();
-    let owner = DACS
-        .lock()
+/// Commit under the owner lock: a racing DAC close either collects this stream or rejects it.
+pub fn insert_stream(dac: &Arc<DacEntry>, stream: DacStream) -> Result<u64, Error> {
+    let owners = DACS.lock();
+    let owner = owners
         .iter()
         .find(|(_, entry)| Arc::ptr_eq(entry, dac))
         .map(|(id, _)| *id)
-        .unwrap_or(0);
+        .ok_or_else(|| Error::InvalidState("DAC closed while playback was opening".into()))?;
+    let id = next_id();
     STREAMS.lock().insert(id, (owner, Arc::new(stream)));
     dac.add_stream(id);
-    id
+    Ok(id)
 }
 
 pub fn stream(id: i64) -> Result<Arc<DacStream>, Error> {
@@ -281,6 +383,54 @@ pub fn stream(id: i64) -> Result<Arc<DacStream>, Error> {
         .ok()
         .and_then(|id| STREAMS.lock().get(&id).map(|(_, stream)| stream.clone()))
         .ok_or_else(|| stale("stream", id))
+}
+
+/// Resolve only a stream registered to this exact DAC owner.
+pub fn stream_for_dac(dac: &Arc<DacEntry>, id: i64) -> Result<Arc<DacStream>, Error> {
+    let owners = DACS.lock();
+    let owner = owners
+        .iter()
+        .find(|(_, entry)| Arc::ptr_eq(entry, dac))
+        .map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed during reconfiguration".into()))?;
+    let key = u64::try_from(id).map_err(|_| stale("stream", id))?;
+    STREAMS
+        .lock()
+        .get(&key)
+        .filter(|(registered, _)| *registered == owner)
+        .map(|(_, stream)| stream.clone())
+        .ok_or_else(|| Error::InvalidArgument("stream is stale or belongs to another DAC".into()))
+}
+
+/// Commit replacement only while both the DAC and old registration still exist.
+/// On failure the unregistered replacement drops/closes and cannot become an orphan.
+pub fn replace_stream(
+    dac: &Arc<DacEntry>,
+    previous: i64,
+    id: u64,
+    stream: DacStream,
+) -> Result<(), Error> {
+    let owners = DACS.lock();
+    let owner = owners
+        .iter()
+        .find(|(_, entry)| Arc::ptr_eq(entry, dac))
+        .map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed before replacement registration".into()))?;
+    let previous = u64::try_from(previous).map_err(|_| stale("stream", previous))?;
+    let mut streams = STREAMS.lock();
+    if !streams
+        .get(&previous)
+        .is_some_and(|(registered, _)| *registered == owner)
+    {
+        return Err(Error::InvalidState(
+            "old stream closed during reconfiguration".into(),
+        ));
+    }
+    streams.remove(&previous);
+    streams.insert(id, (owner, Arc::new(stream)));
+    dac.forget_stream(previous);
+    dac.add_stream(id);
+    Ok(())
 }
 
 pub fn remove_stream(id: i64) -> Result<Arc<DacStream>, Error> {
@@ -300,21 +450,28 @@ mod tests {
 
     #[test]
     fn gen1_tokens_are_owner_scoped_bounded_and_reject_invalid_handles() {
-        use usbdac_core::scarlett::{Gen1Model,Gen1Readback};
-        let snapshot=Gen1Readback {model:Gen1Model::Forte,controls:vec![],
-            source_offsets:[0,4,6,6,6],matrix_sources:7,output_sources:0};
-        let mut owner=Gen1Snapshots::default();
-        let foreign=Gen1Snapshots::default();
-        let token=owner.remember(snapshot.clone());
-        assert_eq!(owner.get(token as i64).unwrap(),snapshot);
+        use usbdac_core::scarlett::{Gen1Model, Gen1Readback};
+        let snapshot = Gen1Readback {
+            model: Gen1Model::Forte,
+            controls: vec![],
+            source_offsets: [0, 4, 6, 6, 6],
+            matrix_sources: 7,
+            output_sources: 0,
+        };
+        let mut owner = Gen1Snapshots::default();
+        let foreign = Gen1Snapshots::default();
+        let token = owner.remember(snapshot.clone());
+        assert_eq!(owner.get(token as i64).unwrap(), snapshot);
         assert!(foreign.get(token as i64).is_err());
         assert!(owner.get(-1).is_err());
         assert!(owner.get(0).is_err());
-        for _ in 0..8 { owner.remember(snapshot.clone()); }
+        for _ in 0..8 {
+            owner.remember(snapshot.clone());
+        }
         assert!(owner.get(token as i64).is_err());
-        assert_eq!(owner.0.len(),8);
-        let fresh=owner.remember(snapshot.clone());
-        assert_eq!(owner.get(fresh as i64).unwrap(),snapshot);
+        assert_eq!(owner.0.len(), 8);
+        let fresh = owner.remember(snapshot.clone());
+        assert_eq!(owner.get(fresh as i64).unwrap(), snapshot);
     }
 
     #[test]
@@ -330,5 +487,8 @@ mod tests {
         assert!(matches!(remove_capture(-1), Err(Error::InvalidArgument(_))));
         assert!(remove_dac_captures(0).is_empty());
         assert!(remove_dac(0).is_err());
+        assert!(retirement_token(0).is_err());
+        assert!(await_retirement(0).is_err());
+        assert!(release_retirement(0).is_err());
     }
 }

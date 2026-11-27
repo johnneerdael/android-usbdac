@@ -159,4 +159,37 @@ class DacIdleReleaseTest {
         runCurrent()
         assertFalse(first.closed)
     }
+    @Test
+    fun resumeReportsWhetherTheQueuedAudioWasActuallyDiscarded() = runTest {
+        val first = FakeOutput()
+        val second = FakeOutput()
+        val idle = DacIdleRelease(this, 1_000, reopen = { second }, closeContext = EmptyCoroutineContext)
+        idle.attach(first)
+        idle.onPaused()
+        assertFalse(idle.resume().reopened)
+        idle.onPaused()
+        advanceTimeBy(1_000)
+        runCurrent()
+        val result = idle.resume()
+        assertTrue(result.reopened)
+        assertSame(second, result.output)
+    }
+
+    @Test
+    fun attachingDuringOldCloseKeepsTheReplacement() = runTest {
+        val replacement = FakeOutput()
+        lateinit var idle: DacIdleRelease<PcmOutput>
+        val old = object : PcmOutput by FakeOutput() {
+            override fun close() { idle.attach(replacement) }
+        }
+        idle = DacIdleRelease(this, 1_000, reopen = { error("replacement already attached") }, closeContext = EmptyCoroutineContext)
+        idle.attach(old)
+        idle.onPaused()
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertSame(replacement, idle.output)
+        assertFalse(idle.isReleased.value)
+        assertFalse(idle.resume().reopened)
+    }
+
 }

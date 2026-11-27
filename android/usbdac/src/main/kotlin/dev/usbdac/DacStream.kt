@@ -36,7 +36,7 @@ internal class StreamSignals(private val publish: (DacEvent) -> Unit) : NativeLi
                 bitPerfect.value = directBitPerfectState(event.bitPerfect, if (event.bitPerfect) null else blocker())
             }
             // Device-level events reach the session's own listener; do not publish them twice.
-            is DacEvent.VolumeChanged, DacEvent.DeviceLost -> return
+            is DacEvent.VolumeChanged, is DacEvent.CompatibilityFallback, DacEvent.DeviceLost -> return
             else -> Unit
         }
         publish(event)
@@ -179,6 +179,16 @@ public class DacStream internal constructor(
             signals.statsSource = null
             onClosed()
         }
+    }
+
+    internal fun handleForReconfigure(): Long { checkOpen(); return handle }
+
+    /** Native replacement already removed the old registration; do not close its stale token. */
+    internal fun retiredByReconfigure() {
+        if (!closed.compareAndSet(false, true)) return
+        signals.state.value = StreamState.CLOSED
+        signals.statsSource = null
+        onClosed()
     }
 
     private fun checkOpen() {

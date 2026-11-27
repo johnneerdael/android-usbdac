@@ -6,7 +6,8 @@
 
 use std::os::fd::RawFd;
 use usbdac_core::{
-    AltFormat, Capabilities, Dac, DacConfig, DeviceInfo, Error, RatePolicy, Result, StreamFormat, StreamRequest,
+    AltFormat, Capabilities, Dac, DacConfig, DeviceInfo, Error, RatePolicy, Result, StreamFormat,
+    StreamRequest,
 };
 
 // region rust-host
@@ -38,7 +39,11 @@ pub fn open_dac(host: &mut dyn UsbHost, identity: DeviceInfo, config: DacConfig)
         let (configuration, candidates) = Dac::feedback_preflight(host.fd(), &info)?;
         let got = host.claim_optional(&candidates);
         info.configuration_id = Some(configuration);
-        info.unavailable_feedback_interfaces = candidates.iter().copied().filter(|n| !got.contains(n)).collect();
+        info.unavailable_feedback_interfaces = candidates
+            .iter()
+            .copied()
+            .filter(|n| !got.contains(n))
+            .collect();
         info.claimed_interfaces.extend(got);
     }
     // Lowers the DAC to at most -40 dB, verifies it, and touches neither the clock nor the audio.
@@ -84,11 +89,21 @@ pub struct Negotiated {
 /// Asks for the track's own format. With `allow_nearest` the DAC may run the nearest rate it has, and
 /// the result says so. Takes 100 ms or more: it programs the DAC's clock and reads it back.
 pub fn negotiate(dac: &Dac, track: TrackFormat, allow_nearest: bool) -> Result<Negotiated> {
-    let policy = if allow_nearest { RatePolicy::NearestSupported } else { RatePolicy::Exact };
-    let request = StreamRequest::pcm(track.sample_rate, track.channels, track.bits).with_rate_policy(policy);
+    let policy = if allow_nearest {
+        RatePolicy::NearestSupported
+    } else {
+        RatePolicy::Exact
+    };
+    let request =
+        StreamRequest::pcm(track.sample_rate, track.channels, track.bits).with_rate_policy(policy);
     let format = dac.negotiate(&request)?;
-    let resample_to = format.rate_differs_from_request().then_some(format.sample_rate);
-    Ok(Negotiated { format, resample_to })
+    let resample_to = format
+        .rate_differs_from_request()
+        .then_some(format.sample_rate);
+    Ok(Negotiated {
+        format,
+        resample_to,
+    })
 }
 
 /// Whether the DAC lists the format among its PCM alternate settings, without touching its clock. A
@@ -119,16 +134,30 @@ pub enum Next {
 
 pub fn next_step(error: &Error) -> Next {
     match error {
-        Error::VolumeUnavailable => Next::AskListener("the DAC has no volume control: allow a fixed level and open again"),
-        Error::Claim(_) => Next::AskListener("the system keeps the DAC: replug it and check that nothing else holds it"),
+        Error::VolumeUnavailable => {
+            Next::AskListener("the DAC has no volume control: allow a fixed level and open again")
+        }
+        Error::Claim(_) => Next::AskListener(
+            "the system keeps the DAC: replug it and check that nothing else holds it",
+        ),
         Error::Busy => Next::FixTheHost("another Dac is open in this process: close it first"),
-        Error::Unsupported { .. } => Next::OtherOutput("the DAC has no alternate setting for this format"),
-        Error::ImplicitFeedbackUnsupported => Next::OtherOutput("an asynchronous endpoint without feedback"),
+        Error::Unsupported { .. } => {
+            Next::OtherOutput("the DAC has no alternate setting for this format")
+        }
+        Error::ImplicitFeedbackUnsupported => {
+            Next::OtherOutput("an asynchronous endpoint without feedback")
+        }
         Error::ClockUnverified { .. } => Next::Report("the DAC did not confirm its sampling rate"),
         Error::DeviceLost => Next::AskListener("the DAC was unplugged"),
-        Error::PlatformUnsupported => Next::Report("direct USB needs Linux usbfs: Android or Linux"),
-        Error::InvalidState(_) | Error::InvalidArgument(_) => Next::FixTheHost("the call was not valid in this state"),
-        Error::Transfer(_) | Error::Control(_) => Next::Report("a transfer or class request failed"),
+        Error::PlatformUnsupported => {
+            Next::Report("direct USB needs Linux usbfs: Android or Linux")
+        }
+        Error::InvalidState(_) | Error::InvalidArgument(_) => {
+            Next::FixTheHost("the call was not valid in this state")
+        }
+        Error::Transfer(_) | Error::Control(_) => {
+            Next::Report("a transfer or class request failed")
+        }
         // `Error` is non-exhaustive: a newer library may add variants.
         _ => Next::Report("an error this host does not know"),
     }
@@ -151,7 +180,11 @@ type ClaimMore = Box<dyn FnMut(&[u8]) -> Vec<u8> + Send>;
 
 impl AndroidHost {
     pub fn new(fd: RawFd, claimed: Vec<u8>, claim_more: ClaimMore) -> Self {
-        Self { fd, claimed, claim_more }
+        Self {
+            fd,
+            claimed,
+            claim_more,
+        }
     }
 }
 
@@ -179,7 +212,8 @@ pub fn open_from_android(
     device_name: &str,
     config: DacConfig,
 ) -> Result<Dac> {
-    let identity = DeviceInfo::new(vendor_id, product_id, product_name).with_device_name(device_name);
+    let identity =
+        DeviceInfo::new(vendor_id, product_id, product_name).with_device_name(device_name);
     open_dac(host, identity, config)
 }
 // endregion
@@ -243,7 +277,11 @@ pub mod usbfs {
             let mut raw = Vec::new();
             file.read_to_end(&mut raw)?;
             let settings = parse_settings(raw.get(18..).unwrap_or(&[]));
-            Ok(Self { file, settings, claimed: Vec::new() })
+            Ok(Self {
+                file,
+                settings,
+                claimed: Vec::new(),
+            })
         }
 
         fn ioctl<T>(&self, request: libc::Ioctl, argument: *mut T) -> io::Result<()> {
@@ -255,7 +293,11 @@ pub mod usbfs {
 
         fn claim(&mut self, interface: u8) -> io::Result<()> {
             // Takes the interface from the kernel's audio driver if it holds it.
-            let mut claim = DisconnectClaim { interface: interface.into(), flags: 0, driver: [0; 256] };
+            let mut claim = DisconnectClaim {
+                interface: interface.into(),
+                flags: 0,
+                driver: [0; 256],
+            };
             self.ioctl(DISCONNECT_CLAIM, &mut claim)?;
             self.claimed.push(interface);
             Ok(())
@@ -273,22 +315,31 @@ pub mod usbfs {
             let mut wanted: Vec<u8> = self
                 .settings
                 .iter()
-                .filter(|s| s.class == 1 && (s.subclass == 1 || (s.subclass == 2 && s.isochronous_out)))
+                .filter(|s| {
+                    s.class == 1 && (s.subclass == 1 || (s.subclass == 2 && s.isochronous_out))
+                })
                 .map(|s| s.number)
                 .collect();
             wanted.sort_unstable();
             wanted.dedup();
             if wanted.is_empty() {
-                return Err(Error::Claim("no AudioControl and playback AudioStreaming interface".into()));
+                return Err(Error::Claim(
+                    "no AudioControl and playback AudioStreaming interface".into(),
+                ));
             }
             for interface in &wanted {
-                self.claim(*interface).map_err(|e| Error::Claim(format!("interface {interface}: {e}")))?;
+                self.claim(*interface)
+                    .map_err(|e| Error::Claim(format!("interface {interface}: {e}")))?;
             }
             Ok(wanted)
         }
 
         fn claim_optional(&mut self, candidates: &[u8]) -> Vec<u8> {
-            candidates.iter().copied().filter(|n| self.claim(*n).is_ok()).collect()
+            candidates
+                .iter()
+                .copied()
+                .filter(|n| self.claim(*n).is_ok())
+                .collect()
         }
     }
 
@@ -299,7 +350,11 @@ pub mod usbfs {
             for interface in std::mem::take(&mut self.claimed) {
                 let mut number: libc::c_uint = interface.into();
                 let _ = self.ioctl(RELEASE_INTERFACE, &mut number);
-                let mut connect = IoctlTransfer { interface: interface.into(), code: CONNECT, data: std::ptr::null_mut() };
+                let mut connect = IoctlTransfer {
+                    interface: interface.into(),
+                    code: CONNECT,
+                    data: std::ptr::null_mut(),
+                };
                 let _ = self.ioctl(IOCTL, &mut connect);
             }
         }
@@ -317,7 +372,12 @@ pub mod usbfs {
             let body = &descriptors[at..at + length];
             match body[1] {
                 // Interface: number, alternate setting, endpoints, class, subclass.
-                4 if length >= 9 => settings.push(Setting { number: body[2], class: body[5], subclass: body[6], isochronous_out: false }),
+                4 if length >= 9 => settings.push(Setting {
+                    number: body[2],
+                    class: body[5],
+                    subclass: body[6],
+                    isochronous_out: false,
+                }),
                 // Endpoint: address (bit 7 is the direction), attributes (bits 0-1 are the transfer type).
                 5 if length >= 7 => {
                     if let Some(last) = settings.last_mut() {
@@ -331,7 +391,9 @@ pub mod usbfs {
         // The settings of one interface share its number: keep the flag if any alternate setting has the endpoint.
         let copy = settings.clone();
         for setting in &mut settings {
-            setting.isochronous_out = copy.iter().any(|s| s.number == setting.number && s.isochronous_out);
+            setting.isochronous_out = copy
+                .iter()
+                .any(|s| s.number == setting.number && s.isochronous_out);
         }
         settings
     }
@@ -339,5 +401,7 @@ pub mod usbfs {
 // endregion
 
 fn main() {
-    println!("guide_open is a compile-checked example of docs/sdk/guide-rust.md; it needs a DAC to run.");
+    println!(
+        "guide_open is a compile-checked example of docs/sdk/guide-rust.md; it needs a DAC to run."
+    );
 }

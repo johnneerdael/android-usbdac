@@ -7,7 +7,10 @@ pub(crate) struct RateRatio {
 }
 
 impl RateRatio {
-    pub(crate) const IDENTITY: Self = Self { numerator: 1, denominator: 1 };
+    pub(crate) const IDENTITY: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
 
     pub(crate) fn from_factors(factors: &[(u16, u16)]) -> Result<Self, String> {
         if factors.iter().any(|&(n, d)| n == 0 || d == 0) {
@@ -25,10 +28,17 @@ impl RateRatio {
             }
         }
         let product = |values: &[u32]| {
-            values.iter().try_fold(1u32, |value, factor| value.checked_mul(*factor))
-                .ok_or_else(|| "clock multiplier ratio exceeds positive u32 rate bounds".to_string())
+            values
+                .iter()
+                .try_fold(1u32, |value, factor| value.checked_mul(*factor))
+                .ok_or_else(|| {
+                    "clock multiplier ratio exceeds positive u32 rate bounds".to_string()
+                })
         };
-        Ok(Self { numerator: product(&numerators)?, denominator: product(&denominators)? })
+        Ok(Self {
+            numerator: product(&numerators)?,
+            denominator: product(&denominators)?,
+        })
     }
 
     pub(crate) fn source_rate(self, wire: u32) -> Option<u32> {
@@ -115,7 +125,8 @@ fn modular_inverse(value: u64, modulus: u64) -> u64 {
     while next_remainder != 0 {
         let quotient = remainder / next_remainder;
         (remainder, next_remainder) = (next_remainder, remainder - quotient * next_remainder);
-        (coefficient, next_coefficient) = (next_coefficient, coefficient - quotient * next_coefficient);
+        (coefficient, next_coefficient) =
+            (next_coefficient, coefficient - quotient * next_coefficient);
     }
     coefficient.rem_euclid(i128::from(modulus)) as u64
 }
@@ -132,7 +143,10 @@ mod tests {
     fn factors_cancel_before_bounded_product() {
         let mut factors = vec![(65535, 1); 16];
         factors.extend(vec![(1, 65535); 16]);
-        assert_eq!(RateRatio::from_factors(&factors).unwrap(), RateRatio::IDENTITY);
+        assert_eq!(
+            RateRatio::from_factors(&factors).unwrap(),
+            RateRatio::IDENTITY
+        );
         assert_eq!(RateRatio::from_factors(&[]).unwrap(), RateRatio::IDENTITY);
         assert!(RateRatio::from_factors(&[(65535, 1); 3]).is_err());
         assert!(RateRatio::from_factors(&[(1, 65535); 3]).is_err());
@@ -162,11 +176,20 @@ mod tests {
 
     #[test]
     fn projection_handles_discrete_and_identity_shapes() {
-        assert_eq!(ratio(3, 2).project_range(48000, 48000, 0), Some((72000, 72000, 0)));
+        assert_eq!(
+            ratio(3, 2).project_range(48000, 48000, 0),
+            Some((72000, 72000, 0))
+        );
         assert_eq!(ratio(3, 2).project_range(48000, 96000, 0), None);
         assert_eq!(ratio(3, 2).project_range(48001, 96000, 0), None);
-        assert_eq!(RateRatio::IDENTITY.project_range(1, 100, 7), Some((1, 99, 7)));
-        assert_eq!(RateRatio::IDENTITY.project_range(1, 99, 7), Some((1, 99, 7)));
+        assert_eq!(
+            RateRatio::IDENTITY.project_range(1, 100, 7),
+            Some((1, 99, 7))
+        );
+        assert_eq!(
+            RateRatio::IDENTITY.project_range(1, 99, 7),
+            Some((1, 99, 7))
+        );
         assert_eq!(RateRatio::IDENTITY.project_range(8, 8, 7), Some((8, 8, 0)));
         assert_eq!(ratio(2, 3).project_range(0, 10, 1), None);
         assert_eq!(ratio(2, 3).project_range(10, 1, 1), None);
@@ -185,12 +208,27 @@ mod tests {
 
     #[test]
     fn projection_caps_overflow_without_scanning_the_grid() {
-        assert_eq!(ratio(2, 1).project_range(1, u32::MAX, 1), Some((2, u32::MAX - 1, 2)));
-        assert_eq!(ratio(2, 1).project_range(u32::MAX / 2 + 1, u32::MAX, 1), None);
-        assert_eq!(ratio(65535, 1).project_range(1, u32::MAX, 1), Some((65535, u32::MAX, 65535)));
+        assert_eq!(
+            ratio(2, 1).project_range(1, u32::MAX, 1),
+            Some((2, u32::MAX - 1, 2))
+        );
+        assert_eq!(
+            ratio(2, 1).project_range(u32::MAX / 2 + 1, u32::MAX, 1),
+            None
+        );
+        assert_eq!(
+            ratio(65535, 1).project_range(1, u32::MAX, 1),
+            Some((65535, u32::MAX, 65535))
+        );
         let r = RateRatio::from_factors(&[(65535, 1), (65535, 1)]).unwrap();
-        assert_eq!(r.project_range(1, u32::MAX, 1), Some((4294836225, 4294836225, 0)));
-        assert_eq!(ratio(1, 65535).project_range(1, u32::MAX, 1), Some((1, 65537, 1)));
+        assert_eq!(
+            r.project_range(1, u32::MAX, 1),
+            Some((4294836225, 4294836225, 0))
+        );
+        assert_eq!(
+            ratio(1, 65535).project_range(1, u32::MAX, 1),
+            Some((1, 65537, 1))
+        );
     }
 
     #[test]
@@ -199,14 +237,18 @@ mod tests {
             let r = ratio(n, d);
             for min in 1..12 {
                 for res in 1..12 {
-                    let sources: Vec<_> = (min..=100).step_by(res as usize)
-                        .filter_map(|source| r.wire_rate(source)).collect();
+                    let sources: Vec<_> = (min..=100)
+                        .step_by(res as usize)
+                        .filter_map(|source| r.wire_rate(source))
+                        .collect();
                     let projected = r.project_range(min, 100, res);
                     if sources.is_empty() {
                         assert_eq!(projected, None);
                     } else {
                         let (first, last, step) = projected.unwrap();
-                        let actual: Vec<_> = if step == 0 { vec![first] } else {
+                        let actual: Vec<_> = if step == 0 {
+                            vec![first]
+                        } else {
                             (first..=last).step_by(step as usize).collect()
                         };
                         assert_eq!(actual, sources);

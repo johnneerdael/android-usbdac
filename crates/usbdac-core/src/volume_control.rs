@@ -32,7 +32,8 @@ impl AudioControlProtocol {
         if channels == 0 || controls.len() <= channels as usize {
             return None;
         }
-        (1..=channels).all(|channel| self.writable(controls[channel as usize], 2))
+        (1..=channels)
+            .all(|channel| self.writable(controls[channel as usize], 2))
             .then(|| (1..=channels).collect())
     }
 }
@@ -103,18 +104,29 @@ pub(crate) fn parse_uac2_volume_ranges(data: &[u8]) -> Result<Vec<RawRange>, Str
     }
     let count = u16::from_le_bytes([data[0], data[1]]) as usize;
     if count == 0 || count > 64 || data.len() != 2 + count * 6 {
-        return Err(format!("invalid USB volume RANGE length/count: {}/{count}", data.len()));
+        return Err(format!(
+            "invalid USB volume RANGE length/count: {}/{count}",
+            data.len()
+        ));
     }
-    data[2..].chunks_exact(6).map(|bytes| RawRange {
-        min: i16::from_le_bytes([bytes[0], bytes[1]]),
-        max: i16::from_le_bytes([bytes[2], bytes[3]]),
-        resolution: i16::from_le_bytes([bytes[4], bytes[5]]),
-    }.validate()).collect()
+    data[2..]
+        .chunks_exact(6)
+        .map(|bytes| {
+            RawRange {
+                min: i16::from_le_bytes([bytes[0], bytes[1]]),
+                max: i16::from_le_bytes([bytes[2], bytes[3]]),
+                resolution: i16::from_le_bytes([bytes[4], bytes[5]]),
+            }
+            .validate()
+        })
+        .collect()
 }
 
 pub(crate) fn volume_bounds(ranges: &[RawRange]) -> (i16, i16) {
-    (ranges.iter().map(|r| r.min).min().unwrap_or(0),
-     ranges.iter().map(|r| r.max).max().unwrap_or(0))
+    (
+        ranges.iter().map(|r| r.min).min().unwrap_or(0),
+        ranges.iter().map(|r| r.max).max().unwrap_or(0),
+    )
 }
 
 /// Quietest level the 0..1 slider range reaches above silence: -80 dB in
@@ -127,7 +139,11 @@ pub(crate) const VOLUME_FLOOR_RAW: i16 = -80 * 256;
 /// so a device whose minimum is above the floor (or that never rises above it)
 /// keeps its linear full-range mapping.
 fn volume_floor(min: i16, max: i16) -> i16 {
-    if max > VOLUME_FLOOR_RAW { min.max(VOLUME_FLOOR_RAW) } else { min }
+    if max > VOLUME_FLOOR_RAW {
+        min.max(VOLUME_FLOOR_RAW)
+    } else {
+        min
+    }
 }
 
 pub(crate) fn normalize_volume(raw: i16, ranges: &[RawRange]) -> f64 {
@@ -151,10 +167,16 @@ pub(crate) fn quantize_volume(volume: f64, ranges: &[RawRange]) -> i16 {
     // In a gap, use the nearest supported value (quieter on a tie). A nonzero
     // fraction stays above the floor so normalize_volume() maps it back to
     // itself; only a range with nothing above it falls back to its minimum.
-    let nearest = |above| ranges.iter().filter_map(|range| range.nearest_above(target, above))
-        .min_by(|a, b| {
-            ((*a as f64 - target).abs()).total_cmp(&(*b as f64 - target).abs()).then(a.cmp(b))
-        });
+    let nearest = |above| {
+        ranges
+            .iter()
+            .filter_map(|range| range.nearest_above(target, above))
+            .min_by(|a, b| {
+                ((*a as f64 - target).abs())
+                    .total_cmp(&(*b as f64 - target).abs())
+                    .then(a.cmp(b))
+            })
+    };
     nearest(floor).or_else(|| nearest(min)).unwrap_or(min)
 }
 
@@ -187,8 +209,13 @@ pub(crate) struct StartupPlan {
 /// The highest level the DAC supports that is at most `db`, or None when `db` is
 /// below its minimum.
 pub(crate) fn floor_db(db: f64, ranges: &[RawRange]) -> Option<i16> {
-    let target = (db * 256.0).floor().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i32;
-    ranges.iter().filter_map(|range| range.floor_on_lattice(target)).max()
+    let target = (db * 256.0)
+        .floor()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i32;
+    ranges
+        .iter()
+        .filter_map(|range| range.floor_on_lattice(target))
+        .max()
 }
 
 /// Lowers each channel to `min(its level, max_db)`, where `max_db` is rounded
@@ -326,6 +353,10 @@ impl<C: SameRoute> OriginalVolumeSlot<C> {
         Self(Vec::new())
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub(crate) fn is_recorded(&self, device: &str) -> bool {
         self.0.iter().any(|original| original.device == device)
     }
@@ -343,7 +374,11 @@ impl<C: SameRoute> OriginalVolumeSlot<C> {
             self.0.clear();
         }
         if !self.is_route_recorded(device, &control) {
-            self.0.push(OriginalVolume { device: device.to_string(), control, channels });
+            self.0.push(OriginalVolume {
+                device: device.to_string(),
+                control,
+                channels,
+            });
         }
     }
 
@@ -356,8 +391,9 @@ impl<C: SameRoute> OriginalVolumeSlot<C> {
 
     /// Every record of `device`, ending them. Another DAC's records are left alone.
     pub(crate) fn take_all(&mut self, device: &str) -> Vec<OriginalVolume<C>> {
-        let (mine, others): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.0).into_iter().partition(|original| original.device == device);
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|original| original.device == device);
         self.0 = others;
         mine
     }
@@ -378,6 +414,7 @@ pub(crate) fn common_channel_volume(channels: &[i16]) -> Option<i16> {
 pub(crate) struct HardwareVolumeSnapshot {
     /// The level every channel reads, exactly as the DAC reported it.
     pub(crate) raw: i16,
+    pub(crate) db: f64,
     pub(crate) volume: f64,
     pub(crate) muted: Option<bool>,
     pub(crate) mute_error: Option<String>,
@@ -390,7 +427,8 @@ pub(crate) fn read_hardware_volume_snapshot(
     mut read_volume: impl FnMut(u16) -> Result<i16, String>,
     read_mute: impl FnOnce() -> Result<Option<bool>, String>,
 ) -> Result<HardwareVolumeSnapshot, String> {
-    let (&first, remaining) = channels.split_first()
+    let (&first, remaining) = channels
+        .split_first()
         .ok_or_else(|| "USB volume has no playback channels".to_string())?;
     let raw = read_volume(first)?;
     for &channel in remaining {
@@ -398,15 +436,20 @@ pub(crate) fn read_hardware_volume_snapshot(
             return Err("USB volume readback channels disagree".to_string());
         }
     }
-    if !ranges.iter().any(|range| raw >= range.min && raw <= range.max) {
+    if !ranges
+        .iter()
+        .any(|range| raw >= range.min && raw <= range.max)
+    {
         return Err("USB volume readback is out of range".to_string());
     }
     let (muted, mute_error) = match read_mute() {
         Ok(muted) => (muted, None),
+        Err(error) if crate::error::is_device_gone(&error) => return Err(error),
         Err(error) => (None, Some(error)),
     };
     Ok(HardwareVolumeSnapshot {
         raw,
+        db: crate::volume::raw_to_db(raw),
         volume: normalize_volume(raw, ranges),
         muted,
         mute_error,
@@ -427,9 +470,15 @@ mod tests {
     fn uac2_volume_requires_read_write_and_all_channels() {
         let protocol = AudioControlProtocol::Uac2;
         assert_eq!(protocol.volume_channels(&[0x0c, 0, 0], 2), Some(vec![0]));
-        assert_eq!(protocol.volume_channels(&[0x04, 0x0c, 0x0c], 2), Some(vec![1, 2]));
+        assert_eq!(
+            protocol.volume_channels(&[0x04, 0x0c, 0x0c], 2),
+            Some(vec![1, 2])
+        );
         assert_eq!(protocol.volume_channels(&[0x08, 0x0c, 0], 2), None);
-        assert_eq!(AudioControlProtocol::Uac1.volume_channels(&[2], 2), Some(vec![0]));
+        assert_eq!(
+            AudioControlProtocol::Uac1.volume_channels(&[2], 2),
+            Some(vec![0])
+        );
     }
 
     #[test]
@@ -441,12 +490,18 @@ mod tests {
         assert!(parse_uac2_volume_ranges(&data[..13]).is_err());
         assert!(parse_uac2_volume_ranges(&[0, 0]).is_err());
         let raw = quantize_volume(0.5, &ranges);
-        assert!(ranges.iter().any(|range| raw >= range.min && raw <= range.max));
+        assert!(ranges
+            .iter()
+            .any(|range| raw >= range.min && raw <= range.max));
     }
 
     #[test]
     fn full_signed_span_does_not_overflow() {
-        let ranges = [RawRange { min: i16::MIN, max: i16::MAX, resolution: 1 }];
+        let ranges = [RawRange {
+            min: i16::MIN,
+            max: i16::MAX,
+            resolution: 1,
+        }];
         assert_eq!(normalize_volume(i16::MIN, &ranges), 0.0);
         assert_eq!(normalize_volume(i16::MAX, &ranges), 1.0);
         assert_eq!(quantize_volume(1.0, &ranges), i16::MAX);
@@ -454,16 +509,25 @@ mod tests {
 
     #[test]
     fn quantization_never_emits_an_unaligned_maximum() {
-        let ranges = [RawRange { min: -1000, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -1000,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(quantize_volume(1.0, &ranges), -232);
     }
 
     /// Every raw value the ranges support.
     fn lattice(ranges: &[RawRange]) -> Vec<i16> {
-        ranges.iter().flat_map(|range| {
-            let step = i32::from(range.resolution).max(1) as usize;
-            (i32::from(range.min)..=i32::from(range.max)).step_by(step).map(|raw| raw as i16)
-        }).collect()
+        ranges
+            .iter()
+            .flat_map(|range| {
+                let step = i32::from(range.resolution).max(1) as usize;
+                (i32::from(range.min)..=i32::from(range.max))
+                    .step_by(step)
+                    .map(|raw| raw as i16)
+            })
+            .collect()
     }
 
     fn assert_floored_curve_is_consistent(ranges: &[RawRange]) {
@@ -477,7 +541,11 @@ mod tests {
         for &raw in supported.iter().filter(|&&raw| raw > floor) {
             let fraction = normalize_volume(raw, ranges);
             assert!(fraction > 0.0 && fraction <= 1.0, "{raw} -> {fraction}");
-            assert_eq!(quantize_volume(fraction, ranges), raw, "fraction {fraction}");
+            assert_eq!(
+                quantize_volume(fraction, ranges),
+                raw,
+                "fraction {fraction}"
+            );
         }
         // Whatever the slider requests, the write is supported, never below the
         // floor, and reads back (1e-6, as the write verification does) unchanged.
@@ -489,25 +557,45 @@ mod tests {
             assert!(raw >= previous, "not monotonic at {volume}");
             previous = raw;
             if volume > 0.0 {
-                assert!(raw > floor || floor == min, "{volume} -> {raw} is at or below the floor");
+                assert!(
+                    raw > floor || floor == min,
+                    "{volume} -> {raw} is at or below the floor"
+                );
             }
             let fraction = normalize_volume(raw, ranges);
-            assert!((normalize_volume(quantize_volume(fraction, ranges), ranges) - fraction).abs() < 1e-6);
+            assert!(
+                (normalize_volume(quantize_volume(fraction, ranges), ranges) - fraction).abs()
+                    < 1e-6
+            );
             // Within one lattice step of the request (a step, not half of one,
             // because the floor itself is excluded for a nonzero fraction).
-            let widest = ranges.iter().map(|r| i32::from(r.resolution).max(1)).max().unwrap();
+            let widest = ranges
+                .iter()
+                .map(|r| i32::from(r.resolution).max(1))
+                .max()
+                .unwrap();
             if volume > 0.0 && ranges.len() == 1 && max > floor {
                 let target = f64::from(floor) + volume * span;
-                assert!((f64::from(raw) - target).abs() <= f64::from(widest), "{volume} -> {raw}");
+                assert!(
+                    (f64::from(raw) - target).abs() <= f64::from(widest),
+                    "{volume} -> {raw}"
+                );
             }
         }
-        assert_eq!(quantize_volume(1.0, ranges), *supported.iter().max().unwrap());
+        assert_eq!(
+            quantize_volume(1.0, ranges),
+            *supported.iter().max().unwrap()
+        );
     }
 
     #[test]
     fn wide_device_spends_the_slider_above_minus_80_db() {
         // -127..0 dB in 1 dB steps; the old mapping put 50 % at -63.5 dB.
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(VOLUME_FLOOR_RAW, -20480);
         assert_eq!(quantize_volume(0.0, &ranges), -127 * 256);
         assert_eq!(quantize_volume(0.5, &ranges), -40 * 256);
@@ -526,11 +614,23 @@ mod tests {
     fn floored_curve_round_trips_unaligned_and_fine_lattices() {
         for ranges in [
             // 1/256 dB resolution, minimum -128 dB.
-            [RawRange { min: i16::MIN, max: 0, resolution: 1 }],
+            [RawRange {
+                min: i16::MIN,
+                max: 0,
+                resolution: 1,
+            }],
             // Coarse steps that do not land on the floor, maximum above 0 dB.
-            [RawRange { min: -32000, max: 3000, resolution: 384 }],
+            [RawRange {
+                min: -32000,
+                max: 3000,
+                resolution: 384,
+            }],
             // Maximum not aligned to the step.
-            [RawRange { min: -25600, max: -500, resolution: 256 }],
+            [RawRange {
+                min: -25600,
+                max: -500,
+                resolution: 256,
+            }],
         ] {
             assert_floored_curve_is_consistent(&ranges);
         }
@@ -538,7 +638,11 @@ mod tests {
 
     #[test]
     fn device_minimum_above_the_floor_keeps_the_linear_curve() {
-        let ranges = [RawRange { min: -60 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -60 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         for step in 0..=100 {
             let volume = f64::from(step) / 100.0;
             let linear = (-60.0 + volume * 60.0).round() as i16 * 256;
@@ -550,7 +654,11 @@ mod tests {
 
     #[test]
     fn device_that_never_rises_above_the_floor_keeps_its_full_range() {
-        let ranges = [RawRange { min: -120 * 256, max: -90 * 256, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -120 * 256,
+            max: -90 * 256,
+            resolution: 256,
+        }];
         assert_eq!(quantize_volume(0.0, &ranges), -120 * 256);
         assert_eq!(quantize_volume(0.5, &ranges), -105 * 256);
         assert_eq!(quantize_volume(1.0, &ranges), -90 * 256);
@@ -562,8 +670,16 @@ mod tests {
     fn multi_range_floor_in_a_gap_or_inside_a_range() {
         // The floor (-80 dB) falls in the gap: only the upper range is above it.
         let gap = [
-            RawRange { min: -127 * 256, max: -100 * 256, resolution: 256 },
-            RawRange { min: -50 * 256, max: 0, resolution: 256 },
+            RawRange {
+                min: -127 * 256,
+                max: -100 * 256,
+                resolution: 256,
+            },
+            RawRange {
+                min: -50 * 256,
+                max: 0,
+                resolution: 256,
+            },
         ];
         assert_eq!(quantize_volume(0.0, &gap), -127 * 256);
         assert_eq!(quantize_volume(0.001, &gap), -50 * 256);
@@ -572,8 +688,16 @@ mod tests {
 
         // The floor falls inside the lower range, which the slider may use above it.
         let inside = [
-            RawRange { min: -127 * 256, max: -64 * 256, resolution: 256 },
-            RawRange { min: -32 * 256, max: 0, resolution: 512 },
+            RawRange {
+                min: -127 * 256,
+                max: -64 * 256,
+                resolution: 256,
+            },
+            RawRange {
+                min: -32 * 256,
+                max: 0,
+                resolution: 512,
+            },
         ];
         assert_eq!(quantize_volume(0.01, &inside), -79 * 256);
         assert!(inside.iter().any(|r| {
@@ -587,7 +711,11 @@ mod tests {
     fn device_with_nothing_supported_above_the_floor_falls_back_to_its_values() {
         // Maximum -20000 is above the floor, but the 20000-wide steps only
         // support -30000: the slider must still produce a supported value.
-        let ranges = [RawRange { min: -30000, max: -20000, resolution: 20000 }];
+        let ranges = [RawRange {
+            min: -30000,
+            max: -20000,
+            resolution: 20000,
+        }];
         assert_eq!(quantize_volume(0.0, &ranges), -30000);
         assert_eq!(quantize_volume(0.5, &ranges), -30000);
         assert_eq!(quantize_volume(1.0, &ranges), -30000);
@@ -598,11 +726,18 @@ mod tests {
         // A fraction saved under the old full-range mapping now lands at the same
         // or a louder level on a device whose minimum is below -80 dB (50 % moved
         // from -63.5 dB to -40 dB), so persisted values must not be replayed as is.
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         for step in 1..100 {
             let volume = f64::from(step) / 100.0;
             let old = (-127.0 + volume * 127.0).round() as i32 * 256;
-            assert!(i32::from(quantize_volume(volume, &ranges)) >= old, "volume {volume}");
+            assert!(
+                i32::from(quantize_volume(volume, &ranges)) >= old,
+                "volume {volume}"
+            );
         }
     }
 
@@ -610,7 +745,11 @@ mod tests {
     fn legacy_fraction_keeps_its_attenuation_on_the_floored_curve() {
         // A host that persisted a level under the old full-range mapping can carry
         // it over by attenuation: -63.5 dB is 20.625 % now.
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         let old_raw = |fraction: f64| (-127.0 * 256.0 * (1.0 - fraction)) as i16;
         assert!((normalize_volume(old_raw(0.5), &ranges) - 0.20625).abs() < 1e-12);
         // 60 % is -50.8 dB, truncated to a whole raw unit here.
@@ -620,16 +759,23 @@ mod tests {
     }
 
     const TEST_RANGES: [RawRange; 1] = [RawRange {
-        min: -25600, max: 0, resolution: 256,
+        min: -25600,
+        max: 0,
+        resolution: 256,
     }];
 
     #[test]
     fn optional_mute_failure_does_not_disable_master_volume() {
         let snapshot = read_hardware_volume_snapshot(
-            &[0], &TEST_RANGES,
-            |channel| { assert_eq!(channel, 0); Ok(-12800) },
+            &[0],
+            &TEST_RANGES,
+            |channel| {
+                assert_eq!(channel, 0);
+                Ok(-12800)
+            },
             || Err("mute GET_CUR stalled".to_string()),
-        ).unwrap();
+        )
+        .unwrap();
         // -50 dB of a -80..0 dB slider span.
         assert_eq!(snapshot.volume, 0.375);
         assert_eq!(snapshot.muted, None);
@@ -640,10 +786,15 @@ mod tests {
     fn stereo_volume_readback_preserves_optional_mute_state() {
         let mut read_channels = Vec::new();
         let snapshot = read_hardware_volume_snapshot(
-            &[1, 2], &TEST_RANGES,
-            |channel| { read_channels.push(channel); Ok(-6400) },
+            &[1, 2],
+            &TEST_RANGES,
+            |channel| {
+                read_channels.push(channel);
+                Ok(-6400)
+            },
             || Ok(Some(true)),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(read_channels, vec![1, 2]);
         assert_eq!(snapshot.volume, 0.6875);
         assert_eq!(snapshot.muted, Some(true));
@@ -653,9 +804,9 @@ mod tests {
     #[test]
     fn volume_without_mute_remains_usable_and_mute_can_recover() {
         for muted in [None, Some(false), Some(true)] {
-            let snapshot = read_hardware_volume_snapshot(
-                &[0], &TEST_RANGES, |_| Ok(-25600), || Ok(muted),
-            ).unwrap();
+            let snapshot =
+                read_hardware_volume_snapshot(&[0], &TEST_RANGES, |_| Ok(-25600), || Ok(muted))
+                    .unwrap();
             assert_eq!(snapshot.volume, 0.0);
             assert_eq!(snapshot.muted, muted);
             assert_eq!(snapshot.mute_error, None);
@@ -669,11 +820,16 @@ mod tests {
             (vec![0], vec![Err("volume GET_CUR stalled".to_string())]),
             (vec![0], vec![Ok(1)]),
             (vec![1, 2], vec![Ok(-12800), Ok(-6400)]),
-            (vec![1, 2], vec![Ok(-12800), Err("right channel stalled".to_string())]),
+            (
+                vec![1, 2],
+                vec![Ok(-12800), Err("right channel stalled".to_string())],
+            ),
         ] {
             let mut values = values.into_iter();
             let result = read_hardware_volume_snapshot(
-                &channels, &TEST_RANGES, |_| values.next().unwrap(),
+                &channels,
+                &TEST_RANGES,
+                |_| values.next().unwrap(),
                 || panic!("mute must not mask a volume failure"),
             );
             assert!(result.is_err());
@@ -702,7 +858,10 @@ mod tests {
         let mut taken = slot.take_all("dac");
         assert_eq!(taken.len(), 1);
         let original = taken.remove(0);
-        assert_eq!((original.channels, original.control), (vec![-12800], "control"));
+        assert_eq!(
+            (original.channels, original.control),
+            (vec![-12800], "control")
+        );
         // Handing it back ends the record; the next reading starts a new one.
         assert!(slot.take_all("dac").is_empty());
         slot.note("dac", "control", vec![-3000]);
@@ -715,7 +874,11 @@ mod tests {
         slot.note("dac", "control", vec![-2560, -12800]);
         let original = slot.take_all("dac").remove(0);
         assert_eq!(original.channels, vec![-2560, -12800]);
-        assert_eq!(original.common(), None, "no single level when they disagree");
+        assert_eq!(
+            original.common(),
+            None,
+            "no single level when they disagree"
+        );
         let mut slot = OriginalVolumeSlot::new();
         slot.note("dac", "control", vec![-2560, -2560]);
         assert_eq!(slot.take_all("dac")[0].common(), Some(-2560));
@@ -728,7 +891,10 @@ mod tests {
         slot.note("dac", "line", vec![-5000]);
         // Each unit's first reading is its original; later ones are ours.
         slot.note("dac", "line", vec![-9000]);
-        assert_eq!(slot.peek("dac", &"headphones").unwrap().channels, vec![-1000]);
+        assert_eq!(
+            slot.peek("dac", &"headphones").unwrap().channels,
+            vec![-1000]
+        );
         assert_eq!(slot.peek("dac", &"line").unwrap().channels, vec![-5000]);
         assert_eq!(slot.take_all("dac").len(), 2);
     }
@@ -737,7 +903,11 @@ mod tests {
     fn a_level_below_the_slider_floor_is_kept_exactly() {
         // Normalised, anything under -80 dB reads 0.0, which would be written
         // back as the device minimum; the raw value is what must survive.
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         let original = -100 * 256;
         assert_eq!(normalize_volume(original, &ranges), 0.0);
         assert_ne!(quantize_volume(0.0, &ranges), original);
@@ -779,17 +949,33 @@ mod tests {
     #[test]
     fn readback_in_a_gap_between_volume_ranges_is_rejected() {
         let ranges = [
-            RawRange { min: -25600, max: -12800, resolution: 256 },
-            RawRange { min: -6400, max: 0, resolution: 256 },
+            RawRange {
+                min: -25600,
+                max: -12800,
+                resolution: 256,
+            },
+            RawRange {
+                min: -6400,
+                max: 0,
+                resolution: 256,
+            },
         ];
         assert!(read_hardware_volume_snapshot(
-            &[0], &ranges, |_| Ok(-9600), || panic!("invalid volume"),
-        ).is_err());
+            &[0],
+            &ranges,
+            |_| Ok(-9600),
+            || panic!("invalid volume"),
+        )
+        .is_err());
     }
 
     #[test]
     fn quantize_db_reaches_levels_below_the_slider_floor() {
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(quantize_db(-100.0, &ranges), -100 * 256);
         assert_eq!(quantize_db(-100.4, &ranges), -100 * 256);
         assert_eq!(quantize_db(-100.6, &ranges), -101 * 256);
@@ -802,8 +988,16 @@ mod tests {
     #[test]
     fn quantize_db_stays_on_the_lattice_of_multi_range_devices() {
         let ranges = [
-            RawRange { min: -127 * 256, max: -100 * 256, resolution: 256 },
-            RawRange { min: -50 * 256, max: 0, resolution: 256 },
+            RawRange {
+                min: -127 * 256,
+                max: -100 * 256,
+                resolution: 256,
+            },
+            RawRange {
+                min: -50 * 256,
+                max: 0,
+                resolution: 256,
+            },
         ];
         assert_eq!(quantize_db(-75.0, &ranges), -100 * 256);
         assert_eq!(quantize_db(-70.0, &ranges), -50 * 256);
@@ -812,14 +1006,26 @@ mod tests {
 
     #[test]
     fn adjacent_raw_walks_the_lattice() {
-        let ranges = [RawRange { min: -25600, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -25600,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(adjacent_raw(-256, 1, &ranges), 0);
         assert_eq!(adjacent_raw(0, 1, &ranges), 0);
         assert_eq!(adjacent_raw(-256, -1, &ranges), -512);
         assert_eq!(adjacent_raw(-25600, -1, &ranges), -25600);
         let gap = [
-            RawRange { min: -127 * 256, max: -100 * 256, resolution: 256 },
-            RawRange { min: -50 * 256, max: 0, resolution: 256 },
+            RawRange {
+                min: -127 * 256,
+                max: -100 * 256,
+                resolution: 256,
+            },
+            RawRange {
+                min: -50 * 256,
+                max: 0,
+                resolution: 256,
+            },
         ];
         assert_eq!(adjacent_raw(-100 * 256, 1, &gap), -50 * 256);
         assert_eq!(adjacent_raw(-50 * 256, -1, &gap), -100 * 256);
@@ -827,17 +1033,24 @@ mod tests {
 
     #[test]
     fn the_snapshot_keeps_the_exact_raw_level() {
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
-        let snapshot = read_hardware_volume_snapshot(
-            &[0], &ranges, |_| Ok(-100 * 256), || Ok(None),
-        ).unwrap();
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
+        let snapshot =
+            read_hardware_volume_snapshot(&[0], &ranges, |_| Ok(-100 * 256), || Ok(None)).unwrap();
         assert_eq!(snapshot.raw, -100 * 256);
         assert_eq!(snapshot.volume, 0.0);
     }
 
     #[test]
     fn a_step_moves_a_sixteenth_of_the_curve_and_never_leaves_the_range() {
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         // 50 % of the curve is -40 dB; a 1/16 step up lands 6.25 % higher.
         let up = step_target_raw(-40 * 256, 0.5, 1, 16, &ranges);
         assert_eq!(up, quantize_volume(0.5625, &ranges));
@@ -846,28 +1059,46 @@ mod tests {
         assert_eq!(down, quantize_volume(0.4375, &ranges));
         // The ends hold.
         assert_eq!(step_target_raw(0, 1.0, 1, 16, &ranges), 0);
-        assert_eq!(step_target_raw(-127 * 256, 0.0, -1, 16, &ranges), -127 * 256);
+        assert_eq!(
+            step_target_raw(-127 * 256, 0.0, -1, 16, &ranges),
+            -127 * 256
+        );
         // No direction, no change.
         assert_eq!(step_target_raw(-40 * 256, 0.5, 0, 16, &ranges), -40 * 256);
     }
 
     #[test]
     fn a_step_always_makes_progress_even_below_the_slider_floor_or_in_a_coarse_lattice() {
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         // -100 dB reads as fraction 0.0 (below the -80 dB floor): stepping up
         // jumps to the first slider step above the floor, never down.
         assert!(step_target_raw(-100 * 256, 0.0, 1, 16, &ranges) > -100 * 256);
         // Stepping down from below the floor goes one DAC step down.
-        assert_eq!(step_target_raw(-100 * 256, 0.0, -1, 16, &ranges), -101 * 256);
+        assert_eq!(
+            step_target_raw(-100 * 256, 0.0, -1, 16, &ranges),
+            -101 * 256
+        );
         // 255 steps on a 3-step lattice still moves by one lattice step.
-        let coarse = [RawRange { min: -768, max: 0, resolution: 256 }];
+        let coarse = [RawRange {
+            min: -768,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(step_target_raw(-512, 1.0 / 3.0, 1, 255, &coarse), -256);
         assert_eq!(step_target_raw(-512, 1.0 / 3.0, -1, 255, &coarse), -768);
     }
 
     #[test]
     fn db_and_fraction_agree_on_the_same_step() {
-        let ranges = [RawRange { min: -127 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         for db in [-79.0f64, -60.0, -40.0, -12.0, -3.0, 0.0] {
             let raw = quantize_db(db, &ranges);
             let fraction = normalize_volume(raw, &ranges);
@@ -881,7 +1112,11 @@ mod tests {
     }
 
     fn dac_127_to_0() -> [RawRange; 1] {
-        [RawRange { min: -127 * 256, max: 0, resolution: 256 }]
+        [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }]
     }
 
     #[test]
@@ -909,27 +1144,63 @@ mod tests {
     #[test]
     fn the_ceiling_rounds_down_to_a_step_the_dac_supports() {
         // 3 dB steps from -80 dB: -80, -77, ... -41, -38.
-        let ranges = [RawRange { min: -80 * 256, max: 0, resolution: 3 * 256 }];
-        assert_eq!(floor_db(-40.0, &ranges), Some(stereo_db(-41)), "the quieter neighbour, not -38");
-        assert_eq!(floor_db(-41.0, &ranges), Some(stereo_db(-41)), "on a step: that step");
+        let ranges = [RawRange {
+            min: -80 * 256,
+            max: 0,
+            resolution: 3 * 256,
+        }];
+        assert_eq!(
+            floor_db(-40.0, &ranges),
+            Some(stereo_db(-41)),
+            "the quieter neighbour, not -38"
+        );
+        assert_eq!(
+            floor_db(-41.0, &ranges),
+            Some(stereo_db(-41)),
+            "on a step: that step"
+        );
         assert_eq!(floor_db(-40.01, &ranges), Some(stereo_db(-41)));
         let plan = plan_startup_attenuation(&[0, stereo_db(-30)], &ranges, -40.0);
         assert_eq!(plan.targets, vec![stereo_db(-41), stereo_db(-41)]);
         // A 0.25 dB lattice, and a ceiling between two steps.
-        let fine = [RawRange { min: -127 * 256, max: 0, resolution: 64 }];
-        assert_eq!(floor_db(-40.1, &fine), Some(-10_304), "-40.25 dB, below -40.1");
+        let fine = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 64,
+        }];
+        assert_eq!(
+            floor_db(-40.1, &fine),
+            Some(-10_304),
+            "-40.25 dB, below -40.1"
+        );
         // Several sub-ranges: the highest step at or below the ceiling anywhere.
         let ranges = [
-            RawRange { min: -80 * 256, max: -50 * 256, resolution: 256 },
-            RawRange { min: -30 * 256, max: 0, resolution: 256 },
+            RawRange {
+                min: -80 * 256,
+                max: -50 * 256,
+                resolution: 256,
+            },
+            RawRange {
+                min: -30 * 256,
+                max: 0,
+                resolution: 256,
+            },
         ];
-        assert_eq!(floor_db(-40.0, &ranges), Some(stereo_db(-50)), "the gap rounds down to the top of the lower range");
+        assert_eq!(
+            floor_db(-40.0, &ranges),
+            Some(stereo_db(-50)),
+            "the gap rounds down to the top of the lower range"
+        );
         assert_eq!(floor_db(-29.5, &ranges), Some(stereo_db(-30)));
     }
 
     #[test]
     fn a_ceiling_below_the_dac_minimum_clamps_to_the_minimum_and_says_so() {
-        let ranges = [RawRange { min: -30 * 256, max: 0, resolution: 256 }];
+        let ranges = [RawRange {
+            min: -30 * 256,
+            max: 0,
+            resolution: 256,
+        }];
         assert_eq!(floor_db(-40.0, &ranges), None);
         let plan = plan_startup_attenuation(&[0, stereo_db(-10), stereo_db(-30)], &ranges, -40.0);
         assert_eq!(plan.targets, vec![stereo_db(-30); 3]);
@@ -953,10 +1224,150 @@ mod tests {
         // ...and the control, which holds one level, takes the quietest of them.
         assert_eq!(single_level(plan.targets), vec![stereo_db(-70); 2]);
         // Agreeing channels are untouched by that step, and nothing is raised.
-        assert_eq!(single_level(vec![stereo_db(-40); 2]), vec![stereo_db(-40); 2]);
+        assert_eq!(
+            single_level(vec![stereo_db(-40); 2]),
+            vec![stereo_db(-40); 2]
+        );
         assert_eq!(single_level(vec![-5]), vec![-5]);
         assert!(single_level(Vec::new()).is_empty());
         assert_eq!(single_level(vec![-3, -9, -5]), vec![-9, -9, -9]);
     }
+}
 
+/// Device-specific meaning of the verified raw Feature Unit lattice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeCurve {
+    Decibels { minimum_is_mute: bool },
+    LinearAmplitude,
+}
+impl VolumeCurve {
+    pub(crate) fn db(self, raw: i16, ranges: &[RawRange]) -> f64 {
+        let (min, max) = volume_bounds(ranges);
+        match self {
+            Self::Decibels { minimum_is_mute } => {
+                if minimum_is_mute && raw == min {
+                    f64::NEG_INFINITY
+                } else {
+                    crate::volume::raw_to_db(raw)
+                }
+            }
+            Self::LinearAmplitude => {
+                if raw <= min || min == max {
+                    f64::NEG_INFINITY
+                } else {
+                    20.0 * ((i32::from(raw) - i32::from(min)) as f64
+                        / (i32::from(max) - i32::from(min)) as f64)
+                        .log10()
+                }
+            }
+        }
+    }
+    pub(crate) fn fraction(self, raw: i16, ranges: &[RawRange]) -> f64 {
+        match self {
+            Self::Decibels { .. } => normalize_volume(raw, ranges),
+            Self::LinearAmplitude => ((self.db(raw, ranges) + 80.0) / 80.0).clamp(0.0, 1.0),
+        }
+    }
+    pub(crate) fn floor_db(self, db: f64, ranges: &[RawRange]) -> Option<i16> {
+        match self {
+            Self::Decibels { .. } => floor_db(db, ranges),
+            Self::LinearAmplitude => {
+                let (min, max) = volume_bounds(ranges);
+                let amplitude = 10.0_f64.powf(db.min(0.0) / 20.0);
+                let target = (f64::from(min) + amplitude * (i32::from(max) - i32::from(min)) as f64)
+                    .floor() as i32;
+                ranges
+                    .iter()
+                    .filter_map(|range| range.floor_on_lattice(target))
+                    .max()
+            }
+        }
+    }
+    pub(crate) fn target_db(self, db: f64, ranges: &[RawRange]) -> i16 {
+        let min = volume_bounds(ranges).0;
+        if db == f64::NEG_INFINITY {
+            return min;
+        }
+        match self {
+            Self::Decibels { .. } => quantize_db(db, ranges),
+            Self::LinearAmplitude => self.floor_db(db, ranges).unwrap_or(min),
+        }
+    }
+    pub(crate) fn target_fraction(self, fraction: f64, ranges: &[RawRange]) -> i16 {
+        match self {
+            Self::Decibels { .. } => quantize_volume(fraction, ranges),
+            Self::LinearAmplitude if fraction <= 0.0 => volume_bounds(ranges).0,
+            Self::LinearAmplitude => {
+                self.target_db(-80.0 + fraction.clamp(0.0, 1.0) * 80.0, ranges)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+    #[test]
+    fn linear_amplitude_never_treats_raw_units_as_decibels_or_raises_safety_ceiling() {
+        let ranges = [RawRange {
+            min: 0,
+            max: 1000,
+            resolution: 1,
+        }];
+        let curve = VolumeCurve::LinearAmplitude;
+        assert_eq!(curve.db(0, &ranges), f64::NEG_INFINITY);
+        assert!((curve.db(500, &ranges) + 6.0206).abs() < 0.0001);
+        assert_eq!(curve.db(1000, &ranges), 0.0);
+        assert_eq!(curve.floor_db(-40.0, &ranges), Some(10));
+        assert_eq!(curve.target_db(-6.0, &ranges), 501);
+        for ceiling in [-80.0, -60.0, -40.0, -20.0, -6.0, 0.0] {
+            let raw = curve.floor_db(ceiling, &ranges).unwrap();
+            assert!(curve.db(raw, &ranges) <= ceiling + 1e-9);
+        }
+    }
+    #[test]
+    fn minimum_mute_preserves_raw_lattice_and_other_levels() {
+        let ranges = [RawRange {
+            min: -40 * 256,
+            max: 0,
+            resolution: 256,
+        }];
+        let curve = VolumeCurve::Decibels {
+            minimum_is_mute: true,
+        };
+        assert_eq!(curve.db(-40 * 256, &ranges), f64::NEG_INFINITY);
+        assert_eq!(curve.db(-39 * 256, &ranges), -39.0);
+        assert_eq!(curve.target_db(f64::NEG_INFINITY, &ranges), -40 * 256);
+        assert_eq!(curve.target_fraction(0.0, &ranges), -40 * 256);
+    }
+}
+
+#[cfg(test)]
+mod optional_mute_detach_tests {
+    use super::*;
+    #[test]
+    fn optional_mute_may_fail_without_fabricating_a_live_detached_device() {
+        let ranges = [RawRange {
+            min: -80 * 256,
+            max: 0,
+            resolution: 256,
+        }];
+        assert!(read_hardware_volume_snapshot(
+            &[0],
+            &ranges,
+            |_| Ok(-40 * 256),
+            || Err("USB DAC disconnected".into())
+        )
+        .is_err());
+        let sample = read_hardware_volume_snapshot(
+            &[0],
+            &ranges,
+            |_| Ok(-40 * 256),
+            || Err("Pipe error".into()),
+        )
+        .unwrap();
+        assert_eq!(sample.db, -40.0);
+        assert_eq!(sample.muted, None);
+        assert!(sample.mute_error.is_some());
+    }
 }

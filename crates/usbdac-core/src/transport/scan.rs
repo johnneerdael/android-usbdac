@@ -3,6 +3,25 @@ use crate::capabilities::{
     AltFormat, AltSetting, EndpointUsage, LinkSpeed, RateRange, SyncKind, UacVersion,
 };
 
+fn type_i_pcm_tag(tag: u16) -> bool {
+    matches!(
+        tag,
+        FORMAT_TAG_PCM | FORMAT_TAG_PCM8 | FORMAT_TAG_IEEE_FLOAT
+    )
+}
+
+/// Descriptor possibilities do not select a live numeric decoder. Reject equal-geometry
+/// signed32/float32 ambiguity until a protocol-backed active-format control is implemented.
+pub(super) fn ambiguous_type_i_pcm(bits: Option<u32>, slot: u8, depth: u8) -> bool {
+    let Some(bits) = bits else {
+        return false;
+    };
+    let signed = bits & 1 != 0 && matches!(depth, 16 | 24 | 32) && slot >= depth / 8;
+    let unsigned = bits & 2 != 0 && slot == 1 && depth == 8;
+    let float = bits & 4 != 0 && slot == 4 && depth == 32;
+    u8::from(signed) + u8::from(unsigned) + u8::from(float) > 1
+}
+
 /// Read-only preflight: base AudioControl/playback claims are already held.
 /// No alternate is activated and no capture transfer is allocated or submitted.
 pub(super) fn preflight_implicit_feedback_interfaces(
@@ -17,7 +36,12 @@ pub(super) fn preflight_implicit_feedback_interfaces(
     }
     Ok((
         config.number(),
-        structural_feedback_interfaces(&config, &claimed.handle, resolve_device_speed(&usb), &claimed.claimed_interfaces),
+        structural_feedback_interfaces(
+            &config,
+            &claimed.handle,
+            resolve_device_speed(&usb),
+            &claimed.claimed_interfaces,
+        ),
     ))
 }
 
@@ -43,7 +67,7 @@ fn structural_feedback_interfaces(
         let Some(format) = parse_android_streaming_interface_format(&out) else {
             continue;
         };
-        if format.is_uac1 || format.format_tag != FORMAT_TAG_PCM {
+        if format.is_uac1 || !type_i_pcm_tag(format.format_tag) {
             continue;
         }
         for ep in out.endpoint_descriptors() {
@@ -56,33 +80,72 @@ fn structural_feedback_interfaces(
                     UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
                 )
                 || !valid_standard_implicit_capacity(&ep, speed)
-                || !matches!(checked_standard_feedback(&out, ep.address(), ep.synch_address(), ep.sync_type(), speed), Ok(None))
+                || !matches!(
+                    checked_standard_feedback(
+                        &out,
+                        ep.address(),
+                        ep.synch_address(),
+                        ep.sync_type(),
+                        speed
+                    ),
+                    Ok(None)
+                )
             {
                 continue;
             }
-            let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else { continue; };
+            let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else {
+                continue;
+            };
             let stride = usize::from(format.channels) * usize::from(format.subslot_size);
             if stride == 0 || capacity < stride {
                 continue;
             }
-            if out.protocol_code() == 0x20 && standard_implicit_pcm_format(&format)
+            if out.protocol_code() == 0x20
+                && standard_implicit_pcm_format(&format)
                 && format.sample_rate_ranges.is_empty()
             {
-                if let Some(clock) = standard_output_clock(config, handle, out.interface_number(), format.terminal_link, claimed) {
-                    let ranges = get_wire_frequency_ranges(handle, AudioControlClock {
-                        interface_number: clock.control_interface, clock_id: clock.source_id,
-                    }, Some(&clock)).unwrap_or_default();
+                if let Some(clock) = standard_output_clock(
+                    config,
+                    handle,
+                    out.interface_number(),
+                    format.terminal_link,
+                    claimed,
+                ) {
+                    let ranges = get_wire_frequency_ranges(
+                        handle,
+                        AudioControlClock {
+                            interface_number: clock.control_interface,
+                            clock_id: clock.source_id,
+                        },
+                        Some(&clock),
+                    )
+                    .unwrap_or_default();
                     if !ranges.is_empty() {
-                        interfaces.extend(standard_implicit_routes(&inventory, config, handle, &out, &ep,
-                            &format, &clock, &ranges, capacity, interval)
-                            .routes.into_iter().map(|(source, _)| source.interface_number));
+                        interfaces.extend(
+                            standard_implicit_routes(
+                                &inventory, config, handle, &out, &ep, &format, &clock, &ranges,
+                                capacity, interval,
+                            )
+                            .routes
+                            .into_iter()
+                            .map(|(source, _)| source.interface_number),
+                        );
                         continue;
                     }
                 }
                 // Live RANGE unavailable: retain the read-only structural claim fallback.
-                if let Some(source) = resolve_implicit_source(&inventory, config, handle,
-                    out.interface_number(), out.setting_number(), format.terminal_link,
-                    ep.synch_address(), interval, None, true) {
+                if let Some(source) = resolve_implicit_source(
+                    &inventory,
+                    config,
+                    handle,
+                    out.interface_number(),
+                    out.setting_number(),
+                    format.terminal_link,
+                    ep.synch_address(),
+                    interval,
+                    None,
+                    true,
+                ) {
                     interfaces.push(source.interface_number);
                 }
                 continue;
@@ -92,7 +155,10 @@ fn structural_feedback_interfaces(
                 let ranges = if source.rates.is_empty() {
                     get_wire_frequency_ranges(
                         handle,
-                        AudioControlClock { interface_number: source.control_interface, clock_id: source.clock.source_id },
+                        AudioControlClock {
+                            interface_number: source.control_interface,
+                            clock_id: source.clock.source_id,
+                        },
                         Some(&source.clock),
                     )
                     .unwrap_or_default()
@@ -125,8 +191,7 @@ fn structural_feedback_interfaces(
                             &format.sample_rate_ranges,
                             rate,
                         ))
-                        || capacity
-                            < required_max_packet_bytes(rate, interval, stride)
+                        || capacity < required_max_packet_bytes(rate, interval, stride)
                     {
                         continue;
                     }
@@ -158,8 +223,20 @@ fn structural_feedback_interfaces(
 /// the historical private short AS dialect must not acquire fixed endpoint profiles.
 fn standard_implicit_pcm_format(format: &StreamingInterfaceFormat) -> bool {
     !format.is_uac1
-        && format.uac2_formats.is_some_and(|bits| bits & 1 != 0)
-        && format.format_tag == FORMAT_TAG_PCM
+        && !ambiguous_type_i_pcm(
+            format.uac2_formats,
+            format.subslot_size,
+            format.bit_resolution,
+        )
+        && type_i_pcm_tag(format.format_tag)
+        && format
+            .uac2_formats
+            .is_some_and(|bits| bits & (1 << (format.format_tag - 1)) != 0)
+        && match format.format_tag {
+            FORMAT_TAG_PCM8 => format.subslot_size == 1 && format.bit_resolution == 8,
+            FORMAT_TAG_IEEE_FLOAT => format.subslot_size == 4 && format.bit_resolution == 32,
+            _ => true,
+        }
         && format.channels > 0
         && format.subslot_size > 0
         && format.bit_resolution > 0
@@ -204,7 +281,13 @@ fn implicit_source_inventory(
     speed: Speed,
     claimed_controls: Option<&[u8]>,
 ) -> Vec<ImplicitSourceCandidate> {
-    if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
+    if settings().has(crate::Quirk::SkipImplicitFeedback) {
+        return Vec::new();
+    }
+    if !matches!(
+        speed,
+        Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus
+    ) {
         return Vec::new();
     }
     let Some(raw) = read_active_configuration_bytes(handle, config) else {
@@ -239,7 +322,9 @@ fn implicit_source_inventory(
             let [(control, ids)] = matching.as_slice() else {
                 continue;
             };
-            if claimed_controls.is_some_and(|claimed| !claimed.contains(control)) { continue; }
+            if claimed_controls.is_some_and(|claimed| !claimed.contains(control)) {
+                continue;
+            }
             let Some(clock) = strict_implicit_clock(config, handle, *control, format.terminal_link)
             else {
                 continue;
@@ -254,7 +339,9 @@ fn implicit_source_inventory(
                 {
                     continue;
                 }
-                let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else { continue; };
+                let Ok((capacity, interval)) = standard_endpoint_geometry(&ep, speed) else {
+                    continue;
+                };
                 if capacity < stride {
                     continue;
                 }
@@ -286,14 +373,22 @@ fn implicit_source_inventory(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaybackImplicitProfile {
     Generic,
-    Fixed { address: u8, interface: u8 },
+    #[cfg(test)]
+    Fixed {
+        address: u8,
+        interface: u8,
+    },
     Skip,
 }
 
 fn playback_implicit_profile(_vendor: u16, _product: u16) -> PlaybackImplicitProfile {
-    // Shared-parity release: device-specific fixed pipes and exclusions remain
-    // deferred. Descriptor/function/clock-based generic discovery stays active.
-    PlaybackImplicitProfile::Generic
+    // Only source-backed exact identity exclusions are active; fixed-pipe
+    // vendor mappings still require a separately proven source contract.
+    if settings().has(crate::Quirk::SkipImplicitFeedback) {
+        PlaybackImplicitProfile::Skip
+    } else {
+        PlaybackImplicitProfile::Generic
+    }
 }
 
 /// Apply the identity rule only after a sink's explicit-feedback path has been
@@ -308,12 +403,11 @@ fn implicit_source_rank(
 ) -> Option<u8> {
     match profile {
         PlaybackImplicitProfile::Skip => None,
-        PlaybackImplicitProfile::Fixed { address, interface } => {
-            (source.address == address
-                && source.interface_number == interface
-                && (linked_address == 0 || linked_address == address))
-                .then_some(0)
-        }
+        #[cfg(test)]
+        PlaybackImplicitProfile::Fixed { address, interface } => (source.address == address
+            && source.interface_number == interface
+            && (linked_address == 0 || linked_address == address))
+            .then_some(0),
         PlaybackImplicitProfile::Generic => {
             if linked_address != 0 {
                 (source.address == linked_address).then_some(0)
@@ -330,16 +424,15 @@ fn implicit_source_rank(
 
 fn implicit_profile_proven(
     profile: PlaybackImplicitProfile,
-    standard_sink: bool,
-    standard_source: bool,
-    rate_proven: bool,
+    _standard_sink: bool,
+    _standard_source: bool,
+    _rate_proven: bool,
 ) -> bool {
     match profile {
         PlaybackImplicitProfile::Skip => false,
         PlaybackImplicitProfile::Generic => true,
-        PlaybackImplicitProfile::Fixed { .. } => {
-            standard_sink && standard_source && rate_proven
-        }
+        #[cfg(test)]
+        PlaybackImplicitProfile::Fixed { .. } => _standard_sink && _standard_source && _rate_proven,
     }
 }
 
@@ -355,9 +448,21 @@ fn resolve_implicit_source(
     sample_rate: Option<u32>,
     standard_sink: bool,
 ) -> Option<ImplicitFeedbackSource> {
-    resolve_implicit_sources(inventory, config, handle, out_interface, out_alt,
-        out_terminal, linked_address, service_interval_us, sample_rate, standard_sink, false)
-        .into_iter().next()
+    resolve_implicit_sources(
+        inventory,
+        config,
+        handle,
+        out_interface,
+        out_alt,
+        out_terminal,
+        linked_address,
+        service_interval_us,
+        sample_rate,
+        standard_sink,
+        false,
+    )
+    .into_iter()
+    .next()
 }
 
 fn resolve_implicit_sources(
@@ -376,33 +481,61 @@ fn resolve_implicit_sources(
     let mut matching = Vec::new();
     let mut standard_sources = Vec::new();
     for (source, rank) in associated_implicit_sources(
-        inventory, config, handle, out_interface, out_alt, out_terminal,
-        linked_address, service_interval_us, sample_rate.is_some(), standard_sink, None,
+        inventory,
+        config,
+        handle,
+        out_interface,
+        out_alt,
+        out_terminal,
+        linked_address,
+        service_interval_us,
+        sample_rate.is_some(),
+        standard_sink,
+        None,
     ) {
         if let Some(sample_rate) = sample_rate {
             let rates = if source.rates.is_empty() {
                 get_wire_frequency_ranges(
                     handle,
-                    AudioControlClock { interface_number: source.control_interface, clock_id: source.clock.source_id },
+                    AudioControlClock {
+                        interface_number: source.control_interface,
+                        clock_id: source.clock.source_id,
+                    },
                     Some(&source.clock),
-                ).unwrap_or_default()
-            } else { source.rates.clone() };
+                )
+                .unwrap_or_default()
+            } else {
+                source.rates.clone()
+            };
             if rates.is_empty()
                 || !sampling_frequency_ranges_support_rate(&rates, sample_rate)
-                || source.source.max_packet_bytes < required_max_packet_bytes(
-                    sample_rate, service_interval_us, source.source.bytes_per_frame,
-                ) { continue; }
+                || source.source.max_packet_bytes
+                    < required_max_packet_bytes(
+                        sample_rate,
+                        service_interval_us,
+                        source.source.bytes_per_frame,
+                    )
+            {
+                continue;
+            }
         }
         matching.push((source.source, rank));
-        if retain_alternates && source.standard_pcm { standard_sources.push(source.source); }
+        if retain_alternates && source.standard_pcm {
+            standard_sources.push(source.source);
+        }
     }
     if !retain_alternates {
-        return choose_implicit_source(matching, out_alt).into_iter().collect();
+        return choose_implicit_source(matching, out_alt)
+            .into_iter()
+            .collect();
     }
     let mut sources = ranked_implicit_sources(matching, out_alt, true);
     // Legacy descriptors keep their original selection. Additional live
     // alternates require the standard PCM descriptor proof on both sides.
-    if sources.first().is_some_and(|source| standard_sources.contains(source)) {
+    if sources
+        .first()
+        .is_some_and(|source| standard_sources.contains(source))
+    {
         sources.retain(|source| standard_sources.contains(source));
     } else {
         sources.truncate(1);
@@ -413,12 +546,21 @@ fn resolve_implicit_sources(
 /// Share association proof between exact selection and full-grid publication.
 /// Capacity and rate selection deliberately happen after this predicate.
 fn associated_implicit_sources<'a>(
-    inventory: &'a [ImplicitSourceCandidate], config: &ConfigDescriptor,
-    handle: &DeviceHandle<Context>, out_interface: u8, out_alt: u8,
-    out_terminal: Option<u8>, linked_address: u8, interval: u32,
-    rate_proven: bool, standard_sink: bool, known_clock: Option<&ClockChoice>,
+    inventory: &'a [ImplicitSourceCandidate],
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    out_interface: u8,
+    out_alt: u8,
+    out_terminal: Option<u8>,
+    linked_address: u8,
+    interval: u32,
+    rate_proven: bool,
+    standard_sink: bool,
+    known_clock: Option<&ClockChoice>,
 ) -> Vec<(&'a ImplicitSourceCandidate, u8)> {
-    let Ok(identity) = handle.device().device_descriptor() else { return Vec::new(); };
+    let Ok(identity) = handle.device().device_descriptor() else {
+        return Vec::new();
+    };
     let profile = playback_implicit_profile(identity.vendor_id(), identity.product_id());
     let mut clocks = std::collections::HashMap::new();
     let mut matching = Vec::new();
@@ -426,16 +568,32 @@ fn associated_implicit_sources<'a>(
         if !implicit_profile_proven(profile, standard_sink, source.standard_pcm, rate_proven) {
             continue;
         }
-        let Some(rank) = implicit_source_rank(profile, source.source, source.marked,
-            out_interface, out_alt, linked_address) else { continue; };
+        let Some(rank) = implicit_source_rank(
+            profile,
+            source.source,
+            source.marked,
+            out_interface,
+            out_alt,
+            linked_address,
+        ) else {
+            continue;
+        };
         if !source.function_interfaces.contains(&out_interface)
-            || (source.source.interface_number == out_interface && source.source.alt_setting != out_alt)
-            || source.source.service_interval_us != interval { continue; }
+            || (source.source.interface_number == out_interface
+                && source.source.alt_setting != out_alt)
+            || source.source.service_interval_us != interval
+        {
+            continue;
+        }
         let clock = if let Some(clock) = known_clock {
             Some(clock)
         } else {
-            clocks.entry(source.control_interface).or_insert_with(||
-                strict_implicit_clock(config, handle, source.control_interface, out_terminal)).as_ref()
+            clocks
+                .entry(source.control_interface)
+                .or_insert_with(|| {
+                    strict_implicit_clock(config, handle, source.control_interface, out_terminal)
+                })
+                .as_ref()
         };
         if clock.is_some_and(|clock| implicit_clocks_compatible(clock, &source.clock)) {
             matching.push((source, rank));
@@ -446,58 +604,110 @@ fn associated_implicit_sources<'a>(
 
 /// Resolve only the unique IAD-owned OUT clock, never a global terminal-ID lookup.
 fn standard_output_clock(
-    config: &ConfigDescriptor, handle: &DeviceHandle<Context>, interface: u8,
-    terminal: Option<u8>, claimed: &[u8],
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    interface: u8,
+    terminal: Option<u8>,
+    claimed: &[u8],
 ) -> Option<ClockChoice> {
     let raw = read_active_configuration_bytes(handle, config)?;
     let functions = audio_functions(&raw);
-    let matching: Vec<_> = functions.iter().filter(|(_, ids)| ids.contains(&interface)).collect();
-    let [(control, _)] = matching.as_slice() else { return None; };
-    if !claimed.contains(control) { return None; }
+    let matching: Vec<_> = functions
+        .iter()
+        .filter(|(_, ids)| ids.contains(&interface))
+        .collect();
+    let [(control, _)] = matching.as_slice() else {
+        return None;
+    };
+    if !claimed.contains(control) {
+        return None;
+    }
     strict_implicit_clock(config, handle, *control, terminal)
 }
 
 fn standard_implicit_routes(
-    inventory: &[ImplicitSourceCandidate], config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
-    out: &rusb::InterfaceDescriptor, endpoint: &rusb::EndpointDescriptor,
-    format: &StreamingInterfaceFormat, clock: &ClockChoice,
-    ranges: &[SamplingFrequencySubrange], capacity: usize, interval: u32,
+    inventory: &[ImplicitSourceCandidate],
+    config: &ConfigDescriptor,
+    handle: &DeviceHandle<Context>,
+    out: &rusb::InterfaceDescriptor,
+    endpoint: &rusb::EndpointDescriptor,
+    format: &StreamingInterfaceFormat,
+    clock: &ClockChoice,
+    ranges: &[SamplingFrequencySubrange],
+    capacity: usize,
+    interval: u32,
 ) -> super::implicit_ranges::ImplicitRatePlan {
-    let ranges = capacity_limited_rates(ranges, capacity, interval,
-        usize::from(format.channels) * usize::from(format.subslot_size)).0;
-    let associated = associated_implicit_sources(inventory, config, handle,
-        out.interface_number(), out.setting_number(), format.terminal_link, endpoint.synch_address(),
-        interval, !ranges.is_empty(), true, Some(clock));
-    let matching: Vec<_> = associated.into_iter().map(|(candidate, rank)| (candidate.source, rank)).collect();
+    let ranges = capacity_limited_rates(
+        ranges,
+        capacity,
+        interval,
+        usize::from(format.channels) * usize::from(format.subslot_size),
+    )
+    .0;
+    let associated = associated_implicit_sources(
+        inventory,
+        config,
+        handle,
+        out.interface_number(),
+        out.setting_number(),
+        format.terminal_link,
+        endpoint.synch_address(),
+        interval,
+        !ranges.is_empty(),
+        true,
+        Some(clock),
+    );
+    let matching: Vec<_> = associated
+        .into_iter()
+        .map(|(candidate, rank)| (candidate.source, rank))
+        .collect();
     super::implicit_ranges::implicit_rate_routes(&ranges, &matching, out.setting_number())
 }
 
 pub(super) fn uac2_choice_has_multiplier(choice: Option<&ClockChoice>) -> bool {
     use crate::clock_resolution::ClockHopKind;
-    choice.is_some_and(|choice| choice.path.iter().any(|hop|
-        matches!(hop.kind, ClockHopKind::Multiplier | ClockHopKind::RateMultiplier { .. })))
+    choice.is_some_and(|choice| {
+        choice.path.iter().any(|hop| {
+            matches!(
+                hop.kind,
+                ClockHopKind::Multiplier | ClockHopKind::RateMultiplier { .. }
+            )
+        })
+    })
 }
 
 /// Implicit feedback shares a wire cadence, not just a source entity ID.
 pub(super) fn implicit_clocks_compatible(output: &ClockChoice, input: &ClockChoice) -> bool {
     use crate::clock_resolution::ClockResolution;
-    if output.resolution != ClockResolution::Resolved || input.resolution != ClockResolution::Resolved
-        || output.control_interface != input.control_interface || output.source_id != input.source_id {
+    if output.resolution != ClockResolution::Resolved
+        || input.resolution != ClockResolution::Resolved
+        || output.control_interface != input.control_interface
+        || output.source_id != input.source_id
+    {
         return false;
     }
-    let (Ok(output_ratio), Ok(input_ratio)) = (uac2_clock_ratio(Some(output)), uac2_clock_ratio(Some(input))) else {
+    let (Ok(output_ratio), Ok(input_ratio)) = (
+        uac2_clock_ratio(Some(output)),
+        uac2_clock_ratio(Some(input)),
+    ) else {
         return false;
     };
-    output_ratio == input_ratio && output.path.iter().all(|left| {
-        input.path.iter().all(|right| left.id != right.id || left.kind == right.kind)
-    })
+    output_ratio == input_ratio
+        && output.path.iter().all(|left| {
+            input
+                .path
+                .iter()
+                .all(|right| left.id != right.id || left.kind == right.kind)
+        })
 }
 
 pub(super) fn choose_implicit_source(
     matching: Vec<(ImplicitFeedbackSource, u8)>,
     out_alt: u8,
 ) -> Option<ImplicitFeedbackSource> {
-    ranked_implicit_sources(matching, out_alt, false).into_iter().next()
+    ranked_implicit_sources(matching, out_alt, false)
+        .into_iter()
+        .next()
 }
 
 /// Prove one physical pipe at the best association rank before exposing its
@@ -508,21 +718,35 @@ fn ranked_implicit_sources(
     out_alt: u8,
     retain_alternates: bool,
 ) -> Vec<ImplicitFeedbackSource> {
-    let Some(rank) = matching.iter().map(|(_, rank)| *rank).min() else { return Vec::new(); };
+    let Some(rank) = matching.iter().map(|(_, rank)| *rank).min() else {
+        return Vec::new();
+    };
     let first = matching.iter().find(|(_, r)| *r == rank).unwrap().0;
     let same_pipe = |source: &ImplicitFeedbackSource| {
         source.interface_number == first.interface_number && source.address == first.address
     };
-    if matching.iter().any(|(source, r)| *r == rank && !same_pipe(source)) {
+    if matching
+        .iter()
+        .any(|(source, r)| *r == rank && !same_pipe(source))
+    {
         return Vec::new();
     }
     matching.retain(|(source, r)| same_pipe(source) && (retain_alternates || *r == rank));
-    matching.sort_by_key(|(source, r)| (*r, super::implicit_ranges::implicit_source_preference(source, out_alt)));
+    matching.sort_by_key(|(source, r)| {
+        (
+            *r,
+            super::implicit_ranges::implicit_source_preference(source, out_alt),
+        )
+    });
     let mut sources = Vec::new();
     for (source, _) in matching {
-        if !sources.contains(&source) { sources.push(source); }
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
     }
-    if !retain_alternates { sources.truncate(1); }
+    if !retain_alternates {
+        sources.truncate(1);
+    }
     sources
 }
 
@@ -533,40 +757,74 @@ pub(super) fn candidate_audio_control_clock_choice(
     candidate: &IsoStreamCandidate,
 ) -> Result<Option<(AudioControlClock, ClockChoice)>, String> {
     // ADC3 reports the same public identity with its protocol-specific proof.
-    let config = device.active_config_descriptor().map_err(|error| error.to_string())?;
-    if config.interfaces().flat_map(|i| i.descriptors())
-        .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30) {
+    let config = device
+        .active_config_descriptor()
+        .map_err(|error| error.to_string())?;
+    if config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .any(|d| d.interface_number() == candidate.interface_number && d.protocol_code() == 0x30)
+    {
         let route = adc3_route_for_candidate(device, handle, candidate)?
             .ok_or_else(|| "ADC3 playback route disappeared".to_string())?;
-        return Ok(route.choice.map(|choice| (AudioControlClock {
-            interface_number: choice.control_interface, clock_id: choice.source_id,
-        }, choice)));
+        return Ok(route.choice.map(|choice| {
+            (
+                AudioControlClock {
+                    interface_number: choice.control_interface,
+                    clock_id: choice.source_id,
+                },
+                choice,
+            )
+        }));
     }
     if let Some(source) = candidate.implicit_feedback {
         let inventory = implicit_source_inventory(&config, handle, candidate.usb_speed, None);
-        let source = inventory.iter().find(|entry| entry.source == source)
+        let source = inventory
+            .iter()
+            .find(|entry| entry.source == source)
             .ok_or_else(|| "implicit feedback source clock proof disappeared".to_string())?;
         let clock = strict_implicit_clock(
-            &config, handle, source.control_interface, candidate.terminal_link,
-        ).ok_or_else(|| "implicit playback clock could not be proved".to_string())?;
+            &config,
+            handle,
+            source.control_interface,
+            candidate.terminal_link,
+        )
+        .ok_or_else(|| "implicit playback clock could not be proved".to_string())?;
         if !implicit_clocks_compatible(&clock, &source.clock) {
             return Err("implicit playback and feedback clock paths disagree".into());
         }
-        Ok(Some((AudioControlClock {
-            interface_number: clock.control_interface, clock_id: clock.source_id,
-        }, clock)))
+        Ok(Some((
+            AudioControlClock {
+                interface_number: clock.control_interface,
+                clock_id: clock.source_id,
+            },
+            clock,
+        )))
     } else {
-        if let Some((control, graph)) = owning_clock_graph(device, handle, candidate.interface_number) {
+        if let Some((control, graph)) =
+            owning_clock_graph(device, handle, candidate.interface_number)
+        {
             let selected = match graph.select_clock(control, candidate.terminal_link, |id| {
                 get_clock_selector_pin(handle, control, id)
             }) {
                 Ok(selected) => selected,
-                Err(error) if candidate.terminal_link.is_some_and(|terminal|
-                    graph.terminal_may_use_multiplier(terminal)) => return Err(error),
+                Err(error)
+                    if candidate
+                        .terminal_link
+                        .is_some_and(|terminal| graph.terminal_may_use_multiplier(terminal)) =>
+                {
+                    return Err(error)
+                }
                 Err(_) => return Ok(None),
             };
             let choice = prove_uac2_clock_choice(handle, &graph, &selected.choice)?;
-            return Ok(Some((AudioControlClock { interface_number: control, clock_id: choice.source_id }, choice)));
+            return Ok(Some((
+                AudioControlClock {
+                    interface_number: control,
+                    clock_id: choice.source_id,
+                },
+                choice,
+            )));
         }
         find_audio_control_clock_choice(device, handle, candidate.terminal_link)
     }
@@ -639,7 +897,10 @@ fn discover_candidate_rate_ranges(
             {
                 return get_wire_frequency_ranges(
                     handle,
-                    AudioControlClock { interface_number: clock.control_interface, clock_id: clock.source_id },
+                    AudioControlClock {
+                        interface_number: clock.control_interface,
+                        clock_id: clock.source_id,
+                    },
                     Some(&clock),
                 )
                 .unwrap_or_default();
@@ -655,34 +916,67 @@ fn discover_candidate_rate_ranges(
 
 /// Explicit duplex registration admits only capture preflight IN claims in addition
 /// to the unchanged base playback and optional vendor/feedback claims.
-fn validate_duplex_capture_claims(claimed: &[u8], controls: &[u8], inputs: &[u8]) -> Result<(), String> {
-    if inputs.is_empty() || controls.is_empty()
-        || !inputs.iter().chain(controls).all(|id| claimed.contains(id)) {
-        return Err("duplex requires capture IN interfaces and their owning AudioControl claims".into());
+fn validate_duplex_capture_claims(
+    claimed: &[u8],
+    controls: &[u8],
+    inputs: &[u8],
+) -> Result<(), String> {
+    if inputs.is_empty()
+        || controls.is_empty()
+        || !inputs.iter().chain(controls).all(|id| claimed.contains(id))
+    {
+        return Err(
+            "duplex requires capture IN interfaces and their owning AudioControl claims".into(),
+        );
     }
     Ok(())
 }
 
-pub(super) fn inspect_duplex_capabilities(device: &UsbDevice, expected: Option<u8>) -> Result<CapabilityModel, String> {
+pub(super) fn inspect_duplex_capabilities(
+    device: &UsbDevice,
+    expected: Option<u8>,
+) -> Result<CapabilityModel, String> {
     let (configuration, controls, inputs) = capture_stream::capture_claim_preflight(device)?;
     if expected.is_some_and(|id| id != configuration) {
         return Err("duplex configuration changed since capture preflight".into());
     }
     let claimed = wrap_android_usb_handle(device)?;
-    let descriptor = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
-    if let Some(profile) = vendor_pcm::discover(&claimed.handle, &descriptor, resolve_device_speed(&claimed.handle.device()))? {
+    let descriptor = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    if let Some(profile) = vendor_pcm::discover(
+        &claimed.handle,
+        &descriptor,
+        resolve_device_speed(&claimed.handle.device()),
+    )? {
         capture_stream::require_vendor_capture_pcm(&profile)?;
-        if !controls.is_empty() || inputs != [profile.input_interface_number] || !profile.claims_match(&device.claimed_interfaces) {
-            return Err("vendor PCM duplex requires its exact proven streaming interface claims".into());
+        if !controls.is_empty()
+            || inputs != [profile.input_interface_number]
+            || !profile.claims_match(&device.claimed_interfaces)
+        {
+            return Err(
+                "vendor PCM duplex requires its exact proven streaming interface claims".into(),
+            );
         }
     } else {
         validate_duplex_capture_claims(&device.claimed_interfaces, &controls, &inputs)?;
     }
     let usb_device = claimed.handle.device();
-    let config = usb_device.active_config_descriptor().map_err(|e| e.to_string())?;
-    if config.number() != configuration { return Err("duplex configuration changed".into()); }
+    let config = usb_device
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    if config.number() != configuration {
+        return Err("duplex configuration changed".into());
+    }
     validate_android_usb_claims_with_capture(&claimed, &config, &inputs)?;
-    build_usb_capability_model(&usb_device, &claimed.handle, resolve_device_speed(&usb_device), &claimed.claimed_interfaces)
+    build_usb_capability_model(
+        &usb_device,
+        &claimed.handle,
+        resolve_device_speed(&usb_device),
+        &claimed.claimed_interfaces,
+    )
 }
 
 pub(super) fn inspect_usb_capabilities(device: &UsbDevice) -> Result<CapabilityModel, String> {
@@ -721,18 +1015,40 @@ pub(super) fn build_usb_capability_model(
         }
         let sample_rates = profile.sample_rates();
         return Ok(CapabilityModel {
-            supported_sample_rates: sample_rates.clone(), link_speed: Some(link_speed_of(profile.speed)),
+            supported_sample_rates: sample_rates.clone(),
+            link_speed: Some(link_speed_of(profile.speed)),
             alt_settings: vec![AltSetting {
-                interface_number: profile.interface_number, alt_setting: profile.alt_setting,
-                endpoint_address: profile.output.address, format: AltFormat::Pcm,
-                channels: profile.output.channels, subslot_bytes: profile.output.subslot_bytes, valid_bits: profile.output.subslot_bytes * 8,
-                rate_ranges: sample_rates.iter().copied().map(|rate| RateRange { min_hz: rate, max_hz: rate, step_hz: 0 }).collect(),
-                sample_rates, sync_type: SyncKind::Asynchronous,
-                feedback_endpoint: None, max_packet_bytes: profile.output.max_packet_bytes,
-                service_interval_us: profile.output.service_us, uac_version: UacVersion::Unknown,
-                endpoint_interval: profile.output.interval, usage: EndpointUsage::Data, refresh: 0, synch_address: 0,
-                pacing: Some(crate::capabilities::Pacing::ImplicitFeedback { interface_number: profile.input_interface_number,
-                    alt_setting: profile.input_alt_setting, endpoint: profile.input.address }),
+                interface_number: profile.interface_number,
+                alt_setting: profile.alt_setting,
+                endpoint_address: profile.output.address,
+                format: AltFormat::Pcm,
+                channels: profile.output.channels,
+                subslot_bytes: profile.output.subslot_bytes,
+                valid_bits: profile.output.subslot_bytes * 8,
+                rate_ranges: sample_rates
+                    .iter()
+                    .copied()
+                    .map(|rate| RateRange {
+                        min_hz: rate,
+                        max_hz: rate,
+                        step_hz: 0,
+                    })
+                    .collect(),
+                sample_rates,
+                sync_type: SyncKind::Asynchronous,
+                feedback_endpoint: None,
+                max_packet_bytes: profile.output.max_packet_bytes,
+                service_interval_us: profile.output.service_us,
+                uac_version: UacVersion::Unknown,
+                endpoint_interval: profile.output.interval,
+                usage: EndpointUsage::Data,
+                refresh: 0,
+                synch_address: 0,
+                pacing: Some(crate::capabilities::Pacing::ImplicitFeedback {
+                    interface_number: profile.input_interface_number,
+                    alt_setting: profile.input_alt_setting,
+                    endpoint: profile.input.address,
+                }),
             }],
         });
     }
@@ -746,9 +1062,13 @@ pub(super) fn build_usb_capability_model(
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
     let mut standard_grid_cache = std::collections::HashMap::<
-        (u8, Option<u8>), Option<(ClockChoice, Vec<SamplingFrequencySubrange>)>,
+        (u8, Option<u8>),
+        Option<(ClockChoice, Vec<SamplingFrequencySubrange>)>,
     >::new();
-    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
+    let usb_id = device
+        .device_descriptor()
+        .ok()
+        .map(|d| (d.vendor_id(), d.product_id()));
     let mut effective_speed = speed;
 
     for interface in config_descriptor.interfaces() {
@@ -764,45 +1084,81 @@ pub(super) fn build_usb_capability_model(
                 continue;
             };
             let ap80_dsd = matches_ap80_raw_dsd(
-                usb_id, config_descriptor.number(), &descriptor, &stream_format,
+                usb_id,
+                config_descriptor.number(),
+                &descriptor,
+                &stream_format,
             );
             stream_format.native_dsd = if ap80_dsd {
                 ap80_native_dsd_profile(&settings())
             } else {
                 resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
             };
-            let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
+            if native_only_profile(&stream_format) {
+                stream_format.format_tag = FORMAT_TAG_DSD;
+            }
+            let playback_designs_dop = resolve_playback_designs_dop(
+                device,
+                &config_descriptor,
+                &descriptor,
+                &stream_format,
+            );
             let standard_grid = descriptor.protocol_code() == 0x20
                 && standard_implicit_pcm_format(&stream_format)
                 && stream_format.sample_rate_ranges.is_empty()
-                && stream_format.native_dsd.is_none() && !playback_designs_dop
+                && stream_format.native_dsd.is_none()
+                && !playback_designs_dop
                 && !settings().disable_feedback();
-            let only_standard_implicit = standard_grid && !settings().allow_unsynchronized_async()
-                && matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus)
-                && descriptor.endpoint_descriptors()
-                .filter(|endpoint| endpoint.direction() == Direction::Out
-                    && endpoint.transfer_type() == TransferType::Isochronous)
-                .all(|endpoint| endpoint.sync_type() == SyncType::Asynchronous
-                    && (1..=16).contains(&endpoint.interval())
-                    && valid_standard_implicit_capacity(&endpoint, speed)
-                    && standard_endpoint_geometry(&endpoint, speed).is_ok()
-                    && matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
-                    && matches!(checked_standard_feedback(&descriptor, endpoint.address(),
-                        endpoint.synch_address(), endpoint.sync_type(), speed), Ok(None)));
-            let sample_rate_ranges = if only_standard_implicit { Vec::new() } else { stream_rate_cache
-                .entry((descriptor.interface_number(), stream_format.terminal_link))
-                .or_insert_with(|| {
-                    discover_candidate_rate_ranges(
-                        device,
-                        handle,
-                        &config_descriptor,
-                        &implicit_sources,
-                        descriptor.interface_number(),
-                        stream_format.terminal_link,
-                        &stream_format.sample_rate_ranges,
-                    )
-                })
-                .clone() };
+            let only_standard_implicit = standard_grid
+                && !settings().allow_unsynchronized_async()
+                && matches!(
+                    speed,
+                    Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus
+                )
+                && descriptor
+                    .endpoint_descriptors()
+                    .filter(|endpoint| {
+                        endpoint.direction() == Direction::Out
+                            && endpoint.transfer_type() == TransferType::Isochronous
+                    })
+                    .all(|endpoint| {
+                        endpoint.sync_type() == SyncType::Asynchronous
+                            && (1..=16).contains(&endpoint.interval())
+                            && valid_standard_implicit_capacity(&endpoint, speed)
+                            && standard_endpoint_geometry(&endpoint, speed).is_ok()
+                            && matches!(
+                                endpoint.usage_type(),
+                                UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
+                            )
+                            && matches!(
+                                checked_standard_feedback(
+                                    &descriptor,
+                                    endpoint.address(),
+                                    endpoint.synch_address(),
+                                    endpoint.sync_type(),
+                                    speed
+                                ),
+                                Ok(None)
+                            )
+                    });
+            let sample_rate_ranges = if only_standard_implicit {
+                Vec::new()
+            } else {
+                stream_rate_cache
+                    .entry((descriptor.interface_number(), stream_format.terminal_link))
+                    .or_insert_with(|| {
+                        discover_candidate_rate_ranges(
+                            device,
+                            handle,
+                            &config_descriptor,
+                            &implicit_sources,
+                            descriptor.interface_number(),
+                            stream_format.terminal_link,
+                            &stream_format.sample_rate_ranges,
+                        )
+                    })
+                    .clone()
+            };
             let sample_rate_ranges = if ap80_dsd {
                 ap80_native_dsd_clock_rates(&sample_rate_ranges)
             } else {
@@ -825,7 +1181,24 @@ pub(super) fn build_usb_capability_model(
                 }
 
                 let Ok((max_packet_bytes, service_interval_us)) =
-                    standard_endpoint_geometry(&endpoint, speed) else { continue; };
+                    standard_endpoint_geometry(&endpoint, speed)
+                else {
+                    continue;
+                };
+                let max_packet_bytes = if settings().source_has(crate::Quirk::TxLengthPrefix) {
+                    if descriptor.interface_number() != 1
+                        || !stream_format.is_uac1
+                        || stream_format.format_tag != FORMAT_TAG_PCM
+                    {
+                        continue;
+                    }
+                    let Some(capacity) = max_packet_bytes.checked_sub(4) else {
+                        continue;
+                    };
+                    capacity
+                } else {
+                    max_packet_bytes
+                };
 
                 let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
@@ -833,43 +1206,87 @@ pub(super) fn build_usb_capability_model(
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
-                ) else { continue; };
-                let feedback_address = discovered_feedback.map(|feedback| feedback.address);
-                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) {
-                    capacity_limited_rates(&sample_rate_ranges, max_packet_bytes, service_interval_us,
-                        usize::from(stream_format.channels) * usize::from(stream_format.subslot_size))
-                } else {
-                    (sample_rate_ranges.clone(), sample_rates.clone())
+                ) else {
+                    continue;
                 };
-                let standard_routes = if standard_grid && discovered_feedback.is_none()
+                let feedback_address = discovered_feedback.map(|feedback| feedback.address);
+                let (mut endpoint_ranges, mut endpoint_rates) =
+                    if matches!(speed, Speed::Super | Speed::SuperPlus)
+                        || settings().source_has(crate::Quirk::TxLengthPrefix)
+                    {
+                        capacity_limited_rates(
+                            &sample_rate_ranges,
+                            max_packet_bytes,
+                            service_interval_us,
+                            usize::from(stream_format.channels)
+                                * usize::from(stream_format.subslot_size),
+                        )
+                    } else {
+                        (sample_rate_ranges.clone(), sample_rates.clone())
+                    };
+                let standard_routes = if standard_grid
+                    && discovered_feedback.is_none()
                     && endpoint.sync_type() == SyncType::Asynchronous
-                    && matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
+                    && matches!(
+                        endpoint.usage_type(),
+                        UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
+                    )
                     && (1..=16).contains(&endpoint.interval())
                     && valid_standard_implicit_capacity(&endpoint, speed)
                 {
-                    let grid = standard_grid_cache.entry((descriptor.interface_number(), stream_format.terminal_link))
+                    let grid = standard_grid_cache
+                        .entry((descriptor.interface_number(), stream_format.terminal_link))
                         .or_insert_with(|| {
-                            let clock = standard_output_clock(&config_descriptor, handle,
-                                descriptor.interface_number(), stream_format.terminal_link, claimed_interfaces)?;
-                            let ranges = get_wire_frequency_ranges(handle, AudioControlClock {
-                                interface_number: clock.control_interface, clock_id: clock.source_id,
-                            }, Some(&clock)).unwrap_or_default();
+                            let clock = standard_output_clock(
+                                &config_descriptor,
+                                handle,
+                                descriptor.interface_number(),
+                                stream_format.terminal_link,
+                                claimed_interfaces,
+                            )?;
+                            let ranges = get_wire_frequency_ranges(
+                                handle,
+                                AudioControlClock {
+                                    interface_number: clock.control_interface,
+                                    clock_id: clock.source_id,
+                                },
+                                Some(&clock),
+                            )
+                            .unwrap_or_default();
                             (!ranges.is_empty()).then_some((clock, ranges))
                         });
-                    let plan = grid.as_ref().map(|(clock, ranges)| standard_implicit_routes(
-                        &implicit_sources, &config_descriptor, handle, &descriptor, &endpoint,
-                        &stream_format, clock, ranges, max_packet_bytes, service_interval_us));
+                    let plan = grid.as_ref().map(|(clock, ranges)| {
+                        standard_implicit_routes(
+                            &implicit_sources,
+                            &config_descriptor,
+                            handle,
+                            &descriptor,
+                            &endpoint,
+                            &stream_format,
+                            clock,
+                            ranges,
+                            max_packet_bytes,
+                            service_interval_us,
+                        )
+                    });
                     // Diagnostic fallback retains its historical discovery policy only
                     // when no shared wire grid can be proved.
-                    if plan.is_some() || settings().allow_unsynchronized_async() { plan }
-                    else { Some(super::implicit_ranges::ImplicitRatePlan {
-                        routes: Vec::new(), without_source: Vec::new(),
-                    }) }
-                } else { None };
-                let implicit = if standard_routes.is_none() && discovered_feedback.is_none()
+                    if plan.is_some() || settings().allow_unsynchronized_async() {
+                        plan
+                    } else {
+                        Some(super::implicit_ranges::ImplicitRatePlan {
+                            routes: Vec::new(),
+                            without_source: Vec::new(),
+                        })
+                    }
+                } else {
+                    None
+                };
+                let implicit = if standard_routes.is_none()
+                    && discovered_feedback.is_none()
                     && endpoint.sync_type() == SyncType::Asynchronous
                     && !stream_format.is_uac1
-                    && stream_format.format_tag == FORMAT_TAG_PCM
+                    && type_i_pcm_tag(stream_format.format_tag)
                 {
                     endpoint_rates.iter().find_map(|rate| {
                         resolve_implicit_source(
@@ -886,21 +1303,26 @@ pub(super) fn build_usb_capability_model(
                                 && standard_implicit_pcm_format(&stream_format)
                                 && (1..=16).contains(&endpoint.interval())
                                 && valid_standard_implicit_capacity(&endpoint, speed)
-                                && max_packet_bytes >= required_max_packet_bytes(
-                                    *rate,
-                                    service_interval_us,
-                                    usize::from(stream_format.channels)
-                                        * usize::from(stream_format.subslot_size),
-                                ),
+                                && max_packet_bytes
+                                    >= required_max_packet_bytes(
+                                        *rate,
+                                        service_interval_us,
+                                        usize::from(stream_format.channels)
+                                            * usize::from(stream_format.subslot_size),
+                                    ),
                         )
                     })
                 } else {
                     None
                 }
                 .filter(|source| claimed_interfaces.contains(&source.interface_number));
-                if let Some(source) = implicit.filter(|_| matches!(speed, Speed::Super | Speed::SuperPlus)) {
+                if let Some(source) =
+                    implicit.filter(|_| matches!(speed, Speed::Super | Speed::SuperPlus))
+                {
                     (endpoint_ranges, endpoint_rates) = capacity_limited_rates(
-                        &endpoint_ranges, source.max_packet_bytes, source.service_interval_us,
+                        &endpoint_ranges,
+                        source.max_packet_bytes,
+                        source.service_interval_us,
                         source.bytes_per_frame,
                     );
                 }
@@ -921,14 +1343,23 @@ pub(super) fn build_usb_capability_model(
                         endpoint.sync_type(),
                         endpoint.synch_address(),
                         feedback_address,
-                        settings().allow_unsynchronized_async(),
+                        settings().allow_nominal_uac1(
+                            stream_format.is_uac1,
+                            speed == Speed::Full,
+                            type_i_pcm_tag(stream_format.format_tag),
+                            endpoint.synch_address(),
+                        ),
                     )
                 };
                 let base_alt = AltSetting {
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
                     endpoint_address: endpoint.address(),
-                    format: if stream_format.format_tag == FORMAT_TAG_DSD { AltFormat::Other } else { alt_format(stream_format.format_tag) },
+                    format: if stream_format.format_tag == FORMAT_TAG_DSD {
+                        AltFormat::Other
+                    } else {
+                        alt_format(stream_format.format_tag)
+                    },
                     channels: stream_format.channels,
                     subslot_bytes: stream_format.subslot_size,
                     valid_bits: stream_format.bit_resolution,
@@ -959,32 +1390,51 @@ pub(super) fn build_usb_capability_model(
                 let superspeed = matches!(speed, Speed::Super | Speed::SuperPlus);
                 if let Some(plan) = standard_routes {
                     let mut published = false;
-                    let output_claimed = claimed_interfaces.contains(&descriptor.interface_number());
+                    let output_claimed =
+                        claimed_interfaces.contains(&descriptor.interface_number());
                     // Rank/ambiguity was resolved against every physical candidate before
                     // claims are considered; an unavailable preferred pipe cannot be replaced.
                     for (source, ranges) in plan.routes {
-                        if !output_claimed || !claimed_interfaces.contains(&source.interface_number) { continue; }
+                        if !output_claimed || !claimed_interfaces.contains(&source.interface_number)
+                        {
+                            continue;
+                        }
                         let mut alt = base_alt.clone();
-                        alt.rate_ranges = ranges.iter().map(|range| RateRange {
-                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
-                        }).collect();
+                        alt.rate_ranges = ranges
+                            .iter()
+                            .map(|range| RateRange {
+                                min_hz: range.min,
+                                max_hz: range.max,
+                                step_hz: range.res,
+                            })
+                            .collect();
                         alt.sample_rates = representative_sample_rates_from_ranges(&ranges);
                         alt.pacing = Some(crate::capabilities::Pacing::ImplicitFeedback {
-                            interface_number: source.interface_number, alt_setting: source.alt_setting,
+                            interface_number: source.interface_number,
+                            alt_setting: source.alt_setting,
                             endpoint: source.address,
                         });
                         supported_sample_rates.extend(alt.sample_rates.iter().copied());
                         alt_settings.push(alt);
                         published = true;
                     }
-                    if output_claimed && settings().allow_unsynchronized_async() && endpoint.synch_address() == 0
+                    if output_claimed
+                        && settings().allow_unsynchronized_async()
+                        && endpoint.synch_address() == 0
                         && !plan.without_source.is_empty()
                     {
                         let mut nominal = base_alt.clone();
-                        nominal.rate_ranges = plan.without_source.iter().map(|range| RateRange {
-                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
-                        }).collect();
-                        nominal.sample_rates = representative_sample_rates_from_ranges(&plan.without_source);
+                        nominal.rate_ranges = plan
+                            .without_source
+                            .iter()
+                            .map(|range| RateRange {
+                                min_hz: range.min,
+                                max_hz: range.max,
+                                step_hz: range.res,
+                            })
+                            .collect();
+                        nominal.sample_rates =
+                            representative_sample_rates_from_ranges(&plan.without_source);
                         nominal.pacing = Some(admitted_pacing(endpoint.sync_type(), None));
                         supported_sample_rates.extend(nominal.sample_rates.iter().copied());
                         alt_settings.push(nominal);
@@ -997,7 +1447,10 @@ pub(super) fn build_usb_capability_model(
                         descriptor_only.pacing = None;
                         alt_settings.push(descriptor_only);
                     }
-                } else if !superspeed || sample_rate_ranges.is_empty() || !endpoint_ranges.is_empty() {
+                } else if !superspeed
+                    || sample_rate_ranges.is_empty()
+                    || !endpoint_ranges.is_empty()
+                {
                     supported_sample_rates.extend(endpoint_rates.iter().copied());
                     alt_settings.push(base_alt.clone());
                 }
@@ -1010,30 +1463,48 @@ pub(super) fn build_usb_capability_model(
                     // pacing, so it cannot borrow the PCM implicit-feedback pipe.
                     native.pacing = if !claimed_interfaces.contains(&descriptor.interface_number())
                         || descriptor.setting_number() == 0
-                        || !matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
+                        || !matches!(
+                            endpoint.usage_type(),
+                            UsageType::Data | UsageType::FeedbackData | UsageType::Feedback
+                        )
                         || (settings().disable_feedback()
                             && endpoint.sync_type() == SyncType::Asynchronous
                             && !settings().allow_unsynchronized_async())
                     {
                         None
                     } else {
-                        match admit_endpoint(endpoint.sync_type(), endpoint.synch_address(),
-                            discovered_feedback.is_some(), settings().allow_unsynchronized_async()) {
-                            EndpointAdmission::Admit => Some(admitted_pacing(endpoint.sync_type(),
-                                feedback_address.filter(|_| !settings().disable_feedback()))),
+                        match admit_endpoint(
+                            endpoint.sync_type(),
+                            endpoint.synch_address(),
+                            discovered_feedback.is_some(),
+                            settings().allow_unsynchronized_async(),
+                        ) {
+                            EndpointAdmission::Admit => Some(admitted_pacing(
+                                endpoint.sync_type(),
+                                feedback_address.filter(|_| !settings().disable_feedback()),
+                            )),
                             _ => None,
                         }
                     };
                     let (ranges, rates) = capacity_limited_rates(
-                        &sample_rate_ranges, max_packet_bytes, service_interval_us,
+                        &sample_rate_ranges,
+                        max_packet_bytes,
+                        service_interval_us,
                         usize::from(stream_format.channels) * usize::from(profile.word_bytes),
                     );
                     // An empty clock response can still be verified during
                     // negotiation; a known range that cannot fit cannot.
-                    if !sample_rate_ranges.is_empty() && ranges.is_empty() { continue; }
-                    native.rate_ranges = ranges.iter().map(|range| RateRange {
-                        min_hz: range.min, max_hz: range.max, step_hz: range.res,
-                    }).collect();
+                    if !sample_rate_ranges.is_empty() && ranges.is_empty() {
+                        continue;
+                    }
+                    native.rate_ranges = ranges
+                        .iter()
+                        .map(|range| RateRange {
+                            min_hz: range.min,
+                            max_hz: range.max,
+                            step_hz: range.res,
+                        })
+                        .collect();
                     native.sample_rates = rates;
                     if native.pacing.is_none() {
                         native.rate_ranges.clear();
@@ -1051,13 +1522,15 @@ pub(super) fn build_usb_capability_model(
                     // Preserve the descriptor's rates but cap the projected wire
                     // carrier by whole stereo frames per USB service interval.
                     let ceiling = ((max_packet_bytes / 6) as u64 * 1_000_000
-                        / u64::from(service_interval_us.max(1))).min(u64::from(u32::MAX)) as u32;
+                        / u64::from(service_interval_us.max(1)))
+                    .min(u64::from(u32::MAX)) as u32;
                     dop.rate_ranges.retain_mut(|range| {
                         range.max_hz = range.max_hz.min(ceiling);
                         range.min_hz <= range.max_hz
                     });
-                    dop.sample_rates.retain(|rate|
-                        playback_designs_dop_capacity(max_packet_bytes, service_interval_us, *rate));
+                    dop.sample_rates.retain(|rate| {
+                        playback_designs_dop_capacity(max_packet_bytes, service_interval_us, *rate)
+                    });
                     if !dop.rate_ranges.is_empty() || !dop.sample_rates.is_empty() {
                         alt_settings.push(dop);
                     }
@@ -1068,28 +1541,99 @@ pub(super) fn build_usb_capability_model(
         }
     }
 
-    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces, true) {
-        if ranges.is_empty() { continue; }
+    for (candidate, ranges) in
+        adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces, true)
+    {
+        if ranges.is_empty() {
+            continue;
+        }
         let rates = candidate.sample_rates;
         supported_sample_rates.extend(rates.iter().copied());
         alt_settings.push(AltSetting {
-            interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
+            interface_number: candidate.interface_number,
+            alt_setting: candidate.alt_setting,
             endpoint_address: candidate.endpoint_address,
-            format: if candidate.native_dsd.is_some() { AltFormat::Dsd } else { AltFormat::Pcm },
-            channels: candidate.channels, subslot_bytes: candidate.subslot_size,
-            valid_bits: if candidate.native_dsd.is_some() { 1 } else { candidate.bit_resolution },
-            rate_ranges: ranges.iter().map(|r| RateRange { min_hz:r.min,max_hz:r.max,step_hz:r.res }).collect(),
-            sample_rates:rates, sync_type:sync_kind(candidate.sync_type),
-            feedback_endpoint:candidate.feedback_endpoint.map(|f|f.address),
-            max_packet_bytes:candidate.max_packet_bytes,service_interval_us:candidate.service_interval_us,
-            uac_version:UacVersion::V3,endpoint_interval:candidate.endpoint_interval,
-            usage:endpoint_usage(candidate.usage_type),refresh:candidate.refresh,
-            synch_address:candidate.synch_address,
-            pacing:Some(if let Some(source) = candidate.implicit_feedback {
-                crate::capabilities::Pacing::ImplicitFeedback { interface_number: source.interface_number, alt_setting: source.alt_setting, endpoint: source.address }
-            } else { admitted_pacing(candidate.sync_type,candidate.feedback_endpoint.map(|f|f.address)) }),
+            format: if candidate.native_dsd.is_some() {
+                AltFormat::Dsd
+            } else {
+                alt_format(candidate.format_tag)
+            },
+            channels: candidate.channels,
+            subslot_bytes: candidate.subslot_size,
+            valid_bits: if candidate.native_dsd.is_some() {
+                1
+            } else {
+                candidate.bit_resolution
+            },
+            rate_ranges: ranges
+                .iter()
+                .map(|r| RateRange {
+                    min_hz: r.min,
+                    max_hz: r.max,
+                    step_hz: r.res,
+                })
+                .collect(),
+            sample_rates: rates,
+            sync_type: sync_kind(candidate.sync_type),
+            feedback_endpoint: candidate.feedback_endpoint.map(|f| f.address),
+            max_packet_bytes: candidate.max_packet_bytes,
+            service_interval_us: candidate.service_interval_us,
+            uac_version: UacVersion::V3,
+            endpoint_interval: candidate.endpoint_interval,
+            usage: endpoint_usage(candidate.usage_type),
+            refresh: candidate.refresh,
+            synch_address: candidate.synch_address,
+            pacing: Some(if let Some(source) = candidate.implicit_feedback {
+                crate::capabilities::Pacing::ImplicitFeedback {
+                    interface_number: source.interface_number,
+                    alt_setting: source.alt_setting,
+                    endpoint: source.address,
+                }
+            } else {
+                admitted_pacing(
+                    candidate.sync_type,
+                    candidate.feedback_endpoint.map(|f| f.address),
+                )
+            }),
         });
     }
+    // A UAC2 Type I bitmap may expose signed and float on the same physical alternate.
+    // Publish distinct layouts while retaining the exact same rate/ownership/pacing evidence.
+    let mut extra_formats = Vec::new();
+    for alt in &alt_settings {
+        if !matches!(
+            alt.format,
+            AltFormat::Pcm | AltFormat::PcmU8 | AltFormat::PcmFloat32
+        ) {
+            continue;
+        }
+        let bitmap = config_descriptor
+            .interfaces()
+            .flat_map(|itf| itf.descriptors())
+            .find(|d| {
+                d.interface_number() == alt.interface_number
+                    && d.setting_number() == alt.alt_setting
+            })
+            .and_then(|d| parse_android_streaming_interface_format(&d))
+            .and_then(|f| f.uac2_formats);
+        if let Some(bits) = bitmap {
+            for (flag, format, slot, depth) in [
+                (2, AltFormat::PcmU8, 1, 8),
+                (4, AltFormat::PcmFloat32, 4, 32),
+            ] {
+                if bits & flag != 0
+                    && alt.format != format
+                    && alt.subslot_bytes == slot
+                    && alt.valid_bits == depth
+                {
+                    let mut variant = alt.clone();
+                    variant.format = format;
+                    extra_formats.push(variant);
+                }
+            }
+        }
+    }
+    alt_settings.extend(extra_formats);
     supported_sample_rates.sort_unstable();
     supported_sample_rates.dedup();
     alt_settings.sort_by_key(|alt| {
@@ -1116,8 +1660,20 @@ pub(super) fn select_stream_candidate(
     speed: Speed,
     claimed_interfaces: &[u8],
 ) -> Result<IsoStreamCandidate, SelectError> {
-    select_stream_candidates(device, handle, playback_format, speed, claimed_interfaces, false)
-        .map(|candidates| candidates.into_iter().next().expect("nonempty stream candidates"))
+    select_stream_candidates(
+        device,
+        handle,
+        playback_format,
+        speed,
+        claimed_interfaces,
+        false,
+    )
+    .map(|candidates| {
+        candidates
+            .into_iter()
+            .next()
+            .expect("nonempty stream candidates")
+    })
 }
 
 pub(super) fn select_stream_candidates(
@@ -1134,27 +1690,43 @@ pub(super) fn select_stream_candidates(
             error
         ))
     })?;
-    if let Some(profile) = vendor_pcm::discover(handle, &config_descriptor, speed).map_err(SelectError::NoMatch)? {
+    if let Some(profile) =
+        vendor_pcm::discover(handle, &config_descriptor, speed).map_err(SelectError::NoMatch)?
+    {
         if !profile.claims_match(claimed_interfaces) {
-            return Err(SelectError::Claim("vendor PCM requires exactly its proven interface claims".into()));
+            return Err(SelectError::Claim(
+                "vendor PCM requires exactly its proven interface claims".into(),
+            ));
         }
         if settings().disable_feedback() {
-            return Err(SelectError::NoMatch("vendor PCM requires implicit feedback".into()));
+            return Err(SelectError::NoMatch(
+                "vendor PCM requires implicit feedback".into(),
+            ));
         }
-        if playback_format.dsd_transport != DsdTransportMode::None || playback_format.is_dop
-            || !profile.supports_rate(playback_format.sample_rate) || playback_format.bit_depth != profile.output.subslot_bytes * 8
-            || playback_format.channels != profile.output.channels {
-            return Err(SelectError::NoMatch("vendor PCM requires its supported native PCM rate and channel format".into()));
+        if playback_format.dsd_transport != DsdTransportMode::None
+            || playback_format.is_dop
+            || playback_format.pcm_encoding != PcmEncoding::Signed
+            || !profile.supports_rate(playback_format.sample_rate)
+            || playback_format.bit_depth != profile.output.subslot_bytes * 8
+            || playback_format.channels != profile.output.channels
+        {
+            return Err(SelectError::NoMatch(
+                "vendor PCM requires its supported native PCM rate and channel format".into(),
+            ));
         }
         return Ok(vec![profile.candidate(config_descriptor.number())]);
     }
-    let implicit_sources = implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces));
+    let implicit_sources =
+        implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces));
     let mut refused_unsynchronized = false;
     let mut refused_claim = None;
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
-    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
+    let usb_id = device
+        .device_descriptor()
+        .ok()
+        .map(|d| (d.vendor_id(), d.product_id()));
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
     for interface in config_descriptor.interfaces() {
@@ -1169,18 +1741,45 @@ pub(super) fn select_stream_candidates(
                 Some(format) => format,
                 None => continue,
             };
+            if playback_format.dsd_transport == DsdTransportMode::None {
+                let tag = playback_format.pcm_encoding.format_tag();
+                let present = stream_format
+                    .uac2_formats
+                    .map_or(stream_format.format_tag == tag, |bits| {
+                        bits & (1 << (tag - 1)) != 0
+                    });
+                if !present {
+                    continue;
+                }
+                stream_format.format_tag = tag;
+            }
             let ap80_dsd = matches_ap80_raw_dsd(
-                usb_id, config_descriptor.number(), &descriptor, &stream_format,
+                usb_id,
+                config_descriptor.number(),
+                &descriptor,
+                &stream_format,
             );
             stream_format.native_dsd = if ap80_dsd {
                 ap80_native_dsd_profile(&settings())
             } else {
                 resolve_native_dsd(device, &config_descriptor, &descriptor, &stream_format)
             };
-            let playback_designs_dop = resolve_playback_designs_dop(device, &config_descriptor, &descriptor, &stream_format);
+            if native_only_profile(&stream_format)
+                && playback_format.dsd_transport != DsdTransportMode::Native
+            {
+                continue;
+            }
+            let playback_designs_dop = resolve_playback_designs_dop(
+                device,
+                &config_descriptor,
+                &descriptor,
+                &stream_format,
+            );
             apply_playback_designs_dop(&mut stream_format, playback_format, playback_designs_dop);
             if playback_format.dsd_transport == DsdTransportMode::Native {
-                let Some(profile) = stream_format.native_dsd else { continue; };
+                let Some(profile) = stream_format.native_dsd else {
+                    continue;
+                };
                 stream_format.subslot_size = profile.word_bytes;
                 stream_format.bit_resolution = 1;
                 stream_format.format_tag = FORMAT_TAG_DSD;
@@ -1213,7 +1812,11 @@ pub(super) fn select_stream_candidates(
             };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
-            let Some(effective_sample_rate) = native_wire_rate(playback_format, stream_format.subslot_size) else { continue; };
+            let Some(effective_sample_rate) =
+                native_wire_rate(playback_format, stream_format.subslot_size)
+            else {
+                continue;
+            };
 
             if !sample_rate_ranges.is_empty()
                 && stream_format.format_tag != FORMAT_TAG_DSD
@@ -1276,18 +1879,37 @@ pub(super) fn select_stream_candidates(
                     service_interval_micros(speed, endpoint.interval())
                 );
                 let Ok((max_packet_bytes, service_interval_us)) =
-                    standard_endpoint_geometry(&endpoint, speed) else { continue; };
+                    standard_endpoint_geometry(&endpoint, speed)
+                else {
+                    continue;
+                };
+                let max_packet_bytes = if settings().source_has(crate::Quirk::TxLengthPrefix) {
+                    if descriptor.interface_number() != 1
+                        || !stream_format.is_uac1
+                        || stream_format.format_tag != FORMAT_TAG_PCM
+                    {
+                        continue;
+                    }
+                    let Some(capacity) = max_packet_bytes.checked_sub(4) else {
+                        continue;
+                    };
+                    capacity
+                } else {
+                    max_packet_bytes
+                };
                 let Ok(discovered_feedback) = checked_standard_feedback(
                     &descriptor,
                     endpoint.address(),
                     endpoint.synch_address(),
                     endpoint.sync_type(),
                     speed,
-                ) else { continue; };
+                ) else {
+                    continue;
+                };
                 let discovered_implicit_sources = if endpoint.sync_type() == SyncType::Asynchronous
                     && discovered_feedback.is_none()
                     && !stream_format.is_uac1
-                    && stream_format.format_tag == FORMAT_TAG_PCM
+                    && type_i_pcm_tag(stream_format.format_tag)
                     && (1..=16).contains(&endpoint.interval())
                     && valid_standard_implicit_capacity(&endpoint, speed)
                 {
@@ -1366,6 +1988,12 @@ pub(super) fn select_stream_candidates(
                     refused_unsynchronized = true;
                     continue;
                 }
+                let allow_unsynchronized_async = settings().allow_nominal_uac1(
+                    stream_format.is_uac1,
+                    speed == Speed::Full,
+                    type_i_pcm_tag(stream_format.format_tag),
+                    endpoint.synch_address(),
+                );
                 match admit_endpoint(
                     endpoint.sync_type(),
                     endpoint.synch_address(),
@@ -1433,8 +2061,13 @@ pub(super) fn select_stream_candidates(
         }
     }
 
-    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces,
-        playback_format.dsd_transport != DsdTransportMode::DoP) {
+    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(
+        device,
+        handle,
+        speed,
+        claimed_interfaces,
+        playback_format.dsd_transport != DsdTransportMode::DoP,
+    ) {
         if adc3::adc3_candidate_matches_ranges(&candidate, &ranges, playback_format) {
             candidates.push(candidate);
         }
@@ -1473,9 +2106,13 @@ pub(super) fn select_stream_candidates(
     } else {
         format!("{} Hz", playback_format.sample_rate)
     };
-    if !candidates.is_empty() { return Ok(candidates); }
+    if !candidates.is_empty() {
+        return Ok(candidates);
+    }
     if let Some(interface) = refused_claim {
-        return Err(SelectError::Claim(format!("Required implicit feedback interface {interface} was not claimed")));
+        return Err(SelectError::Claim(format!(
+            "Required implicit feedback interface {interface} was not claimed"
+        )));
     }
     if refused_unsynchronized {
         return Err(SelectError::ImplicitFeedback(format!(
@@ -1585,12 +2222,18 @@ fn standard_endpoint_geometry(
             return Err("invalid SuperSpeed endpoint address".into());
         }
         super::endpoint_geometry::ss_endpoint_geometry(
-            endpoint.max_packet_size(), endpoint.interval(), endpoint.extra().unwrap_or(&[]), speed,
+            endpoint.max_packet_size(),
+            endpoint.interval(),
+            endpoint.extra().unwrap_or(&[]),
+            speed,
             endpoint.transfer_type() == TransferType::Isochronous,
-        ).map(|(capacity, interval, _)| (capacity, interval))
+        )
+        .map(|(capacity, interval, _)| (capacity, interval))
     } else {
-        Ok((effective_iso_packet_bytes(endpoint.max_packet_size(), speed),
-            service_interval_micros(speed, endpoint.interval())))
+        Ok((
+            effective_iso_packet_bytes(endpoint.max_packet_size(), speed),
+            service_interval_micros(speed, endpoint.interval()),
+        ))
     }
 }
 
@@ -1623,13 +2266,17 @@ fn checked_standard_feedback(
     {
         return Err("invalid SuperSpeed data or feedback association address".into());
     }
-    let advertised: Vec<_> = descriptor.endpoint_descriptors().filter(|ep| {
-        ep.direction() == Direction::In && if address != 0 {
-            ep.address() == address && ep.usage_type() != UsageType::FeedbackData
-        } else {
-            sync == SyncType::Asynchronous && ep.usage_type() == UsageType::Feedback
-        }
-    }).collect();
+    let advertised: Vec<_> = descriptor
+        .endpoint_descriptors()
+        .filter(|ep| {
+            ep.direction() == Direction::In
+                && if address != 0 {
+                    ep.address() == address && ep.usage_type() != UsageType::FeedbackData
+                } else {
+                    sync == SyncType::Asynchronous && ep.usage_type() == UsageType::Feedback
+                }
+        })
+        .collect();
     let endpoint = match advertised.as_slice() {
         [] => return Ok(None),
         [endpoint] => endpoint,
@@ -1638,26 +2285,37 @@ fn checked_standard_feedback(
     if !valid_standard_endpoint_address(endpoint.address()) {
         return Err("invalid SuperSpeed feedback endpoint address".into());
     }
-    if !matches!(endpoint.transfer_type(), TransferType::Isochronous | TransferType::Interrupt) {
+    if !matches!(
+        endpoint.transfer_type(),
+        TransferType::Isochronous | TransferType::Interrupt
+    ) {
         return Err("invalid explicit feedback transfer type".into());
     }
     let (max_packet_bytes, service_interval_us, _) =
         super::endpoint_geometry::ss_feedback_geometry(
-            endpoint.max_packet_size(), endpoint.interval(), endpoint.extra().unwrap_or(&[]),
+            endpoint.max_packet_size(),
+            endpoint.interval(),
+            endpoint.extra().unwrap_or(&[]),
             endpoint.transfer_type() == TransferType::Isochronous,
         )?;
     if !standard_ss_feedback_shape(
-        max_packet_bytes, endpoint.transfer_type(), endpoint.usage_type(),
-        endpoint.sync_type(), sync,
+        max_packet_bytes,
+        endpoint.transfer_type(),
+        endpoint.usage_type(),
+        endpoint.sync_type(),
+        sync,
         address == 0 || address == endpoint.address(),
         (data_address, endpoint.address()),
     ) {
         return Err("invalid SuperSpeed explicit feedback association or endpoint shape".into());
     }
     Ok(Some(FeedbackEndpoint {
-        address: endpoint.address(), transfer_type: endpoint.transfer_type(),
-        interval: endpoint.interval(), refresh: endpoint.refresh(),
-        service_interval_us, max_packet_bytes,
+        address: endpoint.address(),
+        transfer_type: endpoint.transfer_type(),
+        interval: endpoint.interval(),
+        refresh: endpoint.refresh(),
+        service_interval_us,
+        max_packet_bytes,
     }))
 }
 
@@ -1674,12 +2332,14 @@ fn standard_ss_feedback_shape(
 ) -> bool {
     match report_bytes {
         4 => true,
-        8 => transfer == TransferType::Isochronous
-            && usage == UsageType::Feedback
-            && feedback_sync == SyncType::NoSync
-            && sink_sync == SyncType::Asynchronous
-            && associated
-            && (addresses.0 & 0x0f) == (addresses.1 & 0x0f),
+        8 => {
+            transfer == TransferType::Isochronous
+                && usage == UsageType::Feedback
+                && feedback_sync == SyncType::NoSync
+                && sink_sync == SyncType::Asynchronous
+                && associated
+                && (addresses.0 & 0x0f) == (addresses.1 & 0x0f)
+        }
         _ => false,
     }
 }
@@ -1687,19 +2347,37 @@ fn standard_ss_feedback_shape(
 /// Descriptor rates are USB sample/word rates, including native DSD. Clip
 /// ranges to whole frames per service interval without converting DSD to bits.
 fn capacity_limited_rates(
-    ranges: &[SamplingFrequencySubrange], capacity: usize, interval: u32, stride: usize,
+    ranges: &[SamplingFrequencySubrange],
+    capacity: usize,
+    interval: u32,
+    stride: usize,
 ) -> (Vec<SamplingFrequencySubrange>, Vec<u32>) {
-    if stride == 0 || interval == 0 { return (Vec::new(), Vec::new()); }
+    if stride == 0 || interval == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let ceiling = ((capacity / stride) as u64 * 1_000_000 / u64::from(interval))
         .min(u64::from(u32::MAX)) as u32;
-    let clipped: Vec<_> = ranges.iter().filter_map(|range| {
-        if range.min == 0 || range.max < range.min
-            || (range.res == 0 && range.min != range.max) { return None; }
-        let mut max = range.max.min(ceiling);
-        if range.min > max { return None; }
-        if range.res != 0 { max -= (max - range.min) % range.res; }
-        Some(SamplingFrequencySubrange { min: range.min, max, res: range.res })
-    }).collect();
+    let clipped: Vec<_> = ranges
+        .iter()
+        .filter_map(|range| {
+            if range.min == 0 || range.max < range.min || (range.res == 0 && range.min != range.max)
+            {
+                return None;
+            }
+            let mut max = range.max.min(ceiling);
+            if range.min > max {
+                return None;
+            }
+            if range.res != 0 {
+                max -= (max - range.min) % range.res;
+            }
+            Some(SamplingFrequencySubrange {
+                min: range.min,
+                max,
+                res: range.res,
+            })
+        })
+        .collect();
     let rates = representative_sample_rates_from_ranges(&clipped);
     (clipped, rates)
 }
@@ -1765,14 +2443,21 @@ pub(super) fn find_feedback_endpoint(
     };
 
     let feedback = FeedbackEndpoint {
-        refresh: descriptor.endpoint_descriptors().find(|ep| ep.address() == endpoint.address)
-            .map(|ep| ep.refresh()).unwrap_or(0),
+        refresh: descriptor
+            .endpoint_descriptors()
+            .find(|ep| ep.address() == endpoint.address)
+            .map(|ep| ep.refresh())
+            .unwrap_or(0),
         address: endpoint.address,
         transfer_type: endpoint.transfer_type,
         interval: endpoint.interval,
-        service_interval_us: if endpoint.transfer_type == TransferType::Interrupt && speed == Speed::Full {
+        service_interval_us: if endpoint.transfer_type == TransferType::Interrupt
+            && speed == Speed::Full
+        {
             u32::from(endpoint.interval.max(1)) * 1000
-        } else { service_interval_micros(speed, endpoint.interval) },
+        } else {
+            service_interval_micros(speed, endpoint.interval)
+        },
         max_packet_bytes: effective_iso_packet_bytes(endpoint.max_packet_size, speed),
     };
     let resolution = if feedback_address != 0 && endpoint.address == feedback_address {
@@ -1805,10 +2490,14 @@ fn validate_android_usb_claims_with_capture(
     config_descriptor: &ConfigDescriptor,
     capture_inputs: &[u8],
 ) -> Result<(), String> {
-    if let Some(profile) = vendor_pcm::discover(&claimed_handle.handle, config_descriptor,
-        resolve_device_speed(&claimed_handle.handle.device()))? {
+    if let Some(profile) = vendor_pcm::discover(
+        &claimed_handle.handle,
+        config_descriptor,
+        resolve_device_speed(&claimed_handle.handle.device()),
+    )? {
         if !profile.claims_match(&claimed_handle.claimed_interfaces)
-            || (!capture_inputs.is_empty() && capture_inputs != [profile.input_interface_number]) {
+            || (!capture_inputs.is_empty() && capture_inputs != [profile.input_interface_number])
+        {
             return Err("vendor PCM permits only the exact native-proven interface claims".into());
         }
         return Ok(());
@@ -1965,10 +2654,9 @@ pub(super) fn parse_sysfs_speed(raw: &str) -> Option<Speed> {
     // kernel writes Mbps as integer or "1.5" for low-speed
     let mbps: u32 = if let Ok(v) = raw.parse::<u32>() {
         v
-    } else if let Some(dot) = raw.find('.') {
-        raw[..dot].parse::<u32>().ok()?
     } else {
-        return None;
+        let dot = raw.find('.')?;
+        raw[..dot].parse::<u32>().ok()?
     };
     match mbps {
         1 | 2 => Some(Speed::Low),
@@ -2004,12 +2692,13 @@ pub(super) fn required_max_packet_bytes(
     service_interval_us: u32,
     bytes_per_frame: usize,
 ) -> usize {
-    let max_frames = ((sample_rate as u64 * service_interval_us as u64) + 999_999) / 1_000_000;
+    let max_frames = (sample_rate as u64 * service_interval_us as u64).div_ceil(1_000_000);
     max_frames as usize * bytes_per_frame
 }
 
 pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
     match bit_depth {
+        8 => Some(1),
         16 => Some(2),
         24 => Some(3),
         32 => Some(4),
@@ -2022,21 +2711,35 @@ const UAC2_RAW_DATA: u32 = 1 << 31;
 // Preserve the shipped AP80 default and the existing explicit width/order
 // overrides after the exact route/endpoint predicate has admitted this layout.
 fn ap80_native_dsd_profile(policy: &crate::settings::Settings) -> Option<NativeDsdProfile> {
-    let word_bytes = policy.native_dsd_policy(0xc502, 0x0072, 4)
-        .map(|(width, _, _)| width).unwrap_or(4);
-    if !matches!(word_bytes, 1 | 2 | 4) { return None; }
+    let word_bytes = policy
+        .native_dsd_policy(0xc502, 0x0072, 4)
+        .map(|(width, _, _)| width)
+        .unwrap_or(4);
+    if !matches!(word_bytes, 1 | 2 | 4) {
+        return None;
+    }
     let (big_endian, bit_reverse) = policy.native_dsd_order(0xc502, 0x0072, true);
-    Some(NativeDsdProfile { word_bytes, big_endian, bit_reverse,
-        origin: NativeDsdOrigin::DeviceCompatibility })
+    Some(NativeDsdProfile {
+        word_bytes,
+        big_endian,
+        bit_reverse,
+        origin: NativeDsdOrigin::DeviceCompatibility,
+    })
 }
 
-fn ap80_native_dsd_clock_rates(ranges: &[SamplingFrequencySubrange]) -> Vec<SamplingFrequencySubrange> {
+fn ap80_native_dsd_clock_rates(
+    ranges: &[SamplingFrequencySubrange],
+) -> Vec<SamplingFrequencySubrange> {
     // DSD64, DSD128 and DSD256 in 32-bit words. The shared clock also
     // lists PCM rates, which are not native DSD modes on this player.
     [88_200, 176_400, 352_800]
         .into_iter()
         .filter(|rate| ranges.is_empty() || sampling_frequency_ranges_support_rate(ranges, *rate))
-        .map(|rate| SamplingFrequencySubrange { min: rate, max: rate, res: 0 })
+        .map(|rate| SamplingFrequencySubrange {
+            min: rate,
+            max: rate,
+            res: 0,
+        })
         .collect()
 }
 
@@ -2064,19 +2767,25 @@ fn matches_ap80_raw_dsd(
 ) -> bool {
     if !is_ap80_raw_dsd(
         usb_id,
-        (configuration, descriptor.interface_number(), descriptor.setting_number()),
+        (
+            configuration,
+            descriptor.interface_number(),
+            descriptor.setting_number(),
+        ),
         format,
     ) {
         return false;
     }
-    let mut outputs = descriptor.endpoint_descriptors()
+    let mut outputs = descriptor
+        .endpoint_descriptors()
         .filter(|endpoint| endpoint.direction() == Direction::Out);
-    let proven_out = outputs.next().is_some_and(|endpoint|
+    let proven_out = outputs.next().is_some_and(|endpoint| {
         endpoint.address() == 0x01
             && endpoint.transfer_type() == TransferType::Isochronous
             && endpoint.usage_type() == UsageType::Data
             && endpoint.interval() == 2
-            && endpoint.max_packet_size() == 1024);
+            && endpoint.max_packet_size() == 1024
+    });
     proven_out && outputs.next().is_none()
 }
 
@@ -2086,7 +2795,10 @@ pub(super) fn parse_android_streaming_interface_format(
     parse_streaming_extra(descriptor.protocol_code(), descriptor.extra())
 }
 
-pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<StreamingInterfaceFormat> {
+pub(super) fn parse_streaming_extra(
+    protocol: u8,
+    bytes: &[u8],
+) -> Option<StreamingInterfaceFormat> {
     let mut channels = None;
     let mut format_tag = None;
     let mut uac2_formats = None;
@@ -2116,7 +2828,9 @@ pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<Stream
                         format_tag = Some(u16::from_le_bytes([extra[5], extra[6]]));
                     }
                 } else if extra.len() >= 16 {
-                    if extra[5] != UAC2_FORMAT_TYPE_I { return None; }
+                    if extra[5] != UAC2_FORMAT_TYPE_I {
+                        return None;
+                    }
                     channels = Some(extra[10] as u16);
                     let bits = u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]);
                     uac2_formats = Some(bits);
@@ -2190,6 +2904,10 @@ pub(super) fn parse_streaming_extra(protocol: u8, bytes: &[u8]) -> Option<Stream
         bit_resolution?
     };
 
+    if ambiguous_type_i_pcm(uac2_formats, subslot_size, bit_resolution) {
+        return None;
+    }
+
     Some(StreamingInterfaceFormat {
         format_tag,
         uac2_formats,
@@ -2245,9 +2963,16 @@ pub(super) fn validate_transport_against_playback_format(
     playback_format: PlaybackFormat,
 ) -> Result<(), String> {
     let is_native_dsd = playback_format.dsd_transport == DsdTransportMode::Native;
-    let required_format = if is_native_dsd { FORMAT_TAG_DSD } else { FORMAT_TAG_PCM };
-    if if is_native_dsd { candidate.native_dsd.is_none() }
-        else { candidate.format_tag != FORMAT_TAG_PCM } {
+    let required_format = if is_native_dsd {
+        FORMAT_TAG_DSD
+    } else {
+        playback_format.pcm_encoding.format_tag()
+    };
+    if if is_native_dsd {
+        candidate.native_dsd.is_none()
+    } else {
+        candidate.format_tag != required_format
+    } {
         return Err(format!(
             "USB direct requires {} transport, got {}",
             format_tag_label(required_format),
@@ -2305,6 +3030,8 @@ pub(super) fn current_lock_requested_for_fd(device_fd: RawFd) -> bool {
 pub(super) fn alt_format(format_tag: u16) -> AltFormat {
     match format_tag {
         FORMAT_TAG_PCM => AltFormat::Pcm,
+        FORMAT_TAG_PCM8 => AltFormat::PcmU8,
+        FORMAT_TAG_IEEE_FLOAT => AltFormat::PcmFloat32,
         FORMAT_TAG_DSD => AltFormat::Dsd,
         _ => AltFormat::Other,
     }
@@ -2404,14 +3131,21 @@ mod implicit_discovery_tests {
         let parse = |min: u32, max: u32| {
             let min = min.to_le_bytes();
             let max = max.to_le_bytes();
-            parse_streaming_extra(0, &[
-                7, 0x24, 1, 1, 0, 1, 0,
-                14, 0x24, 2, 1, 2, 3, 24, 0,
-                min[0], min[1], min[2], max[0], max[1], max[2],
-            ]).unwrap().sample_rate_ranges
+            parse_streaming_extra(
+                0,
+                &[
+                    7, 0x24, 1, 1, 0, 1, 0, 14, 0x24, 2, 1, 2, 3, 24, 0, min[0], min[1], min[2],
+                    max[0], max[1], max[2],
+                ],
+            )
+            .unwrap()
+            .sample_rate_ranges
         };
         let ranges = parse(32_001, 96_003);
-        assert_eq!((ranges[0].min, ranges[0].max, ranges[0].res), (32_001, 96_003, 1));
+        assert_eq!(
+            (ranges[0].min, ranges[0].max, ranges[0].res),
+            (32_001, 96_003, 1)
+        );
         for rate in [32_001, 44_117, 48_123, 96_003] {
             assert!(sampling_frequency_ranges_support_rate(&ranges, rate));
         }
@@ -2423,8 +3157,15 @@ mod implicit_discovery_tests {
         assert!(sampling_frequency_ranges_support_rate(&clipped, 49_000));
         assert!(!sampling_frequency_ranges_support_rate(&clipped, 49_001));
         // The public capability representation retains the integer-Hz step.
-        let range = RateRange { min_hz: clipped[0].min, max_hz: clipped[0].max, step_hz: clipped[0].res };
-        assert_eq!((range.min_hz, range.max_hz, range.step_hz), (32_001, 49_000, 1));
+        let range = RateRange {
+            min_hz: clipped[0].min,
+            max_hz: clipped[0].max,
+            step_hz: clipped[0].res,
+        };
+        assert_eq!(
+            (range.min_hz, range.max_hz, range.step_hz),
+            (32_001, 49_000, 1)
+        );
         let singleton = parse(44_117, 44_117);
         assert_eq!(singleton[0].res, 0);
         assert!(sampling_frequency_ranges_support_rate(&singleton, 44_117));
@@ -2440,9 +3181,16 @@ mod implicit_discovery_tests {
             control_interface: 0,
             source_id: 10,
             resolution: ClockResolution::Resolved,
-            path: factors.iter().map(|&(id, numerator, denominator)| ClockHop {
-                id, kind: ClockHopKind::RateMultiplier { numerator, denominator },
-            }).collect(),
+            path: factors
+                .iter()
+                .map(|&(id, numerator, denominator)| ClockHop {
+                    id,
+                    kind: ClockHopKind::RateMultiplier {
+                        numerator,
+                        denominator,
+                    },
+                })
+                .collect(),
         };
         let output = choice(&[(3, 3, 2)]);
         let equivalent = choice(&[(4, 6, 4)]);
@@ -2456,7 +3204,10 @@ mod implicit_discovery_tests {
         let mut unread = identity;
         unread.path[0].kind = ClockHopKind::Multiplier;
         assert!(!implicit_clocks_compatible(&unread, &unread));
-        assert!(!implicit_clocks_compatible(&choice(&[(4, 0, 1)]), &choice(&[])));
+        assert!(!implicit_clocks_compatible(
+            &choice(&[(4, 0, 1)]),
+            &choice(&[])
+        ));
         let mut other_source = equivalent;
         other_source.source_id = 11;
         assert!(!implicit_clocks_compatible(&output, &other_source));
@@ -2505,49 +3256,102 @@ mod implicit_discovery_tests {
 
     #[test]
     fn fixed_profiles_require_standard_wire_proof_and_rate_without_restricting_generic() {
-        let fixed = PlaybackImplicitProfile::Fixed { address: 0x84, interface: 3 };
+        let fixed = PlaybackImplicitProfile::Fixed {
+            address: 0x84,
+            interface: 3,
+        };
         assert!(implicit_profile_proven(fixed, true, true, true));
         assert!(!implicit_profile_proven(fixed, false, true, true));
         assert!(!implicit_profile_proven(fixed, true, false, true));
         assert!(!implicit_profile_proven(fixed, true, true, false));
-        assert!(implicit_profile_proven(PlaybackImplicitProfile::Generic, false, false, false));
-        assert!(!implicit_profile_proven(PlaybackImplicitProfile::Skip, true, true, true));
+        assert!(implicit_profile_proven(
+            PlaybackImplicitProfile::Generic,
+            false,
+            false,
+            false
+        ));
+        assert!(!implicit_profile_proven(
+            PlaybackImplicitProfile::Skip,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn shared_release_does_not_activate_fixed_profiles_or_exclusions() {
         for (vendor, product, address, interface) in [
-            (0x0763, 0x2030, 0x81, 3), (0x0763, 0x2031, 0x81, 3),
-            (0x0763, 0x2080, 0x81, 2), (0x0763, 0x2081, 0x81, 2),
-            (0x2466, 0x8010, 0x81, 2), (0x31e9, 0x0001, 0x81, 2),
-            (0x31e9, 0x0002, 0x81, 2), (0x0499, 0x172f, 0x81, 2),
-            (0x0d9a, 0x00df, 0x81, 2), (0x19f7, 0x000a, 0x84, 3),
-            (0x22f0, 0x0006, 0x81, 3), (0x1686, 0xf029, 0x82, 2),
-            (0x2466, 0x8003, 0x86, 2), (0x0499, 0x172a, 0x86, 2),
+            (0x0763, 0x2030, 0x81, 3),
+            (0x0763, 0x2031, 0x81, 3),
+            (0x0763, 0x2080, 0x81, 2),
+            (0x0763, 0x2081, 0x81, 2),
+            (0x2466, 0x8010, 0x81, 2),
+            (0x31e9, 0x0001, 0x81, 2),
+            (0x31e9, 0x0002, 0x81, 2),
+            (0x0499, 0x172f, 0x81, 2),
+            (0x0d9a, 0x00df, 0x81, 2),
+            (0x19f7, 0x000a, 0x84, 3),
+            (0x22f0, 0x0006, 0x81, 3),
+            (0x1686, 0xf029, 0x82, 2),
+            (0x2466, 0x8003, 0x86, 2),
+            (0x0499, 0x172a, 0x86, 2),
         ] {
             let _deferred_pipe = (address, interface);
-            assert_eq!(playback_implicit_profile(vendor, product), PlaybackImplicitProfile::Generic);
+            assert_eq!(
+                playback_implicit_profile(vendor, product),
+                PlaybackImplicitProfile::Generic
+            );
         }
-        for identity in [(0x0763, 0x9999), (0x9999, 0x2030),
-            (0x20b1, 0x200a), (0x07fd, 0x0005), (0x07fd, 0x0004), (0x20b1, 0x2009), (0, 0)] {
-            assert_eq!(playback_implicit_profile(identity.0, identity.1),
-                PlaybackImplicitProfile::Generic);
+        for identity in [
+            (0x0763, 0x9999),
+            (0x9999, 0x2030),
+            (0x20b1, 0x200a),
+            (0x07fd, 0x0005),
+            (0x07fd, 0x0004),
+            (0x20b1, 0x2009),
+            (0, 0),
+        ] {
+            assert_eq!(
+                playback_implicit_profile(identity.0, identity.1),
+                PlaybackImplicitProfile::Generic
+            );
         }
     }
 
     #[test]
     fn fixed_profile_uses_only_exact_pipe_and_refuses_conflicting_sync_address() {
-        let profile = PlaybackImplicitProfile::Fixed { address: 0x84, interface: 3 };
+        let profile = PlaybackImplicitProfile::Fixed {
+            address: 0x84,
+            interface: 3,
+        };
         let fixed = source(3, 7, 0x84, 288);
         // Fixed-source alternates need not match the sink's alternate.
-        assert_eq!(implicit_source_rank(profile, fixed, false, 1, 1, 0), Some(0));
-        assert_eq!(implicit_source_rank(profile, fixed, false, 1, 1, 0x84), Some(0));
+        assert_eq!(
+            implicit_source_rank(profile, fixed, false, 1, 1, 0),
+            Some(0)
+        );
+        assert_eq!(
+            implicit_source_rank(profile, fixed, false, 1, 1, 0x84),
+            Some(0)
+        );
         assert_eq!(implicit_source_rank(profile, fixed, true, 1, 1, 0x81), None);
         // A marked or adjacent source cannot override the product's pipe.
-        assert_eq!(implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, 0), None);
-        assert_eq!(implicit_source_rank(profile, source(2, 1, 0x84, 288), true, 1, 1, 0), None);
-        assert_eq!(implicit_source_rank(profile, source(3, 1, 0x81, 288), true, 1, 1, 0), None);
-        assert_eq!(implicit_source_rank(PlaybackImplicitProfile::Generic, fixed, false, 1, 1, 0), None);
+        assert_eq!(
+            implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, 0),
+            None
+        );
+        assert_eq!(
+            implicit_source_rank(profile, source(2, 1, 0x84, 288), true, 1, 1, 0),
+            None
+        );
+        assert_eq!(
+            implicit_source_rank(profile, source(3, 1, 0x81, 288), true, 1, 1, 0),
+            None
+        );
+        assert_eq!(
+            implicit_source_rank(PlaybackImplicitProfile::Generic, fixed, false, 1, 1, 0),
+            None
+        );
     }
 
     #[test]
@@ -2556,7 +3360,10 @@ mod implicit_discovery_tests {
             let _deferred_identity = identity;
             let profile = PlaybackImplicitProfile::Skip;
             for linked in [0, 0x81] {
-                assert_eq!(implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, linked), None);
+                assert_eq!(
+                    implicit_source_rank(profile, source(2, 1, 0x81, 288), true, 1, 1, linked),
+                    None
+                );
             }
         }
     }
@@ -2597,10 +3404,20 @@ mod implicit_discovery_tests {
         let alternate = source(2, 1, 0x81, 288);
         let lower_rank = source(2, 3, 0x81, 400);
         let other_pipe = source(3, 1, 0x82, 288);
-        let matching = vec![(alternate, 1), (other_pipe, 2), (lower_rank, 2), (preferred, 1)];
-        assert_eq!(ranked_implicit_sources(matching.clone(), 2, true),
-            vec![preferred, alternate, lower_rank]);
-        assert_eq!(ranked_implicit_sources(matching.clone(), 2, false), vec![preferred]);
+        let matching = vec![
+            (alternate, 1),
+            (other_pipe, 2),
+            (lower_rank, 2),
+            (preferred, 1),
+        ];
+        assert_eq!(
+            ranked_implicit_sources(matching.clone(), 2, true),
+            vec![preferred, alternate, lower_rank]
+        );
+        assert_eq!(
+            ranked_implicit_sources(matching.clone(), 2, false),
+            vec![preferred]
+        );
         assert_eq!(choose_implicit_source(matching, 2), Some(preferred));
         assert!(ranked_implicit_sources(vec![(preferred, 1), (other_pipe, 1)], 2, true).is_empty());
         assert!(ranked_implicit_sources(Vec::new(), 2, true).is_empty());
@@ -2664,43 +3481,109 @@ mod standard_capacity_tests {
     #[test]
     fn superspeed_q32_reports_require_standard_feedback_and_async_association() {
         let valid = |transfer, usage, feedback_sync, sink_sync, associated| {
-            standard_ss_feedback_shape(8, transfer, usage, feedback_sync, sink_sync, associated, (0x01, 0x81))
+            standard_ss_feedback_shape(
+                8,
+                transfer,
+                usage,
+                feedback_sync,
+                sink_sync,
+                associated,
+                (0x01, 0x81),
+            )
         };
-        assert!(valid(TransferType::Isochronous, UsageType::Feedback,
-            SyncType::NoSync, SyncType::Asynchronous, true));
-        assert!(!valid(TransferType::Interrupt, UsageType::Feedback,
-            SyncType::NoSync, SyncType::Asynchronous, true));
-        for usage in [UsageType::Data, UsageType::FeedbackData, UsageType::Reserved] {
-            assert!(!valid(TransferType::Isochronous, usage,
-                SyncType::NoSync, SyncType::Asynchronous, true));
+        assert!(valid(
+            TransferType::Isochronous,
+            UsageType::Feedback,
+            SyncType::NoSync,
+            SyncType::Asynchronous,
+            true
+        ));
+        assert!(!valid(
+            TransferType::Interrupt,
+            UsageType::Feedback,
+            SyncType::NoSync,
+            SyncType::Asynchronous,
+            true
+        ));
+        for usage in [
+            UsageType::Data,
+            UsageType::FeedbackData,
+            UsageType::Reserved,
+        ] {
+            assert!(!valid(
+                TransferType::Isochronous,
+                usage,
+                SyncType::NoSync,
+                SyncType::Asynchronous,
+                true
+            ));
         }
-        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
-            SyncType::Asynchronous, SyncType::Asynchronous, true));
-        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
-            SyncType::NoSync, SyncType::Synchronous, true));
-        assert!(!valid(TransferType::Isochronous, UsageType::Feedback,
-            SyncType::NoSync, SyncType::Asynchronous, false));
-        assert!(standard_ss_feedback_shape(4, TransferType::Interrupt, UsageType::Data,
-            SyncType::NoSync, SyncType::Asynchronous, true, (0x01, 0x82)));
+        assert!(!valid(
+            TransferType::Isochronous,
+            UsageType::Feedback,
+            SyncType::Asynchronous,
+            SyncType::Asynchronous,
+            true
+        ));
+        assert!(!valid(
+            TransferType::Isochronous,
+            UsageType::Feedback,
+            SyncType::NoSync,
+            SyncType::Synchronous,
+            true
+        ));
+        assert!(!valid(
+            TransferType::Isochronous,
+            UsageType::Feedback,
+            SyncType::NoSync,
+            SyncType::Asynchronous,
+            false
+        ));
+        assert!(standard_ss_feedback_shape(
+            4,
+            TransferType::Interrupt,
+            UsageType::Data,
+            SyncType::NoSync,
+            SyncType::Asynchronous,
+            true,
+            (0x01, 0x82)
+        ));
         // A declared bSynchAddress cannot override standard endpoint-number association.
-        assert!(!standard_ss_feedback_shape(8, TransferType::Isochronous, UsageType::Feedback,
-            SyncType::NoSync, SyncType::Asynchronous, true, (0x01, 0x82)));
+        assert!(!standard_ss_feedback_shape(
+            8,
+            TransferType::Isochronous,
+            UsageType::Feedback,
+            SyncType::NoSync,
+            SyncType::Asynchronous,
+            true,
+            (0x01, 0x82)
+        ));
     }
 
     #[test]
     fn companion_capacity_clips_word_rates_without_dsd_bit_conversion() {
-        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 768_000, res: 1 }];
+        let ranges = [SamplingFrequencySubrange {
+            min: 44_100,
+            max: 768_000,
+            res: 1,
+        }];
         // Stereo 32-bit words: 192 bytes each 125us carries at most 192k words/s.
         let (clipped, rates) = capacity_limited_rates(&ranges, 192, 125, 8);
         assert_eq!(clipped[0].min, 44_100);
         assert_eq!(clipped[0].max, 192_000);
         assert!(rates.contains(&192_000));
-        assert!(rates.iter().all(|rate| required_max_packet_bytes(*rate, 125, 8) <= 192));
+        assert!(rates
+            .iter()
+            .all(|rate| required_max_packet_bytes(*rate, 125, 8) <= 192));
     }
 
     #[test]
     fn native_word_width_is_clipped_independently_of_descriptor_pcm_width() {
-        let ranges = [SamplingFrequencySubrange { min: 192_000, max: 384_000, res: 192_000 }];
+        let ranges = [SamplingFrequencySubrange {
+            min: 192_000,
+            max: 384_000,
+            res: 192_000,
+        }];
         assert!(capacity_limited_rates(&ranges, 96, 125, 8).0.is_empty());
         let (native, rates) = capacity_limited_rates(&ranges, 96, 125, 2);
         assert_eq!(native[0].max, 384_000);
@@ -2711,7 +3594,11 @@ mod standard_capacity_tests {
 
     #[test]
     fn companion_capacity_preserves_discrete_rate_alignment_and_rejects_too_small() {
-        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 176_400, res: 44_100 }];
+        let ranges = [SamplingFrequencySubrange {
+            min: 44_100,
+            max: 176_400,
+            res: 44_100,
+        }];
         let (clipped, _) = capacity_limited_rates(&ranges, 96, 125, 8);
         assert_eq!(clipped[0].max, 88_200);
         assert_eq!(clipped[0].res, 44_100);
@@ -2720,7 +3607,11 @@ mod standard_capacity_tests {
     }
     #[test]
     fn capacity_limits_native_words_at_full_speed_and_rejects_malformed_ranges() {
-        let ranges = [SamplingFrequencySubrange { min: 88_200, max: 352_800, res: 88_200 }];
+        let ranges = [SamplingFrequencySubrange {
+            min: 88_200,
+            max: 352_800,
+            res: 88_200,
+        }];
         // Full-speed 1023-byte packets admit these stereo byte-word rates,
         // while stereo 32-bit words fit only the lowest cadence.
         let (_, rates) = capacity_limited_rates(&ranges, 1023, 1000, 2);
@@ -2728,16 +3619,27 @@ mod standard_capacity_tests {
         let (_, rates) = capacity_limited_rates(&ranges, 1023, 1000, 8);
         assert_eq!(rates, vec![88_200]);
         for malformed in [
-            SamplingFrequencySubrange { min: 0, max: 0, res: 0 },
-            SamplingFrequencySubrange { min: 44_100, max: 192_000, res: 0 },
-            SamplingFrequencySubrange { min: 192_000, max: 44_100, res: 1 },
+            SamplingFrequencySubrange {
+                min: 0,
+                max: 0,
+                res: 0,
+            },
+            SamplingFrequencySubrange {
+                min: 44_100,
+                max: 192_000,
+                res: 0,
+            },
+            SamplingFrequencySubrange {
+                min: 192_000,
+                max: 44_100,
+                res: 1,
+            },
         ] {
             let (ranges, rates) = capacity_limited_rates(&[malformed], 1023, 1000, 2);
             assert!(ranges.is_empty());
             assert!(rates.is_empty());
         }
     }
-
 }
 
 #[cfg(test)]
@@ -2746,8 +3648,9 @@ mod ap80_raw_data_tests {
 
     #[test]
     fn preserves_uac2_raw_data_without_reclassifying_other_devices_or_pcm() {
-        let mut extra = [16, 0x24, 1, 2, 0, 1, 0, 0, 0, 0x80, 2, 3, 0, 0, 0, 0,
-                         6, 0x24, 2, 1, 4, 32];
+        let mut extra = [
+            16, 0x24, 1, 2, 0, 1, 0, 0, 0, 0x80, 2, 3, 0, 0, 0, 0, 6, 0x24, 2, 1, 4, 32,
+        ];
         let raw = parse_streaming_extra(0x20, &extra).unwrap();
         assert_eq!(raw.uac2_formats, Some(0x8000_0000));
         assert_eq!(alt_format(raw.format_tag), AltFormat::Other);
@@ -2765,20 +3668,39 @@ mod ap80_raw_data_tests {
     fn ap80_preserves_shipped_big_endian_and_explicit_host_overrides() {
         use crate::{config::DacConfig, settings::Settings};
         let mut policy = Settings::default();
-        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (4, true, false));
-        policy.config = DacConfig { dsd_subslot: Some(2), ..DacConfig::default() };
-        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (2, true, false));
+        assert_eq!(
+            ap80_native_dsd_profile(&policy).unwrap().signature(),
+            (4, true, false)
+        );
+        policy.config = DacConfig {
+            dsd_subslot: Some(2),
+            ..DacConfig::default()
+        };
+        assert_eq!(
+            ap80_native_dsd_profile(&policy).unwrap().signature(),
+            (2, true, false)
+        );
         policy.config.dsd_big_endian = Some(false);
-        assert_eq!(ap80_native_dsd_profile(&policy).unwrap().signature(), (2, false, false));
+        assert_eq!(
+            ap80_native_dsd_profile(&policy).unwrap().signature(),
+            (2, false, false)
+        );
         policy.config.dsd_subslot = Some(3);
         assert!(ap80_native_dsd_profile(&policy).is_none());
     }
 
     #[test]
     fn ap80_advertises_verified_native_modes_from_the_shared_clock() {
-        let clock = [44_100, 88_200, 176_400, 352_800, 384_000].map(|rate|
-            SamplingFrequencySubrange { min: rate, max: rate, res: 0 });
+        let clock =
+            [44_100, 88_200, 176_400, 352_800, 384_000].map(|rate| SamplingFrequencySubrange {
+                min: rate,
+                max: rate,
+                res: 0,
+            });
         let rates = ap80_native_dsd_clock_rates(&clock);
-        assert_eq!(rates.iter().map(|r| r.min).collect::<Vec<_>>(), [88_200, 176_400, 352_800]);
+        assert_eq!(
+            rates.iter().map(|r| r.min).collect::<Vec<_>>(),
+            [88_200, 176_400, 352_800]
+        );
     }
 }

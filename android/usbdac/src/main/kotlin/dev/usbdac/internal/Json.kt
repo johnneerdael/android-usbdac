@@ -106,23 +106,32 @@ private fun clockChoice(json: JSONObject?): ClockChoice? = json?.let {
 
 private fun altFormat(name: String?): AltFormat = when (name) {
     "pcm" -> AltFormat.PCM
+    "pcm_u8" -> AltFormat.PCM_U8
+    "pcm_float32" -> AltFormat.PCM_FLOAT32
     "dsd" -> AltFormat.DSD
     "dop" -> AltFormat.DOP
     else -> AltFormat.OTHER
 }
 
+/** The one JSON string used for hardware minimum-mute. Never infer 0 dB from missing data. */
+private fun dbValue(value: Any?): Double = when {
+    value == "-Infinity" -> Double.NEGATIVE_INFINITY
+    value is Number && value.toDouble().isFinite() -> value.toDouble()
+    else -> throw org.json.JSONException("invalid or missing hardware dB value")
+}
+
 internal fun parseVolumeRange(json: String): VolumeRange = parseVolumeRange(JSONObject(json))
 
 private fun parseVolumeRange(json: JSONObject) = VolumeRange(
-    minDb = json.getDouble("min_db"),
-    maxDb = json.getDouble("max_db"),
+    minDb = dbValue(json.get("min_db")),
+    maxDb = dbValue(json.get("max_db")),
     resDb = json.getDouble("res_db"),
 )
 
 internal fun parseVolumeState(json: String): VolumeState {
     val value = JSONObject(json)
     return VolumeState(
-        db = value.getDouble("db"),
+        db = dbValue(value.get("db")),
         fraction = value.getDouble("fraction"),
         muted = if (value.isNull("muted")) null else value.getBoolean("muted"),
     )
@@ -131,11 +140,11 @@ internal fun parseVolumeState(json: String): VolumeState {
 internal fun parseStartupReport(json: String): StartupVolumeReport {
     val value = JSONObject(json)
     fun doubles(key: String): List<Double> =
-        value.getJSONArray(key).let { array -> List(array.length()) { array.getDouble(it) } }
+        value.getJSONArray(key).let { array -> List(array.length()) { dbValue(array.get(it)) } }
     return StartupVolumeReport(
         originalDb = doubles("original_db"),
         appliedDb = doubles("applied_db"),
-        limitDb = value.getDouble("limit_db"),
+        limitDb = dbValue(value.get("limit_db")),
         attenuated = value.getBoolean("attenuated"),
         clampedToMinimum = value.getBoolean("clamped_to_minimum"),
         maxDb = value.doubleOrNull("max_db"),
@@ -195,6 +204,8 @@ internal fun parseStreamFormat(json: String): StreamFormat {
             if (it.size != value.getInt("channels")) throw org.json.JSONException("playback channel count changed")
         } else List(value.getInt("channels")) { CaptureChannel(it, CaptureChannelPosition.UNSPECIFIED) },
         encoding = when (value.stringOrNull("encoding")) {
+            "pcm_u8" -> StreamEncoding.PCM_U8
+            "pcm_float32" -> StreamEncoding.PCM_FLOAT32
             "dop" -> StreamEncoding.DOP
             "dsd_native" -> StreamEncoding.DSD_NATIVE
             else -> StreamEncoding.PCM
@@ -268,5 +279,11 @@ internal fun parseStats(json: String): DacStreamStats {
         feedbackAgeMs = v.longOrNull("feedback_age_ms"),
         feedbackRateHz = v.doubleOrNull("feedback_rate_hz"),
         feedbackStale = v.optBoolean("feedback_stale"),
+        workerGapOver10ms = v.optLong("worker_gap_over_10ms"),
+        workerGapOver50ms = v.optLong("worker_gap_over_50ms"),
+        maxWorkerGapUs = v.optLong("max_worker_gap_us"),
+        adaptiveQueueChanges = v.optLong("adaptive_queue_changes"),
+        adaptiveQueueSlots = v.optLong("adaptive_queue_slots"),
+        adaptiveQueueUs = v.optLong("adaptive_queue_us"),
     )
 }

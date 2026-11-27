@@ -6,11 +6,11 @@
 
 use serde_json::{json, Value};
 use usbdac_core::{
-    AltFormat, AltSetting, Capabilities, ClockChoice, ClockHop, ClockHopKind, DacConfig, DacEvent,
-    DeviceInfo, Encoding, Error, ExplicitFeedbackPacket, FeedbackTrace, FeedbackTraceEvent,
-    HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride, RatePolicy,
-    StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest, StreamStats, SyncKind,
-    UacVersion, VolumeRange, VolumeState,
+    AltFormat, AltSetting, AsyncFallbackPolicy, Capabilities, ClockChoice, ClockHop, ClockHopKind,
+    ClockReadbackPolicy, DacConfig, DacEvent, DeviceInfo, Encoding, Error, ExplicitFeedbackPacket,
+    FeedbackTrace, FeedbackTraceEvent, HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride,
+    QuirkPolicy, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest,
+    StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
 };
 
 fn uac(version: UacVersion) -> &'static str {
@@ -76,7 +76,11 @@ fn clock_hop(hop: &ClockHop) -> Value {
         "selected_pin": selected_pin,
         "pin_count": pin_count,
     });
-    if let ClockHopKind::RateMultiplier { numerator, denominator } = hop.kind {
+    if let ClockHopKind::RateMultiplier {
+        numerator,
+        denominator,
+    } = hop.kind
+    {
         value["numerator"] = json!(numerator);
         value["denominator"] = json!(denominator);
     }
@@ -100,6 +104,8 @@ fn alt(alt: &AltSetting) -> Value {
         "endpoint_address": alt.endpoint_address,
         "format": match alt.format {
             AltFormat::Pcm => "pcm",
+            AltFormat::PcmU8 => "pcm_u8",
+            AltFormat::PcmFloat32 => "pcm_float32",
             AltFormat::Dsd => "dsd",
             AltFormat::Dop => "dop",
             _ => "other",
@@ -122,17 +128,26 @@ fn alt(alt: &AltSetting) -> Value {
     })
 }
 
+/// UAC's true muted minimum is negative infinity, never JSON null/0 dB.
+fn volume_db(value: f64) -> Value {
+    if value == f64::NEG_INFINITY {
+        json!("-Infinity")
+    } else {
+        json!(value)
+    }
+}
+
 pub fn volume_range(range: &VolumeRange) -> Value {
     json!({
-        "min_db": range.min_db,
-        "max_db": range.max_db,
+        "min_db": volume_db(range.min_db),
+        "max_db": volume_db(range.max_db),
         "res_db": range.res_db,
     })
 }
 
 pub fn volume_state(state: &VolumeState) -> Value {
     json!({
-        "db": state.db,
+        "db": volume_db(state.db),
         "fraction": state.fraction,
         "muted": state.muted,
     })
@@ -140,9 +155,9 @@ pub fn volume_state(state: &VolumeState) -> Value {
 
 pub fn startup_report(report: &StartupVolumeReport) -> Value {
     json!({
-        "original_db": report.original_db,
-        "applied_db": report.applied_db,
-        "limit_db": report.limit_db,
+        "original_db": report.original_db.iter().copied().map(volume_db).collect::<Vec<_>>(),
+        "applied_db": report.applied_db.iter().copied().map(volume_db).collect::<Vec<_>>(),
+        "limit_db": volume_db(report.limit_db),
         "attenuated": report.attenuated,
         "clamped_to_minimum": report.clamped_to_minimum,
         "max_db": report.max_db,
@@ -172,6 +187,8 @@ pub fn capabilities(capabilities: &Capabilities) -> Value {
 pub fn stream_format(format_id: u64, format: &StreamFormat) -> Value {
     let (encoding, dsd_bit_rate) = match format.encoding {
         Encoding::Pcm => ("pcm", None),
+        Encoding::PcmU8 => ("pcm_u8", None),
+        Encoding::PcmFloat32 => ("pcm_float32", None),
         Encoding::DoP => ("dop", None),
         Encoding::DsdNative { bit_rate } => ("dsd_native", Some(bit_rate)),
     };
@@ -212,6 +229,66 @@ fn explicit_feedback_packet(packet: &ExplicitFeedbackPacket) -> Value {
     })
 }
 
+fn feedback_trace_observation(event: &FeedbackTraceEvent) -> Value {
+    match event {
+        FeedbackTraceEvent::Submit { slot, status } => json!({
+            "event": "submit", "slot": slot, "status": status,
+        }),
+        FeedbackTraceEvent::Completion {
+            slot,
+            status,
+            actual_bytes,
+        } => json!({
+            "event": "completion", "slot": slot, "status": status, "actual_bytes": actual_bytes,
+        }),
+        FeedbackTraceEvent::ExplicitPacket { index, sample } => {
+            let mut packet = explicit_feedback_packet(sample);
+            packet["event"] = json!("explicit_packet");
+            packet["index"] = json!(index);
+            packet
+        }
+        FeedbackTraceEvent::ImplicitSource {
+            interface_number,
+            alt_setting,
+            endpoint,
+            service_interval_us,
+            max_packet_bytes,
+            bytes_per_frame,
+        } => json!({
+            "event": "implicit_source", "interface_number": interface_number,
+            "alt_setting": alt_setting, "endpoint": endpoint, "service_interval_us": service_interval_us,
+            "max_packet_bytes": max_packet_bytes, "bytes_per_frame": bytes_per_frame,
+        }),
+        FeedbackTraceEvent::ImplicitPacket {
+            index,
+            status,
+            requested_bytes,
+            actual_bytes,
+        } => json!({
+            "event": "implicit_packet", "index": index, "status": status,
+            "requested_bytes": requested_bytes, "actual_bytes": actual_bytes,
+        }),
+        FeedbackTraceEvent::Lock { locked, stale } => json!({
+            "event": "lock", "locked": locked, "stale": stale,
+        }),
+        FeedbackTraceEvent::Timebase { unit, inferred } => json!({
+            "event": "timebase", "unit": unit, "inferred": inferred,
+        }),
+        FeedbackTraceEvent::CompatibilityFallback { tier, reason } => json!({
+            "event":"compatibility_fallback", "tier":tier.as_str(), "reason":reason,
+        }),
+        FeedbackTraceEvent::ClockReadbackSuggestion {
+            control_interface,
+            clock_entity,
+            strikes,
+        } => json!({
+            "event":"clock_readback_suggestion", "control_interface":control_interface,
+            "clock_entity":clock_entity, "strikes":strikes,
+        }),
+        _ => json!({ "event": "unknown" }),
+    }
+}
+
 pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
     let explicit = trace.explicit.as_ref().map(|diag| json!({
         "endpoint": diag.endpoint,
@@ -243,46 +320,24 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "transfer_status_counts": diag.transfer_status_counts,
         "packet_status_counts": diag.packet_status_counts,
         "accepted_reports": diag.accepted_reports,
+        "rate_samples": diag.rate_samples,
+        "rate_min_frames": diag.rate_min_frames,
+        "rate_max_frames": diag.rate_max_frames,
+        "rate_mean_frames": diag.rate_mean_frames,
+        "rate_variance_frames": diag.rate_variance_frames,
         "empty_polls": diag.empty_polls,
         "rejected_reports": diag.rejected_reports,
         "packet_samples": diag.packet_samples().map(explicit_feedback_packet).collect::<Vec<_>>(),
     }));
-    let entries: Vec<_> = trace.entries.iter().map(|entry| {
-        let mut value = match &entry.event {
-            FeedbackTraceEvent::Submit { slot, status } => json!({
-                "event": "submit", "slot": slot, "status": status,
-            }),
-            FeedbackTraceEvent::Completion { slot, status, actual_bytes } => json!({
-                "event": "completion", "slot": slot, "status": status, "actual_bytes": actual_bytes,
-            }),
-            FeedbackTraceEvent::ExplicitPacket { index, sample } => {
-                let mut packet = explicit_feedback_packet(sample);
-                packet["event"] = json!("explicit_packet");
-                packet["index"] = json!(index);
-                packet
-            }
-            FeedbackTraceEvent::ImplicitSource {
-                interface_number, alt_setting, endpoint, service_interval_us, max_packet_bytes, bytes_per_frame,
-            } => json!({
-                "event": "implicit_source", "interface_number": interface_number,
-                "alt_setting": alt_setting, "endpoint": endpoint, "service_interval_us": service_interval_us,
-                "max_packet_bytes": max_packet_bytes, "bytes_per_frame": bytes_per_frame,
-            }),
-            FeedbackTraceEvent::ImplicitPacket { index, status, requested_bytes, actual_bytes } => json!({
-                "event": "implicit_packet", "index": index, "status": status,
-                "requested_bytes": requested_bytes, "actual_bytes": actual_bytes,
-            }),
-            FeedbackTraceEvent::Lock { locked, stale } => json!({
-                "event": "lock", "locked": locked, "stale": stale,
-            }),
-            FeedbackTraceEvent::Timebase { unit, inferred } => json!({
-                "event": "timebase", "unit": unit, "inferred": inferred,
-            }),
-            _ => json!({ "event": "unknown" }),
-        };
-        value["elapsed_us"] = json!(entry.elapsed_us);
-        value
-    }).collect();
+    let entries: Vec<_> = trace
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut value = feedback_trace_observation(&entry.event);
+            value["elapsed_us"] = json!(entry.elapsed_us);
+            value
+        })
+        .collect();
     json!({
         "schema_version": 1,
         "driver_version": env!("CARGO_PKG_VERSION"),
@@ -355,6 +410,26 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
         unreachable!("feedback stats serialize as an object")
     };
     value.extend(feedback);
+    value.extend(serde_json::Map::from_iter([
+        (
+            "worker_gap_over_10ms".into(),
+            json!(stats.worker_gap_over_10ms),
+        ),
+        (
+            "worker_gap_over_50ms".into(),
+            json!(stats.worker_gap_over_50ms),
+        ),
+        ("max_worker_gap_us".into(), json!(stats.max_worker_gap_us)),
+        (
+            "adaptive_queue_changes".into(),
+            json!(stats.adaptive_queue_changes),
+        ),
+        (
+            "adaptive_queue_slots".into(),
+            json!(stats.adaptive_queue_slots),
+        ),
+        ("adaptive_queue_us".into(), json!(stats.adaptive_queue_us)),
+    ]));
     Value::Object(value)
 }
 
@@ -368,6 +443,7 @@ pub mod event_type {
     pub const FEEDBACK_STALE: i32 = 5;
     pub const ERROR: i32 = 6;
     pub const DEVICE_LOST: i32 = 7;
+    pub const COMPATIBILITY_FALLBACK: i32 = 8;
 }
 
 /// Numeric code of an error, for `onEvent(ERROR, code, ...)`.
@@ -419,6 +495,12 @@ pub fn event(event: &DacEvent) -> (i32, i64, f64, Option<String>) {
             Some(volume_state(state).to_string()),
         ),
         DacEvent::FeedbackStale => (event_type::FEEDBACK_STALE, 0, 0.0, None),
+        DacEvent::CompatibilityFallback { tier, reason } => (
+            event_type::COMPATIBILITY_FALLBACK,
+            i64::from(tier.code()),
+            0.0,
+            Some(reason.clone()),
+        ),
         DacEvent::Error(error) => (
             event_type::ERROR,
             error_code(error),
@@ -506,6 +588,14 @@ pub fn parse_request(json: &str) -> Decoded<StreamRequest> {
             channels,
             narrow(required_uint(map, "bit_depth")?, "bit_depth")?,
         ),
+        Some("pcm_u8") => StreamRequest::pcm_u8(
+            narrow(required_uint(map, "sample_rate")?, "sample_rate")?,
+            channels,
+        ),
+        Some("pcm_float32") => StreamRequest::pcm_float32(
+            narrow(required_uint(map, "sample_rate")?, "sample_rate")?,
+            channels,
+        ),
         Some("dop") => {
             let mut request = match uint(map, "dsd_bit_rate")? {
                 Some(bit_rate) => StreamRequest::dop(narrow(bit_rate, "dsd_bit_rate")?, channels),
@@ -584,6 +674,19 @@ fn parse_quirk(value: &Value) -> Decoded<Quirk> {
             "explicit_feedback_per_service_interval" => {
                 Ok(Quirk::ExplicitFeedbackPerServiceInterval)
             }
+            "set_interface_first" => Ok(Quirk::SetInterfaceFirst),
+            "playback_urb_fixup" => Ok(Quirk::PlaybackUrbFixup),
+            "skip_sample_rate_readback" => Ok(Quirk::SkipSampleRateReadback),
+            "skip_implicit_feedback" => Ok(Quirk::SkipImplicitFeedback),
+            "mixer_playback_min_mute" => Ok(Quirk::MixerPlaybackMinMute),
+            "mixer_playback_linear_volume" => Ok(Quirk::MixerPlaybackLinearVolume),
+            "raw_dsd32_be" => Ok(Quirk::RawDsd32Be),
+            "fixed_rate" => Ok(Quirk::FixedRate),
+            "implicit_silence_on_empty" => Ok(Quirk::ImplicitSilenceOnEmpty),
+            "skip_clock_selector_writes" => Ok(Quirk::SkipClockSelectorWrites),
+            "ignore_optional_control_errors" => Ok(Quirk::IgnoreOptionalControlErrors),
+            "tx_length_prefix" | "playback_first" => Err(BadRequest(
+                "packet framing/start ordering quirks require an exact native source-backed profile; generic host override is refused".into())),
             other => Err(unknown(other)),
         },
         Value::Object(map) if map.len() == 1 => {
@@ -593,6 +696,8 @@ fn parse_quirk(value: &Value) -> Decoded<Quirk> {
                 .ok_or_else(|| BadRequest(format!("quirk {name} takes a number")))?;
             match name.as_str() {
                 "settle_delay_ms" => Ok(Quirk::SettleDelayMs(number)),
+                "control_message_delay_us" => Ok(Quirk::ControlMessageDelayUs(number)),
+                "interface_delay_ms" => Ok(Quirk::InterfaceDelayMs(number)),
                 "dsd_subslot_size" => {
                     Ok(Quirk::DsdSubslotSize(narrow(number, "dsd_subslot_size")?))
                 }
@@ -626,6 +731,40 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     }
     if let Some(value) = boolean(map, "require_verified_rate")? {
         config.require_verified_rate = value;
+    }
+    if let Some(policy) = text(map, "clock_readback_policy")? {
+        config.clock_readback_policy = match policy.as_str() {
+            "require_verified" => ClockReadbackPolicy::RequireVerified,
+            "allow_unusable_after_successful_set" => {
+                ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet
+            }
+            _ => {
+                return Err(BadRequest(format!(
+                    "unknown clock_readback_policy {policy:?}"
+                )))
+            }
+        };
+    }
+    if let Some(policy) = text(map, "async_fallback_policy")? {
+        config.async_fallback_policy = match policy.as_str() {
+            "full_speed_uac1" => AsyncFallbackPolicy::FullSpeedUac1,
+            "forbid" => AsyncFallbackPolicy::Forbid,
+            _ => {
+                return Err(BadRequest(format!(
+                    "unknown async_fallback_policy {policy:?}"
+                )))
+            }
+        };
+    }
+    if let Some(enabled) = boolean(map, "adaptive_queue")? {
+        config.adaptive_queue = enabled;
+    }
+    if let Some(policy) = text(map, "quirk_policy")? {
+        config.quirk_policy = match policy.as_str() {
+            "verified_only" => QuirkPolicy::VerifiedOnly,
+            "source_backed" => QuirkPolicy::SourceBacked,
+            _ => return Err(BadRequest(format!("unknown quirk_policy {policy:?}"))),
+        };
     }
     config.clock_settle_delay_ms = uint(map, "clock_settle_delay_ms")?;
     config.dsd_big_endian = boolean(map, "dsd_big_endian")?;
@@ -708,6 +847,60 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn muted_minimum_is_explicit_negative_infinity_never_null_or_full_scale() {
+        let state = volume_state(&VolumeState {
+            db: f64::NEG_INFINITY,
+            fraction: 0.0,
+            muted: Some(true),
+        });
+        assert_eq!(state["db"], "-Infinity");
+        let range = volume_range(&VolumeRange {
+            min_db: f64::NEG_INFINITY,
+            max_db: 0.0,
+            res_db: 0.5,
+        });
+        assert_eq!(range["min_db"], "-Infinity");
+        assert_eq!(range["max_db"], 0.0);
+    }
+
+    #[test]
+    fn compatibility_policies_preserve_defaults_and_reject_unknown_values() {
+        let defaults = parse_config(Some("{}")).ok().unwrap();
+        assert_eq!(
+            defaults.async_fallback_policy,
+            AsyncFallbackPolicy::FullSpeedUac1
+        );
+        assert_eq!(
+            defaults.clock_readback_policy,
+            ClockReadbackPolicy::RequireVerified
+        );
+        assert!(defaults.adaptive_queue);
+        assert_eq!(defaults.quirk_policy, QuirkPolicy::VerifiedOnly);
+        assert_eq!(
+            parse_config(Some(r#"{"quirk_policy":"source_backed"}"#))
+                .ok()
+                .unwrap()
+                .quirk_policy,
+            QuirkPolicy::SourceBacked
+        );
+        assert!(parse_config(Some(r#"{"quirk_policy":"maybe"}"#)).is_err());
+        let selected = parse_config(Some(r#"{"async_fallback_policy":"forbid","clock_readback_policy":"allow_unusable_after_successful_set","adaptive_queue":false}"#)).ok().unwrap();
+        assert_eq!(selected.async_fallback_policy, AsyncFallbackPolicy::Forbid);
+        assert_eq!(
+            selected.clock_readback_policy,
+            ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet
+        );
+        assert!(!selected.adaptive_queue);
+        for invalid in [
+            r#"{"async_fallback_policy":"maybe"}"#,
+            r#"{"clock_readback_policy":"always"}"#,
+            r#"{"adaptive_queue":"yes"}"#,
+        ] {
+            assert!(parse_config(Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn requests_decode_for_each_encoding() {
@@ -812,12 +1005,16 @@ mod tests {
 
     #[test]
     fn the_bus_queue_keys_decode_and_a_bad_value_is_refused() {
-        let config = parse_config(Some(r#"{"bus_queue_ms":32,"transfers_in_flight":4,"transfer_period_us":1500}"#))
-            .ok()
-            .unwrap();
+        let config = parse_config(Some(
+            r#"{"bus_queue_ms":32,"transfers_in_flight":4,"transfer_period_us":1500}"#,
+        ))
+        .ok()
+        .unwrap();
         assert_eq!(config.transfer_period_us, Some(1_500));
         assert!(config.validate().is_ok());
-        let bad = parse_config(Some(r#"{"transfer_period_us":0}"#)).ok().unwrap();
+        let bad = parse_config(Some(r#"{"transfer_period_us":0}"#))
+            .ok()
+            .unwrap();
         assert!(bad.validate().is_err());
         assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (32, 4));
         config.validate().unwrap();
@@ -949,10 +1146,17 @@ mod tests {
 
     #[test]
     fn an_adc3_multiplier_keeps_the_public_kind_and_reports_its_verified_ratio() {
-        assert_eq!(clock_hop(&ClockHop { id: 7, kind: ClockHopKind::RateMultiplier {
-            numerator: 2, denominator: 1,
-        }}), json!({ "id": 7, "kind": "multiplier", "selected_pin": null,
-            "pin_count": null, "numerator": 2, "denominator": 1 }));
+        assert_eq!(
+            clock_hop(&ClockHop {
+                id: 7,
+                kind: ClockHopKind::RateMultiplier {
+                    numerator: 2,
+                    denominator: 1,
+                }
+            }),
+            json!({ "id": 7, "kind": "multiplier", "selected_pin": null,
+            "pin_count": null, "numerator": 2, "denominator": 1 })
+        );
     }
 
     #[test]
@@ -1039,5 +1243,99 @@ mod tests {
         assert_eq!((kind, muted, db), (4, 1, -12.5));
         let parsed: Value = serde_json::from_str(&message.unwrap()).unwrap();
         assert_eq!(parsed["fraction"], 0.6);
+    }
+}
+
+#[cfg(test)]
+mod source_quirk_bridge_tests {
+    use super::*;
+    #[test]
+    fn source_quirk_override_names_and_duration_units_are_distinct() {
+        for (name, expected) in [
+            ("fixed_rate", Quirk::FixedRate),
+            ("implicit_silence_on_empty", Quirk::ImplicitSilenceOnEmpty),
+            ("skip_clock_selector_writes", Quirk::SkipClockSelectorWrites),
+            ("mixer_playback_min_mute", Quirk::MixerPlaybackMinMute),
+            (
+                "mixer_playback_linear_volume",
+                Quirk::MixerPlaybackLinearVolume,
+            ),
+        ] {
+            assert_eq!(
+                parse_quirk(&json!(name)).map_err(|error| error.0).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            parse_quirk(&json!({"control_message_delay_us":5000}))
+                .map_err(|error| error.0)
+                .unwrap(),
+            Quirk::ControlMessageDelayUs(5000)
+        );
+        assert_eq!(
+            parse_quirk(&json!({"interface_delay_ms":50}))
+                .map_err(|error| error.0)
+                .unwrap(),
+            Quirk::InterfaceDelayMs(50)
+        );
+        assert!(parse_quirk(&json!({"interface_delay_ms":-1})).is_err());
+    }
+    #[test]
+    fn framing_and_start_order_cannot_be_enabled_by_unvetted_host_names() {
+        for name in ["tx_length_prefix", "playback_first"] {
+            let input = serde_json::json!({"quirks":[{"vendor_id":0x1234,"product_id":0x5678,"quirks":[name]}]}).to_string();
+            let error = parse_config(Some(&input)).unwrap_err();
+            assert!(
+                error.0.contains("exact native source-backed profile"),
+                "{}",
+                error.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_admission_bridge_tests {
+    use super::*;
+    use usbdac_core::CompatibilityFallbackTier;
+    #[test]
+    fn typed_fallback_admissions_keep_existing_event_codes_and_use_additive_code_eight() {
+        for (tier, code, name) in [
+            (CompatibilityFallbackTier::NominalAsync, 0, "nominal_async"),
+            (
+                CompatibilityFallbackTier::UnverifiedClock,
+                1,
+                "unverified_clock",
+            ),
+        ] {
+            assert_eq!(
+                event(&DacEvent::CompatibilityFallback {
+                    tier,
+                    reason: "admitted".into()
+                }),
+                (8, code, 0.0, Some("admitted".into()))
+            );
+            let trace = feedback_trace_observation(&FeedbackTraceEvent::CompatibilityFallback {
+                tier,
+                reason: "admitted",
+            });
+            assert_eq!(
+                trace,
+                json!({"event":"compatibility_fallback","tier":name,"reason":"admitted"})
+            );
+        }
+        assert_eq!(event(&DacEvent::FeedbackStale), (5, 0, 0.0, None));
+        assert_eq!(event(&DacEvent::DeviceLost), (7, 0, 0.0, None));
+    }
+    #[test]
+    fn clock_quirk_suggestion_export_has_precise_owner_local_entity_and_strikes() {
+        assert_eq!(
+            feedback_trace_observation(&FeedbackTraceEvent::ClockReadbackSuggestion {
+                control_interface: 2,
+                clock_entity: 9,
+                strikes: 3
+            }),
+            json!({"event":"clock_readback_suggestion","control_interface":2,"clock_entity":9,"strikes":3})
+        );
     }
 }

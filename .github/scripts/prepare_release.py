@@ -17,7 +17,7 @@ VERSION_FILES = {
 }
 PACKAGE_PATHS = (
     "Cargo.toml", "Cargo.lock", "LICENSE", "NOTICE", "crates",
-    "android/usbdac", "android/build.gradle.kts", "android/settings.gradle.kts",
+    "android/usbdac", "android/usbdac-media3", "android/build.gradle.kts", "android/settings.gradle.kts",
     "android/gradle.properties", "android/gradle/wrapper", "android/gradlew",
     "android/gradlew.bat",
 )
@@ -66,7 +66,7 @@ def set_version(old, new, last_release):
         "docs/API.md": ["usbdac-core@{version}"],
         "docs/sdk/index.md": ["This guide covers usbdac {version}."],
         "docs/sdk/getting-started.md": [
-            "dev.usbdac:usbdac:{version}", "usbdac-{version}.aar", "v{version})",
+            "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",
             "[{version} release]",
         ],
     }

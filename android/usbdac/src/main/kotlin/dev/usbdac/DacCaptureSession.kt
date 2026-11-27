@@ -79,8 +79,11 @@ public class DacCaptureSession internal constructor(
      * Stop capture and native USB, then release Android claims only after actual retirement.
      * A failed cancellation keeps the host connection owned by a retirement thread.
      */
+    @Synchronized
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        val retirement = runCatching { Native.dacRetirementToken(dac) }.getOrDefault(0L)
+        fun retired() = runCatching { if (retirement != 0L) Native.dacAwaitRetirementToken(retirement) else Native.dacAwaitConnectionRetirement(connection.fileDescriptor) }.getOrDefault(false)
         var failure: Throwable? = null
         try {
             runCatching { synchronized(this) { stream }?.close() }
@@ -88,6 +91,7 @@ public class DacCaptureSession internal constructor(
             try { nativeCall { Native.dacClose(dac) } } catch (error: Throwable) { failure = error }
         } finally {
             fun release() {
+                if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }
                 claims.release()
                 runCatching { configurationSelection.restore() }.onFailure {
                     logWarning("restoring USB configuration failed", it)
@@ -96,11 +100,11 @@ public class DacCaptureSession internal constructor(
                 runCatching { connection.close() }
                 onClosed()
             }
-            if (runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+            if (retired()) {
                 release()
             } else {
                 Thread({
-                    while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+                    while (!retired()) {
                         runCatching { Thread.sleep(50) }
                     }
                     release()

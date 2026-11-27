@@ -54,7 +54,9 @@ const LINE_CD: &[u8] = &[0x00, 0x01, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0f];
 const LINE_PHONO: &[u8] = &[0x00, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0f];
 const DIGITAL_CHANNEL: &[u8] = &[0x00, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a];
 const FOUR_MASTER: &[u8] = &[0x07, 0x08, 0x09, 0x0a, 0x11, 0x12, 0x13, 0x14];
-const V10_PHONO: &[u8] = &[0x03, 0x00, 0x02, 0x06, 0x10, 0x07, 0x08, 0x09, 0x0a, 0x21, 0x22];
+const V10_PHONO: &[u8] = &[
+    0x03, 0x00, 0x02, 0x06, 0x10, 0x07, 0x08, 0x09, 0x0a, 0x21, 0x22,
+];
 const V10_LINE: &[u8] = &[0x00, 0x02, 0x06, 0x10, 0x07, 0x08, 0x09, 0x0a, 0x21, 0x22];
 const PLAYBACK: &[u8] = &[0x00, 0x01, 0x04];
 const LEVEL_COMMON: &[&str] = &["-19dB", "-15dB", "-10dB", "-5dB"];
@@ -100,7 +102,11 @@ impl DjmModel {
     }
 
     fn levels(self) -> &'static [&'static str] {
-        if self == Self::DjmV10 { LEVEL_V10 } else { LEVEL_COMMON }
+        if self == Self::DjmV10 {
+            LEVEL_V10
+        } else {
+            LEVEL_COMMON
+        }
     }
 
     fn capture_sources(self, pair: u8) -> Option<&'static [u8]> {
@@ -125,17 +131,28 @@ impl DjmModel {
     pub fn controls(self) -> Vec<DjmControl> {
         let mut controls = vec![DjmControl {
             key: DjmControlKey::CaptureLevel,
-            options: self.levels().iter().enumerate().map(|(id, &label)| {
-                DjmOption { id: id as u8, label }
-            }).collect(),
+            options: self
+                .levels()
+                .iter()
+                .enumerate()
+                .map(|(id, &label)| DjmOption {
+                    id: id as u8,
+                    label,
+                })
+                .collect(),
         }];
         for pair in 1..=6 {
             if let Some(sources) = self.capture_sources(pair) {
                 controls.push(DjmControl {
                     key: DjmControlKey::CaptureSource(pair),
-                    options: sources.iter().enumerate().map(|(id, &value)| {
-                        DjmOption { id: id as u8, label: self.capture_label(value) }
-                    }).collect(),
+                    options: sources
+                        .iter()
+                        .enumerate()
+                        .map(|(id, &value)| DjmOption {
+                            id: id as u8,
+                            label: self.capture_label(value),
+                        })
+                        .collect(),
                 });
             }
         }
@@ -143,9 +160,14 @@ impl DjmModel {
             for pair in 1..=3 {
                 controls.push(DjmControl {
                     key: DjmControlKey::PlaybackDestination(pair),
-                    options: ["Ch1", "Ch2", "Aux"].into_iter().enumerate().map(|(id, label)| {
-                        DjmOption { id: id as u8, label }
-                    }).collect(),
+                    options: ["Ch1", "Ch2", "Aux"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, label)| DjmOption {
+                            id: id as u8,
+                            label,
+                        })
+                        .collect(),
                 });
             }
         }
@@ -155,13 +177,19 @@ impl DjmModel {
     /// Resolve an explicitly selected choice to `(wValue, wIndex)`.
     pub(crate) fn request(self, key: DjmControlKey, option: u8) -> Option<(u16, u16)> {
         match key {
-            DjmControlKey::CaptureLevel => self.levels().get(usize::from(option))
+            DjmControlKey::CaptureLevel => self
+                .levels()
+                .get(usize::from(option))
                 .map(|_| (u16::from(option) << 8, 0x8003)),
-            DjmControlKey::CaptureSource(pair) => self.capture_sources(pair)?
+            DjmControlKey::CaptureSource(pair) => self
+                .capture_sources(pair)?
                 .get(usize::from(option))
                 .map(|&value| ((u16::from(pair) << 8) | u16::from(value), 0x8002)),
-            DjmControlKey::PlaybackDestination(pair) if self.has_playback() && (1..=3).contains(&pair) => {
-                PLAYBACK.get(usize::from(option))
+            DjmControlKey::PlaybackDestination(pair)
+                if self.has_playback() && (1..=3).contains(&pair) =>
+            {
+                PLAYBACK
+                    .get(usize::from(option))
                     .map(|&value| ((u16::from(pair) << 8) | u16::from(value), 0x8016))
             }
             _ => None,
@@ -218,7 +246,8 @@ mod tests {
             let controls = model.controls();
             let expected: Vec<_> = std::iter::once(DjmControlKey::CaptureLevel)
                 .chain((1..=inputs).map(DjmControlKey::CaptureSource))
-                .chain((1..=outputs).map(DjmControlKey::PlaybackDestination)).collect();
+                .chain((1..=outputs).map(DjmControlKey::PlaybackDestination))
+                .collect();
             assert_eq!(controls.iter().map(|c| c.key).collect::<Vec<_>>(), expected);
             for control in controls {
                 for (ordinal, option) in control.options.iter().enumerate() {
@@ -226,12 +255,24 @@ mod tests {
                     assert!(model.request(control.key, option.id).is_some());
                     assert!(!option.label.is_empty());
                 }
-                assert_eq!(model.request(control.key, control.options.len() as u8), None);
+                assert_eq!(
+                    model.request(control.key, control.options.len() as u8),
+                    None
+                );
             }
             assert_eq!(model.request(DjmControlKey::CaptureSource(0), 0), None);
-            assert_eq!(model.request(DjmControlKey::CaptureSource(inputs + 1), 0), None);
-            assert_eq!(model.request(DjmControlKey::PlaybackDestination(0), 0), None);
-            assert_eq!(model.request(DjmControlKey::PlaybackDestination(outputs + 1), 0), None);
+            assert_eq!(
+                model.request(DjmControlKey::CaptureSource(inputs + 1), 0),
+                None
+            );
+            assert_eq!(
+                model.request(DjmControlKey::PlaybackDestination(0), 0),
+                None
+            );
+            assert_eq!(
+                model.request(DjmControlKey::PlaybackDestination(outputs + 1), 0),
+                None
+            );
         }
         assert_eq!(DjmModel::from_key("djm-a9"), None);
         assert_eq!(DjmModel::from_usb_id(0x2b73, 0x003c), None);
@@ -241,21 +282,86 @@ mod tests {
     fn alsa_capture_request_sequences() {
         use DjmModel::*;
         let cases: &[(DjmModel, &[&[u8]])] = &[
-            (Djm250Mk2, &[&[3,0,6,7,8,9,13,10], &[3,0,6,7,8,9,13,10], &[10,17,18,7,8,9,13]]),
-            (Djm450, &[&[3,0,6,7,8,9,13,10], &[3,0,6,7,8,9,13,10], &[10,17,18,7,8,9,13]]),
-            (Djm750, &[&[1,3,6,7,8,9,10,15], &[0,1,6,7,8,9,10,15], &[0,1,6,7,8,9,10,15], &[1,3,6,7,8,9,10,15]]),
-            (Djm850, &[&[0,3,6,7,8,9,10,15], &[0,1,6,7,8,9,10,15], &[0,1,6,7,8,9,10,15], &[0,3,6,7,8,9,10,15]]),
-            (Djm900Nxs2, &[&[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[7,8,9,10,17,18,19,20]]),
-            (Djm750Mk2, &[&[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[0,2,3,6,7,8,9,10], &[7,8,9,10,17,18,19,20]]),
-            (DjmV10, &[&[3,0,2,6,16,7,8,9,10,33,34], &[0,2,6,16,7,8,9,10,33,34], &[3,0,2,6,16,7,8,9,10,33,34], &[3,0,2,6,16,7,8,9,10,33,34], &[0,2,6,16,7,8,9,10,33,34], &[3,0,2,6,16,7,8,9,10,33,34]]),
+            (
+                Djm250Mk2,
+                &[
+                    &[3, 0, 6, 7, 8, 9, 13, 10],
+                    &[3, 0, 6, 7, 8, 9, 13, 10],
+                    &[10, 17, 18, 7, 8, 9, 13],
+                ],
+            ),
+            (
+                Djm450,
+                &[
+                    &[3, 0, 6, 7, 8, 9, 13, 10],
+                    &[3, 0, 6, 7, 8, 9, 13, 10],
+                    &[10, 17, 18, 7, 8, 9, 13],
+                ],
+            ),
+            (
+                Djm750,
+                &[
+                    &[1, 3, 6, 7, 8, 9, 10, 15],
+                    &[0, 1, 6, 7, 8, 9, 10, 15],
+                    &[0, 1, 6, 7, 8, 9, 10, 15],
+                    &[1, 3, 6, 7, 8, 9, 10, 15],
+                ],
+            ),
+            (
+                Djm850,
+                &[
+                    &[0, 3, 6, 7, 8, 9, 10, 15],
+                    &[0, 1, 6, 7, 8, 9, 10, 15],
+                    &[0, 1, 6, 7, 8, 9, 10, 15],
+                    &[0, 3, 6, 7, 8, 9, 10, 15],
+                ],
+            ),
+            (
+                Djm900Nxs2,
+                &[
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[7, 8, 9, 10, 17, 18, 19, 20],
+                ],
+            ),
+            (
+                Djm750Mk2,
+                &[
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[0, 2, 3, 6, 7, 8, 9, 10],
+                    &[7, 8, 9, 10, 17, 18, 19, 20],
+                ],
+            ),
+            (
+                DjmV10,
+                &[
+                    &[3, 0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                    &[0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                    &[3, 0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                    &[3, 0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                    &[0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                    &[3, 0, 2, 6, 16, 7, 8, 9, 10, 33, 34],
+                ],
+            ),
         ];
         for &(model, pairs) in cases {
             for (pair, values) in pairs.iter().enumerate() {
                 let pair = (pair + 1) as u8;
-                let control = model.controls().into_iter().find(|c| c.key == DjmControlKey::CaptureSource(pair)).unwrap();
+                let control = model
+                    .controls()
+                    .into_iter()
+                    .find(|c| c.key == DjmControlKey::CaptureSource(pair))
+                    .unwrap();
                 assert_eq!(control.options.len(), values.len());
                 for (option, &value) in values.iter().enumerate() {
-                    assert_eq!(model.request(control.key, option as u8), Some(((u16::from(pair) << 8) | u16::from(value), 0x8002)));
+                    assert_eq!(
+                        model.request(control.key, option as u8),
+                        Some(((u16::from(pair) << 8) | u16::from(value), 0x8002))
+                    );
                 }
             }
         }
@@ -266,20 +372,51 @@ mod tests {
         let controls = DjmModel::Djm850.controls();
         assert_eq!(controls[1].options[0].label, "Control Tone CD/LINE");
         assert_eq!(controls[2].options[1].label, "Control Tone LINE");
-        for model in [DjmModel::Djm250Mk2, DjmModel::Djm450, DjmModel::Djm750, DjmModel::Djm850, DjmModel::Djm900Nxs2, DjmModel::Djm750Mk2, DjmModel::DjmV10] {
+        for model in [
+            DjmModel::Djm250Mk2,
+            DjmModel::Djm450,
+            DjmModel::Djm750,
+            DjmModel::Djm850,
+            DjmModel::Djm900Nxs2,
+            DjmModel::Djm750Mk2,
+            DjmModel::DjmV10,
+        ] {
             let controls = model.controls();
             let expected = if model == DjmModel::DjmV10 {
                 &["+15dB", "+12dB", "+9dB", "+6dB", "+3dB", "0dB"][..]
-            } else { &["-19dB", "-15dB", "-10dB", "-5dB"][..] };
-            assert_eq!(controls[0].options.iter().map(|o| o.label).collect::<Vec<_>>(), expected);
+            } else {
+                &["-19dB", "-15dB", "-10dB", "-5dB"][..]
+            };
+            assert_eq!(
+                controls[0]
+                    .options
+                    .iter()
+                    .map(|o| o.label)
+                    .collect::<Vec<_>>(),
+                expected
+            );
             for option in &controls[0].options {
-                assert_eq!(model.request(DjmControlKey::CaptureLevel, option.id), Some((u16::from(option.id) << 8, 0x8003)));
+                assert_eq!(
+                    model.request(DjmControlKey::CaptureLevel, option.id),
+                    Some((u16::from(option.id) << 8, 0x8003))
+                );
             }
-            for control in controls.iter().filter(|c| matches!(c.key, DjmControlKey::PlaybackDestination(_))) {
-                let DjmControlKey::PlaybackDestination(pair) = control.key else { unreachable!() };
-                assert_eq!(control.options.iter().map(|o| o.label).collect::<Vec<_>>(), ["Ch1", "Ch2", "Aux"]);
+            for control in controls
+                .iter()
+                .filter(|c| matches!(c.key, DjmControlKey::PlaybackDestination(_)))
+            {
+                let DjmControlKey::PlaybackDestination(pair) = control.key else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    control.options.iter().map(|o| o.label).collect::<Vec<_>>(),
+                    ["Ch1", "Ch2", "Aux"]
+                );
                 for (id, low) in [0u16, 1, 4].into_iter().enumerate() {
-                    assert_eq!(model.request(control.key, id as u8), Some(((u16::from(pair) << 8) | low, 0x8016)));
+                    assert_eq!(
+                        model.request(control.key, id as u8),
+                        Some(((u16::from(pair) << 8) | low, 0x8016))
+                    );
                 }
             }
         }

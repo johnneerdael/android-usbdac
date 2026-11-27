@@ -67,6 +67,45 @@ public sealed interface DacQuirk {
     /** Trace-backed high-speed four-byte feedback reports express frames per OUT service interval. */
     public data object ExplicitFeedbackPerServiceInterval : DacQuirk
 
+    /** Delay each class control message by this many microseconds. */
+    public data class ControlMessageDelayUs(val microseconds: Long) : DacQuirk
+
+    /** Delay interface transitions by this many milliseconds. */
+    public data class InterfaceDelayMs(val milliseconds: Long) : DacQuirk
+
+    /** Activate the selected alternate before programming its rate. */
+    public data object SetInterfaceFirst : DacQuirk
+
+    /** Apply the exact device playback transfer fixup. */
+    public data object PlaybackUrbFixup : DacQuirk
+
+    /** Skip endpoint sample-rate readback only for an explicitly selected workaround. */
+    public data object SkipSampleRateReadback : DacQuirk
+
+    /** Disable implicit feedback discovery for the selected device policy. */
+    public data object SkipImplicitFeedback : DacQuirk
+
+    /** Treat the hardware minimum playback level as mute. */
+    public data object MixerPlaybackMinMute : DacQuirk
+
+    /** Use the source-backed linear playback-volume interpretation. */
+    public data object MixerPlaybackLinearVolume : DacQuirk
+
+    /** Interpret the proven raw DSD32 layout as big-endian words. */
+    public data object RawDsd32Be : DacQuirk
+
+    /** Use the proven fixed-rate endpoint policy. */
+    public data object FixedRate : DacQuirk
+
+    /** Allow bounded measured-cadence silence after an empty implicit feedback pattern. */
+    public data object ImplicitSilenceOnEmpty : DacQuirk
+
+    /** Keep existing clock-selector choices instead of writing selectors. */
+    public data object SkipClockSelectorWrites : DacQuirk
+
+    /** Ignore only controls designated optional by the source-backed policy. */
+    public data object IgnoreOptionalControlErrors : DacQuirk
+
     /** Wait this long after programming the clock. */
     public data class SettleDelayMs(val milliseconds: Long) : DacQuirk
 
@@ -93,6 +132,30 @@ public enum class UsbQueueProfile {
     BALANCED,
     /** Same target queue as [BALANCED] with fewer, larger transfers and wakeups. */
     LOW_CPU,
+}
+
+/** Which device-specific compatibility facts may affect transport behavior. */
+public enum class QuirkPolicy(internal val wireName: String) {
+    /** Keep the previously shipped device admission policy. */
+    VERIFIED_ONLY("verified_only"),
+    /** Also admit exact source-backed identity/layout rules; this does not claim physical testing. */
+    SOURCE_BACKED("source_backed"),
+}
+
+/** Narrow compatibility fallback when an asynchronous endpoint has no usable feedback. */
+public enum class AsyncFallbackPolicy(internal val wireName: String) {
+    /** Permit nominal pacing only for full-speed UAC1 PCM; this never verifies bit-perfect output. */
+    FULL_SPEED_UAC1("full_speed_uac1"),
+    /** Require feedback unless the separate broad [DacConfig.allowUnsynchronizedAsync] opt-in is set. */
+    FORBID("forbid"),
+}
+
+/** How PCM negotiation treats unusable clock readback after a successful SET request. */
+public enum class ClockReadbackPolicy(internal val wireName: String) {
+    /** Keep strict readback verification. */
+    REQUIRE_VERIFIED("require_verified"),
+    /** Accept zero/unavailable readback after successful SET; positive mismatches still fail. */
+    ALLOW_UNUSABLE_AFTER_SUCCESSFUL_SET("allow_unusable_after_successful_set"),
 }
 
 /**
@@ -145,8 +208,8 @@ public data class DacConfig @JvmOverloads constructor(
 
     /**
      * Stream an asynchronous endpoint that has no explicit feedback endpoint. Default `false`:
-     * [UsbDac.open] succeeds but [DacSession.negotiate] (or [DacSession.openStream]) fails with
-     * [DacErrorCode.IMPLICIT_FEEDBACK_UNSUPPORTED] when that endpoint is the only way to carry the request.
+     * the separate [asyncFallbackPolicy] permits only its narrow compatibility case; other
+     * feedback-less endpoints fail with [DacErrorCode.IMPLICIT_FEEDBACK_UNSUPPORTED].
      * On, the stream runs host-paced at the nominal rate; drift between the DAC's clock and the host's
      * timing ends in underruns or overruns at the DAC, and the stream is never bit-perfect.
      */
@@ -213,6 +276,18 @@ public data class DacConfig @JvmOverloads constructor(
      * A null period uses the fixed slot count.
      */
     val transferPeriodUs: Int? = null,
+
+    /** Narrow feedback-less PCM fallback; independent of the broad diagnostic override. */
+    val asyncFallbackPolicy: AsyncFallbackPolicy = AsyncFallbackPolicy.FULL_SPEED_UAC1,
+
+    /** An unverified clock remains reported unverified when the compatibility policy allows it. */
+    val clockReadbackPolicy: ClockReadbackPolicy = ClockReadbackPolicy.REQUIRE_VERIFIED,
+
+    /** Adapt USB queue depth within the native bounds after measured worker stalls. */
+    val adaptiveQueue: Boolean = true,
+
+    /** Device-specific transport rules; source-backed rules require this explicit opt-in. */
+    val quirkPolicy: QuirkPolicy = QuirkPolicy.VERIFIED_ONLY,
 ) {
     /** Apply a USB queue profile and keep this config's other session settings. */
     public fun withUsbQueueProfile(profile: UsbQueueProfile): DacConfig = when (profile) {

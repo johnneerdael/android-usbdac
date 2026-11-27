@@ -11,9 +11,15 @@ use std::time::{Duration, Instant};
 
 mod fcp;
 mod gen1;
-pub use gen1::{apply_gen1, read_gen1, Gen1Control, Gen1Edit, Gen1Failure, Gen1Io, Gen1Key, Gen1Model, Gen1Readback, Gen1Report, Gen1WriteError};
+pub use fcp::{
+    apply_fcp, read_fcp, FcpBank, FcpFailure, FcpMixEdit, FcpPort, FcpReadback, FcpRouteEdit,
+    FcpTarget, FcpWriteError, FcpWriteReport,
+};
+pub use gen1::{
+    apply_gen1, read_gen1, Gen1Control, Gen1Edit, Gen1Failure, Gen1Io, Gen1Key, Gen1Model,
+    Gen1Readback, Gen1Report, Gen1WriteError,
+};
 pub(crate) use gen1::{restore_gen1, same_gen1_layout};
-pub use fcp::{read_fcp, apply_fcp, FcpBank, FcpPort, FcpReadback, FcpRouteEdit, FcpMixEdit, FcpTarget, FcpWriteReport, FcpFailure, FcpWriteError};
 
 const HEADER: usize = 16;
 pub(crate) use fcp::{restore_fcp, same_fcp_layout};
@@ -54,7 +60,9 @@ pub enum CandidateModel {
 
 impl CandidateModel {
     pub fn recognize(vendor: u16, product: u16) -> Option<Self> {
-        if vendor != 0x1235 { return None; }
+        if vendor != 0x1235 {
+            return None;
+        }
         match product {
             0x8201 => Some(Self::Scarlett18i20Gen2),
             0x8203 => Some(Self::Scarlett6i6Gen2),
@@ -84,7 +92,10 @@ impl CandidateModel {
     pub fn is_fcp(self) -> bool {
         matches!(
             self,
-            Self::Scarlett16i16Gen4 | Self::Scarlett18i16Gen4 | Self::Scarlett18i20Gen4 | Self::IsaC8x
+            Self::Scarlett16i16Gen4
+                | Self::Scarlett18i16Gen4
+                | Self::Scarlett18i20Gen4
+                | Self::IsaC8x
         )
     }
     pub fn key(self) -> &'static str {
@@ -102,7 +113,8 @@ impl CandidateModel {
             Self::ClarettPlus2Pre => "clarett_plus_2pre",
             Self::ClarettPlus4Pre => "clarett_plus_4pre",
             Self::ClarettPlus8Pre => "clarett_plus_8pre",
-            Self::VocasterOne => "vocaster_one", Self::VocasterTwo => "vocaster_two",
+            Self::VocasterOne => "vocaster_one",
+            Self::VocasterTwo => "vocaster_two",
             Self::ScarlettSoloGen4 => "scarlett_solo_gen4",
             Self::Scarlett2i2Gen4 => "scarlett_2i2_gen4",
             Self::Scarlett4i4Gen4 => "scarlett_4i4_gen4",
@@ -127,7 +139,8 @@ impl CandidateModel {
             Self::ClarettPlus2Pre => "Clarett+ 2Pre",
             Self::ClarettPlus4Pre => "Clarett+ 4Pre",
             Self::ClarettPlus8Pre => "Clarett+ 8Pre",
-            Self::VocasterOne => "Vocaster One", Self::VocasterTwo => "Vocaster Two",
+            Self::VocasterOne => "Vocaster One",
+            Self::VocasterTwo => "Vocaster Two",
             Self::ScarlettSoloGen4 => "Scarlett Solo Gen 4",
             Self::Scarlett2i2Gen4 => "Scarlett 2i2 Gen 4",
             Self::Scarlett4i4Gen4 => "Scarlett 4i4 Gen 4",
@@ -149,17 +162,29 @@ impl CandidateModel {
             Self::Scarlett8i6Gen3 => firmware != 0,
             Self::Scarlett18i8Gen3 => firmware != 0,
             Self::Scarlett18i20Gen3 => firmware != 0,
-            Self::ClarettUsb2Pre | Self::ClarettUsb4Pre | Self::ClarettUsb8Pre
-                | Self::ClarettPlus2Pre | Self::ClarettPlus4Pre | Self::ClarettPlus8Pre => firmware != 0,
+            Self::ClarettUsb2Pre
+            | Self::ClarettUsb4Pre
+            | Self::ClarettUsb8Pre
+            | Self::ClarettPlus2Pre
+            | Self::ClarettPlus4Pre
+            | Self::ClarettPlus8Pre => firmware != 0,
             Self::VocasterOne | Self::VocasterTwo => firmware >= 1769,
             Self::ScarlettSoloGen4 | Self::Scarlett2i2Gen4 => firmware >= 2115,
             Self::Scarlett4i4Gen4 => firmware >= 2089,
-            Self::Scarlett16i16Gen4 | Self::Scarlett18i16Gen4 | Self::Scarlett18i20Gen4 | Self::IsaC8x => {
+            Self::Scarlett16i16Gen4
+            | Self::Scarlett18i16Gen4
+            | Self::Scarlett18i20Gen4
+            | Self::IsaC8x => {
                 return Err(ProtocolError::UnsupportedProtocol);
             }
         };
-        if !admitted { return Err(ProtocolError::UnsupportedFirmware(firmware)); }
-        Ok(ReadModel { candidate: self, firmware })
+        if !admitted {
+            return Err(ProtocolError::UnsupportedFirmware(firmware));
+        }
+        Ok(ReadModel {
+            candidate: self,
+            firmware,
+        })
     }
 }
 
@@ -203,20 +228,44 @@ impl ReadModel {
     // Gen4/Vocaster DSP endpoints share MIX IDs but have no mixer controls.
     fn dsp_count(self) -> u8 {
         match self.candidate {
-            CandidateModel::Scarlett18i20Gen2 | CandidateModel::Scarlett6i6Gen2 | CandidateModel::Scarlett18i8Gen2 | CandidateModel::Scarlett4i4Gen3 | CandidateModel::Scarlett8i6Gen3 | CandidateModel::Scarlett18i8Gen3 | CandidateModel::Scarlett18i20Gen3 => 0,
-            CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettUsb8Pre
-                | CandidateModel::ClarettPlus2Pre | CandidateModel::ClarettPlus4Pre | CandidateModel::ClarettPlus8Pre => 0,
-            CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4
-                | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x => 0,
+            CandidateModel::Scarlett18i20Gen2
+            | CandidateModel::Scarlett6i6Gen2
+            | CandidateModel::Scarlett18i8Gen2
+            | CandidateModel::Scarlett4i4Gen3
+            | CandidateModel::Scarlett8i6Gen3
+            | CandidateModel::Scarlett18i8Gen3
+            | CandidateModel::Scarlett18i20Gen3 => 0,
+            CandidateModel::ClarettUsb2Pre
+            | CandidateModel::ClarettUsb4Pre
+            | CandidateModel::ClarettUsb8Pre
+            | CandidateModel::ClarettPlus2Pre
+            | CandidateModel::ClarettPlus4Pre
+            | CandidateModel::ClarettPlus8Pre => 0,
+            CandidateModel::Scarlett16i16Gen4
+            | CandidateModel::Scarlett18i16Gen4
+            | CandidateModel::Scarlett18i20Gen4
+            | CandidateModel::IsaC8x => 0,
             CandidateModel::VocasterOne => 1,
             _ => 2,
         }
     }
-    pub fn mixer_inputs(self) -> u8 { self.count(PortKind::Mix, false) - self.dsp_count() }
-    pub fn mixer_outputs(self) -> u8 { self.count(PortKind::Mix, true) - self.dsp_count() }
+    pub fn mixer_inputs(self) -> u8 {
+        self.count(PortKind::Mix, false) - self.dsp_count()
+    }
+    pub fn mixer_outputs(self) -> u8 {
+        self.count(PortKind::Mix, true) - self.dsp_count()
+    }
     pub fn mux_destinations(self) -> usize {
-        [PortKind::Analogue, PortKind::Spdif, PortKind::Adat, PortKind::Mix, PortKind::Pcm]
-            .iter().map(|&kind| usize::from(self.count(kind, false))).sum()
+        [
+            PortKind::Analogue,
+            PortKind::Spdif,
+            PortKind::Adat,
+            PortKind::Mix,
+            PortKind::Pcm,
+        ]
+        .iter()
+        .map(|&kind| usize::from(self.count(kind, false)))
+        .sum()
     }
     fn bank_widths(self) -> [u16; 3] {
         match self.candidate {
@@ -238,7 +287,10 @@ impl ReadModel {
             CandidateModel::VocasterTwo => [34, 0, 0],
             CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4 => [12; 3],
             CandidateModel::Scarlett4i4Gen4 => [24; 3],
-            CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4 | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x => [0; 3],
+            CandidateModel::Scarlett16i16Gen4
+            | CandidateModel::Scarlett18i16Gen4
+            | CandidateModel::Scarlett18i20Gen4
+            | CandidateModel::IsaC8x => [0; 3],
         }
     }
     fn count(self, kind: PortKind, source: bool) -> u8 {
@@ -279,41 +331,78 @@ impl ReadModel {
             (CandidateModel::Scarlett18i20Gen3, PortKind::Adat) => [8, 8],
             (CandidateModel::Scarlett18i20Gen3, PortKind::Mix) => [12, 25],
             (CandidateModel::Scarlett18i20Gen3, PortKind::Pcm) => [20, 20],
-            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Analogue) => [2, 4],
-            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Analogue) => [8, 6],
-            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Analogue) => [8, 10],
-            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Spdif) => [2, 0],
-            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Spdif) => [2, 2],
-            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Spdif) => [2, 2],
-            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Adat) => [8, 0],
-            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Adat) => [8, 0],
-            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Adat) => [8, 8],
-            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Mix) => [10, 18],
-            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Mix) => [10, 18],
-            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Mix) => [10, 18],
-            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Pcm) => [4, 12],
-            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Pcm) => [8, 18],
-            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Pcm) => [20, 18],
+            (
+                CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre,
+                PortKind::Analogue,
+            ) => [2, 4],
+            (
+                CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre,
+                PortKind::Analogue,
+            ) => [8, 6],
+            (
+                CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre,
+                PortKind::Analogue,
+            ) => [8, 10],
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Spdif) => {
+                [2, 0]
+            }
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Spdif) => {
+                [2, 2]
+            }
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Spdif) => {
+                [2, 2]
+            }
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Adat) => {
+                [8, 0]
+            }
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Adat) => {
+                [8, 0]
+            }
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Adat) => {
+                [8, 8]
+            }
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Mix) => {
+                [10, 18]
+            }
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Mix) => {
+                [10, 18]
+            }
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Mix) => {
+                [10, 18]
+            }
+            (CandidateModel::ClarettUsb2Pre | CandidateModel::ClarettPlus2Pre, PortKind::Pcm) => {
+                [4, 12]
+            }
+            (CandidateModel::ClarettUsb4Pre | CandidateModel::ClarettPlus4Pre, PortKind::Pcm) => {
+                [8, 18]
+            }
+            (CandidateModel::ClarettUsb8Pre | CandidateModel::ClarettPlus8Pre, PortKind::Pcm) => {
+                [20, 18]
+            }
             (CandidateModel::VocasterOne, PortKind::Analogue) => [2, 4],
             (CandidateModel::VocasterOne, PortKind::Mix) => [9, 9],
             (CandidateModel::VocasterOne, PortKind::Pcm) => [4, 10],
             (CandidateModel::VocasterTwo, PortKind::Analogue) => [6, 6],
             (CandidateModel::VocasterTwo, PortKind::Mix) => [12, 14],
             (CandidateModel::VocasterTwo, PortKind::Pcm) => [4, 14],
-            (CandidateModel::ScarlettSoloGen4, PortKind::Analogue) |
-            (CandidateModel::Scarlett2i2Gen4, PortKind::Analogue) => [2, 2],
+            (CandidateModel::ScarlettSoloGen4, PortKind::Analogue)
+            | (CandidateModel::Scarlett2i2Gen4, PortKind::Analogue) => [2, 2],
             (CandidateModel::ScarlettSoloGen4, PortKind::Mix) => [8, 6],
             (CandidateModel::Scarlett2i2Gen4, PortKind::Mix) => [6, 6],
-            (CandidateModel::ScarlettSoloGen4, PortKind::Pcm) |
-            (CandidateModel::Scarlett2i2Gen4, PortKind::Pcm) => [2, 4],
+            (CandidateModel::ScarlettSoloGen4, PortKind::Pcm)
+            | (CandidateModel::Scarlett2i2Gen4, PortKind::Pcm) => [2, 4],
             (CandidateModel::Scarlett4i4Gen4, PortKind::Analogue) => [4, 6],
             (CandidateModel::Scarlett4i4Gen4, PortKind::Mix) => [8, 12],
             (CandidateModel::Scarlett4i4Gen4, PortKind::Pcm) => [6, 6],
             // FCP models cannot construct a legacy ReadModel; all their
             // actual counts and pins come from the firmware-described map.
-            (CandidateModel::Scarlett16i16Gen4 | CandidateModel::Scarlett18i16Gen4
-                | CandidateModel::Scarlett18i20Gen4 | CandidateModel::IsaC8x,
-                PortKind::Analogue | PortKind::Mix | PortKind::Pcm) => [0, 0],
+            (
+                CandidateModel::Scarlett16i16Gen4
+                | CandidateModel::Scarlett18i16Gen4
+                | CandidateModel::Scarlett18i20Gen4
+                | CandidateModel::IsaC8x,
+                PortKind::Analogue | PortKind::Mix | PortKind::Pcm,
+            ) => [0, 0],
             (_, PortKind::Spdif | PortKind::Adat) => [0, 0],
         };
         pair[usize::from(!source)]
@@ -429,14 +518,23 @@ pub struct MuxBankSnapshot {
     words: Vec<u32>,
 }
 impl MuxBankSnapshot {
-    pub fn bank(&self) -> u8 { self.bank }
-    pub fn raw_words(&self) -> &[u32] { &self.words }
+    pub fn bank(&self) -> u8 {
+        self.bank
+    }
+    pub fn raw_words(&self) -> &[u32] {
+        &self.words
+    }
     pub fn routes(&self) -> Vec<MuxRoute> {
         let model = self.model;
-        self.words.iter().copied().filter(|word| *word != 0).map(|word| MuxRoute {
-            source: model.port(((word >> 12) & 0xfff) as u16, true).unwrap(),
-            destination: model.port((word & 0xfff) as u16, false).unwrap(),
-        }).collect()
+        self.words
+            .iter()
+            .copied()
+            .filter(|word| *word != 0)
+            .map(|word| MuxRoute {
+                source: model.port(((word >> 12) & 0xfff) as u16, true).unwrap(),
+                destination: model.port((word & 0xfff) as u16, false).unwrap(),
+            })
+            .collect()
     }
 }
 
@@ -581,16 +679,22 @@ fn packet(command: Command, sequence: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn decode_reply<'a>(
+fn decode_reply(
     command: Command,
     sequence: u16,
     size: usize,
-    bytes: &'a [u8],
-) -> Result<&'a [u8], ProtocolError> {
+    bytes: &[u8],
+) -> Result<&[u8], ProtocolError> {
     decode_reply_mode(command, sequence, size, bytes, false)
 }
 
-fn decode_reply_mode(command: Command, sequence: u16, size: usize, bytes: &[u8], fcp: bool) -> Result<&[u8], ProtocolError> {
+fn decode_reply_mode(
+    command: Command,
+    sequence: u16,
+    size: usize,
+    bytes: &[u8],
+    fcp: bool,
+) -> Result<&[u8], ProtocolError> {
     let expected = HEADER + size;
     if size > if fcp { FCP_MAX_PAYLOAD } else { MAX_PAYLOAD } || bytes.len() != expected {
         return Err(ProtocolError::InvalidLength {
@@ -630,9 +734,18 @@ fn transact<I: ReadIo>(
     transact_mode(io, command, sequence, payload, size, false)
 }
 
-fn transact_mode<I: ReadIo>(io: &mut I, command: Command, sequence: u16, payload: &[u8], size: usize, fcp: bool) -> Result<Vec<u8>, ReadError<I::Error>> {
+fn transact_mode<I: ReadIo>(
+    io: &mut I,
+    command: Command,
+    sequence: u16,
+    payload: &[u8],
+    size: usize,
+    fcp: bool,
+) -> Result<Vec<u8>, ReadError<I::Error>> {
     let limit = if fcp { FCP_MAX_PAYLOAD } else { MAX_PAYLOAD };
-    if size > limit || payload.len() > limit { return Err(ReadError::Protocol(ProtocolError::InvalidPayloadSize)); }
+    if size > limit || payload.len() > limit {
+        return Err(ReadError::Protocol(ProtocolError::InvalidPayloadSize));
+    }
     let request = packet(command, sequence, payload);
     exact(
         io.send_request(&request).map_err(ReadError::Io)?,
@@ -692,7 +805,9 @@ pub struct ReadSession<I> {
 
 impl<I: ReadIo> ReadSession<I> {
     pub fn initialize(mut io: I, candidate: CandidateModel) -> Result<Self, ReadError<I::Error>> {
-        if candidate.is_fcp() { return Err(ReadError::Protocol(ProtocolError::UnsupportedProtocol)); }
+        if candidate.is_fcp() {
+            return Err(ReadError::Protocol(ProtocolError::UnsupportedProtocol));
+        }
         let mut startup = [0; 24];
         exact(
             io.initial_read(&mut startup).map_err(ReadError::Io)?,
@@ -706,16 +821,26 @@ impl<I: ReadIo> ReadSession<I> {
         let model = candidate
             .validate_firmware(firmware)
             .map_err(ReadError::Protocol)?;
-        let mut session = Self { io, model, sequence: 2, poisoned: false };
+        let mut session = Self {
+            io,
+            model,
+            sequence: 2,
+            poisoned: false,
+        };
         // Firmware admission alone never authorizes a new profile. Require
         // observed envelope, lengths, every mux-zero port and mixer row.
         if candidate != CandidateModel::Scarlett18i20Gen2 {
             session.read_all()?;
             // Legacy firmwares may not implement MUX_INFO. Bank proof is an
             // independent explicit operation, never a prerequisite for mix.
-            if matches!(candidate, CandidateModel::VocasterOne | CandidateModel::VocasterTwo
-                | CandidateModel::ScarlettSoloGen4 | CandidateModel::Scarlett2i2Gen4
-                | CandidateModel::Scarlett4i4Gen4) {
+            if matches!(
+                candidate,
+                CandidateModel::VocasterOne
+                    | CandidateModel::VocasterTwo
+                    | CandidateModel::ScarlettSoloGen4
+                    | CandidateModel::Scarlett2i2Gen4
+                    | CandidateModel::Scarlett4i4Gen4
+            ) {
                 session.read_mux_banks()?;
             }
         }
@@ -813,7 +938,9 @@ impl<I: ReadIo> ReadSession<I> {
             .validate_firmware(firmware)
             .map_err(ReadError::Protocol)?;
         if firmware != self.model.firmware {
-            return Err(ReadError::Protocol(ProtocolError::UnsupportedFirmware(firmware)));
+            return Err(ReadError::Protocol(ProtocolError::UnsupportedFirmware(
+                firmware,
+            )));
         }
         self.sequence = 2;
         self.poisoned = false;
@@ -919,43 +1046,67 @@ impl<I: ReadIo> ReadSession<I> {
         // A rejected optional bank probe must not strand independently verified
         // legacy mixer controls. Reinitialize only the poisoned stream; keep
         // the original error and leave the session poisoned if recovery fails.
-        if result.is_err() && self.poisoned { let _ = self.recover(); }
+        if result.is_err() && self.poisoned {
+            let _ = self.recover();
+        }
         result
     }
 
     fn probe_mux_banks(&mut self) -> Result<MuxSnapshot, ReadError<I::Error>> {
         let info = self.request(Command::MuxInfo, &[], 12)?;
-        let widths: Vec<_> = info[..6].chunks_exact(2)
-            .map(|v| u16::from_le_bytes([v[0], v[1]])).collect();
+        let widths: Vec<_> = info[..6]
+            .chunks_exact(2)
+            .map(|v| u16::from_le_bytes([v[0], v[1]]))
+            .collect();
         if widths != self.model.bank_widths() {
             return Err(ReadError::Protocol(ProtocolError::UnsupportedMuxGeometry));
         }
         let mut banks = Vec::new();
         for (bank, width) in self.model.bank_widths().iter().enumerate() {
-            if *width != 0 { banks.push(self.read_mux_bank(bank as u8)?); }
+            if *width != 0 {
+                banks.push(self.read_mux_bank(bank as u8)?);
+            }
         }
-        Ok(MuxSnapshot { model: self.model, banks })
+        Ok(MuxSnapshot {
+            model: self.model,
+            banks,
+        })
     }
 
     fn read_mux_bank(&mut self, bank: u8) -> Result<MuxBankSnapshot, ReadError<I::Error>> {
-        let width = *self.model.bank_widths().get(usize::from(bank))
+        let width = *self
+            .model
+            .bank_widths()
+            .get(usize::from(bank))
             .filter(|&&width| width != 0)
-            .ok_or(ReadError::Protocol(ProtocolError::InvalidMuxBank(bank)))? as u8;
+            .ok_or(ReadError::Protocol(ProtocolError::InvalidMuxBank(bank)))?
+            as u8;
         let bytes = self.request(Command::Mux, &[0, 0, width, bank], usize::from(width) * 4)?;
-        let snapshot = MuxBankSnapshot { bank, model: self.model, words: bytes.chunks_exact(4)
-            .map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect() };
+        let snapshot = MuxBankSnapshot {
+            bank,
+            model: self.model,
+            words: bytes
+                .chunks_exact(4)
+                .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+                .collect(),
+        };
         validate_bank(self.model, &snapshot).map_err(ReadError::Protocol)?;
         Ok(snapshot)
     }
 
     fn set_mux_bank(&mut self, bank: &MuxBankSnapshot) -> Result<(), ReadError<I::Error>> {
         let mut bytes = vec![0, 0, bank.bank, 0];
-        for word in &bank.words { bytes.extend(word.to_le_bytes()); }
+        for word in &bank.words {
+            bytes.extend(word.to_le_bytes());
+        }
         self.request(Command::SetMux, &bytes, 0).map(|_| ())
     }
 
     pub fn apply_mux(&mut self, edit: &MuxEdit) -> Result<MuxWriteReport, MuxWriteError<I::Error>> {
-        let invalid = |e| MuxWriteError { failure: MuxFailure::Invalid(e), rollback: Vec::new() };
+        let invalid = |e| MuxWriteError {
+            failure: MuxFailure::Invalid(e),
+            rollback: Vec::new(),
+        };
         validate_snapshot(self.model, &edit.expected).map_err(invalid)?;
         let mut target = edit.expected.clone();
         let mut seen = Vec::new();
@@ -966,56 +1117,98 @@ impl<I: ReadIo> ReadSession<I> {
             seen.push((route.bank, route.destination));
             let source = port_id(self.model, route.source, true).map_err(invalid)?;
             let destination = port_id(self.model, route.destination, false).map_err(invalid)?;
-            let bank = target.banks.get_mut(usize::from(route.bank))
+            let bank = target
+                .banks
+                .get_mut(usize::from(route.bank))
                 .ok_or_else(|| invalid(ProtocolError::InvalidMuxBank(route.bank)))?;
-            let word = bank.words.iter_mut().find(|word| **word != 0 && (**word & 0xfff) == u32::from(destination))
+            let word = bank
+                .words
+                .iter_mut()
+                .find(|word| **word != 0 && (**word & 0xfff) == u32::from(destination))
                 .ok_or_else(|| invalid(ProtocolError::InvalidMuxEdit))?;
             *word = u32::from(destination) | (u32::from(source) << 12);
         }
         self.replace_mux(&edit.expected, &target)
     }
 
-    pub(crate) fn replace_mux(&mut self, expected: &MuxSnapshot, target: &MuxSnapshot)
-        -> Result<MuxWriteReport, MuxWriteError<I::Error>> {
-        let fail = |failure| MuxWriteError { failure, rollback: Vec::new() };
+    pub(crate) fn replace_mux(
+        &mut self,
+        expected: &MuxSnapshot,
+        target: &MuxSnapshot,
+    ) -> Result<MuxWriteReport, MuxWriteError<I::Error>> {
+        let fail = |failure| MuxWriteError {
+            failure,
+            rollback: Vec::new(),
+        };
         validate_snapshot(self.model, expected).map_err(|e| fail(MuxFailure::Invalid(e)))?;
         validate_snapshot(self.model, target).map_err(|e| fail(MuxFailure::Invalid(e)))?;
         // Includes info and every bank, so no write can rely on selector zero or
         // a snapshot captured before another controller changed the graph.
-        let actual = self.read_mux_banks().map_err(|e| fail(MuxFailure::Read(e)))?;
-        if actual != *expected { return Err(fail(MuxFailure::Drift { actual })); }
+        let actual = self
+            .read_mux_banks()
+            .map_err(|e| fail(MuxFailure::Read(e)))?;
+        if actual != *expected {
+            return Err(fail(MuxFailure::Drift { actual }));
+        }
         let mut attempted = Vec::new();
         let mut verified = actual.clone();
         for (old, new) in expected.banks.iter().zip(&target.banks) {
-            if old == new { continue; }
+            if old == new {
+                continue;
+            }
             attempted.push(old);
-            let result = self.set_mux_bank(new).map_err(MuxFailure::Read).and_then(|_| {
-                let actual = self.read_mux_bank(new.bank).map_err(MuxFailure::Read)?;
-                if actual != *new { return Err(MuxFailure::Verification { bank: new.bank, actual }); }
-                Ok(actual)
-            });
+            let result = self
+                .set_mux_bank(new)
+                .map_err(MuxFailure::Read)
+                .and_then(|_| {
+                    let actual = self.read_mux_bank(new.bank).map_err(MuxFailure::Read)?;
+                    if actual != *new {
+                        return Err(MuxFailure::Verification {
+                            bank: new.bank,
+                            actual,
+                        });
+                    }
+                    Ok(actual)
+                });
             match result {
-                Ok(bank) => { let index = usize::from(bank.bank); verified.banks[index] = bank; },
+                Ok(bank) => {
+                    let index = usize::from(bank.bank);
+                    verified.banks[index] = bank;
+                }
                 Err(failure) => {
                     let mut rollback = Vec::new();
                     for original in attempted.iter().rev() {
                         let restore = (|| {
-                            if self.poisoned { self.recover().map_err(MuxFailure::Read)?; }
+                            if self.poisoned {
+                                self.recover().map_err(MuxFailure::Read)?;
+                            }
                             self.set_mux_bank(original).map_err(MuxFailure::Read)?;
-                            let actual = self.read_mux_bank(original.bank).map_err(MuxFailure::Read)?;
+                            let actual = self
+                                .read_mux_bank(original.bank)
+                                .map_err(MuxFailure::Read)?;
                             if actual != **original {
-                                return Err(MuxFailure::Verification { bank: original.bank, actual });
+                                return Err(MuxFailure::Verification {
+                                    bank: original.bank,
+                                    actual,
+                                });
                             }
                             Ok(())
                         })();
-                        if let Err(error) = restore { rollback.push((original.bank, error)); }
+                        if let Err(error) = restore {
+                            rollback.push((original.bank, error));
+                        }
                     }
-                    if !rollback.is_empty() { self.poisoned = true; }
+                    if !rollback.is_empty() {
+                        self.poisoned = true;
+                    }
                     return Err(MuxWriteError { failure, rollback });
                 }
             }
         }
-        Ok(MuxWriteReport { original: actual, verified })
+        Ok(MuxWriteReport {
+            original: actual,
+            verified,
+        })
     }
 
     pub fn read_all(&mut self) -> Result<RoutingReadback, ReadError<I::Error>> {
@@ -1039,59 +1232,138 @@ fn bank_destinations_for(model: ReadModel, bank: u8) -> Result<Vec<u16>, Protoco
         return Err(ProtocolError::InvalidMuxBank(bank));
     }
     let groups: Vec<(u16, u16, u16)> = match model.candidate {
-        Scarlett6i6Gen2 => vec![(0x600,0,6),(0x080,0,4),(0x180,0,2),(0x300,0,18),(0,0,8)],
-        Scarlett18i8Gen2 => vec![(0x600,0,[18,14,10][bank as usize]),(0x080,0,6),(0x180,0,2),(0x300,0,18),(0,0,if bank==2 {4} else {8})],
-        Scarlett4i4Gen3 => vec![(0x600,0,6),(0x080,0,4),(0x300,0,8),(0,0,16)],
-        Scarlett8i6Gen3 => vec![(0x600,0,8),(0x080,0,4),(0x180,0,2),(0x600,8,2),(0x300,0,8),(0,0,18)],
+        Scarlett6i6Gen2 => vec![
+            (0x600, 0, 6),
+            (0x080, 0, 4),
+            (0x180, 0, 2),
+            (0x300, 0, 18),
+            (0, 0, 8),
+        ],
+        Scarlett18i8Gen2 => vec![
+            (0x600, 0, [18, 14, 10][bank as usize]),
+            (0x080, 0, 6),
+            (0x180, 0, 2),
+            (0x300, 0, 18),
+            (0, 0, if bank == 2 { 4 } else { 8 }),
+        ],
+        Scarlett4i4Gen3 => vec![(0x600, 0, 6), (0x080, 0, 4), (0x300, 0, 8), (0, 0, 16)],
+        Scarlett8i6Gen3 => vec![
+            (0x600, 0, 8),
+            (0x080, 0, 4),
+            (0x180, 0, 2),
+            (0x600, 8, 2),
+            (0x300, 0, 8),
+            (0, 0, 18),
+        ],
         Scarlett18i8Gen3 => {
-            let mut groups=vec![(0x600,0,10)];
-            if bank<2 { groups.push((0x600,12,if bank==0 {8} else {4})); }
-            groups.extend([(0x080,0,2),(0x080,6,2),(0x080,2,4),(0x180,0,2)]);
-            if bank<2 { groups.push((0x600,10,2)); }
-            groups.extend([(0x300,0,20),(0,0,10)]);
+            let mut groups = vec![(0x600, 0, 10)];
+            if bank < 2 {
+                groups.push((0x600, 12, if bank == 0 { 8 } else { 4 }));
+            }
+            groups.extend([(0x080, 0, 2), (0x080, 6, 2), (0x080, 2, 4), (0x180, 0, 2)]);
+            if bank < 2 {
+                groups.push((0x600, 10, 2));
+            }
+            groups.extend([(0x300, 0, 20), (0, 0, 10)]);
             groups
         }
-        Scarlett18i20Gen3 if bank==2 => vec![(0x600,0,10),(0x080,0,10),(0x180,0,2),(0,0,24)],
-        Scarlett18i20Gen3 => vec![(0x600,0,8),(0x600,10,if bank==0 {10} else {8}),(0x080,0,10),(0x180,0,2),(0x200,0,8),(0x600,8,2),(0x300,0,25),(0,0,if bank==0 {12} else {10})],
+        Scarlett18i20Gen3 if bank == 2 => {
+            vec![(0x600, 0, 10), (0x080, 0, 10), (0x180, 0, 2), (0, 0, 24)]
+        }
+        Scarlett18i20Gen3 => vec![
+            (0x600, 0, 8),
+            (0x600, 10, if bank == 0 { 10 } else { 8 }),
+            (0x080, 0, 10),
+            (0x180, 0, 2),
+            (0x200, 0, 8),
+            (0x600, 8, 2),
+            (0x300, 0, 25),
+            (0, 0, if bank == 0 { 12 } else { 10 }),
+        ],
         ClarettUsb2Pre | ClarettPlus2Pre => {
-            let mut groups = vec![(0x600,0,[12,8,2][bank as usize]),(0x080,0,4)];
-            if bank < 2 { groups.push((0x300,0,18)); }
-            groups.push((0,0,if bank == 2 {26} else {8}));
+            let mut groups = vec![(0x600, 0, [12, 8, 2][bank as usize]), (0x080, 0, 4)];
+            if bank < 2 {
+                groups.push((0x300, 0, 18));
+            }
+            groups.push((0, 0, if bank == 2 { 26 } else { 8 }));
             groups
         }
         ClarettUsb4Pre | ClarettPlus4Pre => {
-            let mut groups = vec![(0x600,0,[18,14,12][bank as usize]),(0x080,0,6),(0x180,0,2)];
-            if bank < 2 { groups.push((0x300,0,18)); }
-            groups.push((0,0,if bank == 2 {24} else {8}));
+            let mut groups = vec![
+                (0x600, 0, [18, 14, 12][bank as usize]),
+                (0x080, 0, 6),
+                (0x180, 0, 2),
+            ];
+            if bank < 2 {
+                groups.push((0x300, 0, 18));
+            }
+            groups.push((0, 0, if bank == 2 { 24 } else { 8 }));
             groups
         }
         ClarettUsb8Pre | ClarettPlus8Pre => {
-            let mut groups = vec![(0x600,0,[18,14,12][bank as usize]),(0x080,0,10),(0x180,0,2)];
+            let mut groups = vec![
+                (0x600, 0, [18, 14, 12][bank as usize]),
+                (0x080, 0, 10),
+                (0x180, 0, 2),
+            ];
             if bank < 2 {
-                groups.extend([(0x200,0,if bank == 0 {8} else {4}),(0x300,0,18)]);
+                groups.extend([(0x200, 0, if bank == 0 { 8 } else { 4 }), (0x300, 0, 18)]);
             }
-            groups.push((0,0,if bank == 2 {22} else {8}));
+            groups.push((0, 0, if bank == 2 { 22 } else { 8 }));
             groups
         }
-        VocasterOne => vec![(0x300,8,1),(0x600,5,5),(0x300,6,2),(0x600,0,5),(0x300,0,6),(0x080,0,4)],
-        VocasterTwo => vec![(0x300,12,2),(0x600,6,8),(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
-        ScarlettSoloGen4 | Scarlett2i2Gen4 => vec![(0x300,4,2),(0x300,2,2),(0x600,0,4),(0x300,0,2),(0x080,0,2)],
-        Scarlett4i4Gen4 => vec![(0x300,10,2),(0x600,0,6),(0x300,0,10),(0x080,0,6)],
+        VocasterOne => vec![
+            (0x300, 8, 1),
+            (0x600, 5, 5),
+            (0x300, 6, 2),
+            (0x600, 0, 5),
+            (0x300, 0, 6),
+            (0x080, 0, 4),
+        ],
+        VocasterTwo => vec![
+            (0x300, 12, 2),
+            (0x600, 6, 8),
+            (0x300, 10, 2),
+            (0x600, 0, 6),
+            (0x300, 0, 10),
+            (0x080, 0, 6),
+        ],
+        ScarlettSoloGen4 | Scarlett2i2Gen4 => vec![
+            (0x300, 4, 2),
+            (0x300, 2, 2),
+            (0x600, 0, 4),
+            (0x300, 0, 2),
+            (0x080, 0, 2),
+        ],
+        Scarlett4i4Gen4 => vec![(0x300, 10, 2), (0x600, 0, 6), (0x300, 0, 10), (0x080, 0, 6)],
         Scarlett18i20Gen2 => Vec::new(),
         Scarlett16i16Gen4 | Scarlett18i16Gen4 | Scarlett18i20Gen4 | IsaC8x => {
             return Err(ProtocolError::UnsupportedProtocol);
         }
     };
     if !groups.is_empty() {
-        return Ok(groups.iter().flat_map(|&(base, first, count)|
-            (first..first+count).map(move |channel| if base==0 {0} else {base+channel})).collect());
+        return Ok(groups
+            .iter()
+            .flat_map(|&(base, first, count)| {
+                (first..first + count)
+                    .map(move |channel| if base == 0 { 0 } else { base + channel })
+            })
+            .collect());
     }
     let (pcm, adat, padding) = match bank {
-        0 => (18, 8, 8), 1 => (14, 4, 8), 2 => (10, 0, 6),
+        0 => (18, 8, 8),
+        1 => (14, 4, 8),
+        2 => (10, 0, 6),
         _ => return Err(ProtocolError::InvalidMuxBank(bank)),
     };
     let mut ids = Vec::new();
-    for (base, count) in [(0x600, pcm), (0x080, 10), (0x180, 2), (0x200, adat), (0x300, 18)] {
+    for (base, count) in [
+        (0x600, pcm),
+        (0x080, 10),
+        (0x180, 2),
+        (0x200, adat),
+        (0x300, 18),
+    ] {
         ids.extend((0..count).map(|channel| base + channel));
     }
     ids.extend(std::iter::repeat(0).take(padding));
@@ -1099,11 +1371,17 @@ fn bank_destinations_for(model: ReadModel, bank: u8) -> Result<Vec<u16>, Protoco
 }
 fn validate_bank(model: ReadModel, bank: &MuxBankSnapshot) -> Result<(), ProtocolError> {
     let destinations = bank_destinations_for(model, bank.bank)?;
-    if bank.model != model { return Err(ProtocolError::UnsupportedMuxGeometry); }
-    if destinations.len() != bank.words.len() { return Err(ProtocolError::UnsupportedMuxGeometry); }
+    if bank.model != model {
+        return Err(ProtocolError::UnsupportedMuxGeometry);
+    }
+    if destinations.len() != bank.words.len() {
+        return Err(ProtocolError::UnsupportedMuxGeometry);
+    }
     for (&destination, &word) in destinations.iter().zip(&bank.words) {
         if destination == 0 {
-            if word != 0 { return Err(ProtocolError::UnsupportedMuxGeometry); }
+            if word != 0 {
+                return Err(ProtocolError::UnsupportedMuxGeometry);
+            }
         } else {
             if word >> 24 != 0 || word & 0xfff != u32::from(destination) {
                 return Err(ProtocolError::UnsupportedMuxGeometry);
@@ -1115,21 +1393,35 @@ fn validate_bank(model: ReadModel, bank: &MuxBankSnapshot) -> Result<(), Protoco
     Ok(())
 }
 fn validate_snapshot(model: ReadModel, snapshot: &MuxSnapshot) -> Result<(), ProtocolError> {
-    if snapshot.model != model || snapshot.banks.len() != model.bank_widths().iter().filter(|&&width| width != 0).count() {
+    if snapshot.model != model
+        || snapshot.banks.len()
+            != model
+                .bank_widths()
+                .iter()
+                .filter(|&&width| width != 0)
+                .count()
+    {
         return Err(ProtocolError::UnsupportedMuxGeometry);
     }
     for (index, bank) in snapshot.banks.iter().enumerate() {
-        if usize::from(bank.bank) != index { return Err(ProtocolError::UnsupportedMuxGeometry); }
+        if usize::from(bank.bank) != index {
+            return Err(ProtocolError::UnsupportedMuxGeometry);
+        }
         validate_bank(model, bank)?;
     }
     Ok(())
 }
 fn port_id(model: ReadModel, port: Port, source: bool) -> Result<u16, ProtocolError> {
-    if port == Port::Off && source { return Ok(0); }
+    if port == Port::Off && source {
+        return Ok(0);
+    }
     if let Port::Channel { kind, channel } = port {
         let base = match kind {
-            PortKind::Analogue => 0x080, PortKind::Spdif => 0x180,
-            PortKind::Adat => 0x200, PortKind::Mix => 0x300, PortKind::Pcm => 0x600,
+            PortKind::Analogue => 0x080,
+            PortKind::Spdif => 0x180,
+            PortKind::Adat => 0x200,
+            PortKind::Mix => 0x300,
+            PortKind::Pcm => 0x600,
             PortKind::Off => return Err(ProtocolError::InvalidMuxEdit),
         };
         if channel != 0 && channel <= model.count(kind, source) {
@@ -1217,7 +1509,10 @@ mod tests {
         ] {
             assert_eq!(CandidateModel::recognize(0x1235, product), Some(candidate));
             assert_eq!(CandidateModel::recognize(0x1234, product), None);
-            assert_eq!(candidate.validate_firmware(2778), Err(ProtocolError::UnsupportedProtocol));
+            assert_eq!(
+                candidate.validate_firmware(2778),
+                Err(ProtocolError::UnsupportedProtocol)
+            );
         }
         for firmware in [0, 1082, 1084, u32::MAX] {
             assert_eq!(
@@ -1646,72 +1941,133 @@ mod tests {
         assert_eq!(session.io.writes, 1);
     }
     // Inline independent protocol peer: existing legacy mocks remain unchanged.
-    struct ProfileIo { base: MockIo, model: ReadModel, corrupt: u8 }
+    struct ProfileIo {
+        base: MockIo,
+        model: ReadModel,
+        corrupt: u8,
+    }
     impl ReadIo for ProfileIo {
         type Error = &'static str;
-        fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, Self::Error> { self.base.initial_read(bytes) }
-        fn prepare_notifications(&mut self) -> Result<(), Self::Error> { self.base.prepare_notifications() }
-        fn send_request(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> { self.base.send_request(bytes) }
-        fn next_notification(&mut self, bytes: &mut [u8; 8], timeout: Duration) -> Result<usize, Self::Error> {
+        fn initial_read(&mut self, bytes: &mut [u8; 24]) -> Result<usize, Self::Error> {
+            self.base.initial_read(bytes)
+        }
+        fn prepare_notifications(&mut self) -> Result<(), Self::Error> {
+            self.base.prepare_notifications()
+        }
+        fn send_request(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+            self.base.send_request(bytes)
+        }
+        fn next_notification(
+            &mut self,
+            bytes: &mut [u8; 8],
+            timeout: Duration,
+        ) -> Result<usize, Self::Error> {
             self.base.next_notification(bytes, timeout)
         }
         fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, Self::Error> {
             let command = u32::from_le_bytes(self.base.last[..4].try_into().unwrap());
-            if command == 0 || command == 2 { return self.base.receive_response(bytes); }
+            if command == 0 || command == 2 {
+                return self.base.receive_response(bytes);
+            }
             bytes[..HEADER].copy_from_slice(&self.base.last[..HEADER]);
-            let payload_size = (bytes.len()-HEADER) as u16;
+            let payload_size = (bytes.len() - HEADER) as u16;
             bytes[4..6].copy_from_slice(&payload_size.to_le_bytes());
             match command {
                 0x3000 => {
-                    for (part, width) in bytes[HEADER..].chunks_exact_mut(2).zip(self.model.bank_widths()) {
+                    for (part, width) in bytes[HEADER..]
+                        .chunks_exact_mut(2)
+                        .zip(self.model.bank_widths())
+                    {
                         part.copy_from_slice(&width.to_le_bytes());
                     }
-                    if self.corrupt == 1 { bytes[HEADER] ^= 1; }
-                    if self.corrupt == 5 { bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); }
+                    if self.corrupt == 1 {
+                        bytes[HEADER] ^= 1;
+                    }
+                    if self.corrupt == 5 {
+                        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+                    }
                 }
                 0x3001 => {
-                    let bank = self.base.last[HEADER+3];
-                    for (part, id) in bytes[HEADER..].chunks_exact_mut(4)
-                        .zip(bank_destinations_for(self.model, bank).unwrap()) {
+                    let bank = self.base.last[HEADER + 3];
+                    for (part, id) in bytes[HEADER..]
+                        .chunks_exact_mut(4)
+                        .zip(bank_destinations_for(self.model, bank).unwrap())
+                    {
                         part.copy_from_slice(&u32::from(id).to_le_bytes());
                     }
-                    if self.corrupt == 2 { bytes[HEADER..HEADER+4].copy_from_slice(&0x180u32.to_le_bytes()); }
+                    if self.corrupt == 2 {
+                        bytes[HEADER..HEADER + 4].copy_from_slice(&0x180u32.to_le_bytes());
+                    }
                 }
                 0x2001 => {
-                    assert_eq!(bytes.len()-HEADER, usize::from(self.model.mixer_inputs())*2);
-                    if self.corrupt == 3 { return Ok(bytes.len()-1); }
+                    assert_eq!(
+                        bytes.len() - HEADER,
+                        usize::from(self.model.mixer_inputs()) * 2
+                    );
+                    if self.corrupt == 3 {
+                        return Ok(bytes.len() - 1);
+                    }
                 }
                 _ => panic!("profile proof must never write"),
             }
-            if self.corrupt == 4 { bytes[6] ^= 1; }
+            if self.corrupt == 4 {
+                bytes[6] ^= 1;
+            }
             Ok(bytes.len())
         }
     }
     #[test]
     fn new_profiles_require_complete_live_geometry_and_correct_dsp_dimensions() {
         for (product, firmware, inputs, outputs, destinations, banks) in [
-            (0x8216,1769,8,8,23,1), (0x8217,1769,12,10,34,1),
-            (0x8218,2115,4,6,12,3), (0x8219,2115,4,4,12,3), (0x821a,2089,10,6,24,3),
+            (0x8216, 1769, 8, 8, 23, 1),
+            (0x8217, 1769, 12, 10, 34, 1),
+            (0x8218, 2115, 4, 6, 12, 3),
+            (0x8219, 2115, 4, 4, 12, 3),
+            (0x821a, 2089, 10, 6, 24, 3),
         ] {
             let candidate = CandidateModel::recognize(0x1235, product).unwrap();
-            assert!(candidate.validate_firmware(firmware-1).is_err());
+            assert!(candidate.validate_firmware(firmware - 1).is_err());
             let model = candidate.validate_firmware(firmware).unwrap();
-            assert_eq!((model.mixer_inputs(),model.mixer_outputs(),model.mux_destinations()), (inputs,outputs,destinations));
+            assert_eq!(
+                (
+                    model.mixer_inputs(),
+                    model.mixer_outputs(),
+                    model.mux_destinations()
+                ),
+                (inputs, outputs, destinations)
+            );
             assert!(model.port(0x180, true).is_err());
-            assert!(model.port(0x080+u16::from(model.count(PortKind::Analogue,false)),false).is_err());
+            assert!(model
+                .port(
+                    0x080 + u16::from(model.count(PortKind::Analogue, false)),
+                    false
+                )
+                .is_err());
             for corrupt in 0..=4 {
-                let io = ProfileIo { base: MockIo { firmware, ..MockIo::default() }, model, corrupt };
-                let result = ReadSession::initialize(io,candidate);
+                let io = ProfileIo {
+                    base: MockIo {
+                        firmware,
+                        ..MockIo::default()
+                    },
+                    model,
+                    corrupt,
+                };
+                let result = ReadSession::initialize(io, candidate);
                 if corrupt == 0 {
                     let mut session = result.unwrap();
                     let snapshot = session.read_mux_banks().unwrap();
-                    assert_eq!(snapshot.banks.len(),banks);
+                    assert_eq!(snapshot.banks.len(), banks);
                     for bank in &snapshot.banks {
                         assert_eq!(bank.routes().len(), bank.raw_words().len());
                         assert_eq!(bank.model, model);
                     }
-                    assert_eq!(session.io.base.writes,0);
-                } else { assert!(result.is_err(), "{candidate:?} accepted corrupt proof {corrupt}"); }
+                    assert_eq!(session.io.base.writes, 0);
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{candidate:?} accepted corrupt proof {corrupt}"
+                    );
+                }
             }
         }
     }
@@ -1719,33 +2075,52 @@ mod tests {
     #[test]
     fn legacy_profiles_require_nonzero_firmware_and_full_read_proof() {
         for (product, inputs, outputs, destinations, widths) in [
-            (0x8203,18,10,30,[38,38,38]),
-            (0x8204,18,10,44,[52,48,40]),
-            (0x8212,8,6,18,[34,34,34]),
-            (0x8213,8,8,24,[42,42,42]),
-            (0x8214,20,10,50,[60,56,50]),
-            (0x8215,25,12,65,[77,73,46]),
+            (0x8203, 18, 10, 30, [38, 38, 38]),
+            (0x8204, 18, 10, 44, [52, 48, 40]),
+            (0x8212, 8, 6, 18, [34, 34, 34]),
+            (0x8213, 8, 8, 24, [42, 42, 42]),
+            (0x8214, 20, 10, 50, [60, 56, 50]),
+            (0x8215, 25, 12, 65, [77, 73, 46]),
         ] {
-            let candidate=CandidateModel::recognize(0x1235,product).unwrap();
+            let candidate = CandidateModel::recognize(0x1235, product).unwrap();
             assert!(candidate.validate_firmware(0).is_err());
             // No invented firmware floor: published geometry plus live proof.
-            for firmware in [1,1083,4096] {
-                let model=candidate.validate_firmware(firmware).unwrap();
-                assert_eq!((model.mixer_inputs(),model.mixer_outputs(),model.mux_destinations()),(inputs,outputs,destinations));
-                assert_eq!(model.bank_widths(),widths);
-                for corrupt in [0,2,3,4] {
-                    let io=ProfileIo {base:MockIo {firmware,..MockIo::default()},model,corrupt};
-                    let result=ReadSession::initialize(io,candidate);
-                    if corrupt==0 {
-                        let mut session=result.unwrap();
-                        let snapshot=session.read_mux_banks().unwrap();
-                        assert_eq!(snapshot.banks.len(),3);
+            for firmware in [1, 1083, 4096] {
+                let model = candidate.validate_firmware(firmware).unwrap();
+                assert_eq!(
+                    (
+                        model.mixer_inputs(),
+                        model.mixer_outputs(),
+                        model.mux_destinations()
+                    ),
+                    (inputs, outputs, destinations)
+                );
+                assert_eq!(model.bank_widths(), widths);
+                for corrupt in [0, 2, 3, 4] {
+                    let io = ProfileIo {
+                        base: MockIo {
+                            firmware,
+                            ..MockIo::default()
+                        },
+                        model,
+                        corrupt,
+                    };
+                    let result = ReadSession::initialize(io, candidate);
+                    if corrupt == 0 {
+                        let mut session = result.unwrap();
+                        let snapshot = session.read_mux_banks().unwrap();
+                        assert_eq!(snapshot.banks.len(), 3);
                         for bank in snapshot.banks {
-                            assert_eq!(bank.words.len(),usize::from(widths[bank.bank as usize]));
-                            validate_bank(model,&bank).unwrap();
+                            assert_eq!(bank.words.len(), usize::from(widths[bank.bank as usize]));
+                            validate_bank(model, &bank).unwrap();
                         }
-                        assert_eq!(session.io.base.writes,0);
-                    } else { assert!(result.is_err(),"{candidate:?} accepted corrupt live proof {corrupt}"); }
+                        assert_eq!(session.io.base.writes, 0);
+                    } else {
+                        assert!(
+                            result.is_err(),
+                            "{candidate:?} accepted corrupt live proof {corrupt}"
+                        );
+                    }
                 }
             }
         }
@@ -1755,40 +2130,102 @@ mod tests {
     fn clarett_exact_usb_and_plus_identities_require_complete_live_reads() {
         use CandidateModel::*;
         for (product, candidate, key, name) in [
-            (0x8206, ClarettUsb2Pre, "clarett_usb_2pre", "Clarett USB 2Pre"),
-            (0x8207, ClarettUsb4Pre, "clarett_usb_4pre", "Clarett USB 4Pre"),
-            (0x8208, ClarettUsb8Pre, "clarett_usb_8pre", "Clarett USB 8Pre"),
-            (0x820a, ClarettPlus2Pre, "clarett_plus_2pre", "Clarett+ 2Pre"),
-            (0x820b, ClarettPlus4Pre, "clarett_plus_4pre", "Clarett+ 4Pre"),
-            (0x820c, ClarettPlus8Pre, "clarett_plus_8pre", "Clarett+ 8Pre"),
+            (
+                0x8206,
+                ClarettUsb2Pre,
+                "clarett_usb_2pre",
+                "Clarett USB 2Pre",
+            ),
+            (
+                0x8207,
+                ClarettUsb4Pre,
+                "clarett_usb_4pre",
+                "Clarett USB 4Pre",
+            ),
+            (
+                0x8208,
+                ClarettUsb8Pre,
+                "clarett_usb_8pre",
+                "Clarett USB 8Pre",
+            ),
+            (
+                0x820a,
+                ClarettPlus2Pre,
+                "clarett_plus_2pre",
+                "Clarett+ 2Pre",
+            ),
+            (
+                0x820b,
+                ClarettPlus4Pre,
+                "clarett_plus_4pre",
+                "Clarett+ 4Pre",
+            ),
+            (
+                0x820c,
+                ClarettPlus8Pre,
+                "clarett_plus_8pre",
+                "Clarett+ 8Pre",
+            ),
         ] {
             assert_eq!(CandidateModel::recognize(0x1235, product), Some(candidate));
             assert_eq!(CandidateModel::recognize(0x1234, product), None);
             assert_eq!(candidate.key(), key);
             assert_eq!(candidate.name(), name);
-            assert_eq!(candidate.validate_firmware(0), Err(ProtocolError::UnsupportedFirmware(0)));
+            assert_eq!(
+                candidate.validate_firmware(0),
+                Err(ProtocolError::UnsupportedFirmware(0))
+            );
             for firmware in [1, 1083, 4096] {
                 let model = candidate.validate_firmware(firmware).unwrap();
                 // Wrong destination, short MIX row and wrong reply sequence
                 // must fail admission even with an accepted nonzero firmware.
                 for corrupt in [0, 2, 3, 4] {
-                    let io = ProfileIo { base: MockIo { firmware, ..MockIo::default() }, model, corrupt };
+                    let io = ProfileIo {
+                        base: MockIo {
+                            firmware,
+                            ..MockIo::default()
+                        },
+                        model,
+                        corrupt,
+                    };
                     let result = ReadSession::initialize(io, candidate);
                     if corrupt == 0 {
                         let session = result.unwrap();
                         assert_eq!(session.model(), model);
-                        let mux_reads = session.io.base.sent.iter().filter(|p| p[..4] == 0x3001u32.to_le_bytes()).count();
-                        let mix_reads = session.io.base.sent.iter().filter(|p| p[..4] == 0x2001u32.to_le_bytes()).count();
+                        let mux_reads = session
+                            .io
+                            .base
+                            .sent
+                            .iter()
+                            .filter(|p| p[..4] == 0x3001u32.to_le_bytes())
+                            .count();
+                        let mix_reads = session
+                            .io
+                            .base
+                            .sent
+                            .iter()
+                            .filter(|p| p[..4] == 0x2001u32.to_le_bytes())
+                            .count();
                         assert_eq!((mux_reads, mix_reads), (1, 10));
                         assert_eq!(session.io.base.writes, 0);
                     } else {
-                        assert!(result.is_err(), "{candidate:?} accepted corrupt proof {corrupt}");
+                        assert!(
+                            result.is_err(),
+                            "{candidate:?} accepted corrupt proof {corrupt}"
+                        );
                     }
                 }
                 // Unsupported or wrong optional bank geometry must not prevent
                 // read-only admission or authorize a bank write.
                 for corrupt in [1, 5] {
-                    let io = ProfileIo { base: MockIo { firmware, ..MockIo::default() }, model, corrupt };
+                    let io = ProfileIo {
+                        base: MockIo {
+                            firmware,
+                            ..MockIo::default()
+                        },
+                        model,
+                        corrupt,
+                    };
                     let mut session = ReadSession::initialize(io, candidate).unwrap();
                     assert!(session.read_mux_banks().is_err());
                     assert!(!session.poisoned);
@@ -1807,40 +2244,96 @@ mod tests {
         // Source/destination counts are independent expected protocol identities;
         // in particular 2Pre has S/PDIF sources but no S/PDIF destinations.
         for (candidates, counts, widths, banks) in [
-            ([ClarettUsb2Pre, ClarettPlus2Pre], [[2,4],[2,0],[8,0],[10,18],[4,12]], [42,38,32],
-                [vec![(0x600,12),(0x080,4),(0x300,18),(0,8)],
-                 vec![(0x600,8),(0x080,4),(0x300,18),(0,8)],
-                 vec![(0x600,2),(0x080,4),(0,26)]]),
-            ([ClarettUsb4Pre, ClarettPlus4Pre], [[8,6],[2,2],[8,0],[10,18],[8,18]], [52,48,44],
-                [vec![(0x600,18),(0x080,6),(0x180,2),(0x300,18),(0,8)],
-                 vec![(0x600,14),(0x080,6),(0x180,2),(0x300,18),(0,8)],
-                 vec![(0x600,12),(0x080,6),(0x180,2),(0,24)]]),
-            ([ClarettUsb8Pre, ClarettPlus8Pre], [[8,10],[2,2],[8,8],[10,18],[20,18]], [64,56,46],
-                [vec![(0x600,18),(0x080,10),(0x180,2),(0x200,8),(0x300,18),(0,8)],
-                 vec![(0x600,14),(0x080,10),(0x180,2),(0x200,4),(0x300,18),(0,8)],
-                 vec![(0x600,12),(0x080,10),(0x180,2),(0,22)]]),
+            (
+                [ClarettUsb2Pre, ClarettPlus2Pre],
+                [[2, 4], [2, 0], [8, 0], [10, 18], [4, 12]],
+                [42, 38, 32],
+                [
+                    vec![(0x600, 12), (0x080, 4), (0x300, 18), (0, 8)],
+                    vec![(0x600, 8), (0x080, 4), (0x300, 18), (0, 8)],
+                    vec![(0x600, 2), (0x080, 4), (0, 26)],
+                ],
+            ),
+            (
+                [ClarettUsb4Pre, ClarettPlus4Pre],
+                [[8, 6], [2, 2], [8, 0], [10, 18], [8, 18]],
+                [52, 48, 44],
+                [
+                    vec![(0x600, 18), (0x080, 6), (0x180, 2), (0x300, 18), (0, 8)],
+                    vec![(0x600, 14), (0x080, 6), (0x180, 2), (0x300, 18), (0, 8)],
+                    vec![(0x600, 12), (0x080, 6), (0x180, 2), (0, 24)],
+                ],
+            ),
+            (
+                [ClarettUsb8Pre, ClarettPlus8Pre],
+                [[8, 10], [2, 2], [8, 8], [10, 18], [20, 18]],
+                [64, 56, 46],
+                [
+                    vec![
+                        (0x600, 18),
+                        (0x080, 10),
+                        (0x180, 2),
+                        (0x200, 8),
+                        (0x300, 18),
+                        (0, 8),
+                    ],
+                    vec![
+                        (0x600, 14),
+                        (0x080, 10),
+                        (0x180, 2),
+                        (0x200, 4),
+                        (0x300, 18),
+                        (0, 8),
+                    ],
+                    vec![(0x600, 12), (0x080, 10), (0x180, 2), (0, 22)],
+                ],
+            ),
         ] {
             for candidate in candidates {
                 let model = candidate.validate_firmware(1).unwrap();
                 assert_eq!((model.mixer_inputs(), model.mixer_outputs()), (18, 10));
                 assert_eq!(model.bank_widths(), widths);
-                for (kind, [sources, destinations]) in [PortKind::Analogue, PortKind::Spdif, PortKind::Adat, PortKind::Mix, PortKind::Pcm].into_iter().zip(counts) {
+                for (kind, [sources, destinations]) in [
+                    PortKind::Analogue,
+                    PortKind::Spdif,
+                    PortKind::Adat,
+                    PortKind::Mix,
+                    PortKind::Pcm,
+                ]
+                .into_iter()
+                .zip(counts)
+                {
                     assert_eq!(model.count(kind, true), sources);
                     assert_eq!(model.count(kind, false), destinations);
                 }
                 for (bank, groups) in banks.iter().enumerate() {
-                    let expected: Vec<u16> = groups.iter().flat_map(|&(base, count)|
-                        (0..count).map(move |channel| if base == 0 { 0 } else { base + channel })).collect();
+                    let expected: Vec<u16> = groups
+                        .iter()
+                        .flat_map(|&(base, count)| {
+                            (0..count)
+                                .map(move |channel| if base == 0 { 0 } else { base + channel })
+                        })
+                        .collect();
                     assert_eq!(expected.len(), usize::from(widths[bank]));
                     assert_eq!(bank_destinations_for(model, bank as u8).unwrap(), expected);
-                    let snapshot = MuxBankSnapshot { bank: bank as u8, model, words: expected.iter().copied().map(u32::from).collect() };
+                    let snapshot = MuxBankSnapshot {
+                        bank: bank as u8,
+                        model,
+                        words: expected.iter().copied().map(u32::from).collect(),
+                    };
                     validate_bank(model, &snapshot).unwrap();
                     let mut wrong = snapshot.clone();
                     wrong.words.swap(0, 1);
-                    assert_eq!(validate_bank(model, &wrong), Err(ProtocolError::UnsupportedMuxGeometry));
+                    assert_eq!(
+                        validate_bank(model, &wrong),
+                        Err(ProtocolError::UnsupportedMuxGeometry)
+                    );
                     let mut short = snapshot;
                     short.words.pop();
-                    assert_eq!(validate_bank(model, &short), Err(ProtocolError::UnsupportedMuxGeometry));
+                    assert_eq!(
+                        validate_bank(model, &short),
+                        Err(ProtocolError::UnsupportedMuxGeometry)
+                    );
                 }
             }
         }
@@ -1848,20 +2341,33 @@ mod tests {
 
     #[test]
     fn unsupported_legacy_bank_probe_recovers_independent_mixer_reads() {
-        let candidate=CandidateModel::Scarlett18i20Gen3;
-        let model=candidate.validate_firmware(1).unwrap();
-        let io=ProfileIo {base:MockIo {firmware:1,..MockIo::default()},model,corrupt:5};
-        let mut session=ReadSession::initialize(io,candidate).unwrap();
-        assert!(matches!(session.read_mux_banks(),Err(ReadError::Protocol(ProtocolError::DeviceStatus(1)))));
+        let candidate = CandidateModel::Scarlett18i20Gen3;
+        let model = candidate.validate_firmware(1).unwrap();
+        let io = ProfileIo {
+            base: MockIo {
+                firmware: 1,
+                ..MockIo::default()
+            },
+            model,
+            corrupt: 5,
+        };
+        let mut session = ReadSession::initialize(io, candidate).unwrap();
+        assert!(matches!(
+            session.read_mux_banks(),
+            Err(ReadError::Protocol(ProtocolError::DeviceStatus(1)))
+        ));
         assert!(!session.poisoned);
-        let read=session.read_all().unwrap();
-        assert_eq!(read.mixes.len(),12);
-        assert_eq!(read.mixes[11].coefficients.len(),25);
-        assert_eq!(session.io.base.writes,0);
-        session.io.base.short_send=true;
+        let read = session.read_all().unwrap();
+        assert_eq!(read.mixes.len(), 12);
+        assert_eq!(read.mixes[11].coefficients.len(), 25);
+        assert_eq!(session.io.base.writes, 0);
+        session.io.base.short_send = true;
         assert!(session.read_mux_banks().is_err());
         assert!(session.poisoned);
-        assert!(matches!(session.read_mix(1),Err(ReadError::Protocol(ProtocolError::SessionPoisoned))));
+        assert!(matches!(
+            session.read_mix(1),
+            Err(ReadError::Protocol(ProtocolError::SessionPoisoned))
+        ));
     }
 
     struct BankIo {
@@ -1877,11 +2383,22 @@ mod tests {
         fn default() -> Self {
             Self {
                 base: MockIo::default(),
-                banks: (0..3).map(|bank| MuxBankSnapshot {
-                    bank, model: model(), words: bank_destinations_for(model(), bank).unwrap().into_iter().map(u32::from).collect(),
-                }).collect(),
-                writes: Vec::new(), lost: Vec::new(), corrupt: Vec::new(),
-                unsupported: false, bad_width: false,
+                banks: (0..3)
+                    .map(|bank| MuxBankSnapshot {
+                        bank,
+                        model: model(),
+                        words: bank_destinations_for(model(), bank)
+                            .unwrap()
+                            .into_iter()
+                            .map(u32::from)
+                            .collect(),
+                    })
+                    .collect(),
+                writes: Vec::new(),
+                lost: Vec::new(),
+                corrupt: Vec::new(),
+                unsupported: false,
+                bad_width: false,
             }
         }
     }
@@ -1898,15 +2415,21 @@ mod tests {
             if bytes[..4] == 0x3002u32.to_le_bytes() {
                 let bank = bytes[HEADER + 2];
                 self.writes.push(bank);
-                self.banks[usize::from(bank)].words = bytes[HEADER + 4..].chunks_exact(4)
-                    .map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect();
+                self.banks[usize::from(bank)].words = bytes[HEADER + 4..]
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect();
                 if self.corrupt.contains(&self.writes.len()) {
                     self.banks[usize::from(bank)].words[0] ^= 1 << 12;
                 }
             }
             Ok(n)
         }
-        fn next_notification(&mut self, bytes: &mut [u8; 8], timeout: Duration) -> Result<usize, Self::Error> {
+        fn next_notification(
+            &mut self,
+            bytes: &mut [u8; 8],
+            timeout: Duration,
+        ) -> Result<usize, Self::Error> {
             self.base.next_notification(bytes, timeout)
         }
         fn receive_response(&mut self, bytes: &mut [u8]) -> Result<usize, Self::Error> {
@@ -1922,22 +2445,35 @@ mod tests {
             bytes[4..6].copy_from_slice(&payload_size.to_le_bytes());
             match command {
                 0x3000 => {
-                    for (part, width) in bytes[HEADER..].chunks_exact_mut(2).zip([64u16, 56, 46, 0, 0, 0]) {
+                    for (part, width) in bytes[HEADER..]
+                        .chunks_exact_mut(2)
+                        .zip([64u16, 56, 46, 0, 0, 0])
+                    {
                         part.copy_from_slice(&width.to_le_bytes());
                     }
-                    if self.bad_width { bytes[HEADER] = 63; }
-                    if self.unsupported { bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); }
+                    if self.bad_width {
+                        bytes[HEADER] = 63;
+                    }
+                    if self.unsupported {
+                        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+                    }
                 }
                 0x3001 => {
                     let bank = self.base.last[HEADER + 3];
                     assert_eq!(self.base.last[HEADER], 0);
                     assert_eq!(self.base.last[HEADER + 1], 0);
-                    assert_eq!(usize::from(self.base.last[HEADER + 2]) * 4, bytes.len() - HEADER);
-                    for (part, word) in bytes[HEADER..].chunks_exact_mut(4).zip(&self.banks[usize::from(bank)].words) {
+                    assert_eq!(
+                        usize::from(self.base.last[HEADER + 2]) * 4,
+                        bytes.len() - HEADER
+                    );
+                    for (part, word) in bytes[HEADER..]
+                        .chunks_exact_mut(4)
+                        .zip(&self.banks[usize::from(bank)].words)
+                    {
                         part.copy_from_slice(&word.to_le_bytes());
                     }
                 }
-                0x3002 => {},
+                0x3002 => {}
                 _ => unreachable!(),
             }
             Ok(bytes.len())
@@ -1949,15 +2485,34 @@ mod tests {
     fn bank_edit(session: &mut ReadSession<BankIo>) -> MuxEdit {
         MuxEdit {
             expected: session.read_mux_banks().unwrap(),
-            routes: vec![0, 1].into_iter().map(|bank| MuxRouteEdit {
-                bank, destination: Port::Channel { kind: PortKind::Analogue, channel: 1 },
-                source: Port::Channel { kind: PortKind::Pcm, channel: 2 },
-            }).collect(),
+            routes: vec![0, 1]
+                .into_iter()
+                .map(|bank| MuxRouteEdit {
+                    bank,
+                    destination: Port::Channel {
+                        kind: PortKind::Analogue,
+                        channel: 1,
+                    },
+                    source: Port::Channel {
+                        kind: PortKind::Pcm,
+                        channel: 2,
+                    },
+                })
+                .collect(),
         }
     }
     #[test]
     fn mux_probe_requires_exact_complete_geometry_and_preserves_raw_banks() {
-        for io in [BankIo { unsupported: true, ..BankIo::default() }, BankIo { bad_width: true, ..BankIo::default() }] {
+        for io in [
+            BankIo {
+                unsupported: true,
+                ..BankIo::default()
+            },
+            BankIo {
+                bad_width: true,
+                ..BankIo::default()
+            },
+        ] {
             let mut session = bank_session(io);
             assert!(session.read_mux_banks().is_err());
             assert!(session.io.writes.is_empty());
@@ -1969,7 +2524,9 @@ mod tests {
         assert_eq!(report.original, edit.expected);
         assert_eq!(report.verified.banks[2], edit.expected.banks[2]);
         assert_eq!(&report.verified.banks[0].raw_words()[56..], &[0; 8]);
-        let mut restored = session.replace_mux(&report.verified, &report.original).unwrap();
+        let mut restored = session
+            .replace_mux(&report.verified, &report.original)
+            .unwrap();
         assert_eq!(restored.verified, edit.expected);
         restored.verified.banks.swap(0, 1);
         assert!(validate_snapshot(model(), &restored.verified).is_err());
@@ -1978,27 +2535,54 @@ mod tests {
     fn mux_drift_invalid_destination_and_padding_never_write() {
         let mut session = bank_session(BankIo::default());
         let mut edit = bank_edit(&mut session);
-        let source = port_id(model(), Port::Channel { kind: PortKind::Pcm, channel: 2 }, true).unwrap();
+        let source = port_id(
+            model(),
+            Port::Channel {
+                kind: PortKind::Pcm,
+                channel: 2,
+            },
+            true,
+        )
+        .unwrap();
         session.io.banks[2].words[0] |= u32::from(source) << 12;
-        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Drift { .. }));
-        edit.routes[0].destination = Port::Channel { kind: PortKind::Adat, channel: 8 };
+        assert!(matches!(
+            session.apply_mux(&edit).unwrap_err().failure,
+            MuxFailure::Drift { .. }
+        ));
+        edit.routes[0].destination = Port::Channel {
+            kind: PortKind::Adat,
+            channel: 8,
+        };
         edit.routes[0].bank = 2;
-        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Invalid(_)));
+        assert!(matches!(
+            session.apply_mux(&edit).unwrap_err().failure,
+            MuxFailure::Invalid(_)
+        ));
         edit.expected.banks[0].words[63] = 1;
-        assert!(matches!(session.apply_mux(&edit).unwrap_err().failure, MuxFailure::Invalid(_)));
+        assert!(matches!(
+            session.apply_mux(&edit).unwrap_err().failure,
+            MuxFailure::Invalid(_)
+        ));
         assert!(session.io.writes.is_empty());
     }
     #[test]
     fn mux_partial_lost_set_restores_each_attempted_bank_and_retains_failures() {
         for (lost, corrupt) in [(vec![2], vec![]), (vec![], vec![2])] {
-            let mut session = bank_session(BankIo { lost, corrupt, ..BankIo::default() });
+            let mut session = bank_session(BankIo {
+                lost,
+                corrupt,
+                ..BankIo::default()
+            });
             let edit = bank_edit(&mut session);
             let error = session.apply_mux(&edit).unwrap_err();
             assert!(error.rollback.is_empty());
             assert_eq!(session.io.writes, vec![0, 1, 1, 0]);
             assert_eq!(session.io.banks, edit.expected.banks);
         }
-        let mut session = bank_session(BankIo { lost: vec![2, 3], ..BankIo::default() });
+        let mut session = bank_session(BankIo {
+            lost: vec![2, 3],
+            ..BankIo::default()
+        });
         let edit = bank_edit(&mut session);
         let error = session.apply_mux(&edit).unwrap_err();
         assert_eq!(error.rollback.len(), 1);
@@ -2006,5 +2590,4 @@ mod tests {
         assert_eq!(session.io.writes, vec![0, 1, 1, 0]);
         assert!(session.poisoned);
     }
-
 }

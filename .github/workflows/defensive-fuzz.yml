@@ -1,0 +1,54 @@
+name: Extended defensive USB fuzz evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Bounded ASan parser fuzz duration
+        type: choice
+        required: true
+        default: "60"
+        options: ["10", "60", "180"]
+
+permissions:
+  contents: read
+
+jobs:
+  defensive-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      FUZZ_MINUTES: ${{ inputs.duration_minutes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nightly defensive tooling
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Record source and execute bounded ASan fuzz
+        run: |
+          set -euo pipefail
+          case "$FUZZ_MINUTES" in 10|60|180) ;; *) exit 2 ;; esac
+          mkdir -p target/defensive-fuzz-sanitized
+          git rev-parse HEAD > target/defensive-fuzz-sanitized/revision.txt
+          rustc --version --verbose > target/defensive-fuzz-sanitized/toolchain.txt
+          seconds=$((FUZZ_MINUTES * 60))
+          python3 -I .github/scripts/run_defensive_fuzz.py --seconds "$seconds" --log target/defensive-fuzz-sanitized/report.jsonl
+      - name: Hash successful regression corpus
+        if: success()
+        run: |
+          find fuzz/corpus -type f -exec sha256sum {} + > target/defensive-fuzz-sanitized/corpus-SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: defensive-fuzz-evidence-${{ github.sha }}
+          path: |
+            target/defensive-fuzz-sanitized/report.jsonl
+            target/defensive-fuzz-sanitized/revision.txt
+            target/defensive-fuzz-sanitized/toolchain.txt
+            target/defensive-fuzz-sanitized/corpus-SHA256SUMS
+          retention-days: 30

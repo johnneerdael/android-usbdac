@@ -209,7 +209,7 @@ impl CaptureFormat {
             && request
                 .channel_map
                 .as_ref()
-                .is_none_or(|map| map == &self.channel_map)
+                .map_or(true, |map| map == &self.channel_map)
     }
 }
 
@@ -262,17 +262,30 @@ pub struct CaptureStats {
 impl CaptureStats {
     /// Classify payload without copying it. The USB worker uses the same rules
     /// when reader contention requires dropping valid frames at the host.
-    pub(crate) fn record_completion(&mut self, data_len: usize, submitted: &[usize],
-        packets: &[CapturePacket], transfer_succeeded: bool, known_missing_frames: u64,
-        frame_bytes: usize) -> Result<(), CaptureError> {
+    pub(crate) fn record_completion(
+        &mut self,
+        data_len: usize,
+        submitted: &[usize],
+        packets: &[CapturePacket],
+        transfer_succeeded: bool,
+        known_missing_frames: u64,
+        frame_bytes: usize,
+    ) -> Result<(), CaptureError> {
         self.missing_frames = self.missing_frames.saturating_add(known_missing_frames);
         if !transfer_succeeded {
             self.failed_transfers = self.failed_transfers.saturating_add(1);
             return Ok(());
         }
-        let total = submitted.iter().try_fold(0usize, |total, length| total.checked_add(*length));
-        if submitted.len() != packets.len() || total != Some(data_len)
-            || submitted.iter().zip(packets).any(|(length, packet)| *length != packet.requested_bytes) {
+        let total = submitted
+            .iter()
+            .try_fold(0usize, |total, length| total.checked_add(*length));
+        if submitted.len() != packets.len()
+            || total != Some(data_len)
+            || submitted
+                .iter()
+                .zip(packets)
+                .any(|(length, packet)| *length != packet.requested_bytes)
+        {
             self.malformed_completions = self.malformed_completions.saturating_add(1);
             return Err(CaptureError::InvalidCompletion);
         }
@@ -287,7 +300,9 @@ impl CaptureStats {
                 if packet.actual_bytes < *length {
                     self.short_packets = self.short_packets.saturating_add(1);
                 }
-                self.captured_frames = self.captured_frames.saturating_add((packet.actual_bytes / frame_bytes) as u64);
+                self.captured_frames = self
+                    .captured_frames
+                    .saturating_add((packet.actual_bytes / frame_bytes) as u64);
             }
         }
         Ok(())
@@ -369,7 +384,7 @@ impl DacCaptureStream {
     /// Return whole wire frames copied. An active empty stream returns zero.
     /// Destination length must be a multiple of `format().bytes_per_frame()`.
     pub fn read(&self, destination: &mut [u8]) -> crate::Result<usize> {
-        self.dac.ensure_open()?;
+        let _scope = self.dac.enter()?;
         let handle = self.handle.lock();
         let result = handle.lock_buffer().read(destination);
         result.map_err(|error| match error {
@@ -403,24 +418,55 @@ impl DacCaptureStream {
     /// timeout retains USB ownership in the worker; keep host claims/FD until
     /// `Dac::await_usb_retirement` confirms retirement after closing the DAC.
     pub fn close(&self) -> crate::Result<()> {
+        let _scope = self.dac.context.enter();
         self.handle.lock().stop()
     }
 }
 
 impl CaptureBuffer {
     pub(crate) fn merge_stats(&mut self, stats: CaptureStats) {
-        self.stats.reordered_completions = self.stats.reordered_completions.saturating_add(stats.reordered_completions);
-        self.stats.captured_frames = self.stats.captured_frames.saturating_add(stats.captured_frames);
-        self.stats.delivered_frames = self.stats.delivered_frames.saturating_add(stats.delivered_frames);
-        self.stats.overrun_frames = self.stats.overrun_frames.saturating_add(stats.overrun_frames);
-        self.stats.contention_frames = self.stats.contention_frames.saturating_add(stats.contention_frames);
+        self.stats.reordered_completions = self
+            .stats
+            .reordered_completions
+            .saturating_add(stats.reordered_completions);
+        self.stats.captured_frames = self
+            .stats
+            .captured_frames
+            .saturating_add(stats.captured_frames);
+        self.stats.delivered_frames = self
+            .stats
+            .delivered_frames
+            .saturating_add(stats.delivered_frames);
+        self.stats.overrun_frames = self
+            .stats
+            .overrun_frames
+            .saturating_add(stats.overrun_frames);
+        self.stats.contention_frames = self
+            .stats
+            .contention_frames
+            .saturating_add(stats.contention_frames);
         self.stats.empty_packets = self.stats.empty_packets.saturating_add(stats.empty_packets);
         self.stats.short_packets = self.stats.short_packets.saturating_add(stats.short_packets);
-        self.stats.failed_packets = self.stats.failed_packets.saturating_add(stats.failed_packets);
-        self.stats.malformed_packets = self.stats.malformed_packets.saturating_add(stats.malformed_packets);
-        self.stats.malformed_completions = self.stats.malformed_completions.saturating_add(stats.malformed_completions);
-        self.stats.failed_transfers = self.stats.failed_transfers.saturating_add(stats.failed_transfers);
-        self.stats.missing_frames = self.stats.missing_frames.saturating_add(stats.missing_frames);
+        self.stats.failed_packets = self
+            .stats
+            .failed_packets
+            .saturating_add(stats.failed_packets);
+        self.stats.malformed_packets = self
+            .stats
+            .malformed_packets
+            .saturating_add(stats.malformed_packets);
+        self.stats.malformed_completions = self
+            .stats
+            .malformed_completions
+            .saturating_add(stats.malformed_completions);
+        self.stats.failed_transfers = self
+            .stats
+            .failed_transfers
+            .saturating_add(stats.failed_transfers);
+        self.stats.missing_frames = self
+            .stats
+            .missing_frames
+            .saturating_add(stats.missing_frames);
     }
 
     pub(crate) fn note_malformed_completion(&mut self) {
@@ -491,14 +537,23 @@ impl CaptureBuffer {
         known_missing_frames: u64,
     ) -> Result<(), CaptureError> {
         self.require_active()?;
-        self.stats.record_completion(data.len(), submitted, packets, transfer_succeeded,
-            known_missing_frames, self.format.bytes_per_frame())?;
+        self.stats.record_completion(
+            data.len(),
+            submitted,
+            packets,
+            transfer_succeeded,
+            known_missing_frames,
+            self.format.bytes_per_frame(),
+        )?;
         if transfer_succeeded {
             let frame_bytes = self.format.bytes_per_frame();
             let mut offset = 0;
             for (length, packet) in submitted.iter().zip(packets) {
-                if packet.succeeded && packet.actual_bytes <= *length
-                    && packet.actual_bytes % frame_bytes == 0 && packet.actual_bytes != 0 {
+                if packet.succeeded
+                    && packet.actual_bytes <= *length
+                    && packet.actual_bytes % frame_bytes == 0
+                    && packet.actual_bytes != 0
+                {
                     self.push_frames(&data[offset..offset + packet.actual_bytes]);
                 }
                 offset += length;

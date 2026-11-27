@@ -88,8 +88,14 @@ mod tests {
         let start = Instant::now();
         latch.observe(true, start);
 
-        assert_eq!(latch.observe(false, start + Duration::from_millis(50)), None);
-        assert_eq!(latch.observe(false, start + Duration::from_millis(400)), None);
+        assert_eq!(
+            latch.observe(false, start + Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            latch.observe(false, start + Duration::from_millis(400)),
+            None
+        );
         assert!(latch.is_verified());
     }
 
@@ -119,7 +125,10 @@ mod tests {
         latch.observe(false, start + Duration::from_millis(100));
         latch.observe(false, start + Duration::from_millis(2000));
 
-        assert_eq!(latch.observe(true, start + Duration::from_millis(2100)), Some(true));
+        assert_eq!(
+            latch.observe(true, start + Duration::from_millis(2100)),
+            Some(true)
+        );
         assert!(latch.is_verified());
     }
 
@@ -132,7 +141,10 @@ mod tests {
         latch.observe(true, start + Duration::from_millis(500));
         latch.observe(false, start + Duration::from_millis(600));
 
-        assert_eq!(latch.observe(false, start + Duration::from_millis(1500)), None);
+        assert_eq!(
+            latch.observe(false, start + Duration::from_millis(1500)),
+            None
+        );
         assert!(latch.is_verified());
     }
 

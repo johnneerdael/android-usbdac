@@ -42,7 +42,9 @@ struct PullAdapter {
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
-    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl PullAdapter {
@@ -56,7 +58,8 @@ impl PullAdapter {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
-            let (stream, state, stop) = (Arc::clone(&stream), Arc::clone(&state), Arc::clone(&stop));
+            let (stream, state, stop) =
+                (Arc::clone(&stream), Arc::clone(&state), Arc::clone(&stop));
             thread::Builder::new()
                 .name("host-writer".into())
                 .spawn(move || write_loop(&stream, &state, &stop))
@@ -98,7 +101,8 @@ impl PullAdapter {
     /// plus the music the DAC has completed since.
     fn position_seconds(&self) -> f64 {
         let base = lock(&self.state).base_seconds;
-        base + self.stream.played_frames() as f64 / f64::from(self.stream.format().counter_rate_hz())
+        base + self.stream.played_frames() as f64
+            / f64::from(self.stream.format().counter_rate_hz())
     }
 
     /// The decoder is at the end of the track and the DAC has played it all.

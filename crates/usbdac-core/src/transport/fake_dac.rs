@@ -119,7 +119,11 @@ pub(super) fn control() -> HardwareVolumeControl {
         feature_unit_id: UNIT,
         protocol: AudioControlProtocol::Uac2,
         volume_channels: vec![1, 2],
-        ranges: vec![RawRange { min: -80 * 256, max: 0, resolution: 256 }],
+        ranges: vec![RawRange {
+            min: -80 * 256,
+            max: 0,
+            resolution: 256,
+        }],
         mute_channel: Some(0),
         min_volume_raw: -80 * 256,
         max_volume_raw: 0,
@@ -139,10 +143,7 @@ pub(crate) fn device() -> UsbDevice {
     }
 }
 
-pub(super) fn state(
-    stream_active: bool,
-    control: Option<HardwareVolumeControl>,
-) -> SessionState {
+pub(super) fn state(stream_active: bool, control: Option<HardwareVolumeControl>) -> SessionState {
     let mut state = test_state(None);
     state.device = device();
     state.stream_active = stream_active;
@@ -175,7 +176,10 @@ impl Registered {
         }));
         install(FD, dac.clone());
         *SESSION_STATE.lock() = Some(state(stream_active, with_control.then(control)));
-        Self { _serial: serial, dac }
+        Self {
+            _serial: serial,
+            dac,
+        }
     }
 
     /// Installs the settings a session opened with `config` would have.
@@ -194,13 +198,21 @@ impl Registered {
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        SESSION_STATE.lock().as_ref().unwrap().hardware_volume_generation
+        SESSION_STATE
+            .lock()
+            .as_ref()
+            .unwrap()
+            .hardware_volume_generation
     }
 
     /// What the stream stopping does while the idle lock holds the DAC. The
     /// lock itself needs a live libusb handle, so its presence is stated.
     pub(crate) fn stop_stream_holding_the_dac(&self) {
-        SESSION_STATE.lock().as_mut().unwrap().set_stream_active(false, true);
+        SESSION_STATE
+            .lock()
+            .as_mut()
+            .unwrap()
+            .set_stream_active(false, true);
     }
 
     /// Whether the level the DAC had before the library first changed it is on

@@ -90,6 +90,14 @@ impl VolumeControl {
         Self { shared }
     }
 
+    /// Create a bounded, ordered worker for control I/O. Keep one controller per
+    /// device; requests never block the submitting or async executor thread.
+    /// Dropping a request does not cancel a write already accepted by the worker.
+    pub fn nonblocking(&self) -> Result<crate::AsyncVolumeControl> {
+        self.ensure_open()?;
+        crate::async_volume::AsyncVolumeControl::new(self.clone())
+    }
+
     fn ensure_open(&self) -> Result<()> {
         self.shared.ensure_open()
     }
@@ -97,6 +105,8 @@ impl VolumeControl {
     /// The writable range, or [`Error::Control`] if the control disappeared
     /// (for example the active stream moved to another terminal).
     pub fn range(&self) -> Result<VolumeRange> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
         transport::volume_hw::hardware_volume_range()
             .ok_or_else(|| Error::Control("the DAC has no usable volume control".into()))
@@ -104,6 +114,8 @@ impl VolumeControl {
 
     /// Reads the live level from the device.
     pub fn get(&self) -> Result<VolumeState> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
         let before = transport::volume_hw::cached_volume_state();
         let state = self.finish(transport::volume_hw::read_volume_state())?;
@@ -113,13 +125,18 @@ impl VolumeControl {
         Ok(state)
     }
 
-    /// Sets the level in dB. The value is clamped to the range and snapped to
+    /// Sets the level in dB (`NEG_INFINITY` selects the verified raw minimum).
+    /// The value is clamped to the range and snapped to
     /// the nearest step the DAC supports (a tie goes to the quieter one). Returns
     /// the level read back.
     pub fn set_db(&self, db: f64) -> Result<VolumeState> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
-        if !db.is_finite() {
-            return Err(Error::InvalidArgument("volume must be finite".into()));
+        if db.is_nan() || db == f64::INFINITY {
+            return Err(Error::InvalidArgument(
+                "volume must be finite or negative infinity for silence".into(),
+            ));
         }
         let state = self.finish(transport::volume_hw::write_volume_db(db))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
@@ -130,6 +147,8 @@ impl VolumeControl {
     /// exact inverse of the read-back mapping: feeding a read-back fraction
     /// back in reproduces the same step.
     pub fn set_fraction(&self, fraction: f64) -> Result<VolumeState> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
         if !fraction.is_finite() {
             return Err(Error::InvalidArgument("volume must be finite".into()));
@@ -144,8 +163,14 @@ impl VolumeControl {
     /// `steps == 0` selects [`DEFAULT_VOLUME_STEPS`]. A direction of 0 only
     /// reads the level.
     pub fn step(&self, direction: i8, steps: u8) -> Result<VolumeState> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
-        let steps = if steps == 0 { DEFAULT_VOLUME_STEPS } else { steps };
+        let steps = if steps == 0 {
+            DEFAULT_VOLUME_STEPS
+        } else {
+            steps
+        };
         let state = self.finish(transport::volume_hw::step_volume(direction, steps))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
         Ok(state)
@@ -154,6 +179,8 @@ impl VolumeControl {
     /// Sets the master mute. [`Error::Control`] if the DAC has no writable
     /// mute or the readback disagrees.
     pub fn set_mute(&self, muted: bool) -> Result<VolumeState> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
         let state = self.finish(transport::volume_hw::write_mute(muted))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
@@ -167,6 +194,7 @@ impl VolumeControl {
     /// On connect a host reads this, then restores the level it remembers for
     /// this DAC capped by `limit_db`, or leaves the attenuated level.
     pub fn startup(&self) -> StartupVolumeReport {
+        let _scope = self.shared.context.enter();
         transport::volume_hw::startup_report().unwrap_or_else(|| {
             // Not reachable through `Dac::volume`: a control is only installed
             // together with its start-up step.
@@ -184,12 +212,15 @@ impl VolumeControl {
     /// The level the DAC had before the library first wrote to it, in dB, if
     /// it was recorded (all channels agreed).
     pub fn original_db(&self) -> Option<f64> {
+        let _scope = self.shared.context.enter();
         transport::volume_hw::original_volume_db()
     }
 
     /// Writes the original level back now and ends the record. `Ok(false)` if
     /// there was nothing to restore or it was already in place.
     pub fn hand_back(&self) -> Result<bool> {
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         self.ensure_open()?;
         transport::volume_hw::hand_back_original_volume().or_else_control()
     }

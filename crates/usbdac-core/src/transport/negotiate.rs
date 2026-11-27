@@ -41,38 +41,53 @@ pub(super) fn negotiate_playback_format(
         .ok();
         set_capability_model(capability_model.clone());
 
-        let candidate = match select_owned_stream_candidate(&claimed_handle, requested_format, speed) {
-            Ok(c) => c,
-            Err(error) => {
-                set_last_error(Some(error.message().to_string()));
-                set_direct_mode_refusal_reason(Some(error.message().to_string()));
-                return Err(error.into_error(offered_alt_settings()));
-            }
-        };
+        let candidate =
+            match select_owned_stream_candidate(&claimed_handle, requested_format, speed) {
+                Ok(c) => c,
+                Err(error) => {
+                    set_last_error(Some(error.message().to_string()));
+                    set_direct_mode_refusal_reason(Some(error.message().to_string()));
+                    return Err(error.into_error(offered_alt_settings()));
+                }
+            };
 
         // Vendor pairs have no AudioControl clock. Negotiation stays read-only;
         // programmable DJM rates await stream setup and observed IN cadence.
         if let Some(profile) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
-            .map_err(Error::Transfer)? {
+            .map_err(Error::Transfer)?
+        {
             if requested_format.dsd_transport != DsdTransportMode::None
-                || !profile.supports_rate(requested_format.sample_rate) {
-                return Err(Error::Unsupported { reason: "vendor PCM requires a supported native PCM rate".into(), offered: offered_alt_settings() });
+                || !profile.supports_rate(requested_format.sample_rate)
+            {
+                return Err(Error::Unsupported {
+                    reason: "vendor PCM requires a supported native PCM rate".into(),
+                    offered: offered_alt_settings(),
+                });
             }
             set_effective_playback_format(requested_format);
-            set_dac_mode(if profile.rate_control { DacMode::FullControl } else { DacMode::FixedClock });
+            set_dac_mode(if profile.rate_control {
+                DacMode::FullControl
+            } else {
+                DacMode::FixedClock
+            });
             set_clock_status(None);
-            set_clock_verification(false, false, !profile.rate_control,
-                (!profile.rate_control).then_some(requested_format.sample_rate));
+            set_clock_verification(
+                false,
+                false,
+                !profile.rate_control,
+                (!profile.rate_control).then_some(requested_format.sample_rate),
+            );
             return Ok(requested_format);
         }
 
         // Clock controls and packet pacing use transport words, not source bytes.
         let requested_format = PlaybackFormat {
-            sample_rate: native_wire_rate(requested_format, candidate.subslot_size)
-                .ok_or_else(|| Error::Unsupported {
+            sample_rate: native_wire_rate(requested_format, candidate.subslot_size).ok_or_else(
+                || Error::Unsupported {
                     reason: "native DSD rate is not a whole wire word cadence".into(),
                     offered: offered_alt_settings(),
-                })?,
+                },
+            )?,
             ..requested_format
         };
 
@@ -96,11 +111,18 @@ pub(super) fn negotiate_playback_format(
         apply_itf_mode(&claimed_handle, &candidate, requested_format.dsd_transport)
             .map_err(Error::Transfer)?;
 
-        if !candidate.is_uac1 && adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate).map_err(Error::Transfer)?.is_some() {
-            let route = negotiate_adc3_clock(&claimed_handle, &candidate, requested_format.sample_rate)
-                .map_err(Error::Transfer)?;
+        if !candidate.is_uac1
+            && adc3_route_for_candidate(&usb_device, &claimed_handle.handle, &candidate)
+                .map_err(Error::Transfer)?
+                .is_some()
+        {
+            let route =
+                negotiate_adc3_clock(&claimed_handle, &candidate, requested_format.sample_rate)
+                    .map_err(Error::Transfer)?;
             clock_choice = route.choice.clone();
-            set_clock_status(route.choice.as_ref().map(|_| ClockStatus { reported_sample_rate: None }));
+            set_clock_status(route.choice.as_ref().map(|_| ClockStatus {
+                reported_sample_rate: None,
+            }));
             remember_adc3_route(route);
             set_effective_playback_format(requested_format);
             set_dac_mode(DacMode::FixedClock);
@@ -116,7 +138,10 @@ pub(super) fn negotiate_playback_format(
                 .map_err(Error::Transfer)?;
             candidate_audio_control_clock_choice(&usb_device, &claimed_handle.handle, &candidate)
                 .map_err(Error::Transfer)?
-                .map(|(clock, choice)| { clock_choice = Some(choice); clock })
+                .map(|(clock, choice)| {
+                    clock_choice = Some(choice);
+                    clock
+                })
         };
 
         let mut effective_format = requested_format;
@@ -139,20 +164,14 @@ pub(super) fn negotiate_playback_format(
             // Raw multiplier hops must never degrade to the generic fixed-clock fallback.
             uac2_clock_ratio(clock_choice.as_ref()).map_err(Error::Transfer)?;
             if let Some(choice) = clock_choice.as_ref() {
-                verify_uac2_clock_factors(&claimed_handle.handle, choice).map_err(Error::Transfer)?;
+                verify_uac2_clock_factors(&claimed_handle.handle, choice)
+                    .map_err(Error::Transfer)?;
             }
-            let current_rate = get_wire_frequency(
-                &claimed_handle.handle,
-                clock,
-                clock_choice.as_ref(),
-            )
-            .ok();
-            let supported_ranges = get_wire_frequency_ranges(
-                &claimed_handle.handle,
-                clock,
-                clock_choice.as_ref(),
-            )
-            .ok();
+            let current_rate =
+                get_wire_frequency(&claimed_handle.handle, clock, clock_choice.as_ref()).ok();
+            let supported_ranges =
+                get_wire_frequency_ranges(&claimed_handle.handle, clock, clock_choice.as_ref())
+                    .ok();
 
             if supported_ranges.as_ref().is_some_and(|ranges| {
                 sampling_frequency_ranges_support_rate(ranges, requested_format.sample_rate)
@@ -167,6 +186,18 @@ pub(super) fn negotiate_playback_format(
                     candidate.endpoint_address,
                     requested_format.sample_rate,
                 );
+                if settings().has(crate::Quirk::SetInterfaceFirst)
+                    && candidate.implicit_feedback.is_none()
+                    && requested_format.dsd_transport == DsdTransportMode::None
+                {
+                    claimed_handle
+                        .set_alternate_setting(candidate.interface_number, candidate.alt_setting)
+                        .map_err(|error| {
+                            Error::Transfer(format!(
+                                "interface-first negotiation activation failed: {error}"
+                            ))
+                        })?;
+                }
                 let clock_outcome = apply_wire_frequency(
                     &claimed_handle.handle,
                     clock,
@@ -175,7 +206,7 @@ pub(super) fn negotiate_playback_format(
                     settings().settle_delay_ms(),
                 );
                 clock_attempted = true;
-                clock_succeeded = clock_outcome.clock_ok;
+                clock_succeeded = clock_outcome.set_cur_succeeded || clock_outcome.clock_ok;
                 rate_verified = clock_outcome.rate_verified;
                 reported_rate = clock_outcome.reported_sample_rate.or(current_rate);
                 last_message = clock_outcome.message.clone();
@@ -187,35 +218,79 @@ pub(super) fn negotiate_playback_format(
                     clock.clock_id,
                     clock.interface_number,
                 );
+                let unusable_after_set = clock_outcome.set_cur_succeeded
+                    && clock_outcome
+                        .reported_sample_rate
+                        .map_or(true, |rate| rate == 0)
+                    && !clock_outcome.known_mismatch;
+                let allow_unverified = settings().allow_unusable_clock_readback(
+                    true,
+                    clock_outcome.set_cur_succeeded,
+                    clock_outcome.reported_sample_rate,
+                    uac2_choice_has_multiplier(clock_choice.as_ref()),
+                    requested_format.dsd_transport != DsdTransportMode::None,
+                );
+                if unusable_after_set && !allow_unverified {
+                    return Err(Error::ClockUnverified {
+                        requested_hz: requested_format.sample_rate,
+                        reported_hz: None,
+                    });
+                }
+                if !clock_outcome.set_cur_succeeded && !clock_outcome.clock_ok {
+                    return Err(Error::ClockUnverified {
+                        requested_hz: requested_format.sample_rate,
+                        reported_hz: clock_outcome.reported_sample_rate.filter(|rate| *rate > 0),
+                    });
+                }
+                if allow_unverified {
+                    dac_mode = DacMode::FullControl;
+                    set_effective_playback_format(requested_format);
+                    set_dac_mode(dac_mode);
+                    set_clock_verification(
+                        true,
+                        true,
+                        false,
+                        clock_outcome.reported_sample_rate.filter(|rate| *rate > 0),
+                    );
+                    return Ok(requested_format);
+                }
                 if clock_outcome.rate_verified
                     && clock_outcome.reported_sample_rate == Some(requested_format.sample_rate)
                 {
-                    if let Some(choice) = clock_choice.as_ref().filter(|choice|
-                        choice.resolution == crate::clock_resolution::ClockResolution::Resolved)
-                    {
-                        uac2_alternate = match super::uac2_live_alternate::select_uac2_live_alternate(
-                            &claimed_handle, &candidate, requested_format, choice,
-                        ) {
-                            Ok(alternate) => alternate,
-                            Err(error) => {
-                                // Multiplied routes already own a complete source
-                                // snapshot in the clock planner's outer rollback.
-                                let restore = if clock_outcome.set_cur_succeeded
-                                    && !uac2_choice_has_multiplier(Some(choice))
-                                {
-                                    restore_uac2_rate_after_alternate_failure(
-                                        &claimed_handle, &candidate, clock, choice, current_rate,
-                                        requested_format.sample_rate,
-                                    )
-                                } else {
-                                    Ok(())
-                                };
-                                return Err(Error::Transfer(match restore {
+                    if let Some(choice) = clock_choice.as_ref().filter(|choice| {
+                        choice.resolution == crate::clock_resolution::ClockResolution::Resolved
+                    }) {
+                        uac2_alternate =
+                            match super::uac2_live_alternate::select_uac2_live_alternate(
+                                &claimed_handle,
+                                &candidate,
+                                requested_format,
+                                choice,
+                            ) {
+                                Ok(alternate) => alternate,
+                                Err(error) => {
+                                    // Multiplied routes already own a complete source
+                                    // snapshot in the clock planner's outer rollback.
+                                    let restore = if clock_outcome.set_cur_succeeded
+                                        && !uac2_choice_has_multiplier(Some(choice))
+                                    {
+                                        restore_uac2_rate_after_alternate_failure(
+                                            &claimed_handle,
+                                            &candidate,
+                                            clock,
+                                            choice,
+                                            current_rate,
+                                            requested_format.sample_rate,
+                                        )
+                                    } else {
+                                        Ok(())
+                                    };
+                                    return Err(Error::Transfer(match restore {
                                     Ok(()) => error,
                                     Err(restore_error) => format!("{error}; UAC2 source rate restoration uncertain: {restore_error}"),
                                 }));
-                            }
-                        };
+                                }
+                            };
                     }
                     dac_mode = DacMode::FullControl;
                     set_effective_playback_format(requested_format);
@@ -243,9 +318,11 @@ pub(super) fn negotiate_playback_format(
                 });
             }
 
-            if uac2_choice_has_multiplier(clock_choice.as_ref())
-                && current_rate.is_none() {
-                return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate, reported_hz: reported_rate });
+            if uac2_choice_has_multiplier(clock_choice.as_ref()) && current_rate.is_none() {
+                return Err(Error::ClockUnverified {
+                    requested_hz: requested_format.sample_rate,
+                    reported_hz: reported_rate,
+                });
             }
             if requested_format.dsd_transport == DsdTransportMode::Native {
                 return Err(Error::Unsupported {
@@ -256,11 +333,19 @@ pub(super) fn negotiate_playback_format(
             let adaptive_rate = if uac2_choice_has_multiplier(clock_choice.as_ref()) {
                 // A multiplied route can fall back only to its proven current
                 // wire cadence; RANGE alone does not establish a running rate.
-                current_rate.filter(|rate| select_stream_candidate(
-                    &usb_device, &claimed_handle.handle,
-                    PlaybackFormat { sample_rate: *rate, ..requested_format },
-                    speed, &claimed_handle.claimed_interfaces,
-                ).is_ok())
+                current_rate.filter(|rate| {
+                    select_stream_candidate(
+                        &usb_device,
+                        &claimed_handle.handle,
+                        PlaybackFormat {
+                            sample_rate: *rate,
+                            ..requested_format
+                        },
+                        speed,
+                        &claimed_handle.claimed_interfaces,
+                    )
+                    .is_ok()
+                })
             } else {
                 choose_adaptive_sample_rate(
                     requested_format.sample_rate,
@@ -286,7 +371,10 @@ pub(super) fn negotiate_playback_format(
                     current_rate == Some(actual_rate) || reported_rate == Some(actual_rate);
             } else {
                 if uac2_choice_has_multiplier(clock_choice.as_ref()) {
-                    return Err(Error::ClockUnverified { requested_hz: requested_format.sample_rate, reported_hz: reported_rate });
+                    return Err(Error::ClockUnverified {
+                        requested_hz: requested_format.sample_rate,
+                        reported_hz: reported_rate,
+                    });
                 }
                 let message = last_message.unwrap_or_else(|| {
                     format!(
@@ -303,7 +391,9 @@ pub(super) fn negotiate_playback_format(
             // UAC1 rate control belongs to the active streaming endpoint.
             // Negotiation neither writes it nor claims a live rate readback.
             dac_mode = DacMode::FixedClock;
-            set_clock_status(Some(ClockStatus { reported_sample_rate: None }));
+            set_clock_status(Some(ClockStatus {
+                reported_sample_rate: None,
+            }));
             last_message = Some(format!(
                 "UAC 1.0 device: endpoint 0x{:02x} rate evidence awaits streaming alternate activation",
                 candidate.endpoint_address,
@@ -393,9 +483,13 @@ pub(super) fn negotiate_playback_format(
         }
     }
     let cleanup_ok = cleanup_claimed_handle(claimed_handle, cleanup_interface, lock_requested);
-    if !cleanup_ok || negotiated.is_err() { clear_adc3_negotiation(); }
+    if !cleanup_ok || negotiated.is_err() {
+        clear_adc3_negotiation();
+    }
     if !cleanup_ok && negotiated.is_ok() {
-        return Err(Error::Transfer("USB negotiation could not restore a PCM-safe idle state".into()));
+        return Err(Error::Transfer(
+            "USB negotiation could not restore a PCM-safe idle state".into(),
+        ));
     }
     if negotiated.is_ok() {
         if let Some(state) = SESSION_STATE.lock().as_mut() {
@@ -415,16 +509,24 @@ fn restore_uac2_rate_after_alternate_failure(
     previous_rate: Option<u32>,
     attempted_rate: u32,
 ) -> Result<(), String> {
-    let previous_rate = previous_rate.filter(|rate| *rate != 0)
+    let previous_rate = previous_rate
+        .filter(|rate| *rate != 0)
         .ok_or("pre-write source rate was not proven; preserving current state")?;
     let device = claimed.handle.device();
-    let config = device.active_config_descriptor().map_err(|error| error.to_string())?;
+    let config = device
+        .active_config_descriptor()
+        .map_err(|error| error.to_string())?;
     if config.number() != candidate.configuration_number {
         return Err("live configuration changed; preserving current state".into());
     }
-    let live_choice = || strict_implicit_clock(
-        &config, &claimed.handle, choice.control_interface, candidate.terminal_link,
-    );
+    let live_choice = || {
+        strict_implicit_clock(
+            &config,
+            &claimed.handle,
+            choice.control_interface,
+            candidate.terminal_link,
+        )
+    };
     if live_choice().as_ref() != Some(choice) {
         return Err("live clock choice changed; preserving current state".into());
     }
@@ -436,16 +538,24 @@ fn restore_uac2_rate_after_alternate_failure(
         return Ok(());
     }
     if live_rate != attempted_rate {
-        return Err(format!("live source rate changed externally to {live_rate} Hz; preserving current state"));
+        return Err(format!(
+            "live source rate changed externally to {live_rate} Hz; preserving current state"
+        ));
     }
     let restored = apply_wire_frequency(
-        &claimed.handle, clock, Some(choice), previous_rate, settings().settle_delay_ms(),
+        &claimed.handle,
+        clock,
+        Some(choice),
+        previous_rate,
+        settings().settle_delay_ms(),
     );
-    if !restored.clock_ok || !restored.rate_verified
+    if !restored.clock_ok
+        || !restored.rate_verified
         || restored.reported_sample_rate != Some(previous_rate)
     {
-        return Err(restored.message.unwrap_or_else(||
-            format!("could not verify restored source rate {previous_rate} Hz")));
+        return Err(restored.message.unwrap_or_else(|| {
+            format!("could not verify restored source rate {previous_rate} Hz")
+        }));
     }
     Ok(())
 }
@@ -577,6 +687,10 @@ pub(super) fn sanitize_playback_format(playback_format: PlaybackFormat) -> Playb
         }
     } else if playback_format.dsd_transport == DsdTransportMode::Native {
         playback_format.bit_depth
+    } else if playback_format.pcm_encoding == PcmEncoding::Unsigned8 {
+        8
+    } else if playback_format.pcm_encoding == PcmEncoding::Float32 {
+        32
     } else {
         match playback_format.bit_depth {
             16 | 24 | 32 => playback_format.bit_depth,
@@ -584,6 +698,7 @@ pub(super) fn sanitize_playback_format(playback_format: PlaybackFormat) -> Playb
         }
     };
     PlaybackFormat {
+        pcm_encoding: playback_format.pcm_encoding,
         sample_rate: playback_format.sample_rate.max(8_000),
         bit_depth,
         channels: playback_format.channels.max(1),
@@ -601,9 +716,19 @@ pub(super) fn transport_compatibility_penalty(
     let fmt_ok = if is_native_dsd {
         stream_format.native_dsd.is_some()
     } else {
-        stream_format.format_tag == FORMAT_TAG_PCM
+        stream_format.format_tag == playback_format.pcm_encoding.format_tag()
+            || stream_format.uac2_formats.is_some_and(|bits| {
+                bits & (1 << (playback_format.pcm_encoding.format_tag() - 1)) != 0
+            })
     };
-    if !fmt_ok {
+    if !fmt_ok
+        || (!is_native_dsd
+            && ambiguous_type_i_pcm(
+                stream_format.uac2_formats,
+                stream_format.subslot_size,
+                stream_format.bit_resolution,
+            ))
+    {
         return u32::MAX;
     }
     if stream_format.subslot_size == 0 || stream_format.channels == 0 {
@@ -613,6 +738,13 @@ pub(super) fn transport_compatibility_penalty(
         return u32::MAX;
     }
     if !is_native_dsd {
+        if (playback_format.pcm_encoding == PcmEncoding::Unsigned8
+            && stream_format.subslot_size != 1)
+            || (playback_format.pcm_encoding == PcmEncoding::Float32
+                && stream_format.subslot_size != 4)
+        {
+            return u32::MAX;
+        }
         let Some(min_subslot_size) = bytes_per_sample(playback_format.bit_depth) else {
             return u32::MAX;
         };

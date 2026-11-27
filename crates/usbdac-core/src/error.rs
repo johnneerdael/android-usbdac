@@ -57,6 +57,10 @@ pub enum Error {
     /// the DAC again with `require_hardware_volume` off. `negotiate` and
     /// `capabilities` still work, so the host can show what the DAC offers.
     VolumeUnavailable,
+    /// Reconfiguration did not drain before its deadline. The original stream remains open/draining.
+    ReconfigureDrainTimeout,
+    /// Stream retirement, retained ownership, or rollback failed. Close the DAC before further use.
+    ReconfigureUnusable(String),
 }
 
 impl Error {
@@ -77,6 +81,8 @@ impl Error {
             Self::InvalidState(_) => "invalid_state",
             Self::InvalidArgument(_) => "invalid_argument",
             Self::VolumeUnavailable => "volume_unavailable",
+            Self::ReconfigureDrainTimeout => "reconfigure_drain_timeout",
+            Self::ReconfigureUnusable(_) => "reconfigure_unusable",
         }
     }
 
@@ -91,7 +97,8 @@ impl Error {
             | Self::Transfer(m)
             | Self::Control(m)
             | Self::InvalidState(m)
-            | Self::InvalidArgument(m) => m.clone(),
+            | Self::InvalidArgument(m)
+            | Self::ReconfigureUnusable(m) => m.clone(),
             Self::Unsupported { reason, offered } => {
                 format!("{reason} ({} alternate setting(s) offered)", offered.len())
             }
@@ -106,6 +113,7 @@ impl Error {
                 None => format!("DAC clock not verified at {requested_hz} Hz (no readback)"),
             },
             Self::DeviceLost => "the USB device was disconnected".to_string(),
+            Self::ReconfigureDrainTimeout => "drain deadline expired; original stream remains open/draining and no alternate or clock was changed".into(),
             Self::VolumeUnavailable => "the DAC has no usable hardware volume control, so a stream would play at the DAC's own level; allow fixed-level output (DacConfig::require_hardware_volume = false) to stream anyway".to_string(),
         }
     }

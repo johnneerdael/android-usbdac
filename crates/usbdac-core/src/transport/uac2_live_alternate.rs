@@ -343,6 +343,7 @@ mod tests {
 
     fn format() -> PlaybackFormat {
         PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 96_000,
             bit_depth: 24,
             channels: 2,

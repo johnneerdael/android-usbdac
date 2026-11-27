@@ -102,6 +102,8 @@ public data class OutputPolicy @JvmOverloads constructor(
     val allowConversion: Boolean = false,
     val dacConfig: DacConfig = DacConfig(),
     val aaudioConfig: AAudioConfig = AAudioConfig(),
+    /** Permit same-rate, same-channel integer widening only, with a lossless conversion plan. */
+    val allowWidening: Boolean = false,
 ) {
     init {
         require(!(force == OutputKind.DIRECT_USB && !allowDirectUsb)) {
@@ -219,6 +221,8 @@ public data class WriteFormat(
     val subslotBytes: Int,
     val validBits: Int,
     val counterRateHz: Int,
+    /** Exact source/wire encoding; unsigned8 and float32 must never be interpreted as signed PCM. */
+    val encoding: StreamEncoding = StreamEncoding.PCM,
 ) {
     /** Bytes of one frame: the unit [PcmOutput.write] takes. */
     val bytesPerFrame: Int get() = channels * subslotBytes

@@ -16,4 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "usbdac-android"
 
-include(":usbdac", ":sample")
+include(":usbdac", ":sample", ":usbdac-media3", ":media3-example")

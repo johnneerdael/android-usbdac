@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       skip_package:
-        description: Skip the Android AAR upload if GitHub Packages already has this version
+        description: Skip both Android Maven uploads if GitHub Packages already has this version
         required: false
         type: boolean
         default: false
@@ -124,7 +124,7 @@ jobs:
 
       - name: Build the AAR (all four ABIs), run the unit tests, build the sample
         working-directory: android
-        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug --console=plain
+        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :sample:assembleDebug :media3-example:assembleDebug --console=plain
 
       - name: Check that the AAR carries every ABI
         run: |
@@ -135,7 +135,7 @@ jobs:
 
       - name: Stage the Maven publication
         working-directory: android
-        run: ./gradlew :usbdac:publishReleasePublicationToStagingRepository --console=plain
+        run: ./gradlew :usbdac:publishReleasePublicationToStagingRepository :usbdac-media3:publishReleasePublicationToStagingRepository --console=plain
 
       - name: Check whether the Rust crate version is published
         id: crates
@@ -172,39 +172,47 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
         run: cargo publish --locked --package usbdac-core
 
-      - name: Check the Maven package on a release retry
+      - name: Check each Maven package before uploading
         id: maven
-        if: steps.crates.outputs.published == 'true' && !inputs.skip_package
+        if: ${{ !inputs.skip_package }}
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          base="https://maven.pkg.github.com/$GITHUB_REPOSITORY/dev/usbdac/usbdac/$VERSION/usbdac-$VERSION"
-          found=0
-          for suffix in .aar .pom .module -sources.jar; do
-            status=$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GITHUB_TOKEN" |
-              curl --config - --silent --show-error --location --retry 3 --max-time 30 \
-                --output /dev/null --write-out '%{http_code}' "$base$suffix")
-            case "$status" in
-              200) found=$((found + 1)) ;;
-              404) ;;
-              *) echo "GitHub Packages returned HTTP $status when checking $suffix"; exit 1 ;;
+          for artifact in usbdac usbdac-media3; do
+            base="https://maven.pkg.github.com/$GITHUB_REPOSITORY/dev/usbdac/$artifact/$VERSION/$artifact-$VERSION"
+            found=0
+            for suffix in .aar .pom .module -sources.jar; do
+              status=$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GITHUB_TOKEN" |
+                curl --config - --silent --show-error --location --retry 3 --max-time 30 \
+                  --output /dev/null --write-out '%{http_code}' "$base$suffix")
+              case "$status" in
+                200) found=$((found + 1)) ;;
+                404) ;;
+                *) echo "GitHub Packages returned HTTP $status for $artifact$suffix"; exit 1 ;;
+              esac
+            done
+            case "$found" in
+              0) echo "$artifact=false" >> "$GITHUB_OUTPUT" ;;
+              4) echo "$artifact=true" >> "$GITHUB_OUTPUT" ;;
+              *) echo "The Maven upload for $artifact $VERSION is incomplete; repair it before retrying"; exit 1 ;;
             esac
           done
-          case "$found" in
-            0) echo "published=false" >> "$GITHUB_OUTPUT" ;;
-            4) echo "published=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "The Maven upload for $VERSION is incomplete"; exit 1 ;;
-          esac
 
-      - name: Publish to GitHub Packages
-        if: ${{ !inputs.skip_package && steps.maven.outputs.published != 'true' }}
+      - name: Publish the core to GitHub Packages
+        if: ${{ !inputs.skip_package && steps.maven.outputs.usbdac != 'true' }}
         working-directory: android
         env:
-          # The build reads GITHUB_ACTOR and GITHUB_REPOSITORY, which Actions sets, and this token.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew :usbdac:publishReleasePublicationToGitHubPackagesRepository --console=plain
+
+      - name: Publish the Media3 integration to GitHub Packages
+        if: ${{ !inputs.skip_package && steps.maven.outputs['usbdac-media3'] != 'true' }}
+        working-directory: android
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew :usbdac-media3:publishReleasePublicationToGitHubPackagesRepository --console=plain
 
       - name: Collect the release assets
         env:
@@ -214,9 +222,11 @@ jobs:
           set -euo pipefail
           assets="$PWD/release-assets"
           mkdir -p "$assets"
-          staged="android/build/staging/dev/usbdac/usbdac/$VERSION"
-          cp "$staged/usbdac-$VERSION.aar" "$staged/usbdac-$VERSION-sources.jar" \
-             "$staged/usbdac-$VERSION.pom" "$staged/usbdac-$VERSION.module" "$assets/"
+          for artifact in usbdac usbdac-media3; do
+            staged="android/build/staging/dev/usbdac/$artifact/$VERSION"
+            cp "$staged/$artifact-$VERSION.aar" "$staged/$artifact-$VERSION-sources.jar" \
+               "$staged/$artifact-$VERSION.pom" "$staged/$artifact-$VERSION.module" "$assets/"
+          done
 
           # The native libraries on their own, one directory per ABI.
           (cd android/usbdac/src/main/jniLibs && zip -r -X "$assets/usbdac-$VERSION-jniLibs.zip" .)
@@ -245,6 +255,11 @@ jobs:
               echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library, also published to GitHub Packages as \`dev.usbdac:usbdac:$VERSION\`."
             else
               echo "- \`usbdac-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the Android library and its Maven metadata."
+            fi
+            if [ "$PUBLISHED_MAVEN" = true ]; then
+              echo "- \`usbdac-media3-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the optional Media3 integration, also published as \`dev.usbdac:usbdac-media3:$VERSION\`."
+            else
+              echo "- \`usbdac-media3-$VERSION.aar\`, \`-sources.jar\`, \`.pom\`, \`.module\`: the optional Media3 integration and Maven metadata."
             fi
             echo "- \`usbdac-$VERSION-jniLibs.zip\`: \`libusbdac.so\` for arm64-v8a, armeabi-v7a, x86_64 and x86."
             echo "- \`usbdac-core-$VERSION.crate\`: the Rust USB DAC driver, also available as [usbdac-core $VERSION on crates.io](https://crates.io/crates/usbdac-core/$VERSION)."

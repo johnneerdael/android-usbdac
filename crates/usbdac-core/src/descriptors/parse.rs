@@ -109,7 +109,9 @@ pub fn parse_as_interface_general(data: &[u8]) -> Result<AsInterfaceGeneral, Des
     AS_PARSER.parse_as_general_v2(data)
 }
 
-pub fn parse_as_general_descriptor(data: &[u8]) -> Result<AudioStreamingDescriptor, DescriptorError> {
+pub fn parse_as_general_descriptor(
+    data: &[u8],
+) -> Result<AudioStreamingDescriptor, DescriptorError> {
     AS_PARSER.parse_as_general(data)
 }
 

@@ -30,18 +30,19 @@
 //! # Ok(()) }
 //! ```
 //!
-//! v0.1 supports one open [`Dac`] per process.
+//! Distinct USB attachments have independent [`Dac`] owners and retirement tokens.
 
 #[macro_use]
 mod macros;
 
-pub mod convert;
 pub mod capture;
+pub mod convert;
 pub mod descriptors;
-pub mod routing;
 pub mod pioneer;
+pub mod routing;
 pub mod scarlett;
 
+mod async_volume;
 mod capabilities;
 mod clock_resolution;
 mod config;
@@ -49,9 +50,14 @@ mod dac;
 mod endpoint;
 mod error;
 mod events;
+pub mod fake;
 mod feedback_diagnostics;
-mod format;
 mod flush_cancel;
+mod format;
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;
+pub mod hotplug;
 mod iso_packet_scheduler;
 mod iso_packet_validation;
 mod iso_transport_loss;
@@ -69,22 +75,34 @@ mod volume_control;
 #[cfg(test)]
 mod tests;
 
+pub use async_volume::{AsyncVolumeControl, VolumeOperation};
 pub use capabilities::{
     AltFormat, AltSetting, Capabilities, DeviceInfo, EndpointUsage, LinkSpeed, Pacing, RateRange,
-    SyncKind, UacVersion,
+    ShippedSupport, SyncKind, UacVersion, SHIPPED_SUPPORT,
+};
+pub use capture::{
+    CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition,
+    DacCaptureStream,
 };
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
-pub use config::{CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume, UsbQueueProfile};
-pub use dac::Dac;
-pub use capture::{CaptureFormat, CaptureRequest, CaptureState, CaptureStats, ChannelMap, ChannelPosition, DacCaptureStream};
+pub use config::{
+    AsyncFallbackPolicy, ClockReadbackPolicy, CloseVolume, DacConfig, HandBack, QuirkOverride,
+    StartupVolume, UsbQueueProfile,
+};
+pub use dac::{Dac, StreamReconfiguration, UsbRetirement};
 pub use error::{Error, Result};
-pub use events::{DacEvent, DacListener, StreamState};
+pub use events::{CompatibilityFallbackTier, DacEvent, DacListener, StreamState};
+pub use fake::{PlaybackDevice, PlaybackStream};
 pub use feedback_diagnostics::{
-    ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket,
-    FeedbackTrace, FeedbackTraceEntry, FeedbackTraceEvent,
+    ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket, FeedbackTrace,
+    FeedbackTraceEntry, FeedbackTraceEvent,
 };
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
-pub use quirk::Quirk;
+pub use hotplug::{
+    HotplugEvent, HotplugHub, HotplugSubscription, LinuxHotplugMonitor, UsbAttachment,
+    UsbPermission,
+};
+pub use quirk::{AlsaQuirkFlag, Quirk, QuirkPolicy, SourceQuirkEntry, SOURCE_QUIRKS};
 pub use stream::{BitPerfectBlocker, DacStream, StreamStats};
 pub use volume::{
     StartupVolumeReport, VolumeControl, VolumeRange, VolumeState, DEFAULT_VOLUME_STEPS,

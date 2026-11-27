@@ -42,8 +42,13 @@ pub fn dac_open_capture_device<'l>(
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn dac_open_duplex_device<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32,
-    info: JString<'l>, config: JString<'l>) -> i64 {
+pub fn dac_open_duplex_device<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    info: JString<'l>,
+    config: JString<'l>,
+) -> i64 {
     run(&mut env, |env| {
         let info = json::parse_device_info(&string_of(env, &info)?)?;
         let config = json::parse_config(optional_string_of(env, &config)?.as_deref())?;
@@ -53,20 +58,36 @@ pub fn dac_open_duplex_device<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, 
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn duplex_open<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64,
-    format_id: i64, request: JString<'l>, capacity_frames: i32, listener: JObject<'l>) -> JString<'l> {
+pub fn duplex_open<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    format_id: i64,
+    request: JString<'l>,
+    capacity_frames: i32,
+    listener: JObject<'l>,
+) -> JString<'l> {
     run(&mut env, |env| {
         let entry = registry::dac(dac)?;
-        let format = u64::try_from(format_id).ok().and_then(|id| entry.format(id))
+        let format = u64::try_from(format_id)
+            .ok()
+            .and_then(|id| entry.format(id))
             .ok_or_else(|| Failure::Bad("format was not negotiated on this DAC".into()))?;
         let request = capture_json::parse_request(&string_of(env, &request)?)?;
-        let capacity = usize::try_from(capacity_frames).ok().filter(|n| *n != 0)
+        let capacity = usize::try_from(capacity_frames)
+            .ok()
+            .filter(|n| *n != 0)
             .ok_or_else(|| Failure::Bad("capture capacity_frames must be positive".into()))?;
         let listener = crate::listener_of(env, &listener)?
             .ok_or_else(|| Failure::Bad("the stream listener must not be null".into()))?;
-        let (playback, capture) = entry.dac.open_duplex(&format, &request, capacity, listener)?;
+        let (playback, capture) = entry
+            .dac
+            .open_duplex(&format, &request, capacity, listener)?;
         let (playback, capture) = registry::insert_duplex(&entry, playback, capture)?;
-        java_string(env, &serde_json::json!({ "playback": playback, "capture": capture }))
+        java_string(
+            env,
+            &serde_json::json!({ "playback": playback, "capture": capture }),
+        )
     })
 }
 

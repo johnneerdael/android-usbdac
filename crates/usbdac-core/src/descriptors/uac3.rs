@@ -86,9 +86,7 @@ pub fn parse_as_header(data: &[u8]) -> Result<AsHeader, DescriptorError> {
 
 /// Decode the union of an alternate's ADC3 AS valid frequency ranges (§4.7.3).
 /// An empty result means the alternate imposes no additional clock restriction.
-pub(crate) fn parse_as_frequency_ranges(
-    extra: &[u8],
-) -> Result<Vec<(u32, u32)>, DescriptorError> {
+pub(crate) fn parse_as_frequency_ranges(extra: &[u8]) -> Result<Vec<(u32, u32)>, DescriptorError> {
     let mut ranges = Vec::new();
     let mut remaining = extra;
     while !remaining.is_empty() {

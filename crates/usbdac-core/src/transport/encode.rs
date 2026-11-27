@@ -31,7 +31,9 @@ pub(super) fn audit_dsd_payload(
                 if marker != 0x05 && marker != 0xFA {
                     return false;
                 }
-                if previous == Some(marker) || frame.chunks_exact(ss).any(|word| word[ss - 1] != marker) {
+                if previous == Some(marker)
+                    || frame.chunks_exact(ss).any(|word| word[ss - 1] != marker)
+                {
                     return false;
                 }
                 previous = Some(marker);
@@ -124,6 +126,17 @@ pub(super) fn encode_i24(sample: i32) -> [u8; 3] {
 #[inline]
 pub(super) fn encode_i32_le(sample: i32) -> [u8; 4] {
     sample.to_le_bytes()
+}
+
+/// Encode exact Type I U8 from the ring's reversible centered bit representation.
+pub(super) fn encode_unsigned8_slots(input: &[i32], output: &mut [u8]) -> Result<(), String> {
+    if input.len() != output.len() {
+        return Err("unsigned8 sample/byte count mismatch".into());
+    }
+    for (sample, byte) in input.iter().zip(output) {
+        *byte = sample.to_le_bytes()[3] ^ 0x80;
+    }
+    Ok(())
 }
 
 /// Pack PCM / DoP / native DSD for the active UAC subslot.
@@ -262,7 +275,12 @@ pub(super) fn encode_usb_pcm_slots(
 /// in 23:8, low byte zero) — the same canonical word the DAP I32 path uses.
 /// Emit the top `subslot_size` bytes little-endian so the marker stays the
 /// most-significant wire byte, where the DAC scans for 0x05/0xFA.
-pub(super) fn encode_dop_slots(input: &[i32], output: &mut [u8], subslot_size: u8, _bit_resolution: u8) {
+pub(super) fn encode_dop_slots(
+    input: &[i32],
+    output: &mut [u8],
+    subslot_size: u8,
+    _bit_resolution: u8,
+) {
     let ss = subslot_size as usize;
     for (index, &sample) in input.iter().enumerate() {
         let w = sample as u32;
@@ -292,7 +310,12 @@ pub(super) fn encode_pcm_i16_le(input: &[i32], output: &mut [u8]) {
 ///
 /// When `subslot_size * 8 > bit_resolution`, the sample is shifted left
 /// so that the sign bit occupies the MSB of the container.
-pub(super) fn encode_pcm_bytes(input: &[i32], output: &mut [u8], subslot_size: u8, bit_resolution: u8) {
+pub(super) fn encode_pcm_bytes(
+    input: &[i32],
+    output: &mut [u8],
+    subslot_size: u8,
+    bit_resolution: u8,
+) {
     let subslot_bytes = usize::from(subslot_size);
     debug_assert_eq!(output.len(), input.len() * subslot_bytes);
 
@@ -313,9 +336,6 @@ pub(super) fn encode_pcm_bytes(input: &[i32], output: &mut [u8], subslot_size: u
             kept << left_shift
         };
         let bytes = padded.to_le_bytes();
-        for byte_index in 0..subslot_bytes {
-            output[offset + byte_index] = bytes[byte_index];
-        }
+        output[offset..offset + subslot_bytes].copy_from_slice(&bytes[..subslot_bytes]);
     }
 }
-

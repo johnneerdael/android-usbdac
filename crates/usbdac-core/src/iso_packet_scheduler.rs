@@ -48,12 +48,18 @@ impl IsoQueueGeometry {
     /// Keep at least two slots so an ordinary completion leaves work queued.
     pub(crate) fn for_config(service_interval_us: u32, config: &crate::DacConfig) -> Self {
         let Some(period_us) = config.transfer_period_us else {
-            return Self::for_stream(service_interval_us, config.bus_queue_ms, config.transfers_in_flight);
+            return Self::for_stream(
+                service_interval_us,
+                config.bus_queue_ms,
+                config.transfers_in_flight,
+            );
         };
         let interval = service_interval_us.max(1);
         let target_packets = (config.bus_queue_ms * 1_000 / interval).max(2) as usize;
         let period_packets = (period_us / interval).max(1) as usize;
-        let packets = period_packets.min(MAX_PACKETS_PER_TRANSFER).min(target_packets / 2);
+        let packets = period_packets
+            .min(MAX_PACKETS_PER_TRANSFER)
+            .min(target_packets / 2);
         let slots = (target_packets / packets)
             .min(config.transfers_in_flight as usize)
             .min((PACKET_FLIGHT_LIMIT - 1) / packets);
@@ -172,7 +178,9 @@ impl IsoPacketScheduler {
     }
 
     pub(crate) fn next_transfer_packet_bytes(&mut self) -> Vec<usize> {
-        if let Some(pattern) = self.packet_pattern.take() { return pattern; }
+        if let Some(pattern) = self.packet_pattern.take() {
+            return pattern;
+        }
         (0..self.packets_per_transfer)
             .map(|_| self.next_packet_bytes())
             .collect()
@@ -181,12 +189,12 @@ impl IsoPacketScheduler {
     /// Update packet timing from a device feedback report.
     ///
     /// Returns false when the report is non-finite, non-positive, or too far
-    /// from nominal to be a real DAC clock. A 2% band comfortably covers USB
-    /// clock tolerance (typically hundreds of ppm) while rejecting decode
-    /// errors and malformed feedback values that would otherwise cause a large
-    /// audio discontinuity.
+    /// from nominal to be plausible. Permit bounded FIFO recentering (7/8 to
+    /// 3/2 nominal); the transport separately enforces endpoint packet capacity.
     pub(crate) fn update_feedback_frames_per_packet(&mut self, frames_per_packet: f64) -> bool {
-        if !self.feedback_rate_is_plausible(frames_per_packet) { return false; }
+        if !self.feedback_rate_is_plausible(frames_per_packet) {
+            return false;
+        }
 
         self.feedback_frames_per_packet = Some(match self.feedback_frames_per_packet {
             Some(previous) => previous + (frames_per_packet - previous) * 0.2,
@@ -202,11 +210,7 @@ impl IsoPacketScheduler {
         }
 
         let nominal = self.nominal_frames_per_packet().max(0.001);
-        if frames_per_packet < nominal * 0.98 || frames_per_packet > nominal * 1.02 {
-            return false;
-        }
-
-        true
+        !(frames_per_packet < nominal * 0.875 || frames_per_packet > nominal * 1.5)
     }
 
     pub(crate) fn lock_to_nominal_packet_timing(&mut self) {
@@ -232,5 +236,127 @@ impl IsoPacketScheduler {
             frames
         };
         frames.saturating_mul(self.bytes_per_frame)
+    }
+}
+
+/// Change only active slot count: packet cadence and in-flight payload stay intact.
+#[derive(Debug)]
+pub(crate) struct AdaptiveQueue {
+    pub(crate) slots: usize,
+    pub(crate) max_slots: usize,
+    baseline: usize,
+    window_ms: u64,
+    losses: u32,
+    last_loss_ms: u64,
+}
+impl AdaptiveQueue {
+    pub(crate) fn new(geometry: IsoQueueGeometry, enabled: bool) -> Self {
+        let baseline = geometry.transfer_slots;
+        let max_slots = if enabled {
+            16usize
+                .min((PACKET_FLIGHT_LIMIT - 1) / geometry.packets_per_transfer)
+                .min((64_000 / geometry.transfer_us().max(1)) as usize)
+                .max(baseline)
+        } else {
+            baseline
+        };
+        Self {
+            slots: baseline,
+            max_slots,
+            baseline,
+            window_ms: 0,
+            losses: 0,
+            last_loss_ms: 0,
+        }
+    }
+    pub(crate) fn observe(&mut self, now_ms: u64, lossy: bool) -> bool {
+        let previous = self.slots;
+        if lossy {
+            if now_ms.saturating_sub(self.window_ms) > 1_000 {
+                self.losses = 0;
+                self.window_ms = now_ms;
+            }
+            self.last_loss_ms = now_ms;
+            self.losses = self.losses.saturating_add(1);
+            if self.losses >= 3 {
+                self.slots = (self.slots + 2).min(self.max_slots);
+                self.losses = 0;
+            }
+        } else if self.slots > self.baseline && now_ms.saturating_sub(self.last_loss_ms) >= 30_000 {
+            self.slots -= 1;
+            self.last_loss_ms = now_ms;
+        }
+        previous != self.slots
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+    #[test]
+    fn loss_bursts_deepen_and_quiet_periods_shrink_without_changing_packets() {
+        let g = IsoQueueGeometry::default_for(125);
+        let mut queue = AdaptiveQueue::new(g, true);
+        for at in [0, 10, 20] {
+            queue.observe(at, true);
+        }
+        assert_eq!(queue.slots, 10);
+        assert!(!queue.observe(29_999, false));
+        assert!(queue.observe(30_020, false));
+        assert_eq!(queue.slots, 9);
+        for at in 0..100 {
+            queue.observe(30_021 + at, true);
+        }
+        assert_eq!(queue.slots, 15);
+        assert!(queue.slots * g.packets_per_transfer < PACKET_FLIGHT_LIMIT);
+    }
+    #[test]
+    fn fixed_policy_and_capacity_cannot_deepen() {
+        let g = IsoQueueGeometry::default_for(125);
+        let mut queue = AdaptiveQueue::new(g, false);
+        for at in 0..100 {
+            assert!(!queue.observe(at, true));
+        }
+        assert_eq!(queue.slots, g.transfer_slots);
+    }
+}
+
+/// Host starvation observation only; a host ring cannot measure the DAC FIFO.
+#[derive(Default)]
+pub(crate) struct NominalStarvation {
+    empty_since_ms: Option<u64>,
+    reported: bool,
+}
+impl NominalStarvation {
+    pub(crate) fn observe(&mut self, now_ms: u64, buffered: usize, active: bool) -> bool {
+        if !active || buffered > 0 {
+            self.empty_since_ms = None;
+            self.reported = false;
+            return false;
+        }
+        let since = *self.empty_since_ms.get_or_insert(now_ms);
+        if !self.reported && now_ms.saturating_sub(since) >= 5_000 {
+            self.reported = true;
+            return true;
+        }
+        false
+    }
+}
+#[cfg(test)]
+mod nominal_starvation_tests {
+    use super::*;
+    #[test]
+    fn topped_up_producer_is_never_called_drift_or_starvation() {
+        let mut guard = NominalStarvation::default();
+        for ms in (0..120_000).step_by(2) {
+            assert!(!guard.observe(ms, 48_000, true));
+        }
+        assert!(!guard.observe(120_001, 0, true));
+        assert!(!guard.observe(125_000, 0, true));
+        assert!(guard.observe(125_001, 0, true));
+        assert!(!guard.observe(130_001, 0, true));
+        assert!(!guard.observe(130_002, 1, true));
+        assert!(!guard.observe(130_003, 0, true));
+        assert!(guard.observe(135_003, 0, true));
     }
 }

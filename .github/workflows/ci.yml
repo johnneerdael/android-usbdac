@@ -30,7 +30,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
           rustup target add aarch64-linux-android
 
@@ -41,8 +41,18 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
 
+      - name: Format and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify generated capability and result status
+        run: |
+          cargo run --quiet --locked -p usbdac-core --example support_manifest > target/shipped-support.json
+          python3 -I .github/scripts/generate_evidence.py --check --capabilities target/shipped-support.json
+
       - name: Test (host)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Check (aarch64-linux-android)
         # libusb is compiled from source, so the NDK's clang has to be reachable.
@@ -50,7 +60,7 @@ jobs:
           export PATH="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           export CC_aarch64_linux_android=aarch64-linux-android26-clang
           export AR_aarch64_linux_android=llvm-ar
-          cargo check --workspace --target aarch64-linux-android
+          cargo check --workspace --locked --target aarch64-linux-android
 
   guide:
     name: Guide code samples
@@ -122,7 +132,7 @@ jobs:
       # The :usbdac build runs `cargo ndk` for arm64-v8a, armeabi-v7a, x86_64 and x86.
       - name: Build the AAR, run the unit tests, build the sample
         working-directory: android
-        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug --console=plain
+        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :media3-example:assembleDebug --console=plain
 
       - name: Check that the AAR carries every ABI
         run: |
@@ -144,4 +154,63 @@ jobs:
         with:
           name: unit-test-reports
           path: android/usbdac/build/reports/tests
+          retention-days: 7
+
+  defensive-fuzz:
+    name: Defensive USB parsers (bounded fuzz and Miri)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nightly defensive tooling
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          rustup default nightly
+          cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Exercise untrusted parser and control replies (ASan)
+        run: python3 -I .github/scripts/run_defensive_fuzz.py --seconds 60 --log target/defensive-fuzz-sanitized/report.jsonl
+      - name: Check pure loss accounting and ring memory under Miri
+        run: |
+          cargo miri setup
+          cargo miri test --locked -p usbdac-core --lib iso_transport_loss
+          cargo miri test --locked -p usbdac-core --lib ring_pops_report_how_much_of_the_output_was_music
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: defensive-parser-artifacts
+          path: target/defensive-fuzz-sanitized/report.jsonl
+          retention-days: 7
+
+  qemu-usb:
+    name: QEMU UAC1 playback, reconfigure and two owners
+    # Noble ships QEMU8.2.2 whose UAC1 AC descriptors incorrectly advertise
+    # protocol0x04; Resolute ships fixed QEMU10.2.1. Keep strict driver/probe gates.
+    # https://github.com/qemu/qemu/blob/v8.2.2/hw/usb/dev-audio.c
+    # https://github.com/qemu/qemu/blob/v10.2.1/hw/usb/dev-audio.c
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install virtual USB guest prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86 musl-tools linux-libc-dev cpio libarchive-tools
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build then run the bounded virtual UAC1 acceptance
+        run: bash .github/scripts/qemu_usb_smoke.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: qemu-uac1-evidence
+          path: |
+            target/qemu-usb-smoke/acceptance.log
+            target/qemu-usb-smoke/acceptance-window.txt
+            target/qemu-usb-smoke/qemu-version.txt
+            target/qemu-usb-smoke/SHA256SUMS
           retention-days: 7

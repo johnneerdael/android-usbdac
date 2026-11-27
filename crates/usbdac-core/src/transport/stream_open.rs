@@ -10,8 +10,16 @@ pub(super) struct StreamUsbOwner {
     capture: Option<Arc<duplex::Attachment>>,
 }
 impl StreamUsbOwner {
-    fn new(claimed: ClaimedHandle, lock_requested: bool, capture: Option<Arc<duplex::Attachment>>) -> Self {
-        Self { claimed: Some(claimed), lock_requested, capture }
+    fn new(
+        claimed: ClaimedHandle,
+        lock_requested: bool,
+        capture: Option<Arc<duplex::Attachment>>,
+    ) -> Self {
+        Self {
+            claimed: Some(claimed),
+            lock_requested,
+            capture,
+        }
     }
     pub(super) fn claimed(&self) -> &ClaimedHandle {
         self.claimed.as_ref().expect("live USB stream owner")
@@ -27,6 +35,7 @@ impl Drop for StreamUsbOwner {
 
 /// What a running stream hands back to its owner.
 pub(crate) struct StreamHandle {
+    pub(crate) usb_handle_identity: usize,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) thread: Option<JoinHandle<()>>,
     pub(crate) shared: Arc<StreamShared>,
@@ -48,7 +57,12 @@ impl StreamHandle {
                     // all transfer storage until cancellation really retires.
                     return Err("USB output is still retiring cancelled transfers".into());
                 }
-                handle.join().map_err(|payload| format!("USB output thread panicked: {}", panic_payload_message(payload.as_ref())))
+                handle.join().map_err(|payload| {
+                    format!(
+                        "USB output thread panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    )
+                })
             }
             None => Ok(()),
         }
@@ -63,12 +77,18 @@ impl Drop for StreamHandle {
 
 /// Opens the stream for the format the negotiation stored: programs the clock,
 /// switches the alternate setting and starts the output thread.
-pub(crate) fn start_stream(events: EventSink, expected: &crate::StreamFormat) -> Result<StreamHandle, Error> {
+pub(crate) fn start_stream(
+    events: EventSink,
+    expected: &crate::StreamFormat,
+) -> Result<StreamHandle, Error> {
     start_stream_with_capture(events, expected, None)
 }
 
-pub(crate) fn start_stream_with_capture(events: EventSink, expected: &crate::StreamFormat,
-    capture: Option<(&crate::capture::CaptureRequest, usize)>) -> Result<StreamHandle, Error> {
+pub(crate) fn start_stream_with_capture(
+    events: EventSink,
+    expected: &crate::StreamFormat,
+    capture: Option<(&crate::capture::CaptureRequest, usize)>,
+) -> Result<StreamHandle, Error> {
     // Wait briefly for a previous stream's thread to finish its teardown: a
     // stream closed a moment ago may still be releasing the interface.
     for attempt in 0..15 {
@@ -97,8 +117,12 @@ pub(crate) fn start_stream_with_capture(events: EventSink, expected: &crate::Str
 }
 
 #[allow(unused_assignments)]
-fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard>,
-    expected: &crate::StreamFormat, capture: Option<(&crate::capture::CaptureRequest, usize)>) -> Result<StreamHandle, Error> {
+fn start_stream_inner_with_capture(
+    events: EventSink,
+    session: &Arc<SessionGuard>,
+    expected: &crate::StreamFormat,
+    capture: Option<(&crate::capture::CaptureRequest, usize)>,
+) -> Result<StreamHandle, Error> {
     let config = settings().config.clone();
     let (state, mut playback_format) = {
         let guard = SESSION_STATE.lock();
@@ -121,32 +145,39 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_engine_state(EngineState::Error, Some(error.clone()));
         Error::Claim(error)
     })?;
+    let usb_handle_identity = claimed_handle.handle.as_raw() as usize;
     let mut requested_playback_format = state.requested_playback_format.unwrap_or(playback_format);
     let device = claimed_handle.handle.device();
     let speed = resolve_device_speed(&device);
     let lock_requested = current_lock_requested_for_fd(state.device.fd);
     set_capability_model(
-        build_usb_capability_model(&device, &claimed_handle.handle, speed, &claimed_handle.claimed_interfaces).ok(),
+        build_usb_capability_model(
+            &device,
+            &claimed_handle.handle,
+            speed,
+            &claimed_handle.claimed_interfaces,
+        )
+        .ok(),
     );
-    let candidate =
-        match select_owned_stream_candidate(&claimed_handle, playback_format, speed) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                set_last_error(Some(error.message().to_string()));
-                set_direct_mode_refusal_reason(Some(error.message().to_string()));
-                set_engine_state(
-                    EngineState::Error,
-                    Some(error.message().to_string()),
-                );
-                cleanup_claimed_handle(claimed_handle, None, lock_requested);
-                return Err(error.into_error(offered_alt_settings()));
-            }
-        };
+    let candidate = match select_owned_stream_candidate(&claimed_handle, playback_format, speed) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            set_last_error(Some(error.message().to_string()));
+            set_direct_mode_refusal_reason(Some(error.message().to_string()));
+            set_engine_state(EngineState::Error, Some(error.message().to_string()));
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(error.into_error(offered_alt_settings()));
+        }
+    };
     let vendor_profile = match vendor_pcm::for_candidate(&claimed_handle.handle, &candidate) {
         Ok(profile) => profile,
-        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
+        Err(error) => {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::Transfer(error));
+        }
     };
-    let channel_map = match playback_map::for_candidate(&device, &claimed_handle.handle, &candidate) {
+    let channel_map = match playback_map::for_candidate(&device, &claimed_handle.handle, &candidate)
+    {
         Ok(map) => map,
         Err(error) => {
             cleanup_claimed_handle(claimed_handle, None, lock_requested);
@@ -154,34 +185,54 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         }
     };
     let selected_pacing = if let Some(source) = candidate.implicit_feedback {
-        crate::capabilities::Pacing::ImplicitFeedback { interface_number: source.interface_number,
-            alt_setting: source.alt_setting, endpoint: source.address }
-    } else if candidate.feedback_endpoint.is_some() {
-        crate::capabilities::Pacing::ExplicitFeedback { endpoint: candidate.feedback_endpoint.unwrap().address }
+        crate::capabilities::Pacing::ImplicitFeedback {
+            interface_number: source.interface_number,
+            alt_setting: source.alt_setting,
+            endpoint: source.address,
+        }
+    } else if let Some(feedback) = candidate.feedback_endpoint {
+        crate::capabilities::Pacing::ExplicitFeedback {
+            endpoint: feedback.address,
+        }
     } else if candidate.sync_type == SyncType::Asynchronous {
         crate::capabilities::Pacing::Unsynchronized
-    } else { expected.pacing };
+    } else {
+        expected.pacing
+    };
     let selected_rate = native_wire_rate(playback_format, candidate.subslot_size);
-    if expected.interface_number != candidate.interface_number || expected.alt_setting != candidate.alt_setting
-        || expected.endpoint_address != candidate.endpoint_address || expected.pacing != selected_pacing
-        || Some(expected.sample_rate) != selected_rate || expected.subslot_bytes != candidate.subslot_size
-        || expected.channels != candidate.channels || expected.channel_map != channel_map
+    if expected.interface_number != candidate.interface_number
+        || expected.alt_setting != candidate.alt_setting
+        || expected.endpoint_address != candidate.endpoint_address
+        || expected.pacing != selected_pacing
+        || Some(expected.sample_rate) != selected_rate
+        || expected.subslot_bytes != candidate.subslot_size
+        || expected.channels != candidate.channels
+        || expected.channel_map != channel_map
         || expected.service_interval_us != candidate.service_interval_us
-        || expected.native_dsd_signature != (if playback_format.dsd_transport == DsdTransportMode::Native {
-            candidate.native_dsd.map(|p| p.signature())
-        } else { None }) {
+        || expected.native_dsd_signature
+            != (if playback_format.dsd_transport == DsdTransportMode::Native {
+                candidate.native_dsd.map(|p| p.signature())
+            } else {
+                None
+            })
+    {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
-        return Err(Error::InvalidState("USB stream candidate changed since negotiation; negotiate again".into()));
+        return Err(Error::InvalidState(
+            "USB stream candidate changed since negotiation; negotiate again".into(),
+        ));
     }
     if playback_format.dsd_transport == DsdTransportMode::Native {
         // Native DSD clock frames contain subslot_size bytes per channel.
         // The producer still supplies interleaved byte-rate samples.
-        let standard_adc3 = candidate.native_dsd.is_some_and(|profile|
+        let standard_adc3 = candidate.native_dsd.is_some_and(|profile| {
             profile.origin == native_dsd::NativeDsdOrigin::StandardAdc3
-                && profile.word_bytes == 8 && candidate.subslot_size == 8
-                && candidate.bit_resolution == 64);
+                && profile.word_bytes == 8
+                && candidate.subslot_size == 8
+                && candidate.bit_resolution == 64
+        });
         if (!matches!(candidate.subslot_size, 1 | 2 | 4) && !standard_adc3)
-            || selected_rate.is_none() {
+            || selected_rate.is_none()
+        {
             let error = "USB native DSD refused: invalid subslot or source bit rate".to_string();
             set_last_error(Some(error.clone()));
             set_direct_mode_refusal_reason(Some(error.clone()));
@@ -199,19 +250,35 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             current.requested_playback_format = Some(requested_playback_format);
         }
     }
-    let adc3_route = match if vendor_profile.is_some() || candidate.is_uac1 { Ok(None) } else { adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate) } {
+    let adc3_route = match if vendor_profile.is_some() || candidate.is_uac1 {
+        Ok(None)
+    } else {
+        adc3_route_for_candidate(&device, &claimed_handle.handle, &candidate)
+    } {
         Ok(route) => route,
-        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::Transfer(error)); }
+        Err(error) => {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::Transfer(error));
+        }
     };
     if let Some(route) = adc3_route.as_ref() {
         if let Err(error) = verify_adc3_route(route) {
-            cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(Error::InvalidState(error));
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(Error::InvalidState(error));
         }
     }
-    let clock_choice = if vendor_profile.is_some() || candidate.is_uac1 { None } else if let Some(route) = adc3_route.as_ref() {
-        route.choice.clone().map(|choice| (AudioControlClock {
-            interface_number: choice.control_interface, clock_id: choice.source_id,
-        }, choice))
+    let clock_choice = if vendor_profile.is_some() || candidate.is_uac1 {
+        None
+    } else if let Some(route) = adc3_route.as_ref() {
+        route.choice.clone().map(|choice| {
+            (
+                AudioControlClock {
+                    interface_number: choice.control_interface,
+                    clock_id: choice.source_id,
+                },
+                choice,
+            )
+        })
     } else {
         match candidate_audio_control_clock_choice(&device, &claimed_handle.handle, &candidate) {
             Ok(choice) => choice,
@@ -223,45 +290,74 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     };
     if clock_choice.as_ref().map(|(_, choice)| choice) != expected.clock.as_ref() {
         cleanup_claimed_handle(claimed_handle, None, lock_requested);
-        return Err(Error::InvalidState("clock route changed since negotiation".into()));
+        return Err(Error::InvalidState(
+            "clock route changed since negotiation".into(),
+        ));
     }
     // Select and validate the complete pair while all streaming alternates are idle.
-    let mut attachment = match capture.map(|(request, capacity)|
-        duplex::prepare(&claimed_handle, &candidate, expected, request, capacity)).transpose() {
+    let mut attachment = match capture
+        .map(|(request, capacity)| {
+            duplex::prepare(&claimed_handle, &candidate, expected, request, capacity)
+        })
+        .transpose()
+    {
         Ok(value) => value,
-        Err(error) => { cleanup_claimed_handle(claimed_handle, None, lock_requested); return Err(error); }
+        Err(error) => {
+            cleanup_claimed_handle(claimed_handle, None, lock_requested);
+            return Err(error);
+        }
     };
     if let Some(route) = adc3_route.as_ref() {
-        if let Err(error) = apply_adc3_clock_plan(&claimed_handle, route, playback_format.sample_rate) {
+        if let Err(error) =
+            apply_adc3_clock_plan(&claimed_handle, route, playback_format.sample_rate)
+        {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
             return Err(Error::Transfer(error));
         }
     }
     // ADC3 must never enter the generic UAC2 frequency programming branch.
-    let uac2_choice = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(_, choice)| choice) };
+    let uac2_choice = if adc3_route.is_some() {
+        None
+    } else {
+        clock_choice.as_ref().map(|(_, choice)| choice)
+    };
     let multiplied_clock = uac2_choice_has_multiplier(uac2_choice);
     if let Err(error) = uac2_clock_ratio(uac2_choice) {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(error));
     }
-    let clock = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(clock, _)| *clock) };
+    let clock = if adc3_route.is_some() {
+        None
+    } else {
+        clock_choice.as_ref().map(|(clock, _)| *clock)
+    };
     let clock_detection_msg = if let Some(profile) = vendor_profile.as_ref() {
-        format!("vendor PCM model-backed {}Hz (programmable={}); live implicit lock required", playback_format.sample_rate, profile.rate_control)
-    } else { match (adc3_route.as_ref(), &clock) {
-        (Some(route), _) => match route.choice.as_ref() {
-            Some(choice) => format!("ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
-                choice.control_interface, choice.source_id, candidate.terminal_link),
-            None => "ADC3 BADD fixed 48000Hz clock".to_string(),
-        },
-        (None, Some(c)) => format!(
-            "Clock found: interface={}, clockId={}, via_terminal_link={:?}",
-            c.interface_number, c.clock_id, candidate.terminal_link,
-        ),
-        (None, None) => "Clock NOT FOUND: no UAC2 clock entity in any AudioControl descriptor".to_string(),
-    } };
+        format!(
+            "vendor PCM model-backed {}Hz (programmable={}); live implicit lock required",
+            playback_format.sample_rate, profile.rate_control
+        )
+    } else {
+        match (adc3_route.as_ref(), &clock) {
+            (Some(route), _) => match route.choice.as_ref() {
+                Some(choice) => format!(
+                    "ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
+                    choice.control_interface, choice.source_id, candidate.terminal_link
+                ),
+                None => "ADC3 BADD fixed 48000Hz clock".to_string(),
+            },
+            (None, Some(c)) => format!(
+                "Clock found: interface={}, clockId={}, via_terminal_link={:?}",
+                c.interface_number, c.clock_id, candidate.terminal_link,
+            ),
+            (None, None) => {
+                "Clock NOT FOUND: no UAC2 clock entity in any AudioControl descriptor".to_string()
+            }
+        }
+    };
     dev_eprintln!(
         "[USB] Clock entity for '{}': {}",
-        state.device.product_name, clock_detection_msg
+        state.device.product_name,
+        clock_detection_msg
     );
 
     set_last_error(Some(format!("[clock-diag] {}", clock_detection_msg)));
@@ -274,7 +370,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         // The source-proven vendor interface has no class volume contract.
         // Fixed output remains an explicit host opt-in through the normal guard.
         install_volume_control(None);
-        set_hardware_volume_error(Some("vendor PCM has fixed output without a proven hardware volume control".into()));
+        set_hardware_volume_error(Some(
+            "vendor PCM has fixed output without a proven hardware volume control".into(),
+        ));
     } else {
         refresh_stream_volume_control(
             &state.device,
@@ -282,7 +380,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             candidate.terminal_link,
             candidate.interface_number,
             candidate.channels,
-            adc3_route.as_ref().map(|route| route.control).or_else(|| clock.map(|clock| clock.interface_number)),
+            adc3_route
+                .as_ref()
+                .map(|route| route.control)
+                .or_else(|| clock.map(|clock| clock.interface_number)),
         );
     }
     // The stream's own terminal may have no volume control, or one the start-up
@@ -294,13 +395,20 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(error);
     }
-    set_clock_status((candidate.is_uac1 || clock.is_some() || adc3_route.as_ref().and_then(|route| route.choice.as_ref()).is_some())
+    set_clock_status(
+        (candidate.is_uac1
+            || clock.is_some()
+            || adc3_route
+                .as_ref()
+                .and_then(|route| route.choice.as_ref())
+                .is_some())
         .then(|| ClockStatus {
-        reported_sample_rate: state
-            .clock_status
-            .as_ref()
-            .and_then(|status| status.reported_sample_rate),
-    }));
+            reported_sample_rate: state
+                .clock_status
+                .as_ref()
+                .and_then(|status| status.reported_sample_rate),
+        }),
+    );
     set_clock_verification(
         state.clock_control_attempted,
         state.clock_control_succeeded,
@@ -361,16 +469,26 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         return Err(Error::Claim(error));
     }
 
-    if let Some(source) = candidate.implicit_feedback.filter(|source| source.interface_number != candidate.interface_number) {
-        if !claimed_handle.claimed_interfaces.contains(&source.interface_number) {
+    if let Some(source) = candidate
+        .implicit_feedback
+        .filter(|source| source.interface_number != candidate.interface_number)
+    {
+        if !claimed_handle
+            .claimed_interfaces
+            .contains(&source.interface_number)
+        {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
-            return Err(Error::Claim("implicit source interface was not claimed".into()));
+            return Err(Error::Claim(
+                "implicit source interface was not claimed".into(),
+            ));
         }
         if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Claim(error));
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Claim(error));
         }
         if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, 0) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Transfer(error));
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Transfer(error));
         }
     }
     if let Err(error) = claimed_handle.set_alternate_setting(candidate.interface_number, 0) {
@@ -385,16 +503,42 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         return Err(Error::Transfer(message));
     }
     thread::sleep(Duration::from_millis(50));
-    if let Err(error) = if vendor_profile.is_some() { Ok(()) } else { apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport) } {
+    if let Err(error) = if vendor_profile.is_some() {
+        Ok(())
+    } else {
+        apply_itf_mode(&claimed_handle, &candidate, playback_format.dsd_transport)
+    } {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(error));
     }
-    if let Err(error) = if vendor_profile.is_some() || candidate.is_uac1 { Ok(()) } else { verify_requested_clock_route(&claimed_handle, playback_format.sample_rate) } {
+    if let Err(error) = if vendor_profile.is_some() || candidate.is_uac1 {
+        Ok(())
+    } else {
+        verify_requested_clock_route(&claimed_handle, playback_format.sample_rate)
+    } {
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::InvalidState(error));
     }
 
     let mut clock_control_attempted = state.clock_control_attempted;
+    if settings().has(crate::Quirk::SetInterfaceFirst)
+        && candidate.implicit_feedback.is_none()
+        && playback_format.dsd_transport == DsdTransportMode::None
+    {
+        if let Err(error) =
+            claimed_handle.set_alternate_setting(candidate.interface_number, candidate.alt_setting)
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
+            return Err(Error::Transfer(format!(
+                "interface-first activation failed: {error}"
+            )));
+        }
+    }
     let mut clock_control_succeeded = state.clock_control_succeeded;
     let mut clock_verification_passed = state.clock_verification_passed;
     let mut reported_sample_rate = state
@@ -407,7 +551,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             set_last_error(Some(error.clone()));
             set_direct_mode_refusal_reason(Some(error.clone()));
             set_engine_state(EngineState::Error, Some(error.clone()));
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(Error::Claim(error));
         }
         match state.dac_mode {
@@ -424,7 +573,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     clock_settle_delay_ms,
                 );
                 clock_control_attempted = true;
-                clock_control_succeeded = clock_outcome.clock_ok;
+                clock_control_succeeded = clock_outcome.set_cur_succeeded || clock_outcome.clock_ok;
                 reported_sample_rate = clock_outcome.reported_sample_rate;
                 clock_verification_passed = clock_outcome.rate_verified
                     && clock_outcome.reported_sample_rate == Some(playback_format.sample_rate);
@@ -474,34 +623,16 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     reported_sample_rate.unwrap_or(0),
                     clock_verification_passed,
                 );
-
-                if clock_outcome.set_cur_succeeded
-                    && !multiplied_clock
-                    && !clock_verification_passed
-                    && !clock_outcome.known_mismatch
-                {
-                    clock_verification_passed = true;
-                    reported_sample_rate = Some(playback_format.sample_rate);
-                    set_clock_verification(
-                        clock_control_attempted,
-                        true,
-                        true,
-                        reported_sample_rate,
-                    );
-                    dev_eprintln!(
-                        "[USB] SET_CUR accepted {}Hz on clock {} but readback unavailable (write-only clock); trusting SET_CUR",
-                        playback_format.sample_rate, clock.clock_id,
-                    );
-                }
             }
             DacMode::FixedClock | DacMode::AdaptiveStreaming => {
-                reported_sample_rate = get_wire_frequency(
-                    &claimed_handle.handle,
-                    clock,
-                    uac2_choice,
-                )
-                .ok()
-                .or(if multiplied_clock { None } else { reported_sample_rate });
+                reported_sample_rate =
+                    get_wire_frequency(&claimed_handle.handle, clock, uac2_choice)
+                        .ok()
+                        .or(if multiplied_clock {
+                            None
+                        } else {
+                            reported_sample_rate
+                        });
 
                 if let Some(actual_rate) = reported_sample_rate {
                     if actual_rate != playback_format.sample_rate {
@@ -525,12 +656,14 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                     } else {
                         clock_verification_passed = true;
                     }
-                } else if let Ok(ranges) = get_wire_frequency_ranges(
-                    &claimed_handle.handle,
-                    clock,
-                    uac2_choice,
-                ) {
-                    if !multiplied_clock && sampling_frequency_ranges_support_rate(&ranges, playback_format.sample_rate)
+                } else if let Ok(ranges) =
+                    get_wire_frequency_ranges(&claimed_handle.handle, clock, uac2_choice)
+                {
+                    if !multiplied_clock
+                        && sampling_frequency_ranges_support_rate(
+                            &ranges,
+                            playback_format.sample_rate,
+                        )
                     {
                         reported_sample_rate = Some(playback_format.sample_rate);
                         clock_verification_passed = true;
@@ -576,8 +709,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             }
         }
     } else if let Some(route) = adc3_route.as_ref() {
-        if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(Error::Transfer(error));
+        if let Err(error) =
+            configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate)
+        {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(Error::Transfer(error));
         }
         clock_control_attempted = true;
         clock_control_succeeded = true;
@@ -590,8 +726,17 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         clock_verification_passed = !profile.rate_control
             && playback_format.dsd_transport == DsdTransportMode::None
             && profile.supports_rate(playback_format.sample_rate);
-        reported_sample_rate = if profile.rate_control { None } else { Some(playback_format.sample_rate) };
-        set_clock_verification(false, false, clock_verification_passed, reported_sample_rate);
+        reported_sample_rate = if profile.rate_control {
+            None
+        } else {
+            Some(playback_format.sample_rate)
+        };
+        set_clock_verification(
+            false,
+            false,
+            clock_verification_passed,
+            reported_sample_rate,
+        );
     } else if candidate.is_uac1 {
         // No live endpoint rate evidence survives SET_INTERFACE. Populate it
         // only after the playback alternate has been activated below.
@@ -617,13 +762,24 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(message));
     }
 
-    if let Some(capture) = attachment.as_mut().filter(|_| vendor_profile.is_none() && !candidate.is_uac1) {
-        if let Err(error) = duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
+    if let Some(capture) = attachment
+        .as_mut()
+        .filter(|_| vendor_profile.is_none() && !candidate.is_uac1)
+    {
+        if let Err(error) =
+            duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected)
+        {
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
+            return Err(error);
         }
     }
     if let Some(route) = adc3_route.as_ref() {
-        if let Err(error) = verify_adc3_implicit_activation(&claimed_handle, &candidate, route, playback_format.sample_rate) {
+        if let Err(error) = verify_adc3_implicit_activation(
+            &claimed_handle,
+            &candidate,
+            route,
+            playback_format.sample_rate,
+        ) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
             return Err(Error::Transfer(error));
         }
@@ -631,21 +787,50 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     if let Some(source) = candidate.implicit_feedback {
         if source.interface_number != candidate.interface_number {
             if let Err(error) = claimed_handle.ensure_interface_claimed(source.interface_number) {
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                duplex::cleanup_claimed(
+                    claimed_handle,
+                    attachment.as_ref(),
+                    Some(candidate.interface_number),
+                    lock_requested,
+                );
                 return Err(Error::Claim(error));
             }
-            if let Err(error) = claimed_handle.set_alternate_setting(source.interface_number, source.alt_setting) {
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
-                return Err(Error::Transfer(format!("implicit feedback alternate activation failed: {}", error)));
+            if let Err(error) =
+                claimed_handle.set_alternate_setting(source.interface_number, source.alt_setting)
+            {
+                duplex::cleanup_claimed(
+                    claimed_handle,
+                    attachment.as_ref(),
+                    Some(candidate.interface_number),
+                    lock_requested,
+                );
+                return Err(Error::Transfer(format!(
+                    "implicit feedback alternate activation failed: {}",
+                    error
+                )));
             }
         } else if source.alt_setting != candidate.alt_setting {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
-            return Err(Error::Transfer("implicit source alternate conflicts with playback".into()));
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
+            return Err(Error::Transfer(
+                "implicit source alternate conflicts with playback".into(),
+            ));
         }
     }
     if vendor_profile.is_some() {
-        if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
-            .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed before activation".into()) }) {
+        if let Err(error) =
+            vendor_pcm::for_candidate(&claimed_handle.handle, &candidate).and_then(|profile| {
+                if profile == vendor_profile {
+                    Ok(())
+                } else {
+                    Err("vendor PCM signature changed before activation".into())
+                }
+            })
+        {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
             return Err(Error::Transfer(error));
         }
@@ -663,19 +848,42 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
     }
-    if let Some(capture) = attachment.as_ref().filter(|capture| capture.shared_implicit && !candidate.is_uac1
-        && capture.endpoint.vendor_pcm.is_none() && capture.endpoint.adc3_route.is_none()) {
+    if let Some(capture) = attachment.as_ref().filter(|capture| {
+        capture.shared_implicit
+            && !candidate.is_uac1
+            && capture.endpoint.vendor_pcm.is_none()
+            && capture.endpoint.adc3_route.is_none()
+    }) {
         // Playback activated the shared IN source. Reprove its pinned capture
         // contract after both SET_INTERFACE operations, before publishing it.
-        if let Err(error) = capture_stream::verify_standard_capture(&claimed_handle, &capture.endpoint) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+        if let Err(error) =
+            capture_stream::verify_standard_capture(&claimed_handle, &capture.endpoint)
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
     }
     if vendor_profile.is_some() && attachment.is_none() {
-        if let Err(error) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
-            .and_then(|profile| if profile == vendor_profile { Ok(()) } else { Err("vendor PCM signature changed after activation".into()) }) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+        if let Err(error) =
+            vendor_pcm::for_candidate(&claimed_handle.handle, &candidate).and_then(|profile| {
+                if profile == vendor_profile {
+                    Ok(())
+                } else {
+                    Err("vendor PCM signature changed after activation".into())
+                }
+            })
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(Error::Transfer(error));
         }
     }
@@ -684,27 +892,52 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             if let Some(capture) = attachment.as_mut() {
                 duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected)?;
             } else {
-                capture_stream::verify_vendor_interface_alternate(&claimed_handle, profile.interface_number, profile.alt_setting)?;
+                capture_stream::verify_vendor_interface_alternate(
+                    &claimed_handle,
+                    profile.interface_number,
+                    profile.alt_setting,
+                )?;
                 if profile.input_interface_number != profile.interface_number {
-                    capture_stream::verify_vendor_interface_alternate(&claimed_handle, profile.input_interface_number, profile.input_alt_setting)?;
+                    capture_stream::verify_vendor_interface_alternate(
+                        &claimed_handle,
+                        profile.input_interface_number,
+                        profile.input_alt_setting,
+                    )?;
                 }
             }
             Ok(())
         })();
         if let Err(error) = verification {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
     }
     // Program only after both the exact profile and active streaming
     // alternates are proven. The helper independently reproves the endpoint
     // request contract; a successful write still requires USB cadence proof.
-    let programmed_vendor_rate = vendor_profile.as_ref().is_some_and(|profile| profile.rate_control);
-    if let Some(profile) = vendor_profile.as_ref().filter(|profile| profile.rate_control) {
+    let programmed_vendor_rate = vendor_profile
+        .as_ref()
+        .is_some_and(|profile| profile.rate_control);
+    if let Some(profile) = vendor_profile
+        .as_ref()
+        .filter(|profile| profile.rate_control)
+    {
         clock_control_attempted = true;
-        if let Err(error) = vendor_pcm::program_rate(&claimed_handle, profile, playback_format.sample_rate) {
+        if let Err(error) =
+            vendor_pcm::program_rate(&claimed_handle, profile, playback_format.sample_rate)
+        {
             set_clock_verification(true, false, false, None);
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
         clock_control_succeeded = true;
@@ -717,23 +950,47 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     let mut adc3_status_clock_proven = false;
     let mut uac1_status_rate = None;
     if let Some(route) = adc3_route.as_ref() {
-        if let Err(error) = configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate) {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+        if let Err(error) =
+            configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate)
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(Error::Transfer(error));
         }
         // Both OUT and any embedded implicit IN alternate are active now.
         // Prove their advertised live PCM format before publishing the stream.
-        if let Err(error) = adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control() {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+        if let Err(error) =
+            adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control()
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
         adc3_status_clock_proven = route.clock.is_some();
     }
-    if let Some(route) = attachment.as_ref().filter(|capture| !capture.shared_implicit)
-        .and_then(|capture| capture.endpoint.adc3_route.as_ref()) {
+    if let Some(route) = attachment
+        .as_ref()
+        .filter(|capture| !capture.shared_implicit)
+        .and_then(|capture| capture.endpoint.adc3_route.as_ref())
+    {
         // Final OUT activation/programming can affect independently activated IN.
-        if let Err(error) = adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control() {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+        if let Err(error) =
+            adc3::verify_adc3_active_formats(&claimed_handle.handle, route).or_control()
+        {
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
     }
@@ -742,12 +999,44 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // endpoint even when SET stalls: an exact positive CUR also proves a
     // read-only clock. Explicitly absent controls use only descriptor evidence.
     if candidate.is_uac1 {
-        let profile = match uac1_playback_rate_profile(&claimed_handle, &candidate, playback_format.sample_rate) {
+        let profile = match uac1_playback_rate_profile(
+            &claimed_handle,
+            &candidate,
+            playback_format.sample_rate,
+        ) {
             Ok(profile) => profile,
             Err(error) => {
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
-                return Err(if crate::error::is_device_gone(&error) { Error::DeviceLost } else { Error::Control(error) });
+                duplex::cleanup_claimed(
+                    claimed_handle,
+                    attachment.as_ref(),
+                    Some(candidate.interface_number),
+                    lock_requested,
+                );
+                return Err(if crate::error::is_device_gone(&error) {
+                    Error::DeviceLost
+                } else {
+                    Error::Control(error)
+                });
             }
+        };
+        let fixed_readback = if settings().has(crate::Quirk::FixedRate) && profile.fixed_at_request
+        {
+            get_uac1_sampling_frequency(
+                &claimed_handle.handle,
+                candidate.interface_number,
+                candidate.endpoint_address,
+            )
+            .ok()
+            .filter(|rate| {
+                fixed_rate_live_proof(
+                    playback_format.sample_rate,
+                    Some(*rate),
+                    profile.fixed_at_request,
+                    true,
+                )
+            })
+        } else {
+            None
         };
         if let Some(capture) = attachment.as_ref() {
             match capture.configure_uac1(&claimed_handle, &candidate, expected) {
@@ -758,33 +1047,61 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 }
                 Err(error) => {
                     set_clock_verification(false, false, false, None);
-                    duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                    duplex::cleanup_claimed(
+                        claimed_handle,
+                        attachment.as_ref(),
+                        Some(candidate.interface_number),
+                        lock_requested,
+                    );
                     return Err(error);
                 }
             }
+        } else if let Some(rate) = fixed_readback {
+            clock_control_attempted = false;
+            clock_control_succeeded = false;
+            reported_sample_rate = Some(rate);
         } else if profile.sampling_control != Some(false) {
             clock_control_attempted = true;
             let set_result = set_uac1_sampling_frequency(
-                &claimed_handle.handle, candidate.interface_number,
-                candidate.endpoint_address, playback_format.sample_rate,
+                &claimed_handle.handle,
+                candidate.interface_number,
+                candidate.endpoint_address,
+                playback_format.sample_rate,
             );
             clock_control_succeeded = set_result.is_ok();
             if let Err(error) = set_result {
                 if crate::error::is_device_gone(&error) {
                     set_clock_verification(true, false, false, None);
-                    duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                    duplex::cleanup_claimed(
+                        claimed_handle,
+                        attachment.as_ref(),
+                        Some(candidate.interface_number),
+                        lock_requested,
+                    );
                     return Err(Error::DeviceLost);
                 }
                 dev_eprintln!("[clock-diag] UAC1 post-alt SET_CUR failed: {}", error);
             }
             match get_uac1_sampling_frequency(
-                &claimed_handle.handle, candidate.interface_number, candidate.endpoint_address,
+                &claimed_handle.handle,
+                candidate.interface_number,
+                candidate.endpoint_address,
             ) {
                 Ok(rate) => reported_sample_rate = (rate > 0).then_some(rate),
                 Err(error) => {
                     if crate::error::is_device_gone(&error) {
-                        set_clock_verification(clock_control_attempted, clock_control_succeeded, false, None);
-                        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                        set_clock_verification(
+                            clock_control_attempted,
+                            clock_control_succeeded,
+                            false,
+                            None,
+                        );
+                        duplex::cleanup_claimed(
+                            claimed_handle,
+                            attachment.as_ref(),
+                            Some(candidate.interface_number),
+                            lock_requested,
+                        );
                         return Err(Error::DeviceLost);
                     }
                     dev_eprintln!("[clock-diag] UAC1 post-alt GET_CUR unavailable: {}", error);
@@ -792,21 +1109,33 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 }
             }
         }
-        set_dac_mode(if profile.host_paced_at_request { DacMode::AdaptiveStreaming } else { DacMode::FixedClock });
+        set_dac_mode(if profile.host_paced_at_request {
+            DacMode::AdaptiveStreaming
+        } else {
+            DacMode::FixedClock
+        });
         clock_verification_passed = uac1_playback_rate_verified(
-            playback_format.sample_rate, reported_sample_rate, profile,
+            playback_format.sample_rate,
+            reported_sample_rate,
+            profile,
             playback_format.dsd_transport == DsdTransportMode::None,
         );
         // Tag only this activation's exact readback from an explicitly
         // controllable endpoint. Descriptor and host-paced admission never
         // authorize a later sampling-frequency CUR claim.
-        if profile.sampling_control == Some(true) && clock_verification_passed
+        if profile.sampling_control == Some(true)
+            && clock_verification_passed
             && playback_format.sample_rate > 0
-            && reported_sample_rate == Some(playback_format.sample_rate) {
+            && reported_sample_rate == Some(playback_format.sample_rate)
+        {
             uac1_status_rate = Some(playback_format.sample_rate);
         }
-        set_clock_verification(clock_control_attempted, clock_control_succeeded,
-            clock_verification_passed, reported_sample_rate);
+        set_clock_verification(
+            clock_control_attempted,
+            clock_control_succeeded,
+            clock_verification_passed,
+            reported_sample_rate,
+        );
         let message = format!(
             "[clock-diag] UAC1 post-alt endpoint=0x{:02x}: requested={}Hz reported={:?}Hz attempted={} succeeded={} verified={}",
             candidate.endpoint_address, playback_format.sample_rate, reported_sample_rate,
@@ -827,7 +1156,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
         set_engine_state(EngineState::Error, Some(refusal.clone()));
-        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
+        duplex::cleanup_claimed(
+            claimed_handle,
+            attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -842,7 +1173,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
         set_engine_state(EngineState::Error, Some(refusal.clone()));
-        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
+        duplex::cleanup_claimed(
+            claimed_handle,
+            attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -853,11 +1186,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
 
     if candidate.endpoint_address == 0 {
-        let refusal =
-            "USB direct refused: no valid isochronous OUT endpoint found".to_string();
+        let refusal = "USB direct refused: no valid isochronous OUT endpoint found".to_string();
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
-        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
+        duplex::cleanup_claimed(
+            claimed_handle,
+            attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -875,20 +1209,21 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     let mut post_alt_readback_hz = None;
     if let Some(clock) = clock {
         let skip_clock_validation = settings().skip_clock_validation();
-        if skip_clock_validation && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
+        if skip_clock_validation
+            && !multiplied_clock
+            && playback_format.dsd_transport == DsdTransportMode::None
+        {
             dev_eprintln!(
                 "[USB] Skipping post-alt GET_CUR re-verification (SkipClockValidation quirk)",
             );
         } else {
-            match get_wire_frequency(
-                &claimed_handle.handle,
-                clock,
-                uac2_choice,
-            ) {
+            match get_wire_frequency(&claimed_handle.handle, clock, uac2_choice) {
                 Ok(post_alt_rate) => {
                     dev_eprintln!(
                         "[USB] GET_CUR (post-alt): clock {} reports {}Hz (expected {}Hz)",
-                        clock.clock_id, post_alt_rate, playback_format.sample_rate,
+                        clock.clock_id,
+                        post_alt_rate,
+                        playback_format.sample_rate,
                     );
                     if multiplied_clock {
                         // The route plan owns root programming. A changed source or
@@ -900,8 +1235,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                             // route and converts the live source CUR to wire Hz.
                             post_alt_readback_hz = Some(post_alt_rate);
                         }
-                        set_clock_verification(clock_control_attempted, clock_control_succeeded,
-                            clock_verification_passed, reported_sample_rate);
+                        set_clock_verification(
+                            clock_control_attempted,
+                            clock_control_succeeded,
+                            clock_verification_passed,
+                            reported_sample_rate,
+                        );
                     } else if post_alt_rate != playback_format.sample_rate {
                         dev_eprintln!(
                             "[USB] DAC clock drifted after alt-setting change ({} -> {}Hz); re-issuing SET_CUR",
@@ -915,7 +1254,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                             clock_settle_delay_ms,
                         );
                         clock_control_attempted = true;
-                        clock_control_succeeded = retry.clock_ok;
+                        clock_control_succeeded = retry.set_cur_succeeded || retry.clock_ok;
                         reported_sample_rate = retry.reported_sample_rate;
                         clock_verification_passed = retry.rate_verified
                             && retry.reported_sample_rate == Some(playback_format.sample_rate);
@@ -934,44 +1273,35 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                             clock_verification_passed,
                             retry.reported_sample_rate.unwrap_or(0),
                         );
-
-                        if retry.set_cur_succeeded
-                            && !multiplied_clock
-                            && playback_format.dsd_transport == DsdTransportMode::None
-                            && !clock_verification_passed
-                            && !retry.known_mismatch
-                        {
-                            clock_verification_passed = true;
-                            reported_sample_rate = Some(playback_format.sample_rate);
-                            set_clock_verification(
-                                clock_control_attempted,
-                                true,
-                                true,
-                                reported_sample_rate,
-                            );
-                            dev_eprintln!(
-                                "[USB] Re-SET_CUR accepted {}Hz on clock {} but readback unavailable (write-only clock); trusting SET_CUR",
-                                playback_format.sample_rate, clock.clock_id,
-                            );
-                        }
                     } else {
                         post_alt_readback_hz = Some(post_alt_rate);
                         if playback_format.dsd_transport != DsdTransportMode::None {
                             reported_sample_rate = Some(post_alt_rate);
                             clock_verification_passed = true;
-                            set_clock_verification(clock_control_attempted, clock_control_succeeded, true, reported_sample_rate);
+                            set_clock_verification(
+                                clock_control_attempted,
+                                clock_control_succeeded,
+                                true,
+                                reported_sample_rate,
+                            );
                         }
                     }
                 }
                 Err(error) => {
                     dev_eprintln!(
                         "[USB] GET_CUR (post-alt): failed for clock {}: {}",
-                        clock.clock_id, error,
+                        clock.clock_id,
+                        error,
                     );
                     if multiplied_clock || playback_format.dsd_transport != DsdTransportMode::None {
                         reported_sample_rate = None;
                         clock_verification_passed = false;
-                        set_clock_verification(clock_control_attempted, clock_control_succeeded, false, None);
+                        set_clock_verification(
+                            clock_control_attempted,
+                            clock_control_succeeded,
+                            false,
+                            None,
+                        );
                     }
                 }
             }
@@ -981,13 +1311,22 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         // verifier, which performs no writes and checks the live source rate,
         // multiplier ratio, selector route and validity after SET_INTERFACE.
         // BADD's descriptor-defined fixed rate is not independent readback.
-        if route.clock.is_some() && candidate.sync_type == SyncType::Asynchronous
-            && candidate.feedback_endpoint.is_some() && candidate.usb_speed == Speed::High
+        if route.clock.is_some()
+            && candidate.sync_type == SyncType::Asynchronous
+            && candidate.feedback_endpoint.is_some()
+            && candidate.usb_speed == Speed::High
             && candidate.service_interval_us > 125
         {
-            match verify_adc3_capture_activation(&claimed_handle.handle, route, playback_format.sample_rate) {
+            match verify_adc3_capture_activation(
+                &claimed_handle.handle,
+                route,
+                playback_format.sample_rate,
+            ) {
                 Ok(()) => post_alt_readback_hz = Some(playback_format.sample_rate),
-                Err(error) => log_warn!("[USB] ADC3 post-alt clock readback unavailable for feedback inference: {}", error),
+                Err(error) => log_warn!(
+                    "[USB] ADC3 post-alt clock readback unavailable for feedback inference: {}",
+                    error
+                ),
             }
         }
     }
@@ -1014,58 +1353,51 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         // Some DACs (e.g. Fosi DS2 / Savitech bridge) have broken UAC2 clock
         // control — GET_RANGE and GET_CUR always return 0. SET_CUR is accepted
         // silently. Skip verification and trust the SET_CUR.
-        let skip_clock_validation = settings().skip_clock_validation();
-
-        if skip_clock_validation && !candidate.is_uac1 && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
-            dev_eprintln!(
-                "[USB] Clock verification failed but SkipClockValidation quirk is active — trusting SET_CUR for {}Hz",
-                playback_format.sample_rate,
-            );
-            clock_verification_passed = true;
-            reported_sample_rate = Some(playback_format.sample_rate);
-            set_clock_verification(
-                clock_control_attempted,
-                clock_control_succeeded,
-                true,
-                reported_sample_rate,
-            );
-        } else {
-            set_clock_verification(
-                clock_control_attempted,
-                clock_control_succeeded,
-                false,
-                reported_sample_rate,
-            );
-
+        let unverified_tier = settings().allow_unusable_clock_readback(
+            clock_control_attempted,
+            clock_control_succeeded,
+            reported_sample_rate,
+            multiplied_clock,
+            playback_format.dsd_transport != DsdTransportMode::None,
+        );
+        set_clock_verification(
+            clock_control_attempted,
+            clock_control_succeeded,
+            false,
+            reported_sample_rate,
+        );
+        let known_mismatch = reported_sample_rate
+            .is_some_and(|rate| rate > 0 && rate != playback_format.sample_rate);
+        if known_mismatch
+            || (clock_control_attempted && !clock_control_succeeded)
+            || ((!unverified_tier && settings().require_verified_rate()) || multiplied_clock)
+            || playback_format.dsd_transport != DsdTransportMode::None
+        {
             let refusal = format!(
-                "USB direct refused: DAC clock not verified at {}Hz (reported={}Hz, attempted={}, succeeded={})",
-                playback_format.sample_rate,
-                reported_sample_rate.unwrap_or(0),
-                clock_control_attempted,
-                clock_control_succeeded,
+                "USB direct refused: clock not verified at {}Hz (reported={:?}, SET succeeded={})",
+                playback_format.sample_rate, reported_sample_rate, clock_control_succeeded
             );
-            if settings().require_verified_rate() || multiplied_clock
-                || (candidate.is_uac1 && (playback_format.dsd_transport != DsdTransportMode::None
-                    || reported_sample_rate.is_some_and(|rate| rate > 0 && rate != playback_format.sample_rate))) {
-                dev_eprintln!("[USB] {}", refusal);
-                set_last_error(Some(refusal.clone()));
-                set_direct_mode_refusal_reason(Some(refusal.clone()));
-                set_engine_state(EngineState::Error, Some(refusal.clone()));
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
-                    Some(candidate.interface_number),
-                    lock_requested,
-                );
-                return Err(Error::ClockUnverified {
-                    requested_hz: playback_format.sample_rate,
-                    reported_hz: reported_sample_rate.filter(|rate| *rate > 0),
-                });
-            }
-            // require_verified_rate is off: stream anyway. The clock stays
-            // marked unverified, so the stream is never reported bit-perfect.
-            log_warn!("[USB] {}; continuing because require_verified_rate is off", refusal);
+            set_last_error(Some(refusal.clone()));
+            set_direct_mode_refusal_reason(Some(refusal.clone()));
+            set_engine_state(EngineState::Error, Some(refusal));
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
+            return Err(Error::ClockUnverified {
+                requested_hz: playback_format.sample_rate,
+                reported_hz: reported_sample_rate.filter(|rate| *rate > 0),
+            });
         }
+        log_warn!("[USB] Clock unverified: unusable GET_CUR after successful SET; consider a device-specific readback quirk after hardware validation");
     }
 
+    // Zero is an unusable reply, never a verified/requested frequency.
+    if reported_sample_rate == Some(0) {
+        reported_sample_rate = None;
+    }
     if let Some(rate) = reported_sample_rate {
         if rate != playback_format.sample_rate && (!candidate.is_uac1 || rate > 0) {
             // Check if this device has the IgnoreInvalidSampleRate quirk.
@@ -1073,7 +1405,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             // when operating correctly at the requested rate.
             let ignore_invalid_rate = settings().ignore_invalid_sample_rate();
 
-            if ignore_invalid_rate && !candidate.is_uac1 && !multiplied_clock && playback_format.dsd_transport == DsdTransportMode::None {
+            if ignore_invalid_rate
+                && !candidate.is_uac1
+                && !multiplied_clock
+                && playback_format.dsd_transport == DsdTransportMode::None
+            {
                 dev_eprintln!(
                     "[USB] DAC reported {}Hz (expected {}Hz) but IgnoreInvalidSampleRate quirk is active — continuing",
                     rate, playback_format.sample_rate,
@@ -1088,7 +1424,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 set_last_error(Some(refusal.clone()));
                 set_direct_mode_refusal_reason(Some(refusal.clone()));
                 set_engine_state(EngineState::Error, Some(refusal.clone()));
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
+                duplex::cleanup_claimed(
+                    claimed_handle,
+                    attachment.as_ref(),
                     Some(candidate.interface_number),
                     lock_requested,
                 );
@@ -1109,7 +1447,9 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         dev_eprintln!("[USB] {}", refusal);
         set_last_error(Some(refusal.clone()));
         set_direct_mode_refusal_reason(Some(refusal.clone()));
-        duplex::cleanup_claimed(claimed_handle, attachment.as_ref(),
+        duplex::cleanup_claimed(
+            claimed_handle,
+            attachment.as_ref(),
             Some(candidate.interface_number),
             lock_requested,
         );
@@ -1148,7 +1488,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // seconds, then every few seconds) that looks like a transport bug but is
     // really a clock-lock refusal.
     if let Some(clock) = clock {
-        match get_clock_validity(&claimed_handle.handle, clock.interface_number, clock.clock_id) {
+        match get_clock_validity(
+            &claimed_handle.handle,
+            clock.interface_number,
+            clock.clock_id,
+        ) {
             Ok(valid) => {
                 log_info!(
                     "[clock-diag] Clock Validity after switch: clock={} iface={} valid={} rate={}Hz",
@@ -1199,19 +1543,32 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             if candidate.is_uac1 {
                 // Cached descriptor discovery is optional: missing or
                 // ambiguous collection ownership leaves playback unchanged.
-                if let Some(config) = claimed_handle.handle.device().active_config_descriptor().ok() {
-                    let standard = config.interfaces().flat_map(|i| i.descriptors()).any(|alt|
-                        alt.interface_number() == candidate.interface_number
-                            && alt.setting_number() == candidate.alt_setting
-                            && alt.class_code() == USB_CLASS_AUDIO
-                            && alt.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
-                            && alt.protocol_code() == 0);
-                    if let Some(control) = uac1_status::collection_owner(&config,
-                        candidate.interface_number).filter(|control| standard
-                            && claimed_handle.claimed_interfaces.contains(control)) {
-                        targets.push(audio_status::StreamStatusTarget::uac1(control,
-                            candidate.interface_number, candidate.alt_setting,
-                            candidate.endpoint_address, uac1_status_rate, candidate.terminal_link));
+                if let Ok(config) = claimed_handle.handle.device().active_config_descriptor() {
+                    let standard = config
+                        .interfaces()
+                        .flat_map(|i| i.descriptors())
+                        .any(|alt| {
+                            alt.interface_number() == candidate.interface_number
+                                && alt.setting_number() == candidate.alt_setting
+                                && alt.class_code() == USB_CLASS_AUDIO
+                                && alt.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+                                && alt.protocol_code() == 0
+                        });
+                    if let Some(control) =
+                        uac1_status::collection_owner(&config, candidate.interface_number).filter(
+                            |control| {
+                                standard && claimed_handle.claimed_interfaces.contains(control)
+                            },
+                        )
+                    {
+                        targets.push(audio_status::StreamStatusTarget::uac1(
+                            control,
+                            candidate.interface_number,
+                            candidate.alt_setting,
+                            candidate.endpoint_address,
+                            uac1_status_rate,
+                            candidate.terminal_link,
+                        ));
                     }
                 }
             }
@@ -1219,66 +1576,121 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 // AS status remains useful without frequency evidence, but a
                 // nominal/ignored/fallback rate must never become a CUR claim.
                 let proven_clock = if clock_verification_passed
-                    && (if adc3_route.is_some() { adc3_status_clock_proven }
-                        else { post_alt_readback_hz == Some(playback_format.sample_rate) })
-                    && choice.resolution == crate::clock_resolution::ClockResolution::Resolved {
-                    let source_rate = if let Some(route) = adc3_route.as_ref() {
-                        route.source_rate(playback_format.sample_rate).map_err(Error::Control)?
+                    && (if adc3_route.is_some() {
+                        adc3_status_clock_proven
                     } else {
-                        uac2_clock_ratio(Some(choice)).map_err(Error::Control)?
-                            .source_rate(playback_format.sample_rate).ok_or_else(|| Error::Control(
-                                "status watch cannot represent the exact playback root rate".into()))?
-                    };
+                        post_alt_readback_hz == Some(playback_format.sample_rate)
+                    })
+                    && choice.resolution == crate::clock_resolution::ClockResolution::Resolved
+                {
+                    let source_rate =
+                        if let Some(route) = adc3_route.as_ref() {
+                            route
+                                .source_rate(playback_format.sample_rate)
+                                .map_err(Error::Control)?
+                        } else {
+                            uac2_clock_ratio(Some(choice))
+                                .map_err(Error::Control)?
+                                .source_rate(playback_format.sample_rate)
+                                .ok_or_else(|| {
+                                    Error::Control(
+                                "status watch cannot represent the exact playback root rate".into())
+                                })?
+                        };
                     Some((choice, source_rate))
-                } else { None };
+                } else {
+                    None
+                };
                 let protocol = if adc3_route.is_some() { 0x30 } else { 0x20 };
-                let mut target = audio_status::StreamStatusTarget::new(protocol,
-                    choice.control_interface, candidate.interface_number, candidate.alt_setting,
-                    proven_clock);
+                let mut target = audio_status::StreamStatusTarget::new(
+                    protocol,
+                    choice.control_interface,
+                    candidate.interface_number,
+                    candidate.alt_setting,
+                    proven_clock,
+                );
                 if let Some(route) = adc3_route.as_ref() {
                     for (interface, expected_mask) in route.active_format_expectations() {
                         target.add_adc3_active_format(interface, expected_mask);
                     }
                 }
-                target.add_data_endpoint(candidate.interface_number, candidate.alt_setting,
-                    candidate.endpoint_address);
+                target.add_data_endpoint(
+                    candidate.interface_number,
+                    candidate.alt_setting,
+                    candidate.endpoint_address,
+                );
                 if let Some(source) = candidate.implicit_feedback {
-                    target.add_data_endpoint(source.interface_number, source.alt_setting, source.address);
+                    target.add_data_endpoint(
+                        source.interface_number,
+                        source.alt_setting,
+                        source.address,
+                    );
                 }
                 targets.push(target);
-                if let (Some(source), Some((_, root_rate))) = (candidate.implicit_feedback, proven_clock) {
+                if let (Some(source), Some((_, root_rate))) =
+                    (candidate.implicit_feedback, proven_clock)
+                {
                     let peer = if let Some(route) = adc3_route.as_ref() {
-                        route.implicit_status_route().and_then(|peer| peer.choice.as_ref()
-                            .map(|choice| (choice.clone(), peer.source_rate(playback_format.sample_rate))))
+                        route.implicit_status_route().and_then(|peer| {
+                            peer.choice.as_ref().map(|choice| {
+                                (
+                                    choice.clone(),
+                                    peer.source_rate(playback_format.sample_rate),
+                                )
+                            })
+                        })
                     } else {
-                        claimed_handle.handle.device().active_config_descriptor().ok().and_then(|config| {
-                            let terminal = config.interfaces().flat_map(|i| i.descriptors())
-                                .find(|alt| alt.interface_number() == source.interface_number
-                                    && alt.setting_number() == source.alt_setting)
-                                .and_then(|alt| parse_android_streaming_interface_format(&alt))
-                                .and_then(|format| format.terminal_link);
-                            strict_implicit_clock(&config, &claimed_handle.handle,
-                                choice.control_interface, terminal).map(|peer| {
-                                    let rate = uac2_clock_ratio(Some(&peer)).and_then(|ratio|
-                                        ratio.source_rate(playback_format.sample_rate)
-                                            .ok_or_else(|| "implicit status root rate is not exact".into()));
+                        claimed_handle
+                            .handle
+                            .device()
+                            .active_config_descriptor()
+                            .ok()
+                            .and_then(|config| {
+                                let terminal = config
+                                    .interfaces()
+                                    .flat_map(|i| i.descriptors())
+                                    .find(|alt| {
+                                        alt.interface_number() == source.interface_number
+                                            && alt.setting_number() == source.alt_setting
+                                    })
+                                    .and_then(|alt| parse_android_streaming_interface_format(&alt))
+                                    .and_then(|format| format.terminal_link);
+                                strict_implicit_clock(
+                                    &config,
+                                    &claimed_handle.handle,
+                                    choice.control_interface,
+                                    terminal,
+                                )
+                                .map(|peer| {
+                                    let rate = uac2_clock_ratio(Some(&peer)).and_then(|ratio| {
+                                        ratio.source_rate(playback_format.sample_rate).ok_or_else(
+                                            || "implicit status root rate is not exact".into(),
+                                        )
+                                    });
                                     (peer, rate)
                                 })
-                        })
+                            })
                     };
                     if let Some((peer, Ok(peer_rate))) = peer {
-                        if peer.control_interface == choice.control_interface && peer.source_id == choice.source_id
-                            && peer_rate == root_rate {
-                            targets.push(audio_status::StreamStatusTarget::new(protocol,
-                                peer.control_interface, source.interface_number, source.alt_setting,
-                                Some((&peer, peer_rate))));
+                        if peer.control_interface == choice.control_interface
+                            && peer.source_id == choice.source_id
+                            && peer_rate == root_rate
+                        {
+                            targets.push(audio_status::StreamStatusTarget::new(
+                                protocol,
+                                peer.control_interface,
+                                source.interface_number,
+                                source.alt_setting,
+                                Some((&peer, peer_rate)),
+                            ));
                         }
                     }
                 }
             }
         }
         if let Some(capture) = attachment.as_ref() {
-            if let Some(target) = capture_stream::status_target(&claimed_handle, &capture.endpoint)? {
+            if let Some(target) = capture_stream::status_target(&claimed_handle, &capture.endpoint)?
+            {
                 targets.push(target);
             }
         }
@@ -1287,7 +1699,12 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     let status_targets = match status_targets {
         Ok(targets) => targets,
         Err(error) => {
-            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            duplex::cleanup_claimed(
+                claimed_handle,
+                attachment.as_ref(),
+                Some(candidate.interface_number),
+                lock_requested,
+            );
             return Err(error);
         }
     };
@@ -1296,22 +1713,39 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // has been established. Vendor routes and asynchronous pacing keep their
     // separate bootstrap/feedback contracts.
     let lock_delay = if vendor_profile.is_none()
-        && matches!(candidate.sync_type, SyncType::Synchronous | SyncType::Adaptive) {
-        match endpoint_lock::selected_delay(&claimed_handle, candidate.interface_number,
-            candidate.alt_setting, candidate.endpoint_address,
-            playback_format.dsd_transport != DsdTransportMode::Native).or_control() {
+        && matches!(
+            candidate.sync_type,
+            SyncType::Synchronous | SyncType::Adaptive
+        ) {
+        match endpoint_lock::selected_delay(
+            &claimed_handle,
+            candidate.interface_number,
+            candidate.alt_setting,
+            candidate.endpoint_address,
+            playback_format.dsd_transport != DsdTransportMode::Native,
+        )
+        .or_control()
+        {
             Ok(delay) => delay,
             Err(error) => {
-                duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                duplex::cleanup_claimed(
+                    claimed_handle,
+                    attachment.as_ref(),
+                    Some(candidate.interface_number),
+                    lock_requested,
+                );
                 return Err(error);
             }
         }
-    } else { None };
+    } else {
+        None
+    };
 
     set_last_error(None);
     set_direct_mode_refusal_reason(None);
-    let unsynchronized_async =
-        candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none() && candidate.implicit_feedback.is_none();
+    let unsynchronized_async = candidate.sync_type == SyncType::Asynchronous
+        && candidate.feedback_endpoint.is_none()
+        && candidate.implicit_feedback.is_none();
     if unsynchronized_async {
         log_warn!(
             "[USB] Streaming an asynchronous endpoint without a feedback endpoint at the nominal rate (allow_unsynchronized_async); the stream is not bit-perfect"
@@ -1322,17 +1756,44 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     set_engine_state(EngineState::UsbReady, None);
     set_software_volume_active(false);
     let channels = playback_format.channels as usize;
-    let runtime_stats = Arc::new(RuntimeStats::new(
-        effective_ring_rate(&playback_format),
-        channels,
-        config.buffer_capacity_ms as usize,
-        config.buffer_target_ms as usize,
-        config.start_threshold_ms as usize,
-        config.processing_buffer_target_ms as usize,
-    ).with_feedback_trace(config.capture_feedback_trace));
-    runtime_stats.implicit_feedback.store(candidate.implicit_feedback.is_some(), Ordering::Release);
-    runtime_stats.feedback_required.store(candidate.implicit_feedback.is_some()
-        || (candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_some()), Ordering::Release);
+    let compatibility_admissions = CompatibilityAdmissions::new(
+        unsynchronized_async,
+        // Vendor-rate programming has its own cadence proof and wire protocol;
+        // its ACK is never a standard frequency SET/GET_CUR fallback.
+        clock_control_attempted && !programmed_vendor_rate,
+        clock_control_succeeded,
+        clock_verification_passed,
+        reported_sample_rate,
+    );
+    let runtime_stats = Arc::new(
+        RuntimeStats::new(
+            effective_ring_rate(&playback_format),
+            channels,
+            config.buffer_capacity_ms as usize,
+            config.buffer_target_ms as usize,
+            config.start_threshold_ms as usize,
+            config.processing_buffer_target_ms as usize,
+        )
+        .with_feedback_trace(config.capture_feedback_trace),
+    );
+    if let Some(trace) = runtime_stats.feedback_trace.as_ref() {
+        let suggestions: Vec<_> = state
+            .unreadable_clocks
+            .lock()
+            .iter()
+            .map(|(key, strikes)| (*key, *strikes))
+            .collect();
+        trace.record_clock_readback_suggestions(suggestions);
+    }
+    runtime_stats
+        .implicit_feedback
+        .store(candidate.implicit_feedback.is_some(), Ordering::Release);
+    runtime_stats.feedback_required.store(
+        candidate.implicit_feedback.is_some()
+            || (candidate.sync_type == SyncType::Asynchronous
+                && candidate.feedback_endpoint.is_some()),
+        Ordering::Release,
+    );
     set_runtime_stats(Some(Arc::clone(&runtime_stats)));
     let pcm_buffer = Arc::new(Mutex::new(PcmRing::new(
         runtime_stats.buffer_capacity_samples,
@@ -1360,11 +1821,15 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // not have its error state overwritten by the caller.
     set_engine_state(EngineState::Streaming, None);
     let stream_usb_owner = StreamUsbOwner::new(claimed_handle, lock_requested, attachment.clone());
+    let worker_context = context::current();
     let thread_handle = match thread::Builder::new()
         .name("usbdac-output".to_string())
         .spawn(move || {
+            let _owner_scope = worker_context.enter();
             // Keep the interfaces alive until the loop and its USB handles are done.
-            let _capture_retirement = attachment.as_ref().map(|capture| capture.retirement_guard());
+            let _capture_retirement = attachment
+                .as_ref()
+                .map(|capture| capture.retirement_guard());
             let _session = output_session;
             if realtime_priority && crate::priority::raise_audio_priority().is_err() {
                 dev_eprintln!("[AudioSched] Output thread running without SCHED_FIFO");
@@ -1372,7 +1837,18 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             let panic_shared = Arc::clone(&usb_shared);
             let panic_stop = Arc::clone(&usb_stop);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                run_usb_output_loop(stream_usb_owner, candidate, state, usb_shared, usb_stop, attachment, post_alt_readback_hz, status_targets, lock_delay);
+                run_usb_output_loop(
+                    stream_usb_owner,
+                    candidate,
+                    state,
+                    usb_shared,
+                    usb_stop,
+                    attachment,
+                    post_alt_readback_hz,
+                    status_targets,
+                    lock_delay,
+                    compatibility_admissions,
+                );
             }));
             if let Err(payload) = result {
                 panic_stop.store(true, Ordering::Release);
@@ -1419,8 +1895,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         backend_alt_setting,
         dsd_transport_label,
     );
-    let capture_handle = reader_attachment.as_ref().map(|capture| capture.reader(Arc::clone(&stop)));
+    let capture_handle = reader_attachment
+        .as_ref()
+        .map(|capture| capture.reader(Arc::clone(&stop)));
     Ok(StreamHandle {
+        usb_handle_identity,
         stop,
         thread: Some(thread_handle),
         shared,

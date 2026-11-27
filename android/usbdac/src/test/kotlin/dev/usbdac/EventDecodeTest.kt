@@ -82,4 +82,33 @@ class EventDecodeTest {
         }
         assertEquals(null, BitPerfectBlocker.fromWireName(null))
     }
+    @Test
+    fun compatibilityAdmissionDecodesItsTierAndReasonWithoutInventingVerification() {
+        assertEquals(DacEvent.CompatibilityFallback(CompatibilityFallbackTier.NOMINAL_ASYNC, "full-speed UAC1 nominal pacing"),
+            decodeEvent(8, 0, 0.0, "full-speed UAC1 nominal pacing"))
+        assertEquals(DacEvent.CompatibilityFallback(CompatibilityFallbackTier.UNVERIFIED_CLOCK, "SET succeeded; no usable readback"),
+            decodeEvent(8, 1, 0.0, "SET succeeded; no usable readback"))
+        assertEquals("nominal_async", CompatibilityFallbackTier.NOMINAL_ASYNC.wireName)
+        assertEquals("unverified_clock", CompatibilityFallbackTier.UNVERIFIED_CLOCK.wireName)
+        assertTrue(decodeEvent(8, 2, 0.0, "future tier") is DacEvent.Unknown)
+        assertTrue(decodeEvent(8, 4_294_967_296, 0.0, "overflow must not become tier zero") is DacEvent.Unknown)
+        assertEquals(DacEvent.CompatibilityFallback(CompatibilityFallbackTier.NOMINAL_ASYNC, "compatibility fallback nominal_async"),
+            decodeEvent(8, 0, 0.0, null))
+    }
+
+    @Test
+    fun deviceLevelCompatibilityEventDoesNotDuplicateSessionDeliveryOrChangeTheBlocker() {
+        val published = mutableListOf<DacEvent>()
+        val signals = StreamSignals { published += it }
+        for ((tier, blocker) in listOf(0L to BitPerfectBlocker.UNSYNCHRONIZED_ASYNC,
+                1L to BitPerfectBlocker.CLOCK_UNVERIFIED)) {
+            val existing = directBitPerfectState(false, blocker)
+            signals.bitPerfect.value = existing
+            signals.onEvent(8, tier, 0.0, "admitted compatibility path")
+            assertEquals(existing, signals.bitPerfect.value)
+            assertEquals(StreamState.BUFFERING, signals.state.value)
+        }
+        assertTrue("device listener already publishes this event to session.events", published.isEmpty())
+    }
+
 }
