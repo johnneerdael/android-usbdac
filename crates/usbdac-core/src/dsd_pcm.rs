@@ -408,10 +408,15 @@ mod tests {
                     byte = 0;
                 }
             }
-            let mut c = DsdPcmConverter::new(
+            let options = ConvertOptions {
+                headroom_db: 0.0,
+                ..ConvertOptions::default()
+            };
+            let mut c = DsdPcmConverter::with_options(
                 2_822_400,
                 1,
                 PcmFormat::new(44_100, 1, SampleFormat::Float32),
+                &options,
             )
             .unwrap();
             let mut audio = Vec::new();
