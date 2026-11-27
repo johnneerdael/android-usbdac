@@ -1658,15 +1658,21 @@ pub(super) fn run_usb_output_loop(
         }
         // Ring occupancy describes the producer, not the DAC FIFO. A full
         // ring is normal and must never terminate nominal playback.
-        if nominal_guarded
-            && nominal_starvation.observe(
-                stream_started_at.elapsed().as_millis() as u64,
+        if nominal_guarded {
+            if let Some(empty_ms) = nominal_starvation.observe(
+                stream_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
                 runtime_stats.buffered_samples.load(Ordering::Acquire),
                 !runtime_stats.paused.load(Ordering::Acquire)
                     && !runtime_stats.draining.load(Ordering::Acquire),
-            )
-        {
-            log_warn!("[USB] Nominal asynchronous producer ring empty for 5 seconds; DAC FIFO drift is unobservable from host occupancy");
+            ) {
+                log_warn!("[USB] Nominal asynchronous host ring empty for {} ms; DAC FIFO drift is unobservable", empty_ms);
+                shared
+                    .events
+                    .emit_stream(crate::events::DacEvent::NominalAsyncHostStarvation { empty_ms });
+            }
         }
         let mut batch_lossy_completions = 0u32;
         let mut latest_playback_completion = None;

@@ -393,18 +393,18 @@ pub(crate) struct NominalStarvation {
     reported: bool,
 }
 impl NominalStarvation {
-    pub(crate) fn observe(&mut self, now_ms: u64, buffered: usize, active: bool) -> bool {
+    pub(crate) fn observe(&mut self, now_ms: u64, buffered: usize, active: bool) -> Option<u64> {
         if !active || buffered > 0 {
             self.empty_since_ms = None;
             self.reported = false;
-            return false;
+            return None;
         }
         let since = *self.empty_since_ms.get_or_insert(now_ms);
         if !self.reported && now_ms.saturating_sub(since) >= 5_000 {
             self.reported = true;
-            return true;
+            return Some(now_ms.saturating_sub(since));
         }
-        false
+        None
     }
 }
 #[cfg(test)]
@@ -414,14 +414,17 @@ mod nominal_starvation_tests {
     fn topped_up_producer_is_never_called_drift_or_starvation() {
         let mut guard = NominalStarvation::default();
         for ms in (0..120_000).step_by(2) {
-            assert!(!guard.observe(ms, 48_000, true));
+            assert!(guard.observe(ms, 48_000, true).is_none());
         }
-        assert!(!guard.observe(120_001, 0, true));
-        assert!(!guard.observe(125_000, 0, true));
-        assert!(guard.observe(125_001, 0, true));
-        assert!(!guard.observe(130_001, 0, true));
-        assert!(!guard.observe(130_002, 1, true));
-        assert!(!guard.observe(130_003, 0, true));
-        assert!(guard.observe(135_003, 0, true));
+        assert!(guard.observe(120_001, 0, true).is_none());
+        assert!(guard.observe(125_000, 0, true).is_none());
+        assert_eq!(guard.observe(125_001, 0, true), Some(5_000));
+        assert!(guard.observe(130_001, 0, true).is_none());
+        assert!(guard.observe(130_002, 1, true).is_none());
+        assert!(guard.observe(130_003, 0, true).is_none());
+        assert_eq!(guard.observe(135_003, 0, true), Some(5_000));
+        assert!(guard.observe(135_004, 0, false).is_none());
+        assert!(guard.observe(140_000, 0, true).is_none());
+        assert_eq!(guard.observe(145_001, 0, true), Some(5_001));
     }
 }

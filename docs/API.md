@@ -1083,6 +1083,10 @@ bad handles are `invalid_argument`. A Rust panic is converted to a
 | 5 | FeedbackStale | 0 | 0 | null |
 | 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported, 12 volume_unavailable | 0 | `usbdac:<code>: <message>` |
 | 7 | DeviceLost | 0 | 0 | null |
+| 8 | CompatibilityFallback | tier code | 0 | reason |
+| 9 | NominalAsyncHostStarvation | host ring empty duration in ms | 0 | null |
+
+NominalAsyncHostStarvation occurs once per continuous host-ring starvation episode on nominal asynchronous output; refill, pause, or drain resets the episode. It does not measure the DAC FIFO or its drift. The host chooses whether to pause, re-prime, seek, or select another route.
 
 Unknown future events arrive with `type` -1 and a debug string in `message`.
 

@@ -457,6 +457,7 @@ pub mod event_type {
     pub const ERROR: i32 = 6;
     pub const DEVICE_LOST: i32 = 7;
     pub const COMPATIBILITY_FALLBACK: i32 = 8;
+    pub const NOMINAL_ASYNC_HOST_STARVATION: i32 = 9;
 }
 
 /// Numeric code of an error, for `onEvent(ERROR, code, ...)`.
@@ -508,6 +509,12 @@ pub fn event(event: &DacEvent) -> (i32, i64, f64, Option<String>) {
             Some(volume_state(state).to_string()),
         ),
         DacEvent::FeedbackStale => (event_type::FEEDBACK_STALE, 0, 0.0, None),
+        DacEvent::NominalAsyncHostStarvation { empty_ms } => (
+            event_type::NOMINAL_ASYNC_HOST_STARVATION,
+            (*empty_ms).min(i64::MAX as u64) as i64,
+            0.0,
+            None,
+        ),
         DacEvent::CompatibilityFallback { tier, reason } => (
             event_type::COMPATIBILITY_FALLBACK,
             i64::from(tier.code()),
@@ -1251,6 +1258,10 @@ mod tests {
         );
         assert_eq!(event(&DacEvent::BitPerfectChanged(true)), (3, 1, 0.0, None));
         assert_eq!(event(&DacEvent::FeedbackStale), (5, 0, 0.0, None));
+        assert_eq!(
+            event(&DacEvent::NominalAsyncHostStarvation { empty_ms: 5001 }),
+            (9, 5001, 0.0, None)
+        );
         assert_eq!(event(&DacEvent::DeviceLost), (7, 0, 0.0, None));
         let (kind, code, _, message) = event(&DacEvent::Error(Error::Transfer("boom".into())));
         assert_eq!((kind, code), (6, 7));

@@ -20,6 +20,7 @@ class EventDecodeTest {
         assertEquals(DacEvent.BitPerfectChanged(true), decodeEvent(3, 1, 0.0, null))
         assertEquals(DacEvent.BitPerfectChanged(false), decodeEvent(3, 0, 0.0, null))
         assertEquals(DacEvent.FeedbackStale, decodeEvent(5, 0, 0.0, null))
+        assertEquals(DacEvent.NominalAsyncHostStarvation(5001), decodeEvent(9, 5001, 0.0, null))
         assertEquals(DacEvent.DeviceLost, decodeEvent(7, 0, 0.0, null))
     }
 
