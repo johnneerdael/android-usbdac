@@ -187,6 +187,40 @@ tests, and the four-ABI AAR and sample builds passed. Both Android
 packages contain identical native libraries for each ABI. The AAR
 SHA-256 is `f6ed06a0adcf3e031b26d4442ff2743212ddf047c189d305d854742377dd81e1`.
 
+### UAC2 adaptive capture timing
+
+For an adaptive UAC2 capture source, require a dedicated timing OUT
+endpoint on the same alternate as the audio IN endpoint. Both endpoints
+must have the same endpoint number and opposite directions. Verify
+the timing endpoint's type, packet width and service interval during
+discovery, then revalidate both endpoint descriptors on activation.
+The USB worker sends the negotiated sample rate in USB bus-frame units
+and delivers only capture transfers submitted after the first successful
+timing OUT transfer. Duplex uses the same worker and reserves the timing
+endpoint before activating either stream. [USB-IF UAC2 §§3.16 and 4.10](https://www.usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf),
+[USB 2.0 §§5.12.4.2 and 9.6.6](https://www.alsa-project.org/files/pub/datasheets/usb/usb_20.pdf),
+[ALSA outbound synchronization packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L324-L370)
+
+UAC1 adaptive capture still needs its `bSynchAddress` association and
+`bRefresh` cadence. ALSA can set the isochronous URB period from
+`bRefresh`. Linux usbfs derives that period from `bInterval`, so the
+Android userspace transport needs a separate scheduling proof. [USB-IF UAC1 §4.6.2](https://www.usb.org/sites/default/files/audio10.pdf),
+[ALSA synchronization interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L680-L701),
+[Linux usbfs isochronous interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/core/devio.c#L1896-L1908)
+
+In the final hardware pass, verify standalone capture and duplex on a
+device exposing an adaptive IN alternate. Record both pipes and their
+intervals, confirm the outgoing rate word and subsequent captured
+frames, and exercise stop and detach. Include the additional desktop
+DACs in the final matrix using the playback formats and timing modes
+their descriptors advertise.
+
+Rust workspace tests, the Android arm64 target check, and the release
+AAR and sample builds passed. The existing Kotlin test result remained
+current. All four Android ABIs contained matching native binaries in
+both packages. The AAR SHA-256 is
+`30441e12555a7daf84d8a068c6b9d31d0293ee695117b7201587a42595f19480`.
+
 ### AudioControl notifications during a stream
 
 When a claimed UAC2 or full UAC3 AudioControl interface exposes a

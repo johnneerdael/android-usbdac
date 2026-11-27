@@ -51,18 +51,26 @@ fn validate_alternates(playback: &IsoStreamCandidate, input: &CaptureEndpoint) -
     if playback.interface_number == input.interface && playback.alt_setting != input.alternate {
         return Err(Error::Unsupported { reason: "duplex alternates conflict on one interface".into(), offered: vec![] });
     }
-    if input.adc3_route.as_ref().and_then(|route| route.feedforward)
+    if input.feedforward()
         .is_some_and(|pipe| pipe.address == playback.endpoint_address) {
         return Err(Error::Unsupported { reason: "duplex playback overlaps capture feedforward OUT ownership".into(), offered: vec![] });
     }
     if playback.endpoint_address == input.address {
         return Err(Error::Unsupported { reason: "duplex endpoint directions overlap".into(), offered: vec![] });
     }
+    if playback.feedback_endpoint.is_some_and(|feedback| feedback.address == input.address) {
+        return Err(Error::Unsupported { reason: "capture overlaps playback explicit feedback IN ownership".into(), offered: vec![] });
+    }
     if let Some(source) = playback.implicit_feedback {
         if source.interface_number == input.interface && source.alt_setting != input.alternate {
             return Err(Error::Unsupported { reason: "capture alternate conflicts with implicit feedback".into(), offered: vec![] });
         }
         if source.address == input.address {
+            // An adaptive source consumes host timing on its feedforward OUT;
+            // it cannot also provide the asynchronous clock playback owns.
+            if input.feedforward().is_some() {
+                return Err(Error::Unsupported { reason: "capture requiring feedforward cannot share the owned implicit IN clock".into(), offered: vec![] });
+            }
             let exact = source.interface_number == input.interface && source.alt_setting == input.alternate
                 && source.bytes_per_frame == input.format.bytes_per_frame()
                 && source.service_interval_us == input.service_us && source.max_packet_bytes == input.packet_bytes;
@@ -555,7 +563,8 @@ impl InputPool {
             if usb_stop_requested(stop) { break; }
             let Some((status, completed, _)) = self.slots[index].take_completion() else { break; };
             self.order.pop_front(); self.reordered[index] = false;
-            let timing_allowed = self.feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
+            let timing_allowed = self.feedforward.as_ref().map_or(true, |pool|
+                pool.accepts_capture_transfer(completed, self.slots[index].submitted_at))
                 && self.implicit_feedforward.as_ref().map_or(true, |health| health.accepts(completed));
             let result = if self.lock_delay.pending() {
                 let whole_urb_allowed = timing_allowed && self.slots[index].submitted_at.is_some_and(|submitted|

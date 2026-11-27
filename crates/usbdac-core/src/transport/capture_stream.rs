@@ -23,6 +23,13 @@ pub(crate) struct CaptureEndpoint {
     fixed_rate: bool,
     pub(super) vendor_pcm: Option<vendor_pcm::VendorPcm>,
     pub(super) adc3_route: Option<adc3::Adc3Route>,
+    pub(super) standard_feedforward: Option<adc3::FeedforwardEndpoint>,
+}
+
+impl CaptureEndpoint {
+    pub(super) fn feedforward(&self) -> Option<adc3::FeedforwardEndpoint> {
+        self.standard_feedforward.or_else(|| self.adc3_route.as_ref().and_then(|route| route.feedforward))
+    }
 }
 
 #[derive(Clone)]
@@ -32,6 +39,7 @@ struct RawInterface<'a> {
     class: u8,
     subclass: u8,
     protocol: u8,
+    declared_endpoints: u8,
     descriptors: Vec<&'a [u8]>,
 }
 
@@ -54,6 +62,7 @@ fn raw_interfaces(raw: &[u8]) -> Result<Vec<RawInterface<'_>>, String> {
                 class: d[5],
                 subclass: d[6],
                 protocol: d[7],
+                declared_endpoints: d[4],
                 descriptors: Vec::new(),
             });
         } else if let Some(interface) = interfaces.last_mut() {
@@ -308,10 +317,38 @@ fn capture_input_geometry(
     Some((effective_iso_packet_bytes(packet, speed), service_interval_micros(speed, ep[6])))
 }
 
+/// Adaptive UAC2 IN requires its same-alternate, explicit timing OUT pipe.
+/// UAC1 retains its existing admission until its bRefresh cadence is supported.
+fn standard_capture_feedforward(
+    interface: &RawInterface<'_>, index: usize, speed: Speed, disabled: bool,
+) -> Result<Option<(adc3::FeedforwardEndpoint, usize)>, String> {
+    let ep = interface.descriptors[index];
+    if interface.protocol != 0x20 || (ep[3] >> 2) & 3 != 2 {
+        return Ok(None);
+    }
+    if disabled { return Err("adaptive capture requires enabled feedforward".into()); }
+    if interface.declared_endpoints != 2 {
+        return Err("adaptive capture requires exactly two declared endpoints".into());
+    }
+    super::standard_feedforward::find_standard_capture_feedforward(
+        interface.protocol, ep, &interface.descriptors, speed,
+    ).map(Some)
+}
+
+fn scoped_endpoint_descriptors<'a>(interface: &'a RawInterface<'_>, index: usize) -> impl Iterator<Item = u8> + 'a {
+    interface.descriptors[index..].iter().take(1)
+        .chain(interface.descriptors[index + 1..].iter().take_while(|d| d[1] != 5))
+        .flat_map(|d| d.iter().copied())
+}
+
 /// Claim discovery is structural: prove SS geometry without assuming a rate.
 /// ADC3 retains its own descriptor admission and activation proof.
 fn claimable_capture_input(interface: &RawInterface<'_>, speed: Speed) -> bool {
     interface.descriptors.iter().enumerate().any(|(index, ep)| {
+        if ep.len() < 7 || ep[1] != 5 { return false; }
+        if standard_capture_feedforward(interface, index, speed, false).is_err() {
+            return false;
+        }
         if interface.protocol != 0x30 && matches!(speed, Speed::Super | Speed::SuperPlus) {
             return capture_input_geometry(interface, index, speed).is_some();
         }
@@ -357,6 +394,14 @@ pub(super) fn capture_candidates(
             {
                 continue;
             }
+            let Ok(timing) = standard_capture_feedforward(interface, index, speed, false) else {
+                continue;
+            };
+            if timing.is_some_and(|(pipe, _)| pipe.nominal(rate).is_err()) { continue; }
+            let mut endpoint_descriptors: Vec<_> = scoped_endpoint_descriptors(interface, index).collect();
+            if let Some((_, timing_index)) = timing {
+                endpoint_descriptors.extend(scoped_endpoint_descriptors(interface, timing_index));
+            }
             let sampling_control = interface.descriptors[index + 1..]
                 .iter()
                 .take_while(|d| d[1] != 5)
@@ -379,12 +424,8 @@ pub(super) fn capture_candidates(
                     .filter(|d| d[1] == USB_DT_CS_INTERFACE)
                     .flat_map(|d| d.iter().copied())
                     .collect(),
-                endpoint_descriptors: interface.descriptors[index..]
-                    .iter()
-                    .take(1)
-                    .chain(interface.descriptors[index + 1..].iter().take_while(|d| d[1] != 5))
-                    .flat_map(|d| d.iter().copied())
-                    .collect(),
+                endpoint_descriptors,
+                standard_feedforward: timing.map(|(pipe, _)| pipe),
                 sampling_control,
                 fixed_rate,
                 adc3_route: None,
@@ -441,6 +482,11 @@ pub(super) fn verify_standard_capture(
     {
         return Ok(());
     }
+    if candidate.standard_feedforward.is_some() && settings().disable_feedback() {
+        return Err(Error::Unsupported {
+            reason: "adaptive capture requires enabled feedforward".into(), offered: vec![],
+        });
+    }
     claimed.ensure_interface_claimed(candidate.interface).map_err(Error::Claim)?;
     claimed.ensure_interface_claimed(candidate.control).map_err(Error::Claim)?;
     let map_control_error = |e: rusb::Error| if e == rusb::Error::NoDevice { Error::DeviceLost }
@@ -481,6 +527,9 @@ fn class_capture_candidates(
         .ok_or("cannot read active capture configuration")?;
     let speed = resolve_device_speed(&claimed.handle.device());
     let mut candidates = capture_candidates(&raw, config.number(), speed, rate)?;
+    if settings().disable_feedback() {
+        candidates.retain(|candidate| candidate.standard_feedforward.is_none());
+    }
     for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)? {
         candidates.push(adc3_capture_endpoint(config.number(), rate, candidate, route)?);
     }
@@ -514,7 +563,7 @@ fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm, ra
         packet_bytes: profile.input.max_packet_bytes, format, protocol: 0xff,
         terminal: 0, control: profile.input_interface_number, control_descriptors: vec![],
         endpoint_descriptors: vec![],
-        sampling_control: false, fixed_rate: !profile.rate_control, adc3_route: None, vendor_pcm: Some(profile),
+        sampling_control: false, fixed_rate: !profile.rate_control, adc3_route: None, standard_feedforward: None, vendor_pcm: Some(profile),
     })
 }
 
@@ -579,6 +628,7 @@ fn adc3_capture_endpoint(
         sampling_control: false,
         fixed_rate: route.clock.is_none(),
         adc3_route: Some(route),
+        standard_feedforward: None,
         vendor_pcm: None,
     })
 }
@@ -1476,11 +1526,12 @@ pub(super) struct FeedforwardPool {
     packets: usize,
     scratch: Vec<CapturePacket>,
     first_valid_send: Option<Instant>,
+    requires_post_proof_submission: bool,
     deadline: Duration,
 }
 impl FeedforwardPool {
     pub(super) fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
-        let Some(pipe) = endpoint.adc3_route.as_ref().and_then(|r| r.feedforward) else { return Ok(None); };
+        let Some(pipe) = endpoint.feedforward() else { return Ok(None); };
         let nominal = pipe.nominal(endpoint.format.sample_rate())?;
         // Target 8 ms per URB, capped at 32 packets; one packet for sparse polling.
         // bInterval schedules the transfers; it never rescales the rate value.
@@ -1492,6 +1543,7 @@ impl FeedforwardPool {
         Ok(Some(Self { slots, pipe, payload, packets,
             scratch: vec![CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; packets],
             first_valid_send: None,
+            requires_post_proof_submission: endpoint.standard_feedforward.is_some(),
             deadline: Duration::from_millis(100).max(Duration::from_micros(u64::from(pipe.service_us) * packets as u64 * 4)),
         }))
     }
@@ -1501,7 +1553,7 @@ impl FeedforwardPool {
             transfer_buffer: self.payload.clone(), underrun: false, held: false,
             frame_count: 0, music_frames: 0, epoch: 0,
         }, self.deadline.as_millis().min(u128::from(u32::MAX)) as u32).map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost }
-            else { Error::Transfer(format!("ADC3 capture feedforward submission: {e}")) })
+            else { Error::Transfer(format!("capture feedforward submission: {e}")) })
     }
     pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
         for index in 0..self.slots.len() {
@@ -1513,6 +1565,10 @@ impl FeedforwardPool {
     pub(super) fn primed(&self) -> bool { self.first_valid_send.is_some() }
     pub(super) fn accepts_capture(&self, completed: Instant) -> bool {
         self.first_valid_send.is_some_and(|first| completed >= first)
+    }
+    pub(super) fn accepts_capture_transfer(&self, completed: Instant, submitted_at: Option<Instant>) -> bool {
+        self.accepts_capture(completed) && (!self.requires_post_proof_submission
+            || submitted_at.is_some_and(|submitted| self.accepts_capture(submitted)))
     }
     pub(super) fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
         if usb_stop_requested(stop) { return Ok(()); }
@@ -1526,7 +1582,7 @@ impl FeedforwardPool {
                 self.submit(index, handle)?;
             } else if self.slots[index].in_flight && self.slots[index].submitted_at
                 .is_some_and(|start| start.elapsed() >= self.deadline) {
-                return Err(Error::Transfer("ADC3 capture feedforward deadline missed".into()));
+                return Err(Error::Transfer("capture feedforward deadline missed".into()));
             }
         }
         Ok(())
@@ -1544,19 +1600,19 @@ fn validate_feedforward_slot(slot: &IsoTransferSlot, status: i32, completed: Ins
     deadline: Duration, bytes: usize, payload: &[u8], scratch: &mut [CapturePacket]) -> Result<(), Error> {
     let (data, detached) = inspect_slot(slot, status, scratch).map_err(|error| match error {
         Error::DeviceLost => Error::DeviceLost,
-        other => Error::Transfer(format!("ADC3 capture feedforward completion: {other}")),
+        other => Error::Transfer(format!("capture feedforward completion: {other}")),
     })?;
     if detached { return Err(Error::DeviceLost); }
     if !slot.submitted_at.is_some_and(|start| completed.saturating_duration_since(start) < deadline) {
-        return Err(Error::Transfer("ADC3 capture feedforward deadline missed".into()));
+        return Err(Error::Transfer("capture feedforward deadline missed".into()));
     }
     validate_feedforward_packets(bytes, scratch)?;
-    if data != payload { return Err(Error::Transfer("ADC3 capture feedforward payload changed".into())); }
+    if data != payload { return Err(Error::Transfer("capture feedforward payload changed".into())); }
     Ok(())
 }
 fn validate_feedforward_packets(bytes: usize, packets: &[CapturePacket]) -> Result<(), Error> {
     if packets.is_empty() || packets.iter().any(|p| !p.succeeded || p.requested_bytes != bytes || p.actual_bytes != bytes) {
-        return Err(Error::Transfer("ADC3 capture feedforward short or failed isochronous packet".into()));
+        return Err(Error::Transfer("capture feedforward short or failed isochronous packet".into()));
     }
     Ok(())
 }
@@ -1864,7 +1920,8 @@ fn run_capture(
                     }
                 }
             } else { true };
-            let capture_allowed = vendor_allowed && feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
+            let capture_allowed = vendor_allowed
+                && feedforward.as_ref().map_or(true, |pool| pool.accepts_capture_transfer(completed, slots[index].submitted_at))
                 && companion.as_ref().map_or(true, |pool| pool.accepts_capture(completed));
             let captured_before = companion.as_ref().map(|_| queue.stats().captured_frames);
             let lock_pending = lock_delay.pending();
@@ -2175,6 +2232,90 @@ mod tests {
         raw[2..4].copy_from_slice(&length.to_le_bytes());
     }
 
+    fn adaptive_uac2_configuration() -> Vec<u8> {
+        let mut raw = configuration(0x20);
+        let alternate = raw.windows(4).position(|w| w == [9, 4, 1, 1]).unwrap();
+        raw[alternate + 4] = 2;
+        let data = raw.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
+        raw.splice(data..data + 9, [7, 5, 0x81, 0x09, 0, 2, 1]);
+        let cs = data + 7;
+        raw.splice(cs..cs + 7, [8, 0x25, 1, 0, 0, 0, 0, 0]);
+        raw.extend_from_slice(&[7, 5, 0x01, 0x11, 3, 0, 1]);
+        update_configuration_length(&mut raw);
+        raw
+    }
+
+    #[test]
+    fn adaptive_uac2_requires_proven_timing_and_representable_nominal_rate() {
+        let raw = adaptive_uac2_configuration();
+        let interfaces = raw_interfaces(&raw).unwrap();
+        let interface = interfaces.last().unwrap();
+        let input = interface.descriptors.iter().position(|d| d[1] == 5 && d[2] == 0x81).unwrap();
+        assert!(standard_capture_feedforward(interface, input, Speed::Full, true).is_err());
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        assert_eq!(candidate.feedforward().unwrap().address, 1);
+        assert!(candidate.feedforward().unwrap().nominal(1_024_000).is_err());
+        assert!(capture_candidates(&raw, 1, Speed::Full, 128_000).unwrap().is_empty());
+        let alternate = raw.windows(4).position(|w| w == [9, 4, 1, 1]).unwrap();
+        for declared in [1, 3] {
+            let mut changed = raw.clone();
+            changed[alternate + 4] = declared;
+            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(!claimable_capture_input(raw_interfaces(&changed).unwrap().last().unwrap(), Speed::Full));
+        }
+        // Keep UAC1's existing structural admission; its bRefresh support is separate.
+        let mut uac1 = configuration(0);
+        let input = uac1.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
+        uac1[input + 3] = 9;
+        assert_eq!(capture_candidates(&uac1, 1, Speed::Full, 48_000).unwrap().len(), 1);
+        for change in [0, 1, 2] {
+            let mut changed = raw.clone();
+            let timing = changed.len() - 7;
+            match change {
+                0 => { changed.truncate(timing); },
+                1 => { changed[timing + 2] = 2; },
+                _ => { changed[timing + 3] = 1; },
+            }
+            update_configuration_length(&mut changed);
+            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(!claimable_capture_input(raw_interfaces(&changed).unwrap().last().unwrap(), Speed::Full));
+        }
+    }
+
+    #[test]
+    fn adaptive_uac2_reproof_includes_timing_endpoint_and_scoped_extras() {
+        let mut raw = adaptive_uac2_configuration();
+        raw.extend_from_slice(&[4, 0x25, 0x7f, 0x55]);
+        update_configuration_length(&mut raw);
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        assert!(reprove_standard_capture(&raw, Speed::Full, &candidate).is_ok());
+        let timing = raw.windows(4).position(|w| w == [7, 5, 1, 0x11]).unwrap();
+        for offset in [timing + 6, raw.len() - 1] {
+            let mut changed = raw.clone();
+            changed[offset] ^= 1;
+            assert!(reprove_standard_capture(&changed, Speed::Full, &candidate).is_err());
+        }
+        let mut duplicate = raw.clone();
+        duplicate.extend_from_slice(&[7, 5, 1, 0, 0, 0, 0]);
+        update_configuration_length(&mut duplicate);
+        assert!(reprove_standard_capture(&duplicate, Speed::Full, &candidate).is_err());
+    }
+
+    #[test]
+    fn adaptive_capture_only_publishes_input_submitted_after_confirmed_timing() {
+        let raw = adaptive_uac2_configuration();
+        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let mut pool = FeedforwardPool::for_endpoint(&endpoint).unwrap().unwrap();
+        let at = Instant::now();
+        assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at)));
+        pool.first_valid_send = Some(at);
+        assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), None));
+        assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at - Duration::from_millis(1))));
+        assert!(pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at + Duration::from_millis(1))));
+        pool.requires_post_proof_submission = false;
+        assert!(pool.accepts_capture_transfer(at + Duration::from_millis(2), None));
+    }
+
     #[test]
     fn standard_capture_reproof_rejects_stale_same_alternate_profiles() {
         for protocol in [0, 0x20] {
@@ -2189,7 +2330,7 @@ mod tests {
                 [12, 0x24, 2, 1]
             } else { [8, 0x24, 10, 10] }).unwrap();
             let mut changed_sync = raw.clone();
-            changed_sync[ep + 3] ^= 0x08; // Still isochronous, with different synchronization.
+            changed_sync[ep + 3] ^= 0x04; // Still isochronous, with different synchronization.
             let changed_endpoint = capture_candidates(&changed_sync, 1, Speed::Full, 48_000)
                 .unwrap().remove(0);
             assert_eq!(changed_endpoint.packet_bytes, endpoint.packet_bytes);
