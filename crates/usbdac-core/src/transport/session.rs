@@ -1,45 +1,44 @@
+use super::context::{ScopedMutex, ScopedBool, ScopedU32, ScopedU64};
 use super::*;
 
-pub(super) static SESSION_STATE: Lazy<Mutex<Option<SessionState>>> =
-    Lazy::new(|| Mutex::new(None));
-pub(super) static IDLE_LOCK: Lazy<Mutex<Option<IdleLock>>> = Lazy::new(|| Mutex::new(None));
-pub(super) static LIFECYCLE_STATE: Lazy<Mutex<LifecycleState>> =
-    Lazy::new(|| Mutex::new(LifecycleState::default()));
+pub(super) static SESSION_STATE: ScopedMutex<Option<SessionState>> = ScopedMutex::new(|context| context.session.clone());
+pub(super) static IDLE_LOCK: ScopedMutex<Option<IdleLock>> = ScopedMutex::new(|context| context.idle.clone());
+pub(super) static LIFECYCLE_STATE: ScopedMutex<LifecycleState> = ScopedMutex::new(|context| context.lifecycle.clone());
 /// Serializes Feature Unit I/O with other volume calls and final device clear.
-pub(super) static HARDWARE_VOLUME_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(super) static HARDWARE_VOLUME_MUTEX: ScopedMutex<()> = ScopedMutex::new(|context| context.volume_io.clone());
 pub(super) static DISCOVERY_DISABLED: Once = Once::new();
-pub(super) static USB_SESSION_CLEAR_PENDING: AtomicBool = AtomicBool::new(false);
-pub(super) static HARDWARE_VOLUME_GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(super) static USB_SESSION_CLEAR_PENDING: ScopedBool = ScopedBool::new(|context| &context.clear_pending);
+pub(super) static HARDWARE_VOLUME_GENERATION: ScopedU64 = ScopedU64::new(|context| &context.volume_generation);
 /// The DAC's volume before this library first changed it. Outside SESSION_STATE
 /// so it outlives stream restarts and a `Dac` that is closed with
 /// `HandBack::Keep` and reopened.
-pub(super) static ORIGINAL_HARDWARE_VOLUME: Mutex<OriginalVolumeSlot<HardwareVolumeControl>> =
-    Mutex::new(OriginalVolumeSlot::new());
+pub(super) static ORIGINAL_HARDWARE_VOLUME: ScopedMutex<OriginalVolumeSlot<HardwareVolumeControl>> = ScopedMutex::new(|context| context.original_volume.clone());
 /// What the next device clear does with that level; set by `Dac::close` just
 /// before it.
-pub(super) static ORIGINAL_VOLUME_ACTION: AtomicU32 = AtomicU32::new(ORIGINAL_VOLUME_KEEP);
+pub(super) static ORIGINAL_VOLUME_ACTION: ScopedU32 = ScopedU32::new(|context| &context.original_volume_action);
 pub(super) const ORIGINAL_VOLUME_KEEP: u32 = 0;
 pub(super) const ORIGINAL_VOLUME_RESTORE: u32 = 1;
 pub(super) const ORIGINAL_VOLUME_FORGET: u32 = 2;
 
 /// Only one negotiation or output session can use the claimed interfaces.
 /// Serialize ownership transitions with device clear before the host releases them.
-pub(super) static USB_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-pub(super) static USB_SESSION_GATE: Mutex<()> = Mutex::new(());
+pub(super) static USB_SESSION_ACTIVE: ScopedBool = ScopedBool::new(|context| &context.active);
+pub(super) static USB_SESSION_GATE: ScopedMutex<()> = ScopedMutex::new(|context| context.gate.clone());
 
-pub(super) struct SessionGuard;
+pub(super) struct SessionGuard { context: Arc<context::SessionContext> }
 
 impl SessionGuard {
     // Caller holds USB_SESSION_GATE and has checked that no session is active.
     pub(super) fn start_locked() -> Self {
         USB_STOP_REQUESTED.store(false, Ordering::SeqCst);
         USB_SESSION_ACTIVE.store(true, Ordering::SeqCst);
-        Self
+        Self { context: context::current() }
     }
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        let _scope = self.context.enter();
         let _session_gate = USB_SESSION_GATE.lock();
         USB_SESSION_ACTIVE.store(false, Ordering::SeqCst);
         complete_pending_clear_locked();
@@ -50,7 +49,7 @@ impl Drop for SessionGuard {
 // `stop` flag, so without this the transfer loop would keep running until the
 // stream is closed or the USB fd dies. Set from the deferred-clear path; reset
 // at session start. A second clear during teardown is harmless (idempotent).
-pub(super) static USB_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub(super) static USB_STOP_REQUESTED: ScopedBool = ScopedBool::new(|context| &context.stop);
 
 /// Combined stop predicate for the render/output loops: bail when either the
 /// backend's local `stop` Arc or the global clear-requested flag is set.
@@ -62,8 +61,7 @@ pub(super) fn payload_audit_latch() -> PayloadAuditLatch {
     PayloadAuditLatch::new(Duration::from_millis(USB_PAYLOAD_FLICKER_GRACE_MS))
 }
 
-pub(super) static USB_DSD_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
-    Lazy::new(|| Mutex::new(payload_audit_latch()));
+pub(super) static USB_DSD_PAYLOAD_LATCH: ScopedMutex<PayloadAuditLatch> = ScopedMutex::new(|context| context.dsd_audit.clone());
 
 pub(super) fn usb_dsd_payload_verified() -> bool {
     USB_DSD_PAYLOAD_LATCH.lock().is_verified()
@@ -74,8 +72,7 @@ pub(super) fn usb_dsd_payload_verified() -> bool {
 #[cfg(test)]
 pub(crate) static PAYLOAD_LATCH_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
-pub(super) static USB_PCM_PAYLOAD_LATCH: Lazy<Mutex<PayloadAuditLatch>> =
-    Lazy::new(|| Mutex::new(payload_audit_latch()));
+pub(super) static USB_PCM_PAYLOAD_LATCH: ScopedMutex<PayloadAuditLatch> = ScopedMutex::new(|context| context.pcm_audit.clone());
 
 pub(super) fn usb_pcm_payload_verified() -> bool {
     USB_PCM_PAYLOAD_LATCH.lock().is_verified()
@@ -119,7 +116,7 @@ pub(super) fn log_payload_audit_transition(transport: &str, verified: bool, cons
     }
 }
 
-pub(super) static LAST_BIT_PERFECT_LOGGED: AtomicBool = AtomicBool::new(false);
+pub(super) static LAST_BIT_PERFECT_LOGGED: ScopedBool = ScopedBool::new(|context| &context.last_bit_perfect);
 
 /// Transition evidence line for the bit-perfect claim. Both edges are logged
 /// unconditionally so field reports can show mode flapping without Developer
@@ -201,6 +198,7 @@ pub(super) fn clear_session_state() {
     *SESSION_STATE.lock() = None;
     adc3::clear_adc3_negotiation();
     crate::settings::reset();
+    context::current().release();
 }
 
 // The caller holds USB_SESSION_GATE so the wait API cannot report success while

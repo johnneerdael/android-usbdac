@@ -369,7 +369,7 @@ impl DacCaptureStream {
     /// Return whole wire frames copied. An active empty stream returns zero.
     /// Destination length must be a multiple of `format().bytes_per_frame()`.
     pub fn read(&self, destination: &mut [u8]) -> crate::Result<usize> {
-        self.dac.ensure_open()?;
+        let _scope = self.dac.enter()?;
         let handle = self.handle.lock();
         let result = handle.lock_buffer().read(destination);
         result.map_err(|error| match error {
@@ -403,6 +403,7 @@ impl DacCaptureStream {
     /// timeout retains USB ownership in the worker; keep host claims/FD until
     /// `Dac::await_usb_retirement` confirms retirement after closing the DAC.
     pub fn close(&self) -> crate::Result<()> {
+        let _scope = self.dac.context.enter();
         self.handle.lock().stop()
     }
 }

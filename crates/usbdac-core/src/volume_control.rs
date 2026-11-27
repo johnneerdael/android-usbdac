@@ -326,6 +326,8 @@ impl<C: SameRoute> OriginalVolumeSlot<C> {
         Self(Vec::new())
     }
 
+    pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
+
     pub(crate) fn is_recorded(&self, device: &str) -> bool {
         self.0.iter().any(|original| original.device == device)
     }

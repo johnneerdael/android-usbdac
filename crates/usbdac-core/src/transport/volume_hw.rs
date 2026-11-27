@@ -868,6 +868,7 @@ pub(crate) fn discover_idle_volume_control() {
 }
 
 pub(super) fn original_volume_device_key(device: &UsbDevice) -> String {
+    if let Some(key) = context::current().volume_key() { return key; }
     format!(
         "{}:{:04x}:{:04x}",
         device.device_name.as_deref().unwrap_or_default(),
@@ -923,6 +924,7 @@ pub(crate) fn set_original_volume_action(action: u32) -> bool {
     if action > ORIGINAL_VOLUME_FORGET {
         return false;
     }
+    context::current().keep_original(action == ORIGINAL_VOLUME_KEEP);
     ORIGINAL_VOLUME_ACTION.store(action, Ordering::SeqCst);
     true
 }

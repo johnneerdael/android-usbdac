@@ -192,10 +192,12 @@ impl StreamInner {
 
     /// Publishes the initial state once the listener is in place.
     pub(crate) fn start_events(&self) {
+        let _scope = self.dac.context.enter();
         self.shared.refresh_state();
     }
 
     pub(crate) fn close(&self) -> Result<()> {
+        let _scope = self.dac.context.enter();
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -320,6 +322,7 @@ impl DacStream {
     /// [`Error::InvalidState`] after [`drain`](Self::drain) (until
     /// [`flush`](Self::flush)), or once the stream has closed or failed.
     pub fn write(&self, data: &[u8]) -> Result<usize> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().write_bytes(data)
     }
@@ -328,6 +331,7 @@ impl DacStream {
     /// and returns samples (a whole number of wire frames: multiples of
     /// `channels`, or of `subslot_bytes * channels` for native DSD).
     pub fn write_i32(&self, samples: &[i32]) -> Result<usize> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().write_samples(samples)
     }
@@ -348,6 +352,7 @@ impl DacStream {
     /// Resumes after [`pause`](Self::pause). A new stream plays by itself once
     /// the ring holds the start threshold; this is only needed after a pause.
     pub fn play(&self) -> Result<()> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().set_paused(false);
         Ok(())
@@ -360,6 +365,7 @@ impl DacStream {
     /// by default, at every service interval) still plays out first; the ring
     /// resumes exactly where it was.
     pub fn pause(&self) -> Result<()> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().set_paused(true);
         Ok(())
@@ -380,6 +386,7 @@ impl DacStream {
     /// ([`DacConfig::bus_queue_ms`](crate::DacConfig::bus_queue_ms), 16 ms by
     /// default) and is not counted as played.
     pub fn flush(&self) -> Result<()> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().flush();
         Ok(())
@@ -391,6 +398,7 @@ impl DacStream {
     /// tail is not an underrun. Further writes fail until
     /// [`flush`](Self::flush).
     pub fn drain(&self) -> Result<()> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().drain();
         Ok(())
@@ -439,12 +447,14 @@ impl DacStream {
     /// False as soon as any of that stops being true, and for good after a lost
     /// frame.
     pub fn is_bit_perfect(&self) -> bool {
+        let _scope = self.inner.dac.context.enter();
         !self.inner.is_closed() && self.shared().note_bit_perfect()
     }
 
     /// Why [`is_bit_perfect`](Self::is_bit_perfect) is false: `None` when it is
     /// true, otherwise the first condition that fails.
     pub fn bit_perfect_blocker(&self) -> Option<BitPerfectBlocker> {
+        let _scope = self.inner.dac.context.enter();
         if self.inner.is_closed() {
             return Some(BitPerfectBlocker::NoStream);
         }
@@ -457,6 +467,7 @@ impl DacStream {
     /// ends bit-perfect output. Refused for DoP and native DSD (it would corrupt
     /// the bitstream).
     pub fn set_software_gain(&self, gain: f32) -> Result<()> {
+        let _scope = self.inner.dac.enter()?;
         self.ensure_open()?;
         self.shared().set_software_gain(gain)
     }
@@ -501,6 +512,7 @@ impl DacStream {
     }
 
     pub fn stats(&self) -> StreamStats {
+        let _scope = self.inner.dac.context.enter();
         use std::sync::atomic::Ordering::Relaxed;
         let shared = self.shared();
         let stats = &shared.stats;

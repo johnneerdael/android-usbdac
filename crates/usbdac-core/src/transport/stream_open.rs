@@ -1312,9 +1312,11 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // not have its error state overwritten by the caller.
     set_engine_state(EngineState::Streaming, None);
     let stream_usb_owner = StreamUsbOwner::new(claimed_handle, lock_requested, attachment.clone());
+    let worker_context = context::current();
     let thread_handle = match thread::Builder::new()
         .name("usbdac-output".to_string())
         .spawn(move || {
+            let _owner_scope = worker_context.enter();
             // Keep the interfaces alive until the loop and its USB handles are done.
             let _capture_retirement = attachment.as_ref().map(|capture| capture.retirement_guard());
             let _session = output_session;

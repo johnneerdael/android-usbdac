@@ -5,10 +5,9 @@
 //! Everything here is crate-internal. The public API in [`crate::dac`] and
 //! [`crate::stream`] is a thin layer over it.
 //!
-//! v0.1 keeps one process-wide session (`session::SESSION_STATE` and friends):
-//! one DAC at a time is the reality on a phone, and the claimed interfaces,
-//! the libusb handle and the output thread are inherently single-owner. The
-//! statics never leak into the public types.
+//! Mutable USB state belongs to an explicit per-attachment context. Public
+//! handles and worker lifetimes enter that owner; production has no unscoped
+//! current-device fallback. Only physical-attachment reservation is global.
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
@@ -164,6 +163,7 @@ pub(crate) mod routing_hw;
 mod scan;
 mod vendor_pcm;
 pub(crate) mod session;
+pub(crate) mod context;
 pub(crate) mod shared;
 mod stream_open;
 mod standard_feedforward;

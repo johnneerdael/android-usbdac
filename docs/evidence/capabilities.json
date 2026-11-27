@@ -1,6 +1,6 @@
 {
   "duplex": true,
-  "max_open_devices": 1,
+  "max_open_devices": null,
   "pcm_capture": true,
   "playback": true,
   "schema_version": 1,

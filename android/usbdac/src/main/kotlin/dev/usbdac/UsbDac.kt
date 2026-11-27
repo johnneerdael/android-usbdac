@@ -28,7 +28,7 @@ import dev.usbdac.internal.toNativeJson
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import java.util.concurrent.atomic.AtomicBoolean
+import dev.usbdac.internal.UsbAttachmentOwners
 
 /**
  * A USB audio device. Playback discovery requires an isochronous OUT interface;
@@ -81,7 +81,7 @@ public sealed interface DacHotplugEvent {
  * }
  * ```
  *
- * Only one [DacSession] can be open in a process (the native library's limit in version 0.1).
+ * Distinct USB devices can be open concurrently; each attachment has one owner.
  */
 public object UsbDac {
 
@@ -188,8 +188,8 @@ public object UsbDac {
         awaitClose { app.unregisterReceiver(receiver) }
     }
 
-    /** One session per process: the native library refuses a second one, and so do we, before touching USB. */
-    private val sessionOpen = AtomicBoolean(false)
+    /** Key actual framework attachment identity before touching claims/configuration. */
+    private val sessionOwners = UsbAttachmentOwners()
 
     /**
      * Open explicit standalone USB input after USB permission through [requestPermission]. Android
@@ -219,7 +219,8 @@ public object UsbDac {
         if (!manager.hasPermission(device.device)) {
             throw DacException(DacErrorCode.PERMISSION_DENIED, "no USB permission for ${device.productName}")
         }
-        if (!sessionOpen.compareAndSet(false, true)) throw DacException(DacErrorCode.BUSY, "another USB audio session is open")
+        val ownership = sessionOwners.acquire(device.device.deviceId, device.device.deviceName)
+            ?: throw DacException(DacErrorCode.BUSY, "this USB attachment already has a session")
         var connection: android.hardware.usb.UsbDeviceConnection? = null
         var claims: ClaimedInterfaces? = null
         var selection: UsbConfigurationSelection? = null
@@ -259,7 +260,7 @@ public object UsbDac {
             selected.verify()
             nativeRegistrationAttempted = true
             nativeDac = nativeCall { Native.dacOpenCaptureDevice(fd, infoJson(owned.ids, configuration), config.toNativeJson()) }
-            return DacCaptureSession(nativeDac, device, opened, owned, selected) { sessionOpen.set(false) }
+            return DacCaptureSession(nativeDac, device, opened, owned, selected) { ownership.close() }
         } catch (error: Throwable) {
             if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
             val retainedClaims = claims
@@ -272,11 +273,11 @@ public object UsbDac {
                     logWarning("restoring USB configuration after open failed", it)
                 }
                 runCatching { retainedConnection?.close() }
-                sessionOpen.set(false)
+                ownership.close()
             }
-            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
+            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitConnectionRetirement(retainedConnection?.fileDescriptor ?: -1) }.getOrDefault(false)) release()
             else Thread({
-                while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
+                while (!runCatching { Native.dacAwaitConnectionRetirement(retainedConnection?.fileDescriptor ?: -1) }.getOrDefault(false)) runCatching { Thread.sleep(50) }
                 release()
             }, "usbdac-capture-open-retirement").start()
             if (error is SecurityException) throw DacException(DacErrorCode.PERMISSION_DENIED, "Android denied USB capture permission", error)
@@ -332,9 +333,8 @@ public object UsbDac {
         if (!manager.hasPermission(device.device)) {
             throw DacException(DacErrorCode.PERMISSION_DENIED, "no USB permission for ${device.productName}")
         }
-        if (!sessionOpen.compareAndSet(false, true)) {
-            throw DacException(DacErrorCode.BUSY, "another DAC session is open in this process")
-        }
+        val ownership = sessionOwners.acquire(device.device.deviceId, device.device.deviceName)
+            ?: throw DacException(DacErrorCode.BUSY, "this USB attachment already has a session")
         var connection: android.hardware.usb.UsbDeviceConnection? = null
         var claims: ClaimedInterfaces? = null
         var selection: UsbConfigurationSelection? = null
@@ -403,7 +403,7 @@ public object UsbDac {
                 else Native.dacOpen(fd, infoJson(nativeConfigurationId, unavailable), config.toNativeJson())
             }
             nativeDac = dac
-            return DacSession.create(dac, device, config, connection, ownedClaims, selected, duplexEnabled = duplex) { sessionOpen.set(false) }
+            return DacSession.create(dac, device, config, connection, ownedClaims, selected, duplexEnabled = duplex) { ownership.close() }
         } catch (error: Throwable) {
             if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
             val retainedClaims = claims
@@ -416,13 +416,13 @@ public object UsbDac {
                     logWarning("restoring USB configuration after open failed", it)
                 }
                 runCatching { retainedConnection?.close() }
-                sessionOpen.set(false)
+                ownership.close()
             }
             // Open can fail after native registration; the native retirement gate is
             // authoritative even when no public handle was returned.
-            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) release()
+            if (!nativeRegistrationAttempted || error is LinkageError || runCatching { Native.dacAwaitConnectionRetirement(retainedConnection?.fileDescriptor ?: -1) }.getOrDefault(false)) release()
             else Thread({
-                while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) runCatching { Thread.sleep(50) }
+                while (!runCatching { Native.dacAwaitConnectionRetirement(retainedConnection?.fileDescriptor ?: -1) }.getOrDefault(false)) runCatching { Thread.sleep(50) }
                 release()
             }, "usbdac-open-retirement").start()
             if (error is SecurityException) throw DacException(DacErrorCode.PERMISSION_DENIED, "Android denied USB audio permission", error)

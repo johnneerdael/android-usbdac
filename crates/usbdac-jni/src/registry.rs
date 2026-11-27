@@ -233,6 +233,32 @@ fn stale(kind: &str, id: i64) -> Error {
     Error::InvalidArgument(format!("{kind} handle {id} is not open"))
 }
 
+struct RetirementEntry { owner: u64, token: usbdac_core::UsbRetirement }
+static RETIREMENTS: Lazy<Mutex<HashMap<u64, RetirementEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Allocate at most one retirement token per live owner, atomically with lookup.
+pub fn retirement_token(owner: i64) -> Result<u64, Error> {
+    let owner = u64::try_from(owner).map_err(|_| stale("DAC", owner))?;
+    let dacs = DACS.lock();
+    let entry = dacs.get(&owner).ok_or_else(|| stale("DAC", owner as i64))?;
+    let mut tokens = RETIREMENTS.lock();
+    if let Some((id, _)) = tokens.iter().find(|(_, entry)| entry.owner == owner) { return Ok(*id); }
+    let id = next_id();
+    tokens.insert(id, RetirementEntry { owner, token: entry.dac.retirement() });
+    Ok(id)
+}
+fn retirement(token: i64) -> Result<usbdac_core::UsbRetirement, Error> {
+    u64::try_from(token).ok().and_then(|id| RETIREMENTS.lock().get(&id).map(|entry| entry.token.clone())).ok_or_else(|| stale("retirement", token))
+}
+pub fn await_retirement(token: i64) -> Result<bool, Error> {
+    Ok(retirement(token)?.wait(std::time::Duration::from_millis(500)))
+}
+pub fn release_retirement(token: i64) -> Result<(), Error> {
+    if !retirement(token)?.wait(std::time::Duration::ZERO) { return Err(Error::InvalidState("USB owner has not retired".into())); }
+    RETIREMENTS.lock().remove(&(token as u64)).ok_or_else(|| stale("retirement", token))?;
+    Ok(())
+}
+
 pub fn insert_dac(entry: DacEntry) -> u64 {
     let id = next_id();
     DACS.lock().insert(id, Arc::new(entry));
@@ -263,17 +289,15 @@ pub fn remove_dac(id: i64) -> Result<(Arc<DacEntry>, Vec<Arc<DacStream>>), Error
     Ok((entry, streams))
 }
 
-pub fn insert_stream(dac: &Arc<DacEntry>, stream: DacStream) -> u64 {
+/// Commit under the owner lock: a racing DAC close either collects this stream or rejects it.
+pub fn insert_stream(dac: &Arc<DacEntry>, stream: DacStream) -> Result<u64, Error> {
+    let owners = DACS.lock();
+    let owner = owners.iter().find(|(_, entry)| Arc::ptr_eq(entry, dac)).map(|(id, _)| *id)
+        .ok_or_else(|| Error::InvalidState("DAC closed while playback was opening".into()))?;
     let id = next_id();
-    let owner = DACS
-        .lock()
-        .iter()
-        .find(|(_, entry)| Arc::ptr_eq(entry, dac))
-        .map(|(id, _)| *id)
-        .unwrap_or(0);
     STREAMS.lock().insert(id, (owner, Arc::new(stream)));
     dac.add_stream(id);
-    id
+    Ok(id)
 }
 
 pub fn stream(id: i64) -> Result<Arc<DacStream>, Error> {
@@ -357,5 +381,8 @@ mod tests {
         assert!(matches!(remove_capture(-1), Err(Error::InvalidArgument(_))));
         assert!(remove_dac_captures(0).is_empty());
         assert!(remove_dac(0).is_err());
+        assert!(retirement_token(0).is_err());
+        assert!(await_retirement(0).is_err());
+        assert!(release_retirement(0).is_err());
     }
 }

@@ -106,7 +106,7 @@ public class DacSession private constructor(
     private val deviceListener = object : NativeListener {
         override fun onEvent(type: Int, a: Long, b: Double, message: String?) {
             val event = decodeEvent(type, a, b, message)
-            if (event is DacEvent.DeviceLost) mutableState.update { DacState.LOST }
+            if (event is DacEvent.DeviceLost) mutableState.update { if (it == DacState.CLOSED) it else DacState.LOST }
             mutableEvents.tryEmit(event)
         }
     }
@@ -175,9 +175,14 @@ public class DacSession private constructor(
         lateinit var opened: DacStream
         opened = DacStream(handle, format, signals) { streamClosed(opened) }
         stream = opened
-        signals.seedBitPerfect(nativeCall { Native.streamIsBitPerfect(handle) })
-        mutableState.update { if (it == DacState.READY) DacState.STREAMING else it }
-        return opened
+        try {
+            signals.seedBitPerfect(nativeCall { Native.streamIsBitPerfect(handle) })
+            mutableState.update { if (it == DacState.READY) DacState.STREAMING else it }
+            return opened
+        } catch (error: Throwable) {
+            runCatching { opened.close() }.onFailure(error::addSuppressed)
+            throw error
+        }
     }
 
     /**
@@ -277,6 +282,8 @@ public class DacSession private constructor(
     @Synchronized
     public fun close(handBack: HandBack) {
         if (!closed.compareAndSet(false, true)) return
+        val retirement = runCatching { Native.dacRetirementToken(dac) }.getOrDefault(0L)
+        fun retired() = runCatching { if (retirement != 0L) Native.dacAwaitRetirementToken(retirement) else Native.dacAwaitConnectionRetirement(connection.fileDescriptor) }.getOrDefault(false)
         var failure: DacException? = null
         try {
             runCatching { synchronized(this) { duplex ?: stream }?.close() }.onFailure { logWarning("closing the stream failed", it) }
@@ -297,6 +304,7 @@ public class DacSession private constructor(
             }
         } finally {
             fun releaseHostOwnership() {
+                if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }
                 claims.release()
                 runCatching { configurationSelection.restore() }.onFailure {
                     logWarning("restoring USB configuration failed", it)
@@ -305,11 +313,11 @@ public class DacSession private constructor(
                 runCatching { connection.close() }
                 onClosed()
             }
-            if (runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+            if (retired()) {
                 releaseHostOwnership()
             } else {
                 Thread({
-                    while (!runCatching { Native.dacAwaitRetirement() }.getOrDefault(false)) {
+                    while (!retired()) {
                         runCatching { Thread.sleep(50) }
                     }
                     releaseHostOwnership()

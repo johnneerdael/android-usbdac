@@ -439,14 +439,14 @@ pub(crate) fn scarlett_read() -> Result<crate::scarlett::RoutingReadback, Routin
     Ok(readback)
 }
 
-struct RecordedScarlett {
+pub(super) struct RecordedScarlett {
     device: UsbDevice,
     configuration: u8,
     descriptors: Vec<u8>,
     rows: BTreeMap<u8, (crate::scarlett::MixReadback, crate::scarlett::MixReadback)>,
     mux: Option<(crate::scarlett::MuxSnapshot, crate::scarlett::MuxSnapshot)>,
 }
-static ORIGINAL_SCARLETT: Mutex<Option<RecordedScarlett>> = Mutex::new(None);
+static ORIGINAL_SCARLETT: context::ScopedMutex<Option<RecordedScarlett>> = context::ScopedMutex::new(|context| context.scarlett.clone());
 
 /// The caller owns session/volume serialization. Recheck exact claim and USB
 /// identity for every operation, including configured hand-back.
@@ -621,13 +621,13 @@ struct Gen1Binding {
     configuration: u8,
     descriptors: Vec<u8>,
 }
-struct RecordedGen1 {
+pub(super) struct RecordedGen1 {
     binding: Gen1Binding,
     original: crate::scarlett::Gen1Readback,
     last: crate::scarlett::Gen1Readback,
     uncertain: bool,
 }
-static ORIGINAL_GEN1: Mutex<Option<RecordedGen1>> = Mutex::new(None);
+static ORIGINAL_GEN1: context::ScopedMutex<Option<RecordedGen1>> = context::ScopedMutex::new(|context| context.gen1.clone());
 
 fn gen1_target(device: &UsbDevice, descriptors: &[u8])
     -> Result<(crate::scarlett::Gen1Model, u8), RoutingSessionError> {
@@ -786,7 +786,7 @@ fn finish_gen1_hand_back() {
     if let Err(error) = restore() {log_warn!("[USB] Original Gen1 controls not restored: {error}");}
 }
 
-struct RecordedFcp {
+pub(super) struct RecordedFcp {
     device: UsbDevice,
     configuration: u8,
     descriptors: Vec<u8>,
@@ -794,7 +794,7 @@ struct RecordedFcp {
     last: crate::scarlett::FcpReadback,
     uncertain: bool,
 }
-static ORIGINAL_FCP: Mutex<Option<RecordedFcp>> = Mutex::new(None);
+static ORIGINAL_FCP: context::ScopedMutex<Option<RecordedFcp>> = context::ScopedMutex::new(|context| context.fcp.clone());
 
 pub(crate) fn fcp_apply(
     expected: &crate::scarlett::FcpReadback,
@@ -2125,13 +2125,13 @@ pub(crate) fn read_with_power(
 }
 
 #[derive(Debug)]
-struct RecordedRouting {
+pub(super) struct RecordedRouting {
     snapshot: RoutingSnapshot,
     // Original and last library-written value for each edited control.
     values: BTreeMap<ControlKey, (RouteValue, RouteValue)>,
     powered: bool,
 }
-static ORIGINAL_ROUTING: Mutex<Option<RecordedRouting>> = Mutex::new(None);
+static ORIGINAL_ROUTING: context::ScopedMutex<Option<RecordedRouting>> = context::ScopedMutex::new(|context| context.routing.clone());
 
 pub(crate) fn apply(
     snapshot: &RoutingSnapshot,

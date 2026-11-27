@@ -41,6 +41,10 @@ internal object Native {
     @JvmStatic external fun dacOpen(fd: Int, deviceInfoJson: String, configJson: String?): Long
     @JvmStatic external fun dacClose(dac: Long)
     @JvmStatic external fun dacAwaitRetirement(): Boolean
+    @JvmStatic external fun dacRetirementToken(dac: Long): Long
+    @JvmStatic external fun dacAwaitRetirementToken(token: Long): Boolean
+    @JvmStatic external fun dacReleaseRetirementToken(token: Long)
+    @JvmStatic external fun dacAwaitConnectionRetirement(fd: Int): Boolean
     @JvmStatic external fun pioneerDjmDiscover(dac: Long): String
     @JvmStatic external fun pioneerDjmApply(dac: Long, editJson: String): String
     @JvmStatic external fun scarlettPreflight(fd: Int, deviceInfoJson: String): String

@@ -644,7 +644,7 @@ pub(super) fn run_usb_output_loop(
         Ok(profile) => (profile.is_some(), profile.as_ref().is_some_and(|profile| profile.rate_control)),
         Err(message) => { set_last_error(Some(message.clone())); set_engine_state(EngineState::Error, Some(message.clone())); shared.fail(Error::Transfer(message)); set_stream_active(false); return; }
     };
-    let playback_first=vendor_playback_first || (settings().has(crate::Quirk::PlaybackFirst)
+    let playback_first=vendor_playback_first || (settings().source_has(crate::Quirk::PlaybackFirst)
         && candidate.implicit_feedback.is_some() && playback_format.dsd_transport==DsdTransportMode::None);
     let channels = candidate.channels as usize;
     let bytes_per_frame = slot_bytes.saturating_mul(channels);

@@ -1208,7 +1208,7 @@ pub(super) fn strict_implicit_clock(
 // Kept outside SessionState so frozen registration/test fixtures need no new
 // fields. USB_SESSION_GATE / SessionGuard serialize the lifecycle operations.
 #[derive(Clone)]
-struct SelectedClockRoute {
+pub(super) struct SelectedClockRoute {
     fd: RawFd,
     control: u8,
     streaming: u8,
@@ -1216,7 +1216,7 @@ struct SelectedClockRoute {
     choice: Option<ClockChoice>,
     frequency: Option<CaptureFrequency>,
 }
-static SELECTED_CLOCK_ROUTE: Mutex<Option<SelectedClockRoute>> = Mutex::new(None);
+static SELECTED_CLOCK_ROUTE: context::ScopedMutex<Option<SelectedClockRoute>> = context::ScopedMutex::new(|context| context.clock_route.clone());
 
 /// A unique UAC2 IAD must prove ownership before automatic selector changes.
 /// No adjacency or globally repeated terminal IDs may establish this relation.

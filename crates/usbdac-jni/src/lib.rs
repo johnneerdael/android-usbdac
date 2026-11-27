@@ -240,6 +240,24 @@ pub fn dac_await_retirement<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) ->
     })
 }
 
+/// Retains an owner-specific retirement token across removal of its DAC handle.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> i64 {
+    run(&mut env, |_env| Ok(registry::retirement_token(dac)? as i64))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_await_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, token: i64) -> bool {
+    run(&mut env, |_env| registry::await_retirement(token).map_err(Into::into))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_release_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, token: i64) {
+    run(&mut env, |_env| registry::release_retirement(token).map_err(Into::into))
+}
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_await_connection_retirement<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32) -> bool {
+    run(&mut env, |_env| Dac::await_connection_retirement(fd, std::time::Duration::from_millis(500)).map_err(Into::into))
+}
+
 /// Closes the DAC and every stream opened from it. The handle is invalid
 /// afterwards. A close that fails still releases the handle.
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -344,7 +362,7 @@ pub fn stream_open<'l>(
         let listener = listener_of(env, &listener)?
             .ok_or_else(|| Failure::Bad("the stream listener must not be null".into()))?;
         let stream = entry.dac.open_stream(&format, listener)?;
-        Ok(registry::insert_stream(&entry, stream) as i64)
+        Ok(registry::insert_stream(&entry, stream)? as i64)
     })
 }
 

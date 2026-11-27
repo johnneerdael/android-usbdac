@@ -852,7 +852,7 @@ pub(super) fn build_usb_capability_model(
 
                 let Ok((max_packet_bytes, service_interval_us)) =
                     standard_endpoint_geometry(&endpoint, speed) else { continue; };
-                let max_packet_bytes=if settings().has(crate::Quirk::TxLengthPrefix) {
+                let max_packet_bytes=if settings().source_has(crate::Quirk::TxLengthPrefix) {
                     if descriptor.interface_number()!=1 || !stream_format.is_uac1 || stream_format.format_tag!=FORMAT_TAG_PCM {continue;}
                     let Some(capacity)=max_packet_bytes.checked_sub(4) else {continue;};
                     capacity
@@ -866,7 +866,7 @@ pub(super) fn build_usb_capability_model(
                     speed,
                 ) else { continue; };
                 let feedback_address = discovered_feedback.map(|feedback| feedback.address);
-                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) || settings().has(crate::Quirk::TxLengthPrefix) {
+                let (mut endpoint_ranges, mut endpoint_rates) = if matches!(speed, Speed::Super | Speed::SuperPlus) || settings().source_has(crate::Quirk::TxLengthPrefix) {
                     capacity_limited_rates(&sample_rate_ranges, max_packet_bytes, service_interval_us,
                         usize::from(stream_format.channels) * usize::from(stream_format.subslot_size))
                 } else {
@@ -1334,7 +1334,7 @@ pub(super) fn select_stream_candidates(
                 );
                 let Ok((max_packet_bytes, service_interval_us)) =
                     standard_endpoint_geometry(&endpoint, speed) else { continue; };
-                let max_packet_bytes=if settings().has(crate::Quirk::TxLengthPrefix) {
+                let max_packet_bytes=if settings().source_has(crate::Quirk::TxLengthPrefix) {
                     if descriptor.interface_number()!=1 || !stream_format.is_uac1 || stream_format.format_tag!=FORMAT_TAG_PCM {continue;}
                     let Some(capacity)=max_packet_bytes.checked_sub(4) else {continue;};
                     capacity

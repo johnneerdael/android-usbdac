@@ -343,7 +343,7 @@ impl FeedforwardEndpoint {
         Ok((value as u32).to_le_bytes()[..self.bytes].to_vec())
     }
 }
-static NEGOTIATED: Lazy<Mutex<Option<Adc3Route>>> = Lazy::new(|| Mutex::new(None));
+static NEGOTIATED: context::ScopedMutex<Option<Adc3Route>> = context::ScopedMutex::new(|context| context.adc3_route.clone());
 pub(super) fn clear_adc3_negotiation() {
     *NEGOTIATED.lock() = None;
 }

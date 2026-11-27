@@ -87,7 +87,7 @@ pub(super) struct IsoTransferSlot {
 }
 
 pub(super) fn data_packet_prefix_bytes() -> usize {
-    if settings().has(crate::Quirk::TxLengthPrefix) {4} else {0}
+    if settings().source_has(crate::Quirk::TxLengthPrefix) {4} else {0}
 }
 
 fn add_tx_length_prefix(payload:&mut IsoTransferPayload) -> Result<(),String> {
@@ -185,7 +185,7 @@ impl IsoTransferSlot {
 
         // Payload verification ran before framing. The extra bytes carry no
         // samples and never enter queued frame/music counts.
-        if endpoint & 0x80 == 0 && settings().has(crate::Quirk::TxLengthPrefix) {
+        if endpoint & 0x80 == 0 && settings().source_has(crate::Quirk::TxLengthPrefix) {
             add_tx_length_prefix(&mut payload)?;
         }
         self.retirement_context = Some(handle.context().clone());
@@ -2101,5 +2101,44 @@ mod tx_length_prefix_tests {
             assert_eq!(&payload.transfer_buffer[14..20],&bytes[6..]);
             assert_eq!(payload.frame_count,2);assert_eq!(payload.music_frames,if held {0} else {2});assert_eq!(payload.epoch,7);
         }
+    }
+}
+
+#[cfg(test)]
+mod source_wire_owner_policy_tests {
+    use super::*;
+    use crate::{DacConfig,DeviceInfo,QuirkOverride,QuirkPolicy};
+    #[test]
+    fn host_flag_names_cannot_enable_wire_framing_or_playback_bootstrap() {
+        let a=context::SessionContext::unregistered();
+        let b=context::SessionContext::unregistered();
+        let _a=a.enter();
+        crate::settings::install(crate::settings::Settings::for_device(DacConfig {
+            quirk_policy:QuirkPolicy::SourceBacked,
+            quirks:vec![QuirkOverride {vendor_id:1,product_id:2,name_contains:None,
+                quirks:vec![crate::Quirk::TxLengthPrefix,crate::Quirk::PlaybackFirst]}],
+            ..DacConfig::default()
+        },&DeviceInfo::new(1,2,"caller metadata")));
+        assert!(settings().has(crate::Quirk::TxLengthPrefix));
+        assert!(settings().has(crate::Quirk::PlaybackFirst));
+        assert_eq!(data_packet_prefix_bytes(),0);
+        assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
+        // The internal descriptor path, rather than caller names/overrides,
+        // resolves one exact source fact under its owning context.
+        crate::settings::install_descriptor_identity(0x1686,0x00dd,0x0100);
+        assert_eq!(data_packet_prefix_bytes(),4);
+        assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
+        {
+            let _b=b.enter();
+            assert_eq!(data_packet_prefix_bytes(),0);
+            crate::settings::install(crate::settings::Settings::for_device(DacConfig {
+                quirk_policy:QuirkPolicy::SourceBacked,..DacConfig::default()
+            },&DeviceInfo::new(9,9,"caller metadata")));
+            crate::settings::install_descriptor_identity(0x1397,0x0507,0x0100);
+            assert!(settings().source_has(crate::Quirk::PlaybackFirst));
+            assert_eq!(data_packet_prefix_bytes(),0);
+        }
+        assert_eq!(data_packet_prefix_bytes(),4);
+        assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
     }
 }

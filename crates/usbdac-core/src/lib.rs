@@ -30,7 +30,7 @@
 //! # Ok(()) }
 //! ```
 //!
-//! v0.1 supports one open [`Dac`] per process.
+//! Distinct USB attachments have independent [`Dac`] owners and retirement tokens.
 
 #[macro_use]
 mod macros;
@@ -81,7 +81,7 @@ pub use capabilities::{
 };
 pub use clock_resolution::{ClockChoice, ClockHop, ClockHopKind, ClockResolution};
 pub use config::{AsyncFallbackPolicy, ClockReadbackPolicy, CloseVolume, DacConfig, HandBack, QuirkOverride, StartupVolume, UsbQueueProfile};
-pub use dac::{Dac, StreamReconfiguration};
+pub use dac::{Dac, StreamReconfiguration, UsbRetirement};
 pub use async_volume::{AsyncVolumeControl, VolumeOperation};
 pub use fake::{PlaybackDevice, PlaybackStream};
 pub use hotplug::{HotplugEvent, HotplugHub, HotplugSubscription, LinuxHotplugMonitor, UsbAttachment, UsbPermission};

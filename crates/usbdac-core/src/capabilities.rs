@@ -284,7 +284,8 @@ pub struct ShippedSupport {
     pub playback: bool,
     pub pcm_capture: bool,
     pub duplex: bool,
-    pub max_open_devices: usize,
+    /// None means no process-wide cap; each physical attachment has one owner.
+    pub max_open_devices: Option<usize>,
     pub vendor_protocols: bool,
     pub type_i_formats: &'static [&'static str],
 }
@@ -294,7 +295,7 @@ pub const SHIPPED_SUPPORT: ShippedSupport = ShippedSupport {
     playback: true,
     pcm_capture: true,
     duplex: true,
-    max_open_devices: 1,
+    max_open_devices: None,
     vendor_protocols: false,
     type_i_formats: &["signed_pcm", "unsigned_pcm8", "float32"],
 };

@@ -1,15 +1,12 @@
 //! The per-session settings the transport consults: the configuration plus the
 //! quirks resolved for the open device.
 //!
-//! v0.1 keeps one process-wide session, so these live in a process-wide slot
-//! installed by [`Dac::open`](crate::Dac::open). Nothing outside the crate sees
-//! that; moving them into the session object later changes no public API.
+//! Settings are owned by the explicitly scoped DAC context; worker threads and
+//! facade calls select that owner for their full operation.
 
 use crate::capabilities::DeviceInfo;
 use crate::config::DacConfig;
 use crate::quirk::{builtin_quirks, Quirk};
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// Default wait after programming the clock.
@@ -45,6 +42,13 @@ impl Settings {
 
     pub(crate) fn has(&self, quirk: Quirk) -> bool {
         self.quirks.contains(&quirk) || self.source_quirks.contains(&quirk)
+    }
+
+    /// Wire behaviors requiring descriptor-backed identity cannot be enabled
+    /// through a caller's generic QuirkOverride.
+    pub(crate) fn source_has(&self, quirk: Quirk) -> bool {
+        self.config.quirk_policy == crate::quirk::QuirkPolicy::SourceBacked
+            && self.source_quirks.contains(&quirk)
     }
 
     pub(crate) fn control_delay_us(&self) -> u64 {
@@ -149,21 +153,21 @@ impl Settings {
     }
 }
 
-static SETTINGS: Lazy<RwLock<Arc<Settings>>> =
-    Lazy::new(|| RwLock::new(Arc::new(Settings::default())));
+
 
 /// The settings of the open session, or the defaults when none is open.
 pub(crate) fn settings() -> Arc<Settings> {
-    SETTINGS.read().clone()
+    crate::transport::context::current().settings.read().clone()
 }
 
 pub(crate) fn install(settings: Settings) {
-    *SETTINGS.write() = Arc::new(settings);
+    *crate::transport::context::current().settings.write() = Arc::new(settings);
 }
 
 /// Resolve source facts only from the descriptor read through the opened fd.
 pub(crate) fn install_descriptor_identity(vendor: u16, product: u16, revision: u16) {
-    let mut guard = SETTINGS.write();
+    let context = crate::transport::context::current();
+    let mut guard = context.settings.write();
     let mut next = (**guard).clone();
     let first = next.descriptor_identity != Some((vendor,product,revision));
     next.descriptor_identity = Some((vendor,product,revision));
@@ -182,13 +186,14 @@ pub(crate) fn install_descriptor_identity(vendor: u16, product: u16, revision: u
 }
 
 pub(crate) fn reset() {
-    *SETTINGS.write() = Arc::new(Settings::default());
+    *crate::transport::context::current().settings.write() = Arc::new(Settings::default());
 }
 
 /// Changes the configuration of the installed settings in place, keeping the
 /// quirks resolved for the open device.
 pub(crate) fn update(change: impl FnOnce(&mut DacConfig)) {
-    let mut guard = SETTINGS.write();
+    let context = crate::transport::context::current();
+    let mut guard = context.settings.write();
     let mut settings = (**guard).clone();
     change(&mut settings.config);
     *guard = Arc::new(settings);

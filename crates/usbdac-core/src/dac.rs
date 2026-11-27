@@ -38,6 +38,7 @@ fn reconfigure_or_restore<T>(requested: &StreamRequest, previous: &StreamRequest
 /// State shared by the `Dac`, its streams and its volume handle.
 pub(crate) struct DacShared {
     pub(crate) events: EventSink,
+    pub(crate) context: Arc<transport::context::SessionContext>,
     pub(crate) info: DeviceInfo,
     pub(crate) config: DacConfig,
     closed: AtomicBool,
@@ -51,6 +52,11 @@ impl DacShared {
         if stream.shared.stats.feedback_trace.is_some() {
             *self.last_feedback_stream.lock() = Some((format.clone(), Arc::clone(&stream.shared.stats)));
         }
+    }
+
+    pub(crate) fn enter(&self) -> Result<transport::context::Scope> {
+        self.ensure_open()?;
+        Ok(self.context.enter())
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -74,6 +80,7 @@ impl DacShared {
     /// (`None`) or with what the host decided at close.
     fn shutdown(&self, volume: Option<CloseVolume>) -> Result<()> {
         let _control = self.control_guard.lock();
+        let _scope = self.context.enter();
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -112,8 +119,8 @@ impl DacShared {
 
 /// An open USB DAC.
 ///
-/// v0.1 supports one open `Dac` per process; a second [`Dac::open`] returns
-/// [`Error::Busy`] until the first is closed or dropped. The host keeps its
+/// Distinct USB attachments have independent owners. Opening the same physical
+/// attachment twice returns [`Error::Busy`] until its owner retires. The host keeps its
 /// `UsbDeviceConnection` open until then.
 pub struct Dac {
     shared: Arc<DacShared>,
@@ -141,6 +148,8 @@ impl Dac {
     /// active configuration and the sole interface the host may claim.
     pub fn vendor_pcm_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<(u8, u8)>> {
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() { return Err(Error::Busy); }
         transport::api::vendor_pcm_preflight(fd, info)
     }
@@ -149,6 +158,8 @@ impl Dac {
     /// interface claim set for a fixed-rate vendor PCM profile.
     pub fn vendor_pcm_claims_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<(u8, Vec<u8>)>> {
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() { return Err(Error::Busy); }
         transport::api::vendor_pcm_claims_preflight(fd, info)
     }
@@ -157,6 +168,8 @@ impl Dac {
     /// Requires the host-selected configuration; sends no proprietary requests.
     pub fn scarlett_routing_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>> {
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() { return Err(Error::Busy); }
         transport::routing_hw::scarlett_preflight(fd, info)
     }
@@ -166,6 +179,8 @@ impl Dac {
     /// `(configuration, control_interfaces, input_interfaces)` without audio.
     pub fn capture_preflight(fd: RawFd, info: &DeviceInfo) -> Result<(u8, Vec<u8>, Vec<u8>)> {
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() { return Err(Error::Busy); }
         let device = transport::api::capture_preflight_device(fd, info)?;
         Ok(device)
@@ -178,13 +193,16 @@ impl Dac {
     pub fn open_capture_device(fd: RawFd, info: DeviceInfo, config: DacConfig) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() { return Err(Error::Busy); }
         settings::install(Settings::for_device(config.clone(), &info));
         if let Err(error) = transport::api::open_capture_device(fd, &info) {
             settings::reset();
             return Err(error);
         }
-        Ok(Dac { shared: Arc::new(DacShared { events: EventHub::start(), info, config,
+        context.admit();
+        Ok(Dac { shared: Arc::new(DacShared { context: transport::context::current(), events: EventHub::start(), info, config,
             closed: AtomicBool::new(false), control_guard: Mutex::new(()), stream: Mutex::new(None),
             last_feedback_stream: Mutex::new(None) }) })
     }
@@ -195,23 +213,40 @@ impl Dac {
     pub fn open_capture(&self, request: &crate::capture::CaptureRequest, capacity_frames: usize)
         -> Result<crate::capture::DacCaptureStream>
     {
-        self.shared.ensure_open()?;
+        let _control = self.shared.control_guard.lock();
+        let _scope = self.shared.enter()?;
         let handle = transport::capture_stream::open_capture(request, capacity_frames, self.shared.events.clone())?;
         Ok(crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), handle))
     }
 
-    /// Wait until USB activity has retired before releasing the host's claimed interfaces and FD.
+    /// Capture owner-specific retirement evidence before consuming `close`.
+    /// Retain this token with this device's claims/FD after a close timeout;
+    /// another open device does not affect its result.
+    pub fn retirement(&self) -> UsbRetirement {
+        UsbRetirement { context: self.shared.context.clone() }
+    }
+
+    /// Wait until all process USB owners retire. For a particular connection,
+    /// use [`Dac::retirement`] so another active DAC does not block hand-back.
     ///
     /// After [`Dac::close`] returns a transfer timeout, retain all host ownership
     /// and call this until it returns `true`. This does not require a live `Dac` handle.
+    /// Check retirement using the actual host connection FD after a failed open.
+    /// The host must keep this FD valid; caller-supplied USB names are not identity.
+    pub fn await_connection_retirement(fd: RawFd, timeout: Duration) -> Result<bool> {
+        transport::context::await_connection_retirement(fd, timeout)
+    }
+
     pub fn await_usb_retirement(timeout: Duration) -> bool {
-        transport::api::await_usb_retirement(timeout)
+        transport::context::await_all_retirement(timeout)
     }
 
     /// Identify optional capture interfaces after the host claims the base audio interfaces.
     /// Returns the active configuration ID and source interface numbers without starting audio.
     pub fn feedback_preflight(fd: RawFd, info: &DeviceInfo) -> Result<(u8, Vec<u8>)> {
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() {
             return Err(Error::Busy);
         }
@@ -247,6 +282,8 @@ impl Dac {
     fn open_playback_device(fd: RawFd, info: DeviceInfo, config: DacConfig, duplex: bool) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
+        let context = transport::context::SessionContext::reserve(fd)?;
+        let _scope = context.enter();
         if transport::session::session_registered() {
             return Err(Error::Busy);
         }
@@ -257,6 +294,7 @@ impl Dac {
             settings::reset();
             return Err(error);
         }
+        context.admit();
         let events = EventHub::start();
         // The start-up step lowered the level before this handle existed: tell
         // the first listener, as a change made through the library.
@@ -265,6 +303,7 @@ impl Dac {
         }
         Ok(Dac {
             shared: Arc::new(DacShared {
+                context: transport::context::current(),
                 events,
                 info,
                 config,
@@ -290,7 +329,7 @@ impl Dac {
 
     /// What the DAC offers, from the descriptors scanned at open.
     pub fn capabilities(&self) -> Result<Capabilities> {
-        self.shared.ensure_open()?;
+        let _scope = self.shared.enter()?;
         transport::api::capabilities()
     }
 
@@ -310,7 +349,7 @@ impl Dac {
     }
 
     fn negotiate_locked(&self, request: &StreamRequest) -> Result<StreamFormat> {
-        self.shared.ensure_open()?;
+        let _scope = self.shared.enter()?;
         transport::api::negotiate(request)
     }
 
@@ -335,7 +374,7 @@ impl Dac {
     }
 
     fn open_stream_locked(&self, format: &StreamFormat, listener: Arc<dyn DacListener>) -> Result<DacStream> {
-        self.shared.ensure_open()?;
+        let _scope = self.shared.enter()?;
         let mut slot = self.shared.stream.lock();
         if slot
             .as_ref()
@@ -374,7 +413,7 @@ impl Dac {
     pub fn reconfigure_stream(&self, current: &DacStream, request: &StreamRequest,
         listener: Arc<dyn DacListener>, drain_timeout: Duration) -> Result<StreamReconfiguration> {
         let _control = self.shared.control_guard.lock();
-        self.shared.ensure_open()?;
+        let _scope = self.shared.enter()?;
         transport::api::playback_format_from_request(request)?;
         let identity = current.reconfigure_identity(&self.shared)?;
         let previous = current.format().request;
@@ -435,7 +474,8 @@ impl Dac {
         capacity_frames: usize, listener: Arc<dyn DacListener>)
         -> Result<(DacStream, crate::capture::DacCaptureStream)> {
         let _control = self.shared.control_guard.lock();
-        self.shared.ensure_open()?;
+
+        let _scope = self.shared.enter()?;
         let mut slot = self.shared.stream.lock();
         if slot.as_ref().and_then(Weak::upgrade).is_some_and(|stream| !stream.is_closed()) {
             return Err(Error::Busy);
@@ -455,7 +495,8 @@ impl Dac {
 
     /// The hardware volume control, if the DAC has a writable one.
     pub fn volume(&self) -> Option<VolumeControl> {
-        if self.shared.ensure_open().is_err() || !transport::volume_hw::has_hardware_volume() {
+        let _scope = self.shared.enter().ok()?;
+        if !transport::volume_hw::has_hardware_volume() {
             return None;
         }
         Some(VolumeControl::new(Arc::clone(&self.shared)))
@@ -500,7 +541,7 @@ impl Dac {
     /// [`capabilities`](Self::capabilities) reflects a new subslot size after the
     /// next [`negotiate`](Self::negotiate). `subslot` must be 1, 2 or 4.
     pub fn set_dsd_overrides(&self, big_endian: Option<bool>, subslot: Option<u8>) -> Result<()> {
-        self.shared.ensure_open()?;
+        let _scope = self.shared.enter()?;
         if subslot.is_some_and(|size| !matches!(size, 1 | 2 | 4)) {
             return Err(Error::InvalidArgument(
                 "dsd_subslot must be 1, 2 or 4".to_string(),
@@ -512,6 +553,13 @@ impl Dac {
         });
         Ok(())
     }
+}
+
+/// A particular DAC owner's USB retirement, independent of other devices.
+#[derive(Clone)]
+pub struct UsbRetirement { context: Arc<transport::context::SessionContext> }
+impl UsbRetirement {
+    pub fn wait(&self, timeout: Duration) -> bool { self.context.retired(timeout) }
 }
 
 impl Drop for Dac {
@@ -530,13 +578,13 @@ mod tests {
     use crate::transport::session::PAYLOAD_LATCH_TEST_LOCK as SESSION_TEST_LOCK;
 
     #[test]
-    fn a_second_open_while_one_is_registered_is_busy() {
+    fn another_owner_does_not_hide_an_invalid_device_descriptor() {
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _registered = transport::session::TestSession::install();
         let info = DeviceInfo::new(1, 2, "Fake DAC");
         let error = Dac::open(-1, info, DacConfig::default()).unwrap_err();
-        assert_eq!(error, Error::Busy);
-        assert_eq!(error.code(), "busy");
+        assert!(matches!(error, Error::Claim(_)));
+        assert_eq!(error.code(), "claim");
     }
 
     #[test]
@@ -567,6 +615,7 @@ mod tests {
     fn fake_dac_handle(config: DacConfig) -> Dac {
         Dac {
             shared: Arc::new(DacShared {
+                context: transport::context::current(),
                 events: EventHub::start(),
                 info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
                 config,
@@ -753,6 +802,7 @@ mod tests {
         let seen = Arc::new(Seen(Mutex::new(Vec::new())));
         events.set_dac_listener(Some(seen.clone()));
         let shared = Arc::new(DacShared {
+            context: transport::context::current(),
             events: events.clone(),
             info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
             config: DacConfig::default(),

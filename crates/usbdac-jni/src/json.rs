@@ -621,8 +621,8 @@ fn parse_quirk(value: &Value) -> Decoded<Quirk> {
             "implicit_silence_on_empty" => Ok(Quirk::ImplicitSilenceOnEmpty),
             "skip_clock_selector_writes" => Ok(Quirk::SkipClockSelectorWrites),
             "ignore_optional_control_errors" => Ok(Quirk::IgnoreOptionalControlErrors),
-            "tx_length_prefix" => Ok(Quirk::TxLengthPrefix),
-            "playback_first" => Ok(Quirk::PlaybackFirst),
+            "tx_length_prefix" | "playback_first" => Err(BadRequest(
+                "packet framing/start ordering quirks require an exact native source-backed profile; generic host override is refused".into())),
             other => Err(unknown(other)),
         },
         Value::Object(map) if map.len() == 1 => {
@@ -1139,7 +1139,7 @@ mod source_quirk_bridge_tests {
     fn source_quirk_override_names_and_duration_units_are_distinct() {
         for (name,expected) in [
             ("fixed_rate",Quirk::FixedRate),("implicit_silence_on_empty",Quirk::ImplicitSilenceOnEmpty),
-            ("skip_clock_selector_writes",Quirk::SkipClockSelectorWrites),("tx_length_prefix",Quirk::TxLengthPrefix),
+            ("skip_clock_selector_writes",Quirk::SkipClockSelectorWrites),
             ("mixer_playback_min_mute",Quirk::MixerPlaybackMinMute),("mixer_playback_linear_volume",Quirk::MixerPlaybackLinearVolume)] {
             assert_eq!(parse_quirk(&json!(name)).map_err(|error|error.0).unwrap(),expected);
         }
@@ -1147,4 +1147,13 @@ mod source_quirk_bridge_tests {
         assert_eq!(parse_quirk(&json!({"interface_delay_ms":50})).map_err(|error|error.0).unwrap(),Quirk::InterfaceDelayMs(50));
         assert!(parse_quirk(&json!({"interface_delay_ms":-1})).is_err());
     }
+    #[test]
+    fn framing_and_start_order_cannot_be_enabled_by_unvetted_host_names() {
+        for name in ["tx_length_prefix", "playback_first"] {
+            let input = serde_json::json!({"quirks":[{"vendor_id":0x1234,"product_id":0x5678,"quirks":[name]}]}).to_string();
+            let error = parse_config(Some(&input)).unwrap_err();
+            assert!(error.0.contains("exact native source-backed profile"), "{}", error.0);
+        }
+    }
+
 }

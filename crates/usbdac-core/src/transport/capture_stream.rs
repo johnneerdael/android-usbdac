@@ -1584,9 +1584,11 @@ pub(crate) fn open_capture(
     let worker_stop = stop.clone();
     let worker_endpoint = endpoint.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let worker_context = context::current();
     let worker = thread::Builder::new()
         .name("usbdac-capture".into())
         .spawn(move || {
+            let _owner_scope = worker_context.enter();
             // Explicit local drop order keeps the guard/FD alive through retiring
             // transfer Drops, including unwinding and a failed initial submission.
             let _session = session;
