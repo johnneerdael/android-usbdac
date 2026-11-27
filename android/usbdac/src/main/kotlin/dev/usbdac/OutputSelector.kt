@@ -514,11 +514,6 @@ public class OutputSelector internal constructor(
         }
     }
 
-    /**
-     * Settles the wire format for [request]. Exactly first; and, if the policy allows conversion and the
-     * DAC cannot run it, the same rate at another depth, then the ranked supported rates. Throws the first failure when
-     * nothing works.
-     */
     private fun permitsWire(format: StreamFormat): Boolean {
         if (format.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) return false
         val limit = policy.downstreamLimits ?: return true
@@ -527,6 +522,7 @@ public class OutputSelector internal constructor(
         return format.sampleRate <= limit.maxSampleRateHz && format.validBits in limit.allowedValidBits
     }
 
+    /** Settle [request] exactly first, then try permitted conversions in ranked order. */
     private fun negotiate(link: DirectLink, request: StreamRequest): Negotiated {
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
         val first = if (request.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) {
