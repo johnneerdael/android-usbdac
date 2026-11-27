@@ -494,7 +494,7 @@ class OutputSelectorTest {
 
     @Test
     fun dop_pcm_conversion_requires_both_permissions() {
-        for (policy in listOf(OutputPolicy(force = OutputKind.ANDROID_STANDARD),
+        for (policy in listOf(OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowDopPcmConversion = false),
             OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowConversion = false, allowDopPcmConversion = true))) {
             expectError(DacErrorCode.UNSUPPORTED) { selector(FakePlatform(), policy).select(StreamRequest.dop(2_822_400, 2)) }
         }
@@ -505,7 +505,7 @@ class OutputSelectorTest {
             fakeFormat(request.sampleRate, request.bitDepth, request.bitDepth / 8)
         }
         expectError(DacErrorCode.UNSUPPORTED) {
-            selector(direct, OutputPolicy(force = OutputKind.DIRECT_USB)).select(StreamRequest.dop(2_822_400, 2))
+            selector(direct, OutputPolicy(force = OutputKind.DIRECT_USB, allowDopPcmConversion = false)).select(StreamRequest.dop(2_822_400, 2))
         }
         assertTrue(link.negotiated.none { it.encoding == StreamEncoding.PCM })
         val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowDopPcmConversion = true)
@@ -513,6 +513,16 @@ class OutputSelectorTest {
         val decision = selector(FakePlatform(), policy).select(source)
         assertEquals(source, decision.source)
         assertNull(decision.wireFormat)
+        assertEquals(Guarantee.NONE, decision.guarantee)
+        assertFalse(decision.processing!!.preservesBitPerfect)
+    }
+
+    @Test
+    fun default_policy_permits_validated_dop_pcm_fallback() {
+        val source = StreamRequest.dop(2_822_400, 2)
+        val decision = selector(FakePlatform(), OutputPolicy(force = OutputKind.ANDROID_STANDARD)).select(source)
+        assertEquals(OutputKind.ANDROID_STANDARD, decision.kind)
+        assertEquals(source, decision.source)
         assertEquals(Guarantee.NONE, decision.guarantee)
         assertFalse(decision.processing!!.preservesBitPerfect)
     }
@@ -1252,7 +1262,9 @@ class OutputSelectorTest {
     fun dsd_with_no_dac_cannot_be_played_and_the_error_lists_every_rejection() {
         val platform = FakePlatform()
 
-        val error = expectError(DacErrorCode.UNSUPPORTED) { selector(platform).select(StreamRequest.dop(2_822_400, 2)) }
+        val error = expectError(DacErrorCode.UNSUPPORTED) {
+            selector(platform, OutputPolicy(allowDopPcmConversion = false)).select(StreamRequest.dop(2_822_400, 2))
+        }
 
         for (kind in OutputKind.entries) assertTrue(error.message, error.message!!.contains(kind.name))
         assertTrue(platform.calls.isEmpty())

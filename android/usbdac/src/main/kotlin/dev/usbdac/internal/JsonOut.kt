@@ -101,6 +101,7 @@ internal fun StreamRequest.toJson(): String {
             .put("bit_depth", bitDepth)
         StreamEncoding.DOP -> json
             .put("encoding", "dop")
+            .put("bit_depth", bitDepth)
             .put("dsd_bit_rate", requireNotNull(dsdBitRate) { "a DoP request needs dsdBitRate" })
         StreamEncoding.DSD_NATIVE -> json
             .put("encoding", "dsd_native")

@@ -425,6 +425,8 @@ public class DacSession private constructor(
         }
     }
 
+    internal fun driverHandle(): Long { checkOpen(); return dac }
+
     private fun checkOpen() {
         if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "the session is closed")
     }

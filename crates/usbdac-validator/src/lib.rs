@@ -1,6 +1,7 @@
 //! Bounded, append-on-disk evidence and exact-format USB DAC acceptance runs.
 //! The host must warn users to turn down the amplifier before starting. This
 //! crate never changes hardware volume. USB delivery does not prove audibility.
+mod conversion_check;
 mod fallback;
 use fallback::run_fallback;
 use serde::Serialize;
@@ -769,7 +770,7 @@ impl Capture {
     }
 }
 fn fallback_summary(value: &Value) -> Value {
-    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "conversion_verification": value.get("conversion_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
 }
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];

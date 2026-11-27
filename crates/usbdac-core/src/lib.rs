@@ -39,6 +39,7 @@ pub mod capture;
 pub mod convert;
 pub mod descriptors;
 pub mod pioneer;
+pub mod playback;
 pub mod routing;
 pub mod scarlett;
 

@@ -21,6 +21,49 @@ class RealCoreRankingTest {
         }
     }
 
+    @Test fun unsignedInputUsesProductionCoreExpansionAndKeepsSourceFrames() {
+        assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val target = RecordingOutput()
+        val output = UnsignedPcmOutput(target, 2)
+        val input = ByteBuffer.wrap(byteArrayOf(0, 128.toByte(), 255.toByte(), 64))
+        assertEquals(4, output.write(input))
+        assertArrayEquals(byteArrayOf(0, 128.toByte(), 0, 0, 0, 127, 0, 192.toByte()), target.received.toByteArray())
+        target.played = 7; target.latency = 3
+        assertEquals(7L, output.playedFrames)
+        assertEquals(3L, output.latencyFrames)
+        output.close()
+    }
+
+    @Test fun nativeDsdChannelExpansionUsesProductionCorePrimitive() {
+        assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val target = RecordingOutput()
+        val output = DsdMonoExpansionOutput(target)
+        val source = ByteBuffer.wrap(byteArrayOf(0x12, 0x80.toByte(), 0x5a))
+        assertEquals(3, output.write(source))
+        assertArrayEquals(byteArrayOf(0x12, 0x12, 0x80.toByte(), 0x80.toByte(), 0x5a, 0x5a), target.received.toByteArray())
+        output.close()
+    }
+
+    @Test fun productionConverterCanTargetFloat32Wire() {
+        assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val target = StreamFormat(
+            formatId = 1, encoding = StreamEncoding.PCM_FLOAT32, dsdBitRate = null,
+            sampleRate = 48_000, channels = 2, validBits = 32, subslotBytes = 4,
+            bytesPerFrame = 8, counterRateHz = 48_000, interfaceNumber = 1, altSetting = 1,
+            endpointAddress = 1, syncType = SyncType.SYNCHRONOUS, explicitFeedback = false,
+            linkSpeed = LinkSpeed.HIGH, serviceIntervalUs = 125, rateDiffersFromRequest = false,
+            pacing = Pacing.Synchronous,
+        )
+        val plan = ConversionPlan.between(StreamRequest.pcm(48_000, 2, 16), target, ConversionOptions(headroomDb = 0.0))
+        val sink = RecordingOutput()
+        val output = ConvertingOutput(sink, PcmConverter.create(plan))
+        assertEquals(4, output.write(ByteBuffer.wrap(byteArrayOf(0, 0, 0, 64))))
+        val values = ByteBuffer.wrap(sink.received.toByteArray()).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0.0f, values.float, 0.00001f)
+        assertEquals(0.5f, values.float, 0.00001f)
+        output.close()
+    }
+
     @Test fun selectorUsesCoreRankingForDiscreteAndSteppedAlternates() {
         data class Case(val input: Int, val rates: List<Int>, val range: RateRange?, val expected: Int)
         val cases = listOf(
@@ -162,7 +205,7 @@ class RealCoreRankingTest {
         val byteFrames = 8_192
         fun render(dop: Boolean): ByteArray {
             val fake = FakePlatform()
-            val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD, allowDopPcmConversion = dop)
+            val policy = OutputPolicy(force = OutputKind.ANDROID_STANDARD)
             val request = if (dop) StreamRequest.dop(2_822_400, 2) else StreamRequest.dsdNative(2_822_400, 2)
             val output = OutputSelector(fake, policy).open(request)
             try {

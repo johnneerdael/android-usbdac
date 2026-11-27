@@ -571,6 +571,16 @@ impl Dac {
         transport::api::negotiate_candidates(requests)
     }
 
+    pub(crate) fn negotiate_playback_candidates(
+        &self,
+        requests: &[StreamRequest],
+    ) -> Result<(StreamFormat, usize, Option<Error>)> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.reject_reconfigure()?;
+        let _scope = self.shared.enter()?;
+        transport::api::negotiate_playback_candidates(requests)
+    }
+
     fn negotiate_locked(&self, request: &StreamRequest) -> Result<StreamFormat> {
         let _scope = self.shared.enter()?;
         transport::api::negotiate(request)

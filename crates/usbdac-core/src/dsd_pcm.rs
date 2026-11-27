@@ -5,7 +5,8 @@
 //! A 704-tap Kaiser-windowed low-pass decimates the one-bit stream by 16,
 //! followed by the library's high-quality rational PCM resampler. The first
 //! stage is evaluated with byte lookup tables, so no processing allocation is
-//! required. The bounded input rates are DSD64, DSD128 and DSD256.
+//! required. Input rates are DSD64, DSD128, DSD256 and DSD512 in the
+//! 44.1 kHz and 48 kHz families.
 use crate::convert::{
     ConversionPlan, ConvertError, ConvertOptions, Converter, PcmFormat, Processed, SampleFormat,
 };
@@ -52,9 +53,20 @@ impl DsdPcmConverter {
                 "PCM source layout is not valid for native DSD".into(),
             ));
         }
-        if !matches!(bit_rate, 2_822_400 | 5_644_800 | 11_289_600) || !(1..=8).contains(&channels) {
+        if !matches!(
+            bit_rate,
+            2_822_400
+                | 3_072_000
+                | 5_644_800
+                | 6_144_000
+                | 11_289_600
+                | 12_288_000
+                | 22_579_200
+                | 24_576_000
+        ) || !(1..=8).contains(&channels)
+        {
             return Err(ConvertError::Unsupported(
-                "native DSD supports DSD64/128/256 and 1 to 8 channels".into(),
+                "native DSD supports DSD64/128/256/512 in the 44.1 and 48 kHz families and 1 to 8 channels".into(),
             ));
         }
         let source = PcmFormat::new(bit_rate / 16, channels, SampleFormat::Float32);
@@ -375,7 +387,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_rates_and_recovers_after_reset() {
         assert!(DsdPcmConverter::new(
-            22_579_200,
+            25_000_000,
             2,
             PcmFormat::new(44_100, 2, SampleFormat::Float32)
         )

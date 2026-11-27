@@ -4,6 +4,8 @@ An app can send audio to a DAC in four ways: directly over USB, through Android'
 
 Most apps should start here. Everything the other pages describe (the stream, the volume, the controls) works on the output you get; this page is about getting it.
 
+The direct USB playback API also exists independently of Android route selection. A Rust host can ask `Dac::resolve_playback` for a `PlaybackDecision` under a `playback::PlaybackPolicy` and open a source-domain `PlaybackStream` with `Dac::open_playback`. Its write input is the original source layout; the decision describes the USB target and any exact, sample-preserving or lossy transform. Strict `Dac::negotiate` and `Dac::open_stream` remain available. Target USB verification is separate from source fidelity, and does not prove DoP decoding or analog output. The driver-owned automatic path requires separate hardware acceptance; results for the existing exact path do not establish it. See [the Rust guide](guide-rust.md#automatic-direct-usb-playback).
+
 ## The short version
 
 Build a selector once, with the policy the listener's settings give you:

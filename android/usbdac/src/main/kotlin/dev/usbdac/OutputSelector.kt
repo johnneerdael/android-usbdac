@@ -46,6 +46,13 @@ public class SelectedOutput internal constructor(
         is ConvertingOutput -> output.clippedSamples
         is DsdPcmOutput -> output.clippedSamples
         is DopInputOutput -> output.clippedSamples
+        is SourceFidelityOutput -> when (val underlying = output.target) {
+            is ConvertingOutput -> underlying.clippedSamples
+            is DsdPcmOutput -> underlying.clippedSamples
+            is DopInputOutput -> underlying.clippedSamples
+            is UnsignedPcmOutput -> underlying.clippedSamples
+            else -> null
+        }
         else -> null
     }
 
@@ -56,6 +63,7 @@ public class SelectedOutput internal constructor(
      */
     public fun resetDopInputMarkerPhase(): Boolean = when (output) {
         is DopInputOutput -> { output.resetInputMarkerPhase(); true }
+        is SourceFidelityOutput -> (output.target as? DopInputOutput)?.let { it.resetInputMarkerPhase(); true } ?: false
         is RouteGuardedOutput -> output.resetDopInputMarkerPhase()
         is BoundDirectOutput -> output.resetDopInputMarkerPhase()
         else -> false
@@ -660,7 +668,7 @@ public class OutputSelector internal constructor(
     }
 
     private enum class DsdFallback { NONE, DOP, PCM, DOP_PCM }
-    private class Negotiated(val format: StreamFormat, val plan: ConversionPlan?, val dsdFallback: DsdFallback = DsdFallback.NONE)
+    private class Negotiated(val format: StreamFormat, val plan: ConversionPlan?, val dsdFallback: DsdFallback = DsdFallback.NONE, val driver: DriverPlaybackDecision? = null)
 
     private fun directAttempt(request: StreamRequest, dac: DacDeviceInfo): Attempt {
         val kind = OutputKind.DIRECT_USB
@@ -712,6 +720,11 @@ public class OutputSelector internal constructor(
 
     /** Settle [request] exactly first, then try permitted conversions in ranked order. */
     private fun negotiate(link: DirectLink, request: StreamRequest, bypassLimits: Boolean): Negotiated {
+        if (link.supportsDriverPlayback) {
+            val decision = link.resolvePlayback(request.copy(ratePolicy = RatePolicy.EXACT), policy, bypassLimits)
+            if (!permitsWire(decision.format, bypassLimits)) throw DacException(DacErrorCode.UNSUPPORTED, "driver returned a disallowed wire format")
+            return Negotiated(decision.format, null, driver = decision)
+        }
         if (request.encoding == StreamEncoding.PCM) return negotiatePcmCandidates(link, request, bypassLimits)
         if (request.encoding == StreamEncoding.PCM_FLOAT32 && policy.allowConversion &&
             link.capabilities.altSettings.isNotEmpty() && !hasFloatAlternate(link.capabilities.altSettings, request)) {
@@ -865,6 +878,7 @@ public class OutputSelector internal constructor(
     }
 
     private fun directCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, negotiated: Negotiated, bypassLimits: Boolean): Candidate {
+        negotiated.driver?.let { return driverCandidate(request, dac, link, it, bypassLimits) }
         val format = negotiated.format
         val plan = negotiated.plan
         val unsynchronized = format.pacing == Pacing.Unsynchronized ||
@@ -958,6 +972,96 @@ public class OutputSelector internal constructor(
                     guardedOutput
                 } else output
                 Opened(guarded, written, session = link.session, stream = link.stream, volume = link.volume, releaseSession = { link.close() })
+            },
+            release = { link.close() },
+        )
+    }
+
+    /** Open exactly the format chosen by the shared driver; wrappers only realize that decision. */
+    private fun driverCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, choice: DriverPlaybackDecision, bypassLimits: Boolean): Candidate {
+        val format = choice.format
+        val inputSlot = choice.sourceFrameBytes / request.channels
+        require(choice.sourceFrameBytes > 0 && choice.sourceFrameBytes % request.channels == 0)
+        val inputRate = if (request.encoding == StreamEncoding.DSD_NATIVE) checkNotNull(request.dsdBitRate) / 8 else request.sampleRate
+        val inputBits = when (request.encoding) { StreamEncoding.DSD_NATIVE, StreamEncoding.PCM_U8 -> 8; StreamEncoding.DOP -> 24; else -> request.bitDepth }
+        val sourceLayout = WriteFormat(inputRate, request.channels, inputSlot, inputBits, inputRate, request.encoding)
+        val preserved = choice.fidelity in listOf("exact", "bit_exact")
+        val unsynchronized = format.pacing == Pacing.Unsynchronized || (format.pacing == Pacing.Unknown && format.syncType == SyncType.ASYNCHRONOUS && !format.explicitFeedback)
+        val description = when (choice.transform) {
+            "direct" -> "Direct USB playback"
+            "pcm", "pcm_u8" -> "Driver-selected PCM conversion (${choice.fidelity})"
+            "dsd_to_pcm" -> "Native DSD converted to PCM"
+            "dop_to_pcm" -> "DoP validated and converted to PCM"
+            "dop_to_native" -> "DoP validated and unpacked to native DSD"
+            "native_to_dop" -> "Native DSD framed as DoP for a confirmed decoder"
+            "dsd_expand" -> "Native mono DSD duplicated to stereo"
+            "dop_repack" -> "DoP validated and reframed for a confirmed decoder"
+            else -> throw DacException(DacErrorCode.UNSUPPORTED, "unknown driver playback transform ${choice.transform}")
+        }
+        val plan = when (choice.transform) {
+            "pcm", "pcm_u8" -> {
+                val pcmSource = if (choice.transform == "pcm_u8") StreamRequest.pcm(request.sampleRate, request.channels, 16) else request
+                val options = policy.conversionOptions.copy(
+                    headroomDb = choice.selectedHeadroomDb ?: policy.conversionOptions.headroomDb,
+                    sourceLayout = if (choice.transform == "pcm_u8") null else policy.conversionOptions.sourceLayout,
+                )
+                platform.plan(pcmSource, format, options)
+            }
+            else -> null
+        }
+        val reason = buildString {
+            append("The library drives ${dac.productName} directly over USB (${describe(format)}). $description.")
+            if (choice.exactRefusal != null) append(" Original format: ${choice.exactRefusal}.")
+            if (!preserved) append(" Source bit-perfect playback is not claimed.")
+            if (unsynchronized) append(" The endpoint uses unverified nominal pacing.")
+        }
+        return Candidate(
+            kind = OutputKind.DIRECT_USB,
+            guarantee = if (preserved && !unsynchronized) Guarantee.VERIFIED_BY_LIBRARY else Guarantee.NONE,
+            reason = reason, dac = dac, conversion = plan, wireFormat = format,
+            processing = if (choice.transform == "direct") null else OutputConversion(description, preserved),
+            commit = {
+                if (bypassLimits && policy.downstreamBinding?.classify(dac) != UsbBindingClassification.DISTINCT) throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed before opening")
+                val stream = link.openStream(format)
+                val output = try {
+                    if (bypassLimits && policy.downstreamBinding?.classify(dac) != UsbBindingClassification.DISTINCT) throw DacException(DacErrorCode.DEVICE_LOST, "independent USB attachment changed during opening")
+                    when (choice.transform) {
+                        "direct" -> if (request.encoding == StreamEncoding.DSD_NATIVE) NativeDsdInputOutput(stream, request.channels, format.subslotBytes) else stream
+                        "pcm" -> platform.converting(stream, checkNotNull(plan))
+                        "pcm_u8" -> UnsignedPcmOutput(platform.converting(stream, checkNotNull(plan)), request.channels)
+                        "dop_to_native" -> {
+                            val target = NativeDsdInputOutput(stream, format.channels, format.subslotBytes)
+                            val source = if (request.channels == 1 && format.channels == 2) DsdMonoExpansionOutput(target) else target
+                            DopInputOutput(source, request.channels, inputSlot)
+                        }
+                        "native_to_dop" -> {
+                            val target = DsdDopOutput(stream, format.channels, format.subslotBytes, true)
+                            if (request.channels == 1 && format.channels == 2) DsdMonoExpansionOutput(target) else target
+                        }
+                        "dsd_expand" -> DsdMonoExpansionOutput(NativeDsdInputOutput(stream, format.channels, format.subslotBytes))
+                        "dop_repack" -> {
+                            val target = DsdDopOutput(stream, format.channels, format.subslotBytes, true)
+                            val source = if (request.channels == 1 && format.channels == 2) DsdMonoExpansionOutput(target) else target
+                            DopInputOutput(source, request.channels, inputSlot)
+                        }
+                        "dsd_to_pcm", "dop_to_pcm" -> {
+                            val layout = if (format.encoding == StreamEncoding.PCM_FLOAT32) PcmLayout.FLOAT_32 else when (format.validBits to format.subslotBytes) {
+                                16 to 2 -> PcmLayout.PCM_16; 16 to 3 -> PcmLayout.PCM_16_IN_24; 16 to 4 -> PcmLayout.PCM_16_IN_32
+                                24 to 3 -> PcmLayout.PCM_24_PACKED; 24 to 4 -> PcmLayout.PCM_24_IN_32; 32 to 4 -> PcmLayout.PCM_32
+                                else -> throw DacException(DacErrorCode.UNSUPPORTED, "unsupported DSD-to-PCM layout")
+                            }
+                            val dsd = DsdPcmOutput(stream, checkNotNull(request.dsdBitRate), request.channels, format.sampleRate, format.channels, layout,
+                                policy.conversionOptions.copy(headroomDb = choice.selectedHeadroomDb ?: policy.conversionOptions.headroomDb, sourceLayout = null))
+                            if (choice.transform == "dop_to_pcm") DopInputOutput(dsd, request.channels, inputSlot) else dsd
+                        }
+                        else -> throw DacException(DacErrorCode.UNSUPPORTED, "unknown driver playback transform")
+                    }
+                } catch (error: Throwable) { runCatching { stream.close() }.onFailure(error::addSuppressed); throw error }
+                val fidelityOutput = if (preserved) output else SourceFidelityOutput(output, description)
+                val guarded = if (bypassLimits) BoundDirectOutput(fidelityOutput, checkNotNull(policy.downstreamBinding), dac).also {
+                    try { it.checkLive() } catch (error: Throwable) { runCatching { it.close() }.onFailure(error::addSuppressed); throw error }
+                } else fidelityOutput
+                Opened(guarded, sourceLayout, session = link.session, stream = link.stream, volume = link.volume, releaseSession = { link.close() })
             },
             release = { link.close() },
         )
@@ -1277,7 +1381,8 @@ private class RouteGuardedOutput(
     override val writableBytes: Int get() = try { guard.check(); target.writableBytes } catch (_: DacException) { 0 }
     fun resetDopInputMarkerPhase(): Boolean {
         guard.check()
-        val dop = target as? DopInputOutput ?: return false
+        val candidate = (target as? SourceFidelityOutput)?.target ?: target
+        val dop = candidate as? DopInputOutput ?: return false
         dop.resetInputMarkerPhase()
         return true
     }
@@ -1314,7 +1419,8 @@ private class BoundDirectOutput(
     }
     fun resetDopInputMarkerPhase(): Boolean {
         checkLive()
-        val dop = target as? DopInputOutput ?: return false
+        val candidate = (target as? SourceFidelityOutput)?.target ?: target
+        val dop = candidate as? DopInputOutput ?: return false
         dop.resetInputMarkerPhase()
         return true
     }

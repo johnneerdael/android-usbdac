@@ -8,7 +8,7 @@ use crate::format::{Encoding, StreamFormat, StreamRequest};
 
 /// The lowest and highest sample rate a plan accepts.
 pub const MIN_RATE: u32 = 8_000;
-pub const MAX_RATE: u32 = 768_000;
+pub const MAX_RATE: u32 = 1_536_000;
 
 /// One thing a conversion does.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -165,7 +165,7 @@ impl ConversionPlan {
         options: &ConvertOptions,
     ) -> Result<Self, ConvertError> {
         if !matches!(source.encoding, Encoding::Pcm | Encoding::PcmFloat32)
-            || target.encoding != Encoding::Pcm
+            || !matches!(target.encoding, Encoding::Pcm | Encoding::PcmFloat32)
         {
             return Err(ConvertError::Unsupported(
                 "DoP and native DSD are never converted: a sample-rate or bit-depth change would destroy them".into(),
@@ -199,7 +199,16 @@ impl ConversionPlan {
             PcmFormat::new(
                 target.sample_rate,
                 target.channels,
-                SampleFormat::int(target.valid_bits, target.subslot_bytes)?,
+                if target.encoding == Encoding::PcmFloat32 {
+                    if target.valid_bits != 32 || target.subslot_bytes != 4 {
+                        return Err(ConvertError::InvalidArgument(
+                            "float PCM target must use 32-bit slots".into(),
+                        ));
+                    }
+                    SampleFormat::Float32
+                } else {
+                    SampleFormat::int(target.valid_bits, target.subslot_bytes)?
+                },
             ),
             options,
         )
@@ -657,7 +666,7 @@ mod tests {
         let ok = fmt(44_100, 2, SampleFormat::I16);
         for bad in [
             fmt(7_999, 2, SampleFormat::I16),
-            fmt(768_001, 2, SampleFormat::I16),
+            fmt(MAX_RATE + 1, 2, SampleFormat::I16),
             fmt(44_100, 0, SampleFormat::I16),
             fmt(44_100, 9, SampleFormat::I16),
         ] {
