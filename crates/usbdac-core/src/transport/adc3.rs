@@ -154,6 +154,21 @@ fn adc3_standard_encoding(header: &wire::AsHeader, capture: bool) -> Result<Opti
     Err("ADC3 alternate has no implemented standard encoding/geometry".into())
 }
 
+// Frmts30 section 2.3.1.6.5 defines DSD64 through DSD1024 in both
+// 44.1 kHz and 48 kHz families, with one 64-bit word per channel.
+const ADC3_DSD_WORD_RATES: [u32; 10] = [
+    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
+];
+fn adc3_encoding_ranges(native: Option<NativeDsdProfile>, ranges: &[SamplingFrequencySubrange])
+    -> Vec<SamplingFrequencySubrange> {
+    if !native.is_some_and(|profile| profile.origin == NativeDsdOrigin::StandardAdc3) {
+        return ranges.to_vec();
+    }
+    ADC3_DSD_WORD_RATES.into_iter().filter(|rate|
+        sampling_frequency_ranges_support_rate(ranges, *rate))
+        .map(|rate| SamplingFrequencySubrange { min: rate, max: rate, res: 0 }).collect()
+}
+
 // `rate` is already the selected USB word clock, including native DSD /64.
 fn adc3_playback_format(route: &Adc3Route, rate: u32) -> Result<PlaybackFormat, String> {
     let native = route.native_dsd;
@@ -239,7 +254,7 @@ fn adc3_limit_ranges(ranges: &[SamplingFrequencySubrange], limits: &[(u32, u32)]
 }
 fn adc3_route_limit_ranges(route: &Adc3Route, ranges: &[SamplingFrequencySubrange])
     -> Vec<SamplingFrequencySubrange> {
-    let ranges = adc3_limit_ranges(ranges, &route.frequency_limits);
+    let ranges = adc3_encoding_ranges(route.native_dsd, &adc3_limit_ranges(ranges, &route.frequency_limits));
     match route.implicit.as_deref() {
         Some(peer) => adc3_route_limit_ranges(peer, &ranges),
         None => ranges,
@@ -253,7 +268,12 @@ fn adc3_route_ranges(route: &Adc3Route, source_ranges: &[SamplingFrequencySubran
 fn validate_adc3_static_rate(route: &Adc3Route, rate: u32) -> Result<(), String> {
     let exact = SamplingFrequencySubrange { min: rate, max: rate, res: 0 };
     if rate == 0 || adc3_route_limit_ranges(route, &[exact]).is_empty() {
-        return Err("ADC3 rate outside AS alternate frequency limits".into());
+        return Err("ADC3 rate outside AS alternate frequency limits or standard encoding rates".into());
+    }
+    if route.native_dsd.is_some() && std::iter::once(route).chain(route.implicit.as_deref()).any(|member|
+        member.packet_bytes < required_max_packet_bytes(rate, member.endpoint.3,
+            usize::from(member.pcm.0) * usize::from(member.pcm.1))) {
+        return Err("ADC3 native DSD rate exceeds endpoint capacity".into());
     }
     Ok(())
 }
@@ -1204,7 +1224,9 @@ fn adc3_alternate_pairs(
         let rates = adc3_capacity_ranges(&candidate, &rates);
         let mut candidate = candidate;
         candidate.sample_rates = representative_sample_rates_from_ranges(&rates);
-        return Ok(vec![(candidate, route, rates)]);
+        return Ok(if candidate.native_dsd.is_some() && rates.is_empty() {
+            Vec::new()
+        } else { vec![(candidate, route, rates)] });
     }
     let sources = adc3_implicit_sources(config, handle, &candidate, &route, &rates, plan)?;
     Ok(adc3_expand_implicit_pairs(&candidate, &route, &rates, sources))
@@ -1214,14 +1236,15 @@ fn adc3_expand_implicit_pairs(
     candidate: &IsoStreamCandidate, route: &Adc3Route, rates: &[SamplingFrequencySubrange],
     sources: Vec<(ImplicitFeedbackSource, Adc3Route)>,
 ) -> Vec<(IsoStreamCandidate, Adc3Route, Vec<SamplingFrequencySubrange>)> {
-    sources.into_iter().map(|(source, source_route)| {
+    sources.into_iter().filter_map(|(source, source_route)| {
         let mut candidate = candidate.clone();
         candidate.implicit_feedback = Some(source);
         let ranges = adc3_capacity_ranges(&candidate, &adc3_route_limit_ranges(&source_route, rates));
+        if candidate.native_dsd.is_some() && ranges.is_empty() { return None; }
         candidate.sample_rates = representative_sample_rates_from_ranges(&ranges);
         let mut route = route.clone();
         route.implicit = Some(Box::new(source_route));
-        (candidate, route, ranges)
+        Some((candidate, route, ranges))
     }).collect()
 }
 
@@ -1495,12 +1518,13 @@ pub(super) fn adc3_capacity_ranges(candidate: &IsoStreamCandidate, ranges: &[Sam
     if let Some(source) = candidate.implicit_feedback {
         max = max.min(ceiling(source.max_packet_bytes, source.bytes_per_frame, source.service_interval_us));
     }
-    ranges.iter().filter_map(|r| {
+    let ranges: Vec<_> = ranges.iter().filter_map(|r| {
         if r.min == 0 || r.min > r.max || r.min > max { return None; }
         let upper = r.max.min(max);
         let upper = if r.res == 0 { upper } else { r.min + (upper - r.min) / r.res * r.res };
         Some(SamplingFrequencySubrange { min: r.min, max: upper, res: r.res })
-    }).collect()
+    }).collect();
+    adc3_encoding_ranges(candidate.native_dsd, &ranges)
 }
 
 pub(super) fn adc3_candidates_with_ranges(
@@ -1508,6 +1532,7 @@ pub(super) fn adc3_candidates_with_ranges(
     handle: &DeviceHandle<Context>,
     speed: Speed,
     claimed: &[u8],
+    include_badd: bool,
 ) -> Vec<(IsoStreamCandidate, Vec<SamplingFrequencySubrange>)> {
     let Ok(config) = device.active_config_descriptor() else {
         return vec![];
@@ -1527,7 +1552,8 @@ pub(super) fn adc3_candidates_with_ranges(
         // Do not allow libusb class requests to reach an unclaimed AC owner.
         if !owning_function(&config, handle, alt.interface_number())
             .ok()
-            .is_some_and(|(iad, _, _)| claimed.contains(&iad.b_first_interface))
+            .is_some_and(|(iad, profile, _)| claimed.contains(&iad.b_first_interface)
+                && (include_badd || profile == wire::FunctionProfile::Full))
         {
             continue;
         }
@@ -2596,9 +2622,6 @@ pub(super) fn select_owned_stream_candidate(
         }
         return initial;
     }
-    if requested.dsd_transport == DsdTransportMode::DoP {
-        return initial;
-    }
     let mut refusal = None;
     for alt in config
         .interfaces()
@@ -2613,6 +2636,11 @@ pub(super) fn select_owned_stream_candidate(
                     .any(|e| e.direction() == Direction::Out)
         })
     {
+        if requested.dsd_transport == DsdTransportMode::DoP
+            && !owning_function(&config, &claimed.handle, alt.interface_number()).ok()
+                .is_some_and(|(_, profile, _)| profile == wire::FunctionProfile::Full) {
+            continue;
+        }
         // This bounded candidate probe is necessary only when a stopped domain
         // prevents read-only HC/clock discovery. It never activates an alt.
         let attempt = prepare_adc3_alternate_power(claimed, &config, &alt, false)
@@ -2620,7 +2648,8 @@ pub(super) fn select_owned_stream_candidate(
         match attempt {
             Ok(pairs) => {
                 for (candidate, route, ranges) in pairs {
-                    if candidate.implicit_feedback.map_or(true, |source| claimed.claimed_interfaces.contains(&source.interface_number))
+                    if adc3_request_profile_supported(&route, requested)
+                        && candidate.implicit_feedback.map_or(true, |source| claimed.claimed_interfaces.contains(&source.interface_number))
                         && adc3_candidate_matches_ranges(&candidate, &ranges, requested) {
                         prepare_adc3_implicit_power(claimed, &route).map_err(SelectError::NoMatch)?;
                         return Ok(candidate);
@@ -2652,12 +2681,18 @@ pub(super) fn select_owned_stream_candidate(
         None => initial,
     }
 }
+// BADD's fixed 48 kHz PCM stream is not a standard DoP carrier. Keep
+// profile admission separate from exact PCM-carrier geometry/rate matching.
+fn adc3_request_profile_supported(route: &Adc3Route, requested: PlaybackFormat) -> bool {
+    requested.dsd_transport != DsdTransportMode::DoP || route.profile == wire::FunctionProfile::Full
+}
 fn adc3_candidate_matches(
     handle: &DeviceHandle<Context>,
     candidate: &IsoStreamCandidate,
     route: &Adc3Route,
     requested: PlaybackFormat,
 ) -> bool {
+    if !adc3_request_profile_supported(route, requested) { return false; }
     let ranges = adc3_wire_ranges(handle, route).unwrap_or_default();
     adc3_candidate_matches_ranges(candidate, &ranges, requested)
 }
@@ -2667,10 +2702,15 @@ pub(super) fn adc3_candidate_matches_ranges(candidate: &IsoStreamCandidate, rang
             let Some(rate) = native_wire_rate(requested, profile.word_bytes) else { return false; };
             rate
         }
+        (DsdTransportMode::DoP, None) if candidate.format_tag == FORMAT_TAG_PCM
+            && matches!(requested.bit_depth, 24 | 32)
+            && requested.bit_depth == candidate.bit_resolution && candidate.subslot_size >= 3 => requested.sample_rate,
         (DsdTransportMode::None, None) if requested.bit_depth == candidate.bit_resolution => requested.sample_rate,
         _ => return false,
     };
     requested.channels == candidate.channels
+        && (!candidate.native_dsd.is_some_and(|profile| profile.origin == NativeDsdOrigin::StandardAdc3)
+            || ADC3_DSD_WORD_RATES.contains(&rate))
         && sampling_frequency_ranges_support_rate(ranges, rate)
         && candidate.implicit_feedback.map_or(true, |source| source.max_packet_bytes >= required_max_packet_bytes(
             rate, source.service_interval_us, source.bytes_per_frame))
@@ -3350,6 +3390,106 @@ mod tests {
             dsd_bit_rate: 0, ..requested }));
         candidate.native_dsd = None;
         assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+    }
+
+    #[test]
+    fn standard_dsd_published_singletons_match_exact_projected_clock_and_capacity() {
+        let mut candidate = pcm_candidate();
+        candidate.native_dsd = adc3_standard_encoding(&native_header(), false).unwrap();
+        candidate.format_tag = FORMAT_TAG_DSD;
+        candidate.subslot_size = 8; candidate.bit_resolution = 64;
+        candidate.service_interval_us = 125; candidate.max_packet_bytes = 1536;
+        let all_words = [SamplingFrequencySubrange { min: 44_100, max: 800_001, res: 1 }];
+        assert_eq!(representative_sample_rates_from_ranges(&adc3_encoding_ranges(candidate.native_dsd, &all_words)),
+            ADC3_DSD_WORD_RATES.to_vec());
+        assert!(!adc3_candidate_matches_ranges(&candidate, &all_words, PlaybackFormat {
+            sample_rate: 264_600, channels: 2, bit_depth: 1, is_dop: false,
+            dsd_transport: DsdTransportMode::Native, dsd_bit_rate: 132_300 * 64 }));
+        let mut route = live_test_route();
+        route.native_dsd = candidate.native_dsd; route.pcm = (2, 8, 64);
+        route.packet_bytes = candidate.max_packet_bytes;
+        route.endpoint.3 = candidate.service_interval_us;
+        route.choice = Some(ratio_choice(&[(7, 147, 160)]));
+        route.frequency_limits = vec![(44_101, 768_000)];
+        let projected = adc3_route_ranges(&route, &[
+            SamplingFrequencySubrange { min: 48_000, max: 960_000, res: 48_000 },
+        ]).unwrap();
+        let published = adc3_capacity_ranges(&candidate, &projected);
+        let rates = representative_sample_rates_from_ranges(&published);
+        assert_eq!(rates, vec![88_200, 176_400, 352_800, 705_600]);
+        assert!(published.iter().all(|range| range.min == range.max && range.res == 0));
+        for rate in rates {
+            let requested = PlaybackFormat { sample_rate: rate * 2, channels: 2, bit_depth: 1,
+                is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: rate * 64 };
+            assert!(adc3_candidate_matches_ranges(&candidate, &published, requested));
+            assert!(validate_adc3_static_rate(&route, rate).is_ok());
+        }
+        // The range's arbitrary endpoint and nonstandard intermediate clock
+        // words never become native DSD capabilities or selectable rates.
+        for rate in [44_100, 132_300, 749_700, 882_000] {
+            let requested = PlaybackFormat { sample_rate: rate * 2, channels: 2, bit_depth: 1,
+                is_dop: false, dsd_transport: DsdTransportMode::Native, dsd_bit_rate: rate * 64 };
+            assert!(!adc3_candidate_matches_ranges(&candidate, &published, requested));
+            assert!(validate_adc3_static_rate(&route, rate).is_err());
+        }
+        let nonaligned = adc3_route_ranges(&route, &[
+            SamplingFrequencySubrange { min: 48_001, max: 960_001, res: 48_000 },
+        ]).unwrap();
+        assert!(adc3_capacity_ranges(&candidate, &nonaligned).is_empty());
+        candidate.max_packet_bytes = 1408; // 88 exact frames fit, 88.2 do not.
+        route.packet_bytes = candidate.max_packet_bytes;
+        let capped = adc3_capacity_ranges(&candidate, &projected);
+        assert_eq!(representative_sample_rates_from_ranges(&capped), vec![88_200, 176_400, 352_800]);
+        assert!(validate_adc3_static_rate(&route, 705_600).is_err());
+    }
+
+    #[test]
+    fn dop_matches_exact_pcm_carrier_without_admitting_native_or_badd() {
+        let mut candidate = pcm_candidate();
+        candidate.service_interval_us = 125; candidate.max_packet_bytes = 184;
+        let requested = PlaybackFormat { sample_rate: 176_400, channels: 2, bit_depth: 32,
+            is_dop: true, dsd_transport: DsdTransportMode::DoP, dsd_bit_rate: 0 };
+        let ranges = [SamplingFrequencySubrange { min: 176_400, max: 176_400, res: 0 }];
+        assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        let projected = adc3_project_ranges(&ratio_choice(&[(7, 147, 160)]), &[
+            SamplingFrequencySubrange { min: 48_000, max: 192_000, res: 48_000 },
+        ]).unwrap();
+        assert!(adc3_candidate_matches_ranges(&candidate, &projected, requested));
+        let nonaligned = [SamplingFrequencySubrange { min: 176_401, max: 352_801, res: 176_400 }];
+        assert!(!adc3_candidate_matches_ranges(&candidate, &nonaligned, requested));
+        candidate.implicit_feedback = Some(ImplicitFeedbackSource {
+            interface_number: 6, alt_setting: 1, address: 0x81,
+            bytes_per_frame: 4, service_interval_us: 125, max_packet_bytes: 91,
+        });
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        candidate.implicit_feedback.as_mut().unwrap().max_packet_bytes = 92;
+        assert!(adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        candidate.implicit_feedback = None;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges,
+            PlaybackFormat { bit_depth: 24, ..requested }));
+        candidate.max_packet_bytes = 183;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        candidate.max_packet_bytes = 138; candidate.subslot_size = 3; candidate.bit_resolution = 24;
+        assert!(adc3_candidate_matches_ranges(&candidate, &ranges,
+            PlaybackFormat { bit_depth: 24, ..requested }));
+        candidate.subslot_size = 2;
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges,
+            PlaybackFormat { bit_depth: 24, ..requested }));
+        candidate.subslot_size = 8; candidate.bit_resolution = 64;
+        candidate.native_dsd = adc3_standard_encoding(&native_header(), false).unwrap();
+        assert!(!adc3_candidate_matches_ranges(&candidate, &ranges, requested));
+        let mut route = format_control_route(1);
+        route.pcm = (2, 4, 32);
+        assert!(adc3_request_profile_supported(&route, requested));
+        // A full PCM carrier keeps AS format D0, and live/clock planning
+        // reconstructs its actual PCM layout without changing caller DoP state.
+        assert_eq!(route.active_format_expectations().collect::<Vec<_>>(), vec![(5, 1)]);
+        assert_eq!(adc3_playback_format(&route, requested.sample_rate).unwrap().bit_depth, 32);
+        assert_eq!(requested.dsd_transport, DsdTransportMode::DoP);
+        route.profile = wire::FunctionProfile::Badd(wire::BaddProfile::Headset);
+        assert!(!adc3_request_profile_supported(&route, requested));
+        assert!(adc3_request_profile_supported(&route,
+            PlaybackFormat { is_dop: false, dsd_transport: DsdTransportMode::None, ..requested }));
     }
 
     #[test]

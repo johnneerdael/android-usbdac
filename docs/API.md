@@ -147,8 +147,8 @@ dac.set_dsd_overrides(Option<bool>, Option<u8>) -> Result<()>   // native DSD by
 | `processing_buffer_target_ms` | 100 | Recommended depth while software gain is not 1.0 on PCM (DoP and native DSD always keep the deep target). Nothing is flushed when the depth changes: see `writable_bytes`. |
 | `require_verified_rate` | `true` | Refuse to stream unless the DAC confirms the sampling frequency. Off: a DAC with a broken readback streams, and the stream is never bit-perfect. |
 | `clock_settle_delay_ms` | `None` | Wait after programming the clock. `None`: the device quirk, else 20 ms. |
-| `dsd_big_endian` | `None` | Native DSD byte order on the wire. `None`: the device quirk, else little-endian. |
-| `dsd_subslot` | `None` | Subslot size (1, 2, 4) for native DSD alternate settings. `None`: the device quirk, else the descriptor. |
+| `dsd_big_endian` | `None` | Legacy native DSD byte order on the wire. `None`: the device quirk, else little-endian. Standard UAC3 DSD stays little-endian. |
+| `dsd_subslot` | `None` | Legacy native DSD subslot size (1, 2, 4). `None`: the device quirk, else the descriptor. Standard UAC3 DSD uses 8 bytes. |
 | `padded_24bit` | `None` | Prefer the 4-byte subslot for 24-bit PCM. `None`: the device quirk, else off. |
 | `quirks` | empty | `QuirkOverride { vendor_id, product_id, name_contains, quirks: Vec<Quirk> }`, added to the built-in table. |
 | `allow_unsynchronized_async` | `false` | Allow an otherwise valid asynchronous endpoint without usable feedback to stream at the nominal rate. |
@@ -241,7 +241,7 @@ Capabilities {
     pcm_bit_depths: Vec<u8>,
     channel_counts: Vec<u16>,
     supports_pcm: bool,
-    supports_dop: bool,               // a PCM alt with >= 24 valid bits that runs at >= 176.4 kHz
+    supports_dop: bool,               // feasible PCM carrier: >= 24 valid bits at >= 176.4 kHz; not proof of marker decoding
     dop_max_dsd_bit_rate: Option<u32>,
     supports_native_dsd: bool,
     native_dsd_bit_rates: Vec<u32>,
@@ -562,14 +562,21 @@ The marker byte you write is **ignored and overwritten**: the library owns the
 `0x05`/`0xFA` alternation (the same marker for every channel of a frame), so the
 phase survives pause, flush and underrun. Request DoP with
 `StreamRequest::dop(dsd_bit_rate, channels)`: the carrier rate is the DSD rate
-divided by 16.
+divided by 16. DoP uses PCM framing, including on UAC3; it does not select
+the native DSD format. `supports_dop` and `dop_max_dsd_bit_rate` describe a
+feasible PCM carrier, not proof that the device decodes the markers. See the
+[DoP Open Standard](https://www.dsd-guide.com/sites/default/files/white-papers/DoP_openStandard_1v1.pdf).
 
 **Native DSD.** Raw DSD bytes, most significant bit first (the oldest bit in bit
 7), one byte per channel per step, interleaved: `[ch0, ch1, ch0, ch1, ...]`. A
 wire frame is `subslot_bytes * channels` bytes (one wire word per channel); the
-library groups the consecutive bytes of a channel into the wire word and orders
-them as the DAC needs (big-endian or little-endian per quirk or
-`dsd_big_endian`, with optional bit reversal for DACs that want it). DSF files
+library groups the consecutive bytes of a channel into the wire word. Standard
+[UAC3 DSD](sdk/references.md#ref-uac3-formats) uses 8-byte, 64-bit words per channel at `bit_rate / 64`: the oldest
+bit is D63, and the word is emitted little-endian (LE64), so the eight
+chronological input bytes of each channel appear in reverse byte order on the
+wire. Legacy native DSD uses 1-, 2- or 4-byte words and retains its device
+quirks and `dsd_big_endian`/`dsd_subslot` overrides, including optional bit
+reversal; those controls do not change the standard UAC3 layout. DSF files
 store the least significant bit first, so a host reading DSF must reverse the
 bits of each byte before writing. Request it with
 `StreamRequest::dsd_native(bit_rate, channels)`. The counters count DSD
@@ -1065,8 +1072,9 @@ code string or `null`. `software_gain`, `latency_ms`, `effective_rate_hz` and
 - Linux and Android only (usbfs through libusb's wrap-by-descriptor call). On
   other hosts the crate builds and its logic is unit-tested, but `Dac::open`
   returns `PlatformUnsupported`.
-- Playback only: no capture, no mixer. UAC 1.0 and 2.0 PCM and native DSD;
-  not UAC 3.0.
+- UAC 1.0, 2.0 and 3.0 playback include PCM and native DSD; standard
+  UAC3 DSD has a fixed 8-byte transport word. See the current capture API
+  for capture support; there is no mixer.
 - Not run on hardware as a standalone library. The transport is the code that
   ran in Flick; the layers around it (handle API, push ring, events, JNI) have
   only been exercised by host tests.

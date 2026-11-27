@@ -14,7 +14,7 @@ public enum class AltFormat {
     /** DoP carrier without independently advertised linear PCM. */
     DOP,
 
-    /** Native DSD (raw DSD bytes in a PCM-sized subslot). */
+    /** Native DSD: standard UAC3 8-byte words or a legacy device-specific layout. */
     DSD,
 
     /** Anything else, such as a compressed format. The library does not use it. */
@@ -38,9 +38,9 @@ public data class AltSetting(
     val endpointAddress: Int,
     val format: AltFormat,
     val channels: Int,
-    /** Bytes per sample on the wire (2, 3 or 4). */
+    /** Bytes per sample on the wire; standard UAC3 native DSD uses 8. */
     val subslotBytes: Int,
-    /** Significant bits of each sample (16, 24, 32). */
+    /** Significant bits of each sample; standard UAC3 native DSD uses 64. */
     val validBits: Int,
     val rateRanges: List<RateRange>,
     /** The discrete rates this alternate setting runs. */
@@ -73,9 +73,12 @@ public data class DacCapabilities(
     val pcmBitDepths: List<Int>,
     val channelCounts: List<Int>,
     val supportsPcm: Boolean,
-    /** A PCM alternate setting with at least 24 valid bits runs at 176.4 kHz or more. */
+    /**
+     * A feasible PCM DoP carrier: at least 24 valid bits at 176.4 kHz or more.
+     * This does not prove that the device decodes DoP markers.
+     */
     val supportsDop: Boolean,
-    /** The highest DSD bit rate DoP can reach on this DAC. */
+    /** The highest DSD bit rate the PCM carrier can transport; marker decoding is device-dependent. */
     val dopMaxDsdBitRate: Int?,
     val supportsNativeDsd: Boolean,
     val nativeDsdBitRates: List<Int>,

@@ -16,10 +16,20 @@ compatibility. Use the following order for the remaining work.
    power-domain hand-back. Resolve optional burst admission against
    descriptor or hardware evidence.
 4. Check the shared native DSD and DoP wire paths and PCM hand-back.
-5. Resume model-specific formats, clock commands, routing and firmware
-   rules after the shared implementation and automated checks pass.
-6. Run the physical acceptance matrix after the software work is complete,
-   including the additional desktop DACs.
+5. Record the evidence for additional device-specific support so the
+   maintainer can select models after this release.
+6. Release the shared implementation after software validation.
+   Hardware acceptance cases in this ledger document coverage for
+   a future device pass.
+
+QEMU 10.1.3 instantiated its virtual USB Audio Interface at full
+speed on an emulated xHCI bus. This proves device creation. A guest
+running the library is needed to prove playback through that bus.
+Linux `dummy_hcd` can exercise descriptor and control handling and
+rejects isochronous transfers. Use the Rust protocol and packet tests
+for the affected release paths unless a suitable virtual device
+can exercise them end to end. [QEMU USB emulation](https://www.qemu.org/docs/master/system/devices/usb.html),
+[Linux `dummy_hcd` transfer handling](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/gadget/udc/dummy_hcd.c#L1854-L1869)
 
 | Area | usbdac 0.1.1 | Implementation target | Acceptance evidence |
 |---|---|---|---|
@@ -67,6 +77,28 @@ format verification. The Android arm64 target check, release AAR and
 sample build passed with matching native libraries across all four
 ABIs. The AAR SHA-256 is
 `dc84a60f40269cc20ca1b62af146334dc32b268312d078f298ae7189385d85e1`.
+
+### DSD capability and carrier selection
+
+For standard UAC3 native DSD, intersect the clock's rate steps, the
+alternate's rate limits, and both selected endpoints' packet capacity
+with the 44.1 and 48 kHz families defined for DSD64 through DSD1024.
+Publish those transport rates as discrete choices. Legacy native DSD
+uses its resolved word width to check endpoint capacity, with bit
+rates derived by exact multiplication. [USB-IF Audio Data Formats 3.0 §2.3.1.6.5](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/commit/4762eed5fd4d612bef1a5a43ee87f4f4047bdbe5/Frmts30.pdf)
+
+Full UAC3 can use a PCM alternate as a DoP carrier when its slot,
+requested clock rate, packet capacity and pacing support the request.
+The wire format remains PCM and the existing DoP encoder owns the
+marker sequence. The carrier capability describes transport
+eligibility. Whether the DAC decodes those markers is part of final
+hardware acceptance. [DoP Open Standard 1.1](https://dsd-guide.com/sites/default/files/white-papers/DoP_openStandard_1v1.pdf)
+
+Rust tests covered DSD rate and packet-capacity admission, exact DoP
+carrier selection, and capability reporting. The Android arm64 check,
+Kotlin tests, release AAR and sample build passed. The AAR and sample
+contain matching native libraries for all four ABIs. The AAR SHA-256
+is `190a26732a81dea3b395624e1cd6799c706e79ae152f79f7256991e6f25675f2`.
 
 ## Clock selection and shared ownership
 

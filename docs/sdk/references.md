@@ -1,6 +1,6 @@
 # Public references
 
-Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. Each link was fetched on 2026-11-26 and the excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
+Every source the [design decisions](decisions.md) cite, with what it was used for and a short excerpt from the page. The original links were fetched on 2026-11-26; the UAC3 format reference was added on 2026-11-27. Each excerpt was found in the fetched text; a source that did not say what a claim needed is listed under [what the sources do not say](#gaps). The Linux files are cited on the `master` branch of the mainline tree, which moves; the function names are the stable part.
 
 ## Standards
 
@@ -29,6 +29,15 @@ Every source the [design decisions](decisions.md) cite, with what it was used fo
 - **Volume, section 5.2.5.7.2.** The volume attribute can "range from +127.9961 dB (0x7FFF) down to -127.9961 dB (0x8001) in steps of 1/256 dB", with CUR and RANGE requests.
 - The document refers the feedback format to the USB 2.0 specification, which is why that is the source above.
 - Used in [decisions 6, 9, 11 and 18](decisions.md).
+
+### USB Audio Class 3.0 audio data formats {#ref-uac3-formats}
+
+[`Frmts30.pdf`, USB-IF Release 3.0, mirrored copy](https://git.nefarius.at/nefarius/USB-Bluetooth-Specs/media/commit/4762eed5fd4d612bef1a5a43ee87f4f4047bdbe5/Frmts30.pdf).
+
+- **DSD format, section 2.3.1.6.5.** Native DSD uses 64-bit subslots (`bBitResolution = 64`, `bSubslotSize = 8`) at one sixty-fourth of the DSD sampling rate. This is a standard format, distinct from legacy device-specific DSD layouts.
+- **Type I format bitmap, Table A-2.** PCM and DSD have distinct format bits. A PCM DoP carrier therefore uses PCM framing, including on UAC3.
+- The current [USB-IF audio specification archive](https://www.usb.org/document-library/usb-audio-devices-release-40-and-adopters-agreement) makes the little-endian 64-bit DSD word convention explicit: D0 is newest, hence D63 is oldest. The SDK accepts chronological, MSB-first interleaved bytes and packs them accordingly.
+- Used in [decision 5](decisions-stream.md#dsd) and [bit-perfect output](bit-perfect.md#dsd).
 
 ### DSD over PCM (DoP) open standard 1.1 {#ref-dop}
 
@@ -63,7 +72,7 @@ range-checks the result before storing it. Used in [decision 7](decisions-clock.
 
 ### Native DSD quirks {#ref-linux-quirks}
 
-[`sound/usb/quirks.c`](https://github.com/torvalds/linux/blob/master/sound/usb/quirks.c), `snd_usb_interface_dsd_format_quirks`: "The UAC standards don't have a designated bit field to denote DSD-capable interfaces, hence all hardware that is known to support this format has to be listed here." The byte order (`DSD_U32_BE` or `DSD_U32_LE`) depends on the device. Used in [decision 5](decisions-stream.md#dsd).
+[`sound/usb/quirks.c`](https://github.com/torvalds/linux/blob/master/sound/usb/quirks.c), `snd_usb_interface_dsd_format_quirks`, identifies legacy native DSD devices and their byte order (`DSD_U32_BE` or `DSD_U32_LE`). Its comment about the absence of a designated format bit applies to those legacy paths; UAC3 defines a standard DSD format separately. Used in [decision 5](decisions-stream.md#dsd).
 
 ### xHCI ring segments {#ref-linux-xhci}
 
@@ -156,5 +165,5 @@ The usbdac commits behind the decisions, such as [`eada7d7`](https://github.com/
 - **The MQA article does not say where the signalling is.** usbdac makes no claim about it.
 - **The xHCI sources do not explain the 256-packet stall.** The explanation is a hypothesis.
 - **The Dither paper supports "first and second moments independent", not "fully independent".**
-- **The "UAC 2.0 RAW_DATA" format is not cited.** The audio data format document that defines it was not fetched; native DSD is cited through the Linux quirks instead.
+- **The "UAC 2.0 RAW_DATA" format is not cited.** The audio data format document that defines it was not fetched; legacy native DSD is cited through the Linux quirks; standard UAC3 DSD is cited through `Frmts30.pdf` above.
 - A third-party mirror of Alan Stern's `snd-usb-audio` URB rework, cited in Flick PR #400, redirected to a sign-in page and was not used.

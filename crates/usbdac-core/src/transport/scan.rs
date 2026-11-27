@@ -1008,24 +1008,40 @@ pub(super) fn build_usb_capability_model(
                     native.format = AltFormat::Dsd;
                     native.subslot_bytes = profile.word_bytes;
                     native.valid_bits = 1;
-                    if superspeed {
-                        let (mut ranges, mut rates) = capacity_limited_rates(
-                            &sample_rate_ranges, max_packet_bytes, service_interval_us,
-                            usize::from(stream_format.channels) * usize::from(profile.word_bytes),
-                        );
-                        if let Some(source) = implicit {
-                            (ranges, rates) = capacity_limited_rates(
-                                &ranges, source.max_packet_bytes, source.service_interval_us,
-                                source.bytes_per_frame,
-                            );
+                    // Native selection changes the format tag before resolving
+                    // pacing, so it cannot borrow the PCM implicit-feedback pipe.
+                    native.pacing = if !claimed_interfaces.contains(&descriptor.interface_number())
+                        || descriptor.setting_number() == 0
+                        || !matches!(endpoint.usage_type(), UsageType::Data | UsageType::FeedbackData | UsageType::Feedback)
+                        || (settings().disable_feedback()
+                            && endpoint.sync_type() == SyncType::Asynchronous
+                            && !settings().allow_unsynchronized_async())
+                    {
+                        None
+                    } else {
+                        match admit_endpoint(endpoint.sync_type(), endpoint.synch_address(),
+                            discovered_feedback.is_some(), settings().allow_unsynchronized_async()) {
+                            EndpointAdmission::Admit => Some(admitted_pacing(endpoint.sync_type(),
+                                feedback_address.filter(|_| !settings().disable_feedback()))),
+                            _ => None,
                         }
-                        if !sample_rate_ranges.is_empty() && ranges.is_empty() { continue; }
-                        native.rate_ranges = ranges.iter().map(|range| RateRange {
-                            min_hz: range.min, max_hz: range.max, step_hz: range.res,
-                        }).collect();
-                        native.sample_rates = rates;
-                        supported_sample_rates.extend(native.sample_rates.iter().copied());
+                    };
+                    let (ranges, rates) = capacity_limited_rates(
+                        &sample_rate_ranges, max_packet_bytes, service_interval_us,
+                        usize::from(stream_format.channels) * usize::from(profile.word_bytes),
+                    );
+                    // An empty clock response can still be verified during
+                    // negotiation; a known range that cannot fit cannot.
+                    if !sample_rate_ranges.is_empty() && ranges.is_empty() { continue; }
+                    native.rate_ranges = ranges.iter().map(|range| RateRange {
+                        min_hz: range.min, max_hz: range.max, step_hz: range.res,
+                    }).collect();
+                    native.sample_rates = rates;
+                    if native.pacing.is_none() {
+                        native.rate_ranges.clear();
+                        native.sample_rates.clear();
                     }
+                    supported_sample_rates.extend(native.sample_rates.iter().copied());
                     alt_settings.push(native);
                 }
                 if playback_designs_dop {
@@ -1054,7 +1070,8 @@ pub(super) fn build_usb_capability_model(
         }
     }
 
-    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces) {
+    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces, true) {
+        if ranges.is_empty() { continue; }
         let rates = candidate.sample_rates;
         supported_sample_rates.extend(rates.iter().copied());
         alt_settings.push(AltSetting {
@@ -1405,11 +1422,10 @@ pub(super) fn select_stream_candidates(
         }
     }
 
-    if matches!(playback_format.dsd_transport, DsdTransportMode::None | DsdTransportMode::Native) {
-        for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces) {
-            if adc3::adc3_candidate_matches_ranges(&candidate, &ranges, playback_format) {
-                candidates.push(candidate);
-            }
+    for (candidate, ranges) in adc3::adc3_candidates_with_ranges(device, handle, speed, claimed_interfaces,
+        playback_format.dsd_transport != DsdTransportMode::DoP) {
+        if adc3::adc3_candidate_matches_ranges(&candidate, &ranges, playback_format) {
+            candidates.push(candidate);
         }
     }
     let dsd_bit_rate = playback_format.dsd_bit_rate;
@@ -1666,6 +1682,8 @@ fn capacity_limited_rates(
     let ceiling = ((capacity / stride) as u64 * 1_000_000 / u64::from(interval))
         .min(u64::from(u32::MAX)) as u32;
     let clipped: Vec<_> = ranges.iter().filter_map(|range| {
+        if range.min == 0 || range.max < range.min
+            || (range.res == 0 && range.min != range.max) { return None; }
         let mut max = range.max.min(ceiling);
         if range.min > max { return None; }
         if range.res != 0 { max -= (max - range.min) % range.res; }
@@ -2595,7 +2613,7 @@ mod standard_capacity_tests {
 
     #[test]
     fn companion_capacity_clips_word_rates_without_dsd_bit_conversion() {
-        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 768_000, res: 0 }];
+        let ranges = [SamplingFrequencySubrange { min: 44_100, max: 768_000, res: 1 }];
         // Stereo 32-bit words: 192 bytes each 125us carries at most 192k words/s.
         let (clipped, rates) = capacity_limited_rates(&ranges, 192, 125, 8);
         assert_eq!(clipped[0].min, 44_100);
@@ -2624,4 +2642,24 @@ mod standard_capacity_tests {
         assert!(capacity_limited_rates(&ranges, 1, 125, 8).0.is_empty());
         assert!(capacity_limited_rates(&ranges, 96, 125, 0).0.is_empty());
     }
+    #[test]
+    fn capacity_limits_native_words_at_full_speed_and_rejects_malformed_ranges() {
+        let ranges = [SamplingFrequencySubrange { min: 88_200, max: 352_800, res: 88_200 }];
+        // Full-speed 1023-byte packets admit these stereo byte-word rates,
+        // while stereo 32-bit words fit only the lowest cadence.
+        let (_, rates) = capacity_limited_rates(&ranges, 1023, 1000, 2);
+        assert!(rates.contains(&352_800));
+        let (_, rates) = capacity_limited_rates(&ranges, 1023, 1000, 8);
+        assert_eq!(rates, vec![88_200]);
+        for malformed in [
+            SamplingFrequencySubrange { min: 0, max: 0, res: 0 },
+            SamplingFrequencySubrange { min: 44_100, max: 192_000, res: 0 },
+            SamplingFrequencySubrange { min: 192_000, max: 44_100, res: 1 },
+        ] {
+            let (ranges, rates) = capacity_limited_rates(&[malformed], 1023, 1000, 2);
+            assert!(ranges.is_empty());
+            assert!(rates.is_empty());
+        }
+    }
+
 }

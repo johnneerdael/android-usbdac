@@ -58,10 +58,10 @@ public sealed interface DacQuirk {
     /** Prefer the 4-byte subslot for 24-bit PCM. */
     public data object PreferPadded24BitTransport : DacQuirk
 
-    /** Native DSD words go on the wire most-significant byte first. */
+    /** Legacy native DSD words go on the wire most-significant byte first; standard UAC3 stays LE64. */
     public data object DsdBigEndian : DacQuirk
 
-    /** Reverse the bit order within each native DSD byte. */
+    /** Reverse the bit order within each legacy native DSD byte; standard UAC3 stays MSB first. */
     public data object DsdBitReverse : DacQuirk
 
     /** Trace-backed high-speed four-byte feedback reports express frames per OUT service interval. */
@@ -70,7 +70,7 @@ public sealed interface DacQuirk {
     /** Wait this long after programming the clock. */
     public data class SettleDelayMs(val milliseconds: Long) : DacQuirk
 
-    /** Override the subslot size (1, 2 or 4 bytes) of native DSD alternate settings whose descriptors are wrong or ambiguous. */
+    /** Override legacy native DSD subslots (1, 2 or 4 bytes) whose descriptors are wrong or ambiguous; standard UAC3 stays 8 bytes. */
     public data class DsdSubslotSize(val bytes: Int) : DacQuirk
 }
 
@@ -121,10 +121,10 @@ public data class DacConfig @JvmOverloads constructor(
     /** Wait after programming the clock, in milliseconds. `null`: the device's quirk, else 20 ms. */
     val clockSettleDelayMs: Long? = null,
 
-    /** Native DSD byte order on the wire. `null`: the device's quirk, else little-endian. */
+    /** Legacy native DSD byte order on the wire. `null`: the device's quirk, else little-endian. Standard UAC3 stays LE64. */
     val dsdBigEndian: Boolean? = null,
 
-    /** Subslot size (1, 2 or 4) for native DSD alternate settings. `null`: the device's quirk, else the descriptor. */
+    /** Legacy native DSD subslot size (1, 2 or 4). `null`: the device's quirk, else the descriptor. Standard UAC3 stays 8 bytes. */
     val dsdSubslot: Int? = null,
 
     /** Prefer the 4-byte subslot for 24-bit PCM. `null`: the device's quirk, else off. */

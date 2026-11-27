@@ -12,6 +12,26 @@ use crate::format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 /// PCM frame.
 const DOP_CARRIER_RATES: [u32; 4] = [176_400, 352_800, 705_600, 1_411_200];
 
+const MIN_NATIVE_DSD_BIT_RATE: u32 = 2_822_400;
+
+fn valid_native_dsd_bit_rate(bit_rate: u32) -> bool {
+    bit_rate >= MIN_NATIVE_DSD_BIT_RATE && bit_rate % 32 == 0
+}
+
+fn native_dsd_minimum_fits(capacity: usize, interval_us: u32, channels: u16, word_bytes: u8) -> bool {
+    if !(1..=32).contains(&channels) || !matches!(word_bytes, 1 | 2 | 4) || interval_us == 0 {
+        return false;
+    }
+    let wire_rate = MIN_NATIVE_DSD_BIT_RATE / (u32::from(word_bytes) * 8);
+    capacity >= required_max_packet_bytes(wire_rate, interval_us,
+        usize::from(channels) * usize::from(word_bytes))
+}
+
+fn native_dsd_bit_rate(wire_rate: u32, word_bytes: u8) -> Option<u32> {
+    wire_rate.checked_mul(8)?.checked_mul(u32::from(word_bytes))
+        .filter(|bit_rate| valid_native_dsd_bit_rate(*bit_rate))
+}
+
 /// The transport format a request asks for.
 pub(crate) fn playback_format_from_request(
     request: &StreamRequest,
@@ -54,7 +74,7 @@ pub(crate) fn playback_format_from_request(
             }
         }
         Encoding::DsdNative { bit_rate } => {
-            if bit_rate < 2_822_400 || bit_rate % 32 != 0 {
+            if !valid_native_dsd_bit_rate(bit_rate) {
                 return invalid("the native DSD bit_rate must be a DSD rate (at least 2822400)");
             }
             PlaybackFormat {
@@ -242,7 +262,7 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
         .collect();
     let dsd: Vec<&AltSetting> = alts
         .iter()
-        .filter(|alt| alt.format == AltFormat::Dsd)
+        .filter(|alt| alt.format == AltFormat::Dsd && alt.pacing.is_some())
         .collect();
 
     let mut pcm_sample_rates: Vec<u32> = pcm
@@ -273,12 +293,14 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     let dop_max_carrier = alts
         .iter()
         .filter(|alt| matches!(alt.format, AltFormat::Pcm | AltFormat::Dop))
-        .filter(|alt| alt.valid_bits >= 24)
+        .filter(|alt| alt.valid_bits >= 24 && alt.pacing.is_some())
         .flat_map(|alt| {
             DOP_CARRIER_RATES
                 .iter()
                 .copied()
                 .filter(move |rate| supports(alt, *rate)
+                    && alt.max_packet_bytes >= required_max_packet_bytes(*rate,
+                        alt.service_interval_us, usize::from(alt.channels) * usize::from(alt.subslot_bytes))
                     && (alt.format != AltFormat::Dop || playback_designs_dop_capacity(
                         alt.max_packet_bytes, alt.service_interval_us, *rate)))
         })
@@ -286,9 +308,8 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     let mut native_dsd_bit_rates: Vec<u32> = dsd
         .iter()
         .flat_map(|alt| {
-            alt.sample_rates.iter().map(move |rate| {
-                rate.saturating_mul(8)
-                    .saturating_mul(u32::from(alt.subslot_bytes))
+            alt.sample_rates.iter().filter_map(move |rate| {
+                native_dsd_bit_rate(*rate, alt.subslot_bytes)
             })
         })
         .collect();
@@ -315,7 +336,11 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
         supports_pcm: !pcm.is_empty(),
         supports_dop: dop_max_carrier.is_some(),
         dop_max_dsd_bit_rate: dop_max_carrier.map(|carrier| carrier * 16),
-        supports_native_dsd: !dsd.is_empty(),
+        supports_native_dsd: !native_dsd_bit_rates.is_empty() || dsd.iter().any(|alt|
+            alt.uac_version != UacVersion::V3 && alt.rate_ranges.is_empty()
+                && alt.sample_rates.is_empty()
+                && native_dsd_minimum_fits(alt.max_packet_bytes, alt.service_interval_us,
+                    alt.channels, alt.subslot_bytes)),
         native_dsd_bit_rates,
         has_explicit_feedback: alts.iter().any(|alt| alt.feedback_endpoint.is_some()),
         volume: control.map(|control| crate::volume::VolumeRange {
@@ -445,4 +470,31 @@ pub(crate) fn feedback_preflight(
 
 pub(crate) fn await_usb_retirement(timeout: Duration) -> bool {
     wait_for_session_stop(timeout) && !super::session::session_registered()
+}
+
+#[cfg(test)]
+mod dsd_summary_tests {
+    use super::*;
+
+    #[test]
+    fn native_summary_rates_are_valid_requests_without_overflow() {
+        assert_eq!(native_dsd_bit_rate(352_800, 1), Some(2_822_400));
+        assert_eq!(native_dsd_bit_rate(88_200, 4), Some(2_822_400));
+        assert_eq!(native_dsd_bit_rate(u32::MAX, 4), None);
+        assert_eq!(native_dsd_bit_rate(352_801, 1), None);
+        assert_eq!(native_dsd_bit_rate(44_100, 4), None);
+        assert_eq!(native_dsd_bit_rate(352_800, 0), None);
+    }
+
+    #[test]
+    fn unknown_clock_native_support_still_requires_minimum_packet_capacity() {
+        assert!(native_dsd_minimum_fits(706, 1000, 2, 1));
+        assert!(!native_dsd_minimum_fits(705, 1000, 2, 1));
+        // The resolved word width changes whole-frame packet rounding.
+        assert!(!native_dsd_minimum_fits(710, 1000, 2, 4));
+        assert!(native_dsd_minimum_fits(712, 1000, 2, 4));
+        assert!(!native_dsd_minimum_fits(1023, 0, 2, 1));
+        assert!(!native_dsd_minimum_fits(1023, 1000, 2, 0));
+    }
+
 }

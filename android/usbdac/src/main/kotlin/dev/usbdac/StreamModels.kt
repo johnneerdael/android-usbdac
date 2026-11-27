@@ -8,7 +8,7 @@ public enum class StreamEncoding {
     /** DSD over PCM: DSD bits carried in 24-bit PCM words with alternating marker bytes. */
     DOP,
 
-    /** Raw DSD in a PCM-sized subslot, for DACs that advertise a native DSD alternate setting. */
+    /** Native DSD in standard UAC3 8-byte words or a legacy device-specific layout. */
     DSD_NATIVE,
 }
 
@@ -51,7 +51,7 @@ public data class StreamRequest(
 
         /**
          * A DoP stream. The carrier is 24-bit PCM at `dsdBitRate / 16`, so DSD64 needs a DAC
-         * that runs 176.4 kHz.
+         * that runs 176.4 kHz and decodes DoP markers. UAC3 also uses PCM framing for DoP.
          */
         public fun dop(
             dsdBitRate: Int,
@@ -80,13 +80,13 @@ public class StreamFormat internal constructor(
     public val dsdBitRate: Int?,
     /**
      * The rate on the wire: the PCM rate, the DoP carrier rate, or for native DSD the rate of
-     * subslot-sized words.
+     * subslot-sized words (`dsdBitRate / 64` for standard UAC3 DSD).
      */
     public val sampleRate: Int,
     public val channels: Int,
     /** Significant bits of each sample. */
     public val validBits: Int,
-    /** Bytes per sample on the wire. */
+    /** Bytes per sample on the wire; 8 for standard UAC3 native DSD. */
     public val subslotBytes: Int,
     /** Bytes in one frame (`subslotBytes * channels`): the unit [PcmOutput.write] takes. */
     public val bytesPerFrame: Int,

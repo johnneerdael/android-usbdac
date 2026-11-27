@@ -235,12 +235,17 @@ impl StreamInner {
 ///   dsd_high, marker]`. `dsd_high` holds the older 8 DSD bits (MSB first). The
 ///   marker byte is **ignored and overwritten**: the library owns the
 ///   `0x05`/`0xFA` alternation so the phase survives pause, flush and underrun.
+///   DoP uses PCM framing even on UAC3; carrier capability does not prove
+///   that the device decodes the markers.
 /// * **Native DSD** — raw DSD bytes, MSB first (the oldest bit in bit 7),
 ///   interleaved one byte per channel: `[ch0, ch1, ch0, ch1, ...]` in
 ///   stream order. A wire frame is `subslot_bytes * channels` such bytes (one
 ///   wire word per channel); the library groups consecutive bytes of a channel
-///   into the wire word and orders them as the DAC needs (big-endian or
-///   little-endian, optional bit reversal, per quirk or config).
+///   into the wire word. Standard UAC3 DSD uses 8-byte words at `bit_rate / 64`,
+///   D63 oldest, emitted little-endian (LE64): each channel's eight chronological
+///   input bytes are reversed on the wire. Legacy 1-, 2- and 4-byte formats
+///   retain byte-order and bit-reversal quirks/config; those overrides do not
+///   change the standard UAC3 layout.
 ///
 /// [`write_i32`](Self::write_i32) takes the ring's own sample unit instead:
 /// PCM as full-scale 32-bit left-justified `i32` (the encoder keeps the top
