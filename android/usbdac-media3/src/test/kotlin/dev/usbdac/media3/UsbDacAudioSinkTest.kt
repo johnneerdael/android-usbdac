@@ -228,6 +228,10 @@ class UsbDacAudioSinkTest {
         assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), pcm24.copy(sampleRate = 96_000), true).support)
         assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt), StreamRequest.pcmFloat32(48_000, 2), true).support)
         assertEquals(OutputFormatSupport.UNSUPPORTED, directSessionSupport(listOf(alt.copy(pacing = null)), pcm24, true).support)
+        val alt32 = alt.copy(validBits = 32)
+        val wrongRate = alt.copy(validBits = 16, sampleRates = listOf(96_000))
+        assertEquals(listOf(24, 32), reconfigurationCandidates(listOf(wrongRate, alt32, alt), pcm16, true).map { it.bitDepth })
+        assertTrue(reconfigurationCandidates(listOf(alt), pcm16, false).isEmpty())
     }
     @Test
     fun trimsDelayAndPaddingWithoutChangingIntegerPrecisionAcrossGaplessTracks() {

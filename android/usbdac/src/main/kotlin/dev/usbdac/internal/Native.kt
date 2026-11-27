@@ -72,6 +72,7 @@ internal object Native {
 
     @JvmStatic external fun streamOpen(dac: Long, formatId: Long, listener: Any): Long
     @JvmStatic external fun streamReconfigure(dac: Long, current: Long, requestJson: String, timeoutMs: Long, listener: Any): String
+    @JvmStatic external fun streamReconfigureCandidates(dac: Long, current: Long, requestsJson: String, timeoutMs: Long, listener: Any): String
     @JvmStatic external fun streamClose(stream: Long)
     @JvmStatic external fun streamWrite(stream: Long, buffer: ByteBuffer, offset: Int, count: Int): Int
     @JvmStatic external fun streamWritableBytes(stream: Long): Int

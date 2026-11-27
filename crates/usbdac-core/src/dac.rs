@@ -40,6 +40,37 @@ fn reconfigure_or_restore<T>(
     }
 }
 
+fn validate_reconfigure_candidates(requests: &[StreamRequest]) -> Result<()> {
+    if requests.is_empty() || requests.len() > 4 {
+        return Err(Error::InvalidArgument(
+            "expected one to four reconfiguration candidates".into(),
+        ));
+    }
+    for request in requests {
+        transport::api::playback_format_from_request(request)?;
+    }
+    if requests.len() > 1 {
+        let first = requests[0];
+        if first.encoding != crate::Encoding::Pcm
+            || first.rate_policy != crate::RatePolicy::Exact
+            || requests
+                .windows(2)
+                .any(|pair| pair[0].bit_depth >= pair[1].bit_depth)
+            || requests.iter().any(|r| {
+                r.encoding != first.encoding
+                    || r.sample_rate != first.sample_rate
+                    || r.channels != first.channels
+                    || r.rate_policy != crate::RatePolicy::Exact
+            })
+        {
+            return Err(Error::InvalidArgument(
+                "candidates must be ascending same-rate, same-channel PCM widening".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// State shared by the `Dac`, its streams and its volume handle.
 pub(crate) struct DacShared {
     pub(crate) events: EventSink,
@@ -504,6 +535,26 @@ impl Dac {
         listener: Arc<dyn DacListener>,
         drain_timeout: Duration,
     ) -> Result<StreamReconfiguration> {
+        self.reconfigure_stream_candidates(
+            current,
+            std::slice::from_ref(request),
+            listener,
+            drain_timeout,
+        )
+    }
+
+    /// Replace once using a bounded list of equivalent-rate lossless widening candidates.
+    /// The first admitted candidate is attempted. Later candidates are retained for future
+    /// clean-refusal evidence; an uncertain runtime failure triggers a single rollback.
+    pub fn reconfigure_stream_candidates(
+        &self,
+        current: &DacStream,
+        requests: &[StreamRequest],
+        listener: Arc<dyn DacListener>,
+        drain_timeout: Duration,
+    ) -> Result<StreamReconfiguration> {
+        validate_reconfigure_candidates(requests)?;
+        let request = &requests[0];
         let control = self.shared.control_guard.lock();
         self.shared.reject_reconfigure()?;
         let _scope = self.shared.enter()?;
@@ -525,8 +576,10 @@ impl Dac {
                 Error::InvalidArgument("drain timeout overflows monotonic clock".into())
             })?;
         let volume_route = transport::api::volume_route_signature();
-        current.drain()?;
-        current.play()?;
+        if !current.is_drained() {
+            current.drain()?;
+            current.play()?;
+        }
         drop(control);
         while !current.is_drained() {
             if self.shared.events.device_lost() || self.shared.closed.load(Ordering::Acquire) {
@@ -1130,6 +1183,21 @@ mod tests {
         assert!(dac.shared.reject_reconfigure().is_ok());
         dac.close().unwrap();
         drop(fake);
+    }
+
+    #[test]
+    fn widening_candidates_must_be_bounded_ordered_and_same_source_shape() {
+        let a = StreamRequest::pcm(48_000, 2, 16);
+        let b = StreamRequest::pcm(48_000, 2, 24);
+        let c = StreamRequest::pcm(48_000, 2, 32);
+        assert!(validate_reconfigure_candidates(&[a, b, c]).is_ok());
+        assert!(validate_reconfigure_candidates(&[]).is_err());
+        assert!(validate_reconfigure_candidates(&[b, a]).is_err());
+        assert!(validate_reconfigure_candidates(&[a, StreamRequest::pcm(96_000, 2, 24)]).is_err());
+        assert!(validate_reconfigure_candidates(&[a, StreamRequest::pcm(48_000, 1, 24)]).is_err());
+        assert!(
+            validate_reconfigure_candidates(&[a, StreamRequest::pcm_float32(48_000, 2)]).is_err()
+        );
     }
 
     #[test]

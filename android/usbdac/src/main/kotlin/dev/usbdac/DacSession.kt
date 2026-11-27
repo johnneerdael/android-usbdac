@@ -16,6 +16,7 @@ import dev.usbdac.internal.toJson
 import dev.usbdac.internal.toCaptureJson
 import dev.usbdac.internal.parseCaptureFormat
 import org.json.JSONObject
+import org.json.JSONArray
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -194,16 +195,25 @@ public class DacSession private constructor(
      * [DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT] while [current] remains open/draining (no hidden flush).
      * [DacErrorCode.RECONFIGURE_UNUSABLE] requires closing this session. Duplex is refused.
      */
+    public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration =
+        reconfigureCandidates(current, listOf(request), drainTimeoutMs)
+
+    /**
+     * Reconfigure once with up to four ascending same-rate/channel PCM widening candidates.
+     * A runtime refusal is rolled back unless the native backend can prove retry is safe.
+     */
     @Synchronized
-    public fun reconfigure(current: DacStream, request: StreamRequest, drainTimeoutMs: Long = 5_000): StreamReconfiguration {
+    public fun reconfigureCandidates(current: DacStream, requests: List<StreamRequest>, drainTimeoutMs: Long = 5_000): StreamReconfiguration {
         checkOpen()
+        require(requests.isNotEmpty() && requests.size <= 4) { "expected one to four candidates" }
         require(drainTimeoutMs >= 0) { "negative drain timeout" }
         if (stream !== current || duplex != null) {
             throw DacException(DacErrorCode.INVALID_ARGUMENT, "current must be this session's playback-only stream")
         }
         val signals = StreamSignals { event -> mutableEvents.tryEmit(event) }
-        val response = nativeCall { JSONObject(Native.streamReconfigure(dac, current.handleForReconfigure(),
-            request.toJson(), drainTimeoutMs, signals)) }
+        val candidates = JSONArray().apply { requests.forEach { put(JSONObject(it.toJson())) } }
+        val response = nativeCall { JSONObject(Native.streamReconfigureCandidates(dac, current.handleForReconfigure(),
+            candidates.toString(), drainTimeoutMs, signals)) }
         val handle = nativeCall { response.getLong("stream_id") }
         current.retiredByReconfigure()
         try {

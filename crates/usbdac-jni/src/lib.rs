@@ -444,30 +444,71 @@ pub fn stream_reconfigure<'l>(
     listener: JObject<'l>,
 ) -> JString<'l> {
     run(&mut env, |env| {
-        let timeout =
-            u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
         let request = json::parse_request(&string_of(env, &request_json)?)?;
-        let entry = registry::dac(dac)?;
-        let old = registry::stream_for_dac(&entry, current)?;
-        let listener = listener_of(env, &listener)?
-            .ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
-        let report = entry.dac.reconfigure_stream(
-            &old,
-            &request,
-            listener,
-            std::time::Duration::from_millis(timeout),
-        )?;
-        let id = registry::next_id();
-        let format_id = entry.remember_format(report.stream.format().clone());
-        let response = serde_json::json!({"stream_id": id,
-            "format": json::stream_format(format_id, report.stream.format()),
-            "rolled_back": report.rollback_cause.is_some(),
-            "error_code": report.rollback_cause.as_ref().map(|e| e.code()),
-            "error_message": report.rollback_cause.as_ref().map(|e| e.message())});
-        let result = java_string(env, &response)?;
-        registry::replace_stream(&entry, current, id, report.stream)?;
-        Ok(result)
+        reconfigure_registered(env, dac, current, &[request], timeout_ms, &listener)
     })
+}
+
+/// Reconfigure from a bounded list of equivalent source-layout candidates.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn stream_reconfigure_candidates<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    current: i64,
+    requests_json: JString<'l>,
+    timeout_ms: i64,
+    listener: JObject<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let value: Value = serde_json::from_str(&string_of(env, &requests_json)?)
+            .map_err(|error| Failure::Bad(format!("invalid candidate list: {error}")))?;
+        let array = value
+            .as_array()
+            .ok_or_else(|| Failure::Bad("candidate list must be an array".into()))?;
+        if array.is_empty() || array.len() > 4 {
+            return Err(Failure::Bad(
+                "candidate list must contain one to four entries".into(),
+            ));
+        }
+        let requests = array
+            .iter()
+            .map(|item| json::parse_request(&item.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        reconfigure_registered(env, dac, current, &requests, timeout_ms, &listener)
+    })
+}
+
+fn reconfigure_registered<'l>(
+    env: &mut Env<'l>,
+    dac: i64,
+    current: i64,
+    requests: &[usbdac_core::StreamRequest],
+    timeout_ms: i64,
+    listener: &JObject<'l>,
+) -> Outcome<JString<'l>> {
+    let timeout =
+        u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
+    let entry = registry::dac(dac)?;
+    let old = registry::stream_for_dac(&entry, current)?;
+    let listener = listener_of(env, listener)?
+        .ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
+    let report = entry.dac.reconfigure_stream_candidates(
+        &old,
+        requests,
+        listener,
+        std::time::Duration::from_millis(timeout),
+    )?;
+    let id = registry::next_id();
+    let format_id = entry.remember_format(report.stream.format().clone());
+    let response = serde_json::json!({"stream_id": id,
+        "format": json::stream_format(format_id, report.stream.format()),
+        "rolled_back": report.rollback_cause.is_some(),
+        "error_code": report.rollback_cause.as_ref().map(|e| e.code()),
+        "error_message": report.rollback_cause.as_ref().map(|e| e.message())});
+    let result = java_string(env, &response)?;
+    registry::replace_stream(&entry, current, id, report.stream)?;
+    Ok(result)
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
