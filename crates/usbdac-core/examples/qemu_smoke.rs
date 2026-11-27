@@ -97,7 +97,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "this probe proves UAC1 only"
     );
     println!("CAPABILITIES {capabilities:?}");
-    let fmt = dac.negotiate(&StreamRequest::pcm(48_000, 2, 16))?;
+    let exact = StreamRequest::pcm(44_100, 2, 16);
+    assert!(
+        matches!(
+            dac.negotiate(&exact),
+            Err(usbdac_core::Error::Unsupported { .. })
+        ),
+        "48 kHz-only QEMU alternate must reject 44.1 kHz exact"
+    );
+    let adaptive = StreamRequest {
+        rate_policy: usbdac_core::RatePolicy::NearestSupported,
+        ..exact
+    };
+    let fmt = dac.negotiate(&adaptive)?;
+    assert_eq!(
+        fmt.sample_rate, 48_000,
+        "adaptive QEMU setup must use the supported wire rate"
+    );
+    println!("QEMU_RATE_POLICY_PASS exact=44100-rejected adaptive=48000");
     println!("FORMAT {fmt:?}");
     let listener = Arc::new(|e: DacEvent| eprintln!("EVENT {e:?}"));
     let mut stream = dac.open_stream(&fmt, listener.clone())?;
