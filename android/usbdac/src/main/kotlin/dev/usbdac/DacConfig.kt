@@ -158,6 +158,14 @@ public enum class ClockReadbackPolicy(internal val wireName: String) {
     ALLOW_UNUSABLE_AFTER_SUCCESSFUL_SET("allow_unusable_after_successful_set"),
 }
 
+/** How accepted explicit feedback reports change packet timing; implicit cadence is unaffected. */
+public enum class FeedbackSmoothing(internal val wireName: String) {
+    /** Use each accepted report directly, without averaging or rate rounding. */
+    DIRECT("direct"),
+    /** Legacy filter: first report directly, then old + 0.2 * (report - old). */
+    EWMA("ewma"),
+}
+
 /**
  * Every tunable of a session. The defaults are what the transport was tuned with; change a
  * value only for a reason. Values left `null` follow the DAC's quirk, then a fixed default.
@@ -288,6 +296,9 @@ public data class DacConfig @JvmOverloads constructor(
 
     /** Device-specific transport rules; source-backed rules require this explicit opt-in. */
     val quirkPolicy: QuirkPolicy = QuirkPolicy.VERIFIED_ONLY,
+
+    /** Explicit feedback policy, applied when a stream opens. Default direct; EWMA retains legacy alpha 0.2. */
+    val feedbackSmoothing: FeedbackSmoothing = FeedbackSmoothing.DIRECT,
 ) {
     /** Apply a USB queue profile and keep this config's other session settings. */
     public fun withUsbQueueProfile(profile: UsbQueueProfile): DacConfig = when (profile) {

@@ -8,9 +8,9 @@ use serde_json::{json, Value};
 use usbdac_core::{
     AltFormat, AltSetting, AsyncFallbackPolicy, Capabilities, ClockChoice, ClockHop, ClockHopKind,
     ClockReadbackPolicy, DacConfig, DacEvent, DeviceInfo, Encoding, Error, ExplicitFeedbackPacket,
-    FeedbackTrace, FeedbackTraceEvent, HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride,
-    QuirkPolicy, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest,
-    StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
+    FeedbackSmoothing, FeedbackTrace, FeedbackTraceEvent, HandBack, LinkSpeed, Pacing, Quirk,
+    QuirkOverride, QuirkPolicy, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat,
+    StreamRequest, StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
 };
 
 fn uac(version: UacVersion) -> &'static str {
@@ -273,6 +273,19 @@ fn feedback_trace_observation(event: &FeedbackTraceEvent) -> Value {
         }),
         FeedbackTraceEvent::Timebase { unit, inferred } => json!({
             "event": "timebase", "unit": unit, "inferred": inferred,
+        }),
+        FeedbackTraceEvent::ExplicitFeedbackPolicy { smoothing } => json!({
+            "event":"explicit_feedback_policy","feedback_smoothing":smoothing.as_str(),
+        }),
+        FeedbackTraceEvent::ExplicitFeedbackRate {
+            smoothing,
+            reported_frames_per_out_service,
+            applied_frames_per_out_service,
+            applied_rate_hz,
+        } => json!({
+            "event":"explicit_feedback_rate","feedback_smoothing":smoothing.as_str(),
+            "reported_frames_per_out_service":reported_frames_per_out_service,
+            "applied_frames_per_out_service":applied_frames_per_out_service,"applied_rate_hz":applied_rate_hz,
         }),
         FeedbackTraceEvent::CompatibilityFallback { tier, reason } => json!({
             "event":"compatibility_fallback", "tier":tier.as_str(), "reason":reason,
@@ -774,6 +787,13 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     config.padded_24bit = boolean(map, "padded_24bit")?;
     if let Some(value) = boolean(map, "disable_feedback")? {
         config.disable_feedback = value;
+    }
+    if let Some(policy) = text(map, "feedback_smoothing")? {
+        config.feedback_smoothing = match policy.as_str() {
+            "direct" => FeedbackSmoothing::Direct,
+            "ewma" => FeedbackSmoothing::Ewma,
+            _ => return Err(BadRequest(format!("unknown feedback_smoothing {policy:?}"))),
+        };
     }
     if let Some(value) = boolean(map, "capture_feedback_trace")? {
         config.capture_feedback_trace = value;
@@ -1336,6 +1356,58 @@ mod compatibility_admission_bridge_tests {
                 strikes: 3
             }),
             json!({"event":"clock_readback_suggestion","control_interface":2,"clock_entity":9,"strikes":3})
+        );
+    }
+}
+
+#[cfg(test)]
+mod feedback_smoothing_wire_tests {
+    use super::*;
+    #[test]
+    fn explicit_feedback_smoothing_defaults_to_direct_and_retains_typed_legacy_opt_in() {
+        for input in [None, Some("{}"), Some(r#"{"feedback_smoothing":"direct"}"#)] {
+            assert_eq!(
+                parse_config(input).ok().unwrap().feedback_smoothing,
+                FeedbackSmoothing::Direct
+            );
+        }
+        assert_eq!(
+            parse_config(Some(r#"{"feedback_smoothing":"ewma"}"#))
+                .ok()
+                .unwrap()
+                .feedback_smoothing,
+            FeedbackSmoothing::Ewma
+        );
+        for input in [
+            r#"{"feedback_smoothing":"average"}"#,
+            r#"{"feedback_smoothing":0.2}"#,
+            r#"{"feedback_smoothing":true}"#,
+        ] {
+            assert!(parse_config(Some(input)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod feedback_smoothing_trace_wire_tests {
+    use super::*;
+    #[test]
+    fn support_wire_labels_policy_and_preserves_fractional_applied_rate() {
+        assert_eq!(
+            feedback_trace_observation(&FeedbackTraceEvent::ExplicitFeedbackPolicy {
+                smoothing: FeedbackSmoothing::Direct
+            }),
+            json!({"event":"explicit_feedback_policy","feedback_smoothing":"direct"})
+        );
+        assert_eq!(
+            feedback_trace_observation(&FeedbackTraceEvent::ExplicitFeedbackRate {
+                smoothing: FeedbackSmoothing::Ewma,
+                reported_frames_per_out_service: 9.0,
+                applied_frames_per_out_service: 6.6,
+                applied_rate_hz: 52800.0
+            }),
+            json!({"event":"explicit_feedback_rate","feedback_smoothing":"ewma","reported_frames_per_out_service":9.0,
+                "applied_frames_per_out_service":6.6,"applied_rate_hz":52800.0})
         );
     }
 }

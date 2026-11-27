@@ -237,8 +237,16 @@ microseconds, adaptive queue changes, active slot count, and active queue time.
 These distinguish a late host worker from packet failures; they do not infer an
 OEM cause from a device name. Opt-in explicit feedback reports include accepted
 unsmoothed sample count, minimum, maximum, mean and population variance in frames
-per OUT service interval, alongside the existing packet outcomes. The EWMA
-coefficient remains 0.2. No smoothing or audible tradeoff has been measured from
+per OUT service interval, alongside the existing packet outcomes. These values
+and `feedbackRateHz` describe accepted raw reports, not a filtered scheduling rate.
+The trace's `explicit_feedback_policy` startup entry records `feedback_smoothing`
+(`direct` by default, or legacy `ewma`). Each `explicit_feedback_rate` observation
+records the selected policy, `reported_frames_per_out_service`,
+`applied_frames_per_out_service` and `applied_rate_hz`, preserving fractional
+precision. Direct applies the accepted selected report unchanged; EWMA retains
+alpha 0.2. The intake selects the newest valid report in each completed transfer,
+then commits each completion in order; only the most recent committed value can
+influence the next OUT refill. No physical or audible comparison follows from
 these statistics alone.
 
 For an attachment or permission issue, retain the current attachment ID as well

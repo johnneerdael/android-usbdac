@@ -69,6 +69,7 @@ internal fun DacConfig.toNativeJson(): String =
         .put("adaptive_queue", adaptiveQueue)
         .put("quirk_policy", quirkPolicy.wireName)
         .put("disable_feedback", disableFeedback)
+        .put("feedback_smoothing", feedbackSmoothing.wireName)
         .put("capture_feedback_trace", captureFeedbackTrace)
         .put("realtime_priority", realtimePriority)
         .put("hand_back", "keep")

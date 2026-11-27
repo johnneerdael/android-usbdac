@@ -1,3 +1,5 @@
+use crate::FeedbackSmoothing;
+
 /// Default time the library keeps queued on the bus
 /// ([`DacConfig::bus_queue_ms`](crate::DacConfig::bus_queue_ms)).
 pub(crate) const DEFAULT_BUS_QUEUE_MS: u32 = 16;
@@ -134,6 +136,7 @@ pub(crate) struct IsoPacketScheduler {
     bytes_per_frame: usize,
     packets_per_transfer: usize,
     feedback_frames_per_packet: Option<f64>,
+    feedback_smoothing: FeedbackSmoothing,
     feedback_remainder: f64,
     packet_pattern: Option<Vec<usize>>,
 }
@@ -162,9 +165,25 @@ impl IsoPacketScheduler {
             bytes_per_frame,
             packets_per_transfer: geometry.packets_per_transfer,
             feedback_frames_per_packet: None,
+            feedback_smoothing: FeedbackSmoothing::Direct,
             feedback_remainder: 0.0,
             packet_pattern: None,
         }
+    }
+
+    /// Configure the dedicated explicit-feedback path without changing phase.
+    /// Implicit timing continues to consume its measured packet vectors.
+    pub(crate) fn with_explicit_feedback_smoothing(mut self, policy: FeedbackSmoothing) -> Self {
+        self.feedback_smoothing = policy;
+        self
+    }
+
+    pub(crate) fn explicit_feedback_smoothing(&self) -> FeedbackSmoothing {
+        self.feedback_smoothing
+    }
+
+    pub(crate) fn applied_feedback_frames_per_packet(&self) -> Option<f64> {
+        self.feedback_frames_per_packet
     }
 
     pub(crate) fn packets_per_transfer(&self) -> usize {
@@ -196,14 +215,18 @@ impl IsoPacketScheduler {
             return false;
         }
 
-        self.feedback_frames_per_packet = Some(match self.feedback_frames_per_packet {
-            Some(previous) => previous + (frames_per_packet - previous) * 0.2,
-            None => frames_per_packet,
-        });
+        self.feedback_frames_per_packet = Some(
+            match (self.feedback_smoothing, self.feedback_frames_per_packet) {
+                (FeedbackSmoothing::Ewma, Some(previous)) => {
+                    previous + (frames_per_packet - previous) * 0.2
+                }
+                _ => frames_per_packet,
+            },
+        );
         true
     }
 
-    /// Validate without changing EWMA or fractional phase while scanning a batch.
+    /// Validate without changing the selected rate or fractional phase while scanning a batch.
     pub(crate) fn feedback_rate_is_plausible(&self, frames_per_packet: f64) -> bool {
         if !frames_per_packet.is_finite() || frames_per_packet <= 0.0 {
             return false;
@@ -269,16 +292,17 @@ impl AdaptiveQueue {
             last_loss_ms: 0,
         }
     }
-    pub(crate) fn observe(&mut self, now_ms: u64, lossy: bool) -> bool {
+    pub(crate) fn observe(&mut self, now_ms: u64, lossy_completions: u32) -> bool {
         let previous = self.slots;
-        if lossy {
+        if lossy_completions > 0 {
             if now_ms.saturating_sub(self.window_ms) > 1_000 {
                 self.losses = 0;
                 self.window_ms = now_ms;
             }
             self.last_loss_ms = now_ms;
-            self.losses = self.losses.saturating_add(1);
+            self.losses = self.losses.saturating_add(lossy_completions);
             if self.losses >= 3 {
+                // Count coalesced losses, but grow only once per worker batch.
                 self.slots = (self.slots + 2).min(self.max_slots);
                 self.losses = 0;
             }
@@ -298,14 +322,14 @@ mod adaptive_tests {
         let g = IsoQueueGeometry::default_for(125);
         let mut queue = AdaptiveQueue::new(g, true);
         for at in [0, 10, 20] {
-            queue.observe(at, true);
+            queue.observe(at, 1);
         }
         assert_eq!(queue.slots, 10);
-        assert!(!queue.observe(29_999, false));
-        assert!(queue.observe(30_020, false));
+        assert!(!queue.observe(29_999, 0));
+        assert!(queue.observe(30_020, 0));
         assert_eq!(queue.slots, 9);
         for at in 0..100 {
-            queue.observe(30_021 + at, true);
+            queue.observe(30_021 + at, 1);
         }
         assert_eq!(queue.slots, 15);
         assert!(queue.slots * g.packets_per_transfer < PACKET_FLIGHT_LIMIT);
@@ -315,9 +339,32 @@ mod adaptive_tests {
         let g = IsoQueueGeometry::default_for(125);
         let mut queue = AdaptiveQueue::new(g, false);
         for at in 0..100 {
-            assert!(!queue.observe(at, true));
+            assert!(!queue.observe(at, 1));
         }
         assert_eq!(queue.slots, g.transfer_slots);
+    }
+    #[test]
+    fn three_lossy_completions_coalesced_in_one_batch_deepen_once() {
+        let geometry = IsoQueueGeometry::default_for(125);
+        let mut queue = AdaptiveQueue::new(geometry, true);
+        let losses = [true, false, true, false, true]
+            .into_iter()
+            .fold(0u32, |count, lossy| count.saturating_add(u32::from(lossy)));
+        assert!(queue.observe(100, losses));
+        assert_eq!(queue.slots, geometry.transfer_slots + 2);
+        assert!(!queue.observe(30_099, 0));
+        assert!(queue.observe(30_100, 0));
+        assert_eq!(queue.slots, geometry.transfer_slots + 1);
+        assert!(queue.observe(30_101, u32::MAX));
+        assert_eq!(
+            queue.slots,
+            geometry.transfer_slots + 3,
+            "one growth even for a saturated batch count"
+        );
+        assert!(queue.slots * geometry.packets_per_transfer < PACKET_FLIGHT_LIMIT);
+        let mut fixed = AdaptiveQueue::new(geometry, false);
+        assert!(!fixed.observe(100, losses));
+        assert_eq!(fixed.slots, geometry.transfer_slots);
     }
 }
 

@@ -448,7 +448,8 @@ fn test_scheduler_feedback_rejects_and_recovers_from_outlier() {
 
 #[test]
 fn explicit_feedback_validation_preserves_phase_and_updates_ewma_once() {
-    let mut scheduler = IsoPacketScheduler::new(48_000, 8, 1000);
+    let mut scheduler = IsoPacketScheduler::new(48_000, 8, 1000)
+        .with_explicit_feedback_smoothing(crate::FeedbackSmoothing::Ewma);
     assert!(scheduler.update_feedback_frames_per_packet(48.25));
     let first = scheduler.next_transfer_packet_bytes();
     let first_frames: usize = first.iter().map(|bytes| bytes / 8).sum();
@@ -477,5 +478,71 @@ fn feedback_recentering_window_is_bounded_and_ewma_retained() {
     }
     for factor in [0.874, 1.501, 0.0, f64::INFINITY, f64::NAN] {
         assert!(!scheduler.update_feedback_frames_per_packet(6.0 * factor));
+    }
+}
+
+#[test]
+fn direct_feedback_takes_the_step_immediately_while_ewma_retains_legacy_lag() {
+    let mut direct = IsoPacketScheduler::new(48_000, 4, 125);
+    let mut ewma = IsoPacketScheduler::new(48_000, 4, 125)
+        .with_explicit_feedback_smoothing(crate::FeedbackSmoothing::Ewma);
+    for scheduler in [&mut direct, &mut ewma] {
+        assert!(scheduler.update_feedback_frames_per_packet(6.0));
+        assert_eq!(
+            scheduler.next_transfer_packet_bytes().iter().sum::<usize>() / 4,
+            96
+        );
+        assert!(scheduler.update_feedback_frames_per_packet(9.0));
+    }
+    assert_eq!(direct.next_transfer_packet_bytes(), vec![36; 16]);
+    let legacy = ewma.next_transfer_packet_bytes();
+    assert!(legacy.iter().all(|bytes| [24, 28].contains(bytes)));
+    assert_eq!(legacy.iter().sum::<usize>() / 4, 105);
+}
+
+#[test]
+fn direct_feedback_burst_commits_the_latest_accepted_rate_without_carrying_old_rates() {
+    let mut scheduler = IsoPacketScheduler::new(48_000, 4, 125);
+    for report in [6.0, 9.0, 5.25] {
+        assert!(scheduler.update_feedback_frames_per_packet(report));
+    }
+    let frames = scheduler.next_transfer_packet_bytes().iter().sum::<usize>() / 4;
+    assert_eq!(frames, 84);
+    assert!(!scheduler.update_feedback_frames_per_packet(10.0));
+    assert_eq!(
+        scheduler.next_transfer_packet_bytes().iter().sum::<usize>() / 4,
+        84
+    );
+}
+
+#[test]
+fn direct_fractional_feedback_preserves_phase_across_swings_and_rejected_reports() {
+    let mut scheduler = IsoPacketScheduler::new(48_000, 6, 125);
+    let mut expected = 0.0f64;
+    let mut actual = 0usize;
+    for report in [6.03125, 8.8125, 5.375, 6.0].into_iter().cycle().take(4096) {
+        for rejected in [f64::NAN, f64::INFINITY, 0.0, 5.0, 9.01] {
+            assert!(!scheduler.update_feedback_frames_per_packet(rejected));
+        }
+        assert!(scheduler.update_feedback_frames_per_packet(report));
+        let packets = scheduler.next_transfer_packet_bytes();
+        assert!(packets.iter().all(|bytes| bytes % 6 == 0));
+        expected += report * packets.len() as f64;
+        actual += packets.iter().sum::<usize>() / 6;
+        assert_eq!(actual, expected.floor() as usize);
+    }
+}
+
+#[test]
+fn smoothing_policy_never_filters_or_rewrites_implicit_packet_vectors() {
+    for policy in [
+        crate::FeedbackSmoothing::Direct,
+        crate::FeedbackSmoothing::Ewma,
+    ] {
+        let mut scheduler =
+            IsoPacketScheduler::new(48_000, 4, 125).with_explicit_feedback_smoothing(policy);
+        let measured = vec![20, 24, 20, 24];
+        scheduler.set_packet_pattern(measured.clone());
+        assert_eq!(scheduler.next_transfer_packet_bytes(), measured);
     }
 }

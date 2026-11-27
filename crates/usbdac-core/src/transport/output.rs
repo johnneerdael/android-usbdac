@@ -765,6 +765,12 @@ pub(super) fn run_usb_output_loop(
         candidate.service_interval_us,
         geometry,
     );
+    if candidate.sync_type == SyncType::Asynchronous
+        && candidate.feedback_endpoint.is_some()
+        && candidate.implicit_feedback.is_none()
+    {
+        scheduler = scheduler.with_explicit_feedback_smoothing(bus_config.feedback_smoothing);
+    }
     // Implicit feedback owns a matched IN/OUT pool and must retain its geometry.
     let mut adaptive_queue = crate::iso_packet_scheduler::AdaptiveQueue::new(
         geometry,
@@ -877,6 +883,11 @@ pub(super) fn run_usb_output_loop(
             .contains(&route);
     }
     if let Some(endpoint) = feedback_endpoint.filter(|_| feedback_health.is_some()) {
+        if let Some(trace) = &feedback_counters.trace {
+            trace.record(crate::FeedbackTraceEvent::ExplicitFeedbackPolicy {
+                smoothing: scheduler.explicit_feedback_smoothing(),
+            });
+        }
         feedback_counters.diagnostics = Some(crate::ExplicitFeedbackDiagnostics {
             endpoint: endpoint.address,
             transfer_type: transfer_type_label(endpoint.transfer_type),
@@ -1648,7 +1659,7 @@ pub(super) fn run_usb_output_loop(
         {
             log_warn!("[USB] Nominal asynchronous producer ring empty for 5 seconds; DAC FIFO drift is unobservable from host occupancy");
         }
-        let mut batch_lossy = false;
+        let mut batch_lossy_completions = 0u32;
         let mut latest_playback_completion = None;
         let retirement_count = if batch_lock_pending {
             let order = lock_retirement_order
@@ -1856,7 +1867,9 @@ pub(super) fn run_usb_output_loop(
 
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
                 .with_held(completed_held);
-            batch_lossy |= urb_loss.lost_frames > 0;
+            if urb_loss.lost_frames > 0 {
+                batch_lossy_completions = batch_lossy_completions.saturating_add(1);
+            }
             let verdict = loss_tracker.record(queued_frame_count, urb_loss);
             if verdict.lossy || urb_loss.short_packets > 0 || urb_loss.zero_packets > 0 {
                 publish_transport_loss(&runtime_stats, &loss_tracker);
@@ -2113,7 +2126,10 @@ pub(super) fn run_usb_output_loop(
                 set_usb_stream_stable(false);
             }
         }
-        if adaptive_queue.observe(stream_started_at.elapsed().as_millis() as u64, batch_lossy) {
+        if adaptive_queue.observe(
+            stream_started_at.elapsed().as_millis() as u64,
+            batch_lossy_completions,
+        ) {
             runtime_stats
                 .adaptive_queue_changes
                 .fetch_add(1, Ordering::Relaxed);
