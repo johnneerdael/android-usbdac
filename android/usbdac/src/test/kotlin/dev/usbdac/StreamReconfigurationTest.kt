@@ -28,4 +28,30 @@ class StreamReconfigurationTest {
         assertEquals(DacErrorCode.RECONFIGURE_UNUSABLE,
             parseNativeError("usbdac:reconfigure_unusable: close this owner")!!.code)
     }
+    @Test
+    fun pendingConfigurationCleanupIsExplicitAndWaitsForRetirement() {
+        var ready = false
+        var handBacks = 0
+        val pending = PendingUsbConfigurationRestore({ ready }) { handBacks++ }
+        assertFalse(pending.isReady)
+        assertFalse(pending.finish())
+        assertEquals(0, handBacks)
+        ready = true
+        assertTrue(pending.isReady)
+        assertEquals(0, handBacks)
+        assertTrue(pending.finish())
+        assertTrue(pending.finish())
+        assertEquals(1, handBacks)
+    }
+
+    @Test
+    fun failedConfigurationHandBackIsReportedOnceWithoutRetry() {
+        var handBacks = 0
+        val cause = DacException(DacErrorCode.CONFIGURATION_RESTORE_FAILED, "external change")
+        val pending = PendingUsbConfigurationRestore({ true }) { handBacks++; throw cause }
+        assertSame(cause, assertThrows(DacException::class.java) { pending.finish() })
+        assertSame(cause, assertThrows(DacException::class.java) { pending.finish() })
+        assertEquals(1, handBacks)
+    }
+
 }

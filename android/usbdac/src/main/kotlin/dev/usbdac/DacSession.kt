@@ -344,6 +344,56 @@ public class DacSession private constructor(
         failure?.let { throw it }
     }
 
+    /** Retire native work after the explicit legacy-open path fails; hand-back is caller-owned. */
+    @Synchronized
+    internal fun closeForFailedLegacyOpen(isAttached: () -> Boolean): PendingUsbConfigurationRestore {
+        if (!closed.compareAndSet(false, true)) {
+            throw DacException(DacErrorCode.INVALID_STATE, "the session is already closed")
+        }
+        var preliminaryFailure: Throwable? = null
+        fun recordPreliminary(error: Throwable) {
+            if (preliminaryFailure == null) preliminaryFailure = error else preliminaryFailure?.addSuppressed(error)
+        }
+        val retirementResult = runCatching { Native.dacRetirementToken(dac) }
+        retirementResult.exceptionOrNull()?.let(::recordPreliminary)
+        val retirement = retirementResult.getOrDefault(0L)
+        val fdResult = runCatching { connection.fileDescriptor }
+        fdResult.exceptionOrNull()?.let(::recordPreliminary)
+        val fd = fdResult.getOrNull()
+        fun retired(): Boolean = runCatching {
+            if (retirement != 0L) Native.dacAwaitRetirementToken(retirement)
+            else fd?.let { Native.dacAwaitConnectionRetirement(it) } ?: false
+        }.getOrDefault(false)
+        // Closing native state starts retirement; no Android configuration restoration occurs here.
+        runCatching { (duplex ?: stream)?.close() }.onFailure(::recordPreliminary)
+        if (config.captureFeedbackTrace) runCatching { readFeedbackTrace() }
+            .onSuccess { closedFeedbackTrace = it }.onFailure(::recordPreliminary)
+        runCatching { volume?.close() }.onFailure(::recordPreliminary)
+        runCatching { volumeExecutor.shutdown() }.onFailure(::recordPreliminary)
+        runCatching { nativeCall { Native.dacClose(dac) } }.onFailure(::recordPreliminary)
+        runCatching { mutableState.value = DacState.CLOSED }.onFailure(::recordPreliminary)
+        return PendingUsbConfigurationRestore(::retired) {
+            var failure: Throwable? = preliminaryFailure
+            fun record(error: Throwable) {
+                if (failure == null) failure = error else failure?.addSuppressed(error)
+            }
+            try {
+                if (runCatching { isAttached() }.getOrDefault(false)) {
+                    val released = runCatching { claims.releaseChecked() }.onFailure(::record).isSuccess
+                    // Recheck after releasing claims; a new attachment must never receive a restore.
+                    if (released && runCatching { isAttached() }.getOrDefault(false)) {
+                        runCatching { configurationSelection.restore() }.onFailure(::record)
+                    } else if (released) record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment changed before configuration restoration"))
+                } else record(DacException(DacErrorCode.DEVICE_LOST, "USB attachment is no longer present; configuration was not restored"))
+            } finally {
+                if (retirement != 0L) runCatching { Native.dacReleaseRetirementToken(retirement) }.onFailure(::record)
+                runCatching { connection.close() }.onFailure(::record)
+                runCatching { onClosed() }.onFailure(::record)
+            }
+            failure?.let { throw it }
+        }
+    }
+
     private fun checkOpen() {
         if (closed.get()) throw DacException(DacErrorCode.INVALID_STATE, "the session is closed")
     }

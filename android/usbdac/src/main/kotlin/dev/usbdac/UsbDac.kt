@@ -13,6 +13,10 @@ import dev.usbdac.internal.ClaimedInterfaces
 import dev.usbdac.internal.Native
 import dev.usbdac.internal.UsbConfigurationSelection
 import dev.usbdac.internal.selectConfiguration
+import dev.usbdac.internal.readConfigurationId
+import dev.usbdac.internal.readConfigurationDescriptor
+import dev.usbdac.internal.parseFallbackDescriptor
+import dev.usbdac.internal.legacyFallbackId
 import dev.usbdac.internal.logWarning
 import dev.usbdac.internal.interfaces
 import dev.usbdac.internal.activeConfiguration
@@ -51,6 +55,23 @@ public data class DacDeviceInfo(
         val interfaces = configuration.interfaces().map { it.toInfo() }
         DacUsbConfiguration(configuration.id, configuration.name, hasPlayback(interfaces), hasCapture(interfaces))
     }
+}
+
+/** Whether a request may use the first legacy configuration after a clean descriptor refusal. */
+public enum class PlaybackConfigurationFallback { DISABLED, LEGACY_FIRST_IF_DESCRIPTOR_INCOMPATIBLE }
+
+/** A failed fallback open retains its USB resources until explicit hand-back. */
+public class DacPlaybackOpenException(
+    public val failure: Throwable,
+    public val pendingCleanup: PendingUsbConfigurationRestore,
+) : Exception("playback open failed; USB configuration hand-back is pending", failure)
+
+/** Owns the connection and its negotiated playback format. */
+public class DacPlaybackPreparation internal constructor(
+    public val session: DacSession,
+    public val format: StreamFormat,
+) : AutoCloseable {
+    override fun close(): Unit = session.close()
 }
 
 /** Explicit configuration choices available before opening a USB connection. */
@@ -305,6 +326,41 @@ public object UsbDac {
     public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig()): DacSession =
         open(context, device, config, configurationId = null)
 
+    /**
+     * Open and negotiate [request] under one owning session. When [fallback] is enabled,
+     * an exact request may use the first legacy configuration only if complete descriptors prove
+     * the active full-UAC3 configuration cannot carry the exact request. Explicit configuration
+     * IDs remain authoritative. Close the result to retire native work and restore the configuration.
+     * Descriptor reads and the selection transaction use one retained connection and file descriptor;
+     * the live configuration is checked before selection. The caller's device snapshot may already
+     * be stale before opening, and matching framework identity does not prove a detach/replug ABA.
+     */
+    public fun openPlaybackForRequest(
+        context: Context, device: DacDeviceInfo, request: StreamRequest,
+        config: DacConfig = DacConfig(), configurationId: Int? = null,
+        fallback: PlaybackConfigurationFallback = PlaybackConfigurationFallback.DISABLED,
+    ): DacPlaybackPreparation {
+        require(request.ratePolicy == RatePolicy.EXACT) { "openPlaybackForRequest requires an exact request" }
+        val usedFallback = booleanArrayOf(false)
+        val session = openDevice(context, device, config, configurationId, duplex = false,
+            fallbackRequest = if (fallback == PlaybackConfigurationFallback.LEGACY_FIRST_IF_DESCRIPTOR_INCOMPATIBLE) request else null, fallbackUsed = usedFallback)
+        try {
+            return DacPlaybackPreparation(session, session.negotiate(request))
+        } catch (error: Throwable) {
+            if (usedFallback[0]) {
+                error.addSuppressed(DacException(DacErrorCode.UNSUPPORTED, "active full UAC3 descriptor excludes the exact request"))
+                val manager = usbManager(context.applicationContext)
+                throw DacPlaybackOpenException(error, session.closeForFailedLegacyOpen {
+                    val current = manager.deviceList[device.device.deviceName]
+                    current != null && current.deviceId == device.device.deviceId && current.vendorId == device.vendorId &&
+                        current.productId == device.productId && manager.hasPermission(current)
+                })
+            }
+            try { session.close() } catch (close: Throwable) { error.addSuppressed(close) }
+            throw error
+        }
+    }
+
     /** Select only [configurationId], or keep the active configuration when null. */
     public fun open(context: Context, device: DacDeviceInfo, config: DacConfig = DacConfig(), configurationId: Int?): DacSession =
         openDevice(context, device, config, configurationId, duplex = false)
@@ -327,7 +383,7 @@ public object UsbDac {
         config: DacConfig = DacConfig(), configurationId: Int? = null): DacSession =
         openDevice(context, device, config, configurationId, duplex = true, vendorRouting = vendorRouting)
 
-    private fun openDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, duplex: Boolean, vendorRouting: VendorRouting? = null): DacSession {
+    private fun openDevice(context: Context, device: DacDeviceInfo, config: DacConfig, configurationId: Int?, duplex: Boolean, vendorRouting: VendorRouting? = null, fallbackRequest: StreamRequest? = null, fallbackUsed: BooleanArray? = null): DacSession {
         val app = context.applicationContext
         val manager = usbManager(app)
         if (!manager.hasPermission(device.device)) {
@@ -346,7 +402,42 @@ public object UsbDac {
             val fd = connection.fileDescriptor
             if (fd < 0) throw DacException(DacErrorCode.OPEN_FAILED, "Android gave no file descriptor for ${device.productName}")
 
-            val selected = device.device.selectConfiguration(connection, configurationId)
+            var requestedConfiguration = configurationId
+            if (fallbackRequest != null && configurationId == null) {
+                val usb = device.device
+                if (usb.configurationCount !in 1..255) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "invalid configuration inventory")
+                val attachedBefore = manager.deviceList[usb.deviceName]
+                if (attachedBefore == null || attachedBefore.deviceId != usb.deviceId || attachedBefore.vendorId != usb.vendorId || attachedBefore.productId != usb.productId || !manager.hasPermission(attachedBefore)) {
+                    throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "USB attachment changed before descriptor discovery")
+                }
+                val advertised = (0 until usb.configurationCount).map { usb.getConfiguration(it).id }
+                if (advertised.any { it !in 1..255 } || advertised.distinct().size != advertised.size) {
+                    throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration values are not uniquely advertised")
+                }
+                val activeId = usb.readConfigurationId(connection)
+                val activeIndex = advertised.indexOf(activeId)
+                if (activeIndex < 0) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "active configuration is not advertised")
+                val deadline = android.os.SystemClock.elapsedRealtime() + 10_000
+                val descriptors = (0 until usb.configurationCount).map { index ->
+                    if (android.os.SystemClock.elapsedRealtime() >= deadline) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration discovery deadline expired")
+                    val descriptor = parseFallbackDescriptor(readConfigurationDescriptor(connection, index), fallbackRequest)
+                    if (descriptor == null || descriptor.id != advertised[index]) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration descriptor identity or completeness could not be verified")
+                    descriptor
+                }
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "configuration discovery deadline expired")
+                val active = descriptors[activeIndex]
+                val first = descriptors[0]
+                val candidate = legacyFallbackId(active, first, advertised)
+                if (candidate != null) {
+                    val attached = manager.deviceList[usb.deviceName]
+                    if (attached == null || attached.deviceId != usb.deviceId || attached.vendorId != usb.vendorId || attached.productId != usb.productId || !manager.hasPermission(attached) || usb.readConfigurationId(connection) != activeId) {
+                        throw DacException(DacErrorCode.CONFIGURATION_SELECTION_FAILED, "USB attachment or configuration changed before fallback")
+                    }
+                    requestedConfiguration = candidate
+                    fallbackUsed?.set(0, true)
+                }
+            }
+            val selected = device.device.selectConfiguration(connection, requestedConfiguration)
             selection = selected
             val activeConfiguration = selected.selected
             val interfaces = activeConfiguration.interfaces()
@@ -405,6 +496,9 @@ public object UsbDac {
             nativeDac = dac
             return DacSession.create(dac, device, config, connection, ownedClaims, selected, duplexEnabled = duplex) { ownership.close() }
         } catch (error: Throwable) {
+            if (fallbackUsed?.get(0) == true) {
+                error.addSuppressed(DacException(DacErrorCode.UNSUPPORTED, "active full UAC3 descriptor excludes the exact request"))
+            }
             if (nativeDac != 0L) runCatching { Native.dacClose(nativeDac) }
             val retainedClaims = claims
             val retainedConnection = connection
@@ -417,6 +511,31 @@ public object UsbDac {
                 }
                 runCatching { retainedConnection?.close() }
                 ownership.close()
+            }
+            if (fallbackUsed?.get(0) == true && nativeRegistrationAttempted) {
+                val fd = retainedConnection?.fileDescriptor ?: -1
+                val pending = PendingUsbConfigurationRestore(
+                    checkReady = { runCatching { Native.dacAwaitConnectionRetirement(fd) }.getOrDefault(false) },
+                    finishRetired = {
+                        try {
+                            val attached = manager.deviceList[device.device.deviceName]
+                            if (attached == null || attached.deviceId != device.device.deviceId || attached.vendorId != device.vendorId || attached.productId != device.productId || !manager.hasPermission(attached)) {
+                                throw DacException(DacErrorCode.DEVICE_LOST, "USB attachment lost before configuration hand-back")
+                            }
+                            retainedClaims?.releaseChecked()
+                            val stillAttached = manager.deviceList[device.device.deviceName]
+                            if (stillAttached == null || stillAttached.deviceId != device.device.deviceId ||
+                                stillAttached.vendorId != device.vendorId || stillAttached.productId != device.productId || !manager.hasPermission(stillAttached)) {
+                                throw DacException(DacErrorCode.DEVICE_LOST, "USB attachment lost before configuration restoration")
+                            }
+                            retainedSelection?.restore()
+                        } finally {
+                            runCatching { retainedConnection?.close() }
+                            ownership.close()
+                        }
+                    },
+                )
+                throw DacPlaybackOpenException(error, pending)
             }
             // Open can fail after native registration; the native retirement gate is
             // authoritative even when no public handle was returned.
