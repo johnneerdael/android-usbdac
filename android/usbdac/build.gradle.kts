@@ -125,6 +125,13 @@ tasks.named("preBuild") { dependsOn(buildUsbdacNative) }
 
 dokka {
     moduleName.set("usbdac")
+    // The usbdac brand on the API reference: logo, fonts and colours (docs/site/dokka).
+    pluginsConfiguration.html {
+        val site = rootProject.projectDir.resolve("../docs/site/dokka")
+        customStyleSheets.from(site.resolve("usbdac-dokka.css"))
+        customAssets.from(site.resolve("logo-icon.svg"), rootProject.projectDir.resolve("../branding/fonts/Manrope.woff"))
+        footerMessage.set("usbdac · Direct USB audio. Clear evidence. · MIT licensed")
+    }
     dokkaSourceSets.configureEach {
         includes.from("Module.md")
         if (githubRepository != null) {

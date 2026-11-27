@@ -301,3 +301,16 @@ article h1 .anchor { display: none; }
 .card .foot .links span { color: var(--dac-text); }
 .meta-line code { white-space: nowrap; }
 @media (max-width: 560px) { .hero .lead { font-size: 17px; } .cta .btn { flex: 1 1 auto; justify-content: center; } }
+
+/* Theme-matched images: .only-dark / .only-light follow the active theme. */
+.only-dark { display: none; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .only-dark { display: block; } :root:not([data-theme="light"]) .only-light { display: none; } }
+:root[data-theme="dark"] .only-dark { display: block; }
+:root[data-theme="dark"] .only-light { display: none; }
+
+/* Validator screenshots: the Mac window with the phone in front of it. */
+.validator-band .platforms { margin-top: 28px; }
+.shots { position: relative; margin: 0; padding: 0 0 48px; }
+.shots .mac { width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--dac-border); box-shadow: 0 24px 60px rgba(0, 0, 0, .28); }
+.shots .phone { position: absolute; right: -12px; bottom: 0; width: 30%; height: auto; border-radius: 22px; border: 6px solid #0B0E13; box-shadow: 0 20px 50px rgba(0, 0, 0, .35); }
+@media (max-width: 900px) { .shots .phone { right: 8px; width: 34%; } }

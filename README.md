@@ -78,14 +78,19 @@ For in-app support captures, see [collecting a USB playback support report](docs
 
 ## Validators
 
-<img align="right" src="branding/web/icon-192.png" width="96" alt="usbdac validator icon">
-
 Each release from 0.1.11 on includes an **Android validator APK** and an
 **Apple Silicon macOS validator ZIP**, built from the same commit as the
 library. Start a capture, connect one DAC, and the app runs the direct USB
 format tests and saves a report ZIP with device details, test outcomes and
 debug logs. The APK is signed with the CI debug key; the macOS app is ad hoc
 signed and not notarized. Remove headphones and mute the amplifier first.
+
+<table>
+  <tr>
+    <td width="68%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/screens/macos-validator-dark.png"><img src="docs/site/screens/macos-validator-light.png" alt="The usbdac Validator for macOS: safety callout, capture controls and the worker log"></picture><br><sub><b>macOS.</b> One window: the safety checks, the capture and the worker log.</sub></td>
+    <td width="32%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/site/screens/android-validator-dark.png"><img src="docs/site/screens/android-validator-light.png" alt="The usbdac Validator for Android: safety card and capture controls"></picture><br><sub><b>Android.</b> Material 3, System, Dark or Light.</sub></td>
+  </tr>
+</table>
 
 ## Learn more
 

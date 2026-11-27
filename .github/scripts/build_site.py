@@ -320,6 +320,7 @@ def copy_assets(site_assets: pathlib.Path, brand: pathlib.Path, output: pathlib.
         shutil.copyfile(web / name, assets / name)
     shutil.copyfile(web / "favicon.ico", output / "favicon.ico")
     shutil.copyfile(brand / "marketing" / "usbdac-social-dark.png", assets / "usbdac-social-dark.png")
+    shutil.copytree(site_assets / "screens", assets / "screens")
     manifest = json.loads((web / "site.webmanifest").read_text(encoding="utf-8"))
     manifest["start_url"] = "./"
     for icon in manifest["icons"]:
