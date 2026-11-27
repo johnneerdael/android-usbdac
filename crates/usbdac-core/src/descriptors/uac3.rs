@@ -83,6 +83,131 @@ pub fn parse_as_header(data: &[u8]) -> Result<AsHeader, DescriptorError> {
         control_size: d[22],
     })
 }
+
+/// Decode the union of an alternate's ADC3 AS valid frequency ranges (§4.7.3).
+/// An empty result means the alternate imposes no additional clock restriction.
+pub(crate) fn parse_as_frequency_ranges(
+    extra: &[u8],
+) -> Result<Vec<(u32, u32)>, DescriptorError> {
+    let mut ranges = Vec::new();
+    let mut remaining = extra;
+    while !remaining.is_empty() {
+        if remaining.len() < 2 {
+            return Err(invalid("truncated AS descriptor header"));
+        }
+        let length = usize::from(remaining[0]);
+        if length < 2 || length > remaining.len() {
+            return Err(invalid("invalid AS descriptor length"));
+        }
+        let d = &remaining[..length];
+        if d[1] == 0x24 {
+            if length < 3 {
+                return Err(invalid("missing AS descriptor subtype"));
+            }
+            if d[2] == 0x02 {
+                if length != 11 {
+                    return Err(invalid("invalid AS valid frequency range length"));
+                }
+                let min = le32(d, 3);
+                let max = le32(d, 7);
+                if min == 0 || max < min {
+                    return Err(invalid("invalid AS valid frequency range bounds"));
+                }
+                ranges.push((min, max));
+            }
+        }
+        remaining = &remaining[length..];
+    }
+
+    ranges.sort_unstable();
+    let mut normalized: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (min, max) in ranges {
+        if let Some(previous) = normalized.last_mut() {
+            if min <= previous.1.saturating_add(1) {
+                previous.1 = previous.1.max(max);
+                continue;
+            }
+        }
+        normalized.push((min, max));
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod as_frequency_range_tests {
+    use super::parse_as_frequency_ranges;
+
+    fn wire_range(min: u32, max: u32) -> Vec<u8> {
+        let mut bytes = vec![11, 0x24, 0x02];
+        bytes.extend_from_slice(&min.to_le_bytes());
+        bytes.extend_from_slice(&max.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn omitted_ranges_are_unconstrained_and_unrelated_descriptors_are_ignored() {
+        assert_eq!(parse_as_frequency_ranges(&[]).unwrap(), vec![]);
+        assert_eq!(
+            parse_as_frequency_ranges(&[3, 0x24, 1, 2, 0x25]).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn little_endian_bounds_are_inclusive_and_keep_disjoint_gaps() {
+        let mut bytes = vec![3, 0x24, 1];
+        bytes.extend(wire_range(96_000, 192_000));
+        bytes.extend(wire_range(44_100, 48_000));
+        bytes.extend(wire_range(22_050, 22_050));
+        assert_eq!(
+            parse_as_frequency_ranges(&bytes).unwrap(),
+            vec![(22_050, 22_050), (44_100, 48_000), (96_000, 192_000)]
+        );
+    }
+
+    #[test]
+    fn overlapping_adjacent_and_duplicate_ranges_form_a_canonical_union() {
+        let mut bytes = wire_range(48_001, 96_000);
+        bytes.extend(wire_range(44_100, 48_000));
+        bytes.extend(wire_range(47_000, 50_000));
+        bytes.extend(wire_range(44_100, 48_000));
+        bytes.extend(wire_range(u32::MAX, u32::MAX));
+        bytes.extend(wire_range(u32::MAX - 1, u32::MAX));
+        assert_eq!(
+            parse_as_frequency_ranges(&bytes).unwrap(),
+            vec![(44_100, 96_000), (u32::MAX - 1, u32::MAX)]
+        );
+    }
+
+    #[test]
+    fn zero_and_reversed_bounds_are_rejected() {
+        for (min, max) in [(0, 0), (0, 48_000), (48_000, 44_100)] {
+            assert!(parse_as_frequency_ranges(&wire_range(min, max)).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_descriptor_streams_are_rejected_even_after_a_valid_range() {
+        let valid = wire_range(44_100, 48_000);
+        for prefix_length in 1..valid.len() {
+            assert!(parse_as_frequency_ranges(&valid[..prefix_length]).is_err());
+        }
+        for suffix in [
+            vec![0],
+            vec![0, 0x24],
+            vec![1, 0x24],
+            vec![2, 0x24],
+            vec![3, 0x25],
+            vec![3, 0x24, 0x02],
+            vec![12, 0x24, 0x02, 1, 0, 0, 0, 2, 0, 0, 0, 0],
+        ] {
+            let mut bytes = valid.clone();
+            bytes.extend(suffix);
+            assert!(parse_as_frequency_ranges(&bytes).is_err());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcHeader {
     pub category: u8,

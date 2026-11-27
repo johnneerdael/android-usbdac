@@ -79,6 +79,37 @@ Select UAC3 from the interface protocol and the Audio Interface Association prof
 
 Track the power domain associated with each active entity and reference-count shared domains. Bring a stopped domain to D0, honor specified recovery time, then verify control and streaming state. Keep it awake while a stream or active control holds it. Shut down after the final owner and after retiring transfers, including abort and device hand-back. Preserve UAC1/UAC2 paths through existing CI and verify actual Android configuration and power transitions before stating hardware coverage. [ALSA UAC3 declarations](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/include/linux/usb/audio-v3.h), [ALSA power-domain control](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/power.c)
 
+### Full ADC3 alternate sample-rate limits
+
+An AS Valid Frequency Range descriptor limits one streaming alternate
+in wire Hz. Intersect its inclusive bounds with the clock source's
+supported rates after applying any clock multiplier. Preserve the
+clock's rate steps and gaps between descriptor ranges. Several
+descriptors form a union, and omission leaves the source rates
+unrestricted by the alternate. Malformed bounds make the alternate
+ineligible. BADD uses its profile's fixed rate. [USB-IF ADC3 §4.7.3 via IEC](https://webstore.iec.ch/en/publication/63921)
+
+Playback and capture use these limits for negotiation and clock
+configuration. Implicit feedback also requires the selected IN
+alternate to support the output wire rate. Each independent duplex
+direction checks its own alternate. The live Valid Alternate Settings
+control provides a further check at activation when advertised.
+When one feedback endpoint offers several IN alternates, the current
+driver retains one compatible IN alternate per playback route. If
+those IN alternates support different rates, negotiation can still
+miss a rate that a different IN alternate would support.
+
+For physical acceptance, use two alternates on one clock with
+different declared ranges. Check that discovery lists the correct
+rates and a request selects an eligible alternate. Repeat for capture
+and duplex, including a rate the playback alternate supports that its
+implicit feedback alternate excludes.
+
+Rust workspace tests, the Android arm64 target check and the four-ABI
+AAR and sample builds passed. Each ABI has identical native bytes in
+the AAR and sample. The AAR SHA-256 is
+`cec2cea497dd9d665df8b0a44ed367ed1635aa0e3b8713ad59595dd2f59423eb`.
+
 ## Transport integration sequence
 
 1. **DSD wire formats and identity.** Establish one resolver shared by capabilities and negotiation. Record a transport representation independently of the USB encoding bitmap. Raise `Unsupported` before opening an alternate if a raw layout is ambiguous. Install reviewed built-in profiles first. Validate existing nominal/feedback paths and separate exact protocol verification from physical playability.

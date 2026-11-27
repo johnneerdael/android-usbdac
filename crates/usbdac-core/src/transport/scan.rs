@@ -871,10 +871,10 @@ pub(super) fn build_usb_capability_model(
     }
 
     for (candidate, route) in adc3_candidates(device, handle, speed, claimed_interfaces) {
-        let rates = candidate.sample_rates.clone();
-        supported_sample_rates.extend(rates.iter().copied());
         let ranges = adc3::adc3_wire_ranges(handle, &route).unwrap_or_default();
         let ranges = adc3_capacity_ranges(&candidate, &ranges);
+        let rates = representative_sample_rates_from_ranges(&ranges);
+        supported_sample_rates.extend(rates.iter().copied());
         alt_settings.push(AltSetting {
             interface_number: candidate.interface_number, alt_setting: candidate.alt_setting,
             endpoint_address: candidate.endpoint_address, format: AltFormat::Pcm,

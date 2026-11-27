@@ -27,6 +27,7 @@ pub(super) struct Adc3Route {
     companions: Vec<(u8, [u8; 6])>,
     extended_companions: Vec<(u8, [u8; 8])>,
     pcm: (u16, u8, u8),
+    frequency_limits: Vec<(u32, u32)>,
     cluster: Option<wire::Cluster>,
     header: Option<wire::AsHeader>,
     pub(super) clock: Option<wire::ClockSource>,
@@ -126,6 +127,54 @@ fn adc3_project_ranges(choice: &ClockChoice, ranges: &[SamplingFrequencySubrange
     }
     Ok(projected)
 }
+/// Intersect inclusive AS limits without moving the clock progression's origin.
+/// Empty limits mean the alternate accepts every available clock frequency.
+fn adc3_limit_ranges(ranges: &[SamplingFrequencySubrange], limits: &[(u32, u32)])
+    -> Vec<SamplingFrequencySubrange> {
+    if limits.is_empty() { return ranges.to_vec(); }
+    ranges.iter().flat_map(|range| {
+        let start = limits.partition_point(|&(_, upper)| upper < range.min);
+        limits[start..].iter().take_while(move |&&(lower, _)| lower <= range.max)
+            .filter_map(move |&(lower, upper)| {
+                let lower = range.min.max(lower);
+                let upper = range.max.min(upper);
+                if lower > upper { return None; }
+                let (min, max) = if range.res == 0 {
+                    if range.min != range.max { return None; }
+                    (range.min, range.max)
+                } else {
+                    let origin = u64::from(range.min);
+                    let step = u64::from(range.res);
+                    let delta = u64::from(lower) - origin;
+                    let min = origin + delta.div_ceil(step) * step;
+                    let max = origin + (u64::from(upper) - origin) / step * step;
+                    if min > max { return None; }
+                    (u32::try_from(min).ok()?, u32::try_from(max).ok()?)
+                };
+                Some(SamplingFrequencySubrange { min, max, res: if min == max { 0 } else { range.res } })
+            })
+    }).collect()
+}
+fn adc3_route_limit_ranges(route: &Adc3Route, ranges: &[SamplingFrequencySubrange])
+    -> Vec<SamplingFrequencySubrange> {
+    let ranges = adc3_limit_ranges(ranges, &route.frequency_limits);
+    match route.implicit.as_deref() {
+        Some(peer) => adc3_route_limit_ranges(peer, &ranges),
+        None => ranges,
+    }
+}
+fn adc3_route_ranges(route: &Adc3Route, source_ranges: &[SamplingFrequencySubrange])
+    -> Result<Vec<SamplingFrequencySubrange>, String> {
+    let projected = adc3_project_ranges(route.choice.as_ref().ok_or("ADC3 clock path missing")?, source_ranges)?;
+    Ok(adc3_route_limit_ranges(route, &projected))
+}
+fn validate_adc3_static_rate(route: &Adc3Route, rate: u32) -> Result<(), String> {
+    let exact = SamplingFrequencySubrange { min: rate, max: rate, res: 0 };
+    if rate == 0 || adc3_route_limit_ranges(route, &[exact]).is_empty() {
+        return Err("ADC3 rate outside AS alternate frequency limits".into());
+    }
+    Ok(())
+}
 pub(super) fn adc3_wire_ranges(handle: &DeviceHandle<Context>, route: &Adc3Route)
     -> Result<Vec<SamplingFrequencySubrange>, String> {
     if matches!(route.profile, wire::FunctionProfile::Badd(_)) {
@@ -140,8 +189,7 @@ pub(super) fn adc3_wire_ranges(handle: &DeviceHandle<Context>, route: &Adc3Route
         verify_adc3_rate_route(handle, route)?;
     }
     let source = route.clock.as_ref().ok_or("ADC3 clock source missing")?;
-    adc3_project_ranges(route.choice.as_ref().ok_or("ADC3 clock path missing")?,
-        &get_sampling_frequency_ranges(handle, route.control, source.id)?)
+    adc3_route_ranges(route, &get_sampling_frequency_ranges(handle, route.control, source.id)?)
 }
 /// Full ADC3 adaptive-source explicit host-to-device rate pipe. The rate is
 /// expressed per USB frame/microframe, independently of either pipe's interval.
@@ -930,6 +978,9 @@ fn adc3_alternate_overlay(
             .map(|_| (ep.address(), ep.extra().unwrap()[6..14].try_into().unwrap()))
             .into_iter().collect(),
         pcm: (0, 0, 0),
+        frequency_limits: if profile == wire::FunctionProfile::Full {
+            wire::parse_as_frequency_ranges(alt.extra()).map_err(|e| e.to_string())?
+        } else { vec![] },
         cluster: None,
         header: None,
         clock: None,
@@ -938,7 +989,7 @@ fn adc3_alternate_overlay(
         plan: plan.cloned(),
         clock_context: None,
     };
-    let (channels, subslot, bits, rates) = match profile {
+    let (channels, subslot, bits, mut rates) = match profile {
         wire::FunctionProfile::Badd(profile) => {
             let p = ep.max_packet_size().to_le_bytes();
             let endpoint = [
@@ -1012,7 +1063,7 @@ fn adc3_alternate_overlay(
                 c.channels.len() as u16,
                 h.subslot_size,
                 h.bit_resolution,
-                adc3_project_ranges(&choice, &ranges)?,
+                adc3_limit_ranges(&adc3_project_ranges(&choice, &ranges)?, &route.frequency_limits),
             );
             route.terminal = h.terminal_link;
             route.cluster = Some(c);
@@ -1051,8 +1102,9 @@ fn adc3_alternate_overlay(
     if adc3_requires_implicit(profile, capture, candidate.sync_type, feedback.is_some(),
         ep.synch_address() != 0 || alt.endpoint_descriptors().any(|e| e.usage_type() == UsageType::Feedback),
         settings().disable_feedback())? {
-        let (source, source_route) = adc3_implicit_source(config, handle, &candidate, &route, plan)?;
+        let (source, source_route) = adc3_implicit_source(config, handle, &candidate, &route, &rates, plan)?;
         candidate.implicit_feedback = Some(source);
+        rates = adc3_route_limit_ranges(&source_route, &rates);
         route.implicit = Some(Box::new(source_route));
     }
     candidate.sample_rates = representative_sample_rates_from_ranges(&adc3_capacity_ranges(&candidate, &rates));
@@ -1216,6 +1268,8 @@ pub(super) fn validate_adaptive_duplex(output: &IsoStreamCandidate, output_route
         || output.implicit_feedback.is_some() || input_route.feedforward.is_some()
         || output_rate != input_rate || !adc3_shared_clock(output_route, input_route)
         || output_route.source_rate(output_rate)? != input_route.source_rate(input_rate)?
+        || validate_adc3_static_rate(output_route, output_rate).is_err()
+        || validate_adc3_static_rate(input_route, input_rate).is_err()
         || !capacity(output_route, output_rate) || !capacity(input_route, input_rate) {
         return Err("ADC3 adaptive capture requires the selected marked adaptive OUT in the same clocked function at the same wire rate".into());
     }
@@ -1252,8 +1306,9 @@ fn adc3_unique_implicit(mut matches: Vec<(ImplicitFeedbackSource, Adc3Route)>)
 
 fn adc3_implicit_source(
     config: &ConfigDescriptor, handle: &DeviceHandle<Context>, output: &IsoStreamCandidate,
-    output_route: &Adc3Route, plan: Option<&ClockPlan>,
+    output_route: &Adc3Route, output_ranges: &[SamplingFrequencySubrange], plan: Option<&ClockPlan>,
 ) -> Result<(ImplicitFeedbackSource, Adc3Route), String> {
+    let output_ranges = adc3_capacity_ranges(output, output_ranges);
     let mut matches = Vec::new();
     for alt in config.interfaces().flat_map(|i| i.descriptors()).filter(|d|
         d.class_code() == 1 && d.sub_class_code() == 2 && d.protocol_code() == 0x30
@@ -1267,6 +1322,11 @@ fn adc3_implicit_source(
             && e.usage_type() == UsageType::FeedbackData) { continue; }
         let Ok((input, mut route)) = adc3_alternate_overlay(config, handle, &alt, output.usb_speed, true, plan, false, false) else { continue; };
         if !adc3_implicit_pair(output, output_route, &input, &route) { continue; }
+        // Prove at least one actual clock rate survives both alternates and
+        // both endpoint capacities before ranking same-pipe alternate shapes.
+        // Representative sample rates are deliberately not used as a proxy.
+        let ranges = adc3_route_limit_ranges(&route, &output_ranges);
+        if adc3_capacity_ranges(&input, &ranges).is_empty() { continue; }
         route.plan = None; // The sink owns the common selector transaction.
         matches.push((ImplicitFeedbackSource {
             interface_number: input.interface_number, alt_setting: input.alt_setting, address: input.endpoint_address,
@@ -1603,6 +1663,7 @@ fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: 
             Err("BADD rate must be 48000 Hz".into())
         };
     }
+    validate_adc3_static_rate(route, rate)?;
     verify_adc3_rate_route(handle, route)?;
     let wire_rate = rate;
     let rate = route.source_rate(wire_rate)?;
@@ -1610,8 +1671,8 @@ fn validate_adc3_clock(handle: &DeviceHandle<Context>, route: &Adc3Route, rate: 
     let ranges = get_sampling_frequency_ranges(handle, route.control, source.id)?;
     // Apply the same raw-range validity contract during programming as during
     // advertisement; an integral conversion alone cannot legalize a bad range.
-    adc3_project_ranges(route.choice.as_ref().ok_or("ADC3 clock path missing")?, &ranges)?;
-    if !sampling_frequency_ranges_support_rate(&ranges, rate) {
+    let wire_ranges = adc3_route_ranges(route, &ranges)?;
+    if !sampling_frequency_ranges_support_rate(&wire_ranges, wire_rate) {
         return Err("ADC3 rate outside source ranges".into());
     }
     let mut current = [0; 4];
@@ -2113,6 +2174,7 @@ fn adc3_directional_alternative_routes(
 /// domains are owned. ClockPlan rejects original-pin drift before writing.
 pub(super) fn apply_adc3_clock_plan(claimed: &ClaimedHandle, route: &Adc3Route, rate: u32) -> Result<(), String> {
     let Some(plan) = route.plan.as_ref() else { return Ok(()); };
+    validate_adc3_static_rate(route, rate)?;
     let interfaces = guard_adc3_clock_mutation(claimed, route)?;
     for domain in route.domains.iter().filter(|d| adc3_route_domain_required(route, d)) { claimed.adc3_power.acquire(route.control, domain)?; }
     let config = claimed.handle.device().active_config_descriptor().map_err(|e| e.to_string())?;
@@ -2133,6 +2195,10 @@ pub(super) fn apply_adc3_clock_plan(claimed: &ClaimedHandle, route: &Adc3Route, 
     if frequency.original == 0 { return Err("ADC3 source frequency snapshot is zero".into()); }
     verify_adc3_route_ratios(route, |entity, selector, bytes|
         read_exact(&claimed.handle, route.control, entity, selector, 1, bytes))?;
+    let ranges = get_sampling_frequency_ranges(&claimed.handle, route.control, plan.source_id)?;
+    if !sampling_frequency_ranges_support_rate(&adc3_route_ranges(route, &ranges)?, rate) {
+        return Err("ADC3 rate outside alternate clock ranges".into());
+    }
     match plan.apply(&mut Adc3ClockIo { handle: &claimed.handle, route, rate }) {
         Ok(()) => { *claimed.adc3_power.clock.lock() = Some((route.clone(), plan.clone(), frequency, interfaces.clone())); Ok(()) }
         Err(error) => {
@@ -2907,6 +2973,7 @@ mod tests {
             companions: vec![],
             extended_companions: vec![],
             pcm: (2, 2, 16),
+            frequency_limits: vec![],
             cluster: Some(wire::Cluster {
                 id: 1,
                 channels: vec![wire::Channel::Information {
@@ -3039,6 +3106,33 @@ mod tests {
         assert!(!adc3_route_domain_required(&out, &unrelated));
         let mut clock_domain = domain(13); clock_domain.entities = vec![8];
         assert!(adc3_route_domain_required(&out, &clock_domain));
+        let mut limited_out = out.clone();
+        limited_out.frequency_limits = vec![(44_100, 96_000)];
+        let mut limited_in = input.clone();
+        limited_in.frequency_limits = vec![(48_000, 48_000)];
+        limited_out.implicit = Some(Box::new(limited_in.clone()));
+        assert!(validate_adc3_static_rate(&limited_out, 48_000).is_ok());
+        assert!(validate_adc3_static_rate(&limited_out, 44_100).is_err());
+        assert!(validate_adc3_static_rate(&limited_out, 96_000).is_err());
+        let restricted = adc3_route_limit_ranges(&limited_out,
+            &[SamplingFrequencySubrange { min: 44_000, max: 96_000, res: 1_000 }]);
+        assert_eq!(restricted.iter().map(|r| (r.min, r.max, r.res)).collect::<Vec<_>>(),
+            vec![(48_000, 48_000, 0)]);
+        let mut impossible = limited_out.clone();
+        impossible.implicit.as_mut().unwrap().frequency_limits = vec![(192_000, 192_000)];
+        assert!(adc3_route_limit_ranges(&impossible,
+            &[SamplingFrequencySubrange { min: 44_000, max: 96_000, res: 1_000 }]).is_empty());
+        let mut drift = limited_out.clone();
+        drift.frequency_limits = vec![(44_100, 48_000)];
+        assert_ne!(limited_out, drift);
+        let mut drift = limited_out.clone();
+        drift.implicit.as_mut().unwrap().frequency_limits = vec![];
+        assert_ne!(limited_out, drift);
+        adaptive_in.frequency_limits = vec![(96_000, 96_000)];
+        assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 48_000, &adaptive_in, 48_000).is_err());
+        adaptive_in.frequency_limits.clear();
+        adaptive_out.frequency_limits = vec![(96_000, 96_000)];
+        assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 48_000, &adaptive_in, 48_000).is_err());
         let mut implicit_route = out.clone(); implicit_route.implicit = Some(Box::new(input.clone()));
         let mut drift = implicit_route.clone(); drift.implicit.as_mut().unwrap().terminal = 7;
         assert_ne!(implicit_route, drift);
@@ -3210,5 +3304,37 @@ mod multi_interface_clock_tests {
         assert!(verify_idle_reply(0, 0).is_err());
         assert!(verify_idle_reply(-1, 0).is_err());
         assert!(verify_idle_reply(2, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod alternate_range_tests {
+    use super::*;
+    fn range(min: u32, max: u32, res: u32) -> SamplingFrequencySubrange {
+        SamplingFrequencySubrange { min, max, res }
+    }
+    fn values(ranges: &[SamplingFrequencySubrange]) -> Vec<(u32, u32, u32)> {
+        ranges.iter().map(|r| (r.min, r.max, r.res)).collect()
+    }
+    #[test]
+    fn alternate_bounds_keep_the_projected_progression_anchor() {
+        let clipped = adc3_limit_ranges(&[range(44_100, 96_100, 1_000)], &[(44_101, 48_999)]);
+        assert_eq!(values(&clipped), vec![(45_100, 48_100, 1_000)]);
+        assert!(!sampling_frequency_ranges_support_rate(&clipped, 48_000));
+        assert!(sampling_frequency_ranges_support_rate(&clipped, 48_100));
+    }
+    #[test]
+    fn disjoint_limits_singletons_and_u32_edges_remain_exact() {
+        let clock = [range(44_100, 96_100, 1_000)];
+        assert_eq!(values(&adc3_limit_ranges(&clock, &[(44_100, 44_100), (47_100, 48_000), (96_000, 96_100)])),
+            vec![(44_100, 44_100, 0), (47_100, 47_100, 0), (96_100, 96_100, 0)]);
+        assert!(adc3_limit_ranges(&clock, &[(48_000, 48_000)]).is_empty());
+        assert_eq!(values(&adc3_limit_ranges(&[range(48_000, 48_000, 0)], &[(47_000, 49_000)])),
+            vec![(48_000, 48_000, 0)]);
+        assert_eq!(values(&adc3_limit_ranges(&clock, &[])), values(&clock));
+        assert!(adc3_limit_ranges(&[range(1, u32::MAX, u32::MAX - 1)],
+            &[(u32::MAX - 1, u32::MAX - 1)]).is_empty());
+        assert_eq!(values(&adc3_limit_ranges(&[range(1, u32::MAX, u32::MAX - 1)],
+            &[(u32::MAX, u32::MAX)])), vec![(u32::MAX, u32::MAX, 0)]);
     }
 }
