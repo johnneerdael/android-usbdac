@@ -42,6 +42,18 @@ fn control_error(error: &RoutingError<String>) -> Value {
     }
 }
 pub(super) fn failure(error: RoutingSessionError) -> Value {
+    if let RoutingSessionError::PowerRestore { operation, detail } = error {
+        // Keep the primary error's existing wire kind and typed details. Power
+        // hand-back adds information rather than replacing rollback failures.
+        let primary = operation.map(|error| *error).unwrap_or_else(|| {
+            RoutingSessionError::Session(usbdac_core::Error::Control(format!(
+                "powered routing power hand-back: {detail}"
+            )))
+        });
+        let mut value = failure(primary);
+        value["error"]["power_restore_failure"] = Value::from(detail);
+        return value;
+    }
     let detail = error.to_string();
     let mut value = match error {
         RoutingSessionError::Session(e) => json!({"kind":"session","session_code":e.code()}),
@@ -50,6 +62,7 @@ pub(super) fn failure(error: RoutingSessionError) -> Value {
         RoutingSessionError::Drift(_) => json!({"kind":"drift"}),
         RoutingSessionError::Control(e) => json!({"kind":"control","cause":control_error(&e)}),
         RoutingSessionError::Transaction(e) => json!({"kind":"transaction","failed_change":e.failed_change,"cause":control_error(&e.cause),"rollback_failures":e.rollback_failures.iter().map(|(k,e)|json!({"key":key_json(*k),"cause":control_error(e)})).collect::<Vec<_>>()}),
+        RoutingSessionError::PowerRestore { .. } => unreachable!("handled above"),
         RoutingSessionError::Scarlett(_) | RoutingSessionError::ScarlettMix(_) | RoutingSessionError::ScarlettMux(_) | RoutingSessionError::Fcp(_) | RoutingSessionError::Gen1Read(_) | RoutingSessionError::Gen1(_) => {
             json!({"kind":"scarlett"})
         }
@@ -159,6 +172,43 @@ pub fn routing_apply_powered<'l>(mut env: EnvUnowned<'l>, _class:JObject<'l>, da
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn power_hand_back_failure_keeps_the_primary_transaction_wire_shape() {
+        let key = ControlKey::Selector(Entity {interface:3,id:8});
+        let value = failure(RoutingSessionError::PowerRestore {
+            operation: Some(Box::new(RoutingSessionError::Transaction(usbdac_core::routing::TransactionError {
+                failed_change:Some(2),cause:RoutingError::Io("write".into()),
+                rollback_failures:vec![(key,RoutingError::Io("route restore".into()))],
+            }))),
+            detail: "power restore".into(),
+        });
+        assert_eq!(value["error"]["kind"],"transaction");
+        assert_eq!(value["error"]["failed_change"],2);
+        assert_eq!(value["error"]["cause"]["detail"],"write");
+        assert_eq!(value["error"]["rollback_failures"][0]["key"],key_json(key));
+        assert_eq!(value["error"]["rollback_failures"][0]["cause"]["detail"],"route restore");
+        assert_eq!(value["error"]["power_restore_failure"],"power restore");
+    }
+
+    #[test]
+    fn power_hand_back_preserves_control_failures_and_power_only_session_errors() {
+        let value = failure(RoutingSessionError::PowerRestore {
+            operation: Some(Box::new(RoutingSessionError::Control(RoutingError::ReadbackMismatch {
+                expected: RouteValue::SelectorPin(1), actual: RouteValue::SelectorPin(2),
+            }))),
+            detail: "power restore".into(),
+        });
+        assert_eq!(value["error"]["kind"],"control");
+        assert_eq!(value["error"]["cause"]["kind"],"readback_mismatch");
+        assert_eq!(value["error"]["cause"]["expected"]["value"],1);
+        assert_eq!(value["error"]["cause"]["actual"]["value"],2);
+        let value = failure(RoutingSessionError::PowerRestore {
+            operation: None, detail: "power restore".into(),
+        });
+        assert_eq!(value["error"]["kind"],"session");
+        assert_eq!(value["error"]["session_code"],"control");
+        assert_eq!(value["error"]["power_restore_failure"],"power restore");
+    }
     #[test]
     fn transaction_failure_keeps_edit_index_and_each_rollback_cause() {
         let key = ControlKey::Selector(Entity {interface:3,id:8});

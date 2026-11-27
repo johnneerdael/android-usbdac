@@ -1366,14 +1366,35 @@ pub(super) fn select_requested_clock_route(
                 continue;
             }
             let needs_program = validity == crate::clock_resolution::ClockValidity::Unreported && current != rate;
-            if (plan.selectors.iter().any(|pin| pin.original != pin.target) || needs_program)
-                && !stop_owned_clock_alternates(claimed, candidate.interface_number)?
-            {
+            let owns_idle_function = if needs_program {
+                stop_complete_capture_clock_function(claimed, candidate.interface_number)?
+            } else if plan.selectors.iter().any(|pin| pin.original != pin.target) {
+                stop_owned_clock_alternates(claimed, candidate.interface_number)?
+            } else { true };
+            if !owns_idle_function {
                 // Never alter a clock shared with an unclaimed sibling interface.
                 continue;
             }
-            io.allow_program = true;
-            match plan.apply(&mut io) {
+            let frequency = needs_program.then_some(CaptureFrequency {
+                source: plan.source_id, original: current, target: rate,
+            });
+            // Retain recovery before selectors or a frequency SET can reach the
+            // device. A failed rollback must prevent trying another source.
+            *SELECTED_CLOCK_ROUTE.lock() = Some(SelectedClockRoute {
+                fd: claimed.device_fd, control, streaming: candidate.interface_number,
+                plan: plan.clone(), choice: frequency.map(|_| raw.clone()), frequency,
+            });
+            let outcome = if let Some(frequency) = frequency {
+                let mut frequency_io = CaptureClockIo {
+                    usb: UsbClockPlanIo { handle: &claimed.handle, control, rate, allow_program: true },
+                    expected_frequency: current, program_attempted: false, factors: None, route: plan,
+                };
+                apply_playback_frequency_plan(&mut frequency_io, plan, frequency)
+            } else {
+                io.allow_program = false;
+                plan.apply(&mut io)
+            };
+            match outcome {
                 Ok(()) => {
                     let exact = graph
                         .resolve_terminal_clock(terminal, |id| {
@@ -1387,8 +1408,8 @@ pub(super) fn select_requested_clock_route(
                         control,
                         streaming: candidate.interface_number,
                         plan: plan.clone(),
-                        choice: None,
-                        frequency: None,
+                        choice: frequency.map(|_| raw.clone()),
+                        frequency,
                     });
                     if !exact {
                         restore_requested_clock_route(claimed)?;
@@ -1397,7 +1418,10 @@ pub(super) fn select_requested_clock_route(
                     return Ok(());
                 }
                 Err(error) if !error.rollback_errors.is_empty() => return Err(error.to_string()),
-                Err(error) => log_warn!("[USB] Rejected clock path: {error}"),
+                Err(error) => {
+                    *SELECTED_CLOCK_ROUTE.lock() = None;
+                    log_warn!("[USB] Rejected clock path: {error}");
+                }
             }
             continue;
         }
@@ -1567,6 +1591,21 @@ fn restore_capture_frequency(io: &mut impl CaptureFrequencyIo, saved: CaptureFre
     }
     Ok(())
 }
+/// ClockPlan rolls back pins after a failed source check. Restore a possibly
+/// effective frequency SET as well, including short writes and readback errors.
+fn apply_playback_frequency_plan(
+    io: &mut (impl crate::clock_resolution::ClockPlanIo + CaptureFrequencyIo),
+    plan: &crate::clock_resolution::ClockPlan,
+    frequency: CaptureFrequency,
+) -> Result<(), crate::clock_resolution::ClockPlanError> {
+    plan.apply(io).map_err(|mut error| {
+        if let Err(restore) = restore_capture_frequency(io, frequency) {
+            error.rollback_errors.push(format!("frequency: {restore}"));
+        }
+        error
+    })
+}
+
 fn restore_capture_transaction(
     io: &mut (impl crate::clock_resolution::ClockPlanIo + CaptureFrequencyIo),
     plan: &crate::clock_resolution::ClockPlan, frequency: CaptureFrequency,
@@ -1741,7 +1780,7 @@ pub(super) fn restore_requested_clock_route(claimed: &ClaimedHandle) -> Result<(
         verify_uac2_clock_factors(&claimed.handle, choice)?;
         let mutation = capture_clock_mutates(&selected.plan, frequency.original, frequency.target);
         if mutation && !stop_complete_capture_clock_function(claimed, selected.streaming)? {
-            return Err("multiplier hand-back requires complete idle function ownership".into());
+            return Err("clock frequency hand-back requires complete idle function ownership".into());
         }
         let mut io = CaptureClockIo { usb: UsbClockPlanIo { handle: &claimed.handle, control: selected.control, rate: frequency.target, allow_program: false }, expected_frequency: frequency.target, program_attempted: false, factors: Some(choice), route: &selected.plan };
         restore_capture_transaction(&mut io, &selected.plan, frequency)?;
@@ -1880,6 +1919,47 @@ mod capture_clock_transaction_tests {
         CaptureClockRoute { control: 0, streaming: 1, plan: plan(), frequency: frequency(),
             choice: ClockChoice { control_interface: 0, source_id: 9, path: vec![],
                 resolution: crate::clock_resolution::ClockResolution::Resolved } }
+    }
+    #[test]
+    fn ordinary_playback_frequency_failure_restores_rate_and_blocks_uncertain_retry() {
+        // Reuse the transaction IO, with source validation simulating a SET
+        // that took effect before a short/error reply or failed readback.
+        struct FailedSource { io: Io, drift: bool }
+        impl ClockPlanIo for FailedSource {
+            fn read_pin(&mut self, id: u8) -> Result<u8, String> { self.io.read_pin(id) }
+            fn write_pin(&mut self, id: u8, pin: u8) -> Result<(), String> { self.io.write_pin(id, pin) }
+            fn validate_source(&mut self, source: u8, _: u32) -> Result<(), String> {
+                self.io.write_frequency(source, 48_000)?;
+                if self.drift { self.io.rate = 96_000; }
+                Err("frequency SET failed or readback did not verify".into())
+            }
+        }
+        impl CaptureFrequencyIo for FailedSource {
+            fn read_frequency(&mut self, source: u8) -> Result<u32, String> { self.io.read_frequency(source) }
+            fn write_frequency(&mut self, source: u8, rate: u32) -> Result<(), String> { self.io.write_frequency(source, rate) }
+        }
+        for drift in [false, true] {
+            let mut io = FailedSource { io: Io { pin: 1, rate: 44_100, writes: vec![] }, drift };
+            let error = apply_playback_frequency_plan(&mut io, &plan(), frequency()).unwrap_err();
+            assert!(error.reason.contains("frequency SET"));
+            assert_eq!(io.io.pin, 1);
+            if drift {
+                assert_eq!(io.io.rate, 96_000);
+                assert!(!error.rollback_errors.is_empty());
+                assert_eq!(io.io.writes, ["pin", "rate", "pin"]);
+            } else {
+                assert_eq!(io.io.rate, 44_100);
+                assert!(error.rollback_errors.is_empty());
+                assert_eq!(io.io.writes, ["pin", "rate", "pin", "rate"]);
+            }
+        }
+    }
+    #[test]
+    fn ordinary_playback_frequency_hand_back_uses_saved_rate() {
+        let mut io = Io { pin: 2, rate: 48_000, writes: vec![] };
+        restore_capture_transaction(&mut io, &plan(), frequency()).unwrap();
+        assert_eq!((io.pin, io.rate), (1, 44_100));
+        assert_eq!(io.writes, ["rate", "pin"]);
     }
     #[test]
     fn available_capture_alternate_keeps_selected_clock_snapshot() {

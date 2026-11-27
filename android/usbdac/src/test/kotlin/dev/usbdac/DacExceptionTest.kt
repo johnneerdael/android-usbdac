@@ -9,6 +9,46 @@ import org.junit.Test
 
 class DacExceptionTest {
     @Test
+    fun routingPowerFailureKeepsTransactionAndRollbackDetails() {
+        val response = """{"error":{"kind":"transaction","detail":"write failed","failed_change":2,
+            "cause":{"kind":"io","detail":"write"},"rollback_failures":[
+                {"key":{"kind":"selector","interface":3,"entity":8},"cause":{"kind":"io","detail":"route restore"}}],
+            "power_restore_failure":"power restore"}}"""
+        try {
+            routingResponse { response }
+            fail("expected routing failure")
+        } catch (error: RoutingException) {
+            assertEquals(RoutingErrorKind.TRANSACTION, error.kind)
+            assertEquals(2, error.failedChange)
+            assertEquals("write", error.controlFailure!!.detail)
+            assertEquals(RouteKey.Selector(3, 8), error.rollbackFailures.single().key)
+            assertEquals("route restore", error.rollbackFailures.single().cause.detail)
+            assertEquals("power restore", error.powerRestoreFailure)
+        }
+    }
+
+    @Test
+    fun routingErrorsWithoutPowerFailureKeepExistingConstructorAndDecodeBehavior() {
+        val legacy = RoutingException(RoutingErrorKind.INVALID, "invalid", null, null, null, emptyList())
+        assertNull(legacy.powerRestoreFailure)
+        try {
+            routingResponse { """{"error":{"kind":"session","detail":"power restore","session_code":"control","power_restore_failure":"power restore"}}""" }
+            fail("expected routing failure")
+        } catch (error: RoutingException) {
+            assertEquals(RoutingErrorKind.SESSION, error.kind)
+            assertEquals(DacErrorCode.CONTROL, error.sessionCode)
+            assertEquals("power restore", error.powerRestoreFailure)
+            assertTrue(error.rollbackFailures.isEmpty())
+        }
+        try {
+            routingResponse { """{"error":{"kind":"invalid","detail":"invalid"}}""" }
+            fail("expected routing failure")
+        } catch (error: RoutingException) {
+            assertNull(error.powerRestoreFailure)
+        }
+    }
+
+    @Test
     fun everyDocumentedNativeCodeParses() {
         val expected = mapOf(
             "busy" to DacErrorCode.BUSY,

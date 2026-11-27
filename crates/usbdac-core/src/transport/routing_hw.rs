@@ -53,6 +53,12 @@ pub enum RoutingSessionError {
     Drift(String),
     Control(RoutingError<String>),
     Transaction(TransactionError<String>),
+    /// Scoped ADC3 power hand-back failed. Preserve an operation failure in its
+    /// original typed form; `None` means the routing operation itself succeeded.
+    PowerRestore {
+        operation: Option<Box<RoutingSessionError>>,
+        detail: String,
+    },
     Scarlett(crate::scarlett::ReadError<String>),
     ScarlettMix(crate::scarlett::MixWriteError<String>),
     ScarlettMux(crate::scarlett::MuxWriteError<String>),
@@ -1864,12 +1870,19 @@ fn with_routing_power<T>(
         }
         operation()
     })();
-    match lease.restore_checked() {
-        Ok(()) => result,
-        Err(error) => Err(RoutingSessionError::Session(Error::Control(format!(
-            "powered routing power hand-back: {error}; operation failure: {:?}",
-            result.as_ref().err()
-        )))),
+    finish_routing_power(result, lease.restore_checked())
+}
+
+fn finish_routing_power<T>(
+    operation: Result<T, RoutingSessionError>,
+    restoration: Result<(), String>,
+) -> Result<T, RoutingSessionError> {
+    match restoration {
+        Ok(()) => operation,
+        Err(detail) => Err(RoutingSessionError::PowerRestore {
+            operation: operation.err().map(Box::new),
+            detail,
+        }),
     }
 }
 
@@ -2260,6 +2273,39 @@ pub(super) fn finish_routing_hand_back() {
 mod tests {
     use super::*;
     use crate::routing::Entity;
+
+    #[test]
+    fn routing_power_hand_back_preserves_transaction_and_rollback_failures() {
+        let key = ControlKey::Selector(Entity { interface: 3, id: 8 });
+        let operation = Err::<(), _>(RoutingSessionError::Transaction(TransactionError {
+            failed_change: Some(2),
+            cause: RoutingError::Io("write".into()),
+            rollback_failures: vec![(key, RoutingError::Io("route restore".into()))],
+        }));
+        let error = finish_routing_power(operation, Err("power restore".into())).unwrap_err();
+        let RoutingSessionError::PowerRestore { operation: Some(operation), detail } = error else {
+            panic!("expected both routing and power failures");
+        };
+        assert_eq!(detail, "power restore");
+        let RoutingSessionError::Transaction(transaction) = *operation else {
+            panic!("expected the original typed transaction");
+        };
+        assert_eq!(transaction.failed_change, Some(2));
+        assert_eq!(transaction.cause, RoutingError::Io("write".into()));
+        assert_eq!(transaction.rollback_failures,
+            vec![(key, RoutingError::Io("route restore".into()))]);
+    }
+
+    #[test]
+    fn routing_power_hand_back_keeps_single_failures_and_success_distinct() {
+        assert_eq!(finish_routing_power(Ok(7), Ok(())).unwrap(), 7);
+        assert!(matches!(finish_routing_power::<()>(
+            Err(RoutingSessionError::Drift("changed".into())), Ok(())),
+            Err(RoutingSessionError::Drift(detail)) if detail == "changed"));
+        assert!(matches!(finish_routing_power(Ok(()), Err("power restore".into())),
+            Err(RoutingSessionError::PowerRestore { operation: None, detail })
+                if detail == "power restore"));
+    }
 
     fn terminal(id: u8, channels: u8, locations: u32) -> Vec<u8> {
         let mut bytes = vec![17, 0x24, 2, id, 1, 1, 0, 10, channels];

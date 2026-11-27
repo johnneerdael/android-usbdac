@@ -17,14 +17,17 @@ compatibility. Use the following order for the remaining work.
    descriptor or hardware evidence.
 4. Check the shared native DSD and DoP wire paths and PCM hand-back.
 5. Record the evidence for additional device-specific support so the
-   maintainer can select models after this release.
+   maintainer can select models after this release. See the
+   [device compatibility candidates](device-compatibility-candidates.md).
 6. Release the shared implementation after software validation.
    Hardware acceptance cases in this ledger document coverage for
    a future device pass.
 
-QEMU 10.1.3 instantiated its virtual USB Audio Interface at full
-speed on an emulated xHCI bus. This proves device creation. A guest
-running the library is needed to prove playback through that bus.
+QEMU 10.1.3 presented its virtual USB Audio Interface (`46f4:0002`)
+through an emulated xHCI bus. An Alpine arm64 Linux guest enumerated
+the device at full speed and read its 131 descriptor bytes, including a
+UAC1 stereo 16-bit PCM OUT alternate at 48 kHz. The guest image lacked
+the ALSA USB audio module. This check establishes guest enumeration.
 Linux `dummy_hcd` can exercise descriptor and control handling and
 rejects isochronous transfers. Use the Rust protocol and packet tests
 for the affected release paths unless a suitable virtual device
@@ -101,6 +104,16 @@ contain matching native libraries for all four ABIs. The AAR SHA-256
 is `190a26732a81dea3b395624e1cd6799c706e79ae152f79f7256991e6f25675f2`.
 
 ## Clock selection and shared ownership
+
+The standard-control audit found two release fixes. Ordinary UAC2
+selector fallback now saves the source frequency before a rate write
+and restores it during failed setup or hand-back when the device still
+reports a value owned by that operation. An uncertain restore stops
+the search before another source is tried. Powered ADC3 routing now
+preserves the original typed control or transaction error alongside
+power hand-back failure. Android callers can read both the rollback
+failures and `RoutingException.powerRestoreFailure`. Rust workspace
+and Kotlin unit tests checked these failure cases.
 
 Resolve a terminal's graph under the selected AudioControl function. A reachable source path includes the selector ID and pin at each branch, multiplier ratio where known and source identity. Extend planning to enumerate alternatives with path-local cycle detection and reject invalid IDs, excessive depth and unsupported ratios. Prefer the current route. Probe its validity and sampling rate through the actual source. For alternative selection, honor the selector's readable/writable flags and verify each 1-based selector value through GET_CUR after SET_CUR. Leave valid paths untouched and keep changes transactional. Save original pins, validate after committing a path, restore on failures and at hand-back where safe, and invalidate negotiation if the path changes unexpectedly. Keep separate support for the existing malformed-descriptor fallback, which cannot prove a selectable source or duplex clock equality. [UAC2](https://usb.org/sites/default/files/Audio2_with_Errata_and_ECN_through_Sep_14_2026.pdf), [ALSA clock selection](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L329-L435)
 

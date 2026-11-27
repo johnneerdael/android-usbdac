@@ -30,9 +30,11 @@ public data class RoutingControlFailure(val kind: RoutingControlErrorKind, val d
     val expectedLength: Int?, val actualLength: Int?, val expected: RouteValue?, val actual: RouteValue?)
 public data class RoutingRollbackFailure(val key: RouteKey, val cause: RoutingControlFailure)
 /** A failed transaction preserves the failed edit and every failed verified rollback. */
-public class RoutingException(public val kind: RoutingErrorKind, message: String,
+public class RoutingException @JvmOverloads constructor(public val kind: RoutingErrorKind, message: String,
     public val sessionCode: DacErrorCode?, public val failedChange: Int?,
-    public val controlFailure: RoutingControlFailure?, public val rollbackFailures: List<RoutingRollbackFailure>) : Exception(message)
+    public val controlFailure: RoutingControlFailure?, public val rollbackFailures: List<RoutingRollbackFailure>,
+    /** Scoped ADC3 power hand-back also failed; the primary error fields remain intact. */
+    public val powerRestoreFailure: String? = null) : Exception(message)
 
 /**
  * Typed routing through this session's checked native controls while idle.
@@ -108,7 +110,7 @@ internal fun routingResponse(call: () -> String): JSONObject = nativeCall {
             error.optString("session_code").takeIf { it.isNotEmpty() }?.let { DacErrorCode.fromWireName(it) }, error.optionalInt("failed_change"),
             error.optJSONObject("cause")?.let(::controlFailure), error.optJSONArray("rollback_failures")?.objects()?.map {
                 RoutingRollbackFailure(parseKey(it.getJSONObject("key")), controlFailure(it.getJSONObject("cause")))
-            } ?: emptyList())
+            } ?: emptyList(), error.optString("power_restore_failure").takeIf { it.isNotEmpty() })
     }
     result.getJSONObject("value")
 }
