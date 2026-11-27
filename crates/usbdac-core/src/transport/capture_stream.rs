@@ -392,15 +392,16 @@ pub(super) fn require_vendor_capture_pcm(profile: &vendor_pcm::VendorPcm) -> Res
 }
 
 fn vendor_capture_candidates(configuration: u8, profile: vendor_pcm::VendorPcm, rate: u32) -> Result<Vec<CaptureEndpoint>, String> {
-    if require_vendor_capture_pcm(&profile).is_err() || rate != profile.rate {
+    if require_vendor_capture_pcm(&profile).is_err() || !profile.supports_rate(rate) {
         return Ok(vec![]);
     }
-    Ok(vec![vendor_capture_endpoint(configuration, profile)?])
+    Ok(vec![vendor_capture_endpoint(configuration, profile, rate)?])
 }
 
-fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm) -> Result<CaptureEndpoint, String> {
+fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm, rate: u32) -> Result<CaptureEndpoint, String> {
     require_vendor_capture_pcm(&profile)?;
-    let format = CaptureFormat::pcm(profile.rate, profile.input.subslot_bytes * 8, profile.input.subslot_bytes,
+    if !profile.supports_rate(rate) { return Err("unsupported vendor capture rate".into()); }
+    let format = CaptureFormat::pcm(rate, profile.input.subslot_bytes * 8, profile.input.subslot_bytes,
         ChannelMap::uac2(u16::from(profile.input.channels), 0).map_err(|e| format!("vendor channel map: {e:?}"))?)
         .map_err(|e| format!("vendor capture format: {e:?}"))?;
     Ok(CaptureEndpoint {
@@ -408,7 +409,7 @@ fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm) ->
         address: profile.input.address, service_us: profile.input.service_us,
         packet_bytes: profile.input.max_packet_bytes, format, protocol: 0xff,
         terminal: 0, control: profile.input_interface_number, control_descriptors: vec![],
-        sampling_control: false, fixed_rate: true, adc3_route: None, vendor_pcm: Some(profile),
+        sampling_control: false, fixed_rate: !profile.rate_control, adc3_route: None, vendor_pcm: Some(profile),
     })
 }
 
@@ -439,7 +440,9 @@ pub(super) fn verify_vendor_capture(claimed: &ClaimedHandle, candidate: &Capture
     }
     let actual = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))
         .map_err(Error::Control)?;
-    if actual.as_ref() != Some(expected) {
+    let reproven = vendor_capture_endpoint(candidate.configuration, *expected, candidate.format.sample_rate())
+        .map_err(Error::Control)?;
+    if actual.as_ref() != Some(expected) || &reproven != candidate {
         return Err(Error::InvalidState("vendor capture wire profile changed".into()));
     }
     Ok(())
@@ -681,6 +684,9 @@ pub(super) fn configure_capture_endpoint_guarded(
         verify_vendor_capture_alternate(claimed, candidate, candidate.alternate)?;
         if profile.requires_output_for_capture {
             verify_vendor_interface_alternate(claimed, profile.interface_number, profile.alt_setting)?;
+        }
+        if profile.rate_control {
+            vendor_pcm::program_rate(claimed, profile, candidate.format.sample_rate())?;
         }
         return Ok(());
     }
@@ -1349,7 +1355,7 @@ struct NominalCapturePool {
 }
 impl NominalCapturePool {
     fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
-        let Some(profile) = endpoint.vendor_pcm.filter(|profile| profile.requires_output_for_capture) else { return Ok(None); };
+        let Some(profile) = endpoint.vendor_pcm.filter(|profile| profile.requires_output_for_capture && !profile.rate_control) else { return Ok(None); };
         let geometry = IsoQueueGeometry::for_stream(profile.output.service_us,
             settings().config.bus_queue_ms, settings().config.transfers_in_flight);
         let stride = usize::from(profile.output.channels) * usize::from(profile.output.subslot_bytes);
@@ -1360,8 +1366,8 @@ impl NominalCapturePool {
             slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)?);
         }
         Ok(Some(Self { slots, profile,
-            scheduler: IsoPacketScheduler::with_geometry(profile.rate, stride, profile.output.service_us, geometry),
-            acceptance: PacketAcceptance::new(profile.rate, profile.output.service_us, stride),
+            scheduler: IsoPacketScheduler::with_geometry(endpoint.format.sample_rate(), stride, profile.output.service_us, geometry),
+            acceptance: PacketAcceptance::new(endpoint.format.sample_rate(), profile.output.service_us, stride),
             first_valid: None, latest_valid: None,
             deadline: Duration::from_millis(100).max(Duration::from_micros(
                 u64::from(profile.output.service_us) * geometry.packets_in_flight() as u64 * 4)),
@@ -1437,6 +1443,76 @@ impl Drop for CaptureTransferBatch<'_> {
     }
 }
 
+/// Qualify programmed vendor capture without publishing pre-rate audio. Service
+/// time comes from validated whole-frame packets, never callback wall spacing.
+struct VendorCaptureRateGate {
+    window: implicit::VendorRateWindow,
+    pattern: Vec<usize>,
+    started: Instant,
+    latest: Option<Instant>,
+    startup: Duration,
+    stale: Duration,
+    qualified: bool,
+    ever_qualified: bool,
+    last_proof: Option<Instant>,
+    bad_windows: u8,
+}
+impl VendorCaptureRateGate {
+    fn new(endpoint: &CaptureEndpoint, geometry: IsoQueueGeometry) -> Self {
+        let queue_time = Duration::from_micros(u64::from(endpoint.service_us)
+            * geometry.packets_in_flight() as u64 * 4);
+        Self { window: implicit::VendorRateWindow::new(endpoint.format.sample_rate()),
+            pattern: vec![0; geometry.packets_per_transfer], started: Instant::now(), latest: None,
+            startup: Duration::from_millis(500).max(queue_time),
+            stale: Duration::from_millis(100).max(queue_time), qualified: false,
+            ever_qualified: false, last_proof: None, bad_windows: 0 }
+    }
+    fn check(&self, now: Instant) -> Result<(), Error> {
+        if (!self.ever_qualified && now.saturating_duration_since(self.started) >= self.startup)
+            || self.last_proof.is_some_and(|proof| now.saturating_duration_since(proof) >= self.startup)
+            || self.latest.is_some_and(|latest| now.saturating_duration_since(latest) >= self.stale) {
+            return Err(Error::Transfer("vendor capture rate qualification or cadence deadline missed".into()));
+        }
+        Ok(())
+    }
+    fn observe(&mut self, endpoint: &CaptureEndpoint, slot: &IsoTransferSlot, status: i32,
+        completed: Instant, scratch: &mut [CapturePacket]) -> Result<bool, Error> {
+        self.check(completed)?;
+        let (_, detached) = inspect_slot(slot, status, scratch)?;
+        if detached { return Err(Error::DeviceLost); }
+        let stride = endpoint.format.bytes_per_frame();
+        let valid = implicit::capture_pattern(scratch.iter().map(|packet|
+            (if packet.succeeded { LIBUSB_TRANSFER_COMPLETED } else { -1 },
+                packet.actual_bytes, packet.requested_bytes)), stride, stride,
+            endpoint.packet_bytes, &mut self.pattern).unwrap_or(false);
+        if !valid {
+            self.window.reset();
+            self.qualified = false;
+            return Ok(false);
+        }
+        self.latest = Some(self.latest.map_or(completed, |latest| latest.max(completed)));
+        let publish = self.qualified;
+        let frames = self.pattern.iter().map(|bytes| (bytes / stride) as u64).sum();
+        let service_us = u64::from(endpoint.service_us) * self.pattern.len() as u64;
+        if let Some(valid_rate) = self.window.observe(frames, service_us) {
+            if valid_rate {
+                self.bad_windows = 0;
+                self.qualified = true;
+                self.ever_qualified = true;
+                self.last_proof = Some(completed);
+            } else {
+                self.qualified = false;
+                self.bad_windows += 1;
+                if self.bad_windows >= 2 {
+                    return Err(Error::ClockUnverified { requested_hz: endpoint.format.sample_rate(), reported_hz: None });
+                }
+                return Ok(false);
+            }
+        }
+        Ok(publish)
+    }
+}
+
 fn run_capture(
     owner: &CaptureUsbOwner,
     endpoint: &CaptureEndpoint,
@@ -1492,10 +1568,12 @@ fn run_capture(
         })?;
         order.push_back(index);
     }
+    let mut vendor_rate = endpoint.vendor_pcm.as_ref().filter(|profile| profile.rate_control)
+        .map(|_| VendorCaptureRateGate::new(endpoint, geometry));
     let input_started = Instant::now();
     let mut latest_input: Option<Instant> = None;
     let mut announced = false;
-    if feedforward.is_none() && companion.is_none() { let _ = ready.send(Ok(())); announced = true; }
+    if feedforward.is_none() && companion.is_none() && vendor_rate.is_none() { let _ = ready.send(Ok(())); announced = true; }
     while !usb_stop_requested(stop) {
         owner
             .claimed()
@@ -1512,7 +1590,7 @@ fn run_capture(
             pool.pump(&owner.claimed().handle, stop)?;
         }
         if let Some(pool) = companion.as_mut() { pool.pump(&owner.claimed().handle, stop)?; }
-        if !announced && companion.is_none() && feedforward.as_ref().map_or(true, |pool| pool.primed()) {
+        if !announced && companion.is_none() && vendor_rate.is_none() && feedforward.as_ref().map_or(true, |pool| pool.primed()) {
             let _ = ready.send(Ok(())); announced = true;
         }
         if let Some(&head) = order.front() {
@@ -1541,7 +1619,19 @@ fn run_capture(
                 slots[index].mark_completed();
                 break;
             }
-            let capture_allowed = feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
+            let vendor_allowed = if let Some(gate) = vendor_rate.as_mut() {
+                match gate.observe(endpoint, &slots[index], status, completed, &mut scratch) {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        // take_completion consumed this callback. Retire its
+                        // in-flight ownership before cancellation can drain.
+                        drop(queue);
+                        slots[index].mark_completed();
+                        return Err(error);
+                    }
+                }
+            } else { true };
+            let capture_allowed = vendor_allowed && feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(completed))
                 && companion.as_ref().map_or(true, |pool| pool.accepts_capture(completed));
             let captured_before = companion.as_ref().map(|_| queue.stats().captured_frames);
             let result = if capture_allowed {
@@ -1575,6 +1665,12 @@ fn run_capture(
                 order.push_back(index);
             }
         }
+        if let Some(gate) = vendor_rate.as_ref() {
+            gate.check(Instant::now())?;
+            if !announced && gate.qualified {
+                let _ = ready.send(Ok(())); announced = true;
+            }
+        }
         if let Some(pool) = companion.as_ref() {
             if latest_input.unwrap_or(input_started).elapsed() >= pool.deadline {
                 return Err(Error::Transfer("vendor capture IN cadence deadline missed".into()));
@@ -1606,11 +1702,12 @@ mod tests {
                 channels, subslot_bytes: 3,
             };
             let profile = vendor_pcm::VendorPcm {
+                vendor_id: 0x1686, product_id: 0xf00c, configuration_number: 1,
                 interface_number: 0, alt_setting: 1, input_interface_number: 0, input_alt_setting: 1,
-                requires_output_for_capture: false, input_carries_pcm: true, rate: 48_000, speed: Speed::High,
+                requires_output_for_capture: false, input_carries_pcm: true, rates: &[48_000], rate_control: false, speed: Speed::High,
                 output: vendor_pcm::VendorEndpoint { address: 1, ..endpoint }, input: endpoint,
             };
-            let capture = vendor_capture_endpoint(1, profile).unwrap();
+            let capture = vendor_capture_endpoint(1, profile, profile.rates[0]).unwrap();
             assert_eq!(capture.format.sample_rate(), 48_000);
             assert_eq!(capture.format.valid_bits(), 24);
             assert_eq!(capture.format.subslot_bytes(), 3);
@@ -1628,9 +1725,10 @@ mod tests {
     fn roland_capture_profile() -> vendor_pcm::VendorPcm {
         let output = vendor_pcm::VendorEndpoint { address: 0x05, interval: 1, service_us: 125,
             max_packet_bytes: 7 * 4 * 4, channels: 4, subslot_bytes: 4 };
-        vendor_pcm::VendorPcm { interface_number: 0, alt_setting: 1,
+        vendor_pcm::VendorPcm { vendor_id: 0x0582, product_id: 0x012f, configuration_number: 1,
+            interface_number: 0, alt_setting: 1,
             input_interface_number: 1, input_alt_setting: 1, requires_output_for_capture: true, input_carries_pcm: true,
-            rate: 44_100, speed: Speed::High, output,
+            rates: &[44_100], rate_control: false, speed: Speed::High, output,
             input: vendor_pcm::VendorEndpoint { address: 0x85, ..output } }
     }
     #[test]
@@ -1638,15 +1736,15 @@ mod tests {
         let mut profile = roland_capture_profile();
         profile.input_carries_pcm = false;
         assert!(require_vendor_capture_pcm(&profile).unwrap_err().contains("capture is unsupported"));
-        assert!(vendor_capture_candidates(1, profile, profile.rate).unwrap().is_empty());
-        assert!(vendor_capture_endpoint(1, profile).is_err());
+        assert!(vendor_capture_candidates(1, profile, profile.rates[0]).unwrap().is_empty());
+        assert!(vendor_capture_endpoint(1, profile, profile.rates[0]).is_err());
     }
 
     #[test]
     fn ordinary_vendor_input_remains_capture_pcm_at_its_fixed_rate() {
         let profile = roland_capture_profile();
         assert!(require_vendor_capture_pcm(&profile).is_ok());
-        assert_eq!(vendor_capture_candidates(1, profile, profile.rate).unwrap().len(), 1);
+        assert_eq!(vendor_capture_candidates(1, profile, profile.rates[0]).unwrap().len(), 1);
         assert!(vendor_capture_candidates(1, profile, 48_000).unwrap().is_empty());
     }
 
@@ -1658,15 +1756,101 @@ mod tests {
         for claims in [&[1][..], &[0][..], &[0, 1, 1][..], &[0, 1, 2][..]] {
             assert!(!profile.claims_match(claims));
         }
-        let endpoint = vendor_capture_endpoint(1, profile).unwrap();
+        let endpoint = vendor_capture_endpoint(1, profile, profile.rates[0]).unwrap();
         assert_eq!((endpoint.interface, endpoint.alternate, endpoint.address), (1, 1, 0x85));
         assert_eq!((endpoint.format.sample_rate(), endpoint.format.valid_bits(), endpoint.format.subslot_bytes()), (44_100, 32, 4));
         assert!(endpoint.control_descriptors.is_empty());
         assert!(!endpoint.sampling_control);
     }
+    fn programmed_capture_endpoint() -> CaptureEndpoint {
+        let mut profile = roland_capture_profile();
+        profile.vendor_id = 0x2b73;
+        profile.product_id = 0x001a;
+        profile.rates = &[44_100, 48_000, 96_000];
+        profile.rate_control = true;
+        profile.requires_output_for_capture = false;
+        profile.output.service_us = 1_000;
+        profile.output.max_packet_bytes = 128 * 16;
+        profile.input.service_us = 1_000;
+        profile.input.max_packet_bytes = 128 * 16;
+        vendor_capture_endpoint(1, profile, 48_000).unwrap()
+    }
+    #[test]
+    fn programmed_capture_uses_requested_rate_without_a_companion() {
+        let endpoint = programmed_capture_endpoint();
+        assert_eq!(endpoint.format.sample_rate(), 48_000);
+        assert!(!endpoint.fixed_rate);
+        assert!(NominalCapturePool::for_endpoint(&endpoint).unwrap().is_none());
+        let profile = endpoint.vendor_pcm.unwrap();
+        assert_eq!(vendor_capture_candidates(1, profile, 96_000).unwrap()[0].format.sample_rate(), 96_000);
+        assert!(vendor_capture_candidates(1, profile, 88_200).unwrap().is_empty());
+    }
+    #[test]
+    fn programmed_capture_keeps_the_complete_proof_window_unpublished() {
+        let endpoint = programmed_capture_endpoint();
+        let geometry = IsoQueueGeometry::for_stream(1_000, 8, 4);
+        let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
+        gate.pattern = vec![0];
+        let slot = completed_slot(0, &[0; 48 * 16]);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let start = gate.started;
+        for millis in 1..=100 {
+            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(millis), &mut scratch).unwrap());
+        }
+        assert!(gate.qualified);
+        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+            start + Duration::from_millis(101), &mut scratch).unwrap());
+        assert!(gate.check(start + Duration::from_millis(601)).is_err());
+    }
+    #[test]
+    fn programmed_capture_requires_a_contiguous_whole_frame_window() {
+        let endpoint = programmed_capture_endpoint();
+        let geometry = IsoQueueGeometry::for_stream(1_000, 8, 4);
+        let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
+        gate.pattern = vec![0];
+        let mut slot = completed_slot(0, &[0; 48 * 16]);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let start = gate.started;
+        for millis in 1..50 {
+            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(millis), &mut scratch).unwrap());
+        }
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length -= 1; }
+        assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+            start + Duration::from_millis(50), &mut scratch).unwrap());
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length += 1; }
+        for millis in 51..=150 {
+            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(millis), &mut scratch).unwrap());
+        }
+        assert!(gate.qualified);
+        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+            start + Duration::from_millis(151), &mut scratch).unwrap());
+    }
+
+    #[test]
+    fn programmed_capture_stops_after_two_invalid_windows_or_startup_expiry() {
+        let endpoint = programmed_capture_endpoint();
+        let geometry = IsoQueueGeometry::for_stream(1_000, 8, 4);
+        let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
+        gate.pattern = vec![0];
+        let slot = completed_slot(0, &[0; 44 * 16]);
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let start = gate.started;
+        for millis in 1..200 {
+            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(millis), &mut scratch).unwrap());
+        }
+        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
+            start + Duration::from_millis(200), &mut scratch).is_err());
+        let fresh = VendorCaptureRateGate::new(&endpoint, geometry);
+        assert!(fresh.check(fresh.started + fresh.startup).is_err());
+    }
+
     #[test]
     fn companion_input_progress_requires_accepted_whole_frames() {
-        let endpoint = vendor_capture_endpoint(1, roland_capture_profile()).unwrap();
+        let endpoint = vendor_capture_endpoint(1, roland_capture_profile(), 44_100).unwrap();
         let mut buffer = CaptureBuffer::new(endpoint.format, 8).unwrap();
         let mut slot = completed_slot(0, &[0; 16]);
         let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];

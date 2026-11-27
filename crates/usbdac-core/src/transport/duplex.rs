@@ -82,8 +82,8 @@ fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         capture_stream::verify_vendor_capture(claimed, endpoint)?;
         let proven = vendor_pcm::for_candidate(&claimed.handle, playback).map_err(Error::Control)?;
         let exact = proven.as_ref() == Some(profile)
-            && expected.sample_rate == profile.rate && expected.clock.is_none()
-            && endpoint.format.sample_rate() == profile.rate
+            && profile.supports_rate(expected.sample_rate) && expected.clock.is_none()
+            && endpoint.format.sample_rate() == expected.sample_rate
             && validate_alternates(playback, endpoint)?;
         if exact { return Ok(()); }
         return Err(Error::Unsupported { reason: "duplex must match the exact vendor OUT and shared implicit IN profile".into(), offered: vec![] });

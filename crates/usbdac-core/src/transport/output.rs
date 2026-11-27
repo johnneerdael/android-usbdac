@@ -544,8 +544,8 @@ pub(super) fn run_usb_output_loop(
         return;
     }
 
-    let playback_first = match vendor_pcm::for_candidate(&handle, &candidate) {
-        Ok(profile) => profile.is_some(),
+    let (playback_first, programmed_vendor_rate) = match vendor_pcm::for_candidate(&handle, &candidate) {
+        Ok(profile) => (profile.is_some(), profile.as_ref().is_some_and(|profile| profile.rate_control)),
         Err(message) => { set_last_error(Some(message.clone())); set_engine_state(EngineState::Error, Some(message.clone())); shared.fail(Error::Transfer(message)); set_stream_active(false); return; }
     };
     let channels = candidate.channels as usize;
@@ -830,6 +830,7 @@ pub(super) fn run_usb_output_loop(
             }
             match ImplicitFeedback::new(source, geometry, bytes_per_frame, candidate.max_packet_bytes, playback_format.sample_rate) {
                 Ok(mut engine) => {
+                    if programmed_vendor_rate { engine.require_vendor_rate_proof(); }
                     if !playback_first {
                         engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
                     }
@@ -870,8 +871,16 @@ pub(super) fn run_usb_output_loop(
                             if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
                         }
                     }
-                    if playback_first && fatal_error.is_none() && engine.primed() {
-                        engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
+                    if fatal_error.is_none() && !usb_stop_requested(&stop) && engine.primed() {
+                        if programmed_vendor_rate {
+                            engine.promote_vendor_rate_proof();
+                            // The write ACK is not readback. Readiness requires
+                            // both contiguous cadence proof and a fresh FIFO prime.
+                            set_clock_verification(true, true, true, None);
+                        }
+                        if playback_first {
+                            engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
+                        }
                     }
                     implicit = Some(engine);
                 }
@@ -1589,6 +1598,7 @@ pub(super) fn run_usb_output_loop(
             shared.note_bit_perfect();
         }
         if implicit_feedback_fault && !device_lost {
+            if programmed_vendor_rate { set_clock_verification(true, true, false, None); }
             runtime_stats.feedback_locked.store(false, Ordering::Release);
             runtime_stats.feedback_stale.store(true, Ordering::Release);
             runtime_stats.feedback_errors.fetch_add(1, Ordering::Relaxed);

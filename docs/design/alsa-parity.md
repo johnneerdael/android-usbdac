@@ -900,3 +900,57 @@ the AAR and sample builds, and the SDK snippet check passed. Both JNI
 preflight methods are present on all four ABIs. The AAR SHA-256 is
 `cf030282b9c4697b764e3a87e9711696cbef8f3d37156f4c96f497ffe67a9123`.
 Physical acceptance on the five Pioneer controllers remains pending.
+
+### Pioneer DJM rate programming
+
+ALSA programs the listed DJM mixers through the capture endpoint on
+vendor interface 0, alternate 1. The format in both directions is
+packed signed 24-bit little-endian PCM. Treat the listed rates as
+discrete options and intersect them with the capacity of both endpoints
+at their common USB service interval.
+
+| Mixer | USB ID | OUT channels and endpoint | IN channels and endpoint | Wire rates |
+| --- | --- | --- | --- | --- |
+| DJM-900NXS2 | `2b73:000a` | 10, `0x01` | 12, `0x82` | 44.1, 48, 96 kHz |
+| DJM-V10 | `2b73:0034` | 12, `0x01` | 12, `0x82` | 44.1, 48, 96 kHz |
+| DJM-750 | `08e4:017f` | 8, `0x05` | 8, `0x86` | 44.1, 48, 96 kHz |
+| DJM-850 | `08e4:0163` | 8, `0x05` | 8, `0x86` | 44.1, 48, 96 kHz |
+| DJM-450 | `2b73:0013` | 8, `0x01` | 8, `0x82` | 48 kHz |
+
+[ALSA DJM format entries](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L3028-L3243),
+[ALSA legacy DJM format entries](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks-table.h#L3320-L3528)
+
+Verify the active configuration, exact interface claim, and alternate 1
+before sending the endpoint request `0x22/0x01` with value `0x0100`, index
+equal to the IN endpoint address, and a three-byte little-endian rate.
+Discovery and negotiation only read descriptors. A complete control
+write authorizes startup measurement. Whole-frame IN packet lengths
+must agree with the selected rate over a 100 ms service window before
+the driver submits application audio or releases capture frames. Playback
+primes with silence and duplex shares its timing IN stream. Standalone
+capture measures the same cadence directly from its independent IN
+transfers. Playback and duplex require the SDK's fixed-output allowance
+when volume is controlled on the mixer. The pinned ALSA request documents
+rate selection. Restoring a previous mixer rate requires independent
+evidence for a readback or hand-back transaction. [ALSA endpoint rate request](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L1766-L1782),
+[ALSA model dispatch](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/quirks.c#L1869-L1877)
+
+Physical acceptance should capture the command after alternate 1
+activation, followed by the measured IN cadence at each offered rate.
+Exercise playback, standalone capture and duplex, and confirm the
+mixer uses one rate command per open. Verify that failed or short
+commands, wrong cadence and detach stop the affected stream and that
+alternate zero is restored on an attached device.
+
+Rust workspace tests, Android arm64 NDK, Kotlin unit tests, the
+four-ABI AAR and sample builds, and the SDK snippet check passed.
+The AAR and sample contain identical libraries on all four ABIs.
+The AAR SHA-256 is
+`9115ae24dc3336023e3fdc90c1ee3acdf3720da23c7bde054386a622a09262ba`.
+Target DJM hardware acceptance remains pending.
+
+ALSA's DJM routing controls use separate model-specific requests for
+capture sources, capture levels, and playback destinations. ALSA reports
+the values it stores in software. A routing implementation should leave
+the mixer's current routing intact at open and distinguish a successful
+write from an observed hardware setting. [ALSA DJM controls](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/mixer_quirks.c#L4202-L4332)

@@ -48,18 +48,19 @@ pub(super) fn negotiate_playback_format(
             }
         };
 
-        // A descriptor-proven fixed vendor pair has no AudioControl clock.
-        // This is nominal model evidence; live implicit pacing remains required.
+        // Vendor pairs have no AudioControl clock. Negotiation stays read-only;
+        // programmable DJM rates await stream setup and observed IN cadence.
         if let Some(profile) = vendor_pcm::for_candidate(&claimed_handle.handle, &candidate)
             .map_err(Error::Transfer)? {
             if requested_format.dsd_transport != DsdTransportMode::None
-                || requested_format.sample_rate != profile.rate {
-                return Err(Error::Unsupported { reason: "vendor PCM requires its fixed nominal PCM rate".into(), offered: offered_alt_settings() });
+                || !profile.supports_rate(requested_format.sample_rate) {
+                return Err(Error::Unsupported { reason: "vendor PCM requires a supported native PCM rate".into(), offered: offered_alt_settings() });
             }
             set_effective_playback_format(requested_format);
-            set_dac_mode(DacMode::FixedClock);
+            set_dac_mode(if profile.rate_control { DacMode::FullControl } else { DacMode::FixedClock });
             set_clock_status(None);
-            set_clock_verification(false, false, true, Some(profile.rate));
+            set_clock_verification(false, false, !profile.rate_control,
+                (!profile.rate_control).then_some(requested_format.sample_rate));
             return Ok(requested_format);
         }
 

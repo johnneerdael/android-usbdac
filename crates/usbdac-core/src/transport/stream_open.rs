@@ -243,7 +243,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     }
     let clock = if adc3_route.is_some() { None } else { clock_choice.as_ref().map(|(clock, _)| *clock) };
     let clock_detection_msg = if let Some(profile) = vendor_profile.as_ref() {
-        format!("vendor PCM model-backed nominal {}Hz; live implicit lock required", profile.rate)
+        format!("vendor PCM model-backed {}Hz (programmable={}); live implicit lock required", playback_format.sample_rate, profile.rate_control)
     } else { match (adc3_route.as_ref(), &clock) {
         (Some(route), _) => match route.choice.as_ref() {
             Some(choice) => format!("ADC3 clock resolved: interface={}, clockId={}, via_terminal_link={:?}",
@@ -584,9 +584,10 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     } else if let Some(profile) = vendor_profile.as_ref() {
         clock_control_attempted = false;
         clock_control_succeeded = false;
-        clock_verification_passed = playback_format.dsd_transport == DsdTransportMode::None
-            && playback_format.sample_rate == profile.rate;
-        reported_sample_rate = Some(profile.rate);
+        clock_verification_passed = !profile.rate_control
+            && playback_format.dsd_transport == DsdTransportMode::None
+            && profile.supports_rate(playback_format.sample_rate);
+        reported_sample_rate = if profile.rate_control { None } else { Some(playback_format.sample_rate) };
         set_clock_verification(false, false, clock_verification_passed, reported_sample_rate);
     } else if candidate.is_uac1 {
         // UAC1 has no UAC2 clock entity; the sample rate is set endpoint-level
@@ -746,6 +747,22 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
             return Err(error);
         }
+    }
+    // Program only after both the exact profile and active streaming
+    // alternates are proven. The helper independently reproves the endpoint
+    // request contract; a successful write still requires USB cadence proof.
+    let programmed_vendor_rate = vendor_profile.as_ref().is_some_and(|profile| profile.rate_control);
+    if let Some(profile) = vendor_profile.as_ref().filter(|profile| profile.rate_control) {
+        clock_control_attempted = true;
+        if let Err(error) = vendor_pcm::program_rate(&claimed_handle, profile, playback_format.sample_rate) {
+            set_clock_verification(true, false, false, None);
+            duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+            return Err(error);
+        }
+        clock_control_succeeded = true;
+        clock_verification_passed = false;
+        reported_sample_rate = None;
+        set_clock_verification(true, true, false, None);
     }
     thread::sleep(Duration::from_millis(50));
 
@@ -1025,7 +1042,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
     // Hard-abort: if the clock is unverified or mismatched, refuse to
     // stream. Sending audio at the wrong sample rate causes chipmunk /
     // distorted playback.  There is NO "continue anyway" path.
-    if !clock_verification_passed {
+    if !clock_verification_passed && !programmed_vendor_rate {
         // Check if this device has the SkipClockValidation quirk.
         // Some DACs (e.g. Fosi DS2 / Savitech bridge) have broken UAC2 clock
         // control — GET_RANGE and GET_CUR always return 0. SET_CUR is accepted

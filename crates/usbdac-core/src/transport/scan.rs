@@ -636,14 +636,15 @@ pub(super) fn build_usb_capability_model(
         if settings().disable_feedback() {
             return Err("vendor PCM requires implicit feedback".into());
         }
+        let sample_rates = profile.sample_rates();
         return Ok(CapabilityModel {
-            supported_sample_rates: vec![profile.rate], link_speed: Some(link_speed_of(profile.speed)),
+            supported_sample_rates: sample_rates.clone(), link_speed: Some(link_speed_of(profile.speed)),
             alt_settings: vec![AltSetting {
                 interface_number: profile.interface_number, alt_setting: profile.alt_setting,
                 endpoint_address: profile.output.address, format: AltFormat::Pcm,
                 channels: profile.output.channels, subslot_bytes: profile.output.subslot_bytes, valid_bits: profile.output.subslot_bytes * 8,
-                rate_ranges: vec![RateRange { min_hz: profile.rate, max_hz: profile.rate, step_hz: 0 }],
-                sample_rates: vec![profile.rate], sync_type: SyncKind::Asynchronous,
+                rate_ranges: sample_rates.iter().copied().map(|rate| RateRange { min_hz: rate, max_hz: rate, step_hz: 0 }).collect(),
+                sample_rates, sync_type: SyncKind::Asynchronous,
                 feedback_endpoint: None, max_packet_bytes: profile.output.max_packet_bytes,
                 service_interval_us: profile.output.service_us, uac_version: UacVersion::Unknown,
                 endpoint_interval: profile.output.interval, usage: EndpointUsage::Data, refresh: 0, synch_address: 0,
@@ -905,9 +906,9 @@ pub(super) fn select_stream_candidate(
             return Err(SelectError::NoMatch("vendor PCM requires implicit feedback".into()));
         }
         if playback_format.dsd_transport != DsdTransportMode::None || playback_format.is_dop
-            || playback_format.sample_rate != profile.rate || playback_format.bit_depth != profile.output.subslot_bytes * 8
+            || !profile.supports_rate(playback_format.sample_rate) || playback_format.bit_depth != profile.output.subslot_bytes * 8
             || playback_format.channels != profile.output.channels {
-            return Err(SelectError::NoMatch("vendor PCM requires its exact fixed-rate native channel format".into()));
+            return Err(SelectError::NoMatch("vendor PCM requires its supported native PCM rate and channel format".into()));
         }
         return Ok(profile.candidate(config_descriptor.number()));
     }

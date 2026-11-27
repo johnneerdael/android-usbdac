@@ -1,4 +1,4 @@
-//! Source-proven Pioneer and Roland fixed-rate PCM. Descriptor-only: no initialization requests.
+//! Source-proven Pioneer and Roland PCM profiles and narrowly scoped DJM rate programming.
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,9 @@ pub(super) struct VendorEndpoint {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VendorPcm {
+    pub(super) vendor_id: u16,
+    pub(super) product_id: u16,
+    pub(super) configuration_number: u8,
     pub(super) interface_number: u8,
     pub(super) alt_setting: u8,
     pub(super) input_interface_number: u8,
@@ -19,7 +22,8 @@ pub(super) struct VendorPcm {
     pub(super) requires_output_for_capture: bool,
     /// False when the IN pipe carries dummy frames solely for output pacing.
     pub(super) input_carries_pcm: bool,
-    pub(super) rate: u32,
+    pub(super) rates: &'static [u32],
+    pub(super) rate_control: bool,
     pub(super) speed: Speed,
     pub(super) output: VendorEndpoint,
     pub(super) input: VendorEndpoint,
@@ -27,7 +31,8 @@ pub(super) struct VendorPcm {
 
 #[derive(Clone, Copy)]
 struct PioneerModel {
-    rate: u32,
+    rates: &'static [u32],
+    rate_control: bool,
     subslot_bytes: u8,
     output_address: u8,
     input_address: u8,
@@ -39,16 +44,27 @@ struct PioneerModel {
 // Linux snd-usb-audio quirks-table.h fixes the exact rate, format and routing.
 // Keep each model's wire specification independent of descriptor capacities.
 const PIONEER_MODELS: &[(u16, PioneerModel)] = &[
-    (0x0017, PioneerModel { rate: 48_000, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 8, inputs: 8, input_carries_pcm: true }), // DJM-250MK2
-    (0x001b, PioneerModel { rate: 48_000, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 10, inputs: 12, input_carries_pcm: true }), // DJM-750MK2
-    (0x0023, PioneerModel { rate: 44_100, subslot_bytes: 4, output_address: 0x05, input_address: 0x86, outputs: 12, inputs: 10, input_carries_pcm: true }), // DDJ-SX3
-    (0x000d, PioneerModel { rate: 44_100, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 6, inputs: 4, input_carries_pcm: true }), // DDJ-RR
-    (0x001e, PioneerModel { rate: 44_100, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 4, inputs: 6, input_carries_pcm: true }), // DDJ-SR2
-    (0x0029, PioneerModel { rate: 44_100, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 6, inputs: 6, input_carries_pcm: true }), // DDJ-800
-    (0x000e, PioneerModel { rate: 44_100, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 4, inputs: 2, input_carries_pcm: false }), // DDJ-RB: dummy IN is implicit feedback only
+    (0x0017, PioneerModel { rates: &[48_000], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 8, inputs: 8, input_carries_pcm: true }), // DJM-250MK2
+    (0x001b, PioneerModel { rates: &[48_000], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 10, inputs: 12, input_carries_pcm: true }), // DJM-750MK2
+    (0x0023, PioneerModel { rates: &[44_100], rate_control: false, subslot_bytes: 4, output_address: 0x05, input_address: 0x86, outputs: 12, inputs: 10, input_carries_pcm: true }), // DDJ-SX3
+    (0x000d, PioneerModel { rates: &[44_100], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 6, inputs: 4, input_carries_pcm: true }), // DDJ-RR
+    (0x001e, PioneerModel { rates: &[44_100], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 4, inputs: 6, input_carries_pcm: true }), // DDJ-SR2
+    (0x0029, PioneerModel { rates: &[44_100], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 6, inputs: 6, input_carries_pcm: true }), // DDJ-800
+    (0x000e, PioneerModel { rates: &[44_100], rate_control: false, subslot_bytes: 3, output_address: 0x01, input_address: 0x82, outputs: 4, inputs: 2, input_carries_pcm: false }), // DDJ-RB: dummy IN is implicit feedback only
 ];
 
 fn pioneer_model(vendor: u16, product: u16) -> Option<PioneerModel> {
+    let djm = match (vendor, product) {
+        (0x2b73, 0x000a) => Some((10, 12, 0x01, 0x82, &[44_100, 48_000, 96_000][..])), // DJM-900NXS2
+        (0x2b73, 0x0034) => Some((12, 12, 0x01, 0x82, &[44_100, 48_000, 96_000][..])), // DJM-V10
+        (0x08e4, 0x017f | 0x0163) => Some((8, 8, 0x05, 0x86, &[44_100, 48_000, 96_000][..])), // DJM-750 / DJM-850
+        (0x2b73, 0x0013) => Some((8, 8, 0x01, 0x82, &[48_000][..])), // DJM-450
+        _ => None,
+    };
+    if let Some((outputs, inputs, output_address, input_address, rates)) = djm {
+        return Some(PioneerModel { rates, rate_control: true, subslot_bytes: 3,
+            output_address, input_address, outputs, inputs, input_carries_pcm: true });
+    }
     if vendor != 0x2b73 { return None; }
     PIONEER_MODELS.iter().find_map(|(id, model)| (*id == product).then_some(*model))
 }
@@ -67,7 +83,7 @@ struct AlternateShape { interface: u8, number: u8, class: u8, subclass: u8, prot
 
 fn prove(vendor: u16, product: u16, speed: Speed, alts: &[AlternateShape]) -> Result<Option<VendorPcm>, String> {
     if let Some((outputs, inputs)) = roland_channels(vendor, product) {
-        return prove_roland(outputs, inputs, speed, alts);
+        return prove_roland(outputs, inputs, speed, alts).map(|profile| profile.map(|p| VendorPcm { vendor_id: vendor, product_id: product, ..p }));
     }
     let Some(model) = pioneer_model(vendor, product) else { return Ok(None); };
     let interface_alts = alts.iter().filter(|a| a.interface == 0).collect::<Vec<_>>();
@@ -96,13 +112,18 @@ fn prove(vendor: u16, product: u16, speed: Speed, alts: &[AlternateShape]) -> Re
         let service_us = service_interval_micros(speed, e.interval);
         let max_packet_bytes = effective_iso_packet_bytes(e.packet, speed);
         let stride = usize::from(channels) * usize::from(model.subslot_bytes);
-        if max_packet_bytes < required_max_packet_bytes(model.rate, service_us, stride) { return Err(invalid()); }
+        if !model.rates.iter().any(|rate| max_packet_bytes >= required_max_packet_bytes(*rate, service_us, stride)) { return Err(invalid()); }
         Ok(VendorEndpoint { address, interval: e.interval, service_us, max_packet_bytes, channels, subslot_bytes: model.subslot_bytes })
     };
     let output = endpoint(active.endpoints[0], model.output_address, model.outputs)?;
     let input = endpoint(active.endpoints[1], model.input_address, model.inputs)?;
     if output.service_us != input.service_us { return Err(invalid()); }
-    Ok(Some(VendorPcm { interface_number: 0, alt_setting: 1, input_interface_number: 0, input_alt_setting: 1, requires_output_for_capture: false, input_carries_pcm: model.input_carries_pcm, rate: model.rate, speed, output, input }))
+    let profile = VendorPcm { vendor_id: vendor, product_id: product, configuration_number: 0,
+        interface_number: 0, alt_setting: 1, input_interface_number: 0, input_alt_setting: 1,
+        requires_output_for_capture: false, input_carries_pcm: model.input_carries_pcm,
+        rates: model.rates, rate_control: model.rate_control, speed, output, input };
+    if profile.sample_rates().is_empty() { return Err(invalid()); }
+    Ok(Some(profile))
 }
 
 // Linux snd-usb-audio quirks-table.h fixes these exact models to S32_LE at
@@ -151,8 +172,8 @@ fn prove_roland(outputs: u16, inputs: u16, speed: Speed, alts: &[AlternateShape]
     let output = endpoint(0, 0x05, outputs)?;
     let input = endpoint(1, 0x85, inputs)?;
     if output.service_us != input.service_us { return Err(invalid()); }
-    Ok(Some(VendorPcm { interface_number: 0, alt_setting: 1, input_interface_number: 1,
-        input_alt_setting: 1, requires_output_for_capture: true, input_carries_pcm: true, rate: 44_100, speed, output, input }))
+    Ok(Some(VendorPcm { vendor_id: 0x0582, product_id: 0, configuration_number: 0, interface_number: 0, alt_setting: 1, input_interface_number: 1,
+        input_alt_setting: 1, requires_output_for_capture: true, input_carries_pcm: true, rates: &[44_100], rate_control: false, speed, output, input }))
 }
 
 pub(super) fn discover(handle: &DeviceHandle<Context>, config: &ConfigDescriptor, speed: Speed) -> Result<Option<VendorPcm>, String> {
@@ -167,9 +188,21 @@ pub(super) fn discover(handle: &DeviceHandle<Context>, config: &ConfigDescriptor
         }).collect(),
     }).collect::<Vec<_>>()).collect::<Vec<_>>();
     prove(identity.vendor_id(), identity.product_id(), speed, &alts)
+        .map(|profile| profile.map(|p| VendorPcm { configuration_number: config.number(), ..p }))
 }
 
 impl VendorPcm {
+    pub(super) fn sample_rates(&self) -> Vec<u32> {
+        self.rates.iter().copied().filter(|rate| self.supports_rate(*rate)).collect()
+    }
+
+    pub(super) fn supports_rate(&self, rate: u32) -> bool {
+        self.rates.contains(&rate) && [self.output, self.input].iter().all(|endpoint| {
+            let stride = usize::from(endpoint.channels) * usize::from(endpoint.subslot_bytes);
+            endpoint.max_packet_bytes >= required_max_packet_bytes(rate, endpoint.service_us, stride)
+        })
+    }
+
     pub(super) fn claimed_interfaces(&self) -> Vec<u8> {
         let mut interfaces = vec![self.interface_number];
         if self.input_interface_number != self.interface_number { interfaces.push(self.input_interface_number); }
@@ -187,7 +220,7 @@ impl VendorPcm {
             service_interval_us: self.output.service_us, usb_speed: self.speed, max_packet_bytes: self.output.max_packet_bytes,
             sync_type: SyncType::Asynchronous, usage_type: UsageType::Data, format_tag: FORMAT_TAG_PCM,
             uac2_formats: None, native_dsd: None, channels: self.output.channels, subslot_size: self.output.subslot_bytes, bit_resolution: self.output.subslot_bytes * 8,
-            sample_rates: vec![self.rate], refresh: 0, synch_address: 0, feedback_endpoint: None,
+            sample_rates: self.sample_rates(), refresh: 0, synch_address: 0, feedback_endpoint: None,
             implicit_feedback: Some(ImplicitFeedbackSource { interface_number: self.input_interface_number, alt_setting: self.input_alt_setting,
                 address: self.input.address, bytes_per_frame: usize::from(self.input.channels) * usize::from(self.input.subslot_bytes),
                 service_interval_us: self.input.service_us, max_packet_bytes: self.input.max_packet_bytes }),
@@ -199,7 +232,7 @@ pub(super) fn for_candidate(handle: &DeviceHandle<Context>, candidate: &IsoStrea
     let device = handle.device();
     let config = device.active_config_descriptor().map_err(|e| e.to_string())?;
     let Some(profile) = discover(handle, &config, resolve_device_speed(&device))? else { return Ok(None); };
-    if config.number() != candidate.configuration_number {
+    if config.number() != candidate.configuration_number || profile.configuration_number != candidate.configuration_number {
         return Err("vendor PCM active configuration changed since descriptor proof".into());
     }
     validate_candidate(profile, candidate)?;
@@ -214,7 +247,7 @@ fn validate_candidate(profile: VendorPcm, candidate: &IsoStreamCandidate) -> Res
         || candidate.max_packet_bytes != expected.max_packet_bytes || candidate.sync_type != expected.sync_type
         || !matches!(candidate.usage_type, UsageType::Data | UsageType::FeedbackData)
         || candidate.format_tag != FORMAT_TAG_PCM || candidate.channels != expected.channels || candidate.subslot_size != expected.subslot_size
-        || candidate.bit_resolution != expected.bit_resolution || candidate.sample_rates != [profile.rate] || candidate.native_dsd.is_some()
+        || candidate.bit_resolution != expected.bit_resolution || candidate.sample_rates != profile.sample_rates() || candidate.native_dsd.is_some()
         || candidate.feedback_endpoint.is_some() || candidate.implicit_feedback != expected.implicit_feedback
         || candidate.terminal_link.is_some() || candidate.is_uac1 || candidate.uac2_formats.is_some()
         || candidate.refresh != 0 || candidate.synch_address != 0 {
@@ -223,9 +256,103 @@ fn validate_candidate(profile: VendorPcm, candidate: &IsoStreamCandidate) -> Res
     Ok(())
 }
 
+/// The ALSA DJM endpoint sampling-frequency request, restricted to the write allowlist.
+fn rate_request(profile: &VendorPcm, rate: u32) -> Result<(u8, u8, u16, u16, [u8; 3]), Error> {
+    let permitted = pioneer_model(profile.vendor_id, profile.product_id)
+        .is_some_and(|model| model.rate_control && model.rates == profile.rates
+            && model.input_address == profile.input.address && model.output_address == profile.output.address);
+    if !permitted || !profile.rate_control || !profile.supports_rate(rate) {
+        return Err(Error::Unsupported { reason: "vendor PCM rate programming is not proven for this model and rate".into(), offered: vec![] });
+    }
+    let bytes = rate.to_le_bytes();
+    Ok((0x22, 0x01, 0x0100, u16::from(profile.input.address), [bytes[0], bytes[1], bytes[2]]))
+}
+
+/// Program only the five source-proven DJM clocks after their active stream is owned.
+/// Successful programming is not clock verification: the caller must observe IN cadence.
+pub(super) fn program_rate(claimed: &ClaimedHandle, profile: &VendorPcm, rate: u32) -> Result<(), Error> {
+    let (request_type, request, value, index, bytes) = rate_request(profile, rate)?;
+    if !profile.claims_match(&claimed.claimed_interfaces) {
+        return Err(Error::Claim("vendor PCM requires exactly its proven interface claims".into()));
+    }
+    let device = claimed.handle.device();
+    let config = device.active_config_descriptor().map_err(|e| Error::Control(e.to_string()))?;
+    let actual = discover(&claimed.handle, &config, resolve_device_speed(&device)).map_err(Error::Control)?;
+    if config.number() != profile.configuration_number || actual.as_ref() != Some(profile) {
+        return Err(Error::InvalidState("vendor PCM identity, configuration or profile changed before rate programming".into()));
+    }
+    for interface in profile.claimed_interfaces() {
+        if !claimed.active_interfaces.lock().contains(&interface) {
+            return Err(Error::InvalidState("vendor PCM interface is not active for rate programming".into()));
+        }
+        let expected = if interface == profile.interface_number { profile.alt_setting } else { profile.input_alt_setting };
+        capture_stream::verify_vendor_interface_alternate(claimed, interface, expected)?;
+    }
+    let written = claimed.handle.write_control(request_type, request, value, index, &bytes, Duration::from_millis(500))
+        .map_err(|e| match e {
+            rusb::Error::NoDevice => Error::DeviceLost,
+            _ => Error::Control(e.to_string()),
+        })?;
+    if written != bytes.len() {
+        return Err(Error::Control("vendor PCM rate request transferred an incomplete sampling frequency".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROGRAMMED_MIXERS: &[(u16, u16, u16, u16, u8, u8)] = &[
+        (0x2b73, 0x000a, 10, 12, 1, 0x82),
+        (0x2b73, 0x0034, 12, 12, 1, 0x82),
+        (0x08e4, 0x017f, 8, 8, 5, 0x86),
+        (0x08e4, 0x0163, 8, 8, 5, 0x86),
+        (0x2b73, 0x0013, 8, 8, 1, 0x82),
+    ];
+
+    #[test]
+    fn programmed_mixers_use_exact_alsa_rates_channels_endpoints_and_request() {
+        for &(vendor, product, outputs, inputs, out, input) in PROGRAMMED_MIXERS {
+            let mut alts = controller_geometry(outputs, inputs, 3, out, input);
+            alts[1].endpoints[0].packet = outputs * 3 * 13;
+            alts[1].endpoints[1].packet = inputs * 3 * 13;
+            // Extra unused alternates do not change the source-proven alt1 pair.
+            alts.push(AlternateShape { interface: 0, number: 2, class: 0xff, subclass: 0, protocol: 0, endpoints: vec![] });
+            let p = prove(vendor, product, Speed::High, &alts).unwrap().unwrap();
+            let rates = if product == 0x0013 { vec![48_000] } else { vec![44_100, 48_000, 96_000] };
+            assert_eq!(p.sample_rates(), rates);
+            assert_eq!((p.output.channels, p.input.channels, p.output.subslot_bytes), (outputs, inputs, 3));
+            assert!(p.rate_control && p.input_carries_pcm);
+            assert_eq!(p.claimed_interfaces(), vec![0]);
+            for rate in rates {
+                let bytes = rate.to_le_bytes();
+                assert_eq!(rate_request(&p, rate).unwrap(), (0x22, 1, 0x0100, u16::from(input), [bytes[0], bytes[1], bytes[2]]));
+            }
+            assert!(rate_request(&p, 88_200).is_err());
+            assert!(validate_candidate(p, &p.candidate(1)).is_ok());
+        }
+    }
+
+    #[test]
+    fn programmed_rates_intersect_both_live_packet_capacities() {
+        let alts = controller_geometry(10, 12, 3, 1, 0x82);
+        let p = prove(0x2b73, 0x000a, Speed::High, &alts).unwrap().unwrap();
+        assert_eq!(p.sample_rates(), vec![44_100, 48_000]);
+        assert!(!p.supports_rate(96_000));
+        for endpoint in [0, 1] {
+            let mut alts = controller_geometry(10, 12, 3, 1, 0x82);
+            alts[1].endpoints[endpoint].packet = 1;
+            assert!(prove(0x2b73, 0x000a, Speed::High, &alts).is_err());
+        }
+        let mut forged = p;
+        forged.product_id = 0x003c; // DJM-A9 has no pinned rate-write recipe.
+        assert!(rate_request(&forged, 48_000).is_err());
+        assert!(prove(0x2b73, 0x003c, Speed::High, &alts).unwrap().is_none());
+        let fixed = prove(0x2b73, 0x0017, Speed::High, &geometry(8, 8)).unwrap().unwrap();
+        assert!(!fixed.rate_control);
+        assert!(rate_request(&fixed, 48_000).is_err());
+    }
 
     // Independent fixed wire geometries: seven complete 24-bit frames per
     // microframe, covering nominal six-frame 48 kHz packets with headroom.
@@ -259,7 +386,7 @@ mod tests {
         for &(product, outputs, inputs, width, output, input, carries_pcm) in CONTROLLERS {
             let alts = controller_geometry(outputs, inputs, width, output, input);
             let p = prove(0x2b73, product, Speed::High, &alts).unwrap().unwrap();
-            assert_eq!((p.rate, p.output.channels, p.input.channels), (44_100, outputs, inputs));
+            assert_eq!((p.rates[0], p.output.channels, p.input.channels), (44_100, outputs, inputs));
             assert_eq!((p.output.subslot_bytes, p.input.subslot_bytes), (width, width));
             assert_eq!((p.output.address, p.input.address), (output, input));
             assert_eq!((p.interface_number, p.alt_setting, p.input_interface_number, p.input_alt_setting), (0, 1, 0, 1));
@@ -365,7 +492,7 @@ mod tests {
     fn exact_roland_models_have_separate_s32_pipes() {
         for (product, outputs, inputs) in [(0x0120, 10, 12), (0x012f, 4, 6)] {
             let p = prove(0x0582, product, Speed::High, &roland_geometry(outputs, inputs)).unwrap().unwrap();
-            assert_eq!((p.rate, p.output.channels, p.input.channels), (44_100, outputs, inputs));
+            assert_eq!((p.rates[0], p.output.channels, p.input.channels), (44_100, outputs, inputs));
             assert_eq!((p.output.subslot_bytes, p.input.subslot_bytes), (4, 4));
             assert_eq!((p.interface_number, p.alt_setting, p.output.address), (0, 1, 0x05));
             assert_eq!((p.input_interface_number, p.input_alt_setting, p.input.address), (1, 1, 0x85));
@@ -482,7 +609,7 @@ mod tests {
     fn exact_model_identity_and_asymmetric_format() {
         for (product, outputs, inputs) in [(0x17, 8, 8), (0x1b, 10, 12)] {
             let p = prove(0x2b73, product, Speed::High, &geometry(outputs, inputs)).unwrap().unwrap();
-            assert_eq!((p.rate, p.output.channels, p.input.channels, p.output.subslot_bytes), (48_000, outputs, inputs, 3));
+            assert_eq!((p.rates[0], p.output.channels, p.input.channels, p.output.subslot_bytes), (48_000, outputs, inputs, 3));
             assert_eq!((p.interface_number, p.alt_setting, p.output.address, p.input.address), (0, 1, 1, 0x82));
             assert_eq!(p.claimed_interfaces(), vec![0]);
             assert!(p.claims_match(&[0]));

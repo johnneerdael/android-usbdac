@@ -45,8 +45,12 @@ internal fun isVendorPcmCaptureCandidate(vendorId: Int, productId: Int): Boolean
 private fun isPioneerController(vendorId: Int, productId: Int): Boolean =
     vendorId == 0x2b73 && productId in listOf(0x0023, 0x000d, 0x001e, 0x0029, 0x000e)
 
+private fun isProgrammedPioneerMixer(vendorId: Int, productId: Int): Boolean =
+    (vendorId == 0x2b73 && productId in listOf(0x000a, 0x0034, 0x0013)) ||
+        (vendorId == 0x08e4 && productId in listOf(0x017f, 0x0163))
+
 private fun vendorPcmInterfaceIds(vendorId: Int, productId: Int): List<Int>? = when {
-    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b) || isPioneerController(vendorId, productId) -> listOf(0)
+    vendorId == 0x2b73 && productId in listOf(0x0017, 0x001b) || isPioneerController(vendorId, productId) || isProgrammedPioneerMixer(vendorId, productId) -> listOf(0)
     vendorId == 0x0582 && productId in listOf(0x0120, 0x012f) -> listOf(0, 1)
     else -> null
 }
@@ -61,7 +65,7 @@ internal fun planVendorPcmClaims(
     val expected = vendorPcmInterfaceIds(vendorId, productId) ?: return null
     if (interfaceIds.distinct().size != interfaceIds.size || interfaceIds.sorted() != expected) return null
     for (id in expected) {
-        val requiredAlternatesOnly = vendorId == 0x0582 || isPioneerController(vendorId, productId)
+        val requiredAlternatesOnly = vendorId == 0x0582 || isPioneerController(vendorId, productId) || isProgrammedPioneerMixer(vendorId, productId)
         val alternates = interfaces.filter { it.id == id && (!requiredAlternatesOnly || it.alternateSetting in 0..1) }
         if (alternates.size != 2 || alternates.any { it.interfaceClass != 0xff }) return null
         if (alternates.none { it.alternateSetting == 0 && !it.hasIsochronousIn && !it.hasIsochronousOut }) return null

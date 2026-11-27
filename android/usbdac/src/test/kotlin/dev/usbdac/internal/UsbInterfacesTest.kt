@@ -8,6 +8,31 @@ import org.junit.Test
 
 class UsbInterfacesTest {
     @Test
+    fun programmedPioneerMixersClaimOnlyTheProvenVendorPair() {
+        val idle = InterfaceInfo(0, 0, 0xff, 0, false)
+        val active = InterfaceInfo(0, 1, 0xff, 0, true, true)
+        for ((vendor, product) in listOf(0x2b73 to 0x000a, 0x2b73 to 0x0034,
+            0x08e4 to 0x017f, 0x08e4 to 0x0163, 0x2b73 to 0x0013)) {
+            assertTrue(isVendorPcmCandidate(vendor, product))
+            assertTrue(isVendorPcmCaptureCandidate(vendor, product))
+            fun plan(values: List<InterfaceInfo>, ids: List<Int> = listOf(0)) =
+                planVendorPcmClaims(values, vendor, product, ids)
+            assertEquals(listOf(0), plan(listOf(idle, active, control(2)))!!.allIds)
+            assertEquals(listOf(0), plan(listOf(idle, active, active.copy(alternateSetting = 2)))!!.allIds)
+            assertNull(plan(listOf(idle, idle, active)))
+            assertNull(plan(listOf(idle, active, active)))
+            assertNull(plan(listOf(idle, active.copy(hasIsochronousIn = false))))
+            assertNull(plan(listOf(idle, active.copy(hasIsochronousOut = false))))
+            assertNull(plan(listOf(idle.copy(interfaceClass = 1), active)))
+            assertNull(plan(listOf(idle, active), listOf(0, 2)))
+            assertNull(planVendorPcmClaims(listOf(control(0), streamingOut(1)), vendor, product))
+        }
+        assertFalse(isVendorPcmCandidate(0x2b73, 0x003c)) // DJM-A9 remains outside the proven write list.
+        assertFalse(isVendorPcmCandidate(0x2b73, 0x017f))
+        assertFalse(isVendorPcmCandidate(0x08e4, 0x000a))
+    }
+
+    @Test
     fun vendorPcmDiscoveryIsExactAndClaimsOnlyNativeProvenInterface() {
         assertTrue(isVendorPcmCandidate(0x2b73, 0x0017))
         assertTrue(isVendorPcmCandidate(0x2b73, 0x001b))

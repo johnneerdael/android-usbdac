@@ -29,7 +29,7 @@ impl PatternFifo {
     }
 }
 
-fn capture_pattern(packets: impl Iterator<Item = (i32, usize, usize)>, in_stride: usize,
+pub(super) fn capture_pattern(packets: impl Iterator<Item = (i32, usize, usize)>, in_stride: usize,
     out_stride: usize, max_out: usize, pattern: &mut [usize]) -> Result<bool, String> {
     if in_stride == 0 || out_stride == 0 { return Err("zero implicit frame stride".into()); }
     let mut count = 0;
@@ -54,6 +54,27 @@ fn rate_window_valid(frames: u64, service_us: u64, rate: u32) -> bool {
     (frames as f64 - expected).abs() <= expected * 0.02 + 1.0
 }
 
+/// Count USB service intervals, never callback elapsed time, for a contiguous
+/// whole-frame vendor clock proof. Callers reset on every empty/failed pattern.
+pub(super) struct VendorRateWindow {
+    rate: u32,
+    frames: u64,
+    service_us: u64,
+}
+impl VendorRateWindow {
+    pub(super) fn new(rate: u32) -> Self { Self { rate, frames: 0, service_us: 0 } }
+    pub(super) fn reset(&mut self) { self.frames = 0; self.service_us = 0; }
+    pub(super) fn observe(&mut self, frames: u64, service_us: u64) -> Option<bool> {
+        if frames == 0 || service_us == 0 { self.reset(); return None; }
+        self.frames = self.frames.saturating_add(frames);
+        self.service_us = self.service_us.saturating_add(service_us);
+        if self.service_us < 100_000 { return None; }
+        let valid = rate_window_valid(self.frames, self.service_us, self.rate);
+        self.reset();
+        Some(valid)
+    }
+}
+
 pub(super) struct ImplicitFeedback {
     pub(super) slots: Vec<IsoTransferSlot>,
     order: VecDeque<usize>,
@@ -63,6 +84,8 @@ pub(super) struct ImplicitFeedback {
     out_stride: usize,
     max_out: usize,
     rate: u32,
+    startup_rate_proof: Option<VendorRateWindow>,
+    startup_rate_proved: bool,
     window_frames: u64,
     window_us: u64,
     bad_windows: u8,
@@ -87,12 +110,21 @@ impl ImplicitFeedback {
         Ok(Self { slots, order: VecDeque::with_capacity(geometry.transfer_slots),
             fifo: PatternFifo::new(2 * geometry.transfer_slots, geometry.packets_per_transfer),
             scratch: vec![0; geometry.packets_per_transfer], source, out_stride, max_out, rate,
-            window_frames: 0, window_us: 0, bad_windows: 0, prime_count: 0,
+            startup_rate_proof: None, startup_rate_proved: false, window_frames: 0, window_us: 0, bad_windows: 0, prime_count: 0,
             prime_target: geometry.transfer_slots, running: false, started: Instant::now(),
             startup_budget: Duration::from_micros(500_000.max(4 * geometry.transfer_us())),
             last_valid: Instant::now(), out_of_order_seen: vec![false; geometry.transfer_slots],
             capture: None, capture_scratch: vec![crate::capture::CapturePacket {
                 requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
+    }
+    pub(super) fn require_vendor_rate_proof(&mut self) {
+        self.startup_rate_proof = Some(VendorRateWindow::new(self.rate));
+        self.startup_rate_proved = false;
+    }
+    pub(super) fn promote_vendor_rate_proof(&mut self) {
+        // Keep the gate restartable through the complete fresh FIFO prime.
+        // Output calls this only after primed readiness with no stop or failure.
+        if self.primed() { self.startup_rate_proof = None; }
     }
     pub(super) fn attach_capture(&mut self, capture: Option<Arc<duplex::Attachment>>) { self.capture = capture; }
     pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stats: &RuntimeStats, stop: &AtomicBool) -> Result<(), String> {
@@ -153,15 +185,28 @@ impl ImplicitFeedback {
             self.slots[index].mark_completed();
             match result {
                 Ok(true) => {
-                    if let Err(error) = self.fifo.push(&self.scratch) {
-                        stats.implicit_overruns.fetch_add(1, Ordering::Relaxed); return Err(error);
-                    }
-                    self.prime_count = (self.prime_count + 1).min(self.prime_target);
                     self.last_valid = Instant::now();
                     let frames = self.scratch.iter().sum::<usize>() / self.out_stride;
                     stats.feedback_reports.fetch_add(1, Ordering::Relaxed);
                     stats.implicit_measured_frames.fetch_add(frames as u64, Ordering::Relaxed);
                     stats.feedback_last_report_ms.store(stats.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    if let Some(proof) = self.startup_rate_proof.as_mut().filter(|_| !self.startup_rate_proved) {
+                        let service_us = self.scratch.len() as u64 * u64::from(self.source.service_interval_us);
+                        let verdict = proof.observe(frames as u64, service_us);
+                        if verdict == Some(false) {
+                            return Err("programmed vendor PCM cadence does not match requested rate".into());
+                        }
+                        if verdict == Some(true) {
+                            self.startup_rate_proved = true;
+                        }
+                        // Discard the proof completion as well: prime a fresh,
+                        // bounded FIFO only after proving the programmed clock.
+                    } else {
+                        if let Err(error) = self.fifo.push(&self.scratch) {
+                            stats.implicit_overruns.fetch_add(1, Ordering::Relaxed); return Err(error);
+                        }
+                        self.prime_count = (self.prime_count + 1).min(self.prime_target);
+                    }
                     self.window_frames += frames as u64;
                     self.window_us += self.scratch.len() as u64 * u64::from(self.source.service_interval_us);
                     if self.window_us >= 100_000 {
@@ -182,6 +227,16 @@ impl ImplicitFeedback {
                     stats.feedback_empty.fetch_add(1, Ordering::Relaxed);
                     if self.running { return Err("empty implicit feedback pattern while running".into()); }
                     self.prime_count = 0; self.fifo.clear(); self.window_frames = 0; self.window_us = 0;
+                    if let Some(proof) = self.startup_rate_proof.as_mut() {
+                        proof.reset();
+                        self.startup_rate_proved = false;
+                        let previous = stats.feedback_locked.swap(false, Ordering::AcqRel);
+                        if previous {
+                            if let Some(trace) = &stats.feedback_trace {
+                                trace.record(crate::FeedbackTraceEvent::Lock { locked: false, stale: false });
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     stats.implicit_invalid_packets.fetch_add(1, Ordering::Relaxed);
@@ -204,7 +259,9 @@ impl ImplicitFeedback {
         if !self.running && self.started.elapsed() >= self.startup_budget { return Err("implicit feedback startup deadline expired".into()); }
         Ok(())
     }
-    pub(super) fn primed(&self) -> bool { self.prime_count >= self.prime_target }
+    pub(super) fn primed(&self) -> bool {
+        (self.startup_rate_proof.is_none() || self.startup_rate_proved) && self.prime_count >= self.prime_target
+    }
     pub(super) fn take_pattern(&mut self, stats: &RuntimeStats) -> Option<Vec<usize>> {
         let value = self.fifo.pop()?;
         stats.implicit_fifo_depth.store(self.fifo.depth, Ordering::Relaxed);
@@ -215,6 +272,22 @@ impl ImplicitFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn vendor_rate_proof_requires_contiguous_service_time() {
+        let mut window = VendorRateWindow::new(96_000);
+        assert_eq!(window.observe(9_504, 99_000), None);
+        window.reset();
+        assert_eq!(window.observe(96, 1_000), None);
+        assert_eq!(window.observe(9_504, 99_000), Some(true));
+        assert_eq!(window.observe(4_800, 100_000), Some(false));
+        assert_eq!(window.observe(9_504, 99_000), None);
+        assert_eq!(window.observe(0, 1_000), None);
+        assert_eq!(window.observe(96, 1_000), None);
+    }
+    #[test] fn vendor_rate_proof_counts_fractional_service_packets() {
+        let mut window = VendorRateWindow::new(44_100);
+        for _ in 0..79 { assert_eq!(window.observe(55, 1_250), None); }
+        assert_eq!(window.observe(65, 1_250), Some(true));
+    }
     #[test] fn whole_frames_and_mixed_strides() {
         let mut pattern = [0; 2];
         assert_eq!(capture_pattern([(0,288,294),(0,294,294)].into_iter(),6,8,392,&mut pattern),Ok(true));
