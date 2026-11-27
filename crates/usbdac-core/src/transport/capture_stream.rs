@@ -293,6 +293,13 @@ fn capture_input_geometry(
     {
         return None;
     }
+    iso_endpoint_geometry(interface, index, speed)
+}
+
+/// Shared packet geometry after the caller proves direction and endpoint role.
+fn iso_endpoint_geometry(interface: &RawInterface<'_>, index: usize, speed: Speed) -> Option<(usize, u32)> {
+    let ep = *interface.descriptors.get(index)?;
+    if ep.len() < 7 || ep[1] != 5 || !(1..=16).contains(&ep[6]) { return None; }
     let packet = u16::from_le_bytes([ep[4], ep[5]]);
     if matches!(speed, Speed::Super | Speed::SuperPlus) {
         let extra: Vec<_> = interface.descriptors[index + 1..]
@@ -502,6 +509,194 @@ pub(super) fn verify_standard_capture(
     reprove_standard_capture(&raw, resolve_device_speed(&claimed.handle.device()), candidate)
 }
 
+/// Duplex activation needs explicit endpoint control evidence. Discovery's bool
+/// deliberately cannot distinguish a missing record from a bit-clear record.
+pub(super) fn uac1_duplex_capture_sampling_control(capture: &CaptureEndpoint) -> Result<bool, Error> {
+    let invalid = || Error::InvalidState("UAC1 duplex capture sampling control is not proven".into());
+    if capture.protocol != 0 || capture.vendor_pcm.is_some() || capture.adc3_route.is_some() {
+        return Err(invalid());
+    }
+    let raw = &capture.endpoint_descriptors;
+    let mut at = 0;
+    let mut control = None;
+    while at < raw.len() {
+        let length = usize::from(raw[at]);
+        if length < 2 || at + length > raw.len() { return Err(invalid()); }
+        let d = &raw[at..at + length];
+        // The optional feedforward endpoint has its own control record.
+        if at != 0 && d[1] == 5 { break; }
+        if d[1] == 0x25 {
+            if d.len() != 7 || d[2] != 1 || d[3] & !0x83 != 0 || d[4] > 2 || control.is_some() {
+                return Err(invalid());
+            }
+            control = Some(d[3] & 1 != 0);
+        }
+        at += length;
+    }
+    match control {
+        Some(true) if capture.sampling_control => Ok(true),
+        Some(false) if !capture.sampling_control && capture.fixed_rate => Ok(false),
+        _ => Err(invalid()),
+    }
+}
+
+/// Return the unique UAC1 collection owning this exact selected AS alternate.
+fn uac1_collection_owner<'a, 'raw>(
+    interfaces: &'a [RawInterface<'raw>], streaming: &RawInterface<'_>,
+) -> Result<&'a RawInterface<'raw>, Error> {
+    let invalid = || Error::InvalidState("UAC1 duplex AudioControl collection is ambiguous or malformed".into());
+    let mut owners = Vec::new();
+    for ac in interfaces.iter().filter(|ac| ac.class == USB_CLASS_AUDIO
+        && ac.subclass == USB_SUBCLASS_AUDIOCONTROL && ac.protocol == 0 && ac.alternate == 0)
+    {
+        let headers: Vec<_> = ac.descriptors.iter().copied().filter(|d|
+            d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1)).collect();
+        // An unrelated malformed function cannot own this AS. A header that
+        // actually names it must satisfy the complete collection contract.
+        if !headers.iter().any(|d| d.len() >= 8 && d[8..].contains(&streaming.number)) { continue; }
+        if headers.len() != 1 { return Err(invalid()); }
+        let header = headers[0];
+        if header.len() < 8 || header.len() != 8 + usize::from(header[7])
+            || header[3..5] != [0, 1]
+            || header[8..].iter().enumerate().any(|(index, id)| header[8..8 + index].contains(id))
+        { return Err(invalid()); }
+        if header[8..].contains(&streaming.number) { owners.push(ac); }
+    }
+    if owners.len() != 1
+        || interfaces.iter().filter(|interface| interface.number == owners[0].number
+            && interface.alternate == 0).count() != 1
+    { return Err(invalid()); }
+    Ok(owners[0])
+}
+
+fn reprove_uac1_duplex_owners(
+    raw: &[u8], speed: Speed, playback: &IsoStreamCandidate, capture: &CaptureEndpoint, playback_rate: u32,
+) -> Result<(u8, bool, bool), Error> {
+    let invalid = || Error::InvalidState("UAC1 duplex playback descriptor profile is not proven".into());
+    if !playback.is_uac1 || capture.protocol != 0
+        || playback.configuration_number != capture.configuration
+        || playback.usb_speed != speed || playback.alt_setting == 0
+        || playback.interface_number == capture.interface
+        || playback.native_dsd.is_some() || playback.uac2_formats.is_some() || playback.format_tag != 1
+    { return Err(invalid()); }
+    reprove_standard_capture(raw, speed, capture)?;
+    let interfaces = raw_interfaces(raw).map_err(Error::Control)?;
+    let mut selected = interfaces.iter().filter(|interface|
+        interface.number == playback.interface_number && interface.alternate == playback.alt_setting);
+    let output = selected.next().ok_or_else(invalid)?;
+    if selected.next().is_some() || output.class != USB_CLASS_AUDIO
+        || output.subclass != USB_SUBCLASS_AUDIOSTREAMING || output.protocol != 0
+        || output.declared_endpoints as usize != output.descriptors.iter().filter(|d| d[1] == 5).count()
+    { return Err(invalid()); }
+    let owner = uac1_collection_owner(&interfaces, output)?;
+    let input = interfaces.iter().find(|interface|
+        interface.number == capture.interface && interface.alternate == capture.alternate).ok_or_else(invalid)?;
+    if uac1_collection_owner(&interfaces, input)?.number != capture.control { return Err(invalid()); }
+    let generals: Vec<_> = output.descriptors.iter().copied().filter(|d|
+        d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1)).collect();
+    let formats: Vec<_> = output.descriptors.iter().copied().filter(|d|
+        d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&2)).collect();
+    if generals.len() != 1 || generals[0].len() != 7 || formats.len() != 1 { return Err(invalid()); }
+    let general = generals[0];
+    let format = formats[0];
+    if playback.terminal_link != Some(general[3]) || general[3] == 0
+        || u16::from_le_bytes([general[5], general[6]]) != playback.format_tag
+        || format.len() < 8 || format[3] != 1
+        || u16::from(format[4]) != playback.channels || format[5] != playback.subslot_size
+        || format[6] != playback.bit_resolution
+        || format.len() != if format[7] == 0 { 14 } else { 8 + usize::from(format[7]) * 3 }
+    { return Err(invalid()); }
+    let rate = |at| u32::from_le_bytes([format[at], format[at + 1], format[at + 2], 0]);
+    let requested = playback_rate;
+    let valid_rate = |rate| (1..=0x7f_ffff).contains(&rate);
+    if !valid_rate(requested) { return Err(invalid()); }
+    if format[7] == 0 {
+        if !valid_rate(rate(8)) || !valid_rate(rate(11)) || rate(8) > rate(11)
+            || requested < rate(8) || requested > rate(11)
+        {
+            return Err(invalid());
+        }
+    } else if (0..usize::from(format[7])).any(|index| !valid_rate(rate(8 + 3 * index)))
+        || !(0..usize::from(format[7])).any(|index| rate(8 + 3 * index) == requested)
+    {
+        return Err(invalid());
+    }
+    let fixed_at_request = if format[7] == 0 {
+        rate(8) == requested && rate(11) == requested
+    } else {
+        (0..usize::from(format[7])).all(|index| rate(8 + 3 * index) == requested)
+    };
+    let terminals: Vec<_> = owner.descriptors.iter().copied().filter(|d|
+        d[1] == USB_DT_CS_INTERFACE && d.len() >= 4 && d[2] != 1 && d[3] == general[3]).collect();
+    if terminals.len() != 1 || terminals[0].len() != 12 || terminals[0][2] != 2
+        || terminals[0][4..6] != [1, 1] || u16::from(terminals[0][7]) != playback.channels
+    { return Err(invalid()); }
+    let endpoints: Vec<_> = output.descriptors.iter().enumerate().filter(|(_, d)|
+        d[1] == 5 && d.get(2) == Some(&playback.endpoint_address)).collect();
+    if endpoints.len() != 1 { return Err(invalid()); }
+    let (index, ep) = endpoints[0];
+    if ep.len() != 9 || ep[2] & 0xf0 != 0 || ep[2] & 15 == 0 || ep[3] & 3 != 1
+        || ep[6] != playback.endpoint_interval || ep[7] != playback.refresh || ep[8] != playback.synch_address
+    { return Err(invalid()); }
+    let sync = match (ep[3] >> 2) & 3 {
+        0 => SyncType::NoSync, 1 => SyncType::Asynchronous, 2 => SyncType::Adaptive, _ => SyncType::Synchronous,
+    };
+    let usage = match (ep[3] >> 4) & 3 {
+        0 => UsageType::Data, 2 => UsageType::FeedbackData, _ => return Err(invalid()),
+    };
+    if sync != playback.sync_type || usage != playback.usage_type
+        || iso_endpoint_geometry(output, index, speed)
+            != Some((playback.max_packet_bytes, playback.service_interval_us))
+    { return Err(invalid()); }
+    let controls: Vec<_> = output.descriptors[index + 1..].iter().copied()
+        .take_while(|d| d[1] != 5).filter(|d| d[1] == 0x25).collect();
+    if controls.len() != 1 || controls[0].len() != 7 || controls[0][2] != 1
+        || controls[0][3] & !0x83 != 0 || controls[0][4] > 2
+    { return Err(invalid()); }
+    if let Some(feedback) = playback.feedback_endpoint.as_ref() {
+        let feedbacks: Vec<_> = output.descriptors.iter().enumerate().filter(|(_, d)|
+            d[1] == 5 && d.get(2) == Some(&feedback.address)).collect();
+        if feedbacks.len() != 1 { return Err(invalid()); }
+        let (feedback_index, feedback_ep) = feedbacks[0];
+        if feedback_ep.len() != 9 || feedback_ep[2] & 0xf0 != 0x80 || feedback_ep[2] & 15 == 0
+            || !matches!(feedback_ep[3], 0x01 | 0x11) || feedback_ep[6] != feedback.interval
+            || feedback_ep[7] != feedback.refresh || feedback_ep[8] != 0
+            || feedback.transfer_type != TransferType::Isochronous
+            || (ep[8] != feedback.address && !(ep[8] == 0 && feedback_ep[3] == 0x11))
+            || iso_endpoint_geometry(output, feedback_index, speed)
+                != Some((feedback.max_packet_bytes, feedback.service_interval_us))
+        { return Err(invalid()); }
+    }
+    Ok((owner.number, controls[0][3] & 1 != 0, fixed_at_request))
+}
+
+/// Fresh descriptor proof only: this must never program either endpoint rate.
+pub(super) fn uac1_duplex_owners(
+    claimed: &ClaimedHandle, playback: &IsoStreamCandidate, capture: &CaptureEndpoint, playback_rate: u32,
+) -> Result<u8, Error> {
+    let map_error = |error: rusb::Error| if error == rusb::Error::NoDevice { Error::DeviceLost }
+        else { Error::Control(error.to_string()) };
+    for interface in [playback.interface_number, capture.interface, capture.control] {
+        claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
+    }
+    let config = claimed.handle.device().active_config_descriptor().map_err(map_error)?;
+    if config.number() != capture.configuration
+        || claimed.handle.active_configuration().map_err(map_error)? != capture.configuration
+    { return Err(Error::InvalidState("UAC1 duplex configuration changed".into())); }
+    let raw = clock::read_active_configuration_bytes_checked(&claimed.handle, &config)?;
+    let (owner, sampling_control, fixed_at_request) = reprove_uac1_duplex_owners(
+        &raw, resolve_device_speed(&claimed.handle.device()), playback, capture, playback_rate)?;
+    let profile = clock::uac1_playback_rate_profile(claimed, playback, playback_rate).map_err(Error::Control)?;
+    if profile.sampling_control != Some(sampling_control) || profile.fixed_at_request != fixed_at_request {
+        return Err(Error::InvalidState("UAC1 duplex playback rate evidence changed".into()));
+    }
+    claimed.ensure_interface_claimed(owner).map_err(Error::Claim)?;
+    if claimed.handle.active_configuration().map_err(map_error)? != capture.configuration {
+        return Err(Error::InvalidState("UAC1 duplex configuration changed during reproof".into()));
+    }
+    Ok(owner)
+}
+
 /// Resolve active-configuration candidates while the caller owns USB claims.
 pub(super) fn owned_capture_candidates(
     claimed: &ClaimedHandle,
@@ -566,14 +761,20 @@ fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm, ra
     })
 }
 
-pub(super) fn verify_vendor_interface_alternate(claimed: &ClaimedHandle, interface: u8, expected: u8) -> Result<(), Error> {
+pub(super) fn verify_active_capture_alt(claimed: &ClaimedHandle, interface: u8, expected: u8) -> Result<(), Error> {
+    claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
     let mut alternate = [0u8];
     let read = claimed.handle.read_control(0x81, 0x0a, 0, u16::from(interface), &mut alternate, Duration::from_millis(500))
-        .map_err(|e| Error::Control(e.to_string()))?;
+        .map_err(|e| if e == rusb::Error::NoDevice { Error::DeviceLost } else { Error::Control(e.to_string()) })?;
     if read != 1 || alternate[0] != expected {
-        return Err(Error::InvalidState("vendor streaming alternate did not verify".into()));
+        return Err(Error::InvalidState("streaming alternate did not verify".into()));
     }
     Ok(())
+}
+
+/// Preserve the vendor activation call sites while sharing standard GET_INTERFACE.
+pub(super) fn verify_vendor_interface_alternate(claimed: &ClaimedHandle, interface: u8, expected: u8) -> Result<(), Error> {
+    verify_active_capture_alt(claimed, interface, expected)
 }
 
 pub(super) fn verify_vendor_capture_alternate(claimed: &ClaimedHandle, candidate: &CaptureEndpoint, expected: u8) -> Result<(), Error> {
@@ -2673,6 +2874,88 @@ mod tests {
         assert!(capture_candidates(&raw, 1, Speed::Full, 44_100)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn duplex_capture_requires_explicit_unambiguous_endpoint_rate_control() {
+        let raw = configuration(0);
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        assert_eq!(uac1_duplex_capture_sampling_control(&candidate).unwrap(), true);
+        let mut fixed = candidate.clone();
+        fixed.endpoint_descriptors[12] = 0x80; // Explicit no-control + MaxPacketsOnly.
+        fixed.sampling_control = false;
+        assert_eq!(uac1_duplex_capture_sampling_control(&fixed).unwrap(), false);
+        fixed.fixed_rate = false;
+        assert!(uac1_duplex_capture_sampling_control(&fixed).is_err());
+        for descriptors in [
+            candidate.endpoint_descriptors[..9].to_vec(),
+            [candidate.endpoint_descriptors.as_slice(), &[7, 0x25, 1, 1, 0, 0, 0]].concat(),
+            [&candidate.endpoint_descriptors[..9], &[6, 0x25, 1, 1, 0, 0]].concat(),
+            [&candidate.endpoint_descriptors[..9], &[7, 0x25, 1, 5, 0, 0, 0]].concat(),
+        ] {
+            let mut malformed = candidate.clone();
+            malformed.endpoint_descriptors = descriptors;
+            assert!(uac1_duplex_capture_sampling_control(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn duplex_uac1_fresh_pair_proves_exact_playback_rate_and_terminal() {
+        let mut raw = configuration(0);
+        let header = raw.windows(4).position(|d| d == [9, 0x24, 1, 0]).unwrap();
+        raw[header] = 10;
+        raw[header + 5] = 52;
+        raw[header + 7] = 2;
+        raw.insert(header + 9, 2);
+        let control_end = raw.windows(4).position(|d| d == [9, 4, 1, 0]).unwrap();
+        raw.splice(control_end..control_end, [12, 0x24, 2, 4, 1, 1, 0, 2, 3, 0, 0, 0]);
+        let input_alt = raw.windows(4).position(|d| d == [9, 4, 1, 1]).unwrap();
+        let mut output = raw[input_alt..].to_vec();
+        output[2] = 2;
+        output[12] = 4; // AS_GENERAL bTerminalLink: USB streaming Input Terminal.
+        let endpoint = output.windows(4).position(|d| d == [9, 5, 0x81, 5]).unwrap();
+        output[endpoint + 2] = 1;
+        raw.extend_from_slice(&[9, 4, 2, 0, 0, 1, 2, 0, 0]);
+        raw.extend_from_slice(&output);
+        raw[4] = 3;
+        update_configuration_length(&mut raw);
+        let capture = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let mut playback = IsoStreamCandidate {
+            configuration_number: 1, interface_number: 2, alt_setting: 1,
+            endpoint_address: 1, endpoint_interval: 1, service_interval_us: 1000,
+            usb_speed: Speed::Full, max_packet_bytes: 512,
+            sync_type: SyncType::Asynchronous, usage_type: UsageType::Data,
+            format_tag: 1, uac2_formats: None, native_dsd: None,
+            channels: 2, subslot_size: 3, bit_resolution: 24, sample_rates: vec![48_000],
+            refresh: 0, synch_address: 0, feedback_endpoint: None, implicit_feedback: None,
+            terminal_link: Some(4), is_uac1: true,
+        };
+        assert_eq!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).unwrap(),
+            (0, true, true));
+        assert!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 44_100).is_err());
+        playback.terminal_link = Some(3);
+        assert!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).is_err());
+    }
+
+    #[test]
+    fn duplex_uac1_collection_owner_rejects_selected_collection_ambiguity() {
+        let raw = configuration(0);
+        let interfaces = raw_interfaces(&raw).unwrap();
+        assert_eq!(uac1_collection_owner(&interfaces, &interfaces[2]).unwrap().number, 0);
+        let mut duplicated = interfaces.clone();
+        duplicated.push(interfaces[0].clone());
+        assert!(uac1_collection_owner(&duplicated, &interfaces[2]).is_err());
+        let bad_header = [10, 0x24, 1, 0, 1, 40, 0, 2, 1, 1];
+        let mut malformed = interfaces.clone();
+        malformed[0].descriptors[0] = &bad_header;
+        assert!(uac1_collection_owner(&malformed, &interfaces[2]).is_err());
+        let unrelated_header = [8, 0x24, 1, 0, 1, 8, 0, 1];
+        let mut unrelated = interfaces[0].clone();
+        unrelated.number = 7;
+        unrelated.descriptors = vec![&unrelated_header];
+        let mut multiple_functions = interfaces.clone();
+        multiple_functions.push(unrelated);
+        assert_eq!(uac1_collection_owner(&multiple_functions, &interfaces[2]).unwrap().number, 0);
     }
 
     #[test]

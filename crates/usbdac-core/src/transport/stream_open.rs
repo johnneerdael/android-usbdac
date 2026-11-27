@@ -615,7 +615,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         set_last_error(Some(message));
     }
 
-    if let Some(capture) = attachment.as_mut().filter(|_| vendor_profile.is_none()) {
+    if let Some(capture) = attachment.as_mut().filter(|_| vendor_profile.is_none() && !candidate.is_uac1) {
         if let Err(error) = duplex::configure_with_retry(capture, &claimed_handle, &candidate, expected) {
             duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested); return Err(error);
         }
@@ -661,7 +661,7 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
         duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), None, lock_requested);
         return Err(Error::Transfer(msg));
     }
-    if let Some(capture) = attachment.as_ref().filter(|capture| capture.shared_implicit
+    if let Some(capture) = attachment.as_ref().filter(|capture| capture.shared_implicit && !candidate.is_uac1
         && capture.endpoint.vendor_pcm.is_none() && capture.endpoint.adc3_route.is_none()) {
         // Playback activated the shared IN source. Reprove its pinned capture
         // contract after both SET_INTERFACE operations, before publishing it.
@@ -732,7 +732,20 @@ fn start_stream_inner_with_capture(events: EventSink, session: &Arc<SessionGuard
                 return Err(if crate::error::is_device_gone(&error) { Error::DeviceLost } else { Error::Control(error) });
             }
         };
-        if profile.sampling_control != Some(false) {
+        if let Some(capture) = attachment.as_ref() {
+            match capture.configure_uac1(&claimed_handle, &candidate, expected) {
+                Ok((attempted, succeeded, reported)) => {
+                    clock_control_attempted = attempted;
+                    clock_control_succeeded = succeeded;
+                    reported_sample_rate = reported;
+                }
+                Err(error) => {
+                    set_clock_verification(false, false, false, None);
+                    duplex::cleanup_claimed(claimed_handle, attachment.as_ref(), Some(candidate.interface_number), lock_requested);
+                    return Err(error);
+                }
+            }
+        } else if profile.sampling_control != Some(false) {
             clock_control_attempted = true;
             let set_result = set_uac1_sampling_frequency(
                 &claimed_handle.handle, candidate.interface_number,

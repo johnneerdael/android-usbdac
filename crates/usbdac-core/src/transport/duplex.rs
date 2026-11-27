@@ -13,10 +13,70 @@ pub(super) struct Attachment {
     retired: Arc<AtomicBool>,
     deferred: Arc<capture_stream::DeferredCapture>,
     original_rate: Mutex<Option<(ClockChoice, u32, u32)>>,
+    uac1_rate: Mutex<Option<Uac1DuplexRate>>,
     rate_uncertain: AtomicBool,
     retry_endpoints: Vec<CaptureEndpoint>,
     capacity: usize,
     lock_delay: Option<endpoint_lock::LockDelay>,
+}
+
+#[derive(Clone)]
+struct Uac1EndpointRate {
+    interface: u8,
+    address: u8,
+    original: u32,
+    target: u32,
+    observed: Option<u32>,
+    may_have_changed: bool,
+}
+
+#[derive(Clone)]
+struct Uac1DuplexRate {
+    playback: IsoStreamCandidate,
+    expected: crate::StreamFormat,
+    endpoints: Vec<Uac1EndpointRate>,
+    // A SET_CUR may change either endpoint in the same function, even when
+    // it fails or the other endpoint did not need an explicit write.
+    mutated: bool,
+    playback_owner: u8,
+    shared_function: bool,
+}
+
+fn uac1_pair_rates(output_owner: u8, input_owner: u8, output: u32, input: u32) -> Result<(), Error> {
+    if output_owner == input_owner && output != input {
+        return Err(Error::Unsupported { reason: "UAC1 duplex in one audio function requires equal rates".into(), offered: vec![] });
+    }
+    Ok(())
+}
+
+fn uac1_endpoint_owned(endpoint: &Uac1EndpointRate, current: u32) -> bool {
+    uac1_restore_owned(endpoint.original, endpoint.target, current) || endpoint.observed == Some(current)
+}
+
+fn uac1_restore_owned(original: u32, target: u32, current: u32) -> bool {
+    current == original || current == target
+}
+
+fn uac1_pair_profile(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
+    expected: &crate::StreamFormat, endpoint: &CaptureEndpoint) -> Result<(Uac1PlaybackRateProfile, bool, u8), Error> {
+    if !playback.is_uac1 || endpoint.protocol != 0 || expected.clock.is_some()
+        || expected.encoding != crate::Encoding::Pcm || playback.format_tag != 1
+        || playback.native_dsd.is_some() || endpoint.vendor_pcm.is_some() || endpoint.adc3_route.is_some()
+        || playback.implicit_feedback.is_some() || validate_alternates(playback, endpoint)? {
+        return Err(Error::Unsupported { reason: "duplex UAC1 requires independent standard PCM AudioStreaming alternates".into(), offered: vec![] });
+    }
+    if endpoint.feedforward().is_some() && settings().disable_feedback() {
+        return Err(Error::Unsupported { reason: "adaptive UAC1 duplex capture requires feedforward timing".into(), offered: vec![] });
+    }
+    let owner = capture_stream::uac1_duplex_owners(claimed, playback, endpoint, expected.sample_rate)?;
+    uac1_pair_rates(owner, endpoint.control, expected.sample_rate, endpoint.format.sample_rate())?;
+    let profile = uac1_playback_rate_profile(claimed, playback, expected.sample_rate).map_err(Error::Control)?;
+    if profile.sampling_control != Some(true)
+        && !uac1_playback_rate_verified(expected.sample_rate, None, profile, true) {
+        return Err(Error::Unsupported { reason: "UAC1 duplex OUT has neither explicit rate control nor a fixed or host-paced rate contract".into(), offered: vec![] });
+    }
+    let input_control = capture_stream::uac1_duplex_capture_sampling_control(endpoint)?;
+    Ok((profile, input_control, owner))
 }
 
 /// Equality of rates is insufficient to establish independent clock ownership.
@@ -48,6 +108,9 @@ fn clock_pair(playback: Option<&ClockChoice>, capture: Option<&ClockChoice>,
 }
 
 fn validate_alternates(playback: &IsoStreamCandidate, input: &CaptureEndpoint) -> Result<bool, Error> {
+    if (playback.is_uac1 || input.protocol == 0) && playback.interface_number == input.interface {
+        return Err(Error::Unsupported { reason: "UAC1 duplex requires separate AudioStreaming interfaces".into(), offered: vec![] });
+    }
     if playback.interface_number == input.interface && playback.alt_setting != input.alternate {
         return Err(Error::Unsupported { reason: "duplex alternates conflict on one interface".into(), offered: vec![] });
     }
@@ -91,6 +154,10 @@ fn input_clock(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint) -> Option<Cl
 
 fn validate_clocks(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
     expected: &crate::StreamFormat, endpoint: &CaptureEndpoint) -> Result<(), Error> {
+    if playback.is_uac1 || endpoint.protocol == 0 {
+        uac1_pair_profile(claimed, playback, expected, endpoint)?;
+        return Ok(());
+    }
     if let Some(profile) = endpoint.vendor_pcm.as_ref() {
         capture_stream::verify_vendor_capture(claimed, endpoint)?;
         let proven = vendor_pcm::for_candidate(&claimed.handle, playback).map_err(Error::Control)?;
@@ -229,8 +296,189 @@ impl Attachment {
     pub(super) fn new(endpoint: CaptureEndpoint, shared_implicit: bool, buffer: CaptureBuffer) -> Self {
         Self { endpoint, shared_implicit, buffer: Arc::new(Mutex::new(buffer)),
             error: Arc::new(Mutex::new(None)), retired: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None), rate_uncertain: AtomicBool::new(false),
+            deferred: Arc::new(capture_stream::DeferredCapture::default()), original_rate: Mutex::new(None), uac1_rate: Mutex::new(None), rate_uncertain: AtomicBool::new(false),
             retry_endpoints: Vec::new(), capacity: 0, lock_delay: None }
+    }
+    fn verify_uac1_pair(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
+        expected: &crate::StreamFormat) -> Result<(Uac1PlaybackRateProfile, bool, u8), Error> {
+        let profile = uac1_pair_profile(claimed, playback, expected, &self.endpoint)?;
+        self.verify_uac1_alternates(claimed, playback)?;
+        Ok(profile)
+    }
+
+    fn verify_uac1_alternates(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate) -> Result<(), Error> {
+        capture_stream::verify_active_capture_alt(claimed, playback.interface_number, playback.alt_setting)?;
+        capture_stream::verify_active_capture_alt(claimed, self.endpoint.interface, self.endpoint.alternate)?;
+        Ok(())
+    }
+
+    /// Commit both endpoint clocks together, after OUT activation and before
+    /// either worker can submit transfers. The attachment owns partial setup
+    /// rollback as soon as the first potentially effective request is sent.
+    pub(super) fn configure_uac1(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
+        expected: &crate::StreamFormat) -> Result<(bool, bool, Option<u32>), Error> {
+        if self.uac1_rate.lock().is_some() {
+            return Err(Error::InvalidState("UAC1 duplex rate transaction already configured".into()));
+        }
+        let (_, _, initial_owner) = uac1_pair_profile(claimed, playback, expected, &self.endpoint)?;
+        claimed.set_alternate_setting(self.endpoint.interface, self.endpoint.alternate).map_err(Error::Claim)?;
+        let (profile, input_control, owner) = self.verify_uac1_pair(claimed, playback, expected)?;
+        if owner != initial_owner {
+            return Err(Error::InvalidState("UAC1 duplex playback function changed during activation".into()));
+        }
+        let mut endpoints = Vec::new();
+        for (programmable, interface, address, target) in [
+            (profile.sampling_control == Some(true), playback.interface_number, playback.endpoint_address, expected.sample_rate),
+            (input_control, self.endpoint.interface, self.endpoint.address, self.endpoint.format.sample_rate()),
+        ] {
+            if programmable {
+                // Both original positive GET_CUR values must exist before any
+                // writes; a write-only control cannot be handed back safely.
+                let original = get_uac1_sampling_frequency(&claimed.handle, interface, address).or_control()?;
+                endpoints.push(Uac1EndpointRate { interface, address, original, target, observed: None, may_have_changed: false });
+            }
+        }
+        *self.uac1_rate.lock() = Some(Uac1DuplexRate {
+            playback: playback.clone(), expected: expected.clone(), endpoints: endpoints.clone(), mutated: false,
+            playback_owner: owner,
+            shared_function: owner == self.endpoint.control,
+        });
+        let mut output_attempted = false;
+        let mut output_written = false;
+        for endpoint in &endpoints {
+            // A preceding OUT write may already have moved the shared IN root.
+            // Recheck both active alternates before every control mutation.
+            self.verify_uac1_alternates(claimed, playback)?;
+            let current = get_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address).or_control()?;
+            if current == endpoint.target { continue; }
+            let observed = self.uac1_rate.lock().as_ref().expect("saved UAC1 transaction").endpoints.iter()
+                .find(|saved| saved.address == endpoint.address).and_then(|saved| saved.observed);
+            if current != endpoint.original && Some(current) != observed {
+                return Err(Error::InvalidState("UAC1 duplex endpoint frequency changed outside the transaction".into()));
+            }
+            {
+                let mut saved = self.uac1_rate.lock();
+                let saved = saved.as_mut().expect("saved UAC1 transaction");
+                saved.mutated = true;
+                let shared_function = saved.shared_function;
+                for other in &mut saved.endpoints {
+                    if shared_function || other.address == endpoint.address {
+                        other.may_have_changed = true;
+                    }
+                }
+            }
+            let output = endpoint.address == playback.endpoint_address;
+            if output { output_attempted = true; }
+            let write = set_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address, endpoint.target).or_control();
+            if output { output_written = write.is_ok(); }
+            if write.is_ok() {
+                // Acknowledged UAC1 SET_CUR can round the request. Snapshot
+                // both controls immediately, attributing common-root effects
+                // to this transaction so failed setup can restore them too.
+                for other in &endpoints {
+                    if owner != self.endpoint.control && other.address != endpoint.address { continue; }
+                    let reported = get_uac1_sampling_frequency(&claimed.handle, other.interface, other.address).or_control()?;
+                    if let Some(saved) = self.uac1_rate.lock().as_mut().expect("saved UAC1 transaction").endpoints
+                        .iter_mut().find(|saved| saved.address == other.address) {
+                        saved.observed = Some(reported);
+                    }
+                }
+            }
+            // A stalled SET can still leave the required active rate. Only a
+            // positive final GET_CUR, never the acknowledgement, commits it.
+            if let Err(Error::DeviceLost) = write { return Err(Error::DeviceLost); }
+        }
+        if self.verify_uac1_pair(claimed, playback, expected)?.2 != owner {
+            return Err(Error::InvalidState("UAC1 duplex playback function changed during rate setup".into()));
+        }
+        let output_reported = if profile.sampling_control == Some(true) {
+            Some(get_uac1_sampling_frequency(&claimed.handle, playback.interface_number, playback.endpoint_address).or_control()?)
+        } else { None };
+        let input_reported = if input_control {
+            Some(get_uac1_sampling_frequency(&claimed.handle, self.endpoint.interface, self.endpoint.address).or_control()?)
+        } else { None };
+        if !uac1_playback_rate_verified(expected.sample_rate, output_reported, profile, true) {
+            return Err(Error::ClockUnverified { requested_hz: expected.sample_rate, reported_hz: output_reported });
+        }
+        let input_rate = self.endpoint.format.sample_rate();
+        if input_reported.is_some_and(|rate| rate != input_rate) || (input_control && input_reported != Some(input_rate)) {
+            return Err(Error::ClockUnverified { requested_hz: input_rate, reported_hz: input_reported });
+        }
+        Ok((output_attempted, output_written, output_reported))
+    }
+
+    fn restore_uac1_rate(&self, claimed: &ClaimedHandle) -> Result<(), Error> {
+        let Some(mut transaction) = self.uac1_rate.lock().clone() else { return Ok(()); };
+        if transaction.mutated {
+            if self.verify_uac1_pair(claimed, &transaction.playback, &transaction.expected)?.2 != transaction.playback_owner {
+                return Err(Error::InvalidState("UAC1 duplex playback function changed before rollback".into()));
+            }
+            let mut safe = vec![true; transaction.endpoints.len()];
+            // Preflight the complete pair before changing either root. An
+            // independently proven function can still be restored when its
+            // sibling has drifted, but a shared function must remain intact.
+            for (index, endpoint) in transaction.endpoints.iter().enumerate() {
+                match get_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address).or_control() {
+                    Ok(current) => safe[index] = uac1_endpoint_owned(endpoint, current),
+                    Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                    Err(_) => safe[index] = false,
+                }
+            }
+            if transaction.shared_function && safe.contains(&false) {
+                return Err(Error::InvalidState("UAC1 duplex rollback preserved an external endpoint frequency".into()));
+            }
+            for index in 0..transaction.endpoints.len() {
+                if !safe[index] || !transaction.endpoints[index].may_have_changed { continue; }
+                self.verify_uac1_alternates(claimed, &transaction.playback)?;
+                if transaction.shared_function {
+                    for other in &transaction.endpoints {
+                        let current = get_uac1_sampling_frequency(&claimed.handle, other.interface, other.address).or_control()?;
+                        if !uac1_endpoint_owned(other, current) {
+                            return Err(Error::InvalidState("UAC1 duplex frequency drifted during rollback".into()));
+                        }
+                    }
+                }
+                let endpoint = &transaction.endpoints[index];
+                let current = match get_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address).or_control() {
+                    Ok(current) => current,
+                    Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                    Err(_) => { safe[index] = false; continue; },
+                };
+                if !uac1_endpoint_owned(endpoint, current) { safe[index] = false; continue; }
+                if current != endpoint.original {
+                    let restoring_address = endpoint.address;
+                    let write = set_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address, endpoint.original).or_control();
+                    if let Err(Error::DeviceLost) = write { return Err(Error::DeviceLost); }
+                    if write.is_ok() {
+                        for other in &mut transaction.endpoints {
+                            if !other.may_have_changed || (!transaction.shared_function && other.address != restoring_address) { continue; }
+                            match get_uac1_sampling_frequency(&claimed.handle, other.interface, other.address).or_control() {
+                                Ok(reported) => other.observed = Some(reported),
+                                Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                                Err(_) => {},
+                            }
+                        }
+                    }
+                }
+            }
+            if self.verify_uac1_pair(claimed, &transaction.playback, &transaction.expected)?.2 != transaction.playback_owner {
+                return Err(Error::InvalidState("UAC1 duplex playback function changed during rollback".into()));
+            }
+            // Verify after all restorations: a later request can affect an
+            // earlier endpoint through an undisclosed common UAC1 clock root.
+            for (index, endpoint) in transaction.endpoints.iter().enumerate() {
+                match get_uac1_sampling_frequency(&claimed.handle, endpoint.interface, endpoint.address).or_control() {
+                    Ok(reported) if reported == endpoint.original => {},
+                    Err(Error::DeviceLost) => return Err(Error::DeviceLost),
+                    _ => safe[index] = false,
+                }
+            }
+            if safe.contains(&false) {
+                return Err(Error::InvalidState("UAC1 duplex endpoint restoration did not verify; external frequencies preserved".into()));
+            }
+        }
+        *self.uac1_rate.lock() = None;
+        Ok(())
     }
     fn configure(&self, claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         expected: &crate::StreamFormat) -> Result<bool, Error> {
@@ -356,6 +604,11 @@ impl Attachment {
     pub(super) fn failure(&self) -> Option<Error> { self.error.lock().clone() }
     pub(super) fn retirement_guard(&self) -> Retirement { Retirement(self.retired.clone()) }
     fn restore_rate(&self, claimed: &ClaimedHandle) -> bool {
+        if let Err(error) = self.restore_uac1_rate(claimed) {
+            self.rate_uncertain.store(true, Ordering::Release);
+            set_last_error(Some(format!("UAC1 duplex clock rollback failed: {}", error.message())));
+            return false;
+        }
         let Some((clock, rate, target)) = self.original_rate.lock().clone() else {
             return !self.rate_uncertain.load(Ordering::Acquire);
         };
@@ -601,6 +854,25 @@ impl Drop for InputPool {
 mod tests {
     use super::*;
     use crate::clock_resolution::ClockResolution;
+    #[test]
+    fn uac1_rates_require_a_common_cadence_only_within_the_same_proven_function() {
+        assert!(uac1_pair_rates(0, 0, 48_000, 48_000).is_ok());
+        assert!(uac1_pair_rates(0, 0, 48_000, 44_100).is_err());
+        assert!(uac1_pair_rates(0, 3, 48_000, 44_100).is_ok());
+    }
+    #[test]
+    fn uac1_rollback_preserves_frequency_drift_and_accepts_shared_root_effects() {
+        // A sibling endpoint may already have restored a common root, or may
+        // have moved it to the committed target without its own SET_CUR.
+        assert!(uac1_restore_owned(44_100, 48_000, 44_100));
+        assert!(uac1_restore_owned(44_100, 48_000, 48_000));
+        assert!(!uac1_restore_owned(44_100, 48_000, 96_000));
+        assert!(!uac1_restore_owned(44_100, 48_000, 0));
+        let endpoint = Uac1EndpointRate { interface: 1, address: 1, original: 44_100,
+            target: 48_000, observed: Some(47_999), may_have_changed: true };
+        assert!(uac1_endpoint_owned(&endpoint, 47_999));
+        assert!(!uac1_endpoint_owned(&endpoint, 47_998));
+    }
     fn clock(control_interface: u8, source_id: u8) -> ClockChoice {
         ClockChoice { control_interface, source_id, path: vec![], resolution: ClockResolution::Resolved }
     }

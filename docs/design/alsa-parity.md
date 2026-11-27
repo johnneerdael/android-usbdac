@@ -239,13 +239,42 @@ Physical acceptance needs a UAC1 device with a linked adaptive IN
 alternate. Capture at the advertised rate and verify the report
 spacing, zero-length positions and audio frame counts on a bus trace.
 Exercise full speed through a hub and high speed where supported.
-UAC1 duplex still needs a separate clock and rate ownership proof.
 
 Rust workspace tests covered the descriptor pair, refresh phase across
 transfers, and completion checks for empty slots and rate words. The
 Android arm64 target check passed, and the release AAR and sample
 contain matching native libraries for all four ABIs. The AAR SHA-256
 is `a9e8020be14abdc46dd7a7172c3a5a1ef8cfbac76c13a3f5511328c0b6589f4a`.
+
+### UAC1 duplex endpoint rates
+
+Resolve each PCM alternate through the UAC1 AudioControl collection
+and claim both interfaces and their owners. Use separate USB endpoints
+for playback and capture. Within one AudioControl collection, request
+the same rate in both directions because UAC1 does not expose clock
+source identities. Across distinct collections, verify each endpoint
+at its requested rate. [USB-IF UAC1 §§3.7.1 and 4.3.2](https://www.usb.org/sites/default/files/audio10.pdf)
+
+Activate both alternates before reading or programming endpoint rates.
+Use the class-specific Sampling Frequency capability and verify every
+programmable endpoint again after both operations. The fixed-rate
+capture and fixed or host-paced playback cases use descriptor evidence
+when they explicitly omit the rate control. Keep the original readable
+rates through teardown. After transfers retire, restore those rates
+while the endpoints are still active, then reset both alternates.
+[USB-IF UAC1 §§4.6.1.2 and 5.2.3.2.3.1](https://www.usb.org/sites/default/files/audio10.pdf),
+[ALSA UAC1 endpoint rate setup](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L433-L484)
+
+For final hardware acceptance, run fixed-rate and programmable UAC1
+duplex. Confirm that the worker starts only after both rates are
+proven. Check adaptive capture timing when present. Exercise a rejected
+rate, a clock change during setup, stop and detach, and verify endpoint
+rate hand-back and alternate reset on a bus trace.
+
+Rust workspace and Android arm64 target checks passed. The Android
+release AAR and sample built with matching native libraries for all
+four ABIs. The AAR SHA-256 is
+`1dab8c87898d5e5ba0819ec09932aa15df353c9bd41c5c8597ea219087b7f4e3`.
 
 ### AudioControl notifications during a stream
 
