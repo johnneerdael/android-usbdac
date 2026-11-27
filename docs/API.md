@@ -526,6 +526,9 @@ and whether the driver inferred them. The summary's `reused_timebase` field
 indicates reuse from the open DAC session. Before a captured stream opens, `dacFeedbackTrace` returns JSON
 `null`.
 
+For an in-app capture flow and Kotlin and Rust export examples, see
+[collect a USB playback support report](sdk/support-diagnostics.md).
+
 ### Descriptor parsing
 
 `usbdac_core::descriptors` exposes the UAC 1.0/2.0 descriptor parsers the
