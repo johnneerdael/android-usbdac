@@ -58,6 +58,9 @@ mod format;
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod hotplug;
+/// Shared rate ordering used by the automatic selector and USB negotiation.
+#[doc(hidden)]
+pub use transport::negotiate::rank_sample_rates;
 mod iso_packet_scheduler;
 mod iso_packet_validation;
 mod iso_transport_loss;

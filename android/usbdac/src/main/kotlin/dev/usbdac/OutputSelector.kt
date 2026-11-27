@@ -614,24 +614,14 @@ public class OutputSelector internal constructor(
                 for (rate in link.capabilities.pcmSampleRates + request.sampleRate) pairs += rate to depth
             }
         }
-        fun family(rate: Int): Int = when {
-            rate > 0 && rate % 11025 == 0 -> 441
-            rate > 0 && rate % 8000 == 0 -> 480
-            else -> 0
-        }
-        val ordered = pairs.filter { (rate, depth) ->
+        val eligible = pairs.filter { (rate, depth) ->
             rate > 0 && depth in listOf(16, 24, 32) &&
                 (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true) &&
                 (policy.allowConversion || (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth > request.bitDepth))
-        }.sortedWith(compareBy<Pair<Int, Int>>(
-            { (rate, _) -> when {
-                rate == request.sampleRate -> 0
-                rate < request.sampleRate && request.sampleRate % rate == 0 -> 1
-                rate < request.sampleRate && family(rate) != 0 && family(rate) == family(request.sampleRate) -> 2
-                rate < request.sampleRate -> 3
-                else -> 4
-            } },
-            { (rate, _) -> if (rate <= request.sampleRate) -rate.toLong() else rate.toLong() },
+        }
+        val rank = platform.rankRates(request.sampleRate, eligible.map { it.first }).withIndex().associate { it.value to it.index }
+        val ordered = eligible.sortedWith(compareBy<Pair<Int, Int>>(
+            { rank[it.first] ?: Int.MAX_VALUE },
             { if (it.second >= request.bitDepth) 0 else 1 },
             { kotlin.math.abs(it.second - request.bitDepth) },
         ))

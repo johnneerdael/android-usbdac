@@ -63,6 +63,11 @@ internal class AndroidOutputPlatform(context: Context) : OutputPlatform {
         return runCatching { BitPerfectMixer.supports(audioManager, device, format) }.getOrDefault(false)
     }
 
+    override fun rankRates(requested: Int, rates: List<Int>): List<Int> {
+        Native.version() // Ensure libusbdac is loaded before the pure JNI entry point.
+        return NativeRateRanking.rankList(requested, rates)
+    }
+
     override fun openManaged(request: StreamRequest, route: OutputRoute?): PcmOutput =
         AndroidManagedOutput.open(app, request, route?.device)
 

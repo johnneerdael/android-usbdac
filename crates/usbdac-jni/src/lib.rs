@@ -119,6 +119,35 @@ fn listener_of(env: &Env<'_>, target: &JObject<'_>) -> Outcome<Option<Arc<dyn Da
     Ok(Some(Arc::new(JavaListener::new(global))))
 }
 
+/// Rank positive rate candidates using the same policy as USB negotiation.
+#[jni_mangle("dev.usbdac.internal.NativeRateRanking")]
+pub fn rank<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    requested: i32,
+    values: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        if requested <= 0 {
+            return Err(Failure::Bad("requested rate must be positive".into()));
+        }
+        let input = string_of(env, &values)?;
+        let mut rates: Vec<u32> = serde_json::from_str(&input)
+            .map_err(|_| Failure::Bad("rates must be a JSON array of positive integers".into()))?;
+        if rates.len() > 8192
+            || rates.contains(&0)
+            || rates.iter().any(|&rate| rate > i32::MAX as u32)
+        {
+            return Err(Failure::Bad("rate candidates out of range".into()));
+        }
+        usbdac_core::rank_sample_rates(&mut rates, requested as u32);
+        Ok(JString::from_str(
+            env,
+            serde_json::to_string(&rates).expect("rate array serialization"),
+        )?)
+    })
+}
+
 // ---- library --------------------------------------------------------------
 
 /// The library version, `"<major>.<minor>.<patch>"`.

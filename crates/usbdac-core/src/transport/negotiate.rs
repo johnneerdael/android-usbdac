@@ -695,7 +695,8 @@ fn rate_family(rate: u32) -> u8 {
     }
 }
 
-fn rank_sample_rates(rates: &mut Vec<u32>, requested: u32) {
+#[doc(hidden)]
+pub fn rank_sample_rates(rates: &mut Vec<u32>, requested: u32) {
     rates.retain(|rate| *rate > 0);
     rates.sort_unstable_by_key(|&rate| {
         let class = if rate == requested {
@@ -815,9 +816,12 @@ pub(super) fn candidate_rates_from_supported_ranges(
             2 => 8_000,
             _ => 0,
         };
-        if family_unit != 0 {
-            let mut rate =
-                range.max.min(requested_sample_rate.saturating_sub(1)) / family_unit * family_unit;
+        if let Some(family_index) = range
+            .max
+            .min(requested_sample_rate.saturating_sub(1))
+            .checked_div(family_unit)
+        {
+            let mut rate = family_index * family_unit;
             while rate >= range.min && rate > 0 {
                 if sampling_frequency_ranges_support_rate(std::slice::from_ref(range), rate) {
                     candidates.push(rate);

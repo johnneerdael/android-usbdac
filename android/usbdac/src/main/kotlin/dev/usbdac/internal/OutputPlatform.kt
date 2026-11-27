@@ -77,6 +77,25 @@ internal interface OutputPlatform {
     /** Opens a session on [dac]; the failures of `UsbDac.open`. */
     fun openDac(dac: DacDeviceInfo, config: DacConfig): DirectLink
 
+    /** Host test platforms can order synthetic rates without loading Android JNI. */
+    fun rankRates(requested: Int, rates: List<Int>): List<Int> {
+        fun family(rate: Int): Int = when {
+            rate > 0 && rate % 11025 == 0 -> 1
+            rate > 0 && rate % 8000 == 0 -> 2
+            else -> 0
+        }
+        return rates.distinct().filter { it > 0 }.sortedWith(compareBy<Int>(
+            { rate -> when {
+                rate == requested -> 0
+                rate < requested && requested % rate == 0 -> 1
+                rate < requested && family(rate) != 0 && family(rate) == family(requested) -> 2
+                rate < requested -> 3
+                else -> 4
+            } },
+            { rate -> if (rate <= requested) -rate.toLong() else rate.toLong() },
+        ))
+    }
+
     // ---- audio routing ----
 
     /** The output devices Android sends media to now; empty when it cannot tell. */

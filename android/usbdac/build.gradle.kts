@@ -66,6 +66,13 @@ dependencies {
     testImplementation("org.json:json:20260814")
 }
 
+// The named host-JNI test must rerun when its native ranking implementation changes.
+tasks.withType<Test>().configureEach {
+    val hostJni = providers.environmentVariable("USBDAC_TEST_HOST_JNI")
+    inputs.property("usbdacHostJniPath", hostJni.orElse(""))
+    inputs.files(hostJni.map { file(it) }).withPropertyName("usbdacHostJniLibrary")
+}
+
 // ---- native library ---------------------------------------------------------
 
 // ABIs to build. Restrict for a quick local build: -Pusbdac.abis=arm64-v8a
