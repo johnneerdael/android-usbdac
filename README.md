@@ -61,7 +61,12 @@ and BitChord, behave with the same DACs. No code from either was used.
 
 **Status: 0.1.** Direct USB PCM has played on a OnePlus 15 with an iBasso DC04U
 in Flick and with a Hidizs AP80 Pro-X in the SDK sample. The AP80 Pro-X also
-verified native DSD64 through DSD256 and the transition back to PCM.
+verified native DSD64 through DSD256 and the transition back to PCM. On the
+same phone, the Android validator passed every exact format it tried on four
+DACs: the DC04U, the AP80 Pro-X, an SMSL USB AUDIO and a Schiit Unison
+Modius E. Every format was delivered bit-perfect over USB, including PCM up
+to 768 kHz and native DSD512 under the source-backed quirk policy. These are
+USB transport results; no analog output or DoP decoder lock was observed.
 See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
 formats and paths. Release preparation uses software validation and PCM playback to a
 virtual QEMU USB audio device; it adds no physical streaming checks. Broader hardware

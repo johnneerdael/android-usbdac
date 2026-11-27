@@ -6,11 +6,33 @@ The [generated status ledger](status.md) is checked against the compiled shipped
 
 ## Hardware status {#hardware-status}
 
-Two DACs have streamed audio through usbdac or its Flick ancestor. Direct USB PCM was played on a OnePlus 15 (CPH2747, Android 17) with an iBasso DC04U in Flick and a Hidizs AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. Nothing else has run on a DAC.
+Four DACs have streamed audio through usbdac, all on a OnePlus 15 (CPH2747, Android 17): the iBasso DC04U, the Hidizs AP80 Pro-X, an SMSL USB AUDIO and a Schiit Unison Modius E. The first two also played in earlier builds. Direct USB PCM was played with the DC04U in Flick and with the AP80 Pro-X in a development build of the SDK sample. The parity build then played native DSD64, DSD128 and DSD256 followed by 16-, 24- and 32-bit PCM on the AP80 Pro-X, using universal feedback detection. The DC04U also played 44.1 kHz PCM through the SDK sample on an Android host. On 27 November 2026 the Android validator ran its playback matrix on all four ([validator runs](#validator-2026-11-27)). Nothing else has run on a DAC.
 
-The usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. Code added after those commits has host tests only, and no physical result for later releases is recorded here.
+The earlier usbdac runs are recorded for commits `2f290a1` and `28dbb29` (AP80 Pro-X) and `97e614b` (DC04U). None of them contains the two queued feedback polls (`1b695de`, released in 0.1.3) or the packet recovery and transfer-period options of 0.1.5. The validator runs used a 0.1.10 build, described below. No physical result for 0.1.11 itself is recorded here.
 
 The DC04U sample record at `97e614b` reports 297,672 delivered frames at 44.1 kHz, zero underruns and lost frames, and explicit feedback at approximately 44,099.3 Hz. The phone and volume readback were not recorded. Earlier Flick fault injection used the OnePlus 15 and DC04U on 8 x 16 transfer geometry; it was not repeated on 16 x 8, and audibility was not judged.
+
+### Validator runs, 27 November 2026 {#validator-2026-11-27}
+
+The Android [DAC validator](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/dac-validator.md) ran its exact-format playback matrix on four DACs between 18:22 and 19:17 UTC. All runs used a OnePlus 15 (CPH2747, Android 17, SDK 37) and `QuirkPolicy.SOURCE_BACKED`, with the hardware-volume requirement off and the startup volume kept. The app and driver report version 0.1.10, so the build includes `84197a2`, and with it the Direct feedback default from `e26dd2d`. It was a local build of the validator branch before that branch merged as `7047b6b`, and the exact commit was not recorded.
+
+| DAC | VID:PID, bcdDevice | Passed | PCM | Native DSD | DoP carrier |
+|---|---|---|---|---|---|
+| iBasso DC04U | `0661:0883`, `0x0001` | 44 of 44 | 16, 24, 32-bit, 44.1 to 768 kHz | DSD64 to DSD512, both rate families (interface 2, alternate 4) | DSD64 to DSD256 |
+| SMSL USB AUDIO | `152a:85dd`, `0x0315` | 34 of 34 | 24, 32-bit, 44.1 to 768 kHz | DSD64 to DSD512, both rate families (interface 1, alternate 3) | DSD64 to DSD256 |
+| Schiit Unison Modius E | `30be:101a`, `0x0100` | 20 of 20 | 16, 24, 32-bit, 44.1 to 192 kHz | No native alternate admitted | DSD64 |
+| Hidizs AP80 Pro-X | `c502:0072`, `0xffff` | 34 of 34 | 16, 24, 32-bit, 32 to 384 kHz | DSD64 to DSD256 | DSD64, DSD128 |
+
+Every leg reported `passed_usb`. Each was bit-perfect, with a verified clock and a payload that matched the written bytes, and each closed cleanly. No leg had an underrun, a lost frame, a short packet or a transfer timeout. All four DACs ran at high speed with explicit feedback: the DC04U, SMSL and Modius E at a 125 µs service interval, the AP80 Pro-X at 250 µs. Some AP80 Pro-X feedback polls returned empty reports, without loss.
+
+What these runs do not show:
+
+- **The analog output.** The evidence is the USB transport as the host sees it. No analog output, acoustic result or DAC display was observed.
+- **DoP decoding.** The DoP rows prove the carrier only. Decoder lock was not observed.
+- **Native DSD under the default policy.** On the DC04U and the SMSL, native DSD came from the source-backed `DSD_RAW` rule, which the default `VerifiedOnly` policy does not apply.
+- **Anything beyond exact playback.** Implicit feedback, capture, the admission probes, converted fallback and other host routes were not exercised.
+
+The ledger keeps one summary per run in `docs/evidence/history/validator-*-20261127.json`. Each is derived from the validator ZIP, records that ZIP's SHA-256, and is itself checked by digest (`validator-dc04u`, `validator-smsl`, `validator-modius-e` and `validator-ap80` in the [status ledger](status.md)). The ZIPs are not committed because they contain debug logs. The rows are `historical-pass`, not `passed`, because the source revision and Android build were not recorded.
 
 The [generated capability and evidence table](status.md#implementation-boundaries) is the current summary. It separates historical physical runs, virtual results and pending hardware validation. The narratives below retain the details of the recorded physical runs, including their limits.
 

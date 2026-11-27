@@ -6,7 +6,7 @@ Each entry says what changed, then what that means **in plain terms**.
 
 Several of these came from studying how two other open-source players, Mornye and BitChord, behave with the same DACs. No code from either was used. Each change has a longer entry in [the design decisions](decisions.md), with what each of the three drivers does, the evidence and the public references.
 
-Every item is covered by automated tests. Direct USB PCM has played on a OnePlus 15 with two DACs, and native DSD on one of them. Most of what was added after 0.1.0 has been tested without a DAC only. [Hardware status](evidence.md#hardware-status)
+Every item is covered by automated tests. Direct USB PCM has played on a OnePlus 15 with four DACs, and native DSD on three of them; the [validator runs](evidence.md#validator-2026-11-27) cover USB delivery, not the analog output. Most of what was added after 0.1.0 has been tested without a DAC only. [Hardware status](evidence.md#hardware-status)
 
 ## Sound that does not drop out
 
@@ -59,7 +59,7 @@ dedicated feedback endpoint, an invalid report no longer hides an earlier good
 one in the same batch, and a slow moment in the app no longer leaves the
 endpoint unpolled. Your app can see when timing goes stale and handle
 playback failure if the device stops sending valid timing. Explicit feedback
-has run on two DACs. Implicit feedback has not run on a DAC yet.
+has run on four DACs. Implicit feedback has not run on a DAC yet.
 See [clock and pacing](decisions-clock.md#feedback).
 
 ### More kinds of DAC and the right clock on them
