@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub(super) struct IsoTransferCompletion {
@@ -344,17 +345,69 @@ impl Drop for IsoTransferSlot {
     }
 }
 
-/// Persistent asynchronous feedback IN slot.
-///
-/// The previous implementation performed a blocking feedback read from the
-/// single output thread. The OUT transfers on the bus only cover about 16 ms
-/// (`DacConfig::bus_queue_ms`), so a 50 ms feedback timeout could drain the
-/// entire hardware queue even while the software ring looked full. This slot
-/// is submitted once and re-armed from the same event loop after completion.
-/// It polls over at most the bus queue (and 16 ms), so a report is never older
-/// than what is queued for the DAC.
 const NO_FEEDBACK_PACKET_STATUS: i32 = i32::MIN;
 
+/// Keep a second batch submitted while the output thread handles the first.
+/// Divide the existing polling window between slots rather than growing it.
+pub(super) struct FeedbackTransfers {
+    pub(super) slots: Vec<FeedbackTransferSlot>,
+    pending: VecDeque<usize>,
+}
+
+fn feedback_poll_geometry(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> (usize, usize) {
+    if endpoint.transfer_type != TransferType::Isochronous {
+        return (1, 1);
+    }
+    let window_packets = (USB_FEEDBACK_POLL_WINDOW_MS.min(bus_queue_ms.max(1)) * 1_000)
+        / endpoint.service_interval_us.max(125);
+    let packets = window_packets.clamp(1, 32) as usize;
+    let slots = packets.min(2);
+    (slots, packets / slots)
+}
+
+impl FeedbackTransfers {
+    pub(super) fn new(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> Result<Self, String> {
+        let (count, packets_per_slot) = feedback_poll_geometry(endpoint, bus_queue_ms);
+        let slots = (0..count)
+            .map(|_| FeedbackTransferSlot::new(endpoint, packets_per_slot))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { slots, pending: VecDeque::with_capacity(count) })
+    }
+
+    pub(super) fn start(
+        &mut self, handle: &DeviceHandle<Context>, counters: &mut FeedbackCounters,
+    ) -> Result<(), FeedbackFault> {
+        for index in 0..self.slots.len() {
+            self.submit(index, handle, counters, true)?;
+        }
+        Ok(())
+    }
+
+    fn submit(
+        &mut self, index: usize, handle: &DeviceHandle<Context>, counters: &mut FeedbackCounters,
+        first: bool,
+    ) -> Result<(), FeedbackFault> {
+        let slot = &mut self.slots[index];
+        let result = slot.submit(handle);
+        counters.record_submit(index, slot.last_submit_status);
+        match result {
+            Ok(()) => self.pending.push_back(index),
+            Err(error) => {
+                counters.errors = counters.errors.saturating_add(1);
+                if let Some(fault) = feedback_submit_failure(error.clone(), slot.submit_no_device, first) {
+                    return Err(fault);
+                }
+                slot.retry_at = Instant::now() + Duration::from_millis(5);
+                if counters.errors <= 4 || counters.errors % 64 == 0 {
+                    log_warn!("explicit feedback resubmit failed: {}", error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Persistent asynchronous feedback IN transfer and its buffer.
 pub(super) struct FeedbackTransferSlot {
     pub(super) transfer: std::ptr::NonNull<libusb_transfer>,
     pub(super) user_data: *mut IsoTransferUserData,
@@ -370,15 +423,8 @@ pub(super) struct FeedbackTransferSlot {
 }
 
 impl FeedbackTransferSlot {
-    pub(super) fn new(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> Result<Self, String> {
+    fn new(endpoint: FeedbackEndpoint, packet_count: usize) -> Result<Self, String> {
         let packet_bytes = endpoint.max_packet_bytes.max(4);
-        let packet_count = if endpoint.transfer_type == TransferType::Isochronous {
-            let window_packets = (USB_FEEDBACK_POLL_WINDOW_MS.min(bus_queue_ms.max(1)) * 1_000)
-                / endpoint.service_interval_us.max(125);
-            window_packets.clamp(1, 32) as usize
-        } else {
-            1
-        };
 
         let poll_window_ms = ((packet_count as u64)
             .saturating_mul(endpoint.service_interval_us as u64)
@@ -587,14 +633,14 @@ impl FeedbackCounters {
         self.selected_timebase == Some(FeedbackTimebase::OutService)
     }
 
-    pub(super) fn record_submit(&mut self, status: Option<i32>) {
+    fn record_submit(&mut self, index: usize, status: Option<i32>) {
         if let Some(status) = status {
             if let Some(diagnostics) = self.diagnostics.as_mut() {
                 diagnostics.record_submit(status);
                 self.diagnostics_dirty = true;
             }
             if let Some(trace) = &self.trace {
-                trace.record(crate::FeedbackTraceEvent::Submit { slot: None, status });
+                trace.record(crate::FeedbackTraceEvent::Submit { slot: Some(index), status });
             }
         }
     }
@@ -785,13 +831,18 @@ fn feedback_completion_fault(status: i32, stopping: bool, endpoint: u8) -> Optio
     }
 }
 
-pub(super) fn pump_feedback_transfer(
-    handle: &DeviceHandle<Context>, slot: &mut FeedbackTransferSlot,
+pub(super) fn pump_feedback_transfers(
+    handle: &DeviceHandle<Context>, transfers: &mut FeedbackTransfers,
     scheduler: &mut IsoPacketScheduler, data_service_interval_us: u32, speed: Speed,
     max_frames: usize, per_service: bool, counters: &mut FeedbackCounters, stop: &AtomicBool,
     health: ExplicitFeedbackHealth, started_at: Instant,
 ) -> Result<(), FeedbackFault> {
-    if let Some((status, completed_at, actual_length)) = slot.take_completion() {
+    // Finished batches belong to earlier USB intervals even if libusb hands
+    // a later slot back first. Process them in submission order.
+    while let Some(&index) = transfers.pending.front() {
+        let slot = &mut transfers.slots[index];
+        let Some((status, completed_at, actual_length)) = slot.take_completion() else { break };
+        transfers.pending.pop_front();
         slot.mark_completed();
         if let Some(diagnostics) = counters.diagnostics.as_mut() {
             diagnostics.record_transfer(status);
@@ -799,7 +850,7 @@ pub(super) fn pump_feedback_transfer(
         }
         if let Some(trace) = &counters.trace {
             trace.record_at(completed_at, crate::FeedbackTraceEvent::Completion {
-                slot: None, status, actual_bytes: actual_length,
+                slot: Some(index), status, actual_bytes: actual_length,
             });
         }
         let report = slot.newest_valid_report(scheduler, data_service_interval_us, speed,
@@ -817,7 +868,11 @@ pub(super) fn pump_feedback_transfer(
                     }
                     if scheduler.update_feedback_frames_per_packet(frames) {
                         counters.reports = counters.reports.saturating_add(1);
-                        counters.last_report_at = Some(completed_at);
+                        // Completion callbacks can run out of order. Never
+                        // regress the last-report timestamp in that case.
+                        counters.last_report_at = Some(counters.last_report_at.map_or(
+                            completed_at, |last| last.max(completed_at),
+                        ));
                         counters.last_frames_per_packet = Some(frames);
                         counters.last_estimated_sample_rate = Some(rate);
                         if counters.reports == 1 || counters.reports % 128 == 0 {
@@ -837,18 +892,14 @@ pub(super) fn pump_feedback_transfer(
         if status != LIBUSB_TRANSFER_COMPLETED {
             slot.retry_at = Instant::now() + Duration::from_millis(5);
         }
+        if !usb_stop_requested(stop) && Instant::now() >= slot.retry_at {
+            transfers.submit(index, handle, counters, false)?;
+        }
     }
-    if !usb_stop_requested(stop) && !slot.in_flight && Instant::now() >= slot.retry_at {
-        let submission = slot.submit(handle);
-        counters.record_submit(slot.last_submit_status);
-        if let Err(error) = submission {
-            if let Some(fault) = feedback_submit_failure(error.clone(), slot.submit_no_device, false) { return Err(fault); }
-            counters.errors = counters.errors.saturating_add(1);
-            slot.retry_at = Instant::now() + Duration::from_millis(5);
-            // The health deadline bounds retries; never fall back to nominal timing.
-            if counters.errors <= 4 || counters.errors % 64 == 0 {
-                log_warn!("explicit feedback resubmit failed: {}", error);
-            }
+    for index in 0..transfers.slots.len() {
+        let slot = &transfers.slots[index];
+        if !usb_stop_requested(stop) && !slot.in_flight && Instant::now() >= slot.retry_at {
+            transfers.submit(index, handle, counters, false)?;
         }
     }
     Ok(())
@@ -1096,6 +1147,26 @@ mod explicit_feedback_tests {
             total += packet_bytes.into_iter().map(|n| n / 8).sum::<usize>();
         }
         assert!((total as f64 - selected.0 * packets as f64).abs() < 1.0);
+    }
+
+    #[test]
+    fn pipelined_iso_feedback_stays_within_the_poll_packet_budget() {
+        let mut endpoint = FeedbackEndpoint {
+            refresh: 0,
+            address: 0x81,
+            transfer_type: TransferType::Isochronous,
+            interval: 4,
+            service_interval_us: 1000,
+            max_packet_bytes: 4,
+        };
+        assert_eq!(feedback_poll_geometry(endpoint, 16), (2, 8));
+        assert_eq!(feedback_poll_geometry(endpoint, 5), (2, 2));
+        endpoint.service_interval_us = 125;
+        assert_eq!(feedback_poll_geometry(endpoint, 64), (2, 16));
+        endpoint.service_interval_us = 32_000;
+        assert_eq!(feedback_poll_geometry(endpoint, 16), (1, 1));
+        endpoint.transfer_type = TransferType::Interrupt;
+        assert_eq!(feedback_poll_geometry(endpoint, 16), (1, 1));
     }
 
     #[test]

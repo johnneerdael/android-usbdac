@@ -230,24 +230,25 @@ pub(super) fn drain_iso_transfer_slots(context: &Context, slots: &mut [IsoTransf
 
 }
 
-pub(super) fn drain_feedback_transfer_slot(context: &Context, slot: &mut Option<FeedbackTransferSlot>) {
-    let Some(slot) = slot.as_mut() else {
-        return;
-    };
-    slot.cancel();
-
+pub(super) fn drain_feedback_transfer_slots(context: &Context, slots: &mut [FeedbackTransferSlot]) {
+    for slot in slots.iter_mut() {
+        slot.cancel();
+    }
     let mut warned = false;
-    while slot.in_flight {
+    while slots.iter().any(|slot| slot.in_flight) {
         if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
-            if !warned { log_warn!("USB feedback cancellation retirement pending: {}", error); warned = true; }
+            if !warned {
+                log_warn!("USB feedback cancellation retirement pending: {}", error);
+                warned = true;
+            }
             thread::sleep(Duration::from_millis(10));
         }
-        if slot.take_completion().is_some() {
-            slot.mark_completed();
+        for slot in slots.iter_mut() {
+            if slot.take_completion().is_some() {
+                slot.mark_completed();
+            }
         }
     }
-
-
 }
 
 /// Cancels the transfers the flush left on the bus and waits until libusb has
@@ -437,12 +438,13 @@ pub(super) fn publish_feedback_counters(stats: &RuntimeStats, counters: &Feedbac
 
 fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounters, final_snapshot: bool) {
     let Some(mut diagnostics) = counters.diagnostics else { return };
+    diagnostics.accepted_reports = counters.reports;
+    diagnostics.empty_polls = counters.empty_polls;
+    diagnostics.rejected_reports = counters.rejected;
     if final_snapshot {
-        diagnostics.accepted_reports = counters.reports;
         *stats.explicit_feedback_diagnostics.lock() = Some(diagnostics);
     } else if counters.diagnostics_dirty {
         if let Some(mut snapshot) = stats.explicit_feedback_diagnostics.try_lock() {
-            diagnostics.accepted_reports = counters.reports;
             *snapshot = Some(diagnostics);
             counters.diagnostics_dirty = false;
         }
@@ -511,12 +513,12 @@ pub(super) fn run_usb_output_loop(
     // impossible for this device and only bus-side cushioning can help.
     log_iso_endpoint_descriptors(&handle, &candidate);
     let feedback_endpoint = candidate.feedback_endpoint;
-    let mut feedback_slot = None;
+    let mut feedback_transfers = None;
     let mut feedback_start_error = None;
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
-            match FeedbackTransferSlot::new(endpoint, bus_config.bus_queue_ms) {
-                Ok(slot) => feedback_slot = Some(slot),
+            match FeedbackTransfers::new(endpoint, bus_config.bus_queue_ms) {
+                Ok(transfers) => feedback_transfers = Some(transfers),
                 Err(error) => {
                     feedback_start_error = Some(format!("explicit feedback allocation failed: {}", error));
                 }
@@ -588,9 +590,10 @@ pub(super) fn run_usb_output_loop(
             feedback_refresh: endpoint.refresh,
             feedback_service_interval_us: endpoint.service_interval_us,
             feedback_max_packet_bytes: endpoint.max_packet_bytes,
-            requested_packet_bytes: feedback_slot.as_ref().map_or(0, |slot| slot.packet_bytes),
-            packets_per_transfer: feedback_slot.as_ref().map_or(0, |slot| slot.packet_count),
-            transfer_timeout_ms: feedback_slot.as_ref().map_or(0, |slot| slot.timeout_ms),
+            transfer_slots: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots.len()),
+            requested_packet_bytes: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].packet_bytes),
+            packets_per_transfer: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].packet_count),
+            transfer_timeout_ms: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].timeout_ms),
             per_service_interval_quirk: feedback_per_service,
             ..Default::default()
         });
@@ -733,36 +736,31 @@ pub(super) fn run_usb_output_loop(
             }
         }
     }
-    if let Some(slot) = feedback_slot.as_mut().filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop)) {
-        let endpoint = slot.endpoint;
-        let submission = slot.submit(&handle);
-        feedback_counters.record_submit(slot.last_submit_status);
-        match submission {
+    if let Some(transfers) = feedback_transfers.as_mut().filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop)) {
+        match transfers.start(handle, &mut feedback_counters) {
             Ok(()) => {
+                let slot = &transfers.slots[0];
+                let endpoint = slot.endpoint;
                 log_info!(
-                    "[USB] Feedback endpoint 0x{:02x} {} interval={} service={}us maxPacket={} pollPackets={} timeout={}ms (asynchronous, nonblocking)",
+                    "[USB] Feedback endpoint 0x{:02x} {} interval={} service={}us maxPacket={} pollSlots={} pollPackets={} timeout={}ms (asynchronous, nonblocking)",
                     endpoint.address,
                     transfer_type_label(endpoint.transfer_type),
                     endpoint.interval,
                     endpoint.service_interval_us,
                     endpoint.max_packet_bytes,
+                    transfers.slots.len(),
                     slot.packet_count,
                     slot.timeout_ms,
                 );
             }
-            Err(error) => {
-                dev_eprintln!(
-                    "[USB] Feedback endpoint 0x{:02x} initial submit failed: {}",
-                    endpoint.address,
-                    error
-                );
-                feedback_counters.errors = feedback_counters.errors.saturating_add(1);
+            Err(FeedbackFault::DeviceLost) => {
                 explicit_feedback_fault = true;
-                match feedback_submit_failure(error, slot.submit_no_device, true) {
-                    Some(FeedbackFault::DeviceLost) => { device_lost = true; fatal_error = Some("explicit feedback device disconnected during initial submit".into()); }
-                    Some(FeedbackFault::Transfer(error)) => { fatal_error = Some(error); }
-                    None => unreachable!("first explicit submit failure is terminal"),
-                }
+                device_lost = true;
+                fatal_error = Some("explicit feedback device disconnected during initial submit".into());
+            }
+            Err(FeedbackFault::Transfer(error)) => {
+                explicit_feedback_fault = true;
+                fatal_error = Some(error);
             }
         }
     }
@@ -850,10 +848,10 @@ pub(super) fn run_usb_output_loop(
             handled_flush_epoch = flush_epoch;
             if bus_config.cancel_in_flight_on_flush {
                 let started = Instant::now();
-                let cancel_result = if implicit.is_some() || feedback_slot.is_some() {
+                let cancel_result = if implicit.is_some() || feedback_transfers.is_some() {
                     let targets = flush_cancel_targets(flush_epoch, slots.iter().map(|slot| (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)));
                     for &index in &targets { slots[index].cancel_for_flush(); }
-                    if feedback_slot.is_some() && !targets.is_empty() {
+                    if feedback_transfers.is_some() && !targets.is_empty() {
                         explicit_flush_deadline.get_or_insert(started + FLUSH_CANCEL_TIMEOUT);
                     }
                     Ok(targets.len())
@@ -882,10 +880,10 @@ pub(super) fn run_usb_output_loop(
                 device_lost = error.contains("disconnected"); implicit_feedback_fault = true; fatal_error = Some(error); break;
             }
         }
-        if let Some(feedback_slot) = feedback_slot.as_mut() {
-            let result = pump_feedback_transfer(
-                &handle,
-                feedback_slot,
+        if let Some(transfers) = feedback_transfers.as_mut() {
+            let result = pump_feedback_transfers(
+                handle,
+                transfers,
                 &mut scheduler,
                 candidate.service_interval_us,
                 candidate.usb_speed,
@@ -1264,10 +1262,10 @@ pub(super) fn run_usb_output_loop(
 
             if successful_transfers >= geometry.stable_transfers {
                 // A stream that has lost audio never asserts stability again.
-                if !completed_underrun && !loss_tracker.is_latched() && ((implicit.is_none() && feedback_slot.is_none()) || runtime_stats.feedback_locked.load(Ordering::Acquire)) {
+                if !completed_underrun && !loss_tracker.is_latched() && ((implicit.is_none() && feedback_transfers.is_none()) || runtime_stats.feedback_locked.load(Ordering::Acquire)) {
                     set_usb_stream_stable(true);
                     if !logged_usb_stabilized {
-                        if feedback_slot.is_none() && implicit.is_none() {
+                        if feedback_transfers.is_none() && implicit.is_none() {
                             scheduler.lock_to_nominal_packet_timing();
                             log_info!(
                                 "[USB] USB stream stabilized after {} isochronous transfers (nominal packet timing locked)",
@@ -1374,10 +1372,14 @@ pub(super) fn run_usb_output_loop(
     shared.note_bit_perfect();
     for slot in &mut slots { slot.cancel(); }
     if let Some(engine) = implicit.as_mut() { for slot in &mut engine.slots { slot.cancel(); } }
-    if let Some(slot) = feedback_slot.as_mut() { slot.cancel(); }
+    if let Some(transfers) = feedback_transfers.as_mut() {
+        for slot in &mut transfers.slots { slot.cancel(); }
+    }
     drain_iso_transfer_slots(&context, &mut slots);
     if let Some(engine) = implicit.as_mut() { drain_iso_transfer_slots(&context, &mut engine.slots); }
-    drain_feedback_transfer_slot(&context, &mut feedback_slot);
+    if let Some(transfers) = feedback_transfers.as_mut() {
+        drain_feedback_transfer_slots(context, &mut transfers.slots);
+    }
     runtime_stats.feedback_locked.store(false, Ordering::Release);
 
     drop(usb_owner);
