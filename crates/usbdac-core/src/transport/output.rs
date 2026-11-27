@@ -908,7 +908,8 @@ pub(super) fn run_usb_output_loop(
     let capture_uses_implicit_feedforward = capture_pool.as_ref()
         .is_some_and(|pool| pool.uses_implicit_feedforward());
     // Duplex readiness requires a completed, fully valid adaptive-source
-    // feedforward send, under this same USB event owner.
+    // feedforward send and, for no-control UAC1 capture, measured IN cadence
+    // after the declared lock delay, under this same USB event owner.
     while fatal_error.is_none() && !usb_stop_requested(&stop)
         && capture_pool.as_ref().is_some_and(|pool| !pool.primed()) {
         if let Err(error) = context.handle_events(Some(Duration::from_millis(1))) {

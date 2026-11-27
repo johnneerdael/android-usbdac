@@ -246,6 +246,32 @@ Android arm64 target check passed, and the release AAR and sample
 contain matching native libraries for all four ABIs. The AAR SHA-256
 is `a9e8020be14abdc46dd7a7172c3a5a1ef8cfbac76c13a3f5511328c0b6589f4a`.
 
+### Host-paced UAC1 capture without a rate control
+
+A multi-rate adaptive UAC1 IN alternate can use the host's rate word
+when its descriptors explicitly omit Sampling Frequency control and
+identify the associated timing OUT endpoint. Require unpadded PCM
+packets so the driver can count actual frames. Select the caller's
+exact advertised rate using the timing pipe. [USB-IF UAC1 §§3.7.2.2 and 5.2.3.2.3](https://www.usb.org/sites/default/files/audio10.pdf),
+[USB 2.0 §§5.12.4.1–2](https://www.alsa-project.org/files/pub/datasheets/usb/usb_20.pdf),
+[ALSA UAC1 endpoint rate setup](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/clock.c#L433-L449)
+
+After the first successful rate word and the declared endpoint lock
+delay, measure whole PCM frames over at least 100 ms of USB service
+intervals. Allow a two-frame tolerance for packet boundaries and
+fixed-point rounding. Standalone capture and duplex wait for this
+proof before delivering audio. If timing or frame-count proof is lost,
+suppress capture until it recovers or the bounded deadline expires.
+Exercise two rates on one adaptive alternate during final hardware
+acceptance and confirm the measured cadence follows the rate word.
+
+Rust workspace tests covered explicit descriptor admission, startup
+qualification, sparse service intervals and loss of rate proof. The
+Android arm64 target check, release AAR and sample build passed.
+All four ABIs contain matching native libraries in both packages.
+The AAR SHA-256 is
+`4da7f17089fc8a41e4f52f32052b29459c409ce70a6056e1959005f2a732fff6`.
+
 ### UAC1 duplex endpoint rates
 
 Resolve each PCM alternate through the UAC1 AudioControl collection
@@ -259,7 +285,8 @@ Activate both alternates before reading or programming endpoint rates.
 Use the class-specific Sampling Frequency capability and verify every
 programmable endpoint again after both operations. The fixed-rate
 capture and fixed or host-paced playback cases use descriptor evidence
-when they explicitly omit the rate control. Keep the original readable
+when they explicitly omit the rate control. Multi-rate adaptive capture
+uses the host timing proof above. Keep the original readable
 rates through teardown. After transfers retire, restore those rates
 while the endpoints are still active, then reset both alternates.
 [USB-IF UAC1 §§4.6.1.2 and 5.2.3.2.3.1](https://www.usb.org/sites/default/files/audio10.pdf),

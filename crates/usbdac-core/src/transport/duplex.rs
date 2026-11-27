@@ -75,7 +75,7 @@ fn uac1_pair_profile(claimed: &ClaimedHandle, playback: &IsoStreamCandidate,
         && !uac1_playback_rate_verified(expected.sample_rate, None, profile, true) {
         return Err(Error::Unsupported { reason: "UAC1 duplex OUT has neither explicit rate control nor a fixed or host-paced rate contract".into(), offered: vec![] });
     }
-    let input_control = capture_stream::uac1_duplex_capture_sampling_control(endpoint)?;
+    let input_control = capture_stream::uac1_capture_sampling_control(endpoint)?;
     Ok((profile, input_control, owner))
 }
 
@@ -749,6 +749,7 @@ pub(super) struct InputPool {
     pub(super) slots: Vec<IsoTransferSlot>,
     feedforward: Option<capture_stream::FeedforwardPool>,
     implicit_feedforward: Option<ImplicitFeedforwardHealth>,
+    rate_proof: Option<capture_rate::CaptureRateProof>,
     attachment: Arc<Attachment>,
     order: VecDeque<usize>,
     reordered: Vec<bool>,
@@ -769,7 +770,8 @@ impl InputPool {
         let implicit_feedforward = attachment.endpoint.adc3_route.as_ref()
             .is_some_and(|route| route.implicit_feedforward).then(ImplicitFeedforwardHealth::new);
         let lock_delay = endpoint_lock::LockDelayGate::new(attachment.lock_delay);
-        Ok(Self { slots, feedforward, implicit_feedforward, lock_delay, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
+        let rate_proof = capture_rate::CaptureRateProof::for_endpoint(&attachment.endpoint, geometry, attachment.lock_delay);
+        Ok(Self { slots, feedforward, implicit_feedforward, rate_proof, lock_delay, attachment, order: VecDeque::with_capacity(geometry.transfer_slots),
             reordered: vec![false; geometry.transfer_slots], scratch: vec![CapturePacket {
                 requested_bytes: 0, actual_bytes: 0, succeeded: false }; geometry.packets_per_transfer] })
     }
@@ -783,7 +785,10 @@ impl InputPool {
         }
         Ok(())
     }
-    pub(super) fn primed(&self) -> bool { self.feedforward.as_ref().map_or(true, |pool| pool.primed()) }
+    pub(super) fn primed(&self) -> bool {
+        self.feedforward.as_ref().map_or(true, |pool| pool.primed())
+            && self.rate_proof.as_ref().map_or(true, |proof| proof.qualified())
+    }
     pub(super) fn uses_implicit_feedforward(&self) -> bool { self.implicit_feedforward.is_some() }
     pub(super) fn note_playback_submitted(&mut self, at: Instant, transfer_duration: Duration) {
         if let Some(health) = self.implicit_feedforward.as_mut() { health.submitted(at, transfer_duration); }
@@ -830,7 +835,17 @@ impl InputPool {
                 if let Err(error) = &result { *self.attachment.error.lock() = Some(error.clone()); }
                 result
             } else if timing_allowed {
-                self.attachment.ingest(&self.slots[index], status, &mut self.scratch)
+                // Only measured IN cadence can establish a no-control UAC1
+                // rate. The feedforward word and declared lock delay merely
+                // make this completion eligible to contribute to that proof.
+                let admission = self.rate_proof.as_mut().map_or(Ok(true), |proof|
+                    proof.observe(&self.attachment.endpoint, &self.slots[index], status,
+                        completed, &mut self.scratch));
+                match admission {
+                    Ok(true) => self.attachment.ingest(&self.slots[index], status, &mut self.scratch),
+                    Ok(false) => self.attachment.discard_before_timing(&self.slots[index], status, &mut self.scratch),
+                    Err(error) => Err(error),
+                }
             } else {
                 self.attachment.discard_before_timing(&self.slots[index], status, &mut self.scratch)
             };
@@ -841,6 +856,9 @@ impl InputPool {
                     .map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost } else { Error::Transfer(e) })?;
                 self.order.push_back(index);
             }
+        }
+        if !usb_stop_requested(stop) {
+            if let Some(proof) = self.rate_proof.as_mut() { proof.check(Instant::now())?; }
         }
         Ok(())
     }

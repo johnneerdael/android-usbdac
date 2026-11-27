@@ -27,6 +27,13 @@ pub(crate) struct CaptureEndpoint {
 }
 
 impl CaptureEndpoint {
+    /// Variable UAC1 capture without endpoint rate control can be admitted only
+    /// through its standard adaptive host-timing pipe and a live PCM proof.
+    pub(super) fn requires_host_rate_proof(&self) -> bool {
+        self.protocol == 0 && !self.sampling_control && !self.fixed_rate
+            && self.standard_feedforward.is_some()
+    }
+
     pub(super) fn feedforward(&self) -> Option<adc3::FeedforwardEndpoint> {
         self.standard_feedforward.or_else(|| self.adc3_route.as_ref().and_then(|route| route.feedforward))
     }
@@ -413,7 +420,7 @@ pub(super) fn capture_candidates(
                 .take_while(|d| d[1] != 5)
                 .find(|d| d.len() >= 7 && d[1] == 0x25 && d[2] == 1)
                 .is_some_and(|d| d[3] & 1 != 0);
-            candidates.push(CaptureEndpoint {
+            let candidate = CaptureEndpoint {
                 configuration,
                 interface: interface.number,
                 alternate: interface.alternate,
@@ -436,7 +443,14 @@ pub(super) fn capture_candidates(
                 fixed_rate,
                 adc3_route: None,
                 vendor_pcm: None,
-            });
+            };
+            // Refuse unqualified variable UAC1 alternates before selection so
+            // they cannot hide a later, explicitly host-timed alternate.
+            if candidate.protocol == 0 && !candidate.sampling_control && !candidate.fixed_rate
+                && uac1_capture_sampling_control(&candidate).is_err() {
+                continue;
+            }
+            candidates.push(candidate);
         }
     }
     Ok(candidates)
@@ -509,16 +523,17 @@ pub(super) fn verify_standard_capture(
     reprove_standard_capture(&raw, resolve_device_speed(&claimed.handle.device()), candidate)
 }
 
-/// Duplex activation needs explicit endpoint control evidence. Discovery's bool
+/// Host-timed and duplex activation need explicit endpoint control evidence. Discovery's bool
 /// deliberately cannot distinguish a missing record from a bit-clear record.
-pub(super) fn uac1_duplex_capture_sampling_control(capture: &CaptureEndpoint) -> Result<bool, Error> {
-    let invalid = || Error::InvalidState("UAC1 duplex capture sampling control is not proven".into());
+pub(super) fn uac1_capture_sampling_control(capture: &CaptureEndpoint) -> Result<bool, Error> {
+    let invalid = || Error::InvalidState("UAC1 capture sampling control is not proven".into());
     if capture.protocol != 0 || capture.vendor_pcm.is_some() || capture.adc3_route.is_some() {
         return Err(invalid());
     }
     let raw = &capture.endpoint_descriptors;
     let mut at = 0;
     let mut control = None;
+    let mut max_packets_only = false;
     while at < raw.len() {
         let length = usize::from(raw[at]);
         if length < 2 || at + length > raw.len() { return Err(invalid()); }
@@ -530,12 +545,14 @@ pub(super) fn uac1_duplex_capture_sampling_control(capture: &CaptureEndpoint) ->
                 return Err(invalid());
             }
             control = Some(d[3] & 1 != 0);
+            max_packets_only = d[3] & 0x80 != 0;
         }
         at += length;
     }
     match control {
         Some(true) if capture.sampling_control => Ok(true),
-        Some(false) if !capture.sampling_control && capture.fixed_rate => Ok(false),
+        Some(false) if !capture.sampling_control && (capture.fixed_rate
+            || (capture.requires_host_rate_proof() && !max_packets_only)) => Ok(false),
         _ => Err(invalid()),
     }
 }
@@ -1054,6 +1071,11 @@ pub(super) fn configure_capture_endpoint_guarded(
         }
         return Ok(true);
     }
+    if candidate.protocol == 0 && !candidate.sampling_control && !candidate.fixed_rate {
+        // Prove the explicit bit-clear descriptor before any alternate writes.
+        // Topology discovery alone cannot distinguish missing control evidence.
+        uac1_capture_sampling_control(candidate)?;
+    }
     claimed
         .ensure_interface_claimed(candidate.control)
         .map_err(Error::Claim)?;
@@ -1093,7 +1115,7 @@ pub(super) fn configure_capture_endpoint_guarded(
                     reported_hz: reported,
                 });
             }
-        } else if !candidate.fixed_rate {
+        } else if !candidate.fixed_rate && !candidate.requires_host_rate_proof() {
             return Err(Error::ClockUnverified {
                 requested_hz: rate,
                 reported_hz: None,
@@ -2045,6 +2067,7 @@ fn run_capture(
             endpoint.alternate, endpoint.address, true).or_control()?
     };
     let mut lock_delay = endpoint_lock::LockDelayGate::new(delay);
+    let mut host_rate = capture_rate::CaptureRateProof::for_endpoint(endpoint, geometry, delay);
     let targets: Vec<_> = status_target(owner.claimed(), endpoint)?.into_iter().collect();
     // Declared after the owner and before data transfers: all failure/unwind
     // paths retire the status request before resetting an alternate or handle.
@@ -2103,7 +2126,7 @@ fn run_capture(
     let input_started = Instant::now();
     let mut latest_input: Option<Instant> = None;
     let mut announced = false;
-    if feedforward.is_none() && companion.is_none() && vendor_rate.is_none() { let _ = ready.send(Ok(())); announced = true; }
+    if feedforward.is_none() && companion.is_none() && vendor_rate.is_none() && host_rate.is_none() { let _ = ready.send(Ok(())); announced = true; }
     while !usb_stop_requested(stop) {
         owner
             .claimed()
@@ -2122,7 +2145,7 @@ fn run_capture(
             pool.pump(&owner.claimed().handle, stop)?;
         }
         if let Some(pool) = companion.as_mut() { pool.pump(&owner.claimed().handle, stop)?; }
-        if !announced && companion.is_none() && vendor_rate.is_none() && feedforward.as_ref().map_or(true, |pool| pool.primed()) {
+        if !announced && companion.is_none() && vendor_rate.is_none() && host_rate.is_none() && feedforward.as_ref().map_or(true, |pool| pool.primed()) {
             let _ = ready.send(Ok(())); announced = true;
         }
         if let Some(&head) = order.front() {
@@ -2168,6 +2191,18 @@ fn run_capture(
                 && companion.as_ref().map_or(true, |pool| pool.accepts_capture(completed));
             let captured_before = companion.as_ref().map(|_| queue.stats().captured_frames);
             let lock_pending = lock_delay.pending();
+            let host_allowed = if !lock_pending && capture_allowed {
+                if let Some(gate) = host_rate.as_mut() {
+                    match gate.observe(endpoint, &slots[index], status, completed, &mut scratch) {
+                        Ok(allowed) => allowed,
+                        Err(error) => {
+                            drop(queue);
+                            slots[index].mark_completed();
+                            return Err(error);
+                        }
+                    }
+                } else { true }
+            } else { host_rate.is_none() };
             let result = if lock_pending {
                 let timing_allowed = capture_allowed && slots[index].submitted_at.is_some_and(|submitted|
                     feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(submitted))
@@ -2176,7 +2211,7 @@ fn run_capture(
                     endpoint.format.bytes_per_frame(), endpoint.service_us, timing_allowed, &mut lock_delay);
                 queue.merge_stats(stats);
                 result
-            } else if capture_allowed {
+            } else if capture_allowed && host_allowed {
                 ingest_slot(&slots[index], status, &mut queue, &mut scratch)
             } else {
                 discard_unprimed_capture(&slots[index], status, &mut scratch, endpoint.format.bytes_per_frame())
@@ -2205,6 +2240,12 @@ fn run_capture(
                         }
                     })?;
                 order.push_back(index);
+            }
+        }
+        if let Some(gate) = host_rate.as_ref() {
+            gate.check(Instant::now())?;
+            if !announced && gate.qualified() {
+                let _ = ready.send(Ok(())); announced = true;
             }
         }
         if let Some(gate) = vendor_rate.as_ref() {
@@ -2523,6 +2564,51 @@ mod tests {
         pool.first_valid_send = Some(at);
         assert!(!pool.accepts_capture_transfer(at, Some(at - Duration::from_millis(1))));
         assert!(pool.accepts_capture_transfer(at, Some(at)));
+    }
+
+    #[test]
+    fn variable_adaptive_uac1_needs_explicit_unpadded_host_rate_evidence() {
+        for rates in [
+            [14, 0x24, 2, 1, 2, 3, 24, 2, 0x80, 0xbb, 0, 0x44, 0xac, 0],
+            [14, 0x24, 2, 1, 2, 3, 24, 0, 0x44, 0xac, 0, 0x80, 0xbb, 0],
+        ] {
+            let mut raw = adaptive_uac1_configuration(4);
+            let format = raw.windows(4).position(|w| w == [11, 0x24, 2, 1]).unwrap();
+            raw.splice(format..format + 11, rates);
+            let control = raw.windows(3).position(|w| w == [7, 0x25, 1]).unwrap();
+            raw[control + 3] = 0;
+            update_configuration_length(&mut raw);
+            let mut padded_raw = raw.clone();
+            padded_raw[control + 3] = 0x80;
+            assert!(capture_candidates(&padded_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            let mut missing_raw = raw.clone();
+            missing_raw.drain(control..control + 7);
+            update_configuration_length(&mut missing_raw);
+            assert!(capture_candidates(&missing_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            let mut asynchronous_raw = raw.clone();
+            let data = asynchronous_raw.windows(4).position(|w| w == [9, 5, 0x81, 9]).unwrap();
+            asynchronous_raw[data + 3] = 5;
+            asynchronous_raw[data + 8] = 0;
+            assert!(capture_candidates(&asynchronous_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            for rate in [44_100, 48_000] {
+                let endpoint = capture_candidates(&raw, 1, Speed::Full, rate).unwrap().remove(0);
+                assert!(endpoint.requires_host_rate_proof());
+                assert_eq!(uac1_capture_sampling_control(&endpoint).unwrap(), false);
+                assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
+                let geometry = IsoQueueGeometry::for_stream(endpoint.service_us, 8, 4);
+                assert!(capture_rate::CaptureRateProof::for_endpoint(&endpoint, geometry, None).is_some());
+                let mut padded = endpoint.clone();
+                padded.endpoint_descriptors[12] = 0x80;
+                assert!(uac1_capture_sampling_control(&padded).is_err());
+                let mut missing = endpoint.clone();
+                missing.endpoint_descriptors.drain(9..16);
+                assert!(uac1_capture_sampling_control(&missing).is_err());
+                let mut untimed = endpoint;
+                untimed.standard_feedforward = None;
+                assert!(!untimed.requires_host_rate_proof());
+                assert!(uac1_capture_sampling_control(&untimed).is_err());
+            }
+        }
     }
 
     #[test]
@@ -2880,13 +2966,13 @@ mod tests {
     fn duplex_capture_requires_explicit_unambiguous_endpoint_rate_control() {
         let raw = configuration(0);
         let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
-        assert_eq!(uac1_duplex_capture_sampling_control(&candidate).unwrap(), true);
+        assert_eq!(uac1_capture_sampling_control(&candidate).unwrap(), true);
         let mut fixed = candidate.clone();
         fixed.endpoint_descriptors[12] = 0x80; // Explicit no-control + MaxPacketsOnly.
         fixed.sampling_control = false;
-        assert_eq!(uac1_duplex_capture_sampling_control(&fixed).unwrap(), false);
+        assert_eq!(uac1_capture_sampling_control(&fixed).unwrap(), false);
         fixed.fixed_rate = false;
-        assert!(uac1_duplex_capture_sampling_control(&fixed).is_err());
+        assert!(uac1_capture_sampling_control(&fixed).is_err());
         for descriptors in [
             candidate.endpoint_descriptors[..9].to_vec(),
             [candidate.endpoint_descriptors.as_slice(), &[7, 0x25, 1, 1, 0, 0, 0]].concat(),
@@ -2895,7 +2981,7 @@ mod tests {
         ] {
             let mut malformed = candidate.clone();
             malformed.endpoint_descriptors = descriptors;
-            assert!(uac1_duplex_capture_sampling_control(&malformed).is_err());
+            assert!(uac1_capture_sampling_control(&malformed).is_err());
         }
     }
 

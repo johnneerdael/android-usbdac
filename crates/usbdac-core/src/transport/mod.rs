@@ -141,6 +141,7 @@ const USB_TIMING_LOG_INTERVAL: u64 = 128;
 
 pub(crate) mod api;
 pub(crate) mod capture_stream;
+mod capture_rate;
 pub(crate) mod duplex;
 mod adc3;
 use adc3::*;
