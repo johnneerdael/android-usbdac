@@ -69,6 +69,12 @@ public enum class PcmLayout(internal val bits: Int, internal val slotBytes: Int)
     /** Signed 16-bit in 2 bytes. */
     PCM_16(16, 2),
 
+    /** Signed 16-bit left-justified in a 3-byte slot; the low byte must be zero. */
+    PCM_16_IN_24(16, 3),
+
+    /** Signed 16-bit left-justified in a 4-byte slot; the low two bytes must be zero. */
+    PCM_16_IN_32(16, 4),
+
     /** Signed 24-bit packed in 3 bytes. */
     PCM_24_PACKED(24, 3),
 
@@ -89,9 +95,8 @@ public enum class PcmLayout(internal val bits: Int, internal val slotBytes: Int)
  *   the rounding of resampled values to integers).
  * @property quality Used for sample-rate conversion.
  * @property headroomDb Gain in dB (zero or negative, down to -60) applied after sample-rate
- *   conversion. A resampled signal can exceed its input's peak by up to 3 dB (a full-scale square
- *   wave does); integer outputs saturate at full scale and [PcmConverter.clippedSamples] counts it.
- *   `-3.5` keeps even that from clipping. The default 0 keeps the gain at exactly 1 at DC.
+ *   conversion. The default is -3.5 dB, which covers the measured square-wave overshoot but
+ *   does not guarantee all signals avoid clipping. Set 0 explicitly for unity gain at DC.
  * @property ditherSeed Seed of the dither's pseudo-random generator (not negative); `null` for the library's own. The same seed
  *   gives the same output.
  * @property sourceLayout The layout of the source samples when it is not the one
@@ -100,7 +105,7 @@ public enum class PcmLayout(internal val bits: Int, internal val slotBytes: Int)
 public data class ConversionOptions(
     val narrowing: NarrowingMode = NarrowingMode.TPDF_DITHER,
     val quality: ResampleQuality = ResampleQuality.HIGH,
-    val headroomDb: Double = 0.0,
+    val headroomDb: Double = -3.5,
     val ditherSeed: Long? = null,
     val sourceLayout: PcmLayout? = null,
 )
@@ -166,6 +171,11 @@ public class ConversionPlan internal constructor(
     /** The filter, when [resamples]. */
     public val resampler: ResamplerInfo?,
 ) {
+    /** True when every complete input buffer must satisfy the declared zero padding contract. */
+    public val requiresPaddingValidation: Boolean = JSONObject(requestJson).getJSONObject("source").getJSONObject("sample").let {
+        it.optString("kind") == "int" && it.getInt("bits") < it.getInt("slot_bytes") * 8
+    }
+
     /** Whether a bit-perfect target stream is still bit-perfect with respect to the source. */
     public val preservesBitPerfect: Boolean get() = kind.preservesBitPerfect
 
@@ -196,13 +206,16 @@ public class ConversionPlan internal constructor(
             target: StreamFormat,
             options: ConversionOptions,
         ): ConversionPlan {
-            if (source.encoding != StreamEncoding.PCM || target.encoding != StreamEncoding.PCM) {
+            if (source.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32) || target.encoding != StreamEncoding.PCM) {
                 throw DacException(
                     DacErrorCode.UNSUPPORTED,
                     "DoP and native DSD are never converted: a sample-rate or bit-depth change would destroy them",
                 )
             }
-            val sourceLayout = options.sourceLayout ?: when (source.bitDepth) {
+            if (source.encoding == StreamEncoding.PCM_FLOAT32 && options.sourceLayout != null && options.sourceLayout != PcmLayout.FLOAT_32) {
+                throw DacException(DacErrorCode.INVALID_ARGUMENT, "float PCM source requires FLOAT_32 layout")
+            }
+            val sourceLayout = if (source.encoding == StreamEncoding.PCM_FLOAT32) PcmLayout.FLOAT_32 else options.sourceLayout ?: when (source.bitDepth) {
                 16 -> PcmLayout.PCM_16
                 24 -> PcmLayout.PCM_24_PACKED
                 32 -> PcmLayout.PCM_32
@@ -328,7 +341,7 @@ public class PcmConverter private constructor(
      * advances both positions. Both must be direct buffers, and must not overlap.
      *
      * @throws DacException [DacErrorCode.INVALID_STATE] after [finish] without a [reset], or after [close];
-     *   [DacErrorCode.INVALID_ARGUMENT] for a heap buffer.
+     *   [DacErrorCode.INVALID_ARGUMENT] for a heap buffer or nonzero declared padding bits.
      */
     public fun convert(input: ByteBuffer, output: ByteBuffer): ConvertResult {
         checkOpen()

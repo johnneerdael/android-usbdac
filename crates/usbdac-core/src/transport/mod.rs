@@ -153,7 +153,7 @@ mod endpoint_geometry;
 mod endpoint_lock;
 mod iso;
 mod native_dsd;
-mod negotiate;
+pub(crate) mod negotiate;
 use native_dsd::*;
 pub(crate) mod context;
 #[cfg(test)]

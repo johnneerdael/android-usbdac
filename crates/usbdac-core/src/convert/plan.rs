@@ -164,14 +164,26 @@ impl ConversionPlan {
         target: &StreamFormat,
         options: &ConvertOptions,
     ) -> Result<Self, ConvertError> {
-        if source.encoding != Encoding::Pcm || target.encoding != Encoding::Pcm {
+        if !matches!(source.encoding, Encoding::Pcm | Encoding::PcmFloat32)
+            || target.encoding != Encoding::Pcm
+        {
             return Err(ConvertError::Unsupported(
                 "DoP and native DSD are never converted: a sample-rate or bit-depth change would destroy them".into(),
             ));
         }
-        let source_sample = match options.source_sample {
-            Some(sample) => sample,
-            None => match source.bit_depth {
+        if source.encoding == Encoding::PcmFloat32
+            && options
+                .source_sample
+                .is_some_and(|sample| sample != SampleFormat::Float32)
+        {
+            return Err(ConvertError::InvalidArgument(
+                "float PCM source requires Float32 layout".into(),
+            ));
+        }
+        let source_sample = match (source.encoding, options.source_sample) {
+            (Encoding::PcmFloat32, _) => SampleFormat::Float32,
+            (_, Some(sample)) => sample,
+            (_, None) => match source.bit_depth {
                 16 => SampleFormat::I16,
                 24 => SampleFormat::I24,
                 32 => SampleFormat::I32,
@@ -200,6 +212,9 @@ impl ConversionPlan {
         options: &ConvertOptions,
     ) -> Result<Self, ConvertError> {
         for (name, format) in [("source", &source), ("target", &target)] {
+            if let SampleFormat::Int { bits, slot_bytes } = format.sample {
+                SampleFormat::int(bits, slot_bytes)?;
+            }
             if !(MIN_RATE..=MAX_RATE).contains(&format.sample_rate) {
                 return Err(ConvertError::InvalidArgument(format!(
                     "the {name} rate {} Hz is outside {MIN_RATE} to {MAX_RATE} Hz",
@@ -279,7 +294,12 @@ impl ConversionPlan {
             .map(Step::kind)
             .max()
             .unwrap_or(ConversionKind::None);
-        let description = describe(kind, &steps, options);
+        let mut description = describe(kind, &steps, options.headroom_db);
+        if let SampleFormat::Int { bits, slot_bytes } = source.sample {
+            if u16::from(bits) < u16::from(slot_bytes) * 8 {
+                description.push_str(" Declared zero padding is validated on every input buffer.");
+            }
+        }
         Ok(Self {
             source,
             target,
@@ -329,7 +349,7 @@ impl ConversionPlan {
     }
 }
 
-fn describe(kind: ConversionKind, steps: &[Step], options: &ConvertOptions) -> String {
+fn describe(kind: ConversionKind, steps: &[Step], headroom_db: f64) -> String {
     let lead = match kind {
         ConversionKind::None => {
             return "No conversion: the samples pass through unchanged.".to_string()
@@ -346,14 +366,14 @@ fn describe(kind: ConversionKind, steps: &[Step], options: &ConvertOptions) -> S
             .collect::<Vec<_>>()
             .join("; ")
     );
-    if options.headroom_db != 0.0
+    if headroom_db != 0.0
         && steps
             .iter()
             .any(|step| matches!(step, Step::Resample { .. }))
     {
         text.push_str(&format!(
             "; {:.1} dB of headroom after resampling",
-            options.headroom_db
+            headroom_db
         ));
     }
     text.push('.');
@@ -399,6 +419,20 @@ mod tests {
             native_dsd_signature: None,
             channel_map: crate::capture::ChannelMap::uac2(channels, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn float_stream_request_uses_float_layout_and_rejects_integer_override() {
+        let source = StreamRequest::pcm_float32(44_100, 2);
+        let target = stream_format(44_100, 2, 16, 2, Encoding::Pcm);
+        let plan = ConversionPlan::between(&source, &target, &ConvertOptions::default()).unwrap();
+        assert_eq!(plan.source().sample, SampleFormat::Float32);
+        assert_eq!(plan.kind(), ConversionKind::Lossy);
+        let options = ConvertOptions {
+            source_sample: Some(SampleFormat::I32),
+            ..ConvertOptions::default()
+        };
+        assert!(ConversionPlan::between(&source, &target, &options).is_err());
     }
 
     #[test]

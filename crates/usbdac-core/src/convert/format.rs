@@ -175,7 +175,7 @@ pub struct ConvertOptions {
     pub quality: Quality,
     /// Gain in dB (zero or negative) applied after sample-rate conversion, to keep the overshoot
     /// of a resampled full-scale signal from clipping. `0.0` leaves the gain at exactly unity at
-    /// DC. See the module docs.
+    /// DC. The default is -3.5 dB; 0.0 requests unity.
     pub headroom_db: f64,
     /// Seed of the dither's pseudo-random generator: the same seed gives the same output.
     pub dither_seed: u64,
@@ -189,7 +189,7 @@ impl Default for ConvertOptions {
         Self {
             narrowing: Narrowing::default(),
             quality: Quality::default(),
-            headroom_db: 0.0,
+            headroom_db: -3.5,
             dither_seed: 0x853c_49e6_748f_ea9b,
             source_sample: None,
         }

@@ -33,6 +33,7 @@ fn adaptive_rate_verified(
 #[allow(unused_assignments)]
 pub(super) fn negotiate_playback_format(
     requested_format: PlaybackFormat,
+    rate_policy: crate::RatePolicy,
 ) -> Result<(PlaybackFormat, Option<ClockChoice>), crate::Error> {
     use crate::Error;
     clear_adc3_negotiation();
@@ -65,13 +66,40 @@ pub(super) fn negotiate_playback_format(
         .ok();
         set_capability_model(capability_model.clone());
 
-        let candidate =
+        let (candidate, requested_format) =
             match select_owned_stream_candidate(&claimed_handle, requested_format, speed) {
-                Ok(c) => c,
-                Err(error) => {
-                    set_last_error(Some(error.message().to_string()));
-                    set_direct_mode_refusal_reason(Some(error.message().to_string()));
-                    return Err(error.into_error(offered_alt_settings()));
+                Ok(candidate) => (candidate, requested_format),
+                Err(first) => {
+                    if !matches!(first, SelectError::NoMatch(_))
+                        || rate_policy != crate::RatePolicy::NearestSupported
+                        || requested_format.dsd_transport == DsdTransportMode::Native
+                        || requested_format.is_dop
+                    {
+                        set_last_error(Some(first.message().to_string()));
+                        set_direct_mode_refusal_reason(Some(first.message().to_string()));
+                        return Err(first.into_error(offered_alt_settings()));
+                    }
+                    let mut rates = capability_model
+                        .as_ref()
+                        .map(|model| rates_for_format(model, requested_format))
+                        .unwrap_or_default();
+                    rank_sample_rates(&mut rates, requested_format.sample_rate);
+                    let mut replacement = None;
+                    for rate in rates {
+                        let target = PlaybackFormat {
+                            sample_rate: rate,
+                            ..requested_format
+                        };
+                        match select_owned_stream_candidate(&claimed_handle, target, speed) {
+                            Ok(candidate) => {
+                                replacement = Some((candidate, target));
+                                break;
+                            }
+                            Err(SelectError::NoMatch(_)) => continue,
+                            Err(error) => return Err(error.into_error(offered_alt_settings())),
+                        }
+                    }
+                    replacement.ok_or_else(|| first.into_error(offered_alt_settings()))?
                 }
             };
 
@@ -640,8 +668,7 @@ pub(super) fn choose_adaptive_sample_rate(
         ));
     }
     ordered_candidates.extend(candidates);
-    ordered_candidates.sort_unstable();
-    ordered_candidates.dedup();
+    rank_sample_rates(&mut ordered_candidates, requested_sample_rate);
 
     for candidate_rate in ordered_candidates {
         let candidate_format = PlaybackFormat {
@@ -656,6 +683,79 @@ pub(super) fn choose_adaptive_sample_rate(
     }
 
     Ok(None)
+}
+
+fn rate_family(rate: u32) -> u8 {
+    if rate > 0 && rate % 11025 == 0 {
+        1
+    } else if rate > 0 && rate % 8000 == 0 {
+        2
+    } else {
+        0
+    }
+}
+
+#[doc(hidden)]
+pub fn rank_sample_rates(rates: &mut Vec<u32>, requested: u32) {
+    rates.retain(|rate| *rate > 0);
+    rates.sort_unstable_by_key(|&rate| {
+        let class = if rate == requested {
+            0
+        } else if rate < requested && requested % rate == 0 {
+            1
+        } else if rate < requested
+            && rate_family(rate) != 0
+            && rate_family(rate) == rate_family(requested)
+        {
+            2
+        } else if rate < requested {
+            3
+        } else {
+            4
+        };
+        (
+            class,
+            if rate <= requested {
+                u32::MAX - rate
+            } else {
+                rate
+            },
+        )
+    });
+    rates.dedup();
+}
+
+fn rates_for_format(model: &CapabilityModel, format: PlaybackFormat) -> Vec<u32> {
+    use crate::capabilities::AltFormat;
+    let expected = match format.pcm_encoding {
+        PcmEncoding::Unsigned8 => AltFormat::PcmU8,
+        PcmEncoding::Float32 => AltFormat::PcmFloat32,
+        _ => AltFormat::Pcm,
+    };
+    let mut rates = Vec::new();
+    for alt in &model.alt_settings {
+        if alt.format != expected
+            || alt.channels != format.channels
+            || alt.valid_bits != format.bit_depth
+        {
+            continue;
+        }
+        rates.extend(alt.sample_rates.iter().copied());
+        let ranges: Vec<_> = alt
+            .rate_ranges
+            .iter()
+            .map(|r| SamplingFrequencySubrange {
+                min: r.min_hz,
+                max: r.max_hz,
+                res: r.step_hz,
+            })
+            .collect();
+        rates.extend(candidate_rates_from_supported_ranges(
+            &ranges,
+            format.sample_rate,
+        ));
+    }
+    rates
 }
 
 pub(super) fn preferred_adaptive_sample_rates(requested_sample_rate: u32) -> Vec<u32> {
@@ -686,20 +786,62 @@ pub(super) fn candidate_rates_from_supported_ranges(
     let preferred = preferred_adaptive_sample_rates(requested_sample_rate);
 
     for range in ranges {
-        if range.res == 0 || range.min == range.max {
+        if range.min > range.max {
+            continue;
+        }
+        if range.res == 0 {
+            if range.min == range.max {
+                candidates.push(range.min);
+            }
+            continue;
+        }
+        if range.min == range.max {
             candidates.push(range.min);
             continue;
         }
 
-        for rate in preferred.iter().copied() {
+        for rate in preferred.iter().copied().chain(
+            (1..=requested_sample_rate)
+                .take_while(|v| v.saturating_mul(*v) <= requested_sample_rate)
+                .filter(|v| requested_sample_rate % *v == 0)
+                .flat_map(|v| [v, requested_sample_rate / v]),
+        ) {
             if sampling_frequency_ranges_support_rate(std::slice::from_ref(range), rate) {
                 candidates.push(rate);
             }
         }
 
+        let family_unit = match rate_family(requested_sample_rate) {
+            1 => 11_025,
+            2 => 8_000,
+            _ => 0,
+        };
+        if let Some(family_index) = range
+            .max
+            .min(requested_sample_rate.saturating_sub(1))
+            .checked_div(family_unit)
+        {
+            let mut rate = family_index * family_unit;
+            while rate >= range.min && rate > 0 {
+                if sampling_frequency_ranges_support_rate(std::slice::from_ref(range), rate) {
+                    candidates.push(rate);
+                    break;
+                }
+                rate = rate.saturating_sub(family_unit);
+            }
+        }
+        let steps = requested_sample_rate.saturating_sub(range.min) / range.res;
+        for index in [steps, steps.saturating_add(1)] {
+            if let Some(rate) = range.min.checked_add(index.saturating_mul(range.res)) {
+                if rate <= range.max {
+                    candidates.push(rate);
+                }
+            }
+        }
         candidates.push(range.min);
-        if range.max != range.min {
-            candidates.push(range.max);
+        let last = range.min + ((range.max - range.min) / range.res) * range.res;
+        if last != range.min {
+            candidates.push(last);
         }
     }
 
@@ -821,7 +963,142 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
 
 #[cfg(test)]
 mod evidence_tests {
-    use super::{adaptive_rate_verified, negotiation_reported_rate};
+    use super::{
+        adaptive_rate_verified, candidate_rates_from_supported_ranges, negotiation_reported_rate,
+        rank_sample_rates, rates_for_format,
+    };
+    use crate::transport::types::SamplingFrequencySubrange;
+
+    #[test]
+    fn adaptive_rates_follow_downsampling_order() {
+        let mut rates = vec![44_100, 192_000, 48_000, 96_000, 48_000];
+        rank_sample_rates(&mut rates, 192_000);
+        assert_eq!(rates, vec![192_000, 96_000, 48_000, 44_100]);
+        let ranges = [SamplingFrequencySubrange {
+            min: 40_000,
+            max: 100_000,
+            res: 1000,
+        }];
+        let mut rates = candidate_rates_from_supported_ranges(&ranges, 72_400);
+        rank_sample_rates(&mut rates, 72_400);
+        assert_eq!(rates[0], 72_000);
+        assert!(rates.contains(&73_000));
+        assert!(
+            rates.iter().position(|&r| r == 73_000).unwrap()
+                > rates.iter().position(|&r| r == 48_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn requested_rate_examples_and_continuous_ceiling_rank_correctly() {
+        for (source, rates, expected) in [
+            (192_000, vec![44_100, 48_000, 88_200, 96_000], 96_000),
+            (176_400, vec![44_100, 48_000, 88_200, 96_000], 88_200),
+            (44_100, vec![48_000], 48_000),
+        ] {
+            let mut rates = rates;
+            rank_sample_rates(&mut rates, source);
+            assert_eq!(rates[0], expected);
+        }
+        let ranges = [SamplingFrequencySubrange {
+            min: 8_000,
+            max: 96_000,
+            res: 1,
+        }];
+        let mut rates = candidate_rates_from_supported_ranges(&ranges, 192_000);
+        rank_sample_rates(&mut rates, 192_000);
+        assert_eq!(rates[0], 96_000);
+    }
+
+    #[test]
+    fn zero_resolution_is_only_a_single_fixed_rate() {
+        let ranges = [
+            SamplingFrequencySubrange {
+                min: 44_100,
+                max: 44_100,
+                res: 0,
+            },
+            SamplingFrequencySubrange {
+                min: 48_000,
+                max: 96_000,
+                res: 0,
+            },
+        ];
+        assert_eq!(
+            candidate_rates_from_supported_ranges(&ranges, 88_200),
+            vec![44_100]
+        );
+    }
+
+    #[test]
+    fn stepped_range_includes_aligned_ceiling_and_highest_family_rate() {
+        let ranges = [SamplingFrequencySubrange {
+            min: 8_000,
+            max: 95_777,
+            res: 1000,
+        }];
+        let mut rates = candidate_rates_from_supported_ranges(&ranges, 192_000);
+        rank_sample_rates(&mut rates, 192_000);
+        assert_eq!(rates[0], 64_000); // highest exact divisor beats non-divisor 95 kHz
+        assert!(rates.contains(&95_000));
+        assert!(rates.contains(&88_000)); // highest in-range 8 kHz-family cadence
+    }
+
+    #[test]
+    fn production_candidate_planner_filters_alternates_and_ranks_their_ranges() {
+        use crate::capabilities::{
+            AltFormat, AltSetting, EndpointUsage, Pacing, RateRange, SyncKind, UacVersion,
+        };
+        use crate::transport::types::{
+            CapabilityModel, DsdTransportMode, PcmEncoding, PlaybackFormat,
+        };
+        let alt = AltSetting {
+            interface_number: 1,
+            alt_setting: 1,
+            endpoint_address: 1,
+            format: AltFormat::Pcm,
+            channels: 2,
+            subslot_bytes: 2,
+            valid_bits: 16,
+            rate_ranges: vec![RateRange {
+                min_hz: 8_000,
+                max_hz: 96_000,
+                step_hz: 1,
+            }],
+            sample_rates: vec![44_100, 48_000, 96_000],
+            sync_type: SyncKind::Adaptive,
+            feedback_endpoint: None,
+            max_packet_bytes: 1024,
+            service_interval_us: 125,
+            uac_version: UacVersion::V2,
+            endpoint_interval: 1,
+            usage: EndpointUsage::Data,
+            refresh: 0,
+            synch_address: 0,
+            pacing: Some(Pacing::Adaptive),
+        };
+        let mut wrong_channels = alt.clone();
+        wrong_channels.channels = 1;
+        wrong_channels.sample_rates = vec![192_000];
+        wrong_channels.rate_ranges.clear();
+        let model = CapabilityModel {
+            alt_settings: vec![alt, wrong_channels],
+            ..Default::default()
+        };
+        let format = PlaybackFormat {
+            pcm_encoding: PcmEncoding::Signed,
+            sample_rate: 192_000,
+            bit_depth: 16,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0,
+        };
+        let mut candidates = rates_for_format(&model, format);
+        rank_sample_rates(&mut candidates, format.sample_rate);
+        assert_eq!(candidates[0], 96_000);
+        assert!(!candidates.contains(&192_000));
+    }
 
     #[test]
     fn attempted_set_never_reports_a_stale_or_synthetic_rate() {

@@ -17,16 +17,14 @@
 //! ### Clipping and headroom
 //!
 //! Integer outputs saturate at full scale and never wrap, and [`Converter::clipped_samples`] counts
-//! how often. A resampled signal can exceed its input's peak (the overshoot of a band-limited
-//! reconstruction: a full-scale square wave sampled at 44.1 kHz rises by 3 dB when it is resampled
-//! to 48 kHz, as the tests measure), so a resampling plan for material that can do that takes
-//! headroom: [`ConvertOptions::headroom_db`], for example `-3.5`. The
-//! default of 0 dB keeps the gain at exactly 1 at DC and the passband flat to 0.0001 dB; a full-scale
-//! sine, which the filter passes within that ripple, does not clip.
+//! how often. Resampling defaults to -3.5 dB gain after the filter. This covers the measured
+//! full-scale square-wave overshoot; other signals can still clip, so monitor the saturation count.
+//! Set 0 dB explicitly for unity. Exact and widening paths never apply this gain.
 //!
 //! ### What is not converted
 //!
-//! DoP and native DSD are never converted ([`ConvertError::Unsupported`]), nor is any channel
+//! This PCM converter refuses DoP and native DSD ([`ConvertError::Unsupported`]); the separate
+//! [`crate::dsd_pcm`] module explicitly converts native DSD to PCM. No channel
 //! layout other than mono to stereo.
 
 mod converter;

@@ -137,9 +137,14 @@ jobs:
           done
           exit 1
 
+      - name: Build host JNI for real-core selector ranking
+        run: cargo build --locked -p usbdac-jni
+
       # The :usbdac build runs `cargo ndk` for arm64-v8a, armeabi-v7a, x86_64 and x86.
       - name: Build the AAR, run the unit tests, build the sample
         working-directory: android
+        env:
+          USBDAC_TEST_HOST_JNI: ${{ github.workspace }}/target/debug/libusbdac.so
         run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :media3-example:assembleDebug --console=plain
 
       - name: Check that the AAR carries every ABI

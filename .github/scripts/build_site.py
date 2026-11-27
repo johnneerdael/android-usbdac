@@ -45,6 +45,7 @@ SECTIONS = [
         ("decisions-clock", "Clock and pacing"),
         ("decisions-volume", "Volume"),
         ("decisions-reporting", "Reporting and conversion"),
+        ("decisions-dsd-conversion", "DSD conversion"),
         ("decisions-library", "Outputs and library shape"),
     ]),
     ("How it works", [

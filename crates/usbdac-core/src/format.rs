@@ -29,7 +29,9 @@ pub enum RatePolicy {
     /// wants this.
     #[default]
     Exact,
-    /// Use the closest rate the DAC runs. [`StreamFormat::sample_rate`] then
+    /// Prefer the highest supported integer divisor of the requested rate, then the highest
+    /// lower rate in the same rate family, then the highest other lower rate, then the lowest
+    /// higher rate. [`StreamFormat::sample_rate`] then
     /// differs from the request; the host must resample, and the stream is not
     /// reported bit-perfect.
     NearestSupported,

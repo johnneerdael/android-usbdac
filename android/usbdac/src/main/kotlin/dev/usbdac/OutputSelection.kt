@@ -67,9 +67,25 @@ public enum class Guarantee {
     NONE,
 }
 
+/** Whether the downstream decoder is known to recognise DoP markers. */
+public enum class DopSupport { UNCONFIRMED, CONFIRMED }
+
+/** Limits of the final USB/optical decoder, supplied by the host. These are not inferred
+ * from a USB bridge's carrier capabilities. A null policy limit means no downstream PCM
+ * ceiling is known. DoP still requires explicit [DopSupport.CONFIRMED]. */
+public data class DownstreamLimits(
+    val maxSampleRateHz: Int,
+    val allowedValidBits: Set<Int>,
+) {
+    init {
+        require(maxSampleRateHz > 0)
+        require(allowedValidBits.isNotEmpty() && allowedValidBits.all { it in 1..64 })
+    }
+}
+
 /**
  * What the output is allowed and told to do. The defaults are the cautious ones: bit-perfect first,
- * nothing converted, an exclusive AAudio stream only when it really is exclusive.
+ * PCM conversion enabled, an exclusive AAudio stream only when it really is exclusive.
  *
  * @property allowDirectUsb Whether the app may take a USB DAC away from the rest of the system.
  *   `false` keeps [OutputKind.DIRECT_USB] out of the choice (and an exclusive AAudio stream on a USB
@@ -88,7 +104,7 @@ public enum class Guarantee {
  * @property allowConversion Let the direct output convert (resample, widen or narrow) a request the
  *   DAC cannot run as it is, with the library's own converter. The decision then carries the
  *   [ConversionPlan], and the guarantee drops to [Guarantee.NONE] unless every sample value is kept
- *   (a widening). `false` (the default): a DAC that cannot run the request exactly is rejected.
+ *   (a widening). `false`: only explicitly enabled lossless widening is allowed.
  * @property dacConfig The session configuration for [OutputKind.DIRECT_USB]. With
  *   [DacConfig.requireHardwareVolume] on (the default) a DAC without a usable hardware volume is
  *   rejected ([RejectionReason.NO_HARDWARE_VOLUME]); turn it off to accept a fixed level.
@@ -99,11 +115,17 @@ public data class OutputPolicy @JvmOverloads constructor(
     val allowDirectUsb: Boolean = true,
     val force: OutputKind? = null,
     val requireExclusiveForAAudio: Boolean = true,
-    val allowConversion: Boolean = false,
+    val allowConversion: Boolean = true,
     val dacConfig: DacConfig = DacConfig(),
     val aaudioConfig: AAudioConfig = AAudioConfig(),
     /** Permit same-rate, same-channel integer widening only, with a lossless conversion plan. */
-    val allowWidening: Boolean = false,
+    val allowWidening: Boolean = true,
+    /** Final decoder limits, or null when no downstream PCM constraint is configured. */
+    val downstreamLimits: DownstreamLimits? = null,
+    /** Confirmation of the final decoder's DoP marker support, independent of USB carrier support. */
+    val dopSupport: DopSupport = DopSupport.UNCONFIRMED,
+    /** Resampling, dither and source-layout options. Headroom is applied only when resampling. */
+    val conversionOptions: ConversionOptions = ConversionOptions(headroomDb = -3.5),
 ) {
     init {
         require(!(force == OutputKind.DIRECT_USB && !allowDirectUsb)) {
@@ -228,6 +250,9 @@ public data class WriteFormat(
     val bytesPerFrame: Int get() = channels * subslotBytes
 }
 
+/** A processing stage used by the automatic selector. */
+public data class OutputConversion(val description: String, val preservesBitPerfect: Boolean)
+
 /**
  * What [OutputSelector] chose, and why.
  *
@@ -253,6 +278,12 @@ public data class OutputDecision(
     val conversion: ConversionPlan?,
     val needsUsbPermission: DacDeviceInfo?,
     val alternativesRejected: List<Rejection>,
+    /** Source supplied by the host; null only for decisions manually constructed by older clients. */
+    val source: StreamRequest? = null,
+    /** Negotiated USB wire format; null when the platform output cannot reveal it. */
+    val wireFormat: StreamFormat? = null,
+    /** Processing description, including DSD framing/conversion, or null when unchanged. */
+    val processing: OutputConversion? = null,
 )
 
 /**

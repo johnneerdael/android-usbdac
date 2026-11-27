@@ -41,6 +41,14 @@ public class SelectedOutput internal constructor(
     /** What was chosen: shorthand for `decision.kind`. */
     public val kind: OutputKind get() = decision.kind
 
+    /** Samples clipped by the selector's PCM converter, or null without one. */
+    public val clippedSamples: Long? get() = when (output) {
+        is ConvertingOutput -> output.clippedSamples
+        is DsdPcmOutput -> output.clippedSamples
+        is DopInputOutput -> output.clippedSamples
+        else -> null
+    }
+
     /**
      * Stops the output and releases everything the selector opened for it: the stream, the converter,
      * and for the direct output the DAC session, which hands the DAC back to Android. Safe to call again.
@@ -91,7 +99,7 @@ public class PreparedUsbOutput internal constructor(
  *    or a cast device, and the DAC can carry the request: a session opens, the DAC has a usable hardware
  *    volume (unless [DacConfig.requireHardwareVolume] is off), and [DacSession.negotiate] settles the
  *    format. With [OutputPolicy.allowConversion] a request the DAC does not run as it is is carried
- *    through a [ConversionPlan] to the nearest format it does run; the decision says so and the
+ *    through a [ConversionPlan] to a ranked supported format; the decision says so and the
  *    guarantee drops unless every sample value is kept. If the permission is missing the DAC is not
  *    used and the decision carries [OutputDecision.needsUsbPermission]; the selector never asks.
  *    An implicit-feedback-only DAC, a DAC without hardware volume, a busy or unclaimable DAC and any
@@ -326,6 +334,8 @@ public class OutputSelector internal constructor(
         val reason: String,
         val dac: DacDeviceInfo? = null,
         val conversion: ConversionPlan? = null,
+        val wireFormat: StreamFormat? = null,
+        val processing: OutputConversion? = null,
         /** Opens it for good. */
         val commit: () -> Opened,
         /** Gives back what the look opened; for a candidate that is committed, nothing more to do. */
@@ -410,13 +420,22 @@ public class OutputSelector internal constructor(
             conversion = candidate.conversion,
             needsUsbPermission = if (candidate.kind == OutputKind.DIRECT_USB) null else pass.needsPermission,
             alternativesRejected = rejected.toList(),
+            source = pass.request,
+            wireFormat = candidate.wireFormat,
+            processing = candidate.processing,
         )
 
-    private fun attempts(kind: OutputKind, pass: Pass): Sequence<Attempt> = when (kind) {
+    private fun attempts(kind: OutputKind, pass: Pass): Sequence<Attempt> {
+        if (kind != OutputKind.DIRECT_USB && policy.downstreamLimits != null) {
+            return sequenceOf(reject(kind, RejectionReason.POLICY,
+                "the platform output cannot verify the configured downstream decoder limits"))
+        }
+        return when (kind) {
         OutputKind.DIRECT_USB -> directAttempts(pass)
         OutputKind.ANDROID_BIT_PERFECT -> sequence { yield(bitPerfectAttempt(pass)) }
         OutputKind.AAUDIO_EXCLUSIVE -> sequence { yield(aaudioAttempt(pass)) }
         OutputKind.ANDROID_STANDARD -> sequence { yield(standardAttempt(pass)) }
+        }
     }
 
     // ---- 1. direct USB ----
@@ -463,7 +482,8 @@ public class OutputSelector internal constructor(
         }
     }
 
-    private class Negotiated(val format: StreamFormat, val plan: ConversionPlan?)
+    private enum class DsdFallback { NONE, DOP, PCM, DOP_PCM }
+    private class Negotiated(val format: StreamFormat, val plan: ConversionPlan?, val dsdFallback: DsdFallback = DsdFallback.NONE)
 
     private fun directAttempt(request: StreamRequest, dac: DacDeviceInfo): Attempt {
         val kind = OutputKind.DIRECT_USB
@@ -494,64 +514,147 @@ public class OutputSelector internal constructor(
         }
     }
 
-    /**
-     * Settles the wire format for [request]. Exactly first; and, if the policy allows conversion and the
-     * DAC cannot run it, the closest the DAC does: the same rate at another depth (a widening keeps every
-     * sample, a narrowing does not), then the nearest rate at each depth. Throws the first failure when
-     * nothing works.
-     */
+    private fun permitsWire(format: StreamFormat): Boolean {
+        if (format.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) return false
+        val limit = policy.downstreamLimits ?: return true
+        // Native DSD is not PCM; the supplied PCM/DoP carrier limits cannot prove its compatibility.
+        if (format.encoding == StreamEncoding.DSD_NATIVE) return false
+        return format.sampleRate <= limit.maxSampleRateHz && format.validBits in limit.allowedValidBits
+    }
+
+    /** Settle [request] exactly first, then try permitted conversions in ranked order. */
     private fun negotiate(link: DirectLink, request: StreamRequest): Negotiated {
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
-        val first = try {
-            return Negotiated(link.negotiate(exact), null)
+        val first = if (request.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) {
+            DacException(DacErrorCode.UNSUPPORTED, "DoP decoder support has not been confirmed")
+        } else try {
+            val format = link.negotiate(exact)
+            if (permitsWire(format) && format.encoding == request.encoding && format.channels == request.channels &&
+                (request.encoding == StreamEncoding.DSD_NATIVE || format.sampleRate == request.sampleRate)) {
+                return Negotiated(format, null)
+            }
+            DacException(DacErrorCode.UNSUPPORTED, "negotiated wire format exceeds downstream limits")
         } catch (error: DacException) {
             error
         }
-        if ((!policy.allowConversion && !policy.allowWidening) || first.code != DacErrorCode.UNSUPPORTED || request.encoding != StreamEncoding.PCM) throw first
-
-        val available = link.capabilities.pcmBitDepths.distinct()
-        val wider = available.filter { it > request.bitDepth }.sorted()
-        if (!policy.allowConversion) {
-            for (depth in wider) {
-                converted(link, request, exact.copy(bitDepth = depth))?.let { candidate ->
-                    val format = candidate.format
-                    if (candidate.plan?.preservesBitPerfect == true && format.sampleRate == request.sampleRate &&
-                        format.channels == request.channels && format.counterRateHz == request.sampleRate &&
-                        format.validBits >= request.bitDepth) return candidate
+        if (first.code != DacErrorCode.UNSUPPORTED) throw first
+        if (request.encoding == StreamEncoding.DSD_NATIVE || request.encoding == StreamEncoding.DOP) {
+            val bitRate = request.dsdBitRate ?: throw first
+            if (request.encoding == StreamEncoding.DSD_NATIVE && policy.dopSupport == DopSupport.CONFIRMED) {
+                try {
+                    val dop = link.negotiate(StreamRequest.dop(bitRate, request.channels))
+                    if (dop.encoding == StreamEncoding.DOP && dop.sampleRate == bitRate / 16 &&
+                        dop.channels == request.channels && dop.subslotBytes in 3..4 && permitsWire(dop)) {
+                        return Negotiated(dop, null, DsdFallback.DOP)
+                    }
+                } catch (error: DacException) {
+                    if (error.code != DacErrorCode.UNSUPPORTED) throw error
+                }
+            }
+            if (policy.allowConversion && bitRate in listOf(2_822_400, 5_644_800, 11_289_600)) {
+                try {
+                    val pcm = negotiate(link, StreamRequest.pcm(bitRate / 16, request.channels, 24))
+                    if (pcm.format.encoding == StreamEncoding.PCM) return Negotiated(pcm.format, null, if (request.encoding == StreamEncoding.DOP) DsdFallback.DOP_PCM else DsdFallback.PCM)
+                } catch (error: DacException) {
+                    if (error.code != DacErrorCode.UNSUPPORTED) throw error
                 }
             }
             throw first
         }
-        val others = wider + available.filter { it < request.bitDepth }.sortedDescending()
-        for (depth in others) {
-            converted(link, request, exact.copy(bitDepth = depth))?.let { return it }
+        if ((!policy.allowConversion && !policy.allowWidening) || request.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32)) throw first
+
+        val alts = link.capabilities.altSettings.filter { it.format == AltFormat.PCM && it.channels == request.channels }
+        val pairs = mutableSetOf<Pair<Int, Int>>()
+        val standardRates = listOf(8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000,
+            176400, 192000, 352800, 384000, 705600, 768000)
+        fun addRange(depth: Int, range: RateRange) {
+            if (range.minHz <= 0 || range.maxHz < range.minHz || range.stepHz < 0) return
+            fun add(rate: Int) {
+                if (rate in range.minHz..range.maxHz && (range.stepHz == 0 ||
+                        (rate.toLong() - range.minHz) % range.stepHz == 0L)) pairs += rate to depth
+            }
+            if (range.stepHz == 0) {
+                if (range.minHz == range.maxHz) add(range.minHz)
+            } else {
+                val step = range.stepHz.toLong()
+                val n = ((request.sampleRate.toLong() - range.minHz) / step).coerceAtLeast(0)
+                val ceiling = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz)
+                val limitIndex = ((ceiling.toLong() - range.minHz) / step).coerceAtLeast(0)
+                for (index in listOf(0L, n, n + 1, limitIndex, (range.maxHz.toLong() - range.minHz) / step)) {
+                    val value = range.minHz.toLong() + index * step
+                    if (value <= Int.MAX_VALUE) add(value.toInt())
+                }
+                standardRates.forEach(::add)
+                for (divisor in 1..request.sampleRate.coerceAtLeast(1)) {
+                    if (divisor.toLong() * divisor > request.sampleRate) break
+                    if (request.sampleRate % divisor == 0) {
+                        add(divisor)
+                        add(request.sampleRate / divisor)
+                    }
+                }
+                val familyStep = if (request.sampleRate % 11025 == 0) 11025 else if (request.sampleRate % 8000 == 0) 8000 else 0
+                if (familyStep > 0) {
+                    val maximum = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz, 768_000)
+                    for (rate in familyStep..maximum step familyStep) add(rate)
+                }
+            }
         }
-        val own = if (request.bitDepth in available) listOf(request.bitDepth) else emptyList()
-        for (depth in own + others) {
-            converted(link, request, request.copy(bitDepth = depth, ratePolicy = RatePolicy.NEAREST_SUPPORTED))?.let { return it }
+        for (alt in alts) {
+            if (alt.validBits !in listOf(16, 24, 32)) continue
+            alt.sampleRates.forEach { if (it > 0) pairs += it to alt.validBits }
+            alt.rateRanges.forEach { addRange(alt.validBits, it) }
+        }
+        // Older native libraries may only expose the capability unions, not per-alt entries.
+        if (link.capabilities.altSettings.isEmpty()) {
+            for (depth in link.capabilities.pcmBitDepths) {
+                for (rate in link.capabilities.pcmSampleRates + request.sampleRate) pairs += rate to depth
+            }
+        }
+        val eligible = pairs.filter { (rate, depth) ->
+            rate > 0 && depth in listOf(16, 24, 32) &&
+                (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true) &&
+                (policy.allowConversion || (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth > request.bitDepth))
+        }
+        val rank = platform.rankRates(request.sampleRate, eligible.map { it.first }).withIndex().associate { it.value to it.index }
+        val ordered = eligible.sortedWith(compareBy<Pair<Int, Int>>(
+            { rank[it.first] ?: Int.MAX_VALUE },
+            { if (it.second >= request.bitDepth) 0 else 1 },
+            { kotlin.math.abs(it.second - request.bitDepth) },
+        ))
+        for ((rate, depth) in ordered) {
+            if (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth == request.bitDepth) continue
+            val target = exact.copy(sampleRate = rate, bitDepth = depth, encoding = StreamEncoding.PCM)
+            try {
+                val format = link.negotiate(target)
+                if (!permitsWire(format) || format.encoding != StreamEncoding.PCM || format.sampleRate != rate || format.channels != request.channels) continue
+                val options = if (request.sampleRate == format.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0)
+                    else policy.conversionOptions
+                val plan = platform.plan(request, format, options)
+                if (plan.preservesBitPerfect && !policy.allowWidening) continue
+                if (!plan.preservesBitPerfect && !policy.allowConversion) continue
+                if (plan.kind == ConversionKind.NONE) continue
+                return Negotiated(format, plan)
+            } catch (error: DacException) {
+                if (error.code != DacErrorCode.UNSUPPORTED) throw error
+            }
         }
         throw first
     }
-
-    /** One try at [wire]: the format and the plan from [request] to it, or `null` if the DAC or the plan says unsupported. */
-    private fun converted(link: DirectLink, request: StreamRequest, wire: StreamRequest): Negotiated? =
-        try {
-            val format = link.negotiate(wire)
-            val plan = platform.plan(request, format)
-            Negotiated(format, plan.takeIf { it.kind != ConversionKind.NONE })
-        } catch (error: DacException) {
-            if (error.code == DacErrorCode.UNSUPPORTED) null else throw error
-        }
 
     private fun directCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, negotiated: Negotiated): Candidate {
         val format = negotiated.format
         val plan = negotiated.plan
         val unsynchronized = format.pacing == Pacing.Unsynchronized ||
             (format.pacing == Pacing.Unknown && format.syncType == SyncType.ASYNCHRONOUS && !format.explicitFeedback)
-        val guarantee = if ((plan?.preservesBitPerfect ?: true) && !unsynchronized) Guarantee.VERIFIED_BY_LIBRARY else Guarantee.NONE
+        val guarantee = if (negotiated.dsdFallback !in listOf(DsdFallback.PCM, DsdFallback.DOP_PCM) && (plan?.preservesBitPerfect ?: true) && !unsynchronized) Guarantee.VERIFIED_BY_LIBRARY else Guarantee.NONE
         val reason = buildString {
             append("The library drives ${dac.productName} directly over USB (${describe(format)}): ")
             append("Android's mixer, resampler and volume are out of the path. Live stream diagnostics report whether clock and feedback are verified.")
+            if (negotiated.dsdFallback == DsdFallback.DOP) append(" Native DSD is framed as DoP for the confirmed decoder.")
+            if (negotiated.dsdFallback in listOf(DsdFallback.PCM, DsdFallback.DOP_PCM)) {
+                val gain = if (format.sampleRate != checkNotNull(request.dsdBitRate) / 16) policy.conversionOptions.headroomDb else 0.0
+                append(" ${if (negotiated.dsdFallback == DsdFallback.DOP_PCM) "DoP is validated, unpacked and converted" else "Native DSD is converted"} to PCM and is not bit-perfect; resampling gain $gain dB.")
+            }
             if (plan != null) {
                 if (plan.preservesBitPerfect) {
                     append(" The DAC does not run the request as it is, so the audio is first converted without changing any sample value: ${plan.description}")
@@ -565,7 +668,12 @@ public class OutputSelector internal constructor(
             if (!link.hasUsableVolume) append(" The DAC has no hardware volume: the app cannot control the level.")
         }
         // What the host writes: the wire layout, or, behind a converter, the request's own.
-        val written = if (plan == null) {
+        val written = if (negotiated.dsdFallback == DsdFallback.DOP_PCM) {
+            WriteFormat(request.sampleRate, request.channels, 3, 24, request.sampleRate, StreamEncoding.DOP)
+        } else if (negotiated.dsdFallback != DsdFallback.NONE) {
+            val byteRate = checkNotNull(request.dsdBitRate) / 8
+            WriteFormat(byteRate, request.channels, 1, 8, byteRate, StreamEncoding.DSD_NATIVE)
+        } else if (plan == null) {
             WriteFormat(format.sampleRate, format.channels, format.subslotBytes, format.validBits, format.counterRateHz, format.encoding)
         } else {
             layoutOf(request)
@@ -576,17 +684,41 @@ public class OutputSelector internal constructor(
             reason = reason,
             dac = dac,
             conversion = plan,
+            wireFormat = format,
+            processing = when (negotiated.dsdFallback) {
+                DsdFallback.DOP -> OutputConversion("Native DSD framed as DoP for confirmed decoder", true)
+                DsdFallback.PCM, DsdFallback.DOP_PCM -> {
+                    val gain = if (format.sampleRate != checkNotNull(request.dsdBitRate) / 16) policy.conversionOptions.headroomDb else 0.0
+                    OutputConversion("${if (negotiated.dsdFallback == DsdFallback.DOP_PCM) "DoP unpacked" else "Native DSD"} converted to PCM; resampling gain $gain dB", false)
+                }
+                DsdFallback.NONE -> plan?.let { OutputConversion(it.description, it.preservesBitPerfect) }
+            },
             commit = {
                 val stream = link.openStream(format)
-                val output = if (plan == null) {
-                    stream
-                } else {
-                    try {
-                        platform.converting(stream, plan)
-                    } catch (error: Throwable) {
-                        runCatching { stream.close() }
-                        throw error
+                val output = try {
+                    when (negotiated.dsdFallback) {
+                        DsdFallback.DOP -> DsdDopOutput(stream, request.channels, format.subslotBytes, true)
+                        DsdFallback.PCM, DsdFallback.DOP_PCM -> {
+                            val layout = when (format.validBits to format.subslotBytes) {
+                                16 to 2 -> PcmLayout.PCM_16
+                                16 to 3 -> PcmLayout.PCM_16_IN_24
+                                16 to 4 -> PcmLayout.PCM_16_IN_32
+                                24 to 3 -> PcmLayout.PCM_24_PACKED
+                                24 to 4 -> PcmLayout.PCM_24_IN_32
+                                32 to 4 -> PcmLayout.PCM_32
+                                else -> throw DacException(DacErrorCode.UNSUPPORTED, "unsupported DSD-to-PCM wire layout")
+                            }
+                            val bitRate = checkNotNull(request.dsdBitRate)
+                            val options = if (format.sampleRate == bitRate / 16) policy.conversionOptions.copy(headroomDb = 0.0, sourceLayout = null)
+                                else policy.conversionOptions.copy(sourceLayout = null)
+                            val converted = DsdPcmOutput(stream, bitRate, request.channels, format.sampleRate, format.channels, layout, options)
+                            if (negotiated.dsdFallback == DsdFallback.DOP_PCM) DopInputOutput(converted, request.channels, 3) else converted
+                        }
+                        DsdFallback.NONE -> if (plan == null) stream else platform.converting(stream, plan)
                     }
+                } catch (error: Throwable) {
+                    runCatching { stream.close() }
+                    throw error
                 }
                 Opened(output, written, session = link.session, stream = link.stream, volume = link.volume, releaseSession = { link.close() })
             },

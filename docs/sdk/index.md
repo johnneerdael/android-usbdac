@@ -106,7 +106,7 @@ The pages come in six groups, in the navigation order.
 7. [Automatic output](automatic-output.md): what the selector detects, the order it chooses in, what each guarantee means, the one setting that is the listener's, when to look again, and the handoff helper.
 8. [Media3](media3.md): how to put a `PcmOutput` behind an `AudioSink`. Guidance only.
 
-**Design decisions.** [All decisions at a glance](decisions.md), then five pages with the question, what Flick, Mornye and BitChord do, what usbdac does, the evidence, the trade-off and the public references for each: [streaming and buffering](decisions-stream.md), [clock and pacing](decisions-clock.md), [volume](decisions-volume.md), [reporting and conversion](decisions-reporting.md), [outputs and library shape](decisions-library.md).
+**Design decisions.** [All decisions at a glance](decisions.md), then five pages with the question, what Flick, Mornye and BitChord do, what usbdac does, the evidence, the trade-off and the public references for each: [streaming and buffering](decisions-stream.md), [clock and pacing](decisions-clock.md), [volume](decisions-volume.md), [reporting and conversion](decisions-reporting.md), [DSD conversion](decisions-dsd-conversion.md), [outputs and library shape](decisions-library.md).
 
 **How it works.** [Architecture](architecture.md): the layers, the modules, the life of a sample, the threads. [USB audio in a page](usb-audio-primer.md): the background the decisions assume.
 

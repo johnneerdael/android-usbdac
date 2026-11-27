@@ -391,8 +391,28 @@ impl Converter {
         self.clipped
     }
 
-    /// Converts as many whole frames as fit. Fails only after [`Converter::finish`] without a [`Converter::reset`].
+    /// Converts whole frames. Declared integer padding is checked before any output or state change.
+    /// Nonzero padding returns `InvalidArgument`; after `finish`, call `reset` first.
     pub fn process(&mut self, input: &[u8], output: &mut [u8]) -> Result<Processed, ConvertError> {
+        if let SampleFormat::Int { bits, slot_bytes } = self.plan.source().sample {
+            let padding = u32::from(slot_bytes) * 8 - u32::from(bits);
+            if padding > 0 {
+                let slot = usize::from(slot_bytes);
+                let whole = input.len() / self.source_frame * self.source_frame;
+                let mask = (1u32 << padding) - 1;
+                for sample in input[..whole].chunks_exact(slot) {
+                    let mut word = 0u32;
+                    for (i, byte) in sample.iter().enumerate() {
+                        word |= u32::from(*byte) << (i * 8);
+                    }
+                    if word & mask != 0 {
+                        return Err(ConvertError::InvalidArgument(
+                            "source integer sample has nonzero declared padding bits".into(),
+                        ));
+                    }
+                }
+            }
+        }
         let (consumed, produced) = match &mut self.engine {
             Engine::Copy { frame_bytes } => {
                 let frames = (input.len() / *frame_bytes).min(output.len() / *frame_bytes);
@@ -857,7 +877,10 @@ mod tests {
         let mut c = converter(
             fmt(44_100, 1, SampleFormat::I16),
             fmt(48_000, 1, SampleFormat::I24),
-            ConvertOptions::default(),
+            ConvertOptions {
+                headroom_db: 0.0,
+                ..ConvertOptions::default()
+            },
         );
         let out = convert_all(&mut c, &input, 4096, 8192);
         let samples: Vec<f64> = out
@@ -907,7 +930,14 @@ mod tests {
         let source = fmt(44_100, 1, SampleFormat::I16);
         let target = fmt(48_000, 1, SampleFormat::I16);
 
-        let mut plain = converter(source, target, ConvertOptions::default());
+        let mut plain = converter(
+            source,
+            target,
+            ConvertOptions {
+                headroom_db: 0.0,
+                ..ConvertOptions::default()
+            },
+        );
         let out = convert_all(&mut plain, &input, 4096, 8192);
         let values: Vec<i16> = out
             .chunks_exact(2)
@@ -923,7 +953,10 @@ mod tests {
         let mut reference = converter(
             source,
             fmt(48_000, 1, SampleFormat::Float32),
-            ConvertOptions::default(),
+            ConvertOptions {
+                headroom_db: 0.0,
+                ..ConvertOptions::default()
+            },
         );
         let floats = convert_all(&mut reference, &input, 4096, 8192);
         assert_eq!(floats.len() / 4, values.len());
@@ -951,6 +984,9 @@ mod tests {
         );
         assert!(overshoot > 1.2 && overshoot < 1.6, "{overshoot}");
 
+        let mut default_guard = converter(source, target, ConvertOptions::default());
+        convert_all(&mut default_guard, &input, 4096, 8192);
+        assert_eq!(default_guard.clipped_samples(), 0);
         let headroom = ConvertOptions {
             headroom_db: -3.5,
             ..ConvertOptions::default()
@@ -988,7 +1024,10 @@ mod tests {
             let mut c = converter(
                 fmt(44_100, 1, SampleFormat::Float32),
                 fmt(96_000, 1, SampleFormat::Float32),
-                ConvertOptions::default(),
+                ConvertOptions {
+                    headroom_db: 0.0,
+                    ..ConvertOptions::default()
+                },
             );
             let out = convert_all(&mut c, &input, 4096, 8192);
             let settled = &out[4 * 1000..out.len() - 4 * 1000];
@@ -1006,7 +1045,10 @@ mod tests {
                 .collect();
             let truncate = ConvertOptions {
                 narrowing: Narrowing::Truncate,
-                ..ConvertOptions::default()
+                ..ConvertOptions {
+                    headroom_db: 0.0,
+                    ..ConvertOptions::default()
+                }
             };
             let mut c = converter(
                 fmt(44_100, 1, SampleFormat::I16),

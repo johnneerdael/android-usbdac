@@ -19,7 +19,7 @@ import java.nio.ByteBuffer
  * [bitPerfect] is the target's when the plan is [ConversionKind.NONE] or [ConversionKind.BIT_EXACT]
  * (widening and repacking keep every value). Otherwise it is
  * [BitPerfectState.NotVerified] with [ConversionPlan.description]: **the stream is not bit-perfect**, and the
- * flag says what was done instead. For [ConversionKind.NONE] the output simply forwards to the target.
+ * flag says what was done instead. For [ConversionKind.NONE] the output forwards to the target unless declared padding needs validation.
  *
  * ### Controls
  * [flush] also resets the converter (a seek moves the source: the filter's history belongs to the old position).
@@ -39,8 +39,11 @@ public class ConvertingOutput(
     /** What is being done to the audio. */
     public val plan: ConversionPlan get() = converter.plan
 
+    /** Saturated integer samples since the last reset or flush. */
+    public val clippedSamples: Long get() = synchronized(lock) { converter.clippedSamples }
+
     private val lock = Any()
-    private val passthrough = plan.kind == ConversionKind.NONE
+    private val passthrough = plan.kind == ConversionKind.NONE && !plan.requiresPaddingValidation
     private val sourceRate = plan.sourceSampleRate.toLong()
     private val targetRate = plan.targetSampleRate.toLong()
     private val sourceFrameBytes = plan.sourceFrameBytes
@@ -70,13 +73,19 @@ public class ConvertingOutput(
         var total = 0
         while (buffer.hasRemaining()) {
             pending.clear()
-            val consumed = if (buffer.isDirect) {
-                converter.convert(buffer, pending).consumed
-            } else {
-                val staged = stageFrom(buffer)
-                val done = converter.convert(staged, pending)
-                buffer.position(buffer.position() + done.consumed)
-                done.consumed
+            val consumed = try {
+                if (buffer.isDirect) {
+                    converter.convert(buffer, pending).consumed
+                } else {
+                    val staged = stageFrom(buffer)
+                    val done = converter.convert(staged, pending)
+                    buffer.position(buffer.position() + done.consumed)
+                    done.consumed
+                }
+            } catch (error: Throwable) {
+                pending.clear()
+                pending.limit(0)
+                throw error
             }
             pending.flip()
             total += consumed

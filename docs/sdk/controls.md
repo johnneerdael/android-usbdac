@@ -396,9 +396,9 @@ The conversion helpers are opt-in and never touch the direct path by themselves:
 |---|---|---|---|---|
 | `narrowing` | `NarrowingMode` | `TPDF_DITHER` | Where bits are dropped (narrowing, floats to integers, the rounding of resampled values): `TRUNCATE` rounds toward negative infinity; `TPDF_DITHER` adds triangular noise of one step before rounding to nearest, so the error is signal-independent noise at half a step RMS (-98 dBFS at 16 bits) | Both are lossy; neither is bit-perfect |
 | `quality` | `ResampleQuality` | `HIGH` | `HIGH`: stopband about 110 dB, no aliasing into the output, passband flat to 91% of the lower Nyquist frequency (20.07 kHz at 44.1 kHz). `FAST`: stopband about 84 dB, passband to 90%, about 2.5 times cheaper. Measured numbers are in [the native API document](native-api.html#14-conversion-helpers) | A rate change is lossy either way |
-| `headroomDb` | `Double` | 0.0 | Gain after resampling, 0 to -60 dB. A resampled signal can exceed its input's peak (a full-scale square wave by 3 dB); integer outputs saturate at full scale, never wrap, and `PcmConverter.clippedSamples` counts them. `-3.5` keeps even that from clipping. At 0 the gain at DC is exactly 1 | Any value other than 0 changes the level; the plan's description says so |
+| `headroomDb` | `Double` | -3.5 | Gain after resampling only. Covers the measured square-wave overshoot, but does not guarantee all signals avoid clipping. Set 0 explicitly for unity; monitor `clippedSamples` | No gain applies to exact and widening paths |
 | `ditherSeed` | `Long?` | `null` | Seed of the dither's generator: the same seed gives the same output. Not negative | None |
-| `sourceLayout` | `PcmLayout?` | `null` | The layout of the source samples when it is not the one `StreamRequest.bitDepth` implies (16: `PCM_16`, 24: `PCM_24_PACKED`, 32: `PCM_32`): `FLOAT_32` or `PCM_24_IN_32` | A float source is converted to integers: lossy |
+| `sourceLayout` | `PcmLayout?` | `null` | The layout of the source samples when it is not the one `StreamRequest.bitDepth` implies (16: `PCM_16`, 24: `PCM_24_PACKED`, 32: `PCM_32`): `FLOAT_32`, `PCM_24_IN_32`, `PCM_16_IN_24`, or `PCM_16_IN_32`; declared zero padding is checked on every input buffer | A float source is converted to integers: lossy |
 
 What the plan can contain, and how each step is classified:
 

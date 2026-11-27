@@ -80,6 +80,27 @@ class ConversionPlanTest {
         val sample = JSONObject(backend.planRequest!!).getJSONObject("source").getJSONObject("sample")
         assertEquals(24, sample.getInt("bits"))
         assertEquals(4, sample.getInt("slot_bytes"))
+        for ((layout, slot) in listOf(PcmLayout.PCM_16_IN_24 to 3, PcmLayout.PCM_16_IN_32 to 4)) {
+            ConversionPlan.between(backend, StreamRequest.pcm(44_100, 2, 32), streamFormat(), ConversionOptions(sourceLayout = layout))
+            val padded = JSONObject(backend.planRequest!!).getJSONObject("source").getJSONObject("sample")
+            assertEquals(16, padded.getInt("bits"))
+            assertEquals(slot, padded.getInt("slot_bytes"))
+        }
+    }
+
+    @Test
+    fun floatEncodingUsesFloatLayoutAndRejectsContradictions() {
+        val backend = FakeConvertBackend()
+        val request = StreamRequest.pcmFloat32(44_100, 2)
+        ConversionPlan.between(backend, request, streamFormat(), ConversionOptions())
+        val sample = JSONObject(backend.planRequest!!).getJSONObject("source").getJSONObject("sample")
+        assertEquals("float", sample.getString("kind"))
+        try {
+            ConversionPlan.between(backend, request, streamFormat(), ConversionOptions(sourceLayout = PcmLayout.PCM_32))
+            throw AssertionError("contradictory layout accepted")
+        } catch (error: DacException) {
+            assertEquals(DacErrorCode.INVALID_ARGUMENT, error.code)
+        }
     }
 
     @Test
@@ -94,6 +115,7 @@ class ConversionPlanTest {
         assertEquals(99L, sent.getLong("dither_seed"))
         ConversionPlan.between(backend, StreamRequest.pcm(44_100, 2, 16), streamFormat(), ConversionOptions())
         assertTrue(JSONObject(backend.planRequest!!).getJSONObject("options").isNull("dither_seed"))
+        assertEquals(-3.5, JSONObject(backend.planRequest!!).getJSONObject("options").getDouble("headroom_db"), 0.0)
     }
 
     @Test

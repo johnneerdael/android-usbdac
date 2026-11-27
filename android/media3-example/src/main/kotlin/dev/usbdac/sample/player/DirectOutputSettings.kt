@@ -16,7 +16,7 @@ data class DirectOutputSettings(
     /** "Use the DAC directly." Off keeps the DAC available to other apps. */
     val takeOverDac: Boolean = true,
     /** "If the DAC cannot play a file as it is, convert it (not bit-perfect)." */
-    val allowConversion: Boolean = false,
+    val allowConversion: Boolean = true,
     /** "Play on a DAC whose volume cannot be lowered, at its own level." */
     val allowFixedVolume: Boolean = false,
     /** A support setting, off by default: keep a USB feedback trace of the next attempt. */
