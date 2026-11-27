@@ -37,14 +37,14 @@ def main():
     args = parser.parse_args()
     e = os.environ
     version, source = e['VERSION'], e['SOURCE_SHA']
-    verify(Path('release-payload'), dict(repository=e['GITHUB_REPOSITORY'], version=version,
+    verify(Path('release-payload'), dict(repository=e['SOURCE_REPOSITORY'], version=version,
         source_sha=source, workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
         run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID'])))
     previous = subprocess.run(['git', 'describe', '--tags', '--abbrev=0', f'{source}^'],
         text=True, capture_output=True, check=False)
     revision = f'{previous.stdout.strip()}..{source}' if previous.returncode == 0 else source
     changes = subprocess.check_output(['git', 'log', '--no-merges', '--pretty=- %s (%h)', revision], text=True).splitlines()
-    args.output.write_text(render(version, source, changes, e['GITHUB_REPOSITORY'], e.get('VALIDATOR') == 'true'))
+    args.output.write_text(render(version, source, changes, e['PUBLISH_REPOSITORY'], e.get('VALIDATOR') == 'true'))
 
 
 if __name__ == '__main__':

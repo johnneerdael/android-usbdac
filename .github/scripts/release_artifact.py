@@ -134,7 +134,7 @@ def main():
         stage(args.root, args.version)
     else:
         env = os.environ
-        verify(args.root, dict(repository=env['GITHUB_REPOSITORY'], version=args.version,
+        verify(args.root, dict(repository=env.get('SOURCE_REPOSITORY', env['GITHUB_REPOSITORY']), version=args.version,
                source_sha=env['SOURCE_SHA'], workflow_sha=env['WORKFLOW_SHA'],
                run_id=int(env['SOURCE_RUN_ID']), run_attempt=int(env['SOURCE_RUN_ATTEMPT']),
                reservation_run_id=int(env['RESERVATION_RUN_ID'])))

@@ -9,7 +9,8 @@ import subprocess
 import io
 import zipfile
 
-from prepare_release import STABLE_VERSION, version_files, git, require_latest_reservation
+from prepare_release import (HISTORICAL_WORKFLOWS, RELEASE_IMPLEMENTATION, STABLE_VERSION,
+                             version_files, git, require_latest_reservation)
 
 GATES = {
     "release-gates / Guide code samples",
@@ -108,24 +109,19 @@ def verify_reservation(run, prepare, log, run_id, version, repo, candidate, pare
         fail('Original reservation log mismatch')
 
 def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attempt, reservation_run_id):
-    # Trust only the reviewed current implementation or the explicitly pinned
-    # historical schema-1 implementation. Never infer trust from display names.
-    paths = ('.github/workflows/release.yml', '.github/workflows/ci.yml',
-             '.github/scripts/prepare_release.py', '.github/scripts/release_artifact.py', '.github/scripts/publish_release.py',
-             '.github/scripts/recover_release.py', '.github/scripts/release_notes.py')
+    # Trust exact reviewed implementations, including the version that
+    # sealed schema-2 receipts before repository rename recovery.
     def matches(ref):
         try:
             return all(subprocess.check_output(['git', 'show', f"{run['head_sha']}:{path}"])
                        == (Path(path).read_bytes() if ref is None else
-                           subprocess.check_output(['git', 'show', f'{ref}:{path}'])) for path in paths)
+                           subprocess.check_output(['git', 'show', f'{ref}:{path}']))
+                       for path in RELEASE_IMPLEMENTATION)
         except subprocess.CalledProcessError:
             return False
-    current = matches(None)
-    historical = any(matches(ref) for ref in (
-        '7047b6b2b143389e13e695c37385c7ecfde943a8',
-        '0733689bd30c5e9ffd192947bc4803c380dbdead',
-    ))
-    if not current and not historical:
+    schema_two = matches(None) or matches('16e5dc4d2d16304a8feab8ad54f774eda3f04a54')
+    historical = any(matches(ref) for ref in HISTORICAL_WORKFLOWS)
+    if not schema_two and not historical:
         fail('Unknown release workflow layout')
     for name in (PREPARE, 'Seal release gate evidence'):
         job = one([j for j in jobs if j.get('name') == name], name)
@@ -145,7 +141,7 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
         evidence = json.loads(archive.read('receipt.json'))
     schema = evidence.get('schema_version')
     if schema == 2:
-        if not current or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
+        if not schema_two or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
             fail('Unsupported gate identity or workflow')
     elif schema == 1:
         if not historical:
@@ -166,13 +162,35 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
     if (not re.fullmatch(r'sha256:[0-9a-f]{64}', payload.get('digest') or '')
             or not re.fullmatch(r'[0-9a-f]{64}', evidence.get('manifest_sha256') or '')):
         fail('Missing or malformed artifact or manifest digest')
-    expected = dict(repository=repo, version=version, source_sha=candidate,
+    source_repo = evidence.get('repository')
+    if source_repo != repo:
+        repo_id = run.get('repository', {}).get('id')
+        if (not isinstance(repo_id, int) or not isinstance(source_repo, str)
+                or re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', source_repo) is None
+                or json.loads(api(f'repos/{source_repo}')).get('id') != repo_id):
+            fail('Gate receipt belongs to another repository')
+    expected = dict(version=version, source_sha=candidate,
                     workflow_sha=run['head_sha'], run_id=run_id, run_attempt=attempt,
                     artifact_id=payload['id'], artifact_digest=payload.get('digest'),
                     reservation_run_id=reservation_run_id)
     if any(evidence.get(k) != v for k, v in expected.items()):
         fail('Gate receipt does not bind the original payload and reservation')
     return payload, receipt, evidence
+
+def validator_artifacts(jobs, artifacts, run_id, attempt):
+    result = {}
+    for kind, label in (('android', 'Android'), ('mac', 'macOS')):
+        job = one([j for j in jobs if j.get('name') == f'Build the {label} validator'], f'{label} validator job')
+        if job.get('status') != 'completed' or job.get('conclusion') != 'success':
+            fail(f'Original {label} validator build did not succeed')
+        name = f'{kind}-validator-{run_id}-{attempt}'
+        artifact = one([a for a in artifacts if a.get('name') == name], name)
+        if (artifact.get('expired') or artifact.get('workflow_run', {}).get('id') != run_id
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', artifact.get('digest') or '')):
+            fail(f'{label} validator artifact is unavailable or has invalid provenance')
+        result[kind] = artifact['id']
+    return result
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -248,11 +266,15 @@ def main():
     artifacts = [item for page in artifact_pages for item in page['artifacts']]
     if any(a.get('name', '').startswith(f'release-gate-receipt-{run_id}-{attempt}') for a in artifacts):
         payload, receipt, evidence = verify_staged(run, jobs, artifacts, repo, args.version, candidate, run_id, attempt, reservation_run_id)
+        validators = validator_artifacts(jobs, artifacts, run_id, attempt) if has_validator else {}
         with args.output.open('a') as output:
             print(f'version={declared}', f'commit={candidate}', 'recovered=true',
                   f'source_run_id={run_id}', f'source_run_attempt={attempt}',
+                  f'source_repository={evidence["repository"]}',
                   f'workflow_sha={run["head_sha"]}', f'reservation_run_id={reservation_run_id}', f'artifact_id={payload["id"]}',
                   f'receipt_id={receipt["id"]}', sep='\n', file=output)
+            for kind, artifact_id in validators.items():
+                print(f'{kind}_validator_id={artifact_id}', file=output)
         return
     # Legacy adapter is limited to the historical source-only release.  It does
     # not turn a rebuild into digest-bound provenance.

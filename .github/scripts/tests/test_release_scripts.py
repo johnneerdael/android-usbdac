@@ -63,16 +63,16 @@ class ReservationTests(unittest.TestCase):
 
 class ReceiptTests(unittest.TestCase):
     def check_receipt(self, schema, historical=False, identity='usbdac-release-gates/v1',
-                      changed_digest=False):
+                      changed_digest=False, source_repo='x/y', source_repo_id=17):
         candidate, workflow = 'b' * 40, 'a' * 40
-        run = {'head_sha': workflow}
+        run = {'head_sha': workflow, 'repository': {'id': 17}}
         jobs = [{'name': name, 'status': 'completed', 'conclusion': 'success', 'id': i}
                 for i, name in enumerate((recover.PREPARE, 'Seal release gate evidence', *recover.GATES))]
         digest = 'sha256:' + 'c' * 64
         items = [{'name': f'release-payload-42-1-{candidate}', 'id': 9, 'digest': digest,
                   'workflow_run': {'id': 42}},
                  {'name': 'release-gate-receipt-42-1', 'id': 10, 'workflow_run': {'id': 42}}]
-        receipt = dict(schema_version=schema, repository='x/y', version='0.1.11',
+        receipt = dict(schema_version=schema, repository=source_repo, version='0.1.11',
             source_sha=candidate, workflow_sha=workflow, run_id=42, run_attempt=1,
             artifact_id=9, artifact_digest=('sha256:' + 'e' * 64 if changed_digest else digest),
             reservation_run_id=42, manifest_sha256='d' * 64)
@@ -85,8 +85,12 @@ class ReceiptTests(unittest.TestCase):
             with zipfile.ZipFile(data, 'w') as archive:
                 archive.writestr('receipt.json', json.dumps(receipt))
             return data.getvalue()
+        def api(*args):
+            if args == (f'repos/{source_repo}',):
+                return json.dumps({'id': source_repo_id})
+            return f'[command] git log -1 --format=%H\n2026-11-01T00:00:00Z {candidate}\n'
         with patch.object(recover.subprocess, 'check_output', side_effect=command), \
-             patch.object(recover, 'api', return_value=f'[command] git log -1 --format=%H\n2026-11-01T00:00:00Z {candidate}\n'):
+             patch.object(recover, 'api', side_effect=api):
             return recover.verify_staged(run, jobs, items, 'x/y', '0.1.11', candidate, 42, 1, 42)
 
     def test_schema_two_identity_and_digest(self):
@@ -98,6 +102,21 @@ class ReceiptTests(unittest.TestCase):
 
     def test_schema_one_pinned_historical_shape(self):
         self.assertEqual(self.check_receipt(1, historical=True)[0]['id'], 9)
+
+    def test_receipt_repository_rename_requires_the_same_repository_id(self):
+        self.assertEqual(self.check_receipt(2, source_repo='x/previous')[2]['repository'], 'x/previous')
+        with self.assertRaises(SystemExit):
+            self.check_receipt(2, source_repo='x/previous', source_repo_id=18)
+
+    def test_recovery_reuses_only_verified_validator_artifacts(self):
+        jobs = [dict(name=f'Build the {os} validator', status='completed', conclusion='success')
+                for os in ('Android', 'macOS')]
+        artifacts = [dict(name=f'{platform}-validator-42-1', id=index, digest='sha256:' + 'a' * 64,
+                          workflow_run={'id': 42}) for index, platform in enumerate(('android', 'mac'), 9)]
+        self.assertEqual(recover.validator_artifacts(jobs, artifacts, 42, 1), {'android': 9, 'mac': 10})
+        artifacts[0]['workflow_run']['id'] = 43
+        with self.assertRaises(SystemExit):
+            recover.validator_artifacts(jobs, artifacts, 42, 1)
 
 
 class PayloadAndPublicationTests(unittest.TestCase):

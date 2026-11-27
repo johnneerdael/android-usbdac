@@ -112,8 +112,8 @@ def verify_skip(states, skip):
 def main():
     env = os.environ
     root = Path('release-payload').resolve()
-    version, repo = env['VERSION'], env['GITHUB_REPOSITORY']
-    verify(root, dict(repository=repo, version=version, source_sha=env['SOURCE_SHA'], workflow_sha=env['WORKFLOW_SHA'],
+    version, repo = env['VERSION'], env['PUBLISH_REPOSITORY']
+    verify(root, dict(repository=env['SOURCE_REPOSITORY'], version=version, source_sha=env['SOURCE_SHA'], workflow_sha=env['WORKFLOW_SHA'],
         run_id=int(env['SOURCE_RUN_ID']), run_attempt=int(env['SOURCE_RUN_ATTEMPT']),
         reservation_run_id=int(env['RESERVATION_RUN_ID'])))
     auth = 'Basic ' + base64.b64encode(f"{env['GITHUB_ACTOR']}:{env['GITHUB_TOKEN']}".encode()).decode()
