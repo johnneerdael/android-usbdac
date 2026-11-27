@@ -317,13 +317,12 @@ fn capture_input_geometry(
     Some((effective_iso_packet_bytes(packet, speed), service_interval_micros(speed, ep[6])))
 }
 
-/// Adaptive UAC2 IN requires its same-alternate, explicit timing OUT pipe.
-/// UAC1 retains its existing admission until its bRefresh cadence is supported.
+/// Adaptive UAC1/2 IN requires its same-alternate, explicit timing OUT pipe.
 fn standard_capture_feedforward(
     interface: &RawInterface<'_>, index: usize, speed: Speed, disabled: bool,
 ) -> Result<Option<(adc3::FeedforwardEndpoint, usize)>, String> {
     let ep = interface.descriptors[index];
-    if interface.protocol != 0x20 || (ep[3] >> 2) & 3 != 2 {
+    if !matches!(interface.protocol, 0 | 0x20) || (ep[3] >> 2) & 3 != 2 {
         return Ok(None);
     }
     if disabled { return Err("adaptive capture requires enabled feedforward".into()); }
@@ -1416,7 +1415,9 @@ pub(super) fn inspect_slot<'a>(
     let data = unsafe { &*slot.user_data };
     if transfer.num_iso_packets != scratch.len() as i32
         || transfer.length < 0 || transfer.length as usize != slot.submitted_bytes
-        || slot.submitted_bytes != data.buffer.len() || transfer.endpoint != slot.submitted_endpoint
+        || slot.submitted_bytes > data.buffer.len()
+        || (slot.submitted_endpoint & 0x80 != 0 && slot.submitted_bytes != data.buffer.len())
+        || transfer.endpoint != slot.submitted_endpoint
         || transfer.buffer != data.buffer.as_ptr().cast_mut() {
         return Err(Error::Transfer("capture transfer geometry changed".into()));
     }
@@ -1425,7 +1426,7 @@ pub(super) fn inspect_slot<'a>(
         *destination = CapturePacket { requested_bytes: source.length as usize,
             actual_bytes: source.actual_length as usize, succeeded: source.status == LIBUSB_TRANSFER_COMPLETED };
     }
-    Ok((&data.buffer, descriptors.iter().any(|p| p.status == LIBUSB_TRANSFER_NO_DEVICE)))
+    Ok((&data.buffer[..slot.submitted_bytes], descriptors.iter().any(|p| p.status == LIBUSB_TRANSFER_NO_DEVICE)))
 }
 
 pub(super) fn ingest_slot(slot: &IsoTransferSlot, status: i32, buffer: &mut CaptureBuffer,
@@ -1522,25 +1523,52 @@ pub(super) fn capture_queue_bytes(packet_bytes: usize, geometry: IsoQueueGeometr
 pub(super) struct FeedforwardPool {
     pub(super) slots: Vec<IsoTransferSlot>,
     pipe: adc3::FeedforwardEndpoint,
-    payload: Vec<u8>,
+    nominal_word: Vec<u8>,
     packets: usize,
+    cadence: FeedforwardCadence,
     scratch: Vec<CapturePacket>,
     first_valid_send: Option<Instant>,
     requires_post_proof_submission: bool,
     deadline: Duration,
 }
+/// usbfs schedules every descriptor service slot using bInterval. UAC1's
+/// bRefresh selects which of those slots carries a word; intervening slots
+/// carry zero-length transactions (USB 2.0 sections 5.6 and 5.12.4.2).
+#[derive(Debug, Clone, Copy)]
+struct FeedforwardCadence {
+    period: usize,
+    phase: usize,
+}
+impl FeedforwardCadence {
+    fn new(refresh: Option<u8>) -> Result<Self, String> {
+        let period = match refresh {
+            None => 1,
+            Some(refresh @ 1..=9) => 1usize << refresh,
+            Some(_) => return Err("invalid capture feedforward refresh".into()),
+        };
+        Ok(Self { period, phase: 0 })
+    }
+    fn plan(self, packets: usize, bytes: usize) -> (Vec<usize>, Self) {
+        let lengths = (0..packets).map(|offset| {
+            if (self.phase + offset) % self.period == 0 { bytes } else { 0 }
+        }).collect();
+        (lengths, Self { phase: (self.phase + packets) % self.period, ..self })
+    }
+}
 impl FeedforwardPool {
     pub(super) fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
         let Some(pipe) = endpoint.feedforward() else { return Ok(None); };
         let nominal = pipe.nominal(endpoint.format.sample_rate())?;
-        // Target 8 ms per URB, capped at 32 packets; one packet for sparse polling.
+        if nominal.len() != pipe.bytes { return Err("capture feedforward word width mismatch".into()); }
+        // Target 8 ms per URB, capped at 32 service slots.
         // bInterval schedules the transfers; it never rescales the rate value.
         let packets = 8_000usize.div_ceil(pipe.service_us as usize)
             .clamp(1, crate::iso_packet_scheduler::MAX_PACKETS_PER_TRANSFER);
-        let payload: Vec<_> = nominal.into_iter().cycle().take(packets * pipe.bytes).collect();
+        let cadence = FeedforwardCadence::new(pipe.refresh)?;
+        let nominal_word = nominal;
         let mut slots = Vec::with_capacity(2);
-        for index in 0..2 { slots.push(IsoTransferSlot::new(index, packets, payload.len())?); }
-        Ok(Some(Self { slots, pipe, payload, packets,
+        for index in 0..2 { slots.push(IsoTransferSlot::new(index, packets, packets * pipe.bytes)?); }
+        Ok(Some(Self { slots, pipe, nominal_word, packets, cadence,
             scratch: vec![CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; packets],
             first_valid_send: None,
             requires_post_proof_submission: endpoint.standard_feedforward.is_some(),
@@ -1548,12 +1576,17 @@ impl FeedforwardPool {
         }))
     }
     fn submit(&mut self, index: usize, handle: &DeviceHandle<Context>) -> Result<(), Error> {
+        let (packet_sizes, next_cadence) = self.cadence.plan(self.packets, self.pipe.bytes);
+        let transfer_buffer = packet_sizes.iter().filter(|&&bytes| bytes != 0)
+            .flat_map(|_| self.nominal_word.iter().copied()).collect();
         self.slots[index].submit_with_timeout(handle, self.pipe.address, IsoTransferPayload {
-            packet_sizes: vec![self.pipe.bytes; self.packets], packet_samples: vec![],
-            transfer_buffer: self.payload.clone(), underrun: false, held: false,
+            packet_sizes, packet_samples: vec![],
+            transfer_buffer, underrun: false, held: false,
             frame_count: 0, music_frames: 0, epoch: 0,
         }, self.deadline.as_millis().min(u128::from(u32::MAX)) as u32).map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost }
-            else { Error::Transfer(format!("capture feedforward submission: {e}")) })
+            else { Error::Transfer(format!("capture feedforward submission: {e}")) })?;
+        self.cadence = next_cadence;
+        Ok(())
     }
     pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
         for index in 0..self.slots.len() {
@@ -1575,10 +1608,11 @@ impl FeedforwardPool {
         for index in 0..self.slots.len() {
             if let Some((status, completed, _)) = self.slots[index].take_completion() {
                 let result = validate_feedforward_slot(&self.slots[index], status, completed,
-                    self.deadline, self.pipe.bytes, &self.payload, &mut self.scratch);
+                    self.deadline, self.pipe.bytes, &self.nominal_word, &mut self.scratch);
                 self.slots[index].mark_completed();
-                result?;
-                self.first_valid_send = Some(self.first_valid_send.map_or(completed, |first| first.min(completed)));
+                if result? {
+                    self.first_valid_send = Some(self.first_valid_send.map_or(completed, |first| first.min(completed)));
+                }
                 self.submit(index, handle)?;
             } else if self.slots[index].in_flight && self.slots[index].submitted_at
                 .is_some_and(|start| start.elapsed() >= self.deadline) {
@@ -1597,7 +1631,7 @@ impl Drop for FeedforwardPool {
     fn drop(&mut self) { self.cancel(); }
 }
 fn validate_feedforward_slot(slot: &IsoTransferSlot, status: i32, completed: Instant,
-    deadline: Duration, bytes: usize, payload: &[u8], scratch: &mut [CapturePacket]) -> Result<(), Error> {
+    deadline: Duration, bytes: usize, nominal_word: &[u8], scratch: &mut [CapturePacket]) -> Result<bool, Error> {
     let (data, detached) = inspect_slot(slot, status, scratch).map_err(|error| match error {
         Error::DeviceLost => Error::DeviceLost,
         other => Error::Transfer(format!("capture feedforward completion: {other}")),
@@ -1606,15 +1640,23 @@ fn validate_feedforward_slot(slot: &IsoTransferSlot, status: i32, completed: Ins
     if !slot.submitted_at.is_some_and(|start| completed.saturating_duration_since(start) < deadline) {
         return Err(Error::Transfer("capture feedforward deadline missed".into()));
     }
-    validate_feedforward_packets(bytes, scratch)?;
-    if data != payload { return Err(Error::Transfer("capture feedforward payload changed".into())); }
-    Ok(())
+    let sent_word = validate_feedforward_packets(bytes, &slot.packet_sizes, scratch)?;
+    let expected_bytes: usize = slot.packet_sizes.iter().sum();
+    if nominal_word.len() != bytes || data.len() != expected_bytes
+        || data.chunks(bytes.max(1)).any(|word| word != nominal_word) {
+        return Err(Error::Transfer("capture feedforward payload changed".into()));
+    }
+    Ok(sent_word)
 }
-fn validate_feedforward_packets(bytes: usize, packets: &[CapturePacket]) -> Result<(), Error> {
-    if packets.is_empty() || packets.iter().any(|p| !p.succeeded || p.requested_bytes != bytes || p.actual_bytes != bytes) {
+fn validate_feedforward_packets(bytes: usize, planned: &[usize], packets: &[CapturePacket]) -> Result<bool, Error> {
+    if bytes == 0 || packets.is_empty() || planned.len() != packets.len()
+        || planned.iter().zip(packets).any(|(&expected, packet)| {
+            (expected != 0 && expected != bytes) || !packet.succeeded
+                || packet.requested_bytes != expected || packet.actual_bytes != expected
+        }) {
         return Err(Error::Transfer("capture feedforward short or failed isochronous packet".into()));
     }
-    Ok(())
+    Ok(planned.iter().any(|&length| length != 0))
 }
 
 /// Roland capture has no application playback provider. Service the proven
@@ -2245,6 +2287,133 @@ mod tests {
         raw
     }
 
+    fn adaptive_uac1_configuration(refresh: u8) -> Vec<u8> {
+        let mut raw = configuration(0);
+        let alternate = raw.windows(4).position(|w| w == [9, 4, 1, 1]).unwrap();
+        raw[alternate + 4] = 2;
+        let data = raw.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
+        raw[data + 3] = 0x09;
+        raw[data + 8] = 1;
+        raw.extend_from_slice(&[9, 5, 1, 0x01, 3, 0, 1, refresh, 0]);
+        update_configuration_length(&mut raw);
+        raw
+    }
+
+    #[test]
+    fn adaptive_uac1_discovery_reproof_and_capture_gate_require_timing() {
+        let raw = adaptive_uac1_configuration(4);
+        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        assert_eq!(endpoint.feedforward().unwrap().refresh, Some(4));
+        assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
+        let interfaces = raw_interfaces(&raw).unwrap();
+        let interface = interfaces.last().unwrap();
+        let input = interface.descriptors.iter().position(|d| d[1] == 5 && d[2] == 0x81).unwrap();
+        assert!(standard_capture_feedforward(interface, input, Speed::Full, true).is_err());
+        let mut changed = raw.clone();
+        let refresh = changed.len() - 2;
+        changed[refresh] = 5;
+        assert!(reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err());
+        for invalid_refresh in [0, 10] {
+            assert!(capture_candidates(&adaptive_uac1_configuration(invalid_refresh), 1, Speed::Full, 48_000).unwrap().is_empty());
+        }
+        let mut pool = FeedforwardPool::for_endpoint(&endpoint).unwrap().unwrap();
+        let at = Instant::now();
+        assert!(!pool.primed());
+        pool.first_valid_send = Some(at);
+        assert!(!pool.accepts_capture_transfer(at, Some(at - Duration::from_millis(1))));
+        assert!(pool.accepts_capture_transfer(at, Some(at)));
+    }
+
+    #[test]
+    fn uac1_refresh_phase_spans_both_urbs_and_empty_submissions() {
+        for refresh in [1, 4, 9] {
+            let mut cadence = FeedforwardCadence::new(Some(refresh)).unwrap();
+            let mut words = Vec::new();
+            for transfer in 0..140 {
+                let (lengths, next) = cadence.plan(8, 3);
+                for (packet, length) in lengths.into_iter().enumerate() {
+                    if length == 3 { words.push(transfer * 8 + packet); }
+                    else { assert_eq!(length, 0); }
+                }
+                cadence = next;
+            }
+            assert_eq!(words, (0..1120).step_by(1 << refresh).collect::<Vec<_>>());
+        }
+        assert!(FeedforwardCadence::new(Some(0)).is_err());
+        assert!(FeedforwardCadence::new(Some(10)).is_err());
+        assert_eq!(FeedforwardCadence::new(None).unwrap().plan(8, 4).0, vec![4; 8]);
+    }
+
+    #[test]
+    fn sparse_feedforward_validates_packed_words_and_exact_empty_slots() {
+        for word in [&[0, 0, 12][..], &[0, 0, 6, 0][..]] {
+            let width = word.len();
+            let mut slot = IsoTransferSlot::new(0, 3, width * 3).unwrap();
+            slot.submitted_endpoint = 1;
+            slot.submitted_bytes = width * 2;
+            slot.packet_sizes = vec![width, 0, width];
+            let start = Instant::now();
+            slot.submitted_at = Some(start);
+            unsafe {
+                let data = &mut *slot.user_data;
+                data.buffer[..width].copy_from_slice(word);
+                data.buffer[width..width * 2].copy_from_slice(word);
+                let transfer = slot.transfer.as_mut();
+                transfer.endpoint = 1;
+                transfer.length = (width * 2) as i32;
+                transfer.num_iso_packets = 3;
+                transfer.buffer = data.buffer.as_mut_ptr();
+                for (index, length) in slot.packet_sizes.iter().enumerate() {
+                    let packet = &mut *transfer.iso_packet_desc.as_mut_ptr().add(index);
+                    packet.length = *length as u32;
+                    packet.actual_length = *length as u32;
+                    packet.status = LIBUSB_TRANSFER_COMPLETED;
+                }
+            }
+            let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; 3];
+            let deadline = Duration::from_millis(100);
+            assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+                deadline, width, word, &mut scratch), Ok(true));
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = width as u32; }
+            assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+                deadline, width, word, &mut scratch).is_err());
+            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = 0; }
+            unsafe { (&mut *slot.user_data).buffer[width] ^= 1; }
+            assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+                deadline, width, word, &mut scratch).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_feedforward_urb_is_valid_but_never_proves_a_report() {
+        let word = [0, 0, 12];
+        let mut slot = completed_slot(0, &[0; 3]);
+        slot.submitted_endpoint = 1;
+        slot.submitted_bytes = 0;
+        slot.packet_sizes[0] = 0;
+        let start = Instant::now();
+        slot.submitted_at = Some(start);
+        unsafe {
+            let transfer = slot.transfer.as_mut();
+            transfer.endpoint = 1;
+            transfer.length = 0;
+            let packet = &mut *transfer.iso_packet_desc.as_mut_ptr();
+            packet.length = 0;
+            packet.actual_length = 0;
+        }
+        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let deadline = Duration::from_millis(100);
+        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+            deadline, 3, &word, &mut scratch), Ok(false));
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
+        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
+            deadline, 3, &word, &mut scratch).is_err());
+        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0; }
+        slot.submitted_endpoint = 0x81;
+        unsafe { slot.transfer.as_mut().endpoint = 0x81; }
+        assert!(inspect_slot(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).is_err());
+    }
+
     #[test]
     fn adaptive_uac2_requires_proven_timing_and_representable_nominal_rate() {
         let raw = adaptive_uac2_configuration();
@@ -2263,11 +2432,11 @@ mod tests {
             assert!(capture_candidates(&changed, 1, Speed::Full, 48_000).unwrap().is_empty());
             assert!(!claimable_capture_input(raw_interfaces(&changed).unwrap().last().unwrap(), Speed::Full));
         }
-        // Keep UAC1's existing structural admission; its bRefresh support is separate.
+        // Adaptive UAC1 also requires its proven timing companion.
         let mut uac1 = configuration(0);
         let input = uac1.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
         uac1[input + 3] = 9;
-        assert_eq!(capture_candidates(&uac1, 1, Speed::Full, 48_000).unwrap().len(), 1);
+        assert!(capture_candidates(&uac1, 1, Speed::Full, 48_000).unwrap().is_empty());
         for change in [0, 1, 2] {
             let mut changed = raw.clone();
             let timing = changed.len() - 7;
@@ -2477,12 +2646,12 @@ mod tests {
     #[test]
     fn feedforward_sends_require_every_exact_packet_and_reject_detach_geometry() {
         let valid = CapturePacket { requested_bytes: 4, actual_bytes: 4, succeeded: true };
-        assert!(validate_feedforward_packets(4, &[valid, valid]).is_ok());
-        assert!(validate_feedforward_packets(4, &[]).is_err());
+        assert!(validate_feedforward_packets(4, &[4, 4], &[valid, valid]).is_ok());
+        assert!(validate_feedforward_packets(4, &[], &[]).is_err());
         for packet in [CapturePacket { actual_bytes: 0, ..valid },
             CapturePacket { actual_bytes: 3, ..valid }, CapturePacket { actual_bytes: 5, ..valid },
             CapturePacket { requested_bytes: 3, ..valid }, CapturePacket { succeeded: false, ..valid }] {
-            assert!(validate_feedforward_packets(4, &[valid, packet]).is_err());
+            assert!(validate_feedforward_packets(4, &[4, 4], &[valid, packet]).is_err());
         }
     }
 

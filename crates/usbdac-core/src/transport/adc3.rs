@@ -197,7 +197,7 @@ pub(super) fn adc3_wire_ranges(handle: &DeviceHandle<Context>, route: &Adc3Route
     let source = route.clock.as_ref().ok_or("ADC3 clock source missing")?;
     adc3_route_ranges(route, &get_sampling_frequency_ranges(handle, route.control, source.id)?)
 }
-/// Full ADC3 adaptive-source explicit host-to-device rate pipe. The rate is
+/// Adaptive-source explicit host-to-device rate pipe. The rate is
 /// expressed per USB frame/microframe, independently of either pipe's interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FeedforwardEndpoint {
@@ -206,6 +206,8 @@ pub(super) struct FeedforwardEndpoint {
     pub(super) service_us: u32,
     pub(super) bytes: usize,
     pub(super) full_speed: bool,
+    /// UAC1 report period exponent in USB frames or microframes.
+    pub(super) refresh: Option<u8>,
 }
 impl FeedforwardEndpoint {
     pub(super) fn nominal(self, rate: u32) -> Result<Vec<u8>, String> {
@@ -839,7 +841,7 @@ fn adc3_feedforward(config: &ConfigDescriptor, handle: &DeviceHandle<Context>,
             ep.transfer_type(), ep.sync_type(), ep.usage_type())?;
     }
     Ok((FeedforwardEndpoint { address: ep.address(), interval: ep.interval(), service_us: service,
-        bytes, full_speed: speed == Speed::Full }, companion))
+        bytes, full_speed: speed == Speed::Full, refresh: None }, companion))
 }
 fn adaptive_implicit_inventory(profile: wire::FunctionProfile, duplex: bool,
     endpoints: usize, synch_address: u8, disabled: bool) -> bool {
@@ -2718,7 +2720,7 @@ mod tests {
     }
     #[test]
     fn adaptive_capture_nominal_rate_uses_bus_units_and_source_rounding() {
-        let fs = FeedforwardEndpoint { address: 2, interval: 1, service_us: 1000, bytes: 3, full_speed: true };
+        let fs = FeedforwardEndpoint { address: 2, interval: 1, service_us: 1000, bytes: 3, full_speed: true, refresh: None };
         assert_eq!(fs.nominal(48_000).unwrap(), vec![0, 0, 12]);
         assert_eq!(fs.nominal(44_100).unwrap(), vec![0x66, 0x06, 0x0b]);
         assert_eq!(fs.nominal(2).unwrap(), vec![32, 0, 0]);
@@ -2738,7 +2740,7 @@ mod tests {
     #[test]
     fn enhanced_capture_feedforward_is_unsigned_q32_32_with_data_capacity_guard() {
         let pipe = FeedforwardEndpoint { address: 2, interval: 4, service_us: 1000,
-            bytes: 8, full_speed: false };
+            bytes: 8, full_speed: false, refresh: None };
         assert_eq!(pipe.nominal(48_000).unwrap(), vec![0, 0, 0, 0, 6, 0, 0, 0]);
         assert_eq!(pipe.nominal(44_100).unwrap(), vec![0x33, 0x33, 0x33, 0x83, 5, 0, 0, 0]);
         assert!(pipe.nominal(0).is_err());
@@ -2789,7 +2791,7 @@ mod tests {
     }
     #[test]
     fn adaptive_capture_preserves_extended_in_capacity_for_rate_checks() {
-        let pipe = FeedforwardEndpoint { address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false };
+        let pipe = FeedforwardEndpoint { address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false, refresh: None };
         // The SSP companion's ordinary wBytesPerInterval is the sentinel 1.
         let extra = [6, 0x30, 0, 0x80, 1, 0, 8, 0x31, 0, 0, 0, 0x10, 0, 0];
         let (capacity, service, _) = ss_periodic_geometry(1024, 4, &extra, true).unwrap();
@@ -3334,7 +3336,7 @@ mod tests {
         }
         assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 96_000, &adaptive_in, 48_000).is_err());
         let mut direct = adaptive_in.clone(); direct.feedforward = Some(FeedforwardEndpoint {
-            address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false });
+            address: 2, interval: 4, service_us: 1000, bytes: 4, full_speed: false, refresh: None });
         assert!(validate_adaptive_duplex(&adaptive, &adaptive_out, 48_000, &direct, 48_000).is_err());
         let mut scaled_out = out.clone();
         scaled_out.choice = Some(ratio_choice(&[(7, 2, 4)]));

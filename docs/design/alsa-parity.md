@@ -201,13 +201,6 @@ endpoint before activating either stream. [USB-IF UAC2 §§3.16 and 4.10](https:
 [USB 2.0 §§5.12.4.2 and 9.6.6](https://www.alsa-project.org/files/pub/datasheets/usb/usb_20.pdf),
 [ALSA outbound synchronization packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L324-L370)
 
-UAC1 adaptive capture still needs its `bSynchAddress` association and
-`bRefresh` cadence. ALSA can set the isochronous URB period from
-`bRefresh`. Linux usbfs derives that period from `bInterval`, so the
-Android userspace transport needs a separate scheduling proof. [USB-IF UAC1 §4.6.2](https://www.usb.org/sites/default/files/audio10.pdf),
-[ALSA synchronization interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L680-L701),
-[Linux usbfs isochronous interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/core/devio.c#L1896-L1908)
-
 In the final hardware pass, verify standalone capture and duplex on a
 device exposing an adaptive IN alternate. Record both pipes and their
 intervals, confirm the outgoing rate word and subsequent captured
@@ -220,6 +213,39 @@ AAR and sample builds passed. The existing Kotlin test result remained
 current. All four Android ABIs contained matching native binaries in
 both packages. The AAR SHA-256 is
 `30441e12555a7daf84d8a068c6b9d31d0293ee695117b7201587a42595f19480`.
+
+### UAC1 adaptive capture timing
+
+UAC1 adaptive PCM IN identifies its synchronization OUT endpoint by
+`bSynchAddress`. Require one matching endpoint in the same alternate
+and verify both descriptors again during activation. The refresh
+period is `2^bRefresh` USB frames at full speed. High-speed UAC1 uses
+the generic ALSA convention of microframe units and a four-byte rate
+word. [USB-IF UAC1 §§3.7.2.2 and 4.6.2](https://www.usb.org/sites/default/files/audio10.pdf),
+[ALSA synchronization interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L680-L701),
+[ALSA outbound rate word](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/sound/usb/endpoint.c#L323-L345)
+
+Linux usbfs schedules each isochronous packet at the endpoint's
+`bInterval` period. Fill the scheduled positions between rate words
+with zero-length packets and carry the refresh phase across transfer
+submissions. The rate word stays in bus-frame units. Capture waits for
+a successful transfer carrying a rate word. The worker validates
+actual lengths and status in every position and retires both
+pipes before resetting the alternate. [USB 2.0 §§5.6 and 5.12.4.2](https://www.alsa-project.org/files/pub/datasheets/usb/usb_20.pdf),
+[Linux usbfs isochronous interval](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/core/devio.c#L1896-L1917),
+[Linux xHCI zero-length isochronous packets](https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/drivers/usb/host/xhci-ring.c#L3834-L3858)
+
+Physical acceptance needs a UAC1 device with a linked adaptive IN
+alternate. Capture at the advertised rate and verify the report
+spacing, zero-length positions and audio frame counts on a bus trace.
+Exercise full speed through a hub and high speed where supported.
+UAC1 duplex still needs a separate clock and rate ownership proof.
+
+Rust workspace tests covered the descriptor pair, refresh phase across
+transfers, and completion checks for empty slots and rate words. The
+Android arm64 target check passed, and the release AAR and sample
+contain matching native libraries for all four ABIs. The AAR SHA-256
+is `a9e8020be14abdc46dd7a7172c3a5a1ef8cfbac76c13a3f5511328c0b6589f4a`.
 
 ### AudioControl notifications during a stream
 
