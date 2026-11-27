@@ -280,6 +280,7 @@ pub(super) fn negotiate_playback_format(
                         .map_or(true, |rate| rate == 0)
                     && !clock_outcome.known_mismatch;
                 let allow_unverified = settings().allow_unusable_clock_readback(
+                    candidate.is_uac1,
                     true,
                     clock_outcome.set_cur_succeeded,
                     clock_outcome.reported_sample_rate,

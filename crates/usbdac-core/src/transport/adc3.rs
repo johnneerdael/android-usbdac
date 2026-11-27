@@ -876,6 +876,16 @@ fn linked_terminal_clock(descriptors: &[&[u8]], terminal: u8, capture: bool) -> 
     }
     Ok(id)
 }
+fn clock_entity<'a>(descriptors: &[&'a [u8]], id: u8) -> Result<&'a [u8], String> {
+    let mut nodes = descriptors.iter().copied().filter(|d| {
+        d.get(2).is_some_and(|subtype| (2..=0x10).contains(subtype)) && d.get(3) == Some(&id)
+    });
+    let node = nodes.next().ok_or("ADC3 clock ID missing or duplicated")?;
+    if nodes.next().is_some() {
+        return Err("ADC3 clock ID missing or duplicated".into());
+    }
+    Ok(node)
+}
 fn clock_route(
     handle: &DeviceHandle<Context>,
     control: u8,
@@ -896,13 +906,7 @@ fn clock_route(
         if path.iter().any(|h| h.id == id) {
             return Err("ADC3 clock cycle".into());
         }
-        let nodes: Vec<_> = descriptors
-            .iter()
-            .filter(|d| d.get(3) == Some(&id))
-            .collect();
-        let [d] = nodes.as_slice() else {
-            return Err("ADC3 clock ID missing or duplicated".into());
-        };
+        let d = clock_entity(&descriptors, id)?;
         match d[2] {
             0x0b => {
                 let source = wire::parse_clock_source(d).map_err(|e| e.to_string())?;
@@ -4113,6 +4117,17 @@ pub(super) fn adc3_badd_volume_topology(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clock_entity_ignores_headers_and_rejects_real_duplicates() {
+        let header = [4, 0x24, 1, 9];
+        let clock = [4, 0x24, 0x0b, 9];
+        let terminal = [4, 0x24, 2, 9];
+        assert_eq!(clock_entity(&[&header, &clock], 9).unwrap(), &clock);
+        assert!(clock_entity(&[&header, &clock, &terminal], 9).is_err());
+        assert_eq!(clock_entity(&[&terminal], 9).unwrap()[2], 2);
+        assert!(wire::parse_clock_source(clock_entity(&[&clock], 9).unwrap()).is_err());
+    }
+
     fn ratio_choice(factors: &[(u8, u16, u16)]) -> ClockChoice {
         ClockChoice {
             control_interface: 0,

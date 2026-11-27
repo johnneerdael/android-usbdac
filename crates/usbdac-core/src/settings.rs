@@ -111,6 +111,7 @@ impl Settings {
 
     pub(crate) fn allow_unusable_clock_readback(
         &self,
+        is_uac1: bool,
         set_attempted: bool,
         set_succeeded: bool,
         reported: Option<u32>,
@@ -124,7 +125,7 @@ impl Settings {
             && !dsd
             && !self.has(Quirk::RequireVerifiedRate)
             && (self.skip_clock_validation()
-                || self.has(Quirk::SkipSampleRateReadback)
+                || (is_uac1 && self.has(Quirk::SkipSampleRateReadback))
                 || self.config.clock_readback_policy
                     == crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet)
     }
@@ -401,11 +402,11 @@ mod clock_readback_policy_tests {
     #[test]
     fn only_acknowledged_unreadable_pcm_clock_can_use_fallback() {
         let mut settings = Settings::default();
-        assert!(!settings.allow_unusable_clock_readback(true, true, None, false, false));
+        assert!(!settings.allow_unusable_clock_readback(false, true, true, None, false, false));
         settings.config.clock_readback_policy =
             crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet;
-        assert!(settings.allow_unusable_clock_readback(true, true, None, false, false));
-        assert!(settings.allow_unusable_clock_readback(true, true, Some(0), false, false));
+        assert!(settings.allow_unusable_clock_readback(false, true, true, None, false, false));
+        assert!(settings.allow_unusable_clock_readback(false, true, true, Some(0), false, false));
         for (attempted, succeeded, reported, multiplied, dsd) in [
             (false, true, None, false, false),
             (true, false, None, false, false),
@@ -413,11 +414,16 @@ mod clock_readback_policy_tests {
             (true, true, None, true, false),
             (true, true, None, false, true),
         ] {
-            assert!(!settings
-                .allow_unusable_clock_readback(attempted, succeeded, reported, multiplied, dsd));
+            assert!(!settings.allow_unusable_clock_readback(
+                false, attempted, succeeded, reported, multiplied, dsd
+            ));
         }
+        settings.config.clock_readback_policy = crate::config::ClockReadbackPolicy::RequireVerified;
+        settings.quirks.push(Quirk::SkipSampleRateReadback);
+        assert!(settings.allow_unusable_clock_readback(true, true, true, None, false, false));
+        assert!(!settings.allow_unusable_clock_readback(false, true, true, None, false, false));
         settings.quirks.push(Quirk::RequireVerifiedRate);
-        assert!(!settings.allow_unusable_clock_readback(true, true, None, false, false));
+        assert!(!settings.allow_unusable_clock_readback(true, true, true, None, false, false));
     }
 }
 

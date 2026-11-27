@@ -46,9 +46,14 @@ pub struct RoutingSnapshot {
     inventory: RoutingInventory,
     selectors: Vec<RouteChange>,
     hc_clusters: BTreeMap<(u8, u16), RoutingCluster>,
+    hand_back_report: Arc<Mutex<Option<RoutingHandBackReport>>>,
 }
 
 impl RoutingSnapshot {
+    /// None until final retirement completes; remains available after close.
+    pub fn hand_back_report(&self) -> Option<RoutingHandBackReport> {
+        self.hand_back_report.lock().clone()
+    }
     pub fn configuration(&self) -> u8 {
         self.configuration
     }
@@ -58,6 +63,23 @@ impl RoutingSnapshot {
     pub fn selector_values(&self) -> &[RouteChange] {
         &self.selectors
     }
+}
+
+/// Outcome for one control when the session relinquishes routing ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingHandBackOutcome {
+    Restored,
+    AlreadyOriginal,
+    ExternallyChanged,
+    Unreadable(String),
+    IdentityOrTopologyChanged(String),
+    RestoreUncertain(String),
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingHandBackReport {
+    pub controls: Vec<(ControlKey, RoutingHandBackOutcome)>,
 }
 
 /// Typed failures preserve failed-change and rollback information.
@@ -2422,6 +2444,7 @@ pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, Rout
             inventory,
             selectors,
             hc_clusters,
+            hand_back_report: context::current().routing_report.clone(),
         })
     })
 }
@@ -2458,10 +2481,63 @@ pub(crate) fn read_with_power(
 #[derive(Debug)]
 pub(super) struct RecordedRouting {
     snapshot: RoutingSnapshot,
-    // Original and last library-written value for each edited control.
-    values: BTreeMap<ControlKey, (RouteValue, RouteValue)>,
+    // The first actual pre-write CUR and bounded current ownership evidence.
+    values: BTreeMap<ControlKey, RecordedRoute>,
     powered: bool,
 }
+#[derive(Debug)]
+struct RecordedRoute {
+    original: RouteValue,
+    ownership: Ownership,
+    selectors: Vec<RouteChange>,
+    forfeited: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    None,
+    Verified(RouteValue),
+    Uncertain {
+        previous: Option<RouteValue>,
+        target: RouteValue,
+    },
+}
+impl Ownership {
+    fn owns(self, value: RouteValue) -> bool {
+        match self {
+            Self::None => false,
+            Self::Verified(current) => current == value,
+            Self::Uncertain { previous, target } => previous == Some(value) || target == value,
+        }
+    }
+}
+impl RecordedRoute {
+    fn record_attempt(
+        &mut self,
+        before: RouteValue,
+        target: RouteValue,
+        success: bool,
+        rollback_failed: bool,
+    ) {
+        let prior_owned = before == self.original || self.ownership.owns(before);
+        if !prior_owned {
+            self.forfeited = true;
+        }
+        self.ownership = if self.forfeited {
+            Ownership::None
+        } else if success {
+            Ownership::Verified(target)
+        } else if rollback_failed {
+            Ownership::Uncertain {
+                previous: prior_owned.then_some(before),
+                target,
+            }
+        } else {
+            Ownership::Verified(before)
+        };
+    }
+}
+
 static ORIGINAL_ROUTING: context::ScopedMutex<Option<RecordedRouting>> =
     context::ScopedMutex::new(|context| context.routing.clone());
 
@@ -2503,8 +2579,33 @@ pub(crate) fn apply_with_power(
             ));
         }
         let old_count = originals.as_ref().map_or(0, |prior| prior.values.len());
-        if old_count + edits.len() > MAX_RECORDED_ROUTES {
+        let new_count = edits
+            .iter()
+            .map(|edit| edit.key)
+            .collect::<std::collections::BTreeSet<_>>()
+            .iter()
+            .filter(|key| {
+                !originals
+                    .as_ref()
+                    .is_some_and(|r| r.values.contains_key(*key))
+            })
+            .count();
+        if old_count + new_count > MAX_RECORDED_ROUTES {
             return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
+        }
+        if let Some(prior) = originals.as_ref() {
+            for edit in edits {
+                if matches!(edit.key, ControlKey::Crosspoint { .. })
+                    && prior
+                        .values
+                        .get(&edit.key)
+                        .is_some_and(|entry| entry.selectors != snapshot.selectors)
+                {
+                    return Err(RoutingSessionError::Drift(
+                        "mixer mapping changed since its first edit".into(),
+                    ));
+                }
+            }
         }
         let expected = edits
             .iter()
@@ -2525,35 +2626,65 @@ pub(crate) fn apply_with_power(
             descriptors: &snapshot.descriptors,
         };
         verify_values(&snapshot.inventory, &mut io, &expected)?;
-        let report = match routing::apply_routes(&snapshot.inventory, &mut io, &changes) {
-            Ok(report) => report,
-            Err(failure) => {
-                if !failure.rollback_failures.is_empty() {
-                    invalidate_route_caches();
+        if let Some(recorded) = originals.as_mut() {
+            for edit in edits {
+                if let Some(entry) = recorded.values.get_mut(&edit.key) {
+                    if edit.expected != entry.original && !entry.ownership.owns(edit.expected) {
+                        entry.forfeited = true;
+                        entry.ownership = Ownership::None;
+                    }
                 }
-                return Err(RoutingSessionError::Transaction(failure));
             }
-        };
-        if !report.changed.is_empty() {
+        }
+        let mut attempted = Vec::new();
+        let result =
+            routing::apply_routes_traced(&snapshot.inventory, &mut io, &changes, &mut attempted);
+        for (key, before, target) in attempted {
+            let rollback_failed = match &result {
+                Ok(_) => false,
+                Err(failure) => failure
+                    .rollback_failures
+                    .iter()
+                    .any(|(failed, _)| *failed == key),
+            };
+            let success = result.is_ok();
+            // A new, fully rolled-back edit creates no outstanding ownership.
+            if !success
+                && !rollback_failed
+                && !originals
+                    .as_ref()
+                    .is_some_and(|r| r.values.contains_key(&key))
+            {
+                continue;
+            }
             let recorded = originals.get_or_insert_with(|| RecordedRouting {
                 snapshot: snapshot.clone(),
                 values: BTreeMap::new(),
                 powered,
             });
             recorded.powered |= powered;
-            for edit in edits {
-                if report.changed.contains(&edit.key) {
-                    recorded
-                        .values
-                        .entry(edit.key)
-                        .and_modify(|record| record.1 = edit.value)
-                        .or_insert((edit.expected, edit.value));
-                }
-            }
-            // A later open must repeat route/clock and configured volume admission.
-            invalidate_route_caches();
+            let entry = recorded.values.entry(key).or_insert_with(|| RecordedRoute {
+                original: before,
+                ownership: Ownership::None,
+                selectors: snapshot.selectors.clone(),
+                forfeited: false,
+            });
+            entry.record_attempt(before, target, success, rollback_failed);
         }
-        Ok(report)
+        match result {
+            Ok(report) => {
+                if !report.changed.is_empty() {
+                    invalidate_route_caches();
+                }
+                Ok(report)
+            }
+            Err(failure) => {
+                if !failure.rollback_failures.is_empty() {
+                    invalidate_route_caches();
+                }
+                Err(RoutingSessionError::Transaction(failure))
+            }
+        }
     })
 }
 
@@ -2581,13 +2712,37 @@ pub(super) fn finish_routing_hand_back() {
     let Some(record) = ORIGINAL_ROUTING.lock().take() else {
         return;
     };
+    let sink = record.snapshot.hand_back_report.clone();
+    let mut report = RoutingHandBackReport {
+        controls: Vec::new(),
+    };
+    let fail_all = |report: &mut RoutingHandBackReport, reason: String| {
+        report.controls = record
+            .values
+            .keys()
+            .map(|&key| {
+                (
+                    key,
+                    RoutingHandBackOutcome::IdentityOrTopologyChanged(reason.clone()),
+                )
+            })
+            .collect();
+    };
     if settings().config.hand_back != crate::HandBack::RestoreOriginal {
+        report.controls = record
+            .values
+            .keys()
+            .map(|&key| (key, RoutingHandBackOutcome::Disabled))
+            .collect();
+        *sink.lock() = Some(report);
         return;
     }
     let Some(device) = SESSION_STATE.lock().as_ref().map(|s| s.device.clone()) else {
+        fail_all(&mut report, "attachment detached".into());
+        *sink.lock() = Some(report);
         return;
     };
-    let restore = || -> Result<(), RoutingSessionError> {
+    let mut restore = || -> Result<RoutingHandBackReport, RoutingSessionError> {
         if !Arc::ptr_eq(&record.snapshot.device._fd_owner, &device._fd_owner) {
             return Err(RoutingSessionError::Drift(
                 "attachment changed before routing hand-back".into(),
@@ -2600,43 +2755,79 @@ pub(super) fn finish_routing_hand_back() {
             ));
         }
         with_routing_power(&device, &raw, record.powered, || {
-            let mut expected = record.snapshot.selectors.clone();
-            for item in &mut expected {
-                if let Some((_, last)) = record.values.get(&item.key) {
-                    item.value = *last;
-                }
-            }
-            if routing_clusters(&device, &raw)? != record.snapshot.hc_clusters {
-                return Err(RoutingSessionError::Drift(
-                    "ADC3 HC Clusters changed before routing hand-back".into(),
-                ));
-            }
+            let clusters_ok = routing_clusters(&device, &raw)
+                .is_ok_and(|clusters| clusters == record.snapshot.hc_clusters);
             let mut io = UsbRoutingIo {
                 device: &device,
                 descriptors: &record.snapshot.descriptors,
             };
-            verify_values(&record.snapshot.inventory, &mut io, &expected)?;
-            let current = record
-                .values
-                .iter()
-                .map(|(&key, &(_, value))| RouteChange { key, value })
-                .collect::<Vec<_>>();
-            verify_values(&record.snapshot.inventory, &mut io, &current)?;
-            let changes = record
-                .values
-                .iter()
-                .map(|(&key, &(value, _))| RouteChange { key, value })
-                .collect::<Vec<_>>();
-            // Every bounded group retains the same readback and rollback contract.
-            for batch in changes.chunks(MAX_ROUTE_CHANGES) {
-                routing::apply_routes(&record.snapshot.inventory, &mut io, batch)
-                    .map_err(RoutingSessionError::Transaction)?;
+            let mut entries: Vec<_> = record.values.iter().collect();
+            // Selectors are independent addressable controls; mixer mappings must
+            // be checked against the selector state at their own first edit.
+            entries.sort_by_key(|(key, _)| matches!(key, ControlKey::Selector(_)));
+            let mut controls = Vec::with_capacity(entries.len());
+            for (&key, saved) in entries {
+                let outcome = if matches!(key, ControlKey::Crosspoint { .. })
+                    && (!clusters_ok
+                        || verify_values(&record.snapshot.inventory, &mut io, &saved.selectors)
+                            .is_err())
+                {
+                    RoutingHandBackOutcome::IdentityOrTopologyChanged(
+                        "selector or cluster mapping changed or unreadable".into(),
+                    )
+                } else {
+                    restore_recorded_control(&record.snapshot.inventory, &mut io, key, saved)
+                };
+                controls.push((key, outcome));
             }
-            Ok(())
+            report = RoutingHandBackReport {
+                controls: controls.clone(),
+            };
+            Ok(RoutingHandBackReport { controls })
         })
     };
-    if let Err(error) = restore() {
-        log_warn!("[USB] Original routing not restored: {error}");
+    match restore() {
+        Ok(result) => report = result,
+        Err(error) if report.controls.is_empty() => fail_all(&mut report, error.to_string()),
+        Err(error) => {
+            for (_, outcome) in &mut report.controls {
+                if *outcome == RoutingHandBackOutcome::Restored {
+                    *outcome = RoutingHandBackOutcome::RestoreUncertain(error.to_string());
+                }
+            }
+        }
+    }
+    *sink.lock() = Some(report);
+}
+
+fn restore_recorded_control<I: RoutingIo>(
+    inventory: &RoutingInventory,
+    io: &mut I,
+    key: ControlKey,
+    saved: &RecordedRoute,
+) -> RoutingHandBackOutcome
+where
+    I::Error: std::fmt::Debug,
+{
+    let control = match inventory.control(key) {
+        Ok(control) => control,
+        Err(error) => {
+            return RoutingHandBackOutcome::IdentityOrTopologyChanged(format!("{error:?}"))
+        }
+    };
+    let current = match control.read_current(io) {
+        Ok(value) => value,
+        Err(error) => return RoutingHandBackOutcome::Unreadable(format!("{error:?}")),
+    };
+    if current == saved.original {
+        return RoutingHandBackOutcome::AlreadyOriginal;
+    }
+    if saved.forfeited || !saved.ownership.owns(current) {
+        return RoutingHandBackOutcome::ExternallyChanged;
+    }
+    match routing::write_verified(io, control, saved.original) {
+        Ok(()) => RoutingHandBackOutcome::Restored,
+        Err(error) => RoutingHandBackOutcome::RestoreUncertain(format!("{error:?}")),
     }
 }
 
@@ -3093,6 +3284,56 @@ mod tests {
         fn write(&mut self, _: ControlRequest, _: &[u8]) -> Result<usize, String> {
             panic!("drift verification must never write")
         }
+    }
+
+    #[test]
+    fn ownership_discards_settled_history_and_preserves_ambiguous_pair() {
+        let pin = RouteValue::SelectorPin;
+        let mut entry = RecordedRoute {
+            original: pin(1),
+            ownership: Ownership::None,
+            selectors: Vec::new(),
+            forfeited: false,
+        };
+        entry.record_attempt(pin(1), pin(2), true, false);
+        entry.record_attempt(pin(2), pin(3), true, false);
+        assert!(!entry.ownership.owns(pin(2)));
+        assert!(entry.ownership.owns(pin(3)));
+        entry.record_attempt(pin(3), pin(4), false, true);
+        assert!(entry.ownership.owns(pin(3)) && entry.ownership.owns(pin(4)));
+        assert!(!entry.ownership.owns(pin(2)));
+        entry.record_attempt(pin(3), pin(5), false, false);
+        assert_eq!(entry.ownership, Ownership::Verified(pin(3)));
+        entry.record_attempt(pin(9), pin(6), true, false);
+        assert!(entry.forfeited);
+        assert_eq!(entry.ownership, Ownership::None);
+        assert_eq!(entry.original, pin(1));
+    }
+
+    #[test]
+    fn foreign_live_selector_never_triggers_hand_back_write() {
+        let raw = configuration(&[terminal(1, 2, 3), terminal(2, 2, 3), selector()], 0x20);
+        let inventory = inventory_from_config(&raw, &[3]).unwrap();
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 7,
+        });
+        let saved = RecordedRoute {
+            original: RouteValue::SelectorPin(1),
+            ownership: Ownership::Verified(RouteValue::SelectorPin(3)),
+            selectors: Vec::new(),
+            forfeited: false,
+        };
+        let mut io = ReadIo { pin: 2, reads: 0 };
+        assert_eq!(
+            restore_recorded_control(&inventory, &mut io, key, &saved),
+            RoutingHandBackOutcome::ExternallyChanged
+        );
+        io.pin = 1;
+        assert_eq!(
+            restore_recorded_control(&inventory, &mut io, key, &saved),
+            RoutingHandBackOutcome::AlreadyOriginal
+        );
     }
 
     #[test]

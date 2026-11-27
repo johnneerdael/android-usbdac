@@ -64,6 +64,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     // What the renderer asked for last. It becomes the output in use once the old one has played out.
     private var wanted: Wanted? = null
     private var active: OpenedOutput? = null
+    private var activeFormat: Format? = null
     private var layout: SinkLayout? = null
     private var staging: ByteBuffer? = null
 
@@ -118,10 +119,9 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (format.sampleMimeType != MimeTypes.AUDIO_RAW || bits == null || format.channelCount !in 1..2) {
             throw AudioSink.ConfigurationException("not supported Type I PCM in one or two channels", format)
         }
-        require(format.sampleRate > 0) { "sample rate must be positive" }
-        require(format.encoderDelay >= 0 && format.encoderPadding >= 0) { "negative encoder trim" }
-        require(format.encoderPadding.toLong() * format.channelCount * (bits / 8) <= MAX_PADDING_BYTES) {
-            "encoder padding exceeds bounded trim storage"
+        if (format.sampleRate <= 0 || format.encoderDelay < 0 || format.encoderPadding < 0 ||
+            format.encoderPadding.toLong() * format.channelCount * (bits / 8) > MAX_PADDING_BYTES) {
+            throw AudioSink.ConfigurationException("invalid sample rate or encoder trim", format)
         }
         // Renderer output-format changes configure every stream, including decoder reuse.
         layout?.let { old -> receivedFrames -= (trimBuffer?.position() ?: 0) / old.inputFrameBytes }
@@ -263,7 +263,7 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     }
 
     private fun writeFailure(error: DacException): AudioSink.WriteException =
-        AudioSink.WriteException(error.code.ordinal, wanted?.format ?: Format.Builder().build(), false).also { it.initCause(OutputRecoveryRequiredException(error)) }
+        AudioSink.WriteException(error.code.ordinal, activeFormat ?: wanted?.format ?: Format.Builder().build(), false).also { it.initCause(OutputRecoveryRequiredException(error)) }
     // endregion
 
     // region sink-switch
@@ -277,18 +277,35 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         val out = active ?: return true // handleBuffer opens one
         // A failed output is retained until a seek/flush so queued audio cannot be silently skipped.
         if (out.failure != null || sameFormat(out.request, next.request)) return true
-        if (!drainingForSwitch) {
-            out.output.drain()
-            drainingForSwitch = true
+        try {
+            if (!drainingForSwitch) {
+                out.output.drain()
+                drainingForSwitch = true
+            }
+            if (!out.output.isDrained) return false
+        } catch (error: DacException) {
+            out.failure = error
+            throw writeFailure(error)
         }
-        if (!out.output.isDrained) return false
         val replacement = try { outputs.reconfigure(out, next.request) } catch (error: DacException) {
             throw AudioSink.InitializationException("USB reconfiguration failed: ${error.detail}", 0, next.format, false, error)
         }
         if (replacement != null) {
             outputs.onRecoveryPosition(null, null)
-            active = replacement.opened
-            layout = outputLayout(replacement.opened, replacement.opened.request, next.format)
+            val candidate = replacement.opened
+            val candidateLayout = try {
+                outputLayout(candidate, if (replacement.rollbackCause == null) next.request else out.request, next.format)
+            } catch (error: AudioSink.InitializationException) {
+                // A returned replacement is authoritative; the previous wrapper may be retired.
+                active = null
+                activeFormat = null
+                layout = null
+                try { outputs.close(candidate) } catch (closeError: Throwable) { error.addSuppressed(closeError) }
+                throw error
+            }
+            active = candidate
+            layout = candidateLayout
+            if (replacement.rollbackCause == null) activeFormat = next.format
             drainingForSwitch = false
             startMediaTimeUsNeedsInit = true
             submittedFrames = 0
@@ -320,33 +337,43 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         } catch (error: DacException) {
             throw AudioSink.InitializationException("no output can play ${next.request}: ${error.message}", 0, next.format, false, error)
         }
+        val candidateLayout = try {
+            outputLayout(out, next.request, next.format)
+        } catch (error: AudioSink.InitializationException) {
+            try { outputs.close(out) } catch (closeError: Throwable) { error.addSuppressed(closeError) }
+            throw error
+        }
         active = out
+        activeFormat = next.format
+        layout = candidateLayout
         drainingForSwitch = false
-        layout = outputLayout(out, next.request, next.format)
         if (!playing) out.output.pause()
         return out
     }
 
     private fun outputLayout(out: OpenedOutput, request: StreamRequest, format: Format): SinkLayout {
         val write = out.format
-        if (write.encoding != request.encoding ||
+        if (!sameFormat(out.request, request) || write.encoding != request.encoding ||
             (write.encoding == StreamEncoding.PCM_U8 && write.subslotBytes != 1) ||
             (write.encoding == StreamEncoding.PCM_FLOAT32 && write.subslotBytes != 4) ||
             write.subslotBytes !in 1..4 || write.subslotBytes < request.bitDepth / 8 ||
             write.validBits !in request.bitDepth..(write.subslotBytes * 8) ||
             write.channels != request.channels || write.sampleRate != request.sampleRate ||
             write.counterRateHz != request.sampleRate) {
-            outputs.close(out)
-            throw AudioSink.InitializationException("the output wants ${write}, which is not a widening of ${request}", 0, format, false, null)
+            val message = "the output wants ${write}, which is not a widening of ${request}"
+            val cause = IllegalArgumentException(message)
+            throw AudioSink.InitializationException(message, 0, format, false, cause)
         }
         return SinkLayout(request.bitDepth / 8, write.subslotBytes, write.channels, write.sampleRate, write.counterRateHz)
     }
 
     private fun closeActive() {
-        active?.let { outputs.close(it) }
+        val out = active
         active = null
+        activeFormat = null
         layout = null
         drainingForSwitch = false
+        out?.let { outputs.close(it) }
     }
     // endregion
 
@@ -387,13 +414,14 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
     }
 
     override fun playToEndOfStream() {
-        if (endOfStream) return
         val out = active
+        out?.failure?.let { throw writeFailure(it) }
+        if (endOfStream) return
         if (out != null) {
-            out.failure?.let { throw writeFailure(it) }
             try {
                 out.output.drain()
             } catch (error: DacException) {
+                out.failure = error
                 throw writeFailure(error)
             }
         }
@@ -402,7 +430,11 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
 
     override fun isEnded(): Boolean {
         val out = active ?: return true
-        return endOfStream && out.failure == null && out.output.isDrained
+        if (!endOfStream || out.failure != null) return false
+        return try { out.output.isDrained } catch (error: DacException) {
+            out.failure = error
+            false
+        }
     }
 
     override fun flush() {

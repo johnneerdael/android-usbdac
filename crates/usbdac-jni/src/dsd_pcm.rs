@@ -1,4 +1,4 @@
-use jni::errors::ThrowRuntimeExAndDefault;
+use crate::convert::{require_writable, run};
 use jni::objects::{JByteBuffer, JObject};
 use jni::{jni_mangle, Env, EnvUnowned};
 use once_cell::sync::Lazy;
@@ -11,19 +11,6 @@ use usbdac_core::{
 
 static CONVERTERS: Lazy<Mutex<HashMap<u64, Arc<Mutex<DsdPcmConverter>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-fn run<'l, T: Default>(
-    env: &mut EnvUnowned<'l>,
-    f: impl FnOnce(&mut Env<'l>) -> Result<T, ConvertError>,
-) -> T {
-    env.with_env(|env| match f(env) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            crate::throw(env, e.code(), e.message())?;
-            Err(jni::errors::Error::JavaException)
-        }
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
 fn bad(s: &str) -> ConvertError {
     ConvertError::InvalidArgument(s.into())
 }
@@ -39,6 +26,9 @@ fn range(
     offset: i32,
     len: i32,
 ) -> Result<(*mut u8, usize), ConvertError> {
+    if b.is_null() {
+        return Err(bad("null buffer"));
+    }
     let (o, n) = (
         usize::try_from(offset).map_err(|_| bad("negative offset"))?,
         usize::try_from(len).map_err(|_| bad("negative length"))?,
@@ -87,12 +77,12 @@ pub fn create<'l>(
             quality: match quality {
                 0 => Quality::High,
                 1 => Quality::Fast,
-                _ => return Err(bad("invalid quality")),
+                _ => return Err(bad("invalid quality").into()),
             },
             narrowing: match narrowing {
                 0 => Narrowing::TpdfDither,
                 1 => Narrowing::Truncate,
-                _ => return Err(bad("invalid narrowing")),
+                _ => return Err(bad("invalid narrowing").into()),
             },
             headroom_db: headroom,
             ..ConvertOptions::default()
@@ -126,11 +116,13 @@ pub fn process<'l>(
     run(&mut env, |env| {
         let (a, n) = range(env, &input, off, len)?;
         let (b, m) = range(env, &output, outoff, outlen)?;
+        require_writable(env, &output)?;
         if (a as usize) < (b as usize).saturating_add(m)
             && (b as usize) < (a as usize).saturating_add(n)
         {
-            return Err(bad("overlapping buffers"));
+            return Err(bad("overlapping buffers").into());
         }
+        // SAFETY: ranges are valid and disjoint; the caller keeps input immutable and output exclusive.
         let done = get(id)?
             .lock()
             .process(unsafe { std::slice::from_raw_parts(a, n) }, unsafe {
@@ -150,6 +142,8 @@ pub fn finish<'l>(
 ) -> i32 {
     run(&mut env, |env| {
         let (p, n) = range(env, &output, off, len)?;
+        require_writable(env, &output)?;
+        // SAFETY: the writable range stays alive and exclusively accessible for this call.
         Ok(get(id)?
             .lock()
             .finish(unsafe { std::slice::from_raw_parts_mut(p, n) })? as i32)

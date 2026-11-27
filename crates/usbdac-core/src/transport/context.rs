@@ -40,6 +40,7 @@ pub(crate) struct SessionContext {
     pub(super) gen1: Arc<Mutex<Option<routing_hw::RecordedGen1>>>,
     pub(super) fcp: Arc<Mutex<Option<routing_hw::RecordedFcp>>>,
     pub(super) routing: Arc<Mutex<Option<routing_hw::RecordedRouting>>>,
+    pub(super) routing_report: Arc<Mutex<Option<routing_hw::RoutingHandBackReport>>>,
 }
 impl SessionContext {
     #[cfg(test)]
@@ -72,6 +73,7 @@ impl SessionContext {
             gen1: Arc::new(Mutex::new(None)),
             fcp: Arc::new(Mutex::new(None)),
             routing: Arc::new(Mutex::new(None)),
+            routing_report: Arc::new(Mutex::new(None)),
         })
     }
     pub(crate) fn reserve(fd: RawFd) -> Result<Arc<Self>, Error> {

@@ -1,6 +1,20 @@
 use super::*;
 use crate::error::OrControl;
 
+// A positive active-epoch contradiction survives an unusable retry read.
+pub(super) fn active_rate_evidence(
+    requested: u32,
+    previous_mismatch: Option<u32>,
+    read: Option<u32>,
+    verified: bool,
+) -> (Option<u32>, bool) {
+    match read.filter(|rate| *rate > 0) {
+        Some(rate) if rate != requested => (Some(rate), true),
+        Some(rate) if previous_mismatch.is_none() || verified => (Some(rate), false),
+        _ => (previous_mismatch, previous_mismatch.is_some()),
+    }
+}
+
 /// Keep alternate ownership with the handle, including spawn failure and
 /// unwinding. Declared before the transfer pools so their Drops retire USB
 /// callbacks before this owner resets interfaces or releases the handle.
@@ -520,7 +534,11 @@ fn start_stream_inner_with_capture(
         return Err(Error::InvalidState(error));
     }
 
-    let mut clock_control_attempted = state.clock_control_attempted;
+    let mut clock_control_attempted = if clock.is_some() {
+        false
+    } else {
+        state.clock_control_attempted
+    };
     if settings().has(crate::Quirk::SetInterfaceFirst)
         && candidate.implicit_feedback.is_none()
         && playback_format.dsd_transport == DsdTransportMode::None
@@ -539,13 +557,24 @@ fn start_stream_inner_with_capture(
             )));
         }
     }
-    let mut clock_control_succeeded = state.clock_control_succeeded;
-    let mut clock_verification_passed = state.clock_verification_passed;
+    let mut clock_control_succeeded = if clock.is_some() {
+        false
+    } else {
+        state.clock_control_succeeded
+    };
+    let mut clock_verification_passed = if clock.is_some() {
+        false
+    } else {
+        state.clock_verification_passed
+    };
     let mut reported_sample_rate = state
         .clock_status
         .as_ref()
         .and_then(|status| status.reported_sample_rate);
 
+    if clock.is_some() {
+        reported_sample_rate = None;
+    }
     if let Some(clock) = clock {
         if let Err(error) = claimed_handle.ensure_interface_claimed(clock.interface_number) {
             set_last_error(Some(error.clone()));
@@ -572,8 +601,9 @@ fn start_stream_inner_with_capture(
                     playback_format.sample_rate,
                     clock_settle_delay_ms,
                 );
-                clock_control_attempted = true;
-                clock_control_succeeded = clock_outcome.set_cur_succeeded || clock_outcome.clock_ok;
+                clock_control_attempted = !multiplied_clock
+                    && !(clock_outcome.clock_ok && !clock_outcome.set_cur_succeeded);
+                clock_control_succeeded = clock_outcome.set_cur_succeeded;
                 reported_sample_rate = clock_outcome.reported_sample_rate;
                 clock_verification_passed = clock_outcome.rate_verified
                     && clock_outcome.reported_sample_rate == Some(playback_format.sample_rate);
@@ -628,77 +658,9 @@ fn start_stream_inner_with_capture(
                 reported_sample_rate =
                     get_wire_frequency(&claimed_handle.handle, clock, uac2_choice)
                         .ok()
-                        .or(if multiplied_clock {
-                            None
-                        } else {
-                            reported_sample_rate
-                        });
-
-                if let Some(actual_rate) = reported_sample_rate {
-                    if actual_rate != playback_format.sample_rate {
-                        let message = format!(
-                            "USB direct: DAC reports {} Hz while stream is configured for {} Hz; continuing direct USB with unverified clock",
-                            actual_rate, playback_format.sample_rate
-                        );
-                        set_clock_verification(
-                            clock_control_attempted,
-                            clock_control_succeeded,
-                            false,
-                            Some(actual_rate),
-                        );
-                        dev_eprintln!("{}", message);
-                        dev_eprintln!(
-                            "[USB] Actual sample rate={}Hz verified=false (reported by DAC, requested {}Hz)",
-                            actual_rate,
-                            playback_format.sample_rate,
-                        );
-                        clock_verification_passed = false;
-                    } else {
-                        clock_verification_passed = true;
-                    }
-                } else if let Ok(ranges) =
-                    get_wire_frequency_ranges(&claimed_handle.handle, clock, uac2_choice)
-                {
-                    if !multiplied_clock
-                        && sampling_frequency_ranges_support_rate(
-                            &ranges,
-                            playback_format.sample_rate,
-                        )
-                    {
-                        reported_sample_rate = Some(playback_format.sample_rate);
-                        clock_verification_passed = true;
-                        dev_eprintln!(
-                            "USB direct: using GET_RANGE-verified fixed clock {} Hz on alt setting {} without SET_CUR",
-                            playback_format.sample_rate, candidate.alt_setting
-                        );
-                    } else {
-                        dev_eprintln!(
-                            "[USB] Cannot verify fixed clock {}Hz for alt {} from GET_RANGE — will refuse streaming",
-                            playback_format.sample_rate, candidate.alt_setting,
-                        );
-                        reported_sample_rate = None;
-                        clock_verification_passed = false;
-                        set_clock_verification(
-                            clock_control_attempted,
-                            clock_control_succeeded,
-                            false,
-                            None,
-                        );
-                    }
-                } else {
-                    dev_eprintln!(
-                        "[USB] Cannot verify fixed clock {}Hz for alt {} because GET_RANGE is unavailable — will refuse streaming",
-                        playback_format.sample_rate, candidate.alt_setting,
-                    );
-                    reported_sample_rate = None;
-                    clock_verification_passed = false;
-                    set_clock_verification(
-                        clock_control_attempted,
-                        clock_control_succeeded,
-                        false,
-                        None,
-                    );
-                }
+                        .filter(|rate| *rate > 0);
+                clock_verification_passed =
+                    reported_sample_rate == Some(playback_format.sample_rate);
 
                 set_clock_verification(
                     clock_control_attempted,
@@ -1207,105 +1169,53 @@ fn start_stream_inner_with_capture(
     // rate is wrong, try one more SET_CUR + verify cycle.
     // Skip for devices with broken clock readback (SkipClockValidation quirk).
     let mut post_alt_readback_hz = None;
+    let mut post_alt_mismatch = false;
     if let Some(clock) = clock {
-        let skip_clock_validation = settings().skip_clock_validation();
-        if skip_clock_validation
+        // SET_INTERFACE starts a new live-read epoch. Neither a prior CUR nor
+        // RANGE membership can establish the active clock rate.
+        reported_sample_rate = None;
+        clock_verification_passed = false;
+        let skip = settings().skip_clock_validation()
             && !multiplied_clock
-            && playback_format.dsd_transport == DsdTransportMode::None
-        {
-            dev_eprintln!(
-                "[USB] Skipping post-alt GET_CUR re-verification (SkipClockValidation quirk)",
-            );
-        } else {
-            match get_wire_frequency(&claimed_handle.handle, clock, uac2_choice) {
-                Ok(post_alt_rate) => {
-                    dev_eprintln!(
-                        "[USB] GET_CUR (post-alt): clock {} reports {}Hz (expected {}Hz)",
-                        clock.clock_id,
-                        post_alt_rate,
-                        playback_format.sample_rate,
-                    );
-                    if multiplied_clock {
-                        // The route plan owns root programming. A changed source or
-                        // multiplier after activation must not be silently repaired.
-                        reported_sample_rate = Some(post_alt_rate);
-                        clock_verification_passed = post_alt_rate == playback_format.sample_rate;
-                        if clock_verification_passed {
-                            // get_wire_frequency verifies the active multiplier
-                            // route and converts the live source CUR to wire Hz.
-                            post_alt_readback_hz = Some(post_alt_rate);
-                        }
-                        set_clock_verification(
-                            clock_control_attempted,
-                            clock_control_succeeded,
-                            clock_verification_passed,
-                            reported_sample_rate,
-                        );
-                    } else if post_alt_rate != playback_format.sample_rate {
-                        dev_eprintln!(
-                            "[USB] DAC clock drifted after alt-setting change ({} -> {}Hz); re-issuing SET_CUR",
-                            playback_format.sample_rate, post_alt_rate,
-                        );
-                        let retry = apply_wire_frequency(
-                            &claimed_handle.handle,
-                            clock,
-                            uac2_choice,
-                            playback_format.sample_rate,
-                            clock_settle_delay_ms,
-                        );
-                        clock_control_attempted = true;
-                        clock_control_succeeded = retry.set_cur_succeeded || retry.clock_ok;
-                        reported_sample_rate = retry.reported_sample_rate;
-                        clock_verification_passed = retry.rate_verified
-                            && retry.reported_sample_rate == Some(playback_format.sample_rate);
-                        if clock_verification_passed {
-                            post_alt_readback_hz = retry.reported_sample_rate;
-                        }
-                        set_clock_verification(
-                            clock_control_attempted,
-                            clock_control_succeeded,
-                            clock_verification_passed,
-                            reported_sample_rate,
-                        );
-                        dev_eprintln!(
-                            "[USB] Re-SET_CUR result: clockOk={}, verified={}, reported={}Hz",
-                            retry.clock_ok,
-                            clock_verification_passed,
-                            retry.reported_sample_rate.unwrap_or(0),
-                        );
-                    } else {
-                        post_alt_readback_hz = Some(post_alt_rate);
-                        if playback_format.dsd_transport != DsdTransportMode::None {
-                            reported_sample_rate = Some(post_alt_rate);
-                            clock_verification_passed = true;
-                            set_clock_verification(
-                                clock_control_attempted,
-                                clock_control_succeeded,
-                                true,
-                                reported_sample_rate,
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    dev_eprintln!(
-                        "[USB] GET_CUR (post-alt): failed for clock {}: {}",
-                        clock.clock_id,
-                        error,
-                    );
-                    if multiplied_clock || playback_format.dsd_transport != DsdTransportMode::None {
-                        reported_sample_rate = None;
-                        clock_verification_passed = false;
-                        set_clock_verification(
-                            clock_control_attempted,
-                            clock_control_succeeded,
-                            false,
-                            None,
-                        );
-                    }
-                }
+            && playback_format.dsd_transport == DsdTransportMode::None;
+        if !skip {
+            let read = get_wire_frequency(&claimed_handle.handle, clock, uac2_choice)
+                .ok()
+                .filter(|rate| *rate > 0);
+            reported_sample_rate = read;
+            post_alt_mismatch = read.is_some_and(|rate| rate != playback_format.sample_rate);
+            if post_alt_mismatch
+                && !multiplied_clock
+                && matches!(state.dac_mode, DacMode::FullControl)
+            {
+                let retry = apply_wire_frequency(
+                    &claimed_handle.handle,
+                    clock,
+                    uac2_choice,
+                    playback_format.sample_rate,
+                    clock_settle_delay_ms,
+                );
+                clock_control_attempted = true;
+                clock_control_succeeded = retry.set_cur_succeeded;
+                (reported_sample_rate, post_alt_mismatch) = active_rate_evidence(
+                    playback_format.sample_rate,
+                    reported_sample_rate,
+                    retry.reported_sample_rate,
+                    retry.rate_verified,
+                );
             }
-        } // end of else (not skip_clock_validation)
+            clock_verification_passed =
+                !post_alt_mismatch && reported_sample_rate == Some(playback_format.sample_rate);
+            if clock_verification_passed {
+                post_alt_readback_hz = reported_sample_rate;
+            }
+        }
+        set_clock_verification(
+            clock_control_attempted,
+            clock_control_succeeded,
+            clock_verification_passed,
+            reported_sample_rate,
+        );
     } else if let Some(route) = adc3_route.as_ref() {
         // A Full ADC3 route exposes a real source CUR. Reuse the activation
         // verifier, which performs no writes and checks the live source rate,
@@ -1348,12 +1258,16 @@ fn start_stream_inner_with_capture(
 
     // Missing PCM clock evidence may use the explicit unverified-rate opt-in.
     // UAC1 positive mismatches and DSD still require exact live evidence.
-    if !clock_verification_passed && !programmed_vendor_rate {
+    if (!clock_verification_passed
+        || (clock.is_some() && clock_control_attempted && !clock_control_succeeded))
+        && !programmed_vendor_rate
+    {
         // Check if this device has the SkipClockValidation quirk.
         // Some DACs (e.g. Fosi DS2 / Savitech bridge) have broken UAC2 clock
         // control — GET_RANGE and GET_CUR always return 0. SET_CUR is accepted
         // silently. Skip verification and trust the SET_CUR.
         let unverified_tier = settings().allow_unusable_clock_readback(
+            candidate.is_uac1,
             clock_control_attempted,
             clock_control_succeeded,
             reported_sample_rate,
@@ -1369,8 +1283,10 @@ fn start_stream_inner_with_capture(
         let known_mismatch = reported_sample_rate
             .is_some_and(|rate| rate > 0 && rate != playback_format.sample_rate);
         if known_mismatch
+            || post_alt_mismatch
             || (clock_control_attempted && !clock_control_succeeded)
-            || ((!unverified_tier && settings().require_verified_rate()) || multiplied_clock)
+            || ((!unverified_tier && (clock.is_some() || settings().require_verified_rate()))
+                || multiplied_clock)
             || playback_format.dsd_transport != DsdTransportMode::None
         {
             let refusal = format!(

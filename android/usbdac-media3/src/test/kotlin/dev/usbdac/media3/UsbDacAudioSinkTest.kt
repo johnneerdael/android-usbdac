@@ -354,4 +354,102 @@ class UsbDacAudioSinkTest {
         assertTrue(fake.opened.last().closed)
     }
 
+    @Test
+    fun invalidReplacementIsClosedOnceAndNeverUsedAfterFlush() {
+        val fake = FakeOutputSource()
+        val source = object : OutputSource by fake {
+            override fun reconfigure(output: OpenedOutput, request: dev.usbdac.StreamRequest): OutputReconfiguration {
+                output.output.close()
+                return OutputReconfiguration(fake.open(output.request)) // wrong format for requested transition
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        fake.opened.first().drained = true
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(24, 96_000)).build())
+        val input = audio(4, 6)
+        assertThrows(AudioSink.InitializationException::class.java) { sink.handleBuffer(input, 0, 1) }
+        assertEquals(1, fake.opened.last().calls.count { it == "close" })
+        assertEquals(0, input.position())
+        sink.flush()
+        assertTrue(sink.handleBuffer(input, 0, 1))
+        assertEquals(1, fake.opened[1].calls.count { it == "close" })
+        assertEquals(0, fake.opened[1].written.size())
+    }
+
+    @Test
+    fun invalidFirstLayoutIsClosedOnceAndRetryOpensFreshOutput() {
+        val invalid = FakeOutputSource(wireBytes = 1)
+        val valid = FakeOutputSource()
+        var first = true
+        val source = object : OutputSource by valid {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput =
+                if (first) { first = false; invalid.open(request) } else valid.open(request)
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        val input = audio(4, 4)
+        assertThrows(AudioSink.InitializationException::class.java) { sink.handleBuffer(input, 0, 1) }
+        assertEquals(1, invalid.opened.single().calls.count { it == "close" })
+        assertTrue(sink.handleBuffer(input, 0, 1))
+        assertEquals(1, invalid.opened.single().calls.count { it == "close" })
+    }
+
+    @Test
+    fun malformedSampleRateIsAConfigurationException() {
+        val sink = UsbDacAudioSink(FakeOutputSource())
+        assertThrows(AudioSink.ConfigurationException::class.java) {
+            sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16, 0)).build())
+        }
+    }
+
+    @Test
+    fun switchDrainFailureIsTypedAndRetainsOldFormat() {
+        val fake = FakeOutputSource()
+        val failure = DacException(DacErrorCode.INVALID_STATE, "drain failed")
+        val source = object : OutputSource by fake {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput {
+                val opened = fake.open(request)
+                val failing = object : dev.usbdac.PcmOutput by opened.output {
+                    override fun drain() { throw failure }
+                }
+                return OpenedOutput(failing, opened.format, opened.request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        val oldFormat = pcm(16)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(oldFormat).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(24, 96_000)).build())
+        val error = assertThrows(AudioSink.WriteException::class.java) {
+            sink.handleBuffer(audio(4, 6), 0, 1)
+        }
+        assertEquals(oldFormat, error.format)
+        assertTrue(error.cause is OutputRecoveryRequiredException)
+        assertEquals(failure, error.cause?.cause)
+    }
+
+    @Test
+    fun drainStatusFailureIsReportedByNextEndOfStreamCallback() {
+        val fake = FakeOutputSource()
+        val failure = DacException(DacErrorCode.INVALID_STATE, "drain status failed")
+        val source = object : OutputSource by fake {
+            override fun open(request: dev.usbdac.StreamRequest): OpenedOutput {
+                val opened = fake.open(request)
+                val failing = object : dev.usbdac.PcmOutput by opened.output {
+                    override val isDrained: Boolean get() = throw failure
+                }
+                return OpenedOutput(failing, opened.format, opened.request)
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.handleBuffer(audio(4, 4), 0, 1)
+        sink.playToEndOfStream()
+        assertFalse(sink.isEnded())
+        val error = assertThrows(AudioSink.WriteException::class.java) { sink.playToEndOfStream() }
+        assertEquals(failure, error.cause?.cause)
+    }
+
 }

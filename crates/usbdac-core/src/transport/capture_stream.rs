@@ -134,58 +134,120 @@ fn capture_control<'a, 'raw>(
 
 // UAC1 capture links an Output Terminal, so follow source entities back to the
 // terminal/mixer's explicit channel cluster. Never guess stereo from a count.
-fn uac1_cluster(
-    descriptors: &[&[u8]],
-    id: u8,
+#[derive(Clone)]
+enum ClusterCache {
+    Unknown,
+    Visiting,
+    Failed,
+    Resolved(ChannelMap, usize),
+}
+
+// One resolver belongs to one AC snapshot and one requested channel count.
+// Cache subtree depth with successful maps so a cached result cannot bypass
+// the independent recursion limit on a longer path.
+struct Uac1ClusterResolver<'a> {
+    index: [Option<&'a [u8]>; 256],
+    duplicate: [bool; 256],
+    cache: Vec<ClusterCache>,
     channels: u16,
-    visited: &mut Vec<u8>,
-) -> Option<ChannelMap> {
-    if id == 0 || visited.contains(&id) || visited.len() >= 32 {
-        return None;
-    }
-    visited.push(id);
-    let matches: Vec<_> = descriptors
-        .iter()
-        .copied()
-        .filter(|d| d.len() >= 4 && d[1] == USB_DT_CS_INTERFACE && d[2] != 1 && d[3] == id)
-        .collect();
-    let result = if matches.len() == 1 {
-        let d = matches[0];
-        let cluster = |offset: usize| -> Option<ChannelMap> {
-            if d.len() < offset + 4 || u16::from(d[offset]) != channels {
-                return None;
+    work: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ClusterFailure {
+    Intrinsic,
+    Cycle,
+    Limit,
+}
+
+impl<'a> Uac1ClusterResolver<'a> {
+    fn new(descriptors: &[&'a [u8]], channels: u16) -> Self {
+        let mut index = [None; 256];
+        let mut duplicate = [false; 256];
+        let mut work = 0usize;
+        for &d in descriptors {
+            if d.len() >= 4 && d[1] == USB_DT_CS_INTERFACE && d[2] != 1 && d[3] != 0 {
+                let id = usize::from(d[3]);
+                duplicate[id] |= index[id].is_some();
+                index[id] = Some(d);
+                work = work.saturating_add(d.len());
             }
-            ChannelMap::uac1(channels, u16::from_le_bytes([d[offset + 1], d[offset + 2]])).ok()
+        }
+        Self {
+            index,
+            duplicate,
+            cache: vec![ClusterCache::Unknown; 256],
+            channels,
+            work: work.saturating_mul(32).max(1),
+        }
+    }
+
+    fn resolve(&mut self, id: u8, depth: usize) -> Result<(ChannelMap, usize), ClusterFailure> {
+        if depth >= 32 || self.work == 0 {
+            return Err(ClusterFailure::Limit);
+        }
+        self.work -= 1;
+        let key = usize::from(id);
+        if id == 0 || self.duplicate[key] {
+            return Err(ClusterFailure::Intrinsic);
+        }
+        match &self.cache[key] {
+            ClusterCache::Visiting => return Err(ClusterFailure::Cycle),
+            ClusterCache::Failed => return Err(ClusterFailure::Intrinsic),
+            ClusterCache::Resolved(map, height) => {
+                return if depth + height <= 32 {
+                    Ok((map.clone(), *height))
+                } else {
+                    Err(ClusterFailure::Limit)
+                }
+            }
+            ClusterCache::Unknown => {}
+        }
+        let Some(d) = self.index[key] else {
+            return Err(ClusterFailure::Intrinsic);
         };
-        match d[2] {
+        self.cache[key] = ClusterCache::Visiting;
+        let channels = self.channels;
+        let cluster = |offset: usize| -> Result<(ChannelMap, usize), ClusterFailure> {
+            if d.len() < offset + 4 || u16::from(d[offset]) != channels {
+                return Err(ClusterFailure::Intrinsic);
+            }
+            ChannelMap::uac1(channels, u16::from_le_bytes([d[offset + 1], d[offset + 2]]))
+                .map(|map| (map, 1))
+                .map_err(|_| ClusterFailure::Intrinsic)
+        };
+        let result = match d[2] {
             2 if d.len() >= 12 => cluster(7),
-            3 if d.len() >= 9 => uac1_cluster(descriptors, d[7], channels, visited),
-            6 if d.len() >= 7 => uac1_cluster(descriptors, d[4], channels, visited),
+            3 if d.len() >= 9 => self.resolve(d[7], depth + 1).map(|(m, h)| (m, h + 1)),
+            6 if d.len() >= 7 => self.resolve(d[4], depth + 1).map(|(m, h)| (m, h + 1)),
             4 if d.len() >= 5 => cluster(5 + usize::from(d[4])),
             7 | 8 if d.len() >= 7 => cluster(7 + usize::from(d[6])),
             5 if d.len() >= 6 && d.len() == 6 + usize::from(d[4]) => {
-                let mut map = None;
+                let mut result: Result<Option<(ChannelMap, usize)>, ClusterFailure> = Ok(None);
                 for source in &d[5..5 + usize::from(d[4])] {
-                    let candidate = uac1_cluster(descriptors, *source, channels, visited);
-                    if candidate.is_none()
-                        || map
-                            .as_ref()
-                            .is_some_and(|map| Some(map) != candidate.as_ref())
-                    {
-                        map = None;
+                    result = match (result, self.resolve(*source, depth + 1)) {
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                        (Ok(None), Ok((map, height))) => Ok(Some((map, height + 1))),
+                        (Ok(Some((old, height))), Ok((map, child_height))) if old == map => {
+                            Ok(Some((old, height.max(child_height + 1))))
+                        }
+                        _ => Err(ClusterFailure::Intrinsic),
+                    };
+                    if result.is_err() {
                         break;
                     }
-                    map = candidate;
                 }
-                map
+                result.and_then(|r| r.ok_or(ClusterFailure::Intrinsic))
             }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    visited.pop();
-    result
+            _ => Err(ClusterFailure::Intrinsic),
+        };
+        self.cache[key] = match &result {
+            Ok((map, height)) => ClusterCache::Resolved(map.clone(), *height),
+            Err(ClusterFailure::Intrinsic) => ClusterCache::Failed,
+            Err(ClusterFailure::Cycle | ClusterFailure::Limit) => ClusterCache::Unknown,
+        };
+        result
+    }
 }
 
 /// Parse only standard linear Type I PCM; reject private/float/raw dialects.
@@ -254,7 +316,10 @@ fn capture_format(
             }
             rate_count == 1
         };
-        let map = uac1_cluster(&control.descriptors, general[3], channels, &mut Vec::new())
+        let map = Uac1ClusterResolver::new(&control.descriptors, channels)
+            .resolve(general[3], 0)
+            .ok()
+            .map(|(map, _)| map)
             .or_else(|| ChannelMap::uac1(channels, 0).ok())?;
         Some((
             CaptureFormat::pcm(rate, pcm[6], pcm[5], map).ok()?,
@@ -1711,9 +1776,12 @@ pub(super) fn configure_capture_endpoint_guarded(
                     reported_hz: reported,
                 });
             }
-            let ranges =
-                get_sampling_frequency_ranges(&claimed.handle, candidate.control, choice.source_id)
-                    .map_err(Error::Control)?;
+            let ranges = clock::get_uac2_sampling_frequency_ranges(
+                &claimed.handle,
+                candidate.control,
+                choice.source_id,
+            )
+            .map_err(Error::Control)?;
             if !sampling_frequency_ranges_support_rate(&ranges, source_rate) {
                 return Err(Error::Unsupported {
                     reason: "capture source does not support the exact requested rate".into(),
@@ -3239,6 +3307,24 @@ fn run_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uac1_topology_resolves_shared_inputs_and_rejects_ambiguity() {
+        use super::*;
+        let input = [12, 0x24, 2, 1, 0, 0, 0, 2, 3, 0, 0, 0];
+        let feature = [7, 0x24, 6, 2, 1, 0, 0];
+        let selector = [8, 0x24, 5, 3, 2, 1, 2, 0];
+        let descriptors: Vec<&[u8]> = vec![&input, &feature, &selector];
+        let mut resolver = Uac1ClusterResolver::new(&descriptors, 2);
+        assert!(resolver.resolve(3, 0).is_ok());
+        assert!(resolver.resolve(3, 0).is_ok());
+        let duplicates: Vec<&[u8]> = vec![&input, &input, &selector];
+        assert!(Uac1ClusterResolver::new(&duplicates, 2)
+            .resolve(3, 0)
+            .is_err());
+        let cycle = [7, 0x24, 6, 2, 2, 0, 0];
+        let cyclic: Vec<&[u8]> = vec![&cycle];
+        assert!(Uac1ClusterResolver::new(&cyclic, 2).resolve(2, 0).is_err());
+    }
     #[test]
     fn capture_activation_requires_the_exact_terminal_wire_rate() {
         assert!(super::verify_capture_wire_rate(96_000, Some(96_000)).is_ok());

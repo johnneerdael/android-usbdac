@@ -92,22 +92,7 @@ impl HotplugHub {
     ) -> UsbAttachment {
         let host_key = host_key.into();
         let mut state = self.state.lock();
-        if let Some(existing) = state.attached.get(&host_key) {
-            return existing.clone();
-        }
-        state.next_id = state
-            .next_id
-            .checked_add(1)
-            .expect("USB attachment ID exhausted");
-        let attachment = UsbAttachment {
-            id: state.next_id,
-            host_key: host_key.clone(),
-            info,
-            permission,
-        };
-        state.attached.insert(host_key, attachment.clone());
-        broadcast(&mut state, HotplugEvent::Attached(attachment.clone()));
-        attachment
+        attach_or_replace(&mut state, host_key, info, permission)
     }
     /// Reconcile a complete, authoritative host snapshot after events may have been missed.
     /// Serialize snapshot collection and event delivery in the host. A device which disappeared
@@ -130,33 +115,12 @@ impl HotplugHub {
             broadcast(&mut state, HotplugEvent::Detached(attachment));
         }
         for (key, (info, permission)) in observed {
-            let replaced = state.attached.get(&key).is_some_and(|existing| {
-                existing.info.vendor_id != info.vendor_id
-                    || existing.info.product_id != info.product_id
-            });
-            if replaced {
-                let attachment = state.attached.remove(&key).expect("attachment under lock");
-                broadcast(&mut state, HotplugEvent::Detached(attachment));
-            }
-            if let Some(existing) = state.attached.get_mut(&key) {
-                if existing.permission != permission {
-                    existing.permission = permission;
-                    let event = HotplugEvent::PermissionChanged(existing.clone());
-                    broadcast(&mut state, event);
-                }
-            } else {
-                state.next_id = state
-                    .next_id
-                    .checked_add(1)
-                    .expect("USB attachment ID exhausted");
-                let attachment = UsbAttachment {
-                    id: state.next_id,
-                    host_key: key.clone(),
-                    info,
-                    permission,
-                };
-                state.attached.insert(key, attachment.clone());
-                broadcast(&mut state, HotplugEvent::Attached(attachment));
+            let attachment = attach_or_replace(&mut state, key.clone(), info, permission);
+            if attachment.permission != permission {
+                let existing = state.attached.get_mut(&key).expect("attachment under lock");
+                existing.permission = permission;
+                let event = HotplugEvent::PermissionChanged(existing.clone());
+                broadcast(&mut state, event);
             }
         }
     }
@@ -188,6 +152,42 @@ impl HotplugHub {
         true
     }
 }
+// VID/PID detects changed models, not an unobserved replacement by the same model.
+fn same_identity(existing: &UsbAttachment, info: &DeviceInfo) -> bool {
+    existing.info.vendor_id == info.vendor_id && existing.info.product_id == info.product_id
+}
+
+fn attach_or_replace(
+    state: &mut State,
+    host_key: String,
+    info: DeviceInfo,
+    permission: UsbPermission,
+) -> UsbAttachment {
+    if let Some(existing) = state.attached.get(&host_key) {
+        if same_identity(existing, &info) {
+            return existing.clone();
+        }
+        let old = state
+            .attached
+            .remove(&host_key)
+            .expect("attachment under lock");
+        broadcast(state, HotplugEvent::Detached(old));
+    }
+    state.next_id = state
+        .next_id
+        .checked_add(1)
+        .expect("USB attachment ID exhausted");
+    let attachment = UsbAttachment {
+        id: state.next_id,
+        host_key: host_key.clone(),
+        info,
+        permission,
+    };
+    state.attached.insert(host_key, attachment.clone());
+    broadcast(state, HotplugEvent::Attached(attachment.clone()));
+    attachment
+}
+
 fn broadcast(state: &mut State, event: HotplugEvent) {
     state.subscribers.retain(
         |subscriber| match subscriber.sender.try_send(event.clone()) {
