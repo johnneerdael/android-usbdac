@@ -134,7 +134,9 @@ impl VolumeControl {
         let _scope = self.shared.enter()?;
         self.ensure_open()?;
         if db.is_nan() || db == f64::INFINITY {
-            return Err(Error::InvalidArgument("volume must be finite or negative infinity for silence".into()));
+            return Err(Error::InvalidArgument(
+                "volume must be finite or negative infinity for silence".into(),
+            ));
         }
         let state = self.finish(transport::volume_hw::write_volume_db(db))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
@@ -164,7 +166,11 @@ impl VolumeControl {
         let _control = self.shared.control_guard.lock();
         let _scope = self.shared.enter()?;
         self.ensure_open()?;
-        let steps = if steps == 0 { DEFAULT_VOLUME_STEPS } else { steps };
+        let steps = if steps == 0 {
+            DEFAULT_VOLUME_STEPS
+        } else {
+            steps
+        };
         let state = self.finish(transport::volume_hw::step_volume(direction, steps))?;
         self.shared.events.emit_dac(DacEvent::VolumeChanged(state));
         Ok(state)

@@ -574,7 +574,7 @@ pub(crate) mod tests {
     fn chunking_does_not_change_a_single_bit() {
         let input = tone(44_100.0, 1_234.5, 0.7, 0, 30_000);
         let mut reference = make(44_100, 48_000, Quality::High);
-        let mut expected = run(&mut reference, &input, 30_000.min(4096));
+        let mut expected = run(&mut reference, &input, 4096);
         expected.extend(finish(&mut reference, 4096));
         for block in [1usize, 3, 100, 147, 1000, 4096] {
             let mut resampler = make(44_100, 48_000, Quality::High);

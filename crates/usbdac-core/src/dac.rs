@@ -4,7 +4,7 @@ mod routing;
 
 use crate::capabilities::{Capabilities, DeviceInfo};
 use crate::config::{CloseVolume, DacConfig, HandBack};
-use crate::error::{Error, Result, OrControl};
+use crate::error::{Error, OrControl, Result};
 use crate::events::{DacListener, EventHub, EventSink};
 use crate::format::{StreamFormat, StreamRequest};
 use crate::settings::{self, Settings};
@@ -24,13 +24,18 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// settings.
 static OPEN_GUARD: Mutex<()> = Mutex::new(());
 
-fn reconfigure_or_restore<T>(requested: &StreamRequest, previous: &StreamRequest,
-    mut attempt: impl FnMut(&StreamRequest) -> Result<T>) -> Result<(T, Option<Error>)> {
+fn reconfigure_or_restore<T>(
+    requested: &StreamRequest,
+    previous: &StreamRequest,
+    mut attempt: impl FnMut(&StreamRequest) -> Result<T>,
+) -> Result<(T, Option<Error>)> {
     match attempt(requested) {
         Ok(stream) => Ok((stream, None)),
         Err(error) => match attempt(previous) {
             Ok(stream) => Ok((stream, Some(error))),
-            Err(rollback) => Err(Error::ReconfigureUnusable(format!("requested format failed: {error}; rollback failed: {rollback}"))),
+            Err(rollback) => Err(Error::ReconfigureUnusable(format!(
+                "requested format failed: {error}; rollback failed: {rollback}"
+            ))),
         },
     }
 }
@@ -50,7 +55,8 @@ pub(crate) struct DacShared {
 impl DacShared {
     fn remember_feedback_stream(&self, format: &StreamFormat, stream: &StreamInner) {
         if stream.shared.stats.feedback_trace.is_some() {
-            *self.last_feedback_stream.lock() = Some((format.clone(), Arc::clone(&stream.shared.stats)));
+            *self.last_feedback_stream.lock() =
+                Some((format.clone(), Arc::clone(&stream.shared.stats)));
         }
     }
 
@@ -150,27 +156,39 @@ impl Dac {
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
         let _scope = context.enter();
-        if transport::session::session_registered() { return Err(Error::Busy); }
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
         transport::api::vendor_pcm_preflight(fd, info)
     }
 
     /// Read-only descriptor proof of the exact active configuration and complete
     /// interface claim set for a fixed-rate vendor PCM profile.
-    pub fn vendor_pcm_claims_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<(u8, Vec<u8>)>> {
+    pub fn vendor_pcm_claims_preflight(
+        fd: RawFd,
+        info: &DeviceInfo,
+    ) -> Result<Option<(u8, Vec<u8>)>> {
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
         let _scope = context.enter();
-        if transport::session::session_registered() { return Err(Error::Busy); }
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
         transport::api::vendor_pcm_claims_preflight(fd, info)
     }
 
     /// Prove the exact optional Scarlett vendor claim from actual USB descriptors.
     /// Requires the host-selected configuration; sends no proprietary requests.
-    pub fn scarlett_routing_preflight(fd: RawFd, info: &DeviceInfo) -> Result<Option<crate::scarlett::ReadCapability>> {
+    pub fn scarlett_routing_preflight(
+        fd: RawFd,
+        info: &DeviceInfo,
+    ) -> Result<Option<crate::scarlett::ReadCapability>> {
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
         let _scope = context.enter();
-        if transport::session::session_registered() { return Err(Error::Busy); }
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
         transport::routing_hw::scarlett_preflight(fd, info)
     }
 
@@ -181,7 +199,9 @@ impl Dac {
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
         let _scope = context.enter();
-        if transport::session::session_registered() { return Err(Error::Busy); }
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
         let device = transport::api::capture_preflight_device(fd, info)?;
         Ok(device)
     }
@@ -195,35 +215,57 @@ impl Dac {
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
         let _scope = context.enter();
-        if transport::session::session_registered() { return Err(Error::Busy); }
+        if transport::session::session_registered() {
+            return Err(Error::Busy);
+        }
         settings::install(Settings::for_device(config.clone(), &info));
         if let Err(error) = transport::api::open_capture_device(fd, &info) {
             settings::reset();
             return Err(error);
         }
         context.admit();
-        Ok(Dac { shared: Arc::new(DacShared { context: transport::context::current(), events: EventHub::start(), info, config,
-            closed: AtomicBool::new(false), control_guard: Mutex::new(()), stream: Mutex::new(None),
-            last_feedback_stream: Mutex::new(None) }) })
+        Ok(Dac {
+            shared: Arc::new(DacShared {
+                context: transport::context::current(),
+                events: EventHub::start(),
+                info,
+                config,
+                closed: AtomicBool::new(false),
+                control_guard: Mutex::new(()),
+                stream: Mutex::new(None),
+                last_feedback_stream: Mutex::new(None),
+            }),
+        })
     }
 
     /// Start standalone, exact-format PCM capture on a claimed IN interface.
     /// The capture worker exclusively owns USB until all transfers retire;
     /// concurrent playback, duplex and routing changes are refused.
-    pub fn open_capture(&self, request: &crate::capture::CaptureRequest, capacity_frames: usize)
-        -> Result<crate::capture::DacCaptureStream>
-    {
+    pub fn open_capture(
+        &self,
+        request: &crate::capture::CaptureRequest,
+        capacity_frames: usize,
+    ) -> Result<crate::capture::DacCaptureStream> {
         let _control = self.shared.control_guard.lock();
         let _scope = self.shared.enter()?;
-        let handle = transport::capture_stream::open_capture(request, capacity_frames, self.shared.events.clone())?;
-        Ok(crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), handle))
+        let handle = transport::capture_stream::open_capture(
+            request,
+            capacity_frames,
+            self.shared.events.clone(),
+        )?;
+        Ok(crate::capture::DacCaptureStream::new(
+            Arc::clone(&self.shared),
+            handle,
+        ))
     }
 
     /// Capture owner-specific retirement evidence before consuming `close`.
     /// Retain this token with this device's claims/FD after a close timeout;
     /// another open device does not affect its result.
     pub fn retirement(&self) -> UsbRetirement {
-        UsbRetirement { context: self.shared.context.clone() }
+        UsbRetirement {
+            context: self.shared.context.clone(),
+        }
     }
 
     /// Wait until all process USB owners retire. For a particular connection,
@@ -279,7 +321,12 @@ impl Dac {
         Self::open_playback_device(fd, info, config, true)
     }
 
-    fn open_playback_device(fd: RawFd, info: DeviceInfo, config: DacConfig, duplex: bool) -> Result<Dac> {
+    fn open_playback_device(
+        fd: RawFd,
+        info: DeviceInfo,
+        config: DacConfig,
+        duplex: bool,
+    ) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve(fd)?;
@@ -288,8 +335,11 @@ impl Dac {
             return Err(Error::Busy);
         }
         settings::install(Settings::for_device(config.clone(), &info));
-        let registration = if duplex { transport::api::open_duplex_device(fd, &info) }
-            else { transport::api::open_device(fd, &info) };
+        let registration = if duplex {
+            transport::api::open_duplex_device(fd, &info)
+        } else {
+            transport::api::open_device(fd, &info)
+        };
         if let Err(error) = registration {
             settings::reset();
             return Err(error);
@@ -307,7 +357,8 @@ impl Dac {
                 events,
                 info,
                 config,
-                closed: AtomicBool::new(false), control_guard: Mutex::new(()),
+                closed: AtomicBool::new(false),
+                control_guard: Mutex::new(()),
                 stream: Mutex::new(None),
                 last_feedback_stream: Mutex::new(None),
             }),
@@ -373,7 +424,11 @@ impl Dac {
         self.open_stream_locked(format, listener)
     }
 
-    fn open_stream_locked(&self, format: &StreamFormat, listener: Arc<dyn DacListener>) -> Result<DacStream> {
+    fn open_stream_locked(
+        &self,
+        format: &StreamFormat,
+        listener: Arc<dyn DacListener>,
+    ) -> Result<DacStream> {
         let _scope = self.shared.enter()?;
         let mut slot = self.shared.stream.lock();
         if slot
@@ -410,57 +465,96 @@ impl Dac {
     /// an implicit physical reopen. No volume initialization/hand-back occurs. Success or rollback
     /// returns a paused replacement with zero-based counters; supply/reseek PCM and explicitly play.
     /// A rollback failure returns `ReconfigureUnusable` and requires closing the DAC.
-    pub fn reconfigure_stream(&self, current: &DacStream, request: &StreamRequest,
-        listener: Arc<dyn DacListener>, drain_timeout: Duration) -> Result<StreamReconfiguration> {
+    pub fn reconfigure_stream(
+        &self,
+        current: &DacStream,
+        request: &StreamRequest,
+        listener: Arc<dyn DacListener>,
+        drain_timeout: Duration,
+    ) -> Result<StreamReconfiguration> {
         let _control = self.shared.control_guard.lock();
         let _scope = self.shared.enter()?;
         transport::api::playback_format_from_request(request)?;
         let identity = current.reconfigure_identity(&self.shared)?;
         let previous = current.format().request;
-        let deadline = std::time::Instant::now().checked_add(drain_timeout)
-            .ok_or_else(|| Error::InvalidArgument("drain timeout overflows monotonic clock".into()))?;
+        let deadline = std::time::Instant::now()
+            .checked_add(drain_timeout)
+            .ok_or_else(|| {
+                Error::InvalidArgument("drain timeout overflows monotonic clock".into())
+            })?;
         let volume_route = transport::api::volume_route_signature();
-        let volume_before = if volume_route.is_some() { Some(transport::volume_hw::read_volume_state().or_control()?) } else { None };
+        let volume_before = if volume_route.is_some() {
+            Some(transport::volume_hw::read_volume_state().or_control()?)
+        } else {
+            None
+        };
         current.drain()?;
         current.play()?;
         while !current.is_drained() {
-            if matches!(current.state(), crate::StreamState::Failed | crate::StreamState::Closed) {
+            if matches!(
+                current.state(),
+                crate::StreamState::Failed | crate::StreamState::Closed
+            ) {
                 return Err(Error::ReconfigureUnusable("original stream failed during drain; retained stream remains available for explicit close".into()));
             }
-            if std::time::Instant::now() >= deadline { return Err(Error::ReconfigureDrainTimeout); }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::ReconfigureDrainTimeout);
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
-        current.retire_for_reconfigure().map_err(|error| Error::ReconfigureUnusable(error.to_string()))?;
+        current
+            .retire_for_reconfigure()
+            .map_err(|error| Error::ReconfigureUnusable(error.to_string()))?;
         if transport::api::retained_usb_handle_identity() != Some(identity) {
-            return Err(Error::ReconfigureUnusable("old USB owner was not retained after retirement".into()));
+            return Err(Error::ReconfigureUnusable(
+                "old USB owner was not retained after retirement".into(),
+            ));
         }
         let mut attempt = |target: &StreamRequest| -> Result<DacStream> {
             if transport::api::retained_usb_handle_identity() != Some(identity) {
-                return Err(Error::ReconfigureUnusable("retained USB owner was lost before negotiation".into()));
+                return Err(Error::ReconfigureUnusable(
+                    "retained USB owner was lost before negotiation".into(),
+                ));
             }
             let format = self.negotiate_locked(target)?;
             if transport::api::retained_usb_handle_identity() != Some(identity) {
-                return Err(Error::ReconfigureUnusable("negotiation replaced or lost the USB owner".into()));
+                return Err(Error::ReconfigureUnusable(
+                    "negotiation replaced or lost the USB owner".into(),
+                ));
             }
             let opened = self.open_stream_locked(&format, listener.clone())?;
             if opened.reconfigure_identity(&self.shared)? != identity {
                 drop(opened);
-                return Err(Error::ReconfigureUnusable("replacement used a different physical USB owner".into()));
+                return Err(Error::ReconfigureUnusable(
+                    "replacement used a different physical USB owner".into(),
+                ));
             }
             opened.pause()?;
             if transport::api::volume_route_signature() != volume_route {
                 drop(opened);
-                return Err(Error::Control("reconfiguration changed the hardware volume route; rollback required".into()));
+                return Err(Error::Control(
+                    "reconfiguration changed the hardware volume route; rollback required".into(),
+                ));
             }
-            let volume_after = if volume_route.is_some() { Some(transport::volume_hw::read_volume_state().or_control()?) } else { None };
+            let volume_after = if volume_route.is_some() {
+                Some(transport::volume_hw::read_volume_state().or_control()?)
+            } else {
+                None
+            };
             if volume_after != volume_before {
                 drop(opened);
-                return Err(Error::Control("hardware volume changed during reconfiguration; preservation not proved".into()));
+                return Err(Error::Control(
+                    "hardware volume changed during reconfiguration; preservation not proved"
+                        .into(),
+                ));
             }
             Ok(opened)
         };
         let (stream, rollback_cause) = reconfigure_or_restore(request, &previous, &mut attempt)?;
-        Ok(StreamReconfiguration { stream, rollback_cause })
+        Ok(StreamReconfiguration {
+            stream,
+            rollback_cause,
+        })
     }
 
     /// Open playback and PCM capture atomically on one USB worker.
@@ -470,27 +564,46 @@ impl Dac {
     /// rates and position counters. Capture never supplies playback timing unless
     /// it exactly matches playback's already selected implicit feedback source.
     /// Closing either stream stops both endpoints and retires their transfers.
-    pub fn open_duplex(&self, format: &StreamFormat, capture: &crate::capture::CaptureRequest,
-        capacity_frames: usize, listener: Arc<dyn DacListener>)
-        -> Result<(DacStream, crate::capture::DacCaptureStream)> {
+    pub fn open_duplex(
+        &self,
+        format: &StreamFormat,
+        capture: &crate::capture::CaptureRequest,
+        capacity_frames: usize,
+        listener: Arc<dyn DacListener>,
+    ) -> Result<(DacStream, crate::capture::DacCaptureStream)> {
         let _control = self.shared.control_guard.lock();
 
         let _scope = self.shared.enter()?;
         let mut slot = self.shared.stream.lock();
-        if slot.as_ref().and_then(Weak::upgrade).is_some_and(|stream| !stream.is_closed()) {
+        if slot
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|stream| !stream.is_closed())
+        {
             return Err(Error::Busy);
         }
         self.shared.events.set_stream_listener(Some(listener));
-        let (output, input) = match transport::duplex::open(format, capture, capacity_frames, self.shared.events.clone()) {
+        let (output, input) = match transport::duplex::open(
+            format,
+            capture,
+            capacity_frames,
+            self.shared.events.clone(),
+        ) {
             Ok(pair) => pair,
-            Err(error) => { self.shared.events.set_stream_listener(None); return Err(error); }
+            Err(error) => {
+                self.shared.events.set_stream_listener(None);
+                return Err(error);
+            }
         };
         let inner = StreamInner::new(Arc::clone(&self.shared), output, format.clone());
         self.shared.remember_feedback_stream(format, &inner);
         *slot = Some(Arc::downgrade(&inner));
         drop(slot);
         inner.start_events();
-        Ok((DacStream::from_inner(inner), crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), input)))
+        Ok((
+            DacStream::from_inner(inner),
+            crate::capture::DacCaptureStream::new(Arc::clone(&self.shared), input),
+        ))
     }
 
     /// The hardware volume control, if the DAC has a writable one.
@@ -557,9 +670,13 @@ impl Dac {
 
 /// A particular DAC owner's USB retirement, independent of other devices.
 #[derive(Clone)]
-pub struct UsbRetirement { context: Arc<transport::context::SessionContext> }
+pub struct UsbRetirement {
+    context: Arc<transport::context::SessionContext>,
+}
 impl UsbRetirement {
-    pub fn wait(&self, timeout: Duration) -> bool { self.context.retired(timeout) }
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.context.retired(timeout)
+    }
 }
 
 impl Drop for Dac {
@@ -619,7 +736,8 @@ mod tests {
                 events: EventHub::start(),
                 info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
                 config,
-                closed: AtomicBool::new(false), control_guard: Mutex::new(()),
+                closed: AtomicBool::new(false),
+                control_guard: Mutex::new(()),
                 stream: Mutex::new(None),
                 last_feedback_stream: Mutex::new(None),
             }),
@@ -806,7 +924,8 @@ mod tests {
             events: events.clone(),
             info: DeviceInfo::new(0x1234, 0x5678, "test DAC"),
             config: DacConfig::default(),
-            closed: AtomicBool::new(false), control_guard: Mutex::new(()),
+            closed: AtomicBool::new(false),
+            control_guard: Mutex::new(()),
             stream: Mutex::new(None),
             last_feedback_stream: Mutex::new(None),
         });
@@ -879,18 +998,25 @@ mod tests {
         arrived_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(first.try_result().is_none());
         let mut queued = Vec::new();
-        for _ in 0..32 { queued.push(volume.set_db(-40.0).unwrap()); }
+        for _ in 0..32 {
+            queued.push(volume.set_db(-40.0).unwrap());
+        }
         assert!(matches!(volume.set_db(-50.0), Err(Error::Busy)));
         release_tx.send(()).unwrap();
         assert_eq!(first.wait().unwrap().db, -30.0);
-        for operation in queued { assert_eq!(operation.wait().unwrap().db, -40.0); }
+        for operation in queued {
+            assert_eq!(operation.wait().unwrap().db, -40.0);
+        }
         assert_eq!(fake.raw(), vec![-40 * 256, -40 * 256]);
         let result = volume.get().unwrap();
         // A completion can be observed with polling and then cannot be awaited twice.
         let state = result.wait().unwrap();
         assert_eq!(state.db, -40.0);
         dac.close().unwrap();
-        assert!(matches!(volume.set_db(-20.0).unwrap().wait(), Err(Error::InvalidState(_))));
+        assert!(matches!(
+            volume.set_db(-20.0).unwrap().wait(),
+            Err(Error::InvalidState(_))
+        ));
     }
 
     #[test]
@@ -900,17 +1026,31 @@ mod tests {
         let mut calls = Vec::new();
         let (restored, cause) = reconfigure_or_restore(&new, &old, |request| {
             calls.push(*request);
-            if *request == new { Err(Error::Unsupported { reason: "no float alternate".into(), offered: vec![] }) }
-            else { Ok("restored paused stream") }
-        }).unwrap();
+            if *request == new {
+                Err(Error::Unsupported {
+                    reason: "no float alternate".into(),
+                    offered: vec![],
+                })
+            } else {
+                Ok("restored paused stream")
+            }
+        })
+        .unwrap();
         assert_eq!(calls, vec![new, old]);
         assert_eq!(restored, "restored paused stream");
         assert_eq!(cause.unwrap().code(), "unsupported");
-        let error = reconfigure_or_restore::<()>(&new, &old, |_| Err(Error::Control("clock failed".into()))).unwrap_err();
+        let error = reconfigure_or_restore::<()>(&new, &old, |_| {
+            Err(Error::Control("clock failed".into()))
+        })
+        .unwrap_err();
         assert_eq!(error.code(), "reconfigure_unusable");
         let mut calls = Vec::new();
-        let (_, cause) = reconfigure_or_restore(&new, &old, |request| { calls.push(*request); Ok(()) }).unwrap();
-        assert_eq!(calls, vec![new]); assert!(cause.is_none());
+        let (_, cause) = reconfigure_or_restore(&new, &old, |request| {
+            calls.push(*request);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![new]);
+        assert!(cause.is_none());
     }
-
 }

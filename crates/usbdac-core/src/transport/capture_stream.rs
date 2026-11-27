@@ -30,12 +30,15 @@ impl CaptureEndpoint {
     /// Variable UAC1 capture without endpoint rate control can be admitted only
     /// through its standard adaptive host-timing pipe and a live PCM proof.
     pub(super) fn requires_host_rate_proof(&self) -> bool {
-        self.protocol == 0 && !self.sampling_control && !self.fixed_rate
+        self.protocol == 0
+            && !self.sampling_control
+            && !self.fixed_rate
             && self.standard_feedforward.is_some()
     }
 
     pub(super) fn feedforward(&self) -> Option<adc3::FeedforwardEndpoint> {
-        self.standard_feedforward.or_else(|| self.adc3_route.as_ref().and_then(|route| route.feedforward))
+        self.standard_feedforward
+            .or_else(|| self.adc3_route.as_ref().and_then(|route| route.feedforward))
     }
 }
 
@@ -304,9 +307,15 @@ fn capture_input_geometry(
 }
 
 /// Shared packet geometry after the caller proves direction and endpoint role.
-fn iso_endpoint_geometry(interface: &RawInterface<'_>, index: usize, speed: Speed) -> Option<(usize, u32)> {
+fn iso_endpoint_geometry(
+    interface: &RawInterface<'_>,
+    index: usize,
+    speed: Speed,
+) -> Option<(usize, u32)> {
     let ep = *interface.descriptors.get(index)?;
-    if ep.len() < 7 || ep[1] != 5 || !(1..=16).contains(&ep[6]) { return None; }
+    if ep.len() < 7 || ep[1] != 5 || !(1..=16).contains(&ep[6]) {
+        return None;
+    }
     let packet = u16::from_le_bytes([ep[4], ep[5]]);
     if matches!(speed, Speed::Super | Speed::SuperPlus) {
         let extra: Vec<_> = interface.descriptors[index + 1..]
@@ -314,9 +323,9 @@ fn iso_endpoint_geometry(interface: &RawInterface<'_>, index: usize, speed: Spee
             .take_while(|d| d[1] != 5)
             .flat_map(|d| d.iter().copied())
             .collect();
-        let (capacity, service, _) = super::endpoint_geometry::ss_endpoint_geometry(
-            packet, ep[6], &extra, speed, true,
-        ).ok()?;
+        let (capacity, service, _) =
+            super::endpoint_geometry::ss_endpoint_geometry(packet, ep[6], &extra, speed, true)
+                .ok()?;
         return Some((capacity, service));
     }
     let base = packet & 0x7ff;
@@ -328,29 +337,50 @@ fn iso_endpoint_geometry(interface: &RawInterface<'_>, index: usize, speed: Spee
     {
         return None;
     }
-    Some((effective_iso_packet_bytes(packet, speed), service_interval_micros(speed, ep[6])))
+    Some((
+        effective_iso_packet_bytes(packet, speed),
+        service_interval_micros(speed, ep[6]),
+    ))
 }
 
 /// Adaptive UAC1/2 IN requires its same-alternate, explicit timing OUT pipe.
 fn standard_capture_feedforward(
-    interface: &RawInterface<'_>, index: usize, speed: Speed, disabled: bool,
+    interface: &RawInterface<'_>,
+    index: usize,
+    speed: Speed,
+    disabled: bool,
 ) -> Result<Option<(adc3::FeedforwardEndpoint, usize)>, String> {
     let ep = interface.descriptors[index];
     if !matches!(interface.protocol, 0 | 0x20) || (ep[3] >> 2) & 3 != 2 {
         return Ok(None);
     }
-    if disabled { return Err("adaptive capture requires enabled feedforward".into()); }
+    if disabled {
+        return Err("adaptive capture requires enabled feedforward".into());
+    }
     if interface.declared_endpoints != 2 {
         return Err("adaptive capture requires exactly two declared endpoints".into());
     }
     super::standard_feedforward::find_standard_capture_feedforward(
-        interface.protocol, ep, &interface.descriptors, speed,
-    ).map(Some)
+        interface.protocol,
+        ep,
+        &interface.descriptors,
+        speed,
+    )
+    .map(Some)
 }
 
-fn scoped_endpoint_descriptors<'a>(interface: &'a RawInterface<'_>, index: usize) -> impl Iterator<Item = u8> + 'a {
-    interface.descriptors[index..].iter().take(1)
-        .chain(interface.descriptors[index + 1..].iter().take_while(|d| d[1] != 5))
+fn scoped_endpoint_descriptors<'a>(
+    interface: &'a RawInterface<'_>,
+    index: usize,
+) -> impl Iterator<Item = u8> + 'a {
+    interface.descriptors[index..]
+        .iter()
+        .take(1)
+        .chain(
+            interface.descriptors[index + 1..]
+                .iter()
+                .take_while(|d| d[1] != 5),
+        )
         .flat_map(|d| d.iter().copied())
 }
 
@@ -358,7 +388,9 @@ fn scoped_endpoint_descriptors<'a>(interface: &'a RawInterface<'_>, index: usize
 /// ADC3 retains its own descriptor admission and activation proof.
 fn claimable_capture_input(interface: &RawInterface<'_>, speed: Speed) -> bool {
     interface.descriptors.iter().enumerate().any(|(index, ep)| {
-        if ep.len() < 7 || ep[1] != 5 { return false; }
+        if ep.len() < 7 || ep[1] != 5 {
+            return false;
+        }
         if standard_capture_feedforward(interface, index, speed, false).is_err() {
             return false;
         }
@@ -380,7 +412,10 @@ pub(super) fn capture_candidates(
     speed: Speed,
     rate: u32,
 ) -> Result<Vec<CaptureEndpoint>, String> {
-    if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) {
+    if !matches!(
+        speed,
+        Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus
+    ) {
         return Err("capture requires a recognized Full, High or SuperSpeed USB link".into());
     }
     let interfaces = raw_interfaces(raw)?;
@@ -400,7 +435,8 @@ pub(super) fn capture_candidates(
             continue;
         };
         for (index, ep) in interface.descriptors.iter().enumerate() {
-            let Some((packet_bytes, service_us)) = capture_input_geometry(interface, index, speed) else {
+            let Some((packet_bytes, service_us)) = capture_input_geometry(interface, index, speed)
+            else {
                 continue;
             };
             if packet_bytes < required_max_packet_bytes(rate, service_us, format.bytes_per_frame())
@@ -410,8 +446,11 @@ pub(super) fn capture_candidates(
             let Ok(timing) = standard_capture_feedforward(interface, index, speed, false) else {
                 continue;
             };
-            if timing.is_some_and(|(pipe, _)| pipe.nominal(rate).is_err()) { continue; }
-            let mut endpoint_descriptors: Vec<_> = scoped_endpoint_descriptors(interface, index).collect();
+            if timing.is_some_and(|(pipe, _)| pipe.nominal(rate).is_err()) {
+                continue;
+            }
+            let mut endpoint_descriptors: Vec<_> =
+                scoped_endpoint_descriptors(interface, index).collect();
             if let Some((_, timing_index)) = timing {
                 endpoint_descriptors.extend(scoped_endpoint_descriptors(interface, timing_index));
             }
@@ -446,8 +485,11 @@ pub(super) fn capture_candidates(
             };
             // Refuse unqualified variable UAC1 alternates before selection so
             // they cannot hide a later, explicitly host-timed alternate.
-            if candidate.protocol == 0 && !candidate.sampling_control && !candidate.fixed_rate
-                && uac1_capture_sampling_control(&candidate).is_err() {
+            if candidate.protocol == 0
+                && !candidate.sampling_control
+                && !candidate.fixed_rate
+                && uac1_capture_sampling_control(&candidate).is_err()
+            {
                 continue;
             }
             candidates.push(candidate);
@@ -463,32 +505,56 @@ fn reprove_standard_capture(
     speed: Speed,
     candidate: &CaptureEndpoint,
 ) -> Result<(), Error> {
-    if raw.len() < 9 || raw[0] != 9 || raw[1] != 2
+    if raw.len() < 9
+        || raw[0] != 9
+        || raw[1] != 2
         || usize::from(u16::from_le_bytes([raw[2], raw[3]])) != raw.len()
         || raw[5] != candidate.configuration
     {
-        return Err(Error::InvalidState("standard capture configuration header changed".into()));
+        return Err(Error::InvalidState(
+            "standard capture configuration header changed".into(),
+        ));
     }
     let interfaces = raw_interfaces(raw).map_err(Error::Control)?;
-    let mut selected = interfaces.iter().filter(|interface|
-        interface.number == candidate.interface && interface.alternate == candidate.alternate);
-    let interface = selected.next().ok_or_else(||
-        Error::InvalidState("standard capture alternate disappeared".into()))?;
+    let mut selected = interfaces.iter().filter(|interface| {
+        interface.number == candidate.interface && interface.alternate == candidate.alternate
+    });
+    let interface = selected
+        .next()
+        .ok_or_else(|| Error::InvalidState("standard capture alternate disappeared".into()))?;
     if selected.next().is_some()
-        || interfaces.iter().filter(|interface|
-            interface.number == candidate.control && interface.alternate == 0).count() != 1
-        || interface.descriptors.iter().filter(|d|
-            d.len() >= 3 && d[1] == 5 && d[2] == candidate.address).count() != 1
+        || interfaces
+            .iter()
+            .filter(|interface| interface.number == candidate.control && interface.alternate == 0)
+            .count()
+            != 1
+        || interface
+            .descriptors
+            .iter()
+            .filter(|d| d.len() >= 3 && d[1] == 5 && d[2] == candidate.address)
+            .count()
+            != 1
     {
-        return Err(Error::InvalidState("standard capture descriptors are ambiguous".into()));
+        return Err(Error::InvalidState(
+            "standard capture descriptors are ambiguous".into(),
+        ));
     }
-    let rebuilt = capture_candidates(raw, candidate.configuration, speed, candidate.format.sample_rate())
-        .map_err(Error::Control)?;
-    let mut matching = rebuilt.iter().filter(|endpoint|
-        endpoint.interface == candidate.interface && endpoint.alternate == candidate.alternate
-            && endpoint.address == candidate.address);
+    let rebuilt = capture_candidates(
+        raw,
+        candidate.configuration,
+        speed,
+        candidate.format.sample_rate(),
+    )
+    .map_err(Error::Control)?;
+    let mut matching = rebuilt.iter().filter(|endpoint| {
+        endpoint.interface == candidate.interface
+            && endpoint.alternate == candidate.alternate
+            && endpoint.address == candidate.address
+    });
     if matching.next() != Some(candidate) || matching.next().is_some() {
-        return Err(Error::InvalidState("standard capture descriptor profile changed".into()));
+        return Err(Error::InvalidState(
+            "standard capture descriptor profile changed".into(),
+        ));
     }
     Ok(())
 }
@@ -497,30 +563,61 @@ pub(super) fn verify_standard_capture(
     claimed: &ClaimedHandle,
     candidate: &CaptureEndpoint,
 ) -> Result<(), Error> {
-    if candidate.vendor_pcm.is_some() || candidate.adc3_route.is_some()
+    if candidate.vendor_pcm.is_some()
+        || candidate.adc3_route.is_some()
         || !matches!(candidate.protocol, 0 | 0x20)
     {
         return Ok(());
     }
     if candidate.standard_feedforward.is_some() && settings().disable_feedback() {
         return Err(Error::Unsupported {
-            reason: "adaptive capture requires enabled feedforward".into(), offered: vec![],
+            reason: "adaptive capture requires enabled feedforward".into(),
+            offered: vec![],
         });
     }
-    claimed.ensure_interface_claimed(candidate.interface).map_err(Error::Claim)?;
-    claimed.ensure_interface_claimed(candidate.control).map_err(Error::Claim)?;
-    let map_control_error = |e: rusb::Error| if e == rusb::Error::NoDevice { Error::DeviceLost }
-        else { Error::Control(e.to_string()) };
-    let active = claimed.handle.active_configuration().map_err(map_control_error)?;
-    let config = claimed.handle.device().active_config_descriptor().map_err(map_control_error)?;
+    claimed
+        .ensure_interface_claimed(candidate.interface)
+        .map_err(Error::Claim)?;
+    claimed
+        .ensure_interface_claimed(candidate.control)
+        .map_err(Error::Claim)?;
+    let map_control_error = |e: rusb::Error| {
+        if e == rusb::Error::NoDevice {
+            Error::DeviceLost
+        } else {
+            Error::Control(e.to_string())
+        }
+    };
+    let active = claimed
+        .handle
+        .active_configuration()
+        .map_err(map_control_error)?;
+    let config = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(map_control_error)?;
     if active != candidate.configuration || config.number() != candidate.configuration {
-        return Err(Error::InvalidState("standard capture configuration changed".into()));
+        return Err(Error::InvalidState(
+            "standard capture configuration changed".into(),
+        ));
     }
     let raw = clock::read_active_configuration_bytes_checked(&claimed.handle, &config)?;
-    if claimed.handle.active_configuration().map_err(map_control_error)? != candidate.configuration {
-        return Err(Error::InvalidState("standard capture configuration changed during reproof".into()));
+    if claimed
+        .handle
+        .active_configuration()
+        .map_err(map_control_error)?
+        != candidate.configuration
+    {
+        return Err(Error::InvalidState(
+            "standard capture configuration changed during reproof".into(),
+        ));
     }
-    reprove_standard_capture(&raw, resolve_device_speed(&claimed.handle.device()), candidate)
+    reprove_standard_capture(
+        &raw,
+        resolve_device_speed(&claimed.handle.device()),
+        candidate,
+    )
 }
 
 /// Host-timed and duplex activation need explicit endpoint control evidence. Discovery's bool
@@ -536,10 +633,14 @@ pub(super) fn uac1_capture_sampling_control(capture: &CaptureEndpoint) -> Result
     let mut max_packets_only = false;
     while at < raw.len() {
         let length = usize::from(raw[at]);
-        if length < 2 || at + length > raw.len() { return Err(invalid()); }
+        if length < 2 || at + length > raw.len() {
+            return Err(invalid());
+        }
         let d = &raw[at..at + length];
         // The optional feedforward endpoint has its own control record.
-        if at != 0 && d[1] == 5 { break; }
+        if at != 0 && d[1] == 5 {
+            break;
+        }
         if d[1] == 0x25 {
             if d.len() != 7 || d[2] != 1 || d[3] & !0x83 != 0 || d[4] > 2 || control.is_some() {
                 return Err(invalid());
@@ -551,85 +652,168 @@ pub(super) fn uac1_capture_sampling_control(capture: &CaptureEndpoint) -> Result
     }
     match control {
         Some(true) if capture.sampling_control => Ok(true),
-        Some(false) if !capture.sampling_control && (capture.fixed_rate
-            || (capture.requires_host_rate_proof() && !max_packets_only)) => Ok(false),
+        Some(false)
+            if !capture.sampling_control
+                && (capture.fixed_rate
+                    || (capture.requires_host_rate_proof() && !max_packets_only)) =>
+        {
+            Ok(false)
+        }
         _ => Err(invalid()),
     }
 }
 
 /// Return the unique UAC1 collection owning this exact selected AS alternate.
 fn uac1_collection_owner<'a, 'raw>(
-    interfaces: &'a [RawInterface<'raw>], streaming: &RawInterface<'_>,
+    interfaces: &'a [RawInterface<'raw>],
+    streaming: &RawInterface<'_>,
 ) -> Result<&'a RawInterface<'raw>, Error> {
-    let invalid = || Error::InvalidState("UAC1 duplex AudioControl collection is ambiguous or malformed".into());
+    let invalid = || {
+        Error::InvalidState("UAC1 duplex AudioControl collection is ambiguous or malformed".into())
+    };
     let mut owners = Vec::new();
-    for ac in interfaces.iter().filter(|ac| ac.class == USB_CLASS_AUDIO
-        && ac.subclass == USB_SUBCLASS_AUDIOCONTROL && ac.protocol == 0 && ac.alternate == 0)
-    {
-        let headers: Vec<_> = ac.descriptors.iter().copied().filter(|d|
-            d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1)).collect();
+    for ac in interfaces.iter().filter(|ac| {
+        ac.class == USB_CLASS_AUDIO
+            && ac.subclass == USB_SUBCLASS_AUDIOCONTROL
+            && ac.protocol == 0
+            && ac.alternate == 0
+    }) {
+        let headers: Vec<_> = ac
+            .descriptors
+            .iter()
+            .copied()
+            .filter(|d| d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1))
+            .collect();
         // An unrelated malformed function cannot own this AS. A header that
         // actually names it must satisfy the complete collection contract.
-        if !headers.iter().any(|d| d.len() >= 8 && d[8..].contains(&streaming.number)) { continue; }
-        if headers.len() != 1 { return Err(invalid()); }
+        if !headers
+            .iter()
+            .any(|d| d.len() >= 8 && d[8..].contains(&streaming.number))
+        {
+            continue;
+        }
+        if headers.len() != 1 {
+            return Err(invalid());
+        }
         let header = headers[0];
-        if header.len() < 8 || header.len() != 8 + usize::from(header[7])
+        if header.len() < 8
+            || header.len() != 8 + usize::from(header[7])
             || header[3..5] != [0, 1]
-            || header[8..].iter().enumerate().any(|(index, id)| header[8..8 + index].contains(id))
-        { return Err(invalid()); }
-        if header[8..].contains(&streaming.number) { owners.push(ac); }
+            || header[8..]
+                .iter()
+                .enumerate()
+                .any(|(index, id)| header[8..8 + index].contains(id))
+        {
+            return Err(invalid());
+        }
+        if header[8..].contains(&streaming.number) {
+            owners.push(ac);
+        }
     }
     if owners.len() != 1
-        || interfaces.iter().filter(|interface| interface.number == owners[0].number
-            && interface.alternate == 0).count() != 1
-    { return Err(invalid()); }
+        || interfaces
+            .iter()
+            .filter(|interface| interface.number == owners[0].number && interface.alternate == 0)
+            .count()
+            != 1
+    {
+        return Err(invalid());
+    }
     Ok(owners[0])
 }
 
 fn reprove_uac1_duplex_owners(
-    raw: &[u8], speed: Speed, playback: &IsoStreamCandidate, capture: &CaptureEndpoint, playback_rate: u32,
+    raw: &[u8],
+    speed: Speed,
+    playback: &IsoStreamCandidate,
+    capture: &CaptureEndpoint,
+    playback_rate: u32,
 ) -> Result<(u8, bool, bool), Error> {
-    let invalid = || Error::InvalidState("UAC1 duplex playback descriptor profile is not proven".into());
-    if !playback.is_uac1 || capture.protocol != 0
+    let invalid =
+        || Error::InvalidState("UAC1 duplex playback descriptor profile is not proven".into());
+    if !playback.is_uac1
+        || capture.protocol != 0
         || playback.configuration_number != capture.configuration
-        || playback.usb_speed != speed || playback.alt_setting == 0
+        || playback.usb_speed != speed
+        || playback.alt_setting == 0
         || playback.interface_number == capture.interface
-        || playback.native_dsd.is_some() || playback.uac2_formats.is_some() || playback.format_tag != 1
-    { return Err(invalid()); }
+        || playback.native_dsd.is_some()
+        || playback.uac2_formats.is_some()
+        || playback.format_tag != 1
+    {
+        return Err(invalid());
+    }
     reprove_standard_capture(raw, speed, capture)?;
     let interfaces = raw_interfaces(raw).map_err(Error::Control)?;
-    let mut selected = interfaces.iter().filter(|interface|
-        interface.number == playback.interface_number && interface.alternate == playback.alt_setting);
+    let mut selected = interfaces.iter().filter(|interface| {
+        interface.number == playback.interface_number && interface.alternate == playback.alt_setting
+    });
     let output = selected.next().ok_or_else(invalid)?;
-    if selected.next().is_some() || output.class != USB_CLASS_AUDIO
-        || output.subclass != USB_SUBCLASS_AUDIOSTREAMING || output.protocol != 0
-        || output.declared_endpoints as usize != output.descriptors.iter().filter(|d| d[1] == 5).count()
-    { return Err(invalid()); }
+    if selected.next().is_some()
+        || output.class != USB_CLASS_AUDIO
+        || output.subclass != USB_SUBCLASS_AUDIOSTREAMING
+        || output.protocol != 0
+        || output.declared_endpoints as usize
+            != output.descriptors.iter().filter(|d| d[1] == 5).count()
+    {
+        return Err(invalid());
+    }
     let owner = uac1_collection_owner(&interfaces, output)?;
-    let input = interfaces.iter().find(|interface|
-        interface.number == capture.interface && interface.alternate == capture.alternate).ok_or_else(invalid)?;
-    if uac1_collection_owner(&interfaces, input)?.number != capture.control { return Err(invalid()); }
-    let generals: Vec<_> = output.descriptors.iter().copied().filter(|d|
-        d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1)).collect();
-    let formats: Vec<_> = output.descriptors.iter().copied().filter(|d|
-        d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&2)).collect();
-    if generals.len() != 1 || generals[0].len() != 7 || formats.len() != 1 { return Err(invalid()); }
+    let input = interfaces
+        .iter()
+        .find(|interface| {
+            interface.number == capture.interface && interface.alternate == capture.alternate
+        })
+        .ok_or_else(invalid)?;
+    if uac1_collection_owner(&interfaces, input)?.number != capture.control {
+        return Err(invalid());
+    }
+    let generals: Vec<_> = output
+        .descriptors
+        .iter()
+        .copied()
+        .filter(|d| d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&1))
+        .collect();
+    let formats: Vec<_> = output
+        .descriptors
+        .iter()
+        .copied()
+        .filter(|d| d[1] == USB_DT_CS_INTERFACE && d.get(2) == Some(&2))
+        .collect();
+    if generals.len() != 1 || generals[0].len() != 7 || formats.len() != 1 {
+        return Err(invalid());
+    }
     let general = generals[0];
     let format = formats[0];
-    if playback.terminal_link != Some(general[3]) || general[3] == 0
+    if playback.terminal_link != Some(general[3])
+        || general[3] == 0
         || u16::from_le_bytes([general[5], general[6]]) != playback.format_tag
-        || format.len() < 8 || format[3] != 1
-        || u16::from(format[4]) != playback.channels || format[5] != playback.subslot_size
+        || format.len() < 8
+        || format[3] != 1
+        || u16::from(format[4]) != playback.channels
+        || format[5] != playback.subslot_size
         || format[6] != playback.bit_resolution
-        || format.len() != if format[7] == 0 { 14 } else { 8 + usize::from(format[7]) * 3 }
-    { return Err(invalid()); }
+        || format.len()
+            != if format[7] == 0 {
+                14
+            } else {
+                8 + usize::from(format[7]) * 3
+            }
+    {
+        return Err(invalid());
+    }
     let rate = |at| u32::from_le_bytes([format[at], format[at + 1], format[at + 2], 0]);
     let requested = playback_rate;
     let valid_rate = |rate| (1..=0x7f_ffff).contains(&rate);
-    if !valid_rate(requested) { return Err(invalid()); }
+    if !valid_rate(requested) {
+        return Err(invalid());
+    }
     if format[7] == 0 {
-        if !valid_rate(rate(8)) || !valid_rate(rate(11)) || rate(8) > rate(11)
-            || requested < rate(8) || requested > rate(11)
+        if !valid_rate(rate(8))
+            || !valid_rate(rate(11))
+            || rate(8) > rate(11)
+            || requested < rate(8)
+            || requested > rate(11)
         {
             return Err(invalid());
         }
@@ -643,73 +827,160 @@ fn reprove_uac1_duplex_owners(
     } else {
         (0..usize::from(format[7])).all(|index| rate(8 + 3 * index) == requested)
     };
-    let terminals: Vec<_> = owner.descriptors.iter().copied().filter(|d|
-        d[1] == USB_DT_CS_INTERFACE && d.len() >= 4 && d[2] != 1 && d[3] == general[3]).collect();
-    if terminals.len() != 1 || terminals[0].len() != 12 || terminals[0][2] != 2
-        || terminals[0][4..6] != [1, 1] || u16::from(terminals[0][7]) != playback.channels
-    { return Err(invalid()); }
-    let endpoints: Vec<_> = output.descriptors.iter().enumerate().filter(|(_, d)|
-        d[1] == 5 && d.get(2) == Some(&playback.endpoint_address)).collect();
-    if endpoints.len() != 1 { return Err(invalid()); }
+    let terminals: Vec<_> = owner
+        .descriptors
+        .iter()
+        .copied()
+        .filter(|d| d[1] == USB_DT_CS_INTERFACE && d.len() >= 4 && d[2] != 1 && d[3] == general[3])
+        .collect();
+    if terminals.len() != 1
+        || terminals[0].len() != 12
+        || terminals[0][2] != 2
+        || terminals[0][4..6] != [1, 1]
+        || u16::from(terminals[0][7]) != playback.channels
+    {
+        return Err(invalid());
+    }
+    let endpoints: Vec<_> = output
+        .descriptors
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d[1] == 5 && d.get(2) == Some(&playback.endpoint_address))
+        .collect();
+    if endpoints.len() != 1 {
+        return Err(invalid());
+    }
     let (index, ep) = endpoints[0];
-    if ep.len() != 9 || ep[2] & 0xf0 != 0 || ep[2] & 15 == 0 || ep[3] & 3 != 1
-        || ep[6] != playback.endpoint_interval || ep[7] != playback.refresh || ep[8] != playback.synch_address
-    { return Err(invalid()); }
+    if ep.len() != 9
+        || ep[2] & 0xf0 != 0
+        || ep[2] & 15 == 0
+        || ep[3] & 3 != 1
+        || ep[6] != playback.endpoint_interval
+        || ep[7] != playback.refresh
+        || ep[8] != playback.synch_address
+    {
+        return Err(invalid());
+    }
     let sync = match (ep[3] >> 2) & 3 {
-        0 => SyncType::NoSync, 1 => SyncType::Asynchronous, 2 => SyncType::Adaptive, _ => SyncType::Synchronous,
+        0 => SyncType::NoSync,
+        1 => SyncType::Asynchronous,
+        2 => SyncType::Adaptive,
+        _ => SyncType::Synchronous,
     };
     let usage = match (ep[3] >> 4) & 3 {
-        0 => UsageType::Data, 2 => UsageType::FeedbackData, _ => return Err(invalid()),
+        0 => UsageType::Data,
+        2 => UsageType::FeedbackData,
+        _ => return Err(invalid()),
     };
-    if sync != playback.sync_type || usage != playback.usage_type
+    if sync != playback.sync_type
+        || usage != playback.usage_type
         || iso_endpoint_geometry(output, index, speed)
             != Some((playback.max_packet_bytes, playback.service_interval_us))
-    { return Err(invalid()); }
-    let controls: Vec<_> = output.descriptors[index + 1..].iter().copied()
-        .take_while(|d| d[1] != 5).filter(|d| d[1] == 0x25).collect();
-    if controls.len() != 1 || controls[0].len() != 7 || controls[0][2] != 1
-        || controls[0][3] & !0x83 != 0 || controls[0][4] > 2
-    { return Err(invalid()); }
+    {
+        return Err(invalid());
+    }
+    let controls: Vec<_> = output.descriptors[index + 1..]
+        .iter()
+        .copied()
+        .take_while(|d| d[1] != 5)
+        .filter(|d| d[1] == 0x25)
+        .collect();
+    if controls.len() != 1
+        || controls[0].len() != 7
+        || controls[0][2] != 1
+        || controls[0][3] & !0x83 != 0
+        || controls[0][4] > 2
+    {
+        return Err(invalid());
+    }
     if let Some(feedback) = playback.feedback_endpoint.as_ref() {
-        let feedbacks: Vec<_> = output.descriptors.iter().enumerate().filter(|(_, d)|
-            d[1] == 5 && d.get(2) == Some(&feedback.address)).collect();
-        if feedbacks.len() != 1 { return Err(invalid()); }
+        let feedbacks: Vec<_> = output
+            .descriptors
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d[1] == 5 && d.get(2) == Some(&feedback.address))
+            .collect();
+        if feedbacks.len() != 1 {
+            return Err(invalid());
+        }
         let (feedback_index, feedback_ep) = feedbacks[0];
-        if feedback_ep.len() != 9 || feedback_ep[2] & 0xf0 != 0x80 || feedback_ep[2] & 15 == 0
-            || !matches!(feedback_ep[3], 0x01 | 0x11) || feedback_ep[6] != feedback.interval
-            || feedback_ep[7] != feedback.refresh || feedback_ep[8] != 0
+        if feedback_ep.len() != 9
+            || feedback_ep[2] & 0xf0 != 0x80
+            || feedback_ep[2] & 15 == 0
+            || !matches!(feedback_ep[3], 0x01 | 0x11)
+            || feedback_ep[6] != feedback.interval
+            || feedback_ep[7] != feedback.refresh
+            || feedback_ep[8] != 0
             || feedback.transfer_type != TransferType::Isochronous
             || (ep[8] != feedback.address && !(ep[8] == 0 && feedback_ep[3] == 0x11))
             || iso_endpoint_geometry(output, feedback_index, speed)
                 != Some((feedback.max_packet_bytes, feedback.service_interval_us))
-        { return Err(invalid()); }
+        {
+            return Err(invalid());
+        }
     }
     Ok((owner.number, controls[0][3] & 1 != 0, fixed_at_request))
 }
 
 /// Fresh descriptor proof only: this must never program either endpoint rate.
 pub(super) fn uac1_duplex_owners(
-    claimed: &ClaimedHandle, playback: &IsoStreamCandidate, capture: &CaptureEndpoint, playback_rate: u32,
+    claimed: &ClaimedHandle,
+    playback: &IsoStreamCandidate,
+    capture: &CaptureEndpoint,
+    playback_rate: u32,
 ) -> Result<u8, Error> {
-    let map_error = |error: rusb::Error| if error == rusb::Error::NoDevice { Error::DeviceLost }
-        else { Error::Control(error.to_string()) };
-    for interface in [playback.interface_number, capture.interface, capture.control] {
-        claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
+    let map_error = |error: rusb::Error| {
+        if error == rusb::Error::NoDevice {
+            Error::DeviceLost
+        } else {
+            Error::Control(error.to_string())
+        }
+    };
+    for interface in [
+        playback.interface_number,
+        capture.interface,
+        capture.control,
+    ] {
+        claimed
+            .ensure_interface_claimed(interface)
+            .map_err(Error::Claim)?;
     }
-    let config = claimed.handle.device().active_config_descriptor().map_err(map_error)?;
+    let config = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(map_error)?;
     if config.number() != capture.configuration
         || claimed.handle.active_configuration().map_err(map_error)? != capture.configuration
-    { return Err(Error::InvalidState("UAC1 duplex configuration changed".into())); }
+    {
+        return Err(Error::InvalidState(
+            "UAC1 duplex configuration changed".into(),
+        ));
+    }
     let raw = clock::read_active_configuration_bytes_checked(&claimed.handle, &config)?;
     let (owner, sampling_control, fixed_at_request) = reprove_uac1_duplex_owners(
-        &raw, resolve_device_speed(&claimed.handle.device()), playback, capture, playback_rate)?;
-    let profile = clock::uac1_playback_rate_profile(claimed, playback, playback_rate).map_err(Error::Control)?;
-    if profile.sampling_control != Some(sampling_control) || profile.fixed_at_request != fixed_at_request {
-        return Err(Error::InvalidState("UAC1 duplex playback rate evidence changed".into()));
+        &raw,
+        resolve_device_speed(&claimed.handle.device()),
+        playback,
+        capture,
+        playback_rate,
+    )?;
+    let profile = clock::uac1_playback_rate_profile(claimed, playback, playback_rate)
+        .map_err(Error::Control)?;
+    if profile.sampling_control != Some(sampling_control)
+        || profile.fixed_at_request != fixed_at_request
+    {
+        return Err(Error::InvalidState(
+            "UAC1 duplex playback rate evidence changed".into(),
+        ));
     }
-    claimed.ensure_interface_claimed(owner).map_err(Error::Claim)?;
+    claimed
+        .ensure_interface_claimed(owner)
+        .map_err(Error::Claim)?;
     if claimed.handle.active_configuration().map_err(map_error)? != capture.configuration {
-        return Err(Error::InvalidState("UAC1 duplex configuration changed during reproof".into()));
+        return Err(Error::InvalidState(
+            "UAC1 duplex configuration changed during reproof".into(),
+        ));
     }
     Ok(owner)
 }
@@ -741,8 +1012,15 @@ fn class_capture_candidates(
     if settings().disable_feedback() {
         candidates.retain(|candidate| candidate.standard_feedforward.is_none());
     }
-    for (candidate, route) in adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)? {
-        candidates.push(adc3_capture_endpoint(config.number(), rate, candidate, route)?);
+    for (candidate, route) in
+        adc3::adc3_capture_candidates(claimed, config, speed, rate, planned_clock)?
+    {
+        candidates.push(adc3_capture_endpoint(
+            config.number(),
+            rate,
+            candidate,
+            route,
+        )?);
     }
     Ok(candidates)
 }
@@ -755,72 +1033,159 @@ pub(super) fn require_vendor_capture_pcm(profile: &vendor_pcm::VendorPcm) -> Res
     Ok(())
 }
 
-fn vendor_capture_candidates(configuration: u8, profile: vendor_pcm::VendorPcm, rate: u32) -> Result<Vec<CaptureEndpoint>, String> {
+fn vendor_capture_candidates(
+    configuration: u8,
+    profile: vendor_pcm::VendorPcm,
+    rate: u32,
+) -> Result<Vec<CaptureEndpoint>, String> {
     if require_vendor_capture_pcm(&profile).is_err() || !profile.supports_rate(rate) {
         return Ok(vec![]);
     }
     Ok(vec![vendor_capture_endpoint(configuration, profile, rate)?])
 }
 
-fn vendor_capture_endpoint(configuration: u8, profile: vendor_pcm::VendorPcm, rate: u32) -> Result<CaptureEndpoint, String> {
+fn vendor_capture_endpoint(
+    configuration: u8,
+    profile: vendor_pcm::VendorPcm,
+    rate: u32,
+) -> Result<CaptureEndpoint, String> {
     require_vendor_capture_pcm(&profile)?;
-    if !profile.supports_rate(rate) { return Err("unsupported vendor capture rate".into()); }
-    let format = CaptureFormat::pcm(rate, profile.input.subslot_bytes * 8, profile.input.subslot_bytes,
-        ChannelMap::uac2(u16::from(profile.input.channels), 0).map_err(|e| format!("vendor channel map: {e:?}"))?)
-        .map_err(|e| format!("vendor capture format: {e:?}"))?;
+    if !profile.supports_rate(rate) {
+        return Err("unsupported vendor capture rate".into());
+    }
+    let format = CaptureFormat::pcm(
+        rate,
+        profile.input.subslot_bytes * 8,
+        profile.input.subslot_bytes,
+        ChannelMap::uac2(profile.input.channels, 0)
+            .map_err(|e| format!("vendor channel map: {e:?}"))?,
+    )
+    .map_err(|e| format!("vendor capture format: {e:?}"))?;
     Ok(CaptureEndpoint {
-        configuration, interface: profile.input_interface_number, alternate: profile.input_alt_setting,
-        address: profile.input.address, service_us: profile.input.service_us,
-        packet_bytes: profile.input.max_packet_bytes, format, protocol: 0xff,
-        terminal: 0, control: profile.input_interface_number, control_descriptors: vec![],
+        configuration,
+        interface: profile.input_interface_number,
+        alternate: profile.input_alt_setting,
+        address: profile.input.address,
+        service_us: profile.input.service_us,
+        packet_bytes: profile.input.max_packet_bytes,
+        format,
+        protocol: 0xff,
+        terminal: 0,
+        control: profile.input_interface_number,
+        control_descriptors: vec![],
         endpoint_descriptors: vec![],
-        sampling_control: false, fixed_rate: !profile.rate_control, adc3_route: None, standard_feedforward: None, vendor_pcm: Some(profile),
+        sampling_control: false,
+        fixed_rate: !profile.rate_control,
+        adc3_route: None,
+        standard_feedforward: None,
+        vendor_pcm: Some(profile),
     })
 }
 
-pub(super) fn verify_active_capture_alt(claimed: &ClaimedHandle, interface: u8, expected: u8) -> Result<(), Error> {
-    claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
+pub(super) fn verify_active_capture_alt(
+    claimed: &ClaimedHandle,
+    interface: u8,
+    expected: u8,
+) -> Result<(), Error> {
+    claimed
+        .ensure_interface_claimed(interface)
+        .map_err(Error::Claim)?;
     let mut alternate = [0u8];
-    let read = claimed.handle.read_control(0x81, 0x0a, 0, u16::from(interface), &mut alternate, Duration::from_millis(500))
-        .map_err(|e| if e == rusb::Error::NoDevice { Error::DeviceLost } else { Error::Control(e.to_string()) })?;
+    let read = claimed
+        .handle
+        .read_control(
+            0x81,
+            0x0a,
+            0,
+            u16::from(interface),
+            &mut alternate,
+            Duration::from_millis(500),
+        )
+        .map_err(|e| {
+            if e == rusb::Error::NoDevice {
+                Error::DeviceLost
+            } else {
+                Error::Control(e.to_string())
+            }
+        })?;
     if read != 1 || alternate[0] != expected {
-        return Err(Error::InvalidState("streaming alternate did not verify".into()));
+        return Err(Error::InvalidState(
+            "streaming alternate did not verify".into(),
+        ));
     }
     Ok(())
 }
 
 /// Preserve the vendor activation call sites while sharing standard GET_INTERFACE.
-pub(super) fn verify_vendor_interface_alternate(claimed: &ClaimedHandle, interface: u8, expected: u8) -> Result<(), Error> {
+pub(super) fn verify_vendor_interface_alternate(
+    claimed: &ClaimedHandle,
+    interface: u8,
+    expected: u8,
+) -> Result<(), Error> {
     verify_active_capture_alt(claimed, interface, expected)
 }
 
-pub(super) fn verify_vendor_capture_alternate(claimed: &ClaimedHandle, candidate: &CaptureEndpoint, expected: u8) -> Result<(), Error> {
+pub(super) fn verify_vendor_capture_alternate(
+    claimed: &ClaimedHandle,
+    candidate: &CaptureEndpoint,
+    expected: u8,
+) -> Result<(), Error> {
     verify_vendor_interface_alternate(claimed, candidate.interface, expected)
 }
 
 /// Rediscover the exact fixed duplex profile without sending class clock or power requests.
-pub(super) fn verify_vendor_capture(claimed: &ClaimedHandle, candidate: &CaptureEndpoint) -> Result<(), Error> {
-    let expected = candidate.vendor_pcm.as_ref().ok_or_else(|| Error::InvalidState("missing vendor capture profile".into()))?;
-    require_vendor_capture_pcm(expected).map_err(|reason| Error::Unsupported { reason, offered: vec![] })?;
+pub(super) fn verify_vendor_capture(
+    claimed: &ClaimedHandle,
+    candidate: &CaptureEndpoint,
+) -> Result<(), Error> {
+    let expected = candidate
+        .vendor_pcm
+        .as_ref()
+        .ok_or_else(|| Error::InvalidState("missing vendor capture profile".into()))?;
+    require_vendor_capture_pcm(expected).map_err(|reason| Error::Unsupported {
+        reason,
+        offered: vec![],
+    })?;
     for interface in expected.claimed_interfaces() {
-        claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
+        claimed
+            .ensure_interface_claimed(interface)
+            .map_err(Error::Claim)?;
     }
-    let config = claimed.handle.device().active_config_descriptor().map_err(|e| Error::Claim(e.to_string()))?;
+    let config = claimed
+        .handle
+        .device()
+        .active_config_descriptor()
+        .map_err(|e| Error::Claim(e.to_string()))?;
     if config.number() != candidate.configuration {
-        return Err(Error::InvalidState("vendor capture configuration changed".into()));
+        return Err(Error::InvalidState(
+            "vendor capture configuration changed".into(),
+        ));
     }
-    let actual = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))
-        .map_err(Error::Control)?;
-    let reproven = vendor_capture_endpoint(candidate.configuration, *expected, candidate.format.sample_rate())
-        .map_err(Error::Control)?;
+    let actual = vendor_pcm::discover(
+        &claimed.handle,
+        &config,
+        resolve_device_speed(&claimed.handle.device()),
+    )
+    .map_err(Error::Control)?;
+    let reproven = vendor_capture_endpoint(
+        candidate.configuration,
+        *expected,
+        candidate.format.sample_rate(),
+    )
+    .map_err(Error::Control)?;
     if actual.as_ref() != Some(expected) || &reproven != candidate {
-        return Err(Error::InvalidState("vendor capture wire profile changed".into()));
+        return Err(Error::InvalidState(
+            "vendor capture wire profile changed".into(),
+        ));
     }
     Ok(())
 }
 
 fn adc3_capture_endpoint(
-    configuration: u8, rate: u32, candidate: IsoStreamCandidate, route: adc3::Adc3Route,
+    configuration: u8,
+    rate: u32,
+    candidate: IsoStreamCandidate,
+    route: adc3::Adc3Route,
 ) -> Result<CaptureEndpoint, String> {
     let format = CaptureFormat::pcm(
         rate,
@@ -865,14 +1230,24 @@ pub(super) fn validate_capture_registration(
     if expected_configuration.is_some_and(|id| id != config.number()) {
         return Err("capture configuration changed since host claim handoff".into());
     }
-    if let Some(profile) = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))? {
+    if let Some(profile) = vendor_pcm::discover(
+        &claimed.handle,
+        &config,
+        resolve_device_speed(&claimed.handle.device()),
+    )? {
         require_vendor_capture_pcm(&profile)?;
-        let identity = claimed.handle.device().device_descriptor().map_err(|e| e.to_string())?;
+        let identity = claimed
+            .handle
+            .device()
+            .device_descriptor()
+            .map_err(|e| e.to_string())?;
         if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
             return Err("capture host and actual USB identities differ".into());
         }
         if !profile.claims_match(&device.claimed_interfaces) {
-            return Err("vendor capture requires its exact proven streaming interface claim set".into());
+            return Err(
+                "vendor capture requires its exact proven streaming interface claim set".into(),
+            );
         }
         return Ok(());
     }
@@ -909,11 +1284,19 @@ pub(super) fn validate_capture_registration(
     }
     // Explicit host opt-in may add only this exact actual-device vendor interface.
     // It never substitutes for a PCM IN interface and its owning AudioControl.
-    let identity = claimed.handle.device().device_descriptor().map_err(|e| e.to_string())?;
+    let identity = claimed
+        .handle
+        .device()
+        .device_descriptor()
+        .map_err(|e| e.to_string())?;
     if identity.vendor_id() != device.vendor_id || identity.product_id() != device.product_id {
         return Err("capture host and actual USB identities differ".into());
     }
-    if let Some(interface) = super::routing_hw::scarlett_claim_interface(&config, identity.vendor_id(), identity.product_id()) {
+    if let Some(interface) = super::routing_hw::scarlett_claim_interface(
+        &config,
+        identity.vendor_id(),
+        identity.product_id(),
+    ) {
         allowed.insert(interface);
     }
     if !has_input || !ids.is_subset(&allowed) {
@@ -933,9 +1316,17 @@ pub(crate) fn capture_claim_preflight(
         .device()
         .active_config_descriptor()
         .map_err(|e| e.to_string())?;
-    if let Some(profile) = vendor_pcm::discover(&claimed.handle, &config, resolve_device_speed(&claimed.handle.device()))? {
+    if let Some(profile) = vendor_pcm::discover(
+        &claimed.handle,
+        &config,
+        resolve_device_speed(&claimed.handle.device()),
+    )? {
         require_vendor_capture_pcm(&profile)?;
-        return Ok((config.number(), vec![], vec![profile.input_interface_number]));
+        return Ok((
+            config.number(),
+            vec![],
+            vec![profile.input_interface_number],
+        ));
     }
     let raw = read_active_configuration_bytes(&claimed.handle, &config)
         .ok_or("cannot read active capture configuration")?;
@@ -1002,10 +1393,11 @@ impl Drop for CaptureUsbOwner {
             let mut keep_locked = self.keep_locked;
             if let Some(route) = self.clock_route.take() {
                 let active = claimed.active_interfaces.lock().clone();
-                let idle = active.into_iter().try_for_each(|interface| {
-                    claimed.set_alternate_setting(interface, 0)
-                });
-                let restored = idle.and_then(|()| clock::restore_capture_clock_route(&claimed, &route));
+                let idle = active
+                    .into_iter()
+                    .try_for_each(|interface| claimed.set_alternate_setting(interface, 0));
+                let restored =
+                    idle.and_then(|()| clock::restore_capture_clock_route(&claimed, &route));
                 if let Err(error) = restored {
                     keep_locked = false;
                     claimed.adc3_power.disarm();
@@ -1019,8 +1411,10 @@ impl Drop for CaptureUsbOwner {
 }
 
 /// Build only from the active, strictly resolved capture route after activation.
-pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
-    -> Result<Option<audio_status::StreamStatusTarget>, Error> {
+pub(super) fn status_target(
+    claimed: &ClaimedHandle,
+    endpoint: &CaptureEndpoint,
+) -> Result<Option<audio_status::StreamStatusTarget>, Error> {
     if endpoint.vendor_pcm.is_some() {
         return Ok(None);
     }
@@ -1032,29 +1426,54 @@ pub(super) fn status_target(claimed: &ClaimedHandle, endpoint: &CaptureEndpoint)
             return Ok(None);
         }
         let rate = endpoint.format.sample_rate();
-        return Ok(Some(audio_status::StreamStatusTarget::uac1(endpoint.control,
-            endpoint.interface, endpoint.alternate, endpoint.address,
+        return Ok(Some(audio_status::StreamStatusTarget::uac1(
+            endpoint.control,
+            endpoint.interface,
+            endpoint.alternate,
+            endpoint.address,
             (endpoint.sampling_control && rate > 0).then_some(rate),
-            Some(endpoint.terminal))));
+            Some(endpoint.terminal),
+        )));
     }
     if !matches!(endpoint.protocol, 0x20 | 0x30) {
         return Ok(None);
     }
     let proven = if let Some(route) = endpoint.adc3_route.as_ref() {
-        let Some(choice) = route.choice.as_ref() else { return Ok(None); }; // BADD
-        route.source_rate(endpoint.format.sample_rate()).ok().map(|rate| (choice.clone(), rate))
+        let Some(choice) = route.choice.as_ref() else {
+            return Ok(None);
+        }; // BADD
+        route
+            .source_rate(endpoint.format.sample_rate())
+            .ok()
+            .map(|rate| (choice.clone(), rate))
     } else {
-        claimed.handle.device().active_config_descriptor().ok().and_then(|config| {
-            let choice = strict_implicit_clock(&config, &claimed.handle, endpoint.control,
-                Some(endpoint.terminal))?;
-            let rate = uac2_clock_ratio(Some(&choice)).ok()?.source_rate(endpoint.format.sample_rate())?;
-            Some((choice, rate))
-        })
+        claimed
+            .handle
+            .device()
+            .active_config_descriptor()
+            .ok()
+            .and_then(|config| {
+                let choice = strict_implicit_clock(
+                    &config,
+                    &claimed.handle,
+                    endpoint.control,
+                    Some(endpoint.terminal),
+                )?;
+                let rate = uac2_clock_ratio(Some(&choice))
+                    .ok()?
+                    .source_rate(endpoint.format.sample_rate())?;
+                Some((choice, rate))
+            })
     };
     // Optional monitoring never turns an inconclusive extra snapshot into a
     // new startup gate. The completed configuration owns initial verification.
-    let mut target = audio_status::StreamStatusTarget::new(endpoint.protocol, endpoint.control,
-        endpoint.interface, endpoint.alternate, proven.as_ref().map(|(choice, rate)| (choice, *rate)));
+    let mut target = audio_status::StreamStatusTarget::new(
+        endpoint.protocol,
+        endpoint.control,
+        endpoint.interface,
+        endpoint.alternate,
+        proven.as_ref().map(|(choice, rate)| (choice, *rate)),
+    );
     if let Some(route) = endpoint.adc3_route.as_ref() {
         for (interface, expected_mask) in route.active_format_expectations() {
             target.add_adc3_active_format(interface, expected_mask);
@@ -1073,19 +1492,35 @@ pub(super) fn configure_capture_endpoint_guarded(
     if let Some(profile) = candidate.vendor_pcm.as_ref() {
         verify_vendor_capture(claimed, candidate)?;
         for interface in profile.claimed_interfaces() {
-            claimed.ensure_interface_claimed(interface).map_err(Error::Claim)?;
-            claimed.set_alternate_setting(interface, 0).map_err(Error::Claim)?;
+            claimed
+                .ensure_interface_claimed(interface)
+                .map_err(Error::Claim)?;
+            claimed
+                .set_alternate_setting(interface, 0)
+                .map_err(Error::Claim)?;
             verify_vendor_interface_alternate(claimed, interface, 0)?;
         }
         if profile.requires_output_for_capture {
-            claimed.set_alternate_setting(profile.interface_number, profile.alt_setting).map_err(Error::Claim)?;
-            verify_vendor_interface_alternate(claimed, profile.interface_number, profile.alt_setting)?;
+            claimed
+                .set_alternate_setting(profile.interface_number, profile.alt_setting)
+                .map_err(Error::Claim)?;
+            verify_vendor_interface_alternate(
+                claimed,
+                profile.interface_number,
+                profile.alt_setting,
+            )?;
         }
-        claimed.set_alternate_setting(candidate.interface, candidate.alternate).map_err(Error::Claim)?;
+        claimed
+            .set_alternate_setting(candidate.interface, candidate.alternate)
+            .map_err(Error::Claim)?;
         verify_vendor_capture(claimed, candidate)?;
         verify_vendor_capture_alternate(claimed, candidate, candidate.alternate)?;
         if profile.requires_output_for_capture {
-            verify_vendor_interface_alternate(claimed, profile.interface_number, profile.alt_setting)?;
+            verify_vendor_interface_alternate(
+                claimed,
+                profile.interface_number,
+                profile.alt_setting,
+            )?;
         }
         if profile.rate_control {
             vendor_pcm::program_rate(claimed, profile, candidate.format.sample_rate())?;
@@ -1115,7 +1550,8 @@ pub(super) fn configure_capture_endpoint_guarded(
                 candidate.address,
                 rate,
             )
-            .or_control() {
+            .or_control()
+            {
                 return Err(Error::DeviceLost);
             }
             // A read-only endpoint may stall SET_CUR. Its active rate still
@@ -1125,7 +1561,8 @@ pub(super) fn configure_capture_endpoint_guarded(
                 candidate.interface,
                 candidate.address,
             )
-            .or_control() {
+            .or_control()
+            {
                 Ok(reported) => Some(reported),
                 Err(Error::DeviceLost) => return Err(Error::DeviceLost),
                 Err(_) => None,
@@ -1163,7 +1600,8 @@ pub(super) fn configure_capture_endpoint_guarded(
         }
         if let Some((expected, expected_raw_rate)) = expected_source {
             if actual.choice.as_ref() != Some(expected)
-                || route.source_rate(rate).map_err(Error::Control)? != expected_raw_rate {
+                || route.source_rate(rate).map_err(Error::Control)? != expected_raw_rate
+            {
                 return Err(Error::InvalidState(
                     "ADC3 capture clock differs from the proven playback source".into(),
                 ));
@@ -1180,9 +1618,14 @@ pub(super) fn configure_capture_endpoint_guarded(
         if route.choice.is_some() {
             if !claimed
                 .try_set_alternate_setting(candidate.interface, candidate.alternate)
-                .map_err(|error| if crate::error::is_device_gone(&error) {
-                    Error::DeviceLost
-                } else { Error::Claim(error) })? {
+                .map_err(|error| {
+                    if crate::error::is_device_gone(&error) {
+                        Error::DeviceLost
+                    } else {
+                        Error::Claim(error)
+                    }
+                })?
+            {
                 return Ok(false);
             }
         } else {
@@ -1204,7 +1647,8 @@ pub(super) fn configure_capture_endpoint_guarded(
             ));
         }
         adc3::verify_adc3_active_formats(&claimed.handle, &actual).or_control()?;
-        adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate).map_err(Error::Control)?;
+        adc3::verify_adc3_capture_activation(&claimed.handle, &actual, rate)
+            .map_err(Error::Control)?;
     } else {
         let config = claimed
             .handle
@@ -1240,18 +1684,28 @@ pub(super) fn configure_capture_endpoint_guarded(
             reason: "capture wire rate has no exact representable root source rate".into(),
             offered: vec![],
         })?;
-        let clock = AudioControlClock { interface_number: candidate.control, clock_id: choice.source_id };
+        let clock = AudioControlClock {
+            interface_number: candidate.control,
+            clock_id: choice.source_id,
+        };
         verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
-        let original_source = get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id)
-            .map_err(Error::Control)?;
-        if expected_source.is_some_and(|(expected, original)| expected != &choice || original != original_source) {
-            return Err(Error::InvalidState("capture clock changed since its rollback snapshot".into()));
+        let original_source =
+            get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id)
+                .map_err(Error::Control)?;
+        if expected_source
+            .is_some_and(|(expected, original)| expected != &choice || original != original_source)
+        {
+            return Err(Error::InvalidState(
+                "capture clock changed since its rollback snapshot".into(),
+            ));
         }
         let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
         if reported != Some(rate) {
             // A caller that already proved the target source rate expects a
             // read-only verification during activation.
-            if expected_source.is_some_and(|(_, proven)| proven == source_rate) || source[5] & 3 != 3 {
+            if expected_source.is_some_and(|(_, proven)| proven == source_rate)
+                || source[5] & 3 != 3
+            {
                 return Err(Error::ClockUnverified {
                     requested_hz: rate,
                     reported_hz: reported,
@@ -1268,20 +1722,48 @@ pub(super) fn configure_capture_endpoint_guarded(
             }
             // A multiplier-backed source belongs to the complete function;
             // never change it while an unowned sibling can consume that root.
-            if choice.path.iter().any(|hop| matches!(hop.kind,
-                crate::clock_resolution::ClockHopKind::RateMultiplier { .. }))
-                && !clock::stop_complete_capture_clock_function(claimed, candidate.interface).map_err(Error::Control)? {
-                return Err(Error::Control("capture multiplier programming requires complete idle function ownership".into()));
+            if choice.path.iter().any(|hop| {
+                matches!(
+                    hop.kind,
+                    crate::clock_resolution::ClockHopKind::RateMultiplier { .. }
+                )
+            }) && !clock::stop_complete_capture_clock_function(claimed, candidate.interface)
+                .map_err(Error::Control)?
+            {
+                return Err(Error::Control(
+                    "capture multiplier programming requires complete idle function ownership"
+                        .into(),
+                ));
             }
             verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
-            if strict_implicit_clock(&config, &claimed.handle, candidate.control, Some(candidate.terminal)).as_ref() != Some(&choice) {
-                return Err(Error::InvalidState("capture clock route changed before source programming".into()));
+            if strict_implicit_clock(
+                &config,
+                &claimed.handle,
+                candidate.control,
+                Some(candidate.terminal),
+            )
+            .as_ref()
+                != Some(&choice)
+            {
+                return Err(Error::InvalidState(
+                    "capture clock route changed before source programming".into(),
+                ));
             }
-            if get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id).map_err(Error::Control)? != original_source {
-                return Err(Error::InvalidState("capture source changed before programming".into()));
+            if get_sampling_frequency(&claimed.handle, candidate.control, choice.source_id)
+                .map_err(Error::Control)?
+                != original_source
+            {
+                return Err(Error::InvalidState(
+                    "capture source changed before programming".into(),
+                ));
             }
-            set_sampling_frequency(&claimed.handle, candidate.control, choice.source_id, source_rate)
-                .map_err(Error::Control)?;
+            set_sampling_frequency(
+                &claimed.handle,
+                candidate.control,
+                choice.source_id,
+                source_rate,
+            )
+            .map_err(Error::Control)?;
         }
         verify_uac2_clock_factors(&claimed.handle, &choice).map_err(Error::Control)?;
         let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
@@ -1301,9 +1783,14 @@ pub(super) fn configure_capture_endpoint_guarded(
         }
         if !claimed
             .try_set_alternate_setting(candidate.interface, candidate.alternate)
-            .map_err(|error| if crate::error::is_device_gone(&error) {
-                Error::DeviceLost
-            } else { Error::Claim(error) })? {
+            .map_err(|error| {
+                if crate::error::is_device_gone(&error) {
+                    Error::DeviceLost
+                } else {
+                    Error::Claim(error)
+                }
+            })?
+        {
             return Ok(false);
         }
         // Re-read route after activation; no fallback clock can authorize IN.
@@ -1326,8 +1813,12 @@ pub(super) fn configure_capture_endpoint_guarded(
         let reported = get_wire_frequency(&claimed.handle, clock, Some(&choice)).ok();
         verify_capture_wire_rate(rate, reported)?;
         if source[5] & 0x04 != 0
-            && get_clock_validity(&claimed.handle, candidate.control, choice.source_id) != Ok(true) {
-            return Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported });
+            && get_clock_validity(&claimed.handle, candidate.control, choice.source_id) != Ok(true)
+        {
+            return Err(Error::ClockUnverified {
+                requested_hz: rate,
+                reported_hz: reported,
+            });
         }
     }
     verify_standard_capture(claimed, candidate)?;
@@ -1335,8 +1826,14 @@ pub(super) fn configure_capture_endpoint_guarded(
 }
 
 fn verify_capture_wire_rate(rate: u32, reported: Option<u32>) -> Result<(), Error> {
-    if reported == Some(rate) { Ok(()) }
-    else { Err(Error::ClockUnverified { requested_hz: rate, reported_hz: reported }) }
+    if reported == Some(rate) {
+        Ok(())
+    } else {
+        Err(Error::ClockUnverified {
+            requested_hz: rate,
+            reported_hz: reported,
+        })
+    }
 }
 
 /// Deferred metadata has fixed size and is never locked by a reader. Capture
@@ -1360,23 +1857,38 @@ pub(crate) struct DeferredCapture {
 }
 impl DeferredCapture {
     pub(super) fn record(&self, stats: crate::capture::CaptureStats) {
-        self.reordered_completions.fetch_add(stats.reordered_completions, Ordering::Relaxed);
-        self.captured_frames.fetch_add(stats.captured_frames, Ordering::Relaxed);
-        self.delivered_frames.fetch_add(stats.delivered_frames, Ordering::Relaxed);
-        self.overrun_frames.fetch_add(stats.overrun_frames, Ordering::Relaxed);
-        self.contention_frames.fetch_add(stats.contention_frames, Ordering::Relaxed);
-        self.empty_packets.fetch_add(stats.empty_packets, Ordering::Relaxed);
-        self.short_packets.fetch_add(stats.short_packets, Ordering::Relaxed);
-        self.failed_packets.fetch_add(stats.failed_packets, Ordering::Relaxed);
-        self.malformed_packets.fetch_add(stats.malformed_packets, Ordering::Relaxed);
-        self.malformed_completions.fetch_add(stats.malformed_completions, Ordering::Relaxed);
-        self.failed_transfers.fetch_add(stats.failed_transfers, Ordering::Relaxed);
-        self.missing_frames.fetch_add(stats.missing_frames, Ordering::Relaxed);
+        self.reordered_completions
+            .fetch_add(stats.reordered_completions, Ordering::Relaxed);
+        self.captured_frames
+            .fetch_add(stats.captured_frames, Ordering::Relaxed);
+        self.delivered_frames
+            .fetch_add(stats.delivered_frames, Ordering::Relaxed);
+        self.overrun_frames
+            .fetch_add(stats.overrun_frames, Ordering::Relaxed);
+        self.contention_frames
+            .fetch_add(stats.contention_frames, Ordering::Relaxed);
+        self.empty_packets
+            .fetch_add(stats.empty_packets, Ordering::Relaxed);
+        self.short_packets
+            .fetch_add(stats.short_packets, Ordering::Relaxed);
+        self.failed_packets
+            .fetch_add(stats.failed_packets, Ordering::Relaxed);
+        self.malformed_packets
+            .fetch_add(stats.malformed_packets, Ordering::Relaxed);
+        self.malformed_completions
+            .fetch_add(stats.malformed_completions, Ordering::Relaxed);
+        self.failed_transfers
+            .fetch_add(stats.failed_transfers, Ordering::Relaxed);
+        self.missing_frames
+            .fetch_add(stats.missing_frames, Ordering::Relaxed);
     }
     pub(super) fn finish(&self, failed: bool) {
-        self.terminal.fetch_max(if failed { 2 } else { 1 }, Ordering::Release);
+        self.terminal
+            .fetch_max(if failed { 2 } else { 1 }, Ordering::Release);
     }
-    pub(super) fn is_finished(&self) -> bool { self.terminal.load(Ordering::Acquire) != 0 }
+    pub(super) fn is_finished(&self) -> bool {
+        self.terminal.load(Ordering::Acquire) != 0
+    }
     pub(super) fn merge_into(&self, buffer: &mut CaptureBuffer) {
         let terminal = self.terminal.load(Ordering::Acquire);
         buffer.merge_stats(crate::capture::CaptureStats {
@@ -1414,7 +1926,9 @@ pub(crate) struct CaptureHandle {
 impl CaptureHandle {
     pub(crate) fn lock_buffer(&self) -> parking_lot::MutexGuard<'_, CaptureBuffer> {
         let mut buffer = self.buffer.lock();
-        if let Some(deferred) = &self.deferred { deferred.merge_into(&mut buffer); }
+        if let Some(deferred) = &self.deferred {
+            deferred.merge_into(&mut buffer);
+        }
         buffer
     }
     pub(crate) fn stop(&mut self) -> Result<(), Error> {
@@ -1441,13 +1955,18 @@ impl CaptureHandle {
                 .map_err(|_| Error::Transfer("USB capture worker panicked".into()))?;
         }
         if self.paired {
-            let retired = self.retired.as_ref().expect("paired capture retirement signal");
+            let retired = self
+                .retired
+                .as_ref()
+                .expect("paired capture retirement signal");
             let deadline = Instant::now() + Duration::from_secs(3);
             while !retired.load(Ordering::Acquire) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
             if !retired.load(Ordering::Acquire) {
-                return Err(Error::Transfer("USB duplex is still retiring; retain host claims and FD".into()));
+                return Err(Error::Transfer(
+                    "USB duplex is still retiring; retain host claims and FD".into(),
+                ));
             }
         }
         Ok(())
@@ -1496,14 +2015,19 @@ pub(crate) fn open_capture(
     let config = usb
         .active_config_descriptor()
         .map_err(|e| Error::Claim(e.to_string()))?;
-    let vendor_profile = vendor_pcm::discover(&owner.claimed().handle, &config, resolve_device_speed(&usb))
-        .map_err(Error::Claim)?;
+    let vendor_profile =
+        vendor_pcm::discover(&owner.claimed().handle, &config, resolve_device_speed(&usb))
+            .map_err(Error::Claim)?;
     let mut candidates = if let Some(profile) = vendor_profile {
-        require_vendor_capture_pcm(&profile).map_err(|reason| Error::Unsupported { reason, offered: vec![] })?;
+        require_vendor_capture_pcm(&profile).map_err(|reason| Error::Unsupported {
+            reason,
+            offered: vec![],
+        })?;
         vendor_capture_candidates(config.number(), profile, request.sample_rate)
     } else {
         class_capture_candidates(owner.claimed(), &config, request.sample_rate, false)
-    }.map_err(Error::Claim)?;
+    }
+    .map_err(Error::Claim)?;
     candidates.retain(|candidate| {
         candidate.format.satisfies(request)
             && device.claimed_interfaces.contains(&candidate.interface)
@@ -1530,13 +2054,25 @@ pub(crate) fn open_capture(
     // Live UAC2 alternate validity may reject the preferred descriptor match.
     // Keep retries inside that same capture route; never switch function,
     // terminal, interface or protocol because its first alternate is invalid.
-    let standard_uac2 = endpoint.protocol == 0x20
-        && endpoint.vendor_pcm.is_none() && endpoint.adc3_route.is_none();
-    let input = (endpoint.configuration, endpoint.interface, endpoint.control, endpoint.terminal);
+    let standard_uac2 =
+        endpoint.protocol == 0x20 && endpoint.vendor_pcm.is_none() && endpoint.adc3_route.is_none();
+    let input = (
+        endpoint.configuration,
+        endpoint.interface,
+        endpoint.control,
+        endpoint.terminal,
+    );
     let mut siblings = candidates.into_iter().skip(1).filter(move |candidate| {
-        standard_uac2 && candidate.protocol == 0x20
-            && candidate.vendor_pcm.is_none() && candidate.adc3_route.is_none()
-            && (candidate.configuration, candidate.interface, candidate.control, candidate.terminal) == input
+        standard_uac2
+            && candidate.protocol == 0x20
+            && candidate.vendor_pcm.is_none()
+            && candidate.adc3_route.is_none()
+            && (
+                candidate.configuration,
+                candidate.interface,
+                candidate.control,
+                candidate.terminal,
+            ) == input
     });
     let (buffer, geometry) = loop {
         // Reject invalid capacity/transfer geometry before touching clocks.
@@ -1550,9 +2086,13 @@ pub(crate) fn open_capture(
             verify_standard_capture(owner.claimed(), &endpoint)?;
             let mut route = None;
             let result = clock::select_capture_clock_route(
-                owner.claimed(), endpoint.interface, endpoint.alternate,
-                endpoint.terminal, endpoint.control,
-                endpoint.format.sample_rate(), &mut route,
+                owner.claimed(),
+                endpoint.interface,
+                endpoint.alternate,
+                endpoint.terminal,
+                endpoint.control,
+                endpoint.format.sample_rate(),
+                &mut route,
             );
             // Preserve the owning rollback lease even when selection aborts.
             owner.clock_route = route;
@@ -1568,12 +2108,19 @@ pub(crate) fn open_capture(
         }
         break (buffer, geometry);
     };
-    if !configure_capture_endpoint_guarded(owner.claimed(), &endpoint,
-        owner.clock_route.as_ref().map(|route| route.expected_active_source()))? {
+    if !configure_capture_endpoint_guarded(
+        owner.claimed(),
+        &endpoint,
+        owner
+            .clock_route
+            .as_ref()
+            .map(|route| route.expected_active_source()),
+    )? {
         // The owner still holds the clock lease and retires it normally. A
         // late clean rejection does not start a worker or retry another route.
         return Err(Error::Unsupported {
-            reason: "the selected PCM IN alternate became unavailable before capture activation".into(),
+            reason: "the selected PCM IN alternate became unavailable before capture activation"
+                .into(),
             offered: vec![],
         });
     }
@@ -1648,54 +2195,97 @@ pub(crate) fn open_capture(
 /// Inspect immutable submission geometry before using descriptors or payload.
 /// Device removal is recognized even when presentation has stopped or is busy.
 pub(super) fn inspect_slot<'a>(
-    slot: &'a IsoTransferSlot, status: i32, scratch: &mut [CapturePacket],
+    slot: &'a IsoTransferSlot,
+    status: i32,
+    scratch: &mut [CapturePacket],
 ) -> Result<(&'a [u8], bool), Error> {
     if status != LIBUSB_TRANSFER_COMPLETED {
-        return Err(if status == LIBUSB_TRANSFER_NO_DEVICE { Error::DeviceLost }
-            else { Error::Transfer(format!("capture transfer failed: {}", iso_transfer_status_label(status))) });
+        return Err(if status == LIBUSB_TRANSFER_NO_DEVICE {
+            Error::DeviceLost
+        } else {
+            Error::Transfer(format!(
+                "capture transfer failed: {}",
+                iso_transfer_status_label(status)
+            ))
+        });
     }
     let transfer = unsafe { slot.transfer.as_ref() };
     let data = unsafe { &*slot.user_data };
     if transfer.num_iso_packets != scratch.len() as i32
-        || transfer.length < 0 || transfer.length as usize != slot.submitted_bytes
+        || transfer.length < 0
+        || transfer.length as usize != slot.submitted_bytes
         || slot.submitted_bytes > data.buffer.len()
         || (slot.submitted_endpoint & 0x80 != 0 && slot.submitted_bytes != data.buffer.len())
         || transfer.endpoint != slot.submitted_endpoint
-        || transfer.buffer != data.buffer.as_ptr().cast_mut() {
+        || transfer.buffer != data.buffer.as_ptr().cast_mut()
+    {
         return Err(Error::Transfer("capture transfer geometry changed".into()));
     }
-    let descriptors = unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), scratch.len()) };
+    let descriptors =
+        unsafe { std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), scratch.len()) };
     for (destination, source) in scratch.iter_mut().zip(descriptors) {
-        *destination = CapturePacket { requested_bytes: source.length as usize,
-            actual_bytes: source.actual_length as usize, succeeded: source.status == LIBUSB_TRANSFER_COMPLETED };
+        *destination = CapturePacket {
+            requested_bytes: source.length as usize,
+            actual_bytes: source.actual_length as usize,
+            succeeded: source.status == LIBUSB_TRANSFER_COMPLETED,
+        };
     }
-    Ok((&data.buffer[..slot.submitted_bytes], descriptors.iter().any(|p| p.status == LIBUSB_TRANSFER_NO_DEVICE)))
+    Ok((
+        &data.buffer[..slot.submitted_bytes],
+        descriptors
+            .iter()
+            .any(|p| p.status == LIBUSB_TRANSFER_NO_DEVICE),
+    ))
 }
 
-pub(super) fn ingest_slot(slot: &IsoTransferSlot, status: i32, buffer: &mut CaptureBuffer,
-    scratch: &mut [CapturePacket]) -> Result<(), Error> {
+pub(super) fn ingest_slot(
+    slot: &IsoTransferSlot,
+    status: i32,
+    buffer: &mut CaptureBuffer,
+    scratch: &mut [CapturePacket],
+) -> Result<(), Error> {
     let (data, detached) = match inspect_slot(slot, status, scratch) {
         Ok(completion) => completion,
         Err(error) => {
             if status != LIBUSB_TRANSFER_COMPLETED {
                 let _ = buffer.ingest_completion(&[], &[], &[], false, 0);
-            } else { buffer.note_malformed_completion(); }
+            } else {
+                buffer.note_malformed_completion();
+            }
             return Err(error);
         }
     };
-    let result = buffer.ingest_completion(data, &slot.packet_sizes, scratch, true, 0)
+    let result = buffer
+        .ingest_completion(data, &slot.packet_sizes, scratch, true, 0)
         .map_err(|e| Error::Transfer(format!("capture completion: {e:?}")));
-    if detached { Err(Error::DeviceLost) } else { result }
+    if detached {
+        Err(Error::DeviceLost)
+    } else {
+        result
+    }
 }
 
 /// Keep retiring/rearming IN during feedforward startup without presenting
 /// audio produced before the host's nominal rate has a verified OUT send.
-pub(super) fn discard_unprimed_capture(slot: &IsoTransferSlot, status: i32,
-    scratch: &mut [CapturePacket], frame_bytes: usize) -> Result<(), Error> {
+pub(super) fn discard_unprimed_capture(
+    slot: &IsoTransferSlot,
+    status: i32,
+    scratch: &mut [CapturePacket],
+    frame_bytes: usize,
+) -> Result<(), Error> {
     let (data, detached) = inspect_slot(slot, status, scratch)?;
-    if detached { return Err(Error::DeviceLost); }
-    crate::capture::CaptureStats::default().record_completion(data.len(), &slot.packet_sizes,
-        scratch, true, 0, frame_bytes)
+    if detached {
+        return Err(Error::DeviceLost);
+    }
+    crate::capture::CaptureStats::default()
+        .record_completion(
+            data.len(),
+            &slot.packet_sizes,
+            scratch,
+            true,
+            0,
+            frame_bytes,
+        )
         .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")))
 }
 
@@ -1703,28 +2293,53 @@ pub(super) fn discard_unprimed_capture(slot: &IsoTransferSlot, status: i32,
 /// the URB that satisfies the endpoint's declared lock promise. A failed or
 /// malformed service interval breaks the contiguous proof without changing
 /// capture's existing packet classification or typed detach behavior.
-pub(super) fn discard_lock_delay_capture(slot: &IsoTransferSlot, status: i32,
-    scratch: &mut [CapturePacket], frame_bytes: usize, service_us: u32,
-    timing_allowed: bool, gate: &mut endpoint_lock::LockDelayGate,
+pub(super) fn discard_lock_delay_capture(
+    slot: &IsoTransferSlot,
+    status: i32,
+    scratch: &mut [CapturePacket],
+    frame_bytes: usize,
+    service_us: u32,
+    timing_allowed: bool,
+    gate: &mut endpoint_lock::LockDelayGate,
 ) -> (crate::capture::CaptureStats, Result<(), Error>) {
     let mut stats = crate::capture::CaptureStats::default();
     let result = match inspect_slot(slot, status, scratch) {
         Ok((data, detached)) => {
-            let result = stats.record_completion(data.len(), &slot.packet_sizes, scratch,
-                true, 0, frame_bytes)
+            let result = stats
+                .record_completion(
+                    data.len(),
+                    &slot.packet_sizes,
+                    scratch,
+                    true,
+                    0,
+                    frame_bytes,
+                )
                 .map_err(|e| Error::Transfer(format!("capture startup completion: {e:?}")));
-            if detached { Err(Error::DeviceLost) } else { result }
+            if detached {
+                Err(Error::DeviceLost)
+            } else {
+                result
+            }
         }
         Err(error) => {
-            if status == LIBUSB_TRANSFER_COMPLETED { stats.malformed_completions = 1; }
-            else { stats.failed_transfers = 1; }
+            if status == LIBUSB_TRANSFER_COMPLETED {
+                stats.malformed_completions = 1;
+            } else {
+                stats.failed_transfers = 1;
+            }
             Err(error)
         }
     };
-    let accepted = timing_allowed && result.is_ok() && stats.failed_packets == 0
-        && stats.malformed_packets == 0 && stats.malformed_completions == 0;
-    gate.observe(accepted, u64::from(service_us).saturating_mul(scratch.len() as u64),
-        stats.captured_frames);
+    let accepted = timing_allowed
+        && result.is_ok()
+        && stats.failed_packets == 0
+        && stats.malformed_packets == 0
+        && stats.malformed_completions == 0;
+    gate.observe(
+        accepted,
+        u64::from(service_us).saturating_mul(scratch.len() as u64),
+        stats.captured_frames,
+    );
     // Pre-lock payload never entered the capture queue. Retain packet/error
     // telemetry without presenting it as captured or reader-contention audio.
     stats.captured_frames = 0;
@@ -1740,22 +2355,37 @@ fn oldest_ready_capture(order: &VecDeque<usize>, slots: &[IsoTransferSlot]) -> O
 
 /// Prove libusb integer widths and total backing storage before class writes
 /// or allocating a capture queue, including SSP payloads above u16::MAX.
-pub(super) fn capture_queue_bytes(packet_bytes: usize, geometry: IsoQueueGeometry) -> Result<usize, Error> {
+pub(super) fn capture_queue_bytes(
+    packet_bytes: usize,
+    geometry: IsoQueueGeometry,
+) -> Result<usize, Error> {
     let invalid = || Error::Unsupported {
         reason: "capture packet/queue geometry exceeds libusb or host allocation bounds".into(),
         offered: vec![],
     };
-    if packet_bytes == 0 || packet_bytes > u32::MAX as usize
-        || geometry.packets_per_transfer == 0 || geometry.packets_per_transfer > i32::MAX as usize
-        || geometry.transfer_slots == 0 {
+    if packet_bytes == 0
+        || packet_bytes > u32::MAX as usize
+        || geometry.packets_per_transfer == 0
+        || geometry.packets_per_transfer > i32::MAX as usize
+        || geometry.transfer_slots == 0
+    {
         return Err(invalid());
     }
-    let per_transfer = packet_bytes.checked_mul(geometry.packets_per_transfer).ok_or_else(invalid)?;
-    let total = per_transfer.checked_mul(geometry.transfer_slots).ok_or_else(invalid)?;
-    let packets = geometry.packets_per_transfer.checked_mul(geometry.transfer_slots).ok_or_else(invalid)?;
+    let per_transfer = packet_bytes
+        .checked_mul(geometry.packets_per_transfer)
+        .ok_or_else(invalid)?;
+    let total = per_transfer
+        .checked_mul(geometry.transfer_slots)
+        .ok_or_else(invalid)?;
+    let packets = geometry
+        .packets_per_transfer
+        .checked_mul(geometry.transfer_slots)
+        .ok_or_else(invalid)?;
     if packets >= crate::iso_packet_scheduler::PACKET_FLIGHT_LIMIT
         || geometry.packets_per_transfer > crate::iso_packet_scheduler::MAX_PACKETS_PER_TRANSFER
-        || per_transfer > i32::MAX as usize || total > isize::MAX as usize {
+        || per_transfer > i32::MAX as usize
+        || total > isize::MAX as usize
+    {
         return Err(invalid());
     }
     Ok(per_transfer)
@@ -1792,112 +2422,235 @@ impl FeedforwardCadence {
         Ok(Self { period, phase: 0 })
     }
     fn plan(self, packets: usize, bytes: usize) -> (Vec<usize>, Self) {
-        let lengths = (0..packets).map(|offset| {
-            if (self.phase + offset) % self.period == 0 { bytes } else { 0 }
-        }).collect();
-        (lengths, Self { phase: (self.phase + packets) % self.period, ..self })
+        let lengths = (0..packets)
+            .map(|offset| {
+                if (self.phase + offset) % self.period == 0 {
+                    bytes
+                } else {
+                    0
+                }
+            })
+            .collect();
+        (
+            lengths,
+            Self {
+                phase: (self.phase + packets) % self.period,
+                ..self
+            },
+        )
     }
 }
 impl FeedforwardPool {
     pub(super) fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
-        let Some(pipe) = endpoint.feedforward() else { return Ok(None); };
+        let Some(pipe) = endpoint.feedforward() else {
+            return Ok(None);
+        };
         let nominal = pipe.nominal(endpoint.format.sample_rate())?;
-        if nominal.len() != pipe.bytes { return Err("capture feedforward word width mismatch".into()); }
+        if nominal.len() != pipe.bytes {
+            return Err("capture feedforward word width mismatch".into());
+        }
         // Target 8 ms per URB, capped at 32 service slots.
         // bInterval schedules the transfers; it never rescales the rate value.
-        let packets = 8_000usize.div_ceil(pipe.service_us as usize)
+        let packets = 8_000usize
+            .div_ceil(pipe.service_us as usize)
             .clamp(1, crate::iso_packet_scheduler::MAX_PACKETS_PER_TRANSFER);
         let cadence = FeedforwardCadence::new(pipe.refresh)?;
         let nominal_word = nominal;
         let mut slots = Vec::with_capacity(2);
-        for index in 0..2 { slots.push(IsoTransferSlot::new(index, packets, packets * pipe.bytes)?); }
-        Ok(Some(Self { slots, pipe, nominal_word, packets, cadence,
-            scratch: vec![CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; packets],
+        for index in 0..2 {
+            slots.push(IsoTransferSlot::new(index, packets, packets * pipe.bytes)?);
+        }
+        Ok(Some(Self {
+            slots,
+            pipe,
+            nominal_word,
+            packets,
+            cadence,
+            scratch: vec![
+                CapturePacket {
+                    requested_bytes: 0,
+                    actual_bytes: 0,
+                    succeeded: false
+                };
+                packets
+            ],
             first_valid_send: None,
             requires_post_proof_submission: endpoint.standard_feedforward.is_some(),
-            deadline: Duration::from_millis(100).max(Duration::from_micros(u64::from(pipe.service_us) * packets as u64 * 4)),
+            deadline: Duration::from_millis(100).max(Duration::from_micros(
+                u64::from(pipe.service_us) * packets as u64 * 4,
+            )),
         }))
     }
     fn submit(&mut self, index: usize, handle: &DeviceHandle<Context>) -> Result<(), Error> {
         let (packet_sizes, next_cadence) = self.cadence.plan(self.packets, self.pipe.bytes);
-        let transfer_buffer = packet_sizes.iter().filter(|&&bytes| bytes != 0)
-            .flat_map(|_| self.nominal_word.iter().copied()).collect();
-        self.slots[index].submit_with_timeout(handle, self.pipe.address, IsoTransferPayload {
-            packet_sizes, packet_samples: vec![],
-            transfer_buffer, underrun: false, held: false,
-            frame_count: 0, music_frames: 0, epoch: 0,
-        }, self.deadline.as_millis().min(u128::from(u32::MAX)) as u32).map_err(|e| if crate::error::is_device_gone(&e) { Error::DeviceLost }
-            else { Error::Transfer(format!("capture feedforward submission: {e}")) })?;
+        let transfer_buffer = packet_sizes
+            .iter()
+            .filter(|&&bytes| bytes != 0)
+            .flat_map(|_| self.nominal_word.iter().copied())
+            .collect();
+        self.slots[index]
+            .submit_with_timeout(
+                handle,
+                self.pipe.address,
+                IsoTransferPayload {
+                    packet_sizes,
+                    packet_samples: vec![],
+                    transfer_buffer,
+                    underrun: false,
+                    held: false,
+                    frame_count: 0,
+                    music_frames: 0,
+                    epoch: 0,
+                },
+                self.deadline.as_millis().min(u128::from(u32::MAX)) as u32,
+            )
+            .map_err(|e| {
+                if crate::error::is_device_gone(&e) {
+                    Error::DeviceLost
+                } else {
+                    Error::Transfer(format!("capture feedforward submission: {e}"))
+                }
+            })?;
         self.cadence = next_cadence;
         Ok(())
     }
-    pub(super) fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
+    pub(super) fn start(
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        stop: &AtomicBool,
+    ) -> Result<(), Error> {
         for index in 0..self.slots.len() {
-            if usb_stop_requested(stop) { break; }
+            if usb_stop_requested(stop) {
+                break;
+            }
             self.submit(index, handle)?;
         }
         Ok(())
     }
-    pub(super) fn primed(&self) -> bool { self.first_valid_send.is_some() }
+    pub(super) fn primed(&self) -> bool {
+        self.first_valid_send.is_some()
+    }
     pub(super) fn accepts_capture(&self, completed: Instant) -> bool {
-        self.first_valid_send.is_some_and(|first| completed >= first)
+        self.first_valid_send
+            .is_some_and(|first| completed >= first)
     }
-    pub(super) fn accepts_capture_transfer(&self, completed: Instant, submitted_at: Option<Instant>) -> bool {
-        self.accepts_capture(completed) && (!self.requires_post_proof_submission
-            || submitted_at.is_some_and(|submitted| self.accepts_capture(submitted)))
+    pub(super) fn accepts_capture_transfer(
+        &self,
+        completed: Instant,
+        submitted_at: Option<Instant>,
+    ) -> bool {
+        self.accepts_capture(completed)
+            && (!self.requires_post_proof_submission
+                || submitted_at.is_some_and(|submitted| self.accepts_capture(submitted)))
     }
-    pub(super) fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
-        if usb_stop_requested(stop) { return Ok(()); }
+    pub(super) fn pump(
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        stop: &AtomicBool,
+    ) -> Result<(), Error> {
+        if usb_stop_requested(stop) {
+            return Ok(());
+        }
         for index in 0..self.slots.len() {
             if let Some((status, completed, _)) = self.slots[index].take_completion() {
-                let result = validate_feedforward_slot(&self.slots[index], status, completed,
-                    self.deadline, self.pipe.bytes, &self.nominal_word, &mut self.scratch);
+                let result = validate_feedforward_slot(
+                    &self.slots[index],
+                    status,
+                    completed,
+                    self.deadline,
+                    self.pipe.bytes,
+                    &self.nominal_word,
+                    &mut self.scratch,
+                );
                 self.slots[index].mark_completed();
                 if result? {
-                    self.first_valid_send = Some(self.first_valid_send.map_or(completed, |first| first.min(completed)));
+                    self.first_valid_send = Some(
+                        self.first_valid_send
+                            .map_or(completed, |first| first.min(completed)),
+                    );
                 }
                 self.submit(index, handle)?;
-            } else if self.slots[index].in_flight && self.slots[index].submitted_at
-                .is_some_and(|start| start.elapsed() >= self.deadline) {
-                return Err(Error::Transfer("capture feedforward deadline missed".into()));
+            } else if self.slots[index].in_flight
+                && self.slots[index]
+                    .submitted_at
+                    .is_some_and(|start| start.elapsed() >= self.deadline)
+            {
+                return Err(Error::Transfer(
+                    "capture feedforward deadline missed".into(),
+                ));
             }
         }
         Ok(())
     }
-    pub(super) fn cancel(&mut self) { for slot in &mut self.slots { slot.cancel(); } }
+    pub(super) fn cancel(&mut self) {
+        for slot in &mut self.slots {
+            slot.cancel();
+        }
+    }
     pub(super) fn drain(&mut self, context: &Context) {
         self.cancel();
         drain_iso_transfer_slots(context, &mut self.slots);
     }
 }
 impl Drop for FeedforwardPool {
-    fn drop(&mut self) { self.cancel(); }
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
-fn validate_feedforward_slot(slot: &IsoTransferSlot, status: i32, completed: Instant,
-    deadline: Duration, bytes: usize, nominal_word: &[u8], scratch: &mut [CapturePacket]) -> Result<bool, Error> {
+fn validate_feedforward_slot(
+    slot: &IsoTransferSlot,
+    status: i32,
+    completed: Instant,
+    deadline: Duration,
+    bytes: usize,
+    nominal_word: &[u8],
+    scratch: &mut [CapturePacket],
+) -> Result<bool, Error> {
     let (data, detached) = inspect_slot(slot, status, scratch).map_err(|error| match error {
         Error::DeviceLost => Error::DeviceLost,
         other => Error::Transfer(format!("capture feedforward completion: {other}")),
     })?;
-    if detached { return Err(Error::DeviceLost); }
-    if !slot.submitted_at.is_some_and(|start| completed.saturating_duration_since(start) < deadline) {
-        return Err(Error::Transfer("capture feedforward deadline missed".into()));
+    if detached {
+        return Err(Error::DeviceLost);
+    }
+    if !slot
+        .submitted_at
+        .is_some_and(|start| completed.saturating_duration_since(start) < deadline)
+    {
+        return Err(Error::Transfer(
+            "capture feedforward deadline missed".into(),
+        ));
     }
     let sent_word = validate_feedforward_packets(bytes, &slot.packet_sizes, scratch)?;
     let expected_bytes: usize = slot.packet_sizes.iter().sum();
-    if nominal_word.len() != bytes || data.len() != expected_bytes
-        || data.chunks(bytes.max(1)).any(|word| word != nominal_word) {
-        return Err(Error::Transfer("capture feedforward payload changed".into()));
+    if nominal_word.len() != bytes
+        || data.len() != expected_bytes
+        || data.chunks(bytes.max(1)).any(|word| word != nominal_word)
+    {
+        return Err(Error::Transfer(
+            "capture feedforward payload changed".into(),
+        ));
     }
     Ok(sent_word)
 }
-fn validate_feedforward_packets(bytes: usize, planned: &[usize], packets: &[CapturePacket]) -> Result<bool, Error> {
-    if bytes == 0 || packets.is_empty() || planned.len() != packets.len()
+fn validate_feedforward_packets(
+    bytes: usize,
+    planned: &[usize],
+    packets: &[CapturePacket],
+) -> Result<bool, Error> {
+    if bytes == 0
+        || packets.is_empty()
+        || planned.len() != packets.len()
         || planned.iter().zip(packets).any(|(&expected, packet)| {
-            (expected != 0 && expected != bytes) || !packet.succeeded
-                || packet.requested_bytes != expected || packet.actual_bytes != expected
-        }) {
-        return Err(Error::Transfer("capture feedforward short or failed isochronous packet".into()));
+            (expected != 0 && expected != bytes)
+                || !packet.succeeded
+                || packet.requested_bytes != expected
+                || packet.actual_bytes != expected
+        })
+    {
+        return Err(Error::Transfer(
+            "capture feedforward short or failed isochronous packet".into(),
+        ));
     }
     Ok(planned.iter().any(|&length| length != 0))
 }
@@ -1916,66 +2669,139 @@ struct NominalCapturePool {
 }
 impl NominalCapturePool {
     fn for_endpoint(endpoint: &CaptureEndpoint) -> Result<Option<Self>, String> {
-        let Some(profile) = endpoint.vendor_pcm.filter(|profile| profile.requires_output_for_capture && !profile.rate_control) else { return Ok(None); };
+        let Some(profile) = endpoint
+            .vendor_pcm
+            .filter(|profile| profile.requires_output_for_capture && !profile.rate_control)
+        else {
+            return Ok(None);
+        };
         let geometry = IsoQueueGeometry::for_config(profile.output.service_us, &settings().config);
-        let stride = usize::from(profile.output.channels) * usize::from(profile.output.subslot_bytes);
-        let transfer_bytes = profile.output.max_packet_bytes.checked_mul(geometry.packets_per_transfer)
+        let stride =
+            usize::from(profile.output.channels) * usize::from(profile.output.subslot_bytes);
+        let transfer_bytes = profile
+            .output
+            .max_packet_bytes
+            .checked_mul(geometry.packets_per_transfer)
             .ok_or("vendor capture companion allocation overflow")?;
         let mut slots = Vec::with_capacity(geometry.transfer_slots);
         for index in 0..geometry.transfer_slots {
-            slots.push(IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)?);
+            slots.push(IsoTransferSlot::new(
+                index,
+                geometry.packets_per_transfer,
+                transfer_bytes,
+            )?);
         }
-        Ok(Some(Self { slots, profile,
-            scheduler: IsoPacketScheduler::with_geometry(endpoint.format.sample_rate(), stride, profile.output.service_us, geometry),
-            acceptance: PacketAcceptance::new(endpoint.format.sample_rate(), profile.output.service_us, stride),
-            first_valid: None, latest_valid: None,
+        Ok(Some(Self {
+            slots,
+            profile,
+            scheduler: IsoPacketScheduler::with_geometry(
+                endpoint.format.sample_rate(),
+                stride,
+                profile.output.service_us,
+                geometry,
+            ),
+            acceptance: PacketAcceptance::new(
+                endpoint.format.sample_rate(),
+                profile.output.service_us,
+                stride,
+            ),
+            first_valid: None,
+            latest_valid: None,
             deadline: Duration::from_millis(100).max(Duration::from_micros(
-                u64::from(profile.output.service_us) * geometry.packets_in_flight() as u64 * 4)),
+                u64::from(profile.output.service_us) * geometry.packets_in_flight() as u64 * 4,
+            )),
         }))
     }
     fn submit(&mut self, index: usize, handle: &DeviceHandle<Context>) -> Result<(), Error> {
-        let stride = usize::from(self.profile.output.channels) * usize::from(self.profile.output.subslot_bytes);
-        let payload = output::nominal_pcm_silence(&mut self.scheduler, self.profile.output.max_packet_bytes, stride, 0)
-            .map_err(Error::Transfer)?;
-        self.slots[index].submit_with_timeout(handle, self.profile.output.address, payload,
-            self.deadline.as_millis().min(u128::from(u32::MAX)) as u32)
-            .map_err(|error| if crate::error::is_device_gone(&error) { Error::DeviceLost } else { Error::Transfer(error) })
+        let stride = usize::from(self.profile.output.channels)
+            * usize::from(self.profile.output.subslot_bytes);
+        let payload = output::nominal_pcm_silence(
+            &mut self.scheduler,
+            self.profile.output.max_packet_bytes,
+            stride,
+            0,
+        )
+        .map_err(Error::Transfer)?;
+        self.slots[index]
+            .submit_with_timeout(
+                handle,
+                self.profile.output.address,
+                payload,
+                self.deadline.as_millis().min(u128::from(u32::MAX)) as u32,
+            )
+            .map_err(|error| {
+                if crate::error::is_device_gone(&error) {
+                    Error::DeviceLost
+                } else {
+                    Error::Transfer(error)
+                }
+            })
     }
     fn start(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
         for index in 0..self.slots.len() {
-            if usb_stop_requested(stop) { break; }
+            if usb_stop_requested(stop) {
+                break;
+            }
             self.submit(index, handle)?;
         }
         Ok(())
     }
     fn pump(&mut self, handle: &DeviceHandle<Context>, stop: &AtomicBool) -> Result<(), Error> {
-        if usb_stop_requested(stop) { return Ok(()); }
+        if usb_stop_requested(stop) {
+            return Ok(());
+        }
         for index in 0..self.slots.len() {
             // Bound missing callbacks before retiring: successful late completions
             // cannot revive a companion that has stopped providing cadence.
-            if self.slots[index].in_flight && self.slots[index].submitted_at
-                .is_some_and(|start| start.elapsed() >= self.deadline) {
-                return Err(Error::Transfer("vendor capture companion OUT deadline missed".into()));
+            if self.slots[index].in_flight
+                && self.slots[index]
+                    .submitted_at
+                    .is_some_and(|start| start.elapsed() >= self.deadline)
+            {
+                return Err(Error::Transfer(
+                    "vendor capture companion OUT deadline missed".into(),
+                ));
             }
-            if let Some(completed) = output::retire_bootstrap_completion(&mut self.slots[index], self.acceptance)? {
-                self.first_valid = Some(self.first_valid.map_or(completed, |first| first.min(completed)));
-                self.latest_valid = Some(self.latest_valid.map_or(completed, |latest| latest.max(completed)));
+            if let Some(completed) =
+                output::retire_bootstrap_completion(&mut self.slots[index], self.acceptance)?
+            {
+                self.first_valid = Some(
+                    self.first_valid
+                        .map_or(completed, |first| first.min(completed)),
+                );
+                self.latest_valid = Some(
+                    self.latest_valid
+                        .map_or(completed, |latest| latest.max(completed)),
+                );
                 self.submit(index, handle)?;
             }
         }
-        if self.latest_valid.is_some_and(|latest| latest.elapsed() >= self.deadline) {
-            return Err(Error::Transfer("vendor capture companion OUT cadence expired".into()));
+        if self
+            .latest_valid
+            .is_some_and(|latest| latest.elapsed() >= self.deadline)
+        {
+            return Err(Error::Transfer(
+                "vendor capture companion OUT cadence expired".into(),
+            ));
         }
         Ok(())
     }
-    fn primed(&self) -> bool { self.first_valid.is_some() }
+    fn primed(&self) -> bool {
+        self.first_valid.is_some()
+    }
     fn accepts_capture(&self, completed: Instant) -> bool {
         self.first_valid.is_some_and(|first| completed >= first)
-            && self.latest_valid.is_some_and(|latest| completed.saturating_duration_since(latest) < self.deadline)
+            && self
+                .latest_valid
+                .is_some_and(|latest| completed.saturating_duration_since(latest) < self.deadline)
     }
 }
 impl Drop for NominalCapturePool {
-    fn drop(&mut self) { for slot in &mut self.slots { slot.cancel(); } }
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            slot.cancel();
+        }
+    }
 }
 
 /// Keep the USB owner borrowed until every callback has retired. Cancel every
@@ -1988,11 +2814,17 @@ struct CaptureTransferBatch<'a> {
 }
 impl Drop for CaptureTransferBatch<'_> {
     fn drop(&mut self) {
-        for slot in &mut self.slots { slot.cancel(); }
-        if let Some(pool) = self.companion.as_mut() {
-            for slot in &mut pool.slots { slot.cancel(); }
+        for slot in &mut self.slots {
+            slot.cancel();
         }
-        if let Some(pool) = self.feedforward.as_mut() { pool.cancel(); }
+        if let Some(pool) = self.companion.as_mut() {
+            for slot in &mut pool.slots {
+                slot.cancel();
+            }
+        }
+        if let Some(pool) = self.feedforward.as_mut() {
+            pool.cancel();
+        }
         output::retire_cancelled_iso_transfer_slots(self.context, &mut self.slots);
         if let Some(pool) = self.companion.as_mut() {
             output::retire_cancelled_iso_transfer_slots(self.context, &mut pool.slots);
@@ -2019,40 +2851,84 @@ struct VendorCaptureRateGate {
 }
 impl VendorCaptureRateGate {
     fn new(endpoint: &CaptureEndpoint, geometry: IsoQueueGeometry) -> Self {
-        let queue_time = Duration::from_micros(u64::from(endpoint.service_us)
-            * geometry.packets_in_flight() as u64 * 4);
-        Self { window: implicit::VendorRateWindow::new(endpoint.format.sample_rate()),
-            pattern: vec![0; geometry.packets_per_transfer], started: Instant::now(), latest: None,
+        let queue_time = Duration::from_micros(
+            u64::from(endpoint.service_us) * geometry.packets_in_flight() as u64 * 4,
+        );
+        Self {
+            window: implicit::VendorRateWindow::new(endpoint.format.sample_rate()),
+            pattern: vec![0; geometry.packets_per_transfer],
+            started: Instant::now(),
+            latest: None,
             startup: Duration::from_millis(500).max(queue_time),
-            stale: Duration::from_millis(100).max(queue_time), qualified: false,
-            ever_qualified: false, last_proof: None, bad_windows: 0 }
+            stale: Duration::from_millis(100).max(queue_time),
+            qualified: false,
+            ever_qualified: false,
+            last_proof: None,
+            bad_windows: 0,
+        }
     }
     fn check(&self, now: Instant) -> Result<(), Error> {
         if (!self.ever_qualified && now.saturating_duration_since(self.started) >= self.startup)
-            || self.last_proof.is_some_and(|proof| now.saturating_duration_since(proof) >= self.startup)
-            || self.latest.is_some_and(|latest| now.saturating_duration_since(latest) >= self.stale) {
-            return Err(Error::Transfer("vendor capture rate qualification or cadence deadline missed".into()));
+            || self
+                .last_proof
+                .is_some_and(|proof| now.saturating_duration_since(proof) >= self.startup)
+            || self
+                .latest
+                .is_some_and(|latest| now.saturating_duration_since(latest) >= self.stale)
+        {
+            return Err(Error::Transfer(
+                "vendor capture rate qualification or cadence deadline missed".into(),
+            ));
         }
         Ok(())
     }
-    fn observe(&mut self, endpoint: &CaptureEndpoint, slot: &IsoTransferSlot, status: i32,
-        completed: Instant, scratch: &mut [CapturePacket]) -> Result<bool, Error> {
+    fn observe(
+        &mut self,
+        endpoint: &CaptureEndpoint,
+        slot: &IsoTransferSlot,
+        status: i32,
+        completed: Instant,
+        scratch: &mut [CapturePacket],
+    ) -> Result<bool, Error> {
         self.check(completed)?;
         let (_, detached) = inspect_slot(slot, status, scratch)?;
-        if detached { return Err(Error::DeviceLost); }
+        if detached {
+            return Err(Error::DeviceLost);
+        }
         let stride = endpoint.format.bytes_per_frame();
-        let valid = implicit::capture_pattern(scratch.iter().map(|packet|
-            (if packet.succeeded { LIBUSB_TRANSFER_COMPLETED } else { -1 },
-                packet.actual_bytes, packet.requested_bytes)), stride, stride,
-            endpoint.packet_bytes, &mut self.pattern).unwrap_or(false);
+        let valid = implicit::capture_pattern(
+            scratch.iter().map(|packet| {
+                (
+                    if packet.succeeded {
+                        LIBUSB_TRANSFER_COMPLETED
+                    } else {
+                        -1
+                    },
+                    packet.actual_bytes,
+                    packet.requested_bytes,
+                )
+            }),
+            stride,
+            stride,
+            endpoint.packet_bytes,
+            &mut self.pattern,
+        )
+        .unwrap_or(false);
         if !valid {
             self.window.reset();
             self.qualified = false;
             return Ok(false);
         }
-        self.latest = Some(self.latest.map_or(completed, |latest| latest.max(completed)));
+        self.latest = Some(
+            self.latest
+                .map_or(completed, |latest| latest.max(completed)),
+        );
         let publish = self.qualified;
-        let frames = self.pattern.iter().map(|bytes| (bytes / stride) as u64).sum();
+        let frames = self
+            .pattern
+            .iter()
+            .map(|bytes| (bytes / stride) as u64)
+            .sum();
         let service_us = u64::from(endpoint.service_us) * self.pattern.len() as u64;
         if let Some(valid_rate) = self.window.observe(frames, service_us) {
             if valid_rate {
@@ -2064,7 +2940,10 @@ impl VendorCaptureRateGate {
                 self.qualified = false;
                 self.bad_windows += 1;
                 if self.bad_windows >= 2 {
-                    return Err(Error::ClockUnverified { requested_hz: endpoint.format.sample_rate(), reported_hz: None });
+                    return Err(Error::ClockUnverified {
+                        requested_hz: endpoint.format.sample_rate(),
+                        reported_hz: None,
+                    });
                 }
                 return Ok(false);
             }
@@ -2081,13 +2960,23 @@ fn run_capture(
     stop: &AtomicBool,
     ready: &std::sync::mpsc::SyncSender<Result<(), Error>>,
 ) -> Result<(), Error> {
-    let delay = if endpoint.vendor_pcm.is_some() { None } else {
-        endpoint_lock::selected_delay(owner.claimed(), endpoint.interface,
-            endpoint.alternate, endpoint.address, true).or_control()?
+    let delay = if endpoint.vendor_pcm.is_some() {
+        None
+    } else {
+        endpoint_lock::selected_delay(
+            owner.claimed(),
+            endpoint.interface,
+            endpoint.alternate,
+            endpoint.address,
+            true,
+        )
+        .or_control()?
     };
     let mut lock_delay = endpoint_lock::LockDelayGate::new(delay);
     let mut host_rate = capture_rate::CaptureRateProof::for_endpoint(endpoint, geometry, delay);
-    let targets: Vec<_> = status_target(owner.claimed(), endpoint)?.into_iter().collect();
+    let targets: Vec<_> = status_target(owner.claimed(), endpoint)?
+        .into_iter()
+        .collect();
     // Declared after the owner and before data transfers: all failure/unwind
     // paths retire the status request before resetting an alternate or handle.
     let mut audio_status = audio_status::AudioStatus::start(owner.claimed(), &targets)?;
@@ -2105,21 +2994,33 @@ fn run_capture(
     ];
     for index in 0..geometry.transfer_slots {
         slots.push(
-            IsoTransferSlot::new(
-                index,
-                geometry.packets_per_transfer,
-                transfer_bytes,
-            )
-            .map_err(Error::Transfer)?,
+            IsoTransferSlot::new(index, geometry.packets_per_transfer, transfer_bytes)
+                .map_err(Error::Transfer)?,
         );
     }
     let companion = NominalCapturePool::for_endpoint(endpoint).map_err(Error::Transfer)?;
     let feedforward = FeedforwardPool::for_endpoint(endpoint).map_err(Error::Transfer)?;
-    let mut batch = CaptureTransferBatch { context: &owner.claimed().context, slots, companion, feedforward };
-    let CaptureTransferBatch { slots, companion, feedforward, .. } = &mut batch;
-    if let Some(pool) = companion.as_mut() { pool.start(&owner.claimed().handle, stop)?; }
-    if let Some(pool) = feedforward.as_mut() { pool.start(&owner.claimed().handle, stop)?; }
-    if usb_stop_requested(stop) { return Ok(()); }
+    let mut batch = CaptureTransferBatch {
+        context: &owner.claimed().context,
+        slots,
+        companion,
+        feedforward,
+    };
+    let CaptureTransferBatch {
+        slots,
+        companion,
+        feedforward,
+        ..
+    } = &mut batch;
+    if let Some(pool) = companion.as_mut() {
+        pool.start(&owner.claimed().handle, stop)?;
+    }
+    if let Some(pool) = feedforward.as_mut() {
+        pool.start(&owner.claimed().handle, stop)?;
+    }
+    if usb_stop_requested(stop) {
+        return Ok(());
+    }
     audio_status.arm_endpoint(owner.claimed(), endpoint.address)?;
     for (index, slot) in slots.iter_mut().enumerate() {
         if usb_stop_requested(stop) {
@@ -2140,12 +3041,19 @@ fn run_capture(
         })?;
         order.push_back(index);
     }
-    let mut vendor_rate = endpoint.vendor_pcm.as_ref().filter(|profile| profile.rate_control)
+    let mut vendor_rate = endpoint
+        .vendor_pcm
+        .as_ref()
+        .filter(|profile| profile.rate_control)
         .map(|_| VendorCaptureRateGate::new(endpoint, geometry));
     let input_started = Instant::now();
     let mut latest_input: Option<Instant> = None;
     let mut announced = false;
-    if feedforward.is_none() && companion.is_none() && vendor_rate.is_none() && host_rate.is_none() { let _ = ready.send(Ok(())); announced = true; }
+    if feedforward.is_none() && companion.is_none() && vendor_rate.is_none() && host_rate.is_none()
+    {
+        let _ = ready.send(Ok(()));
+        announced = true;
+    }
     while !usb_stop_requested(stop) {
         owner
             .claimed()
@@ -2158,14 +3066,24 @@ fn run_capture(
                     Error::Transfer(format!("capture event pump: {e}"))
                 }
             })?;
-        if usb_stop_requested(stop) { break; }
+        if usb_stop_requested(stop) {
+            break;
+        }
         audio_status.poll(owner.claimed())?;
         if let Some(pool) = feedforward.as_mut() {
             pool.pump(&owner.claimed().handle, stop)?;
         }
-        if let Some(pool) = companion.as_mut() { pool.pump(&owner.claimed().handle, stop)?; }
-        if !announced && companion.is_none() && vendor_rate.is_none() && host_rate.is_none() && feedforward.as_ref().map_or(true, |pool| pool.primed()) {
-            let _ = ready.send(Ok(())); announced = true;
+        if let Some(pool) = companion.as_mut() {
+            pool.pump(&owner.claimed().handle, stop)?;
+        }
+        if !announced
+            && companion.is_none()
+            && vendor_rate.is_none()
+            && host_rate.is_none()
+            && feedforward.as_ref().map_or(true, |pool| pool.primed())
+        {
+            let _ = ready.send(Ok(()));
+            announced = true;
         }
         if let Some(&head) = order.front() {
             if !slots[head].completion_ready() {
@@ -2179,7 +3097,7 @@ fn run_capture(
         }
         // Callback order is not sample order. Hold later completed buffers
         // until the oldest submitted transfer comes back, then re-arm in order.
-        while let Some(index) = oldest_ready_capture(&order, &slots) {
+        while let Some(index) = oldest_ready_capture(&order, slots) {
             if usb_stop_requested(stop) {
                 break;
             }
@@ -2204,10 +3122,16 @@ fn run_capture(
                         return Err(error);
                     }
                 }
-            } else { true };
+            } else {
+                true
+            };
             let capture_allowed = vendor_allowed
-                && feedforward.as_ref().map_or(true, |pool| pool.accepts_capture_transfer(completed, slots[index].submitted_at))
-                && companion.as_ref().map_or(true, |pool| pool.accepts_capture(completed));
+                && feedforward.as_ref().map_or(true, |pool| {
+                    pool.accepts_capture_transfer(completed, slots[index].submitted_at)
+                })
+                && companion
+                    .as_ref()
+                    .map_or(true, |pool| pool.accepts_capture(completed));
             let captured_before = companion.as_ref().map(|_| queue.stats().captured_frames);
             let lock_pending = lock_delay.pending();
             let host_allowed = if !lock_pending && capture_allowed {
@@ -2220,23 +3144,46 @@ fn run_capture(
                             return Err(error);
                         }
                     }
-                } else { true }
-            } else { host_rate.is_none() };
+                } else {
+                    true
+                }
+            } else {
+                host_rate.is_none()
+            };
             let result = if lock_pending {
-                let timing_allowed = capture_allowed && slots[index].submitted_at.is_some_and(|submitted|
-                    feedforward.as_ref().map_or(true, |pool| pool.accepts_capture(submitted))
-                    && companion.as_ref().map_or(true, |pool| pool.accepts_capture(submitted)));
-                let (stats, result) = discard_lock_delay_capture(&slots[index], status, &mut scratch,
-                    endpoint.format.bytes_per_frame(), endpoint.service_us, timing_allowed, &mut lock_delay);
+                let timing_allowed = capture_allowed
+                    && slots[index].submitted_at.is_some_and(|submitted| {
+                        feedforward
+                            .as_ref()
+                            .map_or(true, |pool| pool.accepts_capture(submitted))
+                            && companion
+                                .as_ref()
+                                .map_or(true, |pool| pool.accepts_capture(submitted))
+                    });
+                let (stats, result) = discard_lock_delay_capture(
+                    &slots[index],
+                    status,
+                    &mut scratch,
+                    endpoint.format.bytes_per_frame(),
+                    endpoint.service_us,
+                    timing_allowed,
+                    &mut lock_delay,
+                );
                 queue.merge_stats(stats);
                 result
             } else if capture_allowed && host_allowed {
                 ingest_slot(&slots[index], status, &mut queue, &mut scratch)
             } else {
-                discard_unprimed_capture(&slots[index], status, &mut scratch, endpoint.format.bytes_per_frame())
+                discard_unprimed_capture(
+                    &slots[index],
+                    status,
+                    &mut scratch,
+                    endpoint.format.bytes_per_frame(),
+                )
             };
-            let captured_input = capture_allowed && !lock_pending && captured_before
-                .is_some_and(|before| queue.stats().captured_frames > before);
+            let captured_input = capture_allowed
+                && !lock_pending
+                && captured_before.is_some_and(|before| queue.stats().captured_frames > before);
             drop(queue);
             slots[index].mark_completed();
             result?;
@@ -2264,21 +3211,26 @@ fn run_capture(
         if let Some(gate) = host_rate.as_ref() {
             gate.check(Instant::now())?;
             if !announced && gate.qualified() {
-                let _ = ready.send(Ok(())); announced = true;
+                let _ = ready.send(Ok(()));
+                announced = true;
             }
         }
         if let Some(gate) = vendor_rate.as_ref() {
             gate.check(Instant::now())?;
             if !announced && gate.qualified {
-                let _ = ready.send(Ok(())); announced = true;
+                let _ = ready.send(Ok(()));
+                announced = true;
             }
         }
         if let Some(pool) = companion.as_ref() {
             if latest_input.unwrap_or(input_started).elapsed() >= pool.deadline {
-                return Err(Error::Transfer("vendor capture IN cadence deadline missed".into()));
+                return Err(Error::Transfer(
+                    "vendor capture IN cadence deadline missed".into(),
+                ));
             }
             if !announced && pool.primed() && latest_input.is_some() {
-                let _ = ready.send(Ok(())); announced = true;
+                let _ = ready.send(Ok(()));
+                announced = true;
             }
         }
     }
@@ -2299,15 +3251,31 @@ mod tests {
     fn vendor_capture_preserves_fixed_packed_pcm_and_unnamed_channel_order() {
         for channels in [8u16, 12] {
             let endpoint = vendor_pcm::VendorEndpoint {
-                address: 0x82, interval: 1, service_us: 125,
+                address: 0x82,
+                interval: 1,
+                service_us: 125,
                 max_packet_bytes: usize::from(channels) * 3 * 7,
-                channels, subslot_bytes: 3,
+                channels,
+                subslot_bytes: 3,
             };
             let profile = vendor_pcm::VendorPcm {
-                vendor_id: 0x1686, product_id: 0xf00c, configuration_number: 1,
-                interface_number: 0, alt_setting: 1, input_interface_number: 0, input_alt_setting: 1,
-                requires_output_for_capture: false, input_carries_pcm: true, rates: &[48_000], rate_control: false, speed: Speed::High,
-                output: vendor_pcm::VendorEndpoint { address: 1, ..endpoint }, input: endpoint,
+                vendor_id: 0x1686,
+                product_id: 0xf00c,
+                configuration_number: 1,
+                interface_number: 0,
+                alt_setting: 1,
+                input_interface_number: 0,
+                input_alt_setting: 1,
+                requires_output_for_capture: false,
+                input_carries_pcm: true,
+                rates: &[48_000],
+                rate_control: false,
+                speed: Speed::High,
+                output: vendor_pcm::VendorEndpoint {
+                    address: 1,
+                    ..endpoint
+                },
+                input: endpoint,
             };
             let capture = vendor_capture_endpoint(1, profile, profile.rates[0]).unwrap();
             assert_eq!(capture.format.sample_rate(), 48_000);
@@ -2315,8 +3283,16 @@ mod tests {
             assert_eq!(capture.format.subslot_bytes(), 3);
             assert_eq!(capture.format.channels(), channels);
             assert_eq!(capture.format.bytes_per_frame(), usize::from(channels) * 3);
-            assert!(capture.format.channel_map().positions().iter().enumerate().all(|(index, position)|
-                *position == crate::capture::ChannelPosition::Unspecified { index: index as u16 }));
+            assert!(capture
+                .format
+                .channel_map()
+                .positions()
+                .iter()
+                .enumerate()
+                .all(|(index, position)| *position
+                    == crate::capture::ChannelPosition::Unspecified {
+                        index: index as u16
+                    }));
             assert_eq!(capture.control, capture.interface);
             assert!(capture.control_descriptors.is_empty());
             assert!(!capture.sampling_control);
@@ -2325,20 +3301,44 @@ mod tests {
     }
 
     fn roland_capture_profile() -> vendor_pcm::VendorPcm {
-        let output = vendor_pcm::VendorEndpoint { address: 0x05, interval: 1, service_us: 125,
-            max_packet_bytes: 7 * 4 * 4, channels: 4, subslot_bytes: 4 };
-        vendor_pcm::VendorPcm { vendor_id: 0x0582, product_id: 0x012f, configuration_number: 1,
-            interface_number: 0, alt_setting: 1,
-            input_interface_number: 1, input_alt_setting: 1, requires_output_for_capture: true, input_carries_pcm: true,
-            rates: &[44_100], rate_control: false, speed: Speed::High, output,
-            input: vendor_pcm::VendorEndpoint { address: 0x85, ..output } }
+        let output = vendor_pcm::VendorEndpoint {
+            address: 0x05,
+            interval: 1,
+            service_us: 125,
+            max_packet_bytes: 7 * 4 * 4,
+            channels: 4,
+            subslot_bytes: 4,
+        };
+        vendor_pcm::VendorPcm {
+            vendor_id: 0x0582,
+            product_id: 0x012f,
+            configuration_number: 1,
+            interface_number: 0,
+            alt_setting: 1,
+            input_interface_number: 1,
+            input_alt_setting: 1,
+            requires_output_for_capture: true,
+            input_carries_pcm: true,
+            rates: &[44_100],
+            rate_control: false,
+            speed: Speed::High,
+            output,
+            input: vendor_pcm::VendorEndpoint {
+                address: 0x85,
+                ..output
+            },
+        }
     }
     #[test]
     fn timing_only_vendor_input_is_never_a_capture_candidate() {
         let mut profile = roland_capture_profile();
         profile.input_carries_pcm = false;
-        assert!(require_vendor_capture_pcm(&profile).unwrap_err().contains("capture is unsupported"));
-        assert!(vendor_capture_candidates(1, profile, profile.rates[0]).unwrap().is_empty());
+        assert!(require_vendor_capture_pcm(&profile)
+            .unwrap_err()
+            .contains("capture is unsupported"));
+        assert!(vendor_capture_candidates(1, profile, profile.rates[0])
+            .unwrap()
+            .is_empty());
         assert!(vendor_capture_endpoint(1, profile, profile.rates[0]).is_err());
     }
 
@@ -2346,8 +3346,15 @@ mod tests {
     fn ordinary_vendor_input_remains_capture_pcm_at_its_fixed_rate() {
         let profile = roland_capture_profile();
         assert!(require_vendor_capture_pcm(&profile).is_ok());
-        assert_eq!(vendor_capture_candidates(1, profile, profile.rates[0]).unwrap().len(), 1);
-        assert!(vendor_capture_candidates(1, profile, 48_000).unwrap().is_empty());
+        assert_eq!(
+            vendor_capture_candidates(1, profile, profile.rates[0])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(vendor_capture_candidates(1, profile, 48_000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2359,8 +3366,18 @@ mod tests {
             assert!(!profile.claims_match(claims));
         }
         let endpoint = vendor_capture_endpoint(1, profile, profile.rates[0]).unwrap();
-        assert_eq!((endpoint.interface, endpoint.alternate, endpoint.address), (1, 1, 0x85));
-        assert_eq!((endpoint.format.sample_rate(), endpoint.format.valid_bits(), endpoint.format.subslot_bytes()), (44_100, 32, 4));
+        assert_eq!(
+            (endpoint.interface, endpoint.alternate, endpoint.address),
+            (1, 1, 0x85)
+        );
+        assert_eq!(
+            (
+                endpoint.format.sample_rate(),
+                endpoint.format.valid_bits(),
+                endpoint.format.subslot_bytes()
+            ),
+            (44_100, 32, 4)
+        );
         assert!(endpoint.control_descriptors.is_empty());
         assert!(!endpoint.sampling_control);
     }
@@ -2382,10 +3399,19 @@ mod tests {
         let endpoint = programmed_capture_endpoint();
         assert_eq!(endpoint.format.sample_rate(), 48_000);
         assert!(!endpoint.fixed_rate);
-        assert!(NominalCapturePool::for_endpoint(&endpoint).unwrap().is_none());
+        assert!(NominalCapturePool::for_endpoint(&endpoint)
+            .unwrap()
+            .is_none());
         let profile = endpoint.vendor_pcm.unwrap();
-        assert_eq!(vendor_capture_candidates(1, profile, 96_000).unwrap()[0].format.sample_rate(), 96_000);
-        assert!(vendor_capture_candidates(1, profile, 88_200).unwrap().is_empty());
+        assert_eq!(
+            vendor_capture_candidates(1, profile, 96_000).unwrap()[0]
+                .format
+                .sample_rate(),
+            96_000
+        );
+        assert!(vendor_capture_candidates(1, profile, 88_200)
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn programmed_capture_keeps_the_complete_proof_window_unpublished() {
@@ -2394,15 +3420,33 @@ mod tests {
         let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
         gate.pattern = vec![0];
         let slot = completed_slot(0, &[0; 48 * 16]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
         let start = gate.started;
         for millis in 1..=100 {
-            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-                start + Duration::from_millis(millis), &mut scratch).unwrap());
+            assert!(!gate
+                .observe(
+                    &endpoint,
+                    &slot,
+                    LIBUSB_TRANSFER_COMPLETED,
+                    start + Duration::from_millis(millis),
+                    &mut scratch
+                )
+                .unwrap());
         }
         assert!(gate.qualified);
-        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-            start + Duration::from_millis(101), &mut scratch).unwrap());
+        assert!(gate
+            .observe(
+                &endpoint,
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(101),
+                &mut scratch
+            )
+            .unwrap());
         assert!(gate.check(start + Duration::from_millis(601)).is_err());
     }
     #[test]
@@ -2412,23 +3456,59 @@ mod tests {
         let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
         gate.pattern = vec![0];
         let mut slot = completed_slot(0, &[0; 48 * 16]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
         let start = gate.started;
         for millis in 1..50 {
-            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-                start + Duration::from_millis(millis), &mut scratch).unwrap());
+            assert!(!gate
+                .observe(
+                    &endpoint,
+                    &slot,
+                    LIBUSB_TRANSFER_COMPLETED,
+                    start + Duration::from_millis(millis),
+                    &mut scratch
+                )
+                .unwrap());
         }
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length -= 1; }
-        assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-            start + Duration::from_millis(50), &mut scratch).unwrap());
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length += 1; }
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length -= 1;
+        }
+        assert!(!gate
+            .observe(
+                &endpoint,
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(50),
+                &mut scratch
+            )
+            .unwrap());
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length += 1;
+        }
         for millis in 51..=150 {
-            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-                start + Duration::from_millis(millis), &mut scratch).unwrap());
+            assert!(!gate
+                .observe(
+                    &endpoint,
+                    &slot,
+                    LIBUSB_TRANSFER_COMPLETED,
+                    start + Duration::from_millis(millis),
+                    &mut scratch
+                )
+                .unwrap());
         }
         assert!(gate.qualified);
-        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-            start + Duration::from_millis(151), &mut scratch).unwrap());
+        assert!(gate
+            .observe(
+                &endpoint,
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(151),
+                &mut scratch
+            )
+            .unwrap());
     }
 
     #[test]
@@ -2438,14 +3518,32 @@ mod tests {
         let mut gate = VendorCaptureRateGate::new(&endpoint, geometry);
         gate.pattern = vec![0];
         let slot = completed_slot(0, &[0; 44 * 16]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
         let start = gate.started;
         for millis in 1..200 {
-            assert!(!gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-                start + Duration::from_millis(millis), &mut scratch).unwrap());
+            assert!(!gate
+                .observe(
+                    &endpoint,
+                    &slot,
+                    LIBUSB_TRANSFER_COMPLETED,
+                    start + Duration::from_millis(millis),
+                    &mut scratch
+                )
+                .unwrap());
         }
-        assert!(gate.observe(&endpoint, &slot, LIBUSB_TRANSFER_COMPLETED,
-            start + Duration::from_millis(200), &mut scratch).is_err());
+        assert!(gate
+            .observe(
+                &endpoint,
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start + Duration::from_millis(200),
+                &mut scratch
+            )
+            .is_err());
         let fresh = VendorCaptureRateGate::new(&endpoint, geometry);
         assert!(fresh.check(fresh.started + fresh.startup).is_err());
     }
@@ -2455,14 +3553,22 @@ mod tests {
         let endpoint = vendor_capture_endpoint(1, roland_capture_profile(), 44_100).unwrap();
         let mut buffer = CaptureBuffer::new(endpoint.format, 8).unwrap();
         let mut slot = completed_slot(0, &[0; 16]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
         for actual_bytes in [17, 15, 0] {
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = actual_bytes; }
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = actual_bytes;
+            }
             let before = buffer.stats().captured_frames;
             ingest_slot(&slot, LIBUSB_TRANSFER_COMPLETED, &mut buffer, &mut scratch).unwrap();
             assert_eq!(buffer.stats().captured_frames, before);
         }
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 16; }
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 16;
+        }
         ingest_slot(&slot, LIBUSB_TRANSFER_COMPLETED, &mut buffer, &mut scratch).unwrap();
         assert_eq!(buffer.stats().captured_frames, 1);
     }
@@ -2470,10 +3576,15 @@ mod tests {
     fn companion_capture_gate_requires_verified_monotonic_and_fresh_output() {
         let profile = roland_capture_profile();
         let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
-        let mut pool = NominalCapturePool { slots: vec![], profile,
+        let mut pool = NominalCapturePool {
+            slots: vec![],
+            profile,
             scheduler: IsoPacketScheduler::with_geometry(44_100, 16, 125, geometry),
             acceptance: PacketAcceptance::new(44_100, 125, 16),
-            first_valid: None, latest_valid: None, deadline: Duration::from_millis(100) };
+            first_valid: None,
+            latest_valid: None,
+            deadline: Duration::from_millis(100),
+        };
         let at = Instant::now();
         assert!(!pool.primed());
         assert!(!pool.accepts_capture(at));
@@ -2563,19 +3674,32 @@ mod tests {
     #[test]
     fn adaptive_uac1_discovery_reproof_and_capture_gate_require_timing() {
         let raw = adaptive_uac1_configuration(4);
-        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
         assert_eq!(endpoint.feedforward().unwrap().refresh, Some(4));
         assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
         let interfaces = raw_interfaces(&raw).unwrap();
         let interface = interfaces.last().unwrap();
-        let input = interface.descriptors.iter().position(|d| d[1] == 5 && d[2] == 0x81).unwrap();
+        let input = interface
+            .descriptors
+            .iter()
+            .position(|d| d[1] == 5 && d[2] == 0x81)
+            .unwrap();
         assert!(standard_capture_feedforward(interface, input, Speed::Full, true).is_err());
         let mut changed = raw.clone();
         let refresh = changed.len() - 2;
         changed[refresh] = 5;
         assert!(reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err());
         for invalid_refresh in [0, 10] {
-            assert!(capture_candidates(&adaptive_uac1_configuration(invalid_refresh), 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(
+                &adaptive_uac1_configuration(invalid_refresh),
+                1,
+                Speed::Full,
+                48_000
+            )
+            .unwrap()
+            .is_empty());
         }
         let mut pool = FeedforwardPool::for_endpoint(&endpoint).unwrap().unwrap();
         let at = Instant::now();
@@ -2599,23 +3723,39 @@ mod tests {
             update_configuration_length(&mut raw);
             let mut padded_raw = raw.clone();
             padded_raw[control + 3] = 0x80;
-            assert!(capture_candidates(&padded_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(&padded_raw, 1, Speed::Full, 48_000)
+                .unwrap()
+                .is_empty());
             let mut missing_raw = raw.clone();
             missing_raw.drain(control..control + 7);
             update_configuration_length(&mut missing_raw);
-            assert!(capture_candidates(&missing_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(&missing_raw, 1, Speed::Full, 48_000)
+                .unwrap()
+                .is_empty());
             let mut asynchronous_raw = raw.clone();
-            let data = asynchronous_raw.windows(4).position(|w| w == [9, 5, 0x81, 9]).unwrap();
+            let data = asynchronous_raw
+                .windows(4)
+                .position(|w| w == [9, 5, 0x81, 9])
+                .unwrap();
             asynchronous_raw[data + 3] = 5;
             asynchronous_raw[data + 8] = 0;
-            assert!(capture_candidates(&asynchronous_raw, 1, Speed::Full, 48_000).unwrap().is_empty());
+            assert!(
+                capture_candidates(&asynchronous_raw, 1, Speed::Full, 48_000)
+                    .unwrap()
+                    .is_empty()
+            );
             for rate in [44_100, 48_000] {
-                let endpoint = capture_candidates(&raw, 1, Speed::Full, rate).unwrap().remove(0);
+                let endpoint = capture_candidates(&raw, 1, Speed::Full, rate)
+                    .unwrap()
+                    .remove(0);
                 assert!(endpoint.requires_host_rate_proof());
-                assert_eq!(uac1_capture_sampling_control(&endpoint).unwrap(), false);
+                assert!(!uac1_capture_sampling_control(&endpoint).unwrap());
                 assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
                 let geometry = IsoQueueGeometry::for_stream(endpoint.service_us, 8, 4);
-                assert!(capture_rate::CaptureRateProof::for_endpoint(&endpoint, geometry, None).is_some());
+                assert!(
+                    capture_rate::CaptureRateProof::for_endpoint(&endpoint, geometry, None)
+                        .is_some()
+                );
                 let mut padded = endpoint.clone();
                 padded.endpoint_descriptors[12] = 0x80;
                 assert!(uac1_capture_sampling_control(&padded).is_err());
@@ -2638,8 +3778,11 @@ mod tests {
             for transfer in 0..140 {
                 let (lengths, next) = cadence.plan(8, 3);
                 for (packet, length) in lengths.into_iter().enumerate() {
-                    if length == 3 { words.push(transfer * 8 + packet); }
-                    else { assert_eq!(length, 0); }
+                    if length == 3 {
+                        words.push(transfer * 8 + packet);
+                    } else {
+                        assert_eq!(length, 0);
+                    }
                 }
                 cadence = next;
             }
@@ -2647,7 +3790,10 @@ mod tests {
         }
         assert!(FeedforwardCadence::new(Some(0)).is_err());
         assert!(FeedforwardCadence::new(Some(10)).is_err());
-        assert_eq!(FeedforwardCadence::new(None).unwrap().plan(8, 4).0, vec![4; 8]);
+        assert_eq!(
+            FeedforwardCadence::new(None).unwrap().plan(8, 4).0,
+            vec![4; 8]
+        );
     }
 
     #[test]
@@ -2676,17 +3822,53 @@ mod tests {
                     packet.status = LIBUSB_TRANSFER_COMPLETED;
                 }
             }
-            let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }; 3];
+            let mut scratch = [CapturePacket {
+                requested_bytes: 0,
+                actual_bytes: 0,
+                succeeded: false,
+            }; 3];
             let deadline = Duration::from_millis(100);
-            assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-                deadline, width, word, &mut scratch), Ok(true));
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = width as u32; }
-            assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-                deadline, width, word, &mut scratch).is_err());
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = 0; }
-            unsafe { (&mut *slot.user_data).buffer[width] ^= 1; }
-            assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-                deadline, width, word, &mut scratch).is_err());
+            assert_eq!(
+                validate_feedforward_slot(
+                    &slot,
+                    LIBUSB_TRANSFER_COMPLETED,
+                    start,
+                    deadline,
+                    width,
+                    word,
+                    &mut scratch
+                ),
+                Ok(true)
+            );
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = width as u32;
+            }
+            assert!(validate_feedforward_slot(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start,
+                deadline,
+                width,
+                word,
+                &mut scratch
+            )
+            .is_err());
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(1)).length = 0;
+            }
+            unsafe {
+                (&mut *slot.user_data).buffer[width] ^= 1;
+            }
+            assert!(validate_feedforward_slot(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start,
+                deadline,
+                width,
+                word,
+                &mut scratch
+            )
+            .is_err());
         }
     }
 
@@ -2707,16 +3889,44 @@ mod tests {
             packet.length = 0;
             packet.actual_length = 0;
         }
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
         let deadline = Duration::from_millis(100);
-        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-            deadline, 3, &word, &mut scratch), Ok(false));
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
-        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-            deadline, 3, &word, &mut scratch).is_err());
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0; }
+        assert_eq!(
+            validate_feedforward_slot(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start,
+                deadline,
+                3,
+                &word,
+                &mut scratch
+            ),
+            Ok(false)
+        );
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3;
+        }
+        assert!(validate_feedforward_slot(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            start,
+            deadline,
+            3,
+            &word,
+            &mut scratch
+        )
+        .is_err());
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0;
+        }
         slot.submitted_endpoint = 0x81;
-        unsafe { slot.transfer.as_mut().endpoint = 0x81; }
+        unsafe {
+            slot.transfer.as_mut().endpoint = 0x81;
+        }
         assert!(inspect_slot(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).is_err());
     }
 
@@ -2725,35 +3935,61 @@ mod tests {
         let raw = adaptive_uac2_configuration();
         let interfaces = raw_interfaces(&raw).unwrap();
         let interface = interfaces.last().unwrap();
-        let input = interface.descriptors.iter().position(|d| d[1] == 5 && d[2] == 0x81).unwrap();
+        let input = interface
+            .descriptors
+            .iter()
+            .position(|d| d[1] == 5 && d[2] == 0x81)
+            .unwrap();
         assert!(standard_capture_feedforward(interface, input, Speed::Full, true).is_err());
-        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
         assert_eq!(candidate.feedforward().unwrap().address, 1);
         assert!(candidate.feedforward().unwrap().nominal(1_024_000).is_err());
-        assert!(capture_candidates(&raw, 1, Speed::Full, 128_000).unwrap().is_empty());
+        assert!(capture_candidates(&raw, 1, Speed::Full, 128_000)
+            .unwrap()
+            .is_empty());
         let alternate = raw.windows(4).position(|w| w == [9, 4, 1, 1]).unwrap();
         for declared in [1, 3] {
             let mut changed = raw.clone();
             changed[alternate + 4] = declared;
-            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000).unwrap().is_empty());
-            assert!(!claimable_capture_input(raw_interfaces(&changed).unwrap().last().unwrap(), Speed::Full));
+            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000)
+                .unwrap()
+                .is_empty());
+            assert!(!claimable_capture_input(
+                raw_interfaces(&changed).unwrap().last().unwrap(),
+                Speed::Full
+            ));
         }
         // Adaptive UAC1 also requires its proven timing companion.
         let mut uac1 = configuration(0);
         let input = uac1.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
         uac1[input + 3] = 9;
-        assert!(capture_candidates(&uac1, 1, Speed::Full, 48_000).unwrap().is_empty());
+        assert!(capture_candidates(&uac1, 1, Speed::Full, 48_000)
+            .unwrap()
+            .is_empty());
         for change in [0, 1, 2] {
             let mut changed = raw.clone();
             let timing = changed.len() - 7;
             match change {
-                0 => { changed.truncate(timing); },
-                1 => { changed[timing + 2] = 2; },
-                _ => { changed[timing + 3] = 1; },
+                0 => {
+                    changed.truncate(timing);
+                }
+                1 => {
+                    changed[timing + 2] = 2;
+                }
+                _ => {
+                    changed[timing + 3] = 1;
+                }
             }
             update_configuration_length(&mut changed);
-            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000).unwrap().is_empty());
-            assert!(!claimable_capture_input(raw_interfaces(&changed).unwrap().last().unwrap(), Speed::Full));
+            assert!(capture_candidates(&changed, 1, Speed::Full, 48_000)
+                .unwrap()
+                .is_empty());
+            assert!(!claimable_capture_input(
+                raw_interfaces(&changed).unwrap().last().unwrap(),
+                Speed::Full
+            ));
         }
     }
 
@@ -2762,7 +3998,9 @@ mod tests {
         let mut raw = adaptive_uac2_configuration();
         raw.extend_from_slice(&[4, 0x25, 0x7f, 0x55]);
         update_configuration_length(&mut raw);
-        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
         assert!(reprove_standard_capture(&raw, Speed::Full, &candidate).is_ok());
         let timing = raw.windows(4).position(|w| w == [7, 5, 1, 0x11]).unwrap();
         for offset in [timing + 6, raw.len() - 1] {
@@ -2779,14 +4017,22 @@ mod tests {
     #[test]
     fn adaptive_capture_only_publishes_input_submitted_after_confirmed_timing() {
         let raw = adaptive_uac2_configuration();
-        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
         let mut pool = FeedforwardPool::for_endpoint(&endpoint).unwrap().unwrap();
         let at = Instant::now();
         assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at)));
         pool.first_valid_send = Some(at);
         assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), None));
-        assert!(!pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at - Duration::from_millis(1))));
-        assert!(pool.accepts_capture_transfer(at + Duration::from_millis(2), Some(at + Duration::from_millis(1))));
+        assert!(!pool.accepts_capture_transfer(
+            at + Duration::from_millis(2),
+            Some(at - Duration::from_millis(1))
+        ));
+        assert!(pool.accepts_capture_transfer(
+            at + Duration::from_millis(2),
+            Some(at + Duration::from_millis(1))
+        ));
         pool.requires_post_proof_submission = false;
         assert!(pool.accepts_capture_transfer(at + Duration::from_millis(2), None));
     }
@@ -2795,31 +4041,60 @@ mod tests {
     fn standard_capture_reproof_rejects_stale_same_alternate_profiles() {
         for protocol in [0, 0x20] {
             let raw = configuration(protocol);
-            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000)
+                .unwrap()
+                .remove(0);
             assert!(reprove_standard_capture(&raw, Speed::Full, &endpoint).is_ok());
             let ep = raw.windows(4).position(|w| w == [9, 5, 0x81, 5]).unwrap();
-            let format = raw.windows(4).position(|w| w == if protocol == 0 {
-                [11, 0x24, 2, 1]
-            } else { [6, 0x24, 2, 1] }).unwrap();
-            let owner = raw.windows(4).position(|w| w == if protocol == 0 {
-                [12, 0x24, 2, 1]
-            } else { [8, 0x24, 10, 10] }).unwrap();
+            let format = raw
+                .windows(4)
+                .position(|w| {
+                    w == if protocol == 0 {
+                        [11, 0x24, 2, 1]
+                    } else {
+                        [6, 0x24, 2, 1]
+                    }
+                })
+                .unwrap();
+            let owner = raw
+                .windows(4)
+                .position(|w| {
+                    w == if protocol == 0 {
+                        [12, 0x24, 2, 1]
+                    } else {
+                        [8, 0x24, 10, 10]
+                    }
+                })
+                .unwrap();
             let mut changed_sync = raw.clone();
             changed_sync[ep + 3] ^= 0x04; // Still isochronous, with different synchronization.
             let changed_endpoint = capture_candidates(&changed_sync, 1, Speed::Full, 48_000)
-                .unwrap().remove(0);
+                .unwrap()
+                .remove(0);
             assert_eq!(changed_endpoint.packet_bytes, endpoint.packet_bytes);
             assert_eq!(changed_endpoint.service_us, endpoint.service_us);
             assert!(reprove_standard_capture(&changed_sync, Speed::Full, &endpoint).is_err());
-            let channel_map = if protocol == 0 { owner + 8 } else {
+            let channel_map = if protocol == 0 {
+                owner + 8
+            } else {
                 raw.windows(4).position(|w| w == [16, 0x24, 1, 3]).unwrap() + 11
             };
             // Preserve interface, alternate, address and valid packet capacity.
-            for offset in [ep + 3, ep + 4, ep + 7, ep + 9 + 3, format + 5, owner + 6, channel_map] {
+            for offset in [
+                ep + 3,
+                ep + 4,
+                ep + 7,
+                ep + 9 + 3,
+                format + 5,
+                owner + 6,
+                channel_map,
+            ] {
                 let mut changed = raw.clone();
                 changed[offset] ^= 1;
-                assert!(reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err(),
-                    "accepted changed standard capture byte {offset} for protocol {protocol}");
+                assert!(
+                    reprove_standard_capture(&changed, Speed::Full, &endpoint).is_err(),
+                    "accepted changed standard capture byte {offset} for protocol {protocol}"
+                );
             }
             for offset in [0, 1, 2, 5] {
                 let mut changed = raw.clone();
@@ -2833,18 +4108,30 @@ mod tests {
     fn standard_capture_reproof_rejects_filtered_duplicate_records() {
         for protocol in [0, 0x20] {
             let raw = configuration(protocol);
-            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+            let endpoint = capture_candidates(&raw, 1, Speed::Full, 48_000)
+                .unwrap()
+                .remove(0);
             // A malformed endpoint with this address is filtered by geometry.
             let mut duplicate = raw.clone();
             duplicate.extend_from_slice(&[7, 5, 0x81, 0, 0, 0, 0]);
             update_configuration_length(&mut duplicate);
-            assert_eq!(capture_candidates(&duplicate, 1, Speed::Full, 48_000).unwrap().len(), 1);
+            assert_eq!(
+                capture_candidates(&duplicate, 1, Speed::Full, 48_000)
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(reprove_standard_capture(&duplicate, Speed::Full, &endpoint).is_err());
             // A duplicate AS claim is filtered by its wrong class/protocol.
             let mut duplicate = raw.clone();
             duplicate.extend_from_slice(&[9, 4, 1, 1, 0, 0xff, 0, 0xff, 0]);
             update_configuration_length(&mut duplicate);
-            assert_eq!(capture_candidates(&duplicate, 1, Speed::Full, 48_000).unwrap().len(), 1);
+            assert_eq!(
+                capture_candidates(&duplicate, 1, Speed::Full, 48_000)
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(reprove_standard_capture(&duplicate, Speed::Full, &endpoint).is_err());
             // Duplicate the owner's identity with an otherwise ineligible record.
             let mut duplicate = raw.clone();
@@ -2858,7 +4145,9 @@ mod tests {
     fn standard_capture_reproof_preserves_superspeed_endpoint_extras() {
         for protocol in [0, 0x20] {
             let raw = superspeed_configuration(protocol, 1024, &[6, 0x30, 1, 1, 0, 16]);
-            let endpoint = capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().remove(0);
+            let endpoint = capture_candidates(&raw, 1, Speed::Super, 48_000)
+                .unwrap()
+                .remove(0);
             assert!(reprove_standard_capture(&raw, Speed::Super, &endpoint).is_ok());
             let companion = raw.windows(2).position(|w| w == [6, 0x30]).unwrap();
             let mut changed = raw.clone();
@@ -2888,7 +4177,9 @@ mod tests {
             // The packet field alone is sufficient, but the effective service
             // capacity cannot carry this rate's largest whole-frame packet.
             let raw = superspeed_configuration(protocol, 1024, &[6, 0x30, 0, 0, 32, 0]);
-            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000)
+                .unwrap()
+                .is_empty());
             let interfaces = raw_interfaces(&raw).unwrap();
             let interface = interfaces.last().unwrap();
             assert!(claimable_capture_input(interface, Speed::Super));
@@ -2913,26 +4204,43 @@ mod tests {
             assert!(candidates.iter().all(|candidate| candidate.address != 0x81));
             let interfaces = raw_interfaces(&raw).unwrap();
             let interface = interfaces.last().unwrap();
-            let endpoint = interface.descriptors.iter().position(|ep| ep[1] == 5).unwrap();
+            let endpoint = interface
+                .descriptors
+                .iter()
+                .position(|ep| ep[1] == 5)
+                .unwrap();
             assert!(capture_input_geometry(interface, endpoint, Speed::Super).is_none());
         }
         for packet in [0, 1025, 0x0c00] {
             let raw = superspeed_configuration(0x20, packet, &[6, 0x30, 0, 0, 64, 0]);
-            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000)
+                .unwrap()
+                .is_empty());
         }
     }
 
     #[test]
     fn extended_capture_companion_requires_superplus_and_retains_effective_capacity() {
-        let raw = superspeed_configuration(0x20, 1024,
-            &[6, 0x30, 0, 0x80, 1, 0, 8, 0x31, 0, 0, 0, 0, 1, 0]);
-        assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+        let raw = superspeed_configuration(
+            0x20,
+            1024,
+            &[6, 0x30, 0, 0x80, 1, 0, 8, 0x31, 0, 0, 0, 0, 1, 0],
+        );
+        assert!(capture_candidates(&raw, 1, Speed::Super, 48_000)
+            .unwrap()
+            .is_empty());
         let candidates = capture_candidates(&raw, 1, Speed::SuperPlus, 48_000).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].packet_bytes, 65_536);
         let interfaces = raw_interfaces(&raw).unwrap();
-        assert!(!claimable_capture_input(interfaces.last().unwrap(), Speed::Super));
-        assert!(claimable_capture_input(interfaces.last().unwrap(), Speed::SuperPlus));
+        assert!(!claimable_capture_input(
+            interfaces.last().unwrap(),
+            Speed::Super
+        ));
+        assert!(claimable_capture_input(
+            interfaces.last().unwrap(),
+            Speed::SuperPlus
+        ));
     }
 
     #[test]
@@ -2945,18 +4253,43 @@ mod tests {
                 assert_eq!(candidates[0].packet_bytes, 512);
                 assert_eq!(candidates[0].service_us, service_us);
             }
-            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000).unwrap().is_empty());
+            assert!(capture_candidates(&raw, 1, Speed::Super, 48_000)
+                .unwrap()
+                .is_empty());
         }
     }
 
     #[test]
     fn feedforward_sends_require_every_exact_packet_and_reject_detach_geometry() {
-        let valid = CapturePacket { requested_bytes: 4, actual_bytes: 4, succeeded: true };
+        let valid = CapturePacket {
+            requested_bytes: 4,
+            actual_bytes: 4,
+            succeeded: true,
+        };
         assert!(validate_feedforward_packets(4, &[4, 4], &[valid, valid]).is_ok());
         assert!(validate_feedforward_packets(4, &[], &[]).is_err());
-        for packet in [CapturePacket { actual_bytes: 0, ..valid },
-            CapturePacket { actual_bytes: 3, ..valid }, CapturePacket { actual_bytes: 5, ..valid },
-            CapturePacket { requested_bytes: 3, ..valid }, CapturePacket { succeeded: false, ..valid }] {
+        for packet in [
+            CapturePacket {
+                actual_bytes: 0,
+                ..valid
+            },
+            CapturePacket {
+                actual_bytes: 3,
+                ..valid
+            },
+            CapturePacket {
+                actual_bytes: 5,
+                ..valid
+            },
+            CapturePacket {
+                requested_bytes: 3,
+                ..valid
+            },
+            CapturePacket {
+                succeeded: false,
+                ..valid
+            },
+        ] {
             assert!(validate_feedforward_packets(4, &[4, 4], &[valid, packet]).is_err());
         }
     }
@@ -2984,19 +4317,29 @@ mod tests {
     #[test]
     fn duplex_capture_requires_explicit_unambiguous_endpoint_rate_control() {
         let raw = configuration(0);
-        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
-        assert_eq!(uac1_capture_sampling_control(&candidate).unwrap(), true);
+        let candidate = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
+        assert!(uac1_capture_sampling_control(&candidate).unwrap());
         let mut fixed = candidate.clone();
         fixed.endpoint_descriptors[12] = 0x80; // Explicit no-control + MaxPacketsOnly.
         fixed.sampling_control = false;
-        assert_eq!(uac1_capture_sampling_control(&fixed).unwrap(), false);
+        assert!(!uac1_capture_sampling_control(&fixed).unwrap());
         fixed.fixed_rate = false;
         assert!(uac1_capture_sampling_control(&fixed).is_err());
         for descriptors in [
             candidate.endpoint_descriptors[..9].to_vec(),
-            [candidate.endpoint_descriptors.as_slice(), &[7, 0x25, 1, 1, 0, 0, 0]].concat(),
+            [
+                candidate.endpoint_descriptors.as_slice(),
+                &[7, 0x25, 1, 1, 0, 0, 0],
+            ]
+            .concat(),
             [&candidate.endpoint_descriptors[..9], &[6, 0x25, 1, 1, 0, 0]].concat(),
-            [&candidate.endpoint_descriptors[..9], &[7, 0x25, 1, 5, 0, 0, 0]].concat(),
+            [
+                &candidate.endpoint_descriptors[..9],
+                &[7, 0x25, 1, 5, 0, 0, 0],
+            ]
+            .concat(),
         ] {
             let mut malformed = candidate.clone();
             malformed.endpoint_descriptors = descriptors;
@@ -3013,40 +4356,74 @@ mod tests {
         raw[header + 7] = 2;
         raw.insert(header + 9, 2);
         let control_end = raw.windows(4).position(|d| d == [9, 4, 1, 0]).unwrap();
-        raw.splice(control_end..control_end, [12, 0x24, 2, 4, 1, 1, 0, 2, 3, 0, 0, 0]);
+        raw.splice(
+            control_end..control_end,
+            [12, 0x24, 2, 4, 1, 1, 0, 2, 3, 0, 0, 0],
+        );
         let input_alt = raw.windows(4).position(|d| d == [9, 4, 1, 1]).unwrap();
         let mut output = raw[input_alt..].to_vec();
         output[2] = 2;
         output[12] = 4; // AS_GENERAL bTerminalLink: USB streaming Input Terminal.
-        let endpoint = output.windows(4).position(|d| d == [9, 5, 0x81, 5]).unwrap();
+        let endpoint = output
+            .windows(4)
+            .position(|d| d == [9, 5, 0x81, 5])
+            .unwrap();
         output[endpoint + 2] = 1;
         raw.extend_from_slice(&[9, 4, 2, 0, 0, 1, 2, 0, 0]);
         raw.extend_from_slice(&output);
         raw[4] = 3;
         update_configuration_length(&mut raw);
-        let capture = capture_candidates(&raw, 1, Speed::Full, 48_000).unwrap().remove(0);
+        let capture = capture_candidates(&raw, 1, Speed::Full, 48_000)
+            .unwrap()
+            .remove(0);
         let mut playback = IsoStreamCandidate {
-            configuration_number: 1, interface_number: 2, alt_setting: 1,
-            endpoint_address: 1, endpoint_interval: 1, service_interval_us: 1000,
-            usb_speed: Speed::Full, max_packet_bytes: 512,
-            sync_type: SyncType::Asynchronous, usage_type: UsageType::Data,
-            format_tag: 1, uac2_formats: None, native_dsd: None,
-            channels: 2, subslot_size: 3, bit_resolution: 24, sample_rates: vec![48_000],
-            refresh: 0, synch_address: 0, feedback_endpoint: None, implicit_feedback: None,
-            terminal_link: Some(4), is_uac1: true,
+            configuration_number: 1,
+            interface_number: 2,
+            alt_setting: 1,
+            endpoint_address: 1,
+            endpoint_interval: 1,
+            service_interval_us: 1000,
+            usb_speed: Speed::Full,
+            max_packet_bytes: 512,
+            sync_type: SyncType::Asynchronous,
+            usage_type: UsageType::Data,
+            format_tag: 1,
+            uac2_formats: None,
+            native_dsd: None,
+            channels: 2,
+            subslot_size: 3,
+            bit_resolution: 24,
+            sample_rates: vec![48_000],
+            refresh: 0,
+            synch_address: 0,
+            feedback_endpoint: None,
+            implicit_feedback: None,
+            terminal_link: Some(4),
+            is_uac1: true,
         };
-        assert_eq!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).unwrap(),
-            (0, true, true));
-        assert!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 44_100).is_err());
+        assert_eq!(
+            reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).unwrap(),
+            (0, true, true)
+        );
+        assert!(
+            reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 44_100).is_err()
+        );
         playback.terminal_link = Some(3);
-        assert!(reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).is_err());
+        assert!(
+            reprove_uac1_duplex_owners(&raw, Speed::Full, &playback, &capture, 48_000).is_err()
+        );
     }
 
     #[test]
     fn duplex_uac1_collection_owner_rejects_selected_collection_ambiguity() {
         let raw = configuration(0);
         let interfaces = raw_interfaces(&raw).unwrap();
-        assert_eq!(uac1_collection_owner(&interfaces, &interfaces[2]).unwrap().number, 0);
+        assert_eq!(
+            uac1_collection_owner(&interfaces, &interfaces[2])
+                .unwrap()
+                .number,
+            0
+        );
         let mut duplicated = interfaces.clone();
         duplicated.push(interfaces[0].clone());
         assert!(uac1_collection_owner(&duplicated, &interfaces[2]).is_err());
@@ -3060,7 +4437,12 @@ mod tests {
         unrelated.descriptors = vec![&unrelated_header];
         let mut multiple_functions = interfaces.clone();
         multiple_functions.push(unrelated);
-        assert_eq!(uac1_collection_owner(&multiple_functions, &interfaces[2]).unwrap().number, 0);
+        assert_eq!(
+            uac1_collection_owner(&multiple_functions, &interfaces[2])
+                .unwrap()
+                .number,
+            0
+        );
     }
 
     #[test]
@@ -3128,26 +4510,67 @@ mod tests {
     #[test]
     fn capture_lock_delay_counts_short_whole_frames_and_resets_on_malformed_packets() {
         let mut slot = completed_slot(0, &[0; 8]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
-        let mut gate = endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::PcmSampleFrames(3)));
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 4; }
-        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate);
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
+        let mut gate =
+            endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::PcmSampleFrames(3)));
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 4;
+        }
+        let (stats, result) = discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        );
         result.unwrap();
         assert_eq!(stats.short_packets, 1);
         assert_eq!(stats.captured_frames, 0);
         assert!(gate.pending());
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
-        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate);
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3;
+        }
+        let (stats, result) = discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        );
         result.unwrap();
         assert_eq!(stats.malformed_packets, 1);
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 8; }
-        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 8;
+        }
+        discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        )
+        .1
+        .unwrap();
         assert!(gate.pending()); // Two frames after the malformed interval.
-        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate);
+        let (stats, result) = discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        );
         result.unwrap();
         assert!(!gate.pending());
         assert_eq!(stats.captured_frames, 0); // Satisfying URB is discarded too.
@@ -3156,23 +4579,77 @@ mod tests {
     #[test]
     fn capture_lock_delay_requires_timing_and_preserves_packet_detach() {
         let mut slot = completed_slot(0, &[0; 8]);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
-        let mut gate = endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::Milliseconds(2)));
-        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
-        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, false, &mut gate).1.unwrap();
-        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
+        let mut gate =
+            endpoint_lock::LockDelayGate::new(Some(endpoint_lock::LockDelay::Milliseconds(2)));
+        discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        )
+        .1
+        .unwrap();
+        discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            false,
+            &mut gate,
+        )
+        .1
+        .unwrap();
+        discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        )
+        .1
+        .unwrap();
         assert!(gate.pending());
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
-        let (stats, result) = discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate);
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status =
+                LIBUSB_TRANSFER_NO_DEVICE;
+        }
+        let (stats, result) = discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        );
         assert!(matches!(result, Err(Error::DeviceLost)));
         assert_eq!(stats.failed_packets, 1);
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_COMPLETED; }
-        discard_lock_delay_capture(&slot, LIBUSB_TRANSFER_COMPLETED,
-            &mut scratch, 4, 1000, true, &mut gate).1.unwrap();
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status =
+                LIBUSB_TRANSFER_COMPLETED;
+        }
+        discard_lock_delay_capture(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            &mut scratch,
+            4,
+            1000,
+            true,
+            &mut gate,
+        )
+        .1
+        .unwrap();
         assert!(gate.pending());
     }
 
@@ -3190,21 +4667,82 @@ mod tests {
         let start = Instant::now();
         slot.submitted_at = Some(start);
         let deadline = Duration::from_millis(100);
-        let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
-        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start + deadline / 2,
-            deadline, 4, &payload, &mut scratch).is_ok());
-        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start + deadline,
-            deadline, 4, &payload, &mut scratch).is_err());
-        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_STALL, start,
-            deadline, 4, &payload, &mut scratch).is_err());
-        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_NO_DEVICE, start,
-            deadline, 4, &payload, &mut scratch), Err(Error::DeviceLost));
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3; }
-        assert!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-            deadline, 4, &payload, &mut scratch).is_err());
-        unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
-        assert_eq!(validate_feedforward_slot(&slot, LIBUSB_TRANSFER_COMPLETED, start,
-            deadline, 4, &payload, &mut scratch), Err(Error::DeviceLost));
+        let mut scratch = [CapturePacket {
+            requested_bytes: 0,
+            actual_bytes: 0,
+            succeeded: false,
+        }];
+        assert!(validate_feedforward_slot(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            start + deadline / 2,
+            deadline,
+            4,
+            &payload,
+            &mut scratch
+        )
+        .is_ok());
+        assert!(validate_feedforward_slot(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            start + deadline,
+            deadline,
+            4,
+            &payload,
+            &mut scratch
+        )
+        .is_err());
+        assert!(validate_feedforward_slot(
+            &slot,
+            LIBUSB_TRANSFER_STALL,
+            start,
+            deadline,
+            4,
+            &payload,
+            &mut scratch
+        )
+        .is_err());
+        assert_eq!(
+            validate_feedforward_slot(
+                &slot,
+                LIBUSB_TRANSFER_NO_DEVICE,
+                start,
+                deadline,
+                4,
+                &payload,
+                &mut scratch
+            ),
+            Err(Error::DeviceLost)
+        );
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 3;
+        }
+        assert!(validate_feedforward_slot(
+            &slot,
+            LIBUSB_TRANSFER_COMPLETED,
+            start,
+            deadline,
+            4,
+            &payload,
+            &mut scratch
+        )
+        .is_err());
+        unsafe {
+            (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status =
+                LIBUSB_TRANSFER_NO_DEVICE;
+        }
+        assert_eq!(
+            validate_feedforward_slot(
+                &slot,
+                LIBUSB_TRANSFER_COMPLETED,
+                start,
+                deadline,
+                4,
+                &payload,
+                &mut scratch
+            ),
+            Err(Error::DeviceLost)
+        );
     }
 
     #[test]
@@ -3271,31 +4809,65 @@ mod tests {
     fn duplex_reader_contention_drops_only_valid_frames_without_blocking_completion_or_finish() {
         for shared_implicit in [false, true] {
             let endpoint = capture_candidates(&configuration(0), 1, Speed::Full, 48_000)
-                .unwrap().remove(0);
+                .unwrap()
+                .remove(0);
             let buffer = CaptureBuffer::new(endpoint.format.clone(), 1).unwrap();
             let attachment = duplex::Attachment::new(endpoint, shared_implicit, buffer);
             let mut reader = attachment.reader(Arc::new(AtomicBool::new(false)));
             let retirement = attachment.retirement_guard();
             let mut slot = completed_slot(0, &[1; 12]); // stereo 24-bit: two frames
-            let mut scratch = [CapturePacket { requested_bytes: 0, actual_bytes: 0, succeeded: false }];
-            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
+            let mut scratch = [CapturePacket {
+                requested_bytes: 0,
+                actual_bytes: 0,
+                succeeded: false,
+            }];
+            attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .unwrap();
             assert_eq!(reader.lock_buffer().read(&mut [0; 6]), Ok(1));
 
             // Deliberately retain the reader lock on this thread. Any blocking
             // worker append or finish would deadlock here, before OUT resumes.
             let held = reader.buffer.lock();
-            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 6; }
-            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0; }
-            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 5; }
-            attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).unwrap();
-            unsafe { (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status = LIBUSB_TRANSFER_NO_DEVICE; }
-            assert_eq!(attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch), Err(Error::DeviceLost));
-            assert_eq!(attachment.ingest(&slot, LIBUSB_TRANSFER_NO_DEVICE, &mut scratch), Err(Error::DeviceLost));
-            unsafe { slot.transfer.as_mut().endpoint = 0x82; }
-            assert!(attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch).is_err());
+            attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .unwrap();
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 6;
+            }
+            attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .unwrap();
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 0;
+            }
+            attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .unwrap();
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).actual_length = 5;
+            }
+            attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .unwrap();
+            unsafe {
+                (*slot.transfer.as_mut().iso_packet_desc.as_mut_ptr()).status =
+                    LIBUSB_TRANSFER_NO_DEVICE;
+            }
+            assert_eq!(
+                attachment.ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch),
+                Err(Error::DeviceLost)
+            );
+            assert_eq!(
+                attachment.ingest(&slot, LIBUSB_TRANSFER_NO_DEVICE, &mut scratch),
+                Err(Error::DeviceLost)
+            );
+            unsafe {
+                slot.transfer.as_mut().endpoint = 0x82;
+            }
+            assert!(attachment
+                .ingest(&slot, LIBUSB_TRANSFER_COMPLETED, &mut scratch)
+                .is_err());
             attachment.reordered();
             attachment.finish(Some(Error::DeviceLost));
             drop(retirement);
@@ -3317,15 +4889,19 @@ mod tests {
             assert_eq!(stats.reordered_completions, 1);
             assert_eq!(stats.missing_frames, 0);
             assert_eq!(stats.device_position_frames(), 5);
-            assert_eq!(stats.captured_frames, stats.delivered_frames + buffer.available_frames() as u64
-                + stats.overrun_frames + stats.contention_frames);
+            assert_eq!(
+                stats.captured_frames,
+                stats.delivered_frames
+                    + buffer.available_frames() as u64
+                    + stats.overrun_frames
+                    + stats.contention_frames
+            );
             assert_eq!(buffer.state(), CaptureState::Failed);
             drop(buffer);
             assert_eq!(reader.error.lock().clone(), Some(Error::DeviceLost));
             reader.stop().unwrap();
         }
     }
-
 }
 
 #[cfg(test)]
@@ -3335,13 +4911,37 @@ mod capture_geometry_tests {
     #[test]
     fn extended_capture_queue_checks_host_and_libusb_lengths_before_allocation() {
         let geometry = IsoQueueGeometry::for_stream(125, 16, 8);
-        assert_eq!(capture_queue_bytes(98_303, geometry).unwrap(), 98_303 * geometry.packets_per_transfer);
-        assert!(matches!(capture_queue_bytes(0, geometry), Err(Error::Unsupported { .. })));
-        assert!(matches!(capture_queue_bytes(usize::MAX, geometry), Err(Error::Unsupported { .. })));
-        assert!(matches!(capture_queue_bytes(i32::MAX as usize, geometry), Err(Error::Unsupported { .. })));
-        let too_many = IsoQueueGeometry { transfer_slots: 256, ..geometry };
-        assert!(matches!(capture_queue_bytes(4, too_many), Err(Error::Unsupported { .. })));
-        let overflow = IsoQueueGeometry { transfer_slots: usize::MAX, ..geometry };
-        assert!(matches!(capture_queue_bytes(98_303, overflow), Err(Error::Unsupported { .. })));
+        assert_eq!(
+            capture_queue_bytes(98_303, geometry).unwrap(),
+            98_303 * geometry.packets_per_transfer
+        );
+        assert!(matches!(
+            capture_queue_bytes(0, geometry),
+            Err(Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            capture_queue_bytes(usize::MAX, geometry),
+            Err(Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            capture_queue_bytes(i32::MAX as usize, geometry),
+            Err(Error::Unsupported { .. })
+        ));
+        let too_many = IsoQueueGeometry {
+            transfer_slots: 256,
+            ..geometry
+        };
+        assert!(matches!(
+            capture_queue_bytes(4, too_many),
+            Err(Error::Unsupported { .. })
+        ));
+        let overflow = IsoQueueGeometry {
+            transfer_slots: usize::MAX,
+            ..geometry
+        };
+        assert!(matches!(
+            capture_queue_bytes(98_303, overflow),
+            Err(Error::Unsupported { .. })
+        ));
     }
 }

@@ -11,11 +11,12 @@ use crate::descriptors::error::DescriptorError;
 pub struct AudioStreamingParser;
 
 impl AudioStreamingParser {
-    pub fn parse_as_general(&self, data: &[u8]) -> Result<AudioStreamingDescriptor, DescriptorError> {
+    pub fn parse_as_general(
+        &self,
+        data: &[u8],
+    ) -> Result<AudioStreamingDescriptor, DescriptorError> {
         if data.len() < 7 {
-            return Err(DescriptorError::Invalid(
-                "AS general too short".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("AS general too short".to_string()));
         }
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC2_AS_GENERAL {
             return Err(DescriptorError::Invalid("not AS general".to_string()));
@@ -81,9 +82,7 @@ impl AudioStreamingParser {
             || data[2] != UAC2_FORMAT_TYPE
             || data[3] != UAC2_FORMAT_TYPE_I
         {
-            return Err(DescriptorError::Invalid(
-                "not format type I".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not format type I".to_string()));
         }
         let b_sam_freq_type = data[6];
         let mut sample_rates: Vec<u32> = Vec::new();
@@ -115,9 +114,7 @@ impl AudioStreamingParser {
             || data[2] != UAC2_FORMAT_TYPE
             || data[3] != UAC2_FORMAT_TYPE_II
         {
-            return Err(DescriptorError::Invalid(
-                "not format type II".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not format type II".to_string()));
         }
         let b_sam_freq_type = data[9];
         let mut sample_rates: Vec<u32> = Vec::new();
@@ -149,9 +146,7 @@ impl AudioStreamingParser {
             || data[2] != UAC2_FORMAT_TYPE
             || data[3] != UAC2_FORMAT_TYPE_III
         {
-            return Err(DescriptorError::Invalid(
-                "not format type III".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not format type III".to_string()));
         }
         let f = FormatTypeIII {
             b_subslot_size: data[4],
@@ -161,7 +156,10 @@ impl AudioStreamingParser {
         Ok(f)
     }
 
-    pub fn parse_endpoint_specific(&self, data: &[u8]) -> Result<EndpointSpecific, DescriptorError> {
+    pub fn parse_endpoint_specific(
+        &self,
+        data: &[u8],
+    ) -> Result<EndpointSpecific, DescriptorError> {
         const LEN: usize = 5;
         require_len(data, LEN)?;
         if data[1] != USB_DT_CS_ENDPOINT {
@@ -185,9 +183,7 @@ impl DescriptorParser for AudioStreamingParser {
 
     fn parse(&self, data: &[u8]) -> Result<Self::Output, DescriptorError> {
         if data.len() < 4 {
-            return Err(DescriptorError::Invalid(
-                "descriptor too short".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("descriptor too short".to_string()));
         }
         // CS_ENDPOINT descriptors are on the endpoint, not interface
         if data[1] == USB_DT_CS_ENDPOINT {

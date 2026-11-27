@@ -249,7 +249,11 @@ pub enum UsbQueueProfile {
 impl DacConfig {
     /// Apply the USB queue profile. All other session settings are retained.
     pub fn with_usb_queue_profile(mut self, profile: UsbQueueProfile) -> Self {
-        (self.bus_queue_ms, self.transfers_in_flight, self.transfer_period_us) = match profile {
+        (
+            self.bus_queue_ms,
+            self.transfers_in_flight,
+            self.transfer_period_us,
+        ) = match profile {
             UsbQueueProfile::LowLatency => (8, 8, Some(1_000)),
             UsbQueueProfile::Balanced => (DEFAULT_BUS_QUEUE_MS, DEFAULT_TRANSFERS_IN_FLIGHT, None),
             UsbQueueProfile::LowCpu => (16, 4, None),
@@ -290,7 +294,10 @@ impl DacConfig {
         if !(2..=16).contains(&self.transfers_in_flight) {
             return bad("transfers_in_flight must be between 2 and 16");
         }
-        if self.transfer_period_us.is_some_and(|period| !(125..=32_000).contains(&period)) {
+        if self
+            .transfer_period_us
+            .is_some_and(|period| !(125..=32_000).contains(&period))
+        {
             return bad("transfer_period_us must be between 125 and 32000");
         }
         Ok(())
@@ -325,14 +332,20 @@ mod tests {
 
     #[test]
     fn validation_rejects_inconsistent_depths() {
-        let mut config = DacConfig::default();
-        config.buffer_target_ms = 600;
+        let config = DacConfig {
+            buffer_target_ms: 600,
+            ..DacConfig::default()
+        };
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
-        let mut config = DacConfig::default();
-        config.dsd_subslot = Some(3);
+        let config = DacConfig {
+            dsd_subslot: Some(3),
+            ..DacConfig::default()
+        };
         assert!(matches!(config.validate(), Err(Error::InvalidArgument(_))));
-        let mut config = DacConfig::default();
-        config.buffer_capacity_ms = 0;
+        let config = DacConfig {
+            buffer_capacity_ms: 0,
+            ..DacConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 

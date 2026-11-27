@@ -146,7 +146,11 @@ mod tests {
     fn a_transfer_that_finished_before_the_cancel_arrived_is_accounted_normally() {
         // It was flagged, but it completed (or timed out, or failed): it played,
         // so the ordinary accounting applies and an error stays an error.
-        for status in [LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_ERROR] {
+        for status in [
+            LIBUSB_TRANSFER_COMPLETED,
+            LIBUSB_TRANSFER_TIMED_OUT,
+            LIBUSB_TRANSFER_ERROR,
+        ] {
             assert_eq!(classify_completion(status, true), Completion::Played);
             assert_eq!(classify_completion(status, false), Completion::Played);
         }
@@ -191,8 +195,12 @@ mod tests {
 
     #[test]
     fn a_failing_pump_is_reported_at_once() {
-        let error = wait_for_acknowledgements(|| 1, || Err("libusb_handle_events failed".into()), Duration::from_secs(5))
-            .unwrap_err();
+        let error = wait_for_acknowledgements(
+            || 1,
+            || Err("libusb_handle_events failed".into()),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
         assert_eq!(error, "libusb_handle_events failed");
     }
 }

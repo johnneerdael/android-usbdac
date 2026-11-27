@@ -156,7 +156,9 @@ fn test_failed_packet_recovery_accounts_every_known_empty_request() {
     let stats = validate_iso_packet_descriptors(&schedule, &packets, acceptance).unwrap();
     assert_eq!(stats.lost_bytes, 24);
     assert_eq!(stats.shortfall_frames, 6);
-    assert!(validate_iso_packet_descriptors(&schedule, &packets, PacketAcceptance::exact()).is_err());
+    assert!(
+        validate_iso_packet_descriptors(&schedule, &packets, PacketAcceptance::exact()).is_err()
+    );
 
     packets[0].length = 20;
     assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
@@ -164,7 +166,12 @@ fn test_failed_packet_recovery_accounts_every_known_empty_request() {
 
     packets[2].status = LIBUSB_TRANSFER_ERROR;
     packets[2].actual_length = 0;
-    assert_eq!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).unwrap().lost_bytes, 48);
+    assert_eq!(
+        validate_iso_packet_descriptors(&schedule, &packets, acceptance)
+            .unwrap()
+            .lost_bytes,
+        48
+    );
     packets[2].status = LIBUSB_TRANSFER_COMPLETED;
     packets[2].actual_length = 24;
 
@@ -181,14 +188,31 @@ fn test_failed_packet_recovery_accounts_every_known_empty_request() {
 #[test]
 fn test_empty_error_bursts_retain_exact_loss_for_each_packet() {
     let schedule = [24, 24, 24, 24];
-    for status in [LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_OVERFLOW] {
+    for status in [
+        LIBUSB_TRANSFER_ERROR,
+        LIBUSB_TRANSFER_TIMED_OUT,
+        LIBUSB_TRANSFER_OVERFLOW,
+    ] {
         let mut packets = completed_packets(&schedule);
-        for packet in &mut packets { packet.status = status; packet.actual_length = 0; }
-        let stats = validate_iso_packet_descriptors(&schedule, &packets, PacketAcceptance::new(48_000, 125, 4)).unwrap();
+        for packet in &mut packets {
+            packet.status = status;
+            packet.actual_length = 0;
+        }
+        let stats = validate_iso_packet_descriptors(
+            &schedule,
+            &packets,
+            PacketAcceptance::new(48_000, 125, 4),
+        )
+        .unwrap();
         assert_eq!(stats.lost_bytes, 96);
         assert_eq!(stats.lost_ring_frames(4), 24);
         packets[0].actual_length = 4;
-        assert!(validate_iso_packet_descriptors(&schedule, &packets, PacketAcceptance::new(48_000, 125, 4)).is_err());
+        assert!(validate_iso_packet_descriptors(
+            &schedule,
+            &packets,
+            PacketAcceptance::new(48_000, 125, 4)
+        )
+        .is_err());
     }
 }
 
@@ -429,19 +453,41 @@ fn test_timed_out_transfer_with_mismatched_descriptors_loses_the_whole_urb() {
 
 #[test]
 fn tx_length_prefix_is_not_audio_or_lost_frames() {
-    let acceptance=PacketAcceptance::new(44_100,125,6).with_packet_prefix(4);
-    let schedule=[34,40]; // 30/36 audio bytes, 4-byte headers.
-    let mut packets=completed_packets(&schedule);
-    assert_eq!(validate_iso_packet_descriptors(&schedule,&packets,acceptance).unwrap(),CompletionStats::default());
-    packets[0].actual_length=40; packets[1].actual_length=34;
-    assert_eq!(validate_iso_packet_descriptors(&schedule,&packets,acceptance).unwrap().lost_bytes,0);
-    for packet in &mut packets {packet.status=LIBUSB_TRANSFER_ERROR;packet.actual_length=0;}
-    let stats=validate_iso_packet_descriptors(&schedule,&packets,acceptance).unwrap();
-    assert_eq!(stats.lost_bytes,66); assert_eq!(stats.lost_ring_frames(6),11);
-    packets[0]=completed_packets(&[34]).remove(0);
-    assert_eq!(account_timed_out_transfer(&schedule,&packets,acceptance).lost_bytes,36);
-    packets[0].actual_length=4; packets[1]=completed_packets(&[40]).remove(0);
-    assert_eq!(validate_iso_packet_descriptors(&schedule,&packets,acceptance).unwrap().lost_bytes,30);
-    packets[0].actual_length=3;
-    assert!(validate_iso_packet_descriptors(&schedule,&packets,acceptance).is_err());
+    let acceptance = PacketAcceptance::new(44_100, 125, 6).with_packet_prefix(4);
+    let schedule = [34, 40]; // 30/36 audio bytes, 4-byte headers.
+    let mut packets = completed_packets(&schedule);
+    assert_eq!(
+        validate_iso_packet_descriptors(&schedule, &packets, acceptance).unwrap(),
+        CompletionStats::default()
+    );
+    packets[0].actual_length = 40;
+    packets[1].actual_length = 34;
+    assert_eq!(
+        validate_iso_packet_descriptors(&schedule, &packets, acceptance)
+            .unwrap()
+            .lost_bytes,
+        0
+    );
+    for packet in &mut packets {
+        packet.status = LIBUSB_TRANSFER_ERROR;
+        packet.actual_length = 0;
+    }
+    let stats = validate_iso_packet_descriptors(&schedule, &packets, acceptance).unwrap();
+    assert_eq!(stats.lost_bytes, 66);
+    assert_eq!(stats.lost_ring_frames(6), 11);
+    packets[0] = completed_packets(&[34]).remove(0);
+    assert_eq!(
+        account_timed_out_transfer(&schedule, &packets, acceptance).lost_bytes,
+        36
+    );
+    packets[0].actual_length = 4;
+    packets[1] = completed_packets(&[40]).remove(0);
+    assert_eq!(
+        validate_iso_packet_descriptors(&schedule, &packets, acceptance)
+            .unwrap()
+            .lost_bytes,
+        30
+    );
+    packets[0].actual_length = 3;
+    assert!(validate_iso_packet_descriptors(&schedule, &packets, acceptance).is_err());
 }

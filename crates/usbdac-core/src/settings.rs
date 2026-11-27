@@ -17,7 +17,7 @@ pub(crate) struct Settings {
     pub(crate) config: DacConfig,
     quirks: Vec<Quirk>,
     source_quirks: Vec<Quirk>,
-    descriptor_identity: Option<(u16,u16,u16)>,
+    descriptor_identity: Option<(u16, u16, u16)>,
     device_identity: Option<(u16, u16)>,
 }
 
@@ -37,7 +37,13 @@ impl Settings {
                 quirks.extend_from_slice(&entry.quirks);
             }
         }
-        Self { config, quirks, device_identity: Some((info.vendor_id, info.product_id)), source_quirks: Vec::new(), descriptor_identity: None }
+        Self {
+            config,
+            quirks,
+            device_identity: Some((info.vendor_id, info.product_id)),
+            source_quirks: Vec::new(),
+            descriptor_identity: None,
+        }
     }
 
     pub(crate) fn has(&self, quirk: Quirk) -> bool {
@@ -52,14 +58,26 @@ impl Settings {
     }
 
     pub(crate) fn control_delay_us(&self) -> u64 {
-        self.quirks.iter().chain(self.source_quirks.iter()).filter_map(|quirk| match quirk {
-            Quirk::ControlMessageDelayUs(us) => Some(*us), _ => None,
-        }).max().unwrap_or(0)
+        self.quirks
+            .iter()
+            .chain(self.source_quirks.iter())
+            .filter_map(|quirk| match quirk {
+                Quirk::ControlMessageDelayUs(us) => Some(*us),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
     pub(crate) fn interface_delay_ms(&self) -> u64 {
-        self.quirks.iter().chain(self.source_quirks.iter()).filter_map(|quirk| match quirk {
-            Quirk::InterfaceDelayMs(ms) => Some(*ms), _ => None,
-        }).max().unwrap_or(0)
+        self.quirks
+            .iter()
+            .chain(self.source_quirks.iter())
+            .filter_map(|quirk| match quirk {
+                Quirk::InterfaceDelayMs(ms) => Some(*ms),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub(crate) fn skip_clock_validation(&self) -> bool {
@@ -74,18 +92,41 @@ impl Settings {
         self.config.allow_unsynchronized_async
     }
 
-    pub(crate) fn allow_nominal_uac1(&self, is_uac1: bool, full_speed: bool, pcm: bool, synch_address: u8) -> bool {
-        self.allow_unsynchronized_async() || (!self.disable_feedback() && is_uac1 && full_speed && pcm
-            && synch_address == 0
-            && self.config.async_fallback_policy == crate::config::AsyncFallbackPolicy::FullSpeedUac1)
+    pub(crate) fn allow_nominal_uac1(
+        &self,
+        is_uac1: bool,
+        full_speed: bool,
+        pcm: bool,
+        synch_address: u8,
+    ) -> bool {
+        self.allow_unsynchronized_async()
+            || (!self.disable_feedback()
+                && is_uac1
+                && full_speed
+                && pcm
+                && synch_address == 0
+                && self.config.async_fallback_policy
+                    == crate::config::AsyncFallbackPolicy::FullSpeedUac1)
     }
 
-    pub(crate) fn allow_unusable_clock_readback(&self, set_attempted: bool, set_succeeded: bool,
-        reported: Option<u32>, multiplied: bool, dsd: bool) -> bool {
-        set_attempted && set_succeeded && reported.map_or(true, |rate| rate == 0)
-            && !multiplied && !dsd && !self.has(Quirk::RequireVerifiedRate)
-            && (self.skip_clock_validation() || self.has(Quirk::SkipSampleRateReadback) || self.config.clock_readback_policy
-                == crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet)
+    pub(crate) fn allow_unusable_clock_readback(
+        &self,
+        set_attempted: bool,
+        set_succeeded: bool,
+        reported: Option<u32>,
+        multiplied: bool,
+        dsd: bool,
+    ) -> bool {
+        set_attempted
+            && set_succeeded
+            && reported.map_or(true, |rate| rate == 0)
+            && !multiplied
+            && !dsd
+            && !self.has(Quirk::RequireVerifiedRate)
+            && (self.skip_clock_validation()
+                || self.has(Quirk::SkipSampleRateReadback)
+                || self.config.clock_readback_policy
+                    == crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet)
     }
 
     pub(crate) fn disable_feedback(&self) -> bool {
@@ -115,21 +156,45 @@ impl Settings {
     }
 
     /// Device-scoped policy is usable only for the identity read from USB.
-    pub(crate) fn native_dsd_policy(&self, vendor: u16, product: u16, descriptor_width: u8) -> Option<(u8, bool, bool)> {
+    pub(crate) fn native_dsd_policy(
+        &self,
+        vendor: u16,
+        product: u16,
+        descriptor_width: u8,
+    ) -> Option<(u8, bool, bool)> {
         let scoped = self.device_identity == Some((vendor, product));
-        let width = if scoped { self.dsd_subslot_override() } else { self.config.dsd_subslot };
+        let width = if scoped {
+            self.dsd_subslot_override()
+        } else {
+            self.config.dsd_subslot
+        };
         let explicit_order = self.config.dsd_big_endian.is_some()
             || (scoped && (self.has(Quirk::DsdBigEndian) || self.has(Quirk::DsdBitReverse)));
-        if width.is_none() && !explicit_order { return None; }
-        Some((width.unwrap_or(descriptor_width),
-            self.config.dsd_big_endian.unwrap_or(scoped && self.has(Quirk::DsdBigEndian)),
-            scoped && self.dsd_bit_reverse()))
+        if width.is_none() && !explicit_order {
+            return None;
+        }
+        Some((
+            width.unwrap_or(descriptor_width),
+            self.config
+                .dsd_big_endian
+                .unwrap_or(scoped && self.has(Quirk::DsdBigEndian)),
+            scoped && self.dsd_bit_reverse(),
+        ))
     }
 
-    pub(crate) fn native_dsd_order(&self, vendor: u16, product: u16, big_endian: bool) -> (bool, bool) {
+    pub(crate) fn native_dsd_order(
+        &self,
+        vendor: u16,
+        product: u16,
+        big_endian: bool,
+    ) -> (bool, bool) {
         let scoped = self.device_identity == Some((vendor, product));
-        (self.config.dsd_big_endian.unwrap_or(big_endian || (scoped && self.has(Quirk::DsdBigEndian))),
-         scoped && self.dsd_bit_reverse())
+        (
+            self.config
+                .dsd_big_endian
+                .unwrap_or(big_endian || (scoped && self.has(Quirk::DsdBigEndian))),
+            scoped && self.dsd_bit_reverse(),
+        )
     }
 
     pub(crate) fn dsd_subslot_override(&self) -> Option<u8> {
@@ -153,8 +218,6 @@ impl Settings {
     }
 }
 
-
-
 /// The settings of the open session, or the defaults when none is open.
 pub(crate) fn settings() -> Arc<Settings> {
     crate::transport::context::current().settings.read().clone()
@@ -169,13 +232,18 @@ pub(crate) fn install_descriptor_identity(vendor: u16, product: u16, revision: u
     let context = crate::transport::context::current();
     let mut guard = context.settings.write();
     let mut next = (**guard).clone();
-    let first = next.descriptor_identity != Some((vendor,product,revision));
-    next.descriptor_identity = Some((vendor,product,revision));
+    let first = next.descriptor_identity != Some((vendor, product, revision));
+    next.descriptor_identity = Some((vendor, product, revision));
     next.source_quirks = if next.config.quirk_policy == crate::quirk::QuirkPolicy::SourceBacked {
-        crate::quirk::source_quirks(vendor,product,revision)
-    } else { Vec::new() };
+        crate::quirk::source_quirks(vendor, product, revision)
+    } else {
+        Vec::new()
+    };
     if first && next.config.quirk_policy == crate::quirk::QuirkPolicy::SourceBacked {
-        for row in crate::quirk::SOURCE_QUIRKS.iter().filter(|row| row.matches(vendor,product,revision)) {
+        for row in crate::quirk::SOURCE_QUIRKS
+            .iter()
+            .filter(|row| row.matches(vendor, product, revision))
+        {
             for flag in row.flags {
                 log::info!("[USB] source-backed quirk {:04x}:{:04x} bcdDevice={:04x} {:?}: {}; hardware unverified; {}",
                     vendor,product,revision,flag,flag.applicability(),row.source_url());
@@ -281,18 +349,30 @@ mod tests {
     }
     #[test]
     fn native_policy_uses_actual_usb_identity_and_keeps_order_only_tuning() {
-        let dawn = Settings::for_device(DacConfig::default(), &info(12230, 61546, "MOONDROP Dawn Pro"));
-        assert_eq!(dawn.native_dsd_policy(12230, 61546, 4), Some((4, true, false)));
+        let dawn = Settings::for_device(
+            DacConfig::default(),
+            &info(12230, 61546, "MOONDROP Dawn Pro"),
+        );
+        assert_eq!(
+            dawn.native_dsd_policy(12230, 61546, 4),
+            Some((4, true, false))
+        );
         assert_eq!(dawn.native_dsd_policy(1, 2, 4), None);
-        let config = DacConfig { dsd_big_endian: Some(true), ..DacConfig::default() };
+        let config = DacConfig {
+            dsd_big_endian: Some(true),
+            ..DacConfig::default()
+        };
         let host = Settings::for_device(config, &info(1, 2, "x"));
         assert_eq!(host.native_dsd_policy(1, 2, 2), Some((2, true, false)));
-        let config = DacConfig { dsd_big_endian: Some(false), dsd_subslot: Some(1), ..DacConfig::default() };
+        let config = DacConfig {
+            dsd_big_endian: Some(false),
+            dsd_subslot: Some(1),
+            ..DacConfig::default()
+        };
         let host = Settings::for_device(config, &info(1, 2, "x"));
         assert_eq!(host.native_dsd_order(1, 2, true), (false, false));
         assert_eq!(host.native_dsd_policy(1, 2, 4), Some((1, false, false)));
     }
-
 }
 
 #[cfg(test)]
@@ -302,11 +382,16 @@ mod fallback_policy_tests {
     fn nominal_default_is_only_full_speed_uac1_pcm_without_pipe() {
         let mut settings = Settings::default();
         assert!(settings.allow_nominal_uac1(true, true, true, 0));
-        for args in [(false,true,true,0),(true,false,true,0),(true,true,false,0),(true,true,true,0x81)] {
-            assert!(!settings.allow_nominal_uac1(args.0,args.1,args.2,args.3));
+        for args in [
+            (false, true, true, 0),
+            (true, false, true, 0),
+            (true, true, false, 0),
+            (true, true, true, 0x81),
+        ] {
+            assert!(!settings.allow_nominal_uac1(args.0, args.1, args.2, args.3));
         }
         settings.config.async_fallback_policy = crate::config::AsyncFallbackPolicy::Forbid;
-        assert!(!settings.allow_nominal_uac1(true,true,true,0));
+        assert!(!settings.allow_nominal_uac1(true, true, true, 0));
     }
 }
 
@@ -316,18 +401,23 @@ mod clock_readback_policy_tests {
     #[test]
     fn only_acknowledged_unreadable_pcm_clock_can_use_fallback() {
         let mut settings = Settings::default();
-        assert!(!settings.allow_unusable_clock_readback(true,true,None,false,false));
-        settings.config.clock_readback_policy = crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet;
-        assert!(settings.allow_unusable_clock_readback(true,true,None,false,false));
-        assert!(settings.allow_unusable_clock_readback(true,true,Some(0),false,false));
+        assert!(!settings.allow_unusable_clock_readback(true, true, None, false, false));
+        settings.config.clock_readback_policy =
+            crate::config::ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet;
+        assert!(settings.allow_unusable_clock_readback(true, true, None, false, false));
+        assert!(settings.allow_unusable_clock_readback(true, true, Some(0), false, false));
         for (attempted, succeeded, reported, multiplied, dsd) in [
-            (false,true,None,false,false), (true,false,None,false,false),
-            (true,true,Some(44_100),false,false), (true,true,None,true,false),
-            (true,true,None,false,true)] {
-            assert!(!settings.allow_unusable_clock_readback(attempted,succeeded,reported,multiplied,dsd));
+            (false, true, None, false, false),
+            (true, false, None, false, false),
+            (true, true, Some(44_100), false, false),
+            (true, true, None, true, false),
+            (true, true, None, false, true),
+        ] {
+            assert!(!settings
+                .allow_unusable_clock_readback(attempted, succeeded, reported, multiplied, dsd));
         }
         settings.quirks.push(Quirk::RequireVerifiedRate);
-        assert!(!settings.allow_unusable_clock_readback(true,true,None,false,false));
+        assert!(!settings.allow_unusable_clock_readback(true, true, None, false, false));
     }
 }
 
@@ -337,13 +427,24 @@ mod source_delay_tests {
     use crate::config::QuirkOverride;
     #[test]
     fn host_delay_overrides_have_bounded_identity_and_deterministic_resolution() {
-        let config = DacConfig { quirks: vec![QuirkOverride {vendor_id:1,product_id:2,name_contains:None,
-            quirks:vec![Quirk::ControlMessageDelayUs(1_000),Quirk::ControlMessageDelayUs(5_000),Quirk::InterfaceDelayMs(50)]}], ..DacConfig::default() };
-        let selected = Settings::for_device(config.clone(),&DeviceInfo::new(1,2,"DAC"));
-        assert_eq!(selected.control_delay_us(),5_000);
-        assert_eq!(selected.interface_delay_ms(),50);
-        let other = Settings::for_device(config,&DeviceInfo::new(1,3,"DAC"));
-        assert_eq!(other.control_delay_us(),0);
-        assert_eq!(other.interface_delay_ms(),0);
+        let config = DacConfig {
+            quirks: vec![QuirkOverride {
+                vendor_id: 1,
+                product_id: 2,
+                name_contains: None,
+                quirks: vec![
+                    Quirk::ControlMessageDelayUs(1_000),
+                    Quirk::ControlMessageDelayUs(5_000),
+                    Quirk::InterfaceDelayMs(50),
+                ],
+            }],
+            ..DacConfig::default()
+        };
+        let selected = Settings::for_device(config.clone(), &DeviceInfo::new(1, 2, "DAC"));
+        assert_eq!(selected.control_delay_us(), 5_000);
+        assert_eq!(selected.interface_delay_ms(), 50);
+        let other = Settings::for_device(config, &DeviceInfo::new(1, 3, "DAC"));
+        assert_eq!(other.control_delay_us(), 0);
+        assert_eq!(other.interface_delay_ms(), 0);
     }
 }

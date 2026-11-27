@@ -6,11 +6,11 @@
 
 use serde_json::{json, Value};
 use usbdac_core::{
-    AltFormat, AltSetting, AsyncFallbackPolicy, Capabilities, ClockChoice, ClockHop, ClockHopKind, ClockReadbackPolicy, DacConfig, DacEvent,
-    DeviceInfo, Encoding, Error, ExplicitFeedbackPacket, FeedbackTrace, FeedbackTraceEvent,
-    HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride, QuirkPolicy, RatePolicy,
-    StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest, StreamStats, SyncKind,
-    UacVersion, VolumeRange, VolumeState,
+    AltFormat, AltSetting, AsyncFallbackPolicy, Capabilities, ClockChoice, ClockHop, ClockHopKind,
+    ClockReadbackPolicy, DacConfig, DacEvent, DeviceInfo, Encoding, Error, ExplicitFeedbackPacket,
+    FeedbackTrace, FeedbackTraceEvent, HandBack, LinkSpeed, Pacing, Quirk, QuirkOverride,
+    QuirkPolicy, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat, StreamRequest,
+    StreamStats, SyncKind, UacVersion, VolumeRange, VolumeState,
 };
 
 fn uac(version: UacVersion) -> &'static str {
@@ -76,7 +76,11 @@ fn clock_hop(hop: &ClockHop) -> Value {
         "selected_pin": selected_pin,
         "pin_count": pin_count,
     });
-    if let ClockHopKind::RateMultiplier { numerator, denominator } = hop.kind {
+    if let ClockHopKind::RateMultiplier {
+        numerator,
+        denominator,
+    } = hop.kind
+    {
         value["numerator"] = json!(numerator);
         value["denominator"] = json!(denominator);
     }
@@ -126,7 +130,11 @@ fn alt(alt: &AltSetting) -> Value {
 
 /// UAC's true muted minimum is negative infinity, never JSON null/0 dB.
 fn volume_db(value: f64) -> Value {
-    if value == f64::NEG_INFINITY { json!("-Infinity") } else { json!(value) }
+    if value == f64::NEG_INFINITY {
+        json!("-Infinity")
+    } else {
+        json!(value)
+    }
 }
 
 pub fn volume_range(range: &VolumeRange) -> Value {
@@ -370,11 +378,23 @@ pub fn stream_stats(stats: &StreamStats) -> Value {
     };
     value.extend(feedback);
     value.extend(serde_json::Map::from_iter([
-        ("worker_gap_over_10ms".into(), json!(stats.worker_gap_over_10ms)),
-        ("worker_gap_over_50ms".into(), json!(stats.worker_gap_over_50ms)),
+        (
+            "worker_gap_over_10ms".into(),
+            json!(stats.worker_gap_over_10ms),
+        ),
+        (
+            "worker_gap_over_50ms".into(),
+            json!(stats.worker_gap_over_50ms),
+        ),
         ("max_worker_gap_us".into(), json!(stats.max_worker_gap_us)),
-        ("adaptive_queue_changes".into(), json!(stats.adaptive_queue_changes)),
-        ("adaptive_queue_slots".into(), json!(stats.adaptive_queue_slots)),
+        (
+            "adaptive_queue_changes".into(),
+            json!(stats.adaptive_queue_changes),
+        ),
+        (
+            "adaptive_queue_slots".into(),
+            json!(stats.adaptive_queue_slots),
+        ),
         ("adaptive_queue_us".into(), json!(stats.adaptive_queue_us)),
     ]));
     Value::Object(value)
@@ -529,9 +549,13 @@ pub fn parse_request(json: &str) -> Decoded<StreamRequest> {
             narrow(required_uint(map, "bit_depth")?, "bit_depth")?,
         ),
         Some("pcm_u8") => StreamRequest::pcm_u8(
-            narrow(required_uint(map, "sample_rate")?, "sample_rate")?, channels),
+            narrow(required_uint(map, "sample_rate")?, "sample_rate")?,
+            channels,
+        ),
         Some("pcm_float32") => StreamRequest::pcm_float32(
-            narrow(required_uint(map, "sample_rate")?, "sample_rate")?, channels),
+            narrow(required_uint(map, "sample_rate")?, "sample_rate")?,
+            channels,
+        ),
         Some("dop") => {
             let mut request = match uint(map, "dsd_bit_rate")? {
                 Some(bit_rate) => StreamRequest::dop(narrow(bit_rate, "dsd_bit_rate")?, channels),
@@ -671,18 +695,30 @@ pub fn parse_config(json: Option<&str>) -> Decoded<DacConfig> {
     if let Some(policy) = text(map, "clock_readback_policy")? {
         config.clock_readback_policy = match policy.as_str() {
             "require_verified" => ClockReadbackPolicy::RequireVerified,
-            "allow_unusable_after_successful_set" => ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet,
-            _ => return Err(BadRequest(format!("unknown clock_readback_policy {policy:?}"))),
+            "allow_unusable_after_successful_set" => {
+                ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet
+            }
+            _ => {
+                return Err(BadRequest(format!(
+                    "unknown clock_readback_policy {policy:?}"
+                )))
+            }
         };
     }
     if let Some(policy) = text(map, "async_fallback_policy")? {
         config.async_fallback_policy = match policy.as_str() {
             "full_speed_uac1" => AsyncFallbackPolicy::FullSpeedUac1,
             "forbid" => AsyncFallbackPolicy::Forbid,
-            _ => return Err(BadRequest(format!("unknown async_fallback_policy {policy:?}"))),
+            _ => {
+                return Err(BadRequest(format!(
+                    "unknown async_fallback_policy {policy:?}"
+                )))
+            }
         };
     }
-    if let Some(enabled) = boolean(map, "adaptive_queue")? { config.adaptive_queue = enabled; }
+    if let Some(enabled) = boolean(map, "adaptive_queue")? {
+        config.adaptive_queue = enabled;
+    }
     if let Some(policy) = text(map, "quirk_policy")? {
         config.quirk_policy = match policy.as_str() {
             "verified_only" => QuirkPolicy::VerifiedOnly,
@@ -774,9 +810,17 @@ mod tests {
 
     #[test]
     fn muted_minimum_is_explicit_negative_infinity_never_null_or_full_scale() {
-        let state = volume_state(&VolumeState { db: f64::NEG_INFINITY, fraction: 0.0, muted: Some(true) });
+        let state = volume_state(&VolumeState {
+            db: f64::NEG_INFINITY,
+            fraction: 0.0,
+            muted: Some(true),
+        });
         assert_eq!(state["db"], "-Infinity");
-        let range = volume_range(&VolumeRange { min_db: f64::NEG_INFINITY, max_db: 0.0, res_db: 0.5 });
+        let range = volume_range(&VolumeRange {
+            min_db: f64::NEG_INFINITY,
+            max_db: 0.0,
+            res_db: 0.5,
+        });
         assert_eq!(range["min_db"], "-Infinity");
         assert_eq!(range["max_db"], 0.0);
     }
@@ -784,17 +828,36 @@ mod tests {
     #[test]
     fn compatibility_policies_preserve_defaults_and_reject_unknown_values() {
         let defaults = parse_config(Some("{}")).ok().unwrap();
-        assert_eq!(defaults.async_fallback_policy, AsyncFallbackPolicy::FullSpeedUac1);
-        assert_eq!(defaults.clock_readback_policy, ClockReadbackPolicy::RequireVerified);
+        assert_eq!(
+            defaults.async_fallback_policy,
+            AsyncFallbackPolicy::FullSpeedUac1
+        );
+        assert_eq!(
+            defaults.clock_readback_policy,
+            ClockReadbackPolicy::RequireVerified
+        );
         assert!(defaults.adaptive_queue);
         assert_eq!(defaults.quirk_policy, QuirkPolicy::VerifiedOnly);
-        assert_eq!(parse_config(Some(r#"{"quirk_policy":"source_backed"}"#)).ok().unwrap().quirk_policy, QuirkPolicy::SourceBacked);
+        assert_eq!(
+            parse_config(Some(r#"{"quirk_policy":"source_backed"}"#))
+                .ok()
+                .unwrap()
+                .quirk_policy,
+            QuirkPolicy::SourceBacked
+        );
         assert!(parse_config(Some(r#"{"quirk_policy":"maybe"}"#)).is_err());
         let selected = parse_config(Some(r#"{"async_fallback_policy":"forbid","clock_readback_policy":"allow_unusable_after_successful_set","adaptive_queue":false}"#)).ok().unwrap();
         assert_eq!(selected.async_fallback_policy, AsyncFallbackPolicy::Forbid);
-        assert_eq!(selected.clock_readback_policy, ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet);
+        assert_eq!(
+            selected.clock_readback_policy,
+            ClockReadbackPolicy::AllowUnusableAfterSuccessfulSet
+        );
         assert!(!selected.adaptive_queue);
-        for invalid in [r#"{"async_fallback_policy":"maybe"}"#, r#"{"clock_readback_policy":"always"}"#, r#"{"adaptive_queue":"yes"}"#] {
+        for invalid in [
+            r#"{"async_fallback_policy":"maybe"}"#,
+            r#"{"clock_readback_policy":"always"}"#,
+            r#"{"adaptive_queue":"yes"}"#,
+        ] {
             assert!(parse_config(Some(invalid)).is_err());
         }
     }
@@ -902,12 +965,16 @@ mod tests {
 
     #[test]
     fn the_bus_queue_keys_decode_and_a_bad_value_is_refused() {
-        let config = parse_config(Some(r#"{"bus_queue_ms":32,"transfers_in_flight":4,"transfer_period_us":1500}"#))
-            .ok()
-            .unwrap();
+        let config = parse_config(Some(
+            r#"{"bus_queue_ms":32,"transfers_in_flight":4,"transfer_period_us":1500}"#,
+        ))
+        .ok()
+        .unwrap();
         assert_eq!(config.transfer_period_us, Some(1_500));
         assert!(config.validate().is_ok());
-        let bad = parse_config(Some(r#"{"transfer_period_us":0}"#)).ok().unwrap();
+        let bad = parse_config(Some(r#"{"transfer_period_us":0}"#))
+            .ok()
+            .unwrap();
         assert!(bad.validate().is_err());
         assert_eq!((config.bus_queue_ms, config.transfers_in_flight), (32, 4));
         config.validate().unwrap();
@@ -1039,10 +1106,17 @@ mod tests {
 
     #[test]
     fn an_adc3_multiplier_keeps_the_public_kind_and_reports_its_verified_ratio() {
-        assert_eq!(clock_hop(&ClockHop { id: 7, kind: ClockHopKind::RateMultiplier {
-            numerator: 2, denominator: 1,
-        }}), json!({ "id": 7, "kind": "multiplier", "selected_pin": null,
-            "pin_count": null, "numerator": 2, "denominator": 1 }));
+        assert_eq!(
+            clock_hop(&ClockHop {
+                id: 7,
+                kind: ClockHopKind::RateMultiplier {
+                    numerator: 2,
+                    denominator: 1,
+                }
+            }),
+            json!({ "id": 7, "kind": "multiplier", "selected_pin": null,
+            "pin_count": null, "numerator": 2, "denominator": 1 })
+        );
     }
 
     #[test]
@@ -1137,14 +1211,33 @@ mod source_quirk_bridge_tests {
     use super::*;
     #[test]
     fn source_quirk_override_names_and_duration_units_are_distinct() {
-        for (name,expected) in [
-            ("fixed_rate",Quirk::FixedRate),("implicit_silence_on_empty",Quirk::ImplicitSilenceOnEmpty),
-            ("skip_clock_selector_writes",Quirk::SkipClockSelectorWrites),
-            ("mixer_playback_min_mute",Quirk::MixerPlaybackMinMute),("mixer_playback_linear_volume",Quirk::MixerPlaybackLinearVolume)] {
-            assert_eq!(parse_quirk(&json!(name)).map_err(|error|error.0).unwrap(),expected);
+        for (name, expected) in [
+            ("fixed_rate", Quirk::FixedRate),
+            ("implicit_silence_on_empty", Quirk::ImplicitSilenceOnEmpty),
+            ("skip_clock_selector_writes", Quirk::SkipClockSelectorWrites),
+            ("mixer_playback_min_mute", Quirk::MixerPlaybackMinMute),
+            (
+                "mixer_playback_linear_volume",
+                Quirk::MixerPlaybackLinearVolume,
+            ),
+        ] {
+            assert_eq!(
+                parse_quirk(&json!(name)).map_err(|error| error.0).unwrap(),
+                expected
+            );
         }
-        assert_eq!(parse_quirk(&json!({"control_message_delay_us":5000})).map_err(|error|error.0).unwrap(),Quirk::ControlMessageDelayUs(5000));
-        assert_eq!(parse_quirk(&json!({"interface_delay_ms":50})).map_err(|error|error.0).unwrap(),Quirk::InterfaceDelayMs(50));
+        assert_eq!(
+            parse_quirk(&json!({"control_message_delay_us":5000}))
+                .map_err(|error| error.0)
+                .unwrap(),
+            Quirk::ControlMessageDelayUs(5000)
+        );
+        assert_eq!(
+            parse_quirk(&json!({"interface_delay_ms":50}))
+                .map_err(|error| error.0)
+                .unwrap(),
+            Quirk::InterfaceDelayMs(50)
+        );
         assert!(parse_quirk(&json!({"interface_delay_ms":-1})).is_err());
     }
     #[test]
@@ -1152,8 +1245,11 @@ mod source_quirk_bridge_tests {
         for name in ["tx_length_prefix", "playback_first"] {
             let input = serde_json::json!({"quirks":[{"vendor_id":0x1234,"product_id":0x5678,"quirks":[name]}]}).to_string();
             let error = parse_config(Some(&input)).unwrap_err();
-            assert!(error.0.contains("exact native source-backed profile"), "{}", error.0);
+            assert!(
+                error.0.contains("exact native source-backed profile"),
+                "{}",
+                error.0
+            );
         }
     }
-
 }

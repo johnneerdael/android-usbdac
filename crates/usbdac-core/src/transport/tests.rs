@@ -12,7 +12,14 @@ mod dsd_bitperfect_tests {
     fn native_dsd_u32_big_endian_groups_channels() {
         let mut out = [0u8; 8];
         encode_usb_pcm_slots(
-            &NATIVE_IN, &mut out, 4, 1, DsdTransportMode::Native, 2, true, false,
+            &NATIVE_IN,
+            &mut out,
+            4,
+            1,
+            DsdTransportMode::Native,
+            2,
+            true,
+            false,
         )
         .unwrap();
         // BE: each channel word is b0(MSB)..b3(LSB), channel 0 then channel 1.
@@ -23,7 +30,14 @@ mod dsd_bitperfect_tests {
     fn native_dsd_u32_little_endian_reverses_byte_order() {
         let mut out = [0u8; 8];
         encode_usb_pcm_slots(
-            &NATIVE_IN, &mut out, 4, 1, DsdTransportMode::Native, 2, false, false,
+            &NATIVE_IN,
+            &mut out,
+            4,
+            1,
+            DsdTransportMode::Native,
+            2,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(out, [13, 12, 11, 10, 23, 22, 21, 20]);
@@ -32,18 +46,41 @@ mod dsd_bitperfect_tests {
     #[test]
     fn standard_adc3_dsd_le64_reverses_each_channel_word_without_reversing_bits() {
         // Chronological MSB-first bytes, alternating left and right channels.
-        let input = [0x01, 0x81, 0x02, 0x82, 0x03, 0x83, 0x04, 0x84,
-                     0x05, 0x85, 0x06, 0x86, 0x07, 0x87, 0x08, 0x88];
+        let input = [
+            0x01, 0x81, 0x02, 0x82, 0x03, 0x83, 0x04, 0x84, 0x05, 0x85, 0x06, 0x86, 0x07, 0x87,
+            0x08, 0x88,
+        ];
         let mut out = [0; 16];
         encode_usb_pcm_slots(
-            &input, &mut out, 8, 64, DsdTransportMode::Native, 2, false, false,
-        ).unwrap();
-        assert_eq!(out, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-                         0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81]);
+            &input,
+            &mut out,
+            8,
+            64,
+            DsdTransportMode::Native,
+            2,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83,
+                0x82, 0x81
+            ]
+        );
         let mut partial = [0xaa; 14];
         assert!(encode_usb_pcm_slots(
-            &input[..14], &mut partial, 8, 64, DsdTransportMode::Native, 2, false, false,
-        ).is_err());
+            &input[..14],
+            &mut partial,
+            8,
+            64,
+            DsdTransportMode::Native,
+            2,
+            false,
+            false,
+        )
+        .is_err());
         assert_eq!(partial, [0xaa; 14]);
     }
 
@@ -51,7 +88,14 @@ mod dsd_bitperfect_tests {
     fn native_dsd_bit_reverse_flips_each_byte() {
         let mut out = [0u8; 8];
         encode_usb_pcm_slots(
-            &NATIVE_IN, &mut out, 4, 1, DsdTransportMode::Native, 2, true, true,
+            &NATIVE_IN,
+            &mut out,
+            4,
+            1,
+            DsdTransportMode::Native,
+            2,
+            true,
+            true,
         )
         .unwrap();
         let bytes: [u8; 8] = [10, 11, 12, 13, 20, 21, 22, 23];
@@ -64,7 +108,14 @@ mod dsd_bitperfect_tests {
         let input = [0x100u32 as i32, 0x205u32 as i32];
         let mut out = [0u8; 2];
         encode_usb_pcm_slots(
-            &input, &mut out, 1, 1, DsdTransportMode::Native, 2, false, false,
+            &input,
+            &mut out,
+            1,
+            1,
+            DsdTransportMode::Native,
+            2,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(out, [0x00, 0x05]);
@@ -101,7 +152,10 @@ mod dsd_bitperfect_tests {
         use crate::capabilities::EndpointUsage;
         assert_eq!(endpoint_usage(UsageType::Data), EndpointUsage::Data);
         assert_eq!(endpoint_usage(UsageType::Feedback), EndpointUsage::Feedback);
-        assert_eq!(endpoint_usage(UsageType::FeedbackData), EndpointUsage::FeedbackData);
+        assert_eq!(
+            endpoint_usage(UsageType::FeedbackData),
+            EndpointUsage::FeedbackData
+        );
         assert_eq!(endpoint_usage(UsageType::Reserved), EndpointUsage::Reserved);
     }
 
@@ -136,12 +190,16 @@ mod dsd_bitperfect_tests {
     fn dop_ring_preserves_phase_through_starvation_and_resume() {
         let mut ring = PcmRing::new(9, 2);
         assert_eq!(ring.capacity_samples % 2, 0);
-        assert_eq!(ring.push_samples(&[0xfa112200u32 as i32, 0xfa334400u32 as i32]), 2);
+        assert_eq!(
+            ring.push_samples(&[0xfa112200u32 as i32, 0xfa334400u32 as i32]),
+            2
+        );
         let mut first = [0i32; 6];
         assert!(ring.pop_into_or_pad(&mut first, 2, DsdTransportMode::DoP));
-        assert_eq!(first.map(|s| s as u32), [
-            0x05112200, 0x05334400, 0xfa696900, 0xfa696900, 0x05696900, 0x05696900,
-        ]);
+        assert_eq!(
+            first.map(|s| s as u32),
+            [0x05112200, 0x05334400, 0xfa696900, 0xfa696900, 0x05696900, 0x05696900,]
+        );
         assert_eq!(ring.push_samples(&[0x05556600, 0x05778800, 99]), 2);
         let mut resumed = [0i32; 2];
         assert!(!ring.pop_into_or_pad(&mut resumed, 2, DsdTransportMode::DoP));
@@ -163,7 +221,12 @@ mod dsd_bitperfect_tests {
         ];
         assert!(!audit_dsd_payload(&flat, DsdTransportMode::DoP, 4, 2));
         // fewer than 2 words
-        assert!(!audit_dsd_payload(&[0, 0, 0, 0x05], DsdTransportMode::DoP, 4, 2));
+        assert!(!audit_dsd_payload(
+            &[0, 0, 0, 0x05],
+            DsdTransportMode::DoP,
+            4,
+            2
+        ));
     }
 
     #[test]
@@ -177,8 +240,18 @@ mod dsd_bitperfect_tests {
 
     #[test]
     fn audit_native_requires_nonzero() {
-        assert!(audit_dsd_payload(&[0x00, 0x55, 0x00], DsdTransportMode::Native, 1, 2));
-        assert!(!audit_dsd_payload(&[0, 0, 0, 0], DsdTransportMode::Native, 1, 2));
+        assert!(audit_dsd_payload(
+            &[0x00, 0x55, 0x00],
+            DsdTransportMode::Native,
+            1,
+            2
+        ));
+        assert!(!audit_dsd_payload(
+            &[0, 0, 0, 0],
+            DsdTransportMode::Native,
+            1,
+            2
+        ));
         assert!(!audit_dsd_payload(&[], DsdTransportMode::Native, 1, 2));
     }
 
@@ -228,7 +301,8 @@ mod dsd_bitperfect_tests {
     #[test]
     fn effective_ring_rate_uses_byte_rate_for_native() {
         // DSD64: dsd_bit_rate 2_822_400 -> byte rate 352_800, wire rate 88_200.
-        let native = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
+        let native = PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 88_200,
             bit_depth: 1,
             channels: 2,
@@ -237,7 +311,8 @@ mod dsd_bitperfect_tests {
             dsd_bit_rate: 2_822_400,
         };
         assert_eq!(effective_ring_rate(&native), 352_800);
-        let pcm = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
+        let pcm = PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 96_000,
             bit_depth: 24,
             channels: 2,
@@ -269,7 +344,8 @@ mod dsd_bitperfect_tests {
 
         // A value that 16.16 holds exactly decodes exactly.
         let exact = ((44.0 + 0.125) * 65_536.0) as u32;
-        let (frames, rate) = decode_feedback_report(&exact.to_le_bytes(), 125, Speed::High).unwrap();
+        let (frames, rate) =
+            decode_feedback_report(&exact.to_le_bytes(), 125, Speed::High).unwrap();
         assert_eq!(frames, 44.125);
         assert_eq!(rate, 353_000.0);
     }
@@ -321,7 +397,8 @@ mod transport_loss_tests {
 
     fn lossy_tracker(lost_frames: u64) -> LossTracker {
         let mut tracker = LossTracker::new(LossLimits {
-            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125).max_consecutive_lossy_urbs(),
+            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125)
+                .max_consecutive_lossy_urbs(),
             max_lost_frames: u64::MAX,
         });
         tracker.record(
@@ -336,22 +413,32 @@ mod transport_loss_tests {
 
     #[test]
     fn explicit_feedback_live_lock_gates_bit_perfect() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();
         let state = streaming_state(Arc::clone(&stats));
         stats.feedback_required.store(true, Ordering::Release);
-        assert_eq!(bit_perfect_blocker(&state), Some(BitPerfectBlocker::FeedbackUnlocked));
+        assert_eq!(
+            bit_perfect_blocker(&state),
+            Some(BitPerfectBlocker::FeedbackUnlocked)
+        );
         stats.feedback_locked.store(true, Ordering::Release);
         assert_eq!(bit_perfect_blocker(&state), None);
         stats.feedback_locked.store(false, Ordering::Release);
-        assert_eq!(bit_perfect_blocker(&state), Some(BitPerfectBlocker::FeedbackUnlocked));
+        assert_eq!(
+            bit_perfect_blocker(&state),
+            Some(BitPerfectBlocker::FeedbackUnlocked)
+        );
         stats.feedback_required.store(false, Ordering::Release);
         assert_eq!(bit_perfect_blocker(&state), None);
     }
 
     #[test]
     fn lost_frames_clear_the_bit_perfect_claim_until_a_new_stream() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();
         let state = streaming_state(Arc::clone(&stats));
         assert!(direct_path_is_bit_perfect(&state));
@@ -372,7 +459,9 @@ mod transport_loss_tests {
 
     #[test]
     fn a_lossless_tracker_never_latches_the_stream() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();
         let state = streaming_state(Arc::clone(&stats));
         publish_transport_loss(&stats, &lossy_tracker(0));
@@ -383,10 +472,13 @@ mod transport_loss_tests {
 
     #[test]
     fn publish_mirrors_every_counter() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = new_stream_stats();
         let mut tracker = LossTracker::new(LossLimits {
-            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125).max_consecutive_lossy_urbs(),
+            max_consecutive_lossy_urbs: IsoQueueGeometry::default_for(125)
+                .max_consecutive_lossy_urbs(),
             max_lost_frames: u64::MAX,
         });
         tracker.record(
@@ -601,12 +693,25 @@ mod pcm_ring_hold_tests {
         };
         let route = FeedbackTimebaseRoute::new(&candidate, feedback);
         let session = test_state(None);
-        session.service_interval_feedback_routes.lock().insert(route);
-        assert!(session.clone().service_interval_feedback_routes.lock().contains(&route));
-        assert!(!test_state(None).service_interval_feedback_routes.lock().contains(&route));
+        session
+            .service_interval_feedback_routes
+            .lock()
+            .insert(route);
+        assert!(session
+            .clone()
+            .service_interval_feedback_routes
+            .lock()
+            .contains(&route));
+        assert!(!test_state(None)
+            .service_interval_feedback_routes
+            .lock()
+            .contains(&route));
         candidate.alt_setting += 1;
         let other_alt = FeedbackTimebaseRoute::new(&candidate, feedback);
-        assert!(!session.service_interval_feedback_routes.lock().contains(&other_alt));
+        assert!(!session
+            .service_interval_feedback_routes
+            .lock()
+            .contains(&other_alt));
     }
 
     #[test]
@@ -614,7 +719,8 @@ mod pcm_ring_hold_tests {
         let mut candidate = pcm_candidate();
         candidate.subslot_size = 4;
         candidate.bit_resolution = 32;
-        let requested = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
+        let requested = PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 88_200,
             bit_depth: 1,
             channels: 2,
@@ -622,12 +728,18 @@ mod pcm_ring_hold_tests {
             dsd_transport: DsdTransportMode::Native,
             dsd_bit_rate: 2_822_400,
         };
-        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), u32::MAX);
+        assert_eq!(
+            transport_compatibility_penalty_for_candidate(&candidate, requested),
+            u32::MAX
+        );
         assert!(validate_transport_against_playback_format(&candidate, requested).is_err());
         candidate.format_tag = FORMAT_TAG_DSD;
         candidate.bit_resolution = 1;
         // A format tag alone cannot authorize native wire packing.
-        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), u32::MAX);
+        assert_eq!(
+            transport_compatibility_penalty_for_candidate(&candidate, requested),
+            u32::MAX
+        );
         assert!(validate_transport_against_playback_format(&candidate, requested).is_err());
         candidate.native_dsd = Some(native_dsd::NativeDsdProfile {
             word_bytes: 4,
@@ -635,7 +747,10 @@ mod pcm_ring_hold_tests {
             bit_reverse: false,
             origin: native_dsd::NativeDsdOrigin::HostPolicy,
         });
-        assert_eq!(transport_compatibility_penalty_for_candidate(&candidate, requested), 0);
+        assert_eq!(
+            transport_compatibility_penalty_for_candidate(&candidate, requested),
+            0
+        );
         assert!(validate_transport_against_playback_format(&candidate, requested).is_ok());
     }
 
@@ -677,13 +792,12 @@ mod pcm_ring_hold_tests {
 
     #[test]
     fn held_transfers_are_silent_unconsumed_and_not_underruns() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = deep_ring_stats();
         let threshold = stats.start_threshold_samples;
-        let ring = Arc::new(Mutex::new(PcmRing::new(
-            stats.buffer_capacity_samples,
-            2,
-        )));
+        let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
         // Distinct 16-bit values so the payload audit sees real audio.
         let music: Vec<i32> = (1..=20_000).map(|i| i << 16).collect();
         assert_eq!(ring.lock().push_samples(&music), 20_000);
@@ -722,10 +836,17 @@ mod pcm_ring_hold_tests {
         assert_eq!(ring.lock().len_samples(), 0);
 
         // Below the threshold the hold goes on, however much has arrived.
-        assert_eq!(ring.lock().push_samples(&music[..threshold - 2]), threshold - 2);
+        assert_eq!(
+            ring.lock().push_samples(&music[..threshold - 2]),
+            threshold - 2
+        );
         let waiting = prepare(&ring, &stats, false);
         assert!(waiting.held && !waiting.underrun);
-        assert_eq!(ring.lock().len_samples(), threshold - 2, "a hold consumes nothing");
+        assert_eq!(
+            ring.lock().len_samples(),
+            threshold - 2,
+            "a hold consumes nothing"
+        );
 
         // At the threshold it ends, and a later drain is a genuine underrun.
         assert_eq!(ring.lock().push_samples(&music[..2]), 2);
@@ -752,7 +873,10 @@ mod pcm_ring_hold_tests {
 
         // A target below the threshold lowers the threshold with it.
         let shallow = RuntimeStats::new(48_000, 2, 100, 50, 100, 50);
-        assert_eq!(shallow.start_threshold_samples, shallow.buffer_target_samples);
+        assert_eq!(
+            shallow.start_threshold_samples,
+            shallow.buffer_target_samples
+        );
     }
 
     #[test]
@@ -760,7 +884,10 @@ mod pcm_ring_hold_tests {
         let stats = deep_ring_stats();
         assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
         stats.gain_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
-        assert_eq!(stats.active_target_samples(), stats.processing_target_samples);
+        assert_eq!(
+            stats.active_target_samples(),
+            stats.processing_target_samples
+        );
         stats.gain_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
     }
@@ -771,7 +898,10 @@ mod pcm_ring_hold_tests {
         assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
         assert_eq!(stats.active_target_ms(), 250);
         stats.host_processing.store(true, Ordering::Relaxed);
-        assert_eq!(stats.active_target_samples(), stats.processing_target_samples);
+        assert_eq!(
+            stats.active_target_samples(),
+            stats.processing_target_samples
+        );
         assert_eq!(stats.active_target_ms(), 100);
         stats.host_processing.store(false, Ordering::Relaxed);
         assert_eq!(stats.active_target_samples(), stats.buffer_target_samples);
@@ -869,13 +999,12 @@ mod pcm_ring_hold_tests {
 
     #[test]
     fn transfers_report_their_music_frames_and_the_flush_epoch_they_were_filled_in() {
-        let _latch = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _latch = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = deep_ring_stats();
         let threshold = stats.start_threshold_samples;
-        let ring = Arc::new(Mutex::new(PcmRing::new(
-            stats.buffer_capacity_samples,
-            2,
-        )));
+        let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
         let music: Vec<i32> = (1..=20_000).map(|i| i << 16).collect();
         assert_eq!(ring.lock().push_samples(&music), 20_000);
 
@@ -922,8 +1051,9 @@ mod pcm_ring_hold_tests {
 
         // Three transfers on the bus: music of this epoch, held silence, and
         // music from before a flush.
-        let mut slots: Vec<IsoTransferSlot> =
-            (0..3).map(|i| IsoTransferSlot::new(i, 16, 1024).unwrap()).collect();
+        let mut slots: Vec<IsoTransferSlot> = (0..3)
+            .map(|i| IsoTransferSlot::new(i, 16, 1024).unwrap())
+            .collect();
         for (slot, (epoch, music)) in slots.iter_mut().zip([(1, 96), (1, 0), (0, 96)]) {
             slot.in_flight = true;
             slot.queued_epoch = epoch;
@@ -1004,7 +1134,8 @@ mod push_stream_tests {
             let hub = EventHub::start();
             let events = Arc::new(Collector::default());
             hub.set_stream_listener(Some(events.clone()));
-            let format = PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
+            let format = PlaybackFormat {
+                pcm_encoding: crate::transport::PcmEncoding::Signed,
                 sample_rate: rate,
                 bit_depth: bits,
                 channels,
@@ -1041,7 +1172,8 @@ mod push_stream_tests {
         /// What the output loop does to fill one slot.
         fn prepare(&mut self) -> IsoTransferPayload {
             let channels = usize::from(self.candidate.channels);
-            let payload = prepare_iso_transfer_payload(
+
+            prepare_iso_transfer_payload(
                 &mut self.scheduler,
                 &self.shared.ring,
                 &self.shared.stats,
@@ -1054,8 +1186,7 @@ mod push_stream_tests {
                 false,
             )
             .unwrap()
-            .unwrap();
-            payload
+            .unwrap()
         }
 
         /// Prepares a transfer and puts it on the simulated bus.
@@ -1142,7 +1273,9 @@ mod push_stream_tests {
     }
 
     fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
-        let guard = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         USB_PCM_PAYLOAD_LATCH.lock().reset();
         USB_DSD_PAYLOAD_LATCH.lock().reset();
         guard
@@ -1168,7 +1301,10 @@ mod push_stream_tests {
             let mut rig = Rig::pcm(subslot, bits);
             let frame_bytes = usize::from(subslot) * 2;
             let frames = 96 * 5; // five 125 us transfers at 48 kHz
-            let mut input = noise(frames * frame_bytes, 7 + u32::from(subslot) * u32::from(bits));
+            let mut input = noise(
+                frames * frame_bytes,
+                7 + u32::from(subslot) * u32::from(bits),
+            );
             if (subslot, bits) == (4, 24) {
                 for sample in input.chunks_exact_mut(4) {
                     sample[0] = 0;
@@ -1225,11 +1361,17 @@ mod push_stream_tests {
         let bytes = [10u8, 20, 11, 21, 12, 22, 13, 23];
         assert_eq!(rig.shared.write_bytes(&bytes).unwrap(), 8);
         let mut out = [0i32; 8];
-        rig.shared.ring.lock().pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
+        rig.shared
+            .ring
+            .lock()
+            .pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
         assert_eq!(out, [10, 20, 11, 21, 12, 22, 13, 23]);
         // 0xFF must not turn negative.
         assert_eq!(rig.shared.write_bytes(&[0xFF; 8]).unwrap(), 8);
-        rig.shared.ring.lock().pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
+        rig.shared
+            .ring
+            .lock()
+            .pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
         assert_eq!(out, [255; 8]);
     }
 
@@ -1241,10 +1383,16 @@ mod push_stream_tests {
         assert_eq!(rig.shared.write_samples(&[0x81; 15]).unwrap(), 0);
         assert_eq!(rig.shared.write_bytes(&[0xff; 31]).unwrap(), 16);
         assert_eq!(rig.shared.write_samples(&[0x81; 17]).unwrap(), 16);
-        assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 32);
+        assert_eq!(
+            rig.shared.stats.buffered_samples.load(Ordering::Relaxed),
+            32
+        );
         assert_eq!(rig.shared.stats.producer_frames.load(Ordering::Relaxed), 16);
         let mut out = [0; 32];
-        rig.shared.ring.lock().pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
+        rig.shared
+            .ring
+            .lock()
+            .pop_into_or_pad(&mut out, 2, DsdTransportMode::Native);
         assert_eq!(&out[..16], &[255; 16]);
         assert_eq!(&out[16..], &[0x81; 16]);
 
@@ -1266,10 +1414,24 @@ mod push_stream_tests {
         assert_eq!(payload.music_frames, 8); // byte frames, not 64-bit wire words
         assert_eq!(payload.frame_count, payload.transfer_buffer.len() / 2);
         assert_eq!(&payload.transfer_buffer[..16], &[0x81; 16]);
-        assert!(payload.transfer_buffer[16..].iter().all(|byte| *byte == 0x69));
-        assert_eq!(rig.shared.stats.inflight_music_frames.load(Ordering::Relaxed), 8);
+        assert!(payload.transfer_buffer[16..]
+            .iter()
+            .all(|byte| *byte == 0x69));
+        assert_eq!(
+            rig.shared
+                .stats
+                .inflight_music_frames
+                .load(Ordering::Relaxed),
+            8
+        );
         rig.shared.flush();
-        assert_eq!(rig.shared.stats.inflight_music_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            rig.shared
+                .stats
+                .inflight_music_frames
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 0);
         assert_eq!(rig.shared.write_bytes(&[0x02; 16]).unwrap(), 16);
         rig.shared.drain();
@@ -1283,7 +1445,9 @@ mod push_stream_tests {
     fn dop_words_keep_their_data_bits_and_the_library_owns_the_marker() {
         let mut rig = Rig::new(3, 24, 2, DsdTransportMode::DoP);
         // Two stereo frames of [dsd_low, dsd_high, marker]; the markers are junk.
-        let bytes = [0x22u8, 0x11, 0xEE, 0x44, 0x33, 0xEE, 0x66, 0x55, 0xEE, 0x88, 0x77, 0xEE];
+        let bytes = [
+            0x22u8, 0x11, 0xEE, 0x44, 0x33, 0xEE, 0x66, 0x55, 0xEE, 0x88, 0x77, 0xEE,
+        ];
         assert_eq!(rig.shared.write_bytes(&bytes).unwrap(), 12);
         let mut out = [0i32; 4];
         rig.shared
@@ -1347,8 +1511,12 @@ mod push_stream_tests {
         assert_eq!(rig.shared.stats.queued_frames(), (taken / 4) as u64);
         // Native DSD counts DSD bytes per channel.
         let dsd = Rig::new(4, 1, 2, DsdTransportMode::Native);
-        dsd.shared.write_bytes(&vec![0x69u8; 64]).unwrap();
-        assert_eq!(dsd.shared.stats.queued_frames(), 32, "one DSD byte per channel is one frame");
+        dsd.shared.write_bytes(&[0x69u8; 64]).unwrap();
+        assert_eq!(
+            dsd.shared.stats.queued_frames(),
+            32,
+            "one DSD byte per channel is one frame"
+        );
     }
 
     #[test]
@@ -1410,8 +1578,17 @@ mod push_stream_tests {
         let pop = ring.pop_music_into_or_pad(&mut samples, 2, DsdTransportMode::None);
         assert_eq!(pop.music_samples, 2_000);
         let mut wire = vec![0u8; samples.len() * 2];
-        encode_usb_pcm_slots(&samples, &mut wire, 2, 16, DsdTransportMode::None, 2, false, false)
-            .unwrap();
+        encode_usb_pcm_slots(
+            &samples,
+            &mut wire,
+            2,
+            16,
+            DsdTransportMode::None,
+            2,
+            false,
+            false,
+        )
+        .unwrap();
         observe_pcm_payload_audit(audit_pcm_payload(&wire, 2, 2));
         assert!(stream_verdicts().payload_verified);
         assert_eq!(stream_verdicts().payload_constant_for_ms, None);
@@ -1442,7 +1619,10 @@ mod push_stream_tests {
         // Half the target is queued: half is still writable.
         let queued = vec![3u8; target_bytes / 2];
         let taken = rig.shared.write_bytes(&queued).unwrap();
-        assert_eq!(rig.shared.writable_bytes(), (target_bytes - taken) / frame * frame);
+        assert_eq!(
+            rig.shared.writable_bytes(),
+            (target_bytes - taken) / frame * frame
+        );
 
         // With software gain the recommended depth is the (shallower) processing
         // target, which is already exceeded by the queue above.
@@ -1454,7 +1634,10 @@ mod push_stream_tests {
             processing_bytes.saturating_sub(taken) / frame * frame
         );
         rig.shared.set_software_gain(1.0).unwrap();
-        assert_eq!(rig.shared.writable_bytes(), (target_bytes - taken) / frame * frame);
+        assert_eq!(
+            rig.shared.writable_bytes(),
+            (target_bytes - taken) / frame * frame
+        );
 
         // Nothing is writable after drain().
         rig.shared.drain();
@@ -1488,7 +1671,11 @@ mod push_stream_tests {
 
         rig.shared.set_paused(false);
         let first = rig.prepare();
-        assert_eq!(&first.transfer_buffer[..], &ramp[..96 * 4], "resume starts at the pause point");
+        assert_eq!(
+            &first.transfer_buffer[..],
+            &ramp[..96 * 4],
+            "resume starts at the pause point"
+        );
         let second = rig.prepare();
         assert_eq!(&second.transfer_buffer[..], &ramp[96 * 4..96 * 4 * 2]);
     }
@@ -1503,7 +1690,11 @@ mod push_stream_tests {
         assert_eq!(rig.shared.stats.played_frames(), 0);
         rig.submit();
         rig.submit();
-        assert_eq!(rig.shared.stats.played_frames(), 0, "submitted is not played");
+        assert_eq!(
+            rig.shared.stats.played_frames(),
+            0,
+            "submitted is not played"
+        );
         assert_eq!(
             rig.shared.stats.output_latency_frames(),
             (96 * 4 + 96 * 2) as u64,
@@ -1537,9 +1728,19 @@ mod push_stream_tests {
         rig.submit();
         rig.shared.flush();
         assert_eq!(rig.shared.stats.played_frames(), 0);
-        assert_eq!(rig.shared.stats.inflight_music_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            rig.shared
+                .stats
+                .inflight_music_frames
+                .load(Ordering::Relaxed),
+            0
+        );
         rig.complete_oldest(0);
-        assert_eq!(rig.shared.stats.played_frames(), 0, "old-epoch audio is not played audio");
+        assert_eq!(
+            rig.shared.stats.played_frames(),
+            0,
+            "old-epoch audio is not played audio"
+        );
 
         // Audio after the flush is counted again, from zero. The refill hold
         // waits for the start threshold first.
@@ -1547,7 +1748,10 @@ mod push_stream_tests {
         let before = rig.shared.stats.buffered_samples.load(Ordering::Relaxed);
         assert_eq!(before, 0);
         let held = rig.prepare();
-        assert!(held.held, "after a flush the stream holds silence until the threshold");
+        assert!(
+            held.held,
+            "after a flush the stream holds silence until the threshold"
+        );
         rig.shared.write_bytes(&refill).unwrap();
         rig.submit();
         rig.complete_oldest(0);
@@ -1592,7 +1796,10 @@ mod push_stream_tests {
         assert_eq!(stats.played_frames(), 0);
         let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
         assert_eq!((cancelled, raced), (6, 0));
-        assert!(rig.in_flight.is_empty(), "nothing of the old position stays on the bus");
+        assert!(
+            rig.in_flight.is_empty(),
+            "nothing of the old position stays on the bus"
+        );
 
         // Nothing was lost, nothing underran, nothing counted as taken or played.
         assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
@@ -1601,13 +1808,20 @@ mod push_stream_tests {
         assert_eq!(stats.played_frames(), 0);
         assert_eq!(stats.inflight_music_frames.load(Ordering::Relaxed), 0);
         assert_eq!(stats.flush_cancelled_transfers.load(Ordering::Relaxed), 6);
-        assert_eq!(stats.output_latency_frames(), 0, "the ring is empty and so is the bus");
+        assert_eq!(
+            stats.output_latency_frames(),
+            0,
+            "the ring is empty and so is the bus"
+        );
 
         // The slots are refilled with wire silence while the ring refills: held,
         // not an underrun, and the audit and the verdict are untouched.
         for _ in 0..8 {
             let payload = rig.prepare();
-            assert!(payload.held && !payload.underrun, "held silence after a flush");
+            assert!(
+                payload.held && !payload.underrun,
+                "held silence after a flush"
+            );
             assert!(payload.transfer_buffer.iter().all(|byte| *byte == 0));
             assert_eq!(payload.music_frames, 0);
             rig.in_flight.push(payload);
@@ -1616,7 +1830,10 @@ mod push_stream_tests {
             rig.complete_oldest(0);
         }
         assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
-        assert!(rig.shared.note_bit_perfect(), "cancelled transfers do not clear bit-perfect");
+        assert!(
+            rig.shared.note_bit_perfect(),
+            "cancelled transfers do not clear bit-perfect"
+        );
 
         // The refill hold ends at the start threshold, and from then on the
         // new position counts from zero.
@@ -1647,13 +1864,24 @@ mod push_stream_tests {
         // complete (libusb reports COMPLETED for a flagged transfer), the other
         // six come back cancelled.
         let (cancelled, raced) = rig.cancel_for_flush(|index| {
-            if index < 2 { LIBUSB_TRANSFER_COMPLETED } else { LIBUSB_TRANSFER_CANCELLED }
+            if index < 2 {
+                LIBUSB_TRANSFER_COMPLETED
+            } else {
+                LIBUSB_TRANSFER_CANCELLED
+            }
         });
         assert_eq!((cancelled, raced), (6, 2));
         // The two that played took the DAC's time: counted as taken (they were),
         // not as lost, and not as played in the new position.
-        assert_eq!(stats.consumer_frames.load(Ordering::Relaxed), consumed + 192);
-        assert_eq!(stats.played_frames(), 0, "audio of the old position is not played audio");
+        assert_eq!(
+            stats.consumer_frames.load(Ordering::Relaxed),
+            consumed + 192
+        );
+        assert_eq!(
+            stats.played_frames(),
+            0,
+            "audio of the old position is not played audio"
+        );
         assert_eq!(loss_and_underruns(&stats), (0, 0, 0, false));
         assert!(rig.in_flight.is_empty());
     }
@@ -1678,12 +1906,21 @@ mod push_stream_tests {
         let (cancelled, raced) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
         assert_eq!((cancelled, raced), (0, 0));
         assert_eq!(rig.in_flight.len(), 8);
-        assert_eq!(rig.shared.stats.flush_cancelled_transfers.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            rig.shared
+                .stats
+                .flush_cancelled_transfers
+                .load(Ordering::Relaxed),
+            0
+        );
 
         // The flush emptied the ring and the stream stays paused; the next
         // transfers are still silence, and the accounting is untouched.
         assert_eq!(rig.shared.stats.buffered_samples.load(Ordering::Relaxed), 0);
-        assert_eq!(rig.shared.current_state(), crate::events::StreamState::Paused);
+        assert_eq!(
+            rig.shared.current_state(),
+            crate::events::StreamState::Paused
+        );
         for _ in 0..8 {
             rig.complete_oldest(0);
         }
@@ -1758,7 +1995,10 @@ mod push_stream_tests {
             .unwrap();
         rig.submit();
         rig.submit();
-        assert_eq!(rig.in_flight.iter().map(|p| p.epoch).collect::<Vec<_>>(), [0, 0, 1, 1]);
+        assert_eq!(
+            rig.in_flight.iter().map(|p| p.epoch).collect::<Vec<_>>(),
+            [0, 0, 1, 1]
+        );
 
         let (cancelled, _) = rig.cancel_for_flush(|_| LIBUSB_TRANSFER_CANCELLED);
         assert_eq!(cancelled, 2, "only the old position's transfers");
@@ -1796,14 +2036,20 @@ mod push_stream_tests {
 
         slot.in_flight = true;
         slot.cancelled_for_flush = true;
-        assert!(!slot.completion_ready(), "libusb has not handed it back yet");
+        assert!(
+            !slot.completion_ready(),
+            "libusb has not handed it back yet"
+        );
         unsafe { &(*slot.user_data).completion }
             .status
             .lock()
             .unwrap()
             .replace(LIBUSB_TRANSFER_CANCELLED);
         assert!(slot.completion_ready());
-        assert_eq!(slot.take_completion().map(|(status, _, _)| status), Some(LIBUSB_TRANSFER_CANCELLED));
+        assert_eq!(
+            slot.take_completion().map(|(status, _, _)| status),
+            Some(LIBUSB_TRANSFER_CANCELLED)
+        );
         assert!(!slot.completion_ready(), "taken");
 
         // The slot is reused: the flag does not leak into the next transfer.
@@ -1840,7 +2086,10 @@ mod push_stream_tests {
         assert_eq!(rig.shared.current_state(), StreamState::Draining);
 
         let payload = rig.prepare();
-        assert!(!payload.underrun, "the padded tail after drain() is not an underrun");
+        assert!(
+            !payload.underrun,
+            "the padded tail after drain() is not an underrun"
+        );
         assert!(!payload.held);
         assert_eq!(payload.music_frames, 10);
         assert_eq!(&payload.transfer_buffer[..tail.len()], &tail[..]);
@@ -1864,7 +2113,10 @@ mod push_stream_tests {
         let mut rig = Rig::pcm(2, 16);
         let _session = TestSession::install_streaming(Arc::clone(&rig.shared.stats));
         USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
-        assert!(rig.shared.note_bit_perfect(), "unity gain on a verified stream is bit-perfect");
+        assert!(
+            rig.shared.note_bit_perfect(),
+            "unity gain on a verified stream is bit-perfect"
+        );
 
         // 16-bit samples 0x4000 and -0x4000, repeated.
         let mut input = Vec::new();
@@ -1874,7 +2126,10 @@ mod push_stream_tests {
         }
         rig.shared.write_bytes(&input).unwrap();
         rig.shared.set_software_gain(0.5).unwrap();
-        assert!(!rig.shared.note_bit_perfect(), "any gain other than 1.0 ends bit-perfect");
+        assert!(
+            !rig.shared.note_bit_perfect(),
+            "any gain other than 1.0 ends bit-perfect"
+        );
         assert_eq!(rig.shared.stats.software_gain(), 0.5);
 
         let payload = rig.prepare();
@@ -1924,14 +2179,20 @@ mod push_stream_tests {
             dop.shared.set_software_gain(0.5),
             Err(crate::Error::InvalidState(_))
         ));
-        assert!(dop.shared.set_software_gain(1.0).is_ok(), "unity is always fine");
+        assert!(
+            dop.shared.set_software_gain(1.0).is_ok(),
+            "unity is always fine"
+        );
         let native = Rig::new(4, 1, 2, DsdTransportMode::Native);
         assert!(native.shared.set_software_gain(0.9).is_err());
 
         let pcm = Rig::pcm(2, 16);
         for bad in [f32::NAN, f32::INFINITY, -0.5, 17.0] {
             assert!(
-                matches!(pcm.shared.set_software_gain(bad), Err(crate::Error::InvalidArgument(_))),
+                matches!(
+                    pcm.shared.set_software_gain(bad),
+                    Err(crate::Error::InvalidArgument(_))
+                ),
                 "{bad}"
             );
         }
@@ -2012,7 +2273,10 @@ mod hardware_volume_without_a_stream_tests {
     #[test]
     fn a_stopped_stream_keeps_the_control_while_the_idle_lock_holds_the_dac() {
         let mut stopped = state(true, Some(control()));
-        let (generation, level) = (stopped.hardware_volume_generation, stopped.hardware_volume_state);
+        let (generation, level) = (
+            stopped.hardware_volume_generation,
+            stopped.hardware_volume_state,
+        );
 
         stopped.set_stream_active(false, true);
 
@@ -2116,10 +2380,16 @@ mod hardware_volume_without_a_stream_tests {
         dac.dac.lock().unwrap().hold_next_volume_write = Some((arrived_tx, release_rx));
 
         let write = thread::spawn(|| write_volume_fraction(0.25));
-        arrived.recv_timeout(Duration::from_secs(5)).expect("the write reached the DAC");
+        arrived
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the write reached the DAC");
         let generation = dac.generation();
         dac.stop_stream_holding_the_dac();
-        assert_eq!(dac.generation(), generation, "a stopped stream is not a new route");
+        assert_eq!(
+            dac.generation(),
+            generation,
+            "a stopped stream is not a new route"
+        );
         release.send(()).unwrap();
 
         let state = write.join().unwrap().unwrap();
@@ -2200,7 +2470,11 @@ mod hardware_volume_without_a_stream_tests {
 
         assert_eq!(hand_back_original_volume(), Ok(true));
         assert_eq!(dac.raw(), vec![ORIGINAL_RAW; 2]);
-        assert_eq!(original_volume_db(), None, "the record ends once handed back");
+        assert_eq!(
+            original_volume_db(),
+            None,
+            "the record ends once handed back"
+        );
         assert_eq!(hand_back_original_volume(), Ok(false));
     }
 }
@@ -2255,7 +2529,11 @@ mod startup_volume_tests {
         // The control works and its cached level is the attenuated one.
         assert!(has_hardware_volume());
         assert_eq!(cached_volume_state().unwrap().db, -40.0);
-        assert_eq!(startup_lowered_volume().unwrap().db, -40.0, "the open changed the level");
+        assert_eq!(
+            startup_lowered_volume().unwrap().db,
+            -40.0,
+            "the open changed the level"
+        );
     }
 
     #[test]
@@ -2265,7 +2543,10 @@ mod startup_volume_tests {
         open_with(&dac, attenuate(-40.0), control());
 
         assert_eq!(dac.raw(), vec![db(-64), db(-64)]);
-        assert!(dac.dac.lock().unwrap().volume_writes.is_empty(), "nothing was written");
+        assert!(
+            dac.dac.lock().unwrap().volume_writes.is_empty(),
+            "nothing was written"
+        );
         let report = report();
         assert_eq!(report.applied_db, report.original_db);
         assert_eq!(report.limit_db, -64.0);
@@ -2279,7 +2560,11 @@ mod startup_volume_tests {
         let dac = Registered::new(false, false);
         dac.set_levels(db(0), db(0));
         let mut coarse = control();
-        coarse.ranges = vec![RawRange { min: db(-80), max: 0, resolution: 3 * 256 }];
+        coarse.ranges = vec![RawRange {
+            min: db(-80),
+            max: 0,
+            resolution: 3 * 256,
+        }];
         coarse.resolution_raw = 3 * 256;
         open_with(&dac, attenuate(-40.0), coarse);
 
@@ -2293,7 +2578,11 @@ mod startup_volume_tests {
         let dac = Registered::new(false, false);
         dac.set_levels(db(0), db(-10));
         let mut shallow = control();
-        shallow.ranges = vec![RawRange { min: db(-30), max: 0, resolution: 256 }];
+        shallow.ranges = vec![RawRange {
+            min: db(-30),
+            max: 0,
+            resolution: 256,
+        }];
         shallow.min_volume_raw = db(-30);
         open_with(&dac, attenuate(-40.0), shallow);
 
@@ -2301,7 +2590,11 @@ mod startup_volume_tests {
         let report = report();
         assert!(report.clamped_to_minimum);
         assert_eq!(report.applied_db, vec![-30.0, -30.0]);
-        assert_eq!(report.max_db, Some(-40.0), "what was asked is still reported");
+        assert_eq!(
+            report.max_db,
+            Some(-40.0),
+            "what was asked is still reported"
+        );
     }
 
     #[test]
@@ -2331,7 +2624,11 @@ mod startup_volume_tests {
 
         // Left was loud and comes down; right was already quiet and is not written.
         let writes = dac.dac.lock().unwrap().volume_writes.clone();
-        assert_eq!(writes, vec![(1, db(-70))], "only the loud channel, and nothing is raised");
+        assert_eq!(
+            writes,
+            vec![(1, db(-70))],
+            "only the loud channel, and nothing is raised"
+        );
         assert_eq!(dac.raw(), vec![db(-70), db(-70)]);
         let report = report();
         assert_eq!(report.original_db, vec![-10.0, -70.0]);
@@ -2349,7 +2646,10 @@ mod startup_volume_tests {
     fn keep_leaves_the_levels_alone() {
         let dac = Registered::new(false, false);
         dac.set_levels(db(0), db(0));
-        let keep = DacConfig { startup_volume: StartupVolume::Keep, ..DacConfig::default() };
+        let keep = DacConfig {
+            startup_volume: StartupVolume::Keep,
+            ..DacConfig::default()
+        };
         open_with(&dac, keep, control());
 
         assert_eq!(dac.raw(), vec![db(0), db(0)]);
@@ -2359,7 +2659,10 @@ mod startup_volume_tests {
         assert!(!report.attenuated);
         assert_eq!(report.max_db, None);
         assert_eq!(report.limit_db, 0.0);
-        assert!(has_hardware_volume(), "the control is there, just not lowered");
+        assert!(
+            has_hardware_volume(),
+            "the control is there, just not lowered"
+        );
         assert_eq!(startup_lowered_volume(), None);
     }
 
@@ -2378,14 +2681,22 @@ mod startup_volume_tests {
             .as_ref()
             .and_then(|state| state.hardware_volume_error.clone())
             .unwrap();
-        assert!(reason.contains("start-up volume protection failed"), "{reason}");
+        assert!(
+            reason.contains("start-up volume protection failed"),
+            "{reason}"
+        );
         assert!(reason.contains("could not be verified"), "{reason}");
 
         // With a control required, a stream is refused; otherwise it may go ahead.
-        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(
+            ensure_volume_if_required(true),
+            Err(crate::Error::VolumeUnavailable)
+        );
         assert_eq!(ensure_volume_if_required(false), Ok(()));
         // What the library may have changed is still on record for hand-back.
-        assert!(ORIGINAL_HARDWARE_VOLUME.lock().is_recorded(&original_volume_device_key(&device())));
+        assert!(ORIGINAL_HARDWARE_VOLUME
+            .lock()
+            .is_recorded(&original_volume_device_key(&device())));
     }
 
     #[test]
@@ -2394,18 +2705,28 @@ mod startup_volume_tests {
         dac.dac.lock().unwrap().unreachable = true;
         open_with(&dac, attenuate(-40.0), control());
         assert!(!has_hardware_volume());
-        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(
+            ensure_volume_if_required(true),
+            Err(crate::Error::VolumeUnavailable)
+        );
     }
 
     #[test]
     fn no_control_at_all_is_refused_only_when_one_is_required() {
         let none = Registered::new(false, false);
         assert!(!has_hardware_volume());
-        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
+        assert_eq!(
+            ensure_volume_if_required(true),
+            Err(crate::Error::VolumeUnavailable)
+        );
         assert_eq!(ensure_volume_if_required(false), Ok(()));
         drop(none); // the fake registration is process-wide: one at a time
         let dac = Registered::new(false, true);
-        assert_eq!(ensure_volume_if_required(true), Ok(()), "a DAC with a control is never refused");
+        assert_eq!(
+            ensure_volume_if_required(true),
+            Ok(()),
+            "a DAC with a control is never refused"
+        );
         drop(dac);
     }
 
@@ -2422,8 +2743,15 @@ mod startup_volume_tests {
             adopt_volume_control(&device(), None);
         }
         assert!(!has_hardware_volume());
-        assert_eq!(ensure_volume_if_required(true), Err(crate::Error::VolumeUnavailable));
-        assert_eq!(ensure_volume_if_required(false), Ok(()), "a fixed level the user allowed");
+        assert_eq!(
+            ensure_volume_if_required(true),
+            Err(crate::Error::VolumeUnavailable)
+        );
+        assert_eq!(
+            ensure_volume_if_required(false),
+            Ok(()),
+            "a fixed level the user allowed"
+        );
     }
 
     #[test]
@@ -2443,7 +2771,10 @@ mod startup_volume_tests {
         let report = report();
         assert_eq!(report.original_db, vec![-5.0, -5.0]);
         assert_eq!(report.applied_db, vec![-40.0, -40.0]);
-        assert!(report.attenuated, "below the level it had before the library touched it");
+        assert!(
+            report.attenuated,
+            "below the level it had before the library touched it"
+        );
         assert_eq!(report.limit_db, -5.0);
         assert_eq!(startup_lowered_volume(), None, "this open wrote nothing");
 
@@ -2463,7 +2794,11 @@ mod startup_volume_tests {
         *SESSION_STATE.lock() = Some(fake_dac::state(false, None));
         open_with(&dac, attenuate(-40.0), control());
         assert_eq!(dac.raw(), vec![db(-40), db(-40)]);
-        assert_eq!(report().original_db, vec![-5.0, -5.0], "still the first original");
+        assert_eq!(
+            report().original_db,
+            vec![-5.0, -5.0],
+            "still the first original"
+        );
     }
 
     #[test]
@@ -2495,7 +2830,10 @@ mod startup_volume_tests {
         assert!(!startup_volume_pending(&control()));
         let mut other = control();
         other.feature_unit_id += 1;
-        assert!(startup_volume_pending(&other), "its level was never lowered");
+        assert!(
+            startup_volume_pending(&other),
+            "its level was never lowered"
+        );
     }
 
     #[test]
@@ -2573,7 +2911,10 @@ mod unsynchronized_async_tests {
     fn adaptive_and_synchronous_endpoints_need_no_feedback() {
         for sync in [SyncType::Adaptive, SyncType::Synchronous, SyncType::NoSync] {
             for allow in [false, true] {
-                assert_eq!(admit_endpoint(sync, 0, false, allow), EndpointAdmission::Admit);
+                assert_eq!(
+                    admit_endpoint(sync, 0, false, allow),
+                    EndpointAdmission::Admit
+                );
             }
         }
     }
@@ -2594,7 +2935,9 @@ mod unsynchronized_async_tests {
 
     #[test]
     fn a_nominal_rate_async_stream_is_never_bit_perfect_and_says_why() {
-        let _globals = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _globals = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         USB_PCM_PAYLOAD_LATCH.lock().reset();
         USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
         let mut stream = state(true, Some(control()));
@@ -2607,7 +2950,9 @@ mod unsynchronized_async_tests {
             Some(BitPerfectBlocker::UnsynchronizedAsync)
         );
         assert!(!direct_path_is_bit_perfect(&stream));
-        assert!(bit_perfect_release_reason(&stream).contains("asynchronous endpoint without feedback"));
+        assert!(
+            bit_perfect_release_reason(&stream).contains("asynchronous endpoint without feedback")
+        );
 
         // The flag belongs to the stream: it ends with it.
         stream.set_stream_active(false, true);
@@ -2616,23 +2961,47 @@ mod unsynchronized_async_tests {
 
     #[test]
     fn the_blockers_are_reported_in_order_of_precedence() {
-        let _globals = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _globals = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         USB_PCM_PAYLOAD_LATCH.lock().reset();
         let mut stream = state(true, None);
         // Nothing audited yet.
-        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::PayloadUnverified));
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::PayloadUnverified)
+        );
         USB_PCM_PAYLOAD_LATCH.lock().observe(true, Instant::now());
         assert_eq!(bit_perfect_blocker(&stream), None);
 
         stream.software_volume_active = true;
-        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::SoftwareGain));
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::SoftwareGain)
+        );
         stream.clock_verification_passed = false;
-        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::ClockUnverified));
-        stream.requested_playback_format.as_mut().unwrap().sample_rate = 96_000;
-        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::FormatChanged));
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::ClockUnverified)
+        );
+        stream
+            .requested_playback_format
+            .as_mut()
+            .unwrap()
+            .sample_rate = 96_000;
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::FormatChanged)
+        );
         stream.stream_active = false;
-        assert_eq!(bit_perfect_blocker(&stream), Some(BitPerfectBlocker::NoStream));
-        assert_eq!(BitPerfectBlocker::UnsynchronizedAsync.code(), "unsynchronized_async");
+        assert_eq!(
+            bit_perfect_blocker(&stream),
+            Some(BitPerfectBlocker::NoStream)
+        );
+        assert_eq!(
+            BitPerfectBlocker::UnsynchronizedAsync.code(),
+            "unsynchronized_async"
+        );
     }
 }
 
@@ -2655,7 +3024,13 @@ mod pacing_tests {
         for allow in [false, true] {
             rows.extend([
                 // Asynchronous with its feedback endpoint: polled, whatever the config says.
-                (SyncType::Asynchronous, FEEDBACK, Some(FEEDBACK), allow, explicit),
+                (
+                    SyncType::Asynchronous,
+                    FEEDBACK,
+                    Some(FEEDBACK),
+                    allow,
+                    explicit,
+                ),
                 // The feedback endpoint found by its usage bits rather than bSynchAddress.
                 (SyncType::Asynchronous, 0, Some(FEEDBACK), allow, explicit),
                 // A declared feedback endpoint that cannot be resolved is never streamed.
@@ -2663,18 +3038,48 @@ mod pacing_tests {
                 (SyncType::Adaptive, FEEDBACK, None, allow, None),
                 // Adaptive and synchronous follow the host's packet timing.
                 (SyncType::Adaptive, 0, None, allow, Some(Pacing::Adaptive)),
-                (SyncType::Synchronous, 0, None, allow, Some(Pacing::Synchronous)),
+                (
+                    SyncType::Synchronous,
+                    0,
+                    None,
+                    allow,
+                    Some(Pacing::Synchronous),
+                ),
                 // The transport only polls feedback for an asynchronous endpoint.
-                (SyncType::Adaptive, FEEDBACK, Some(FEEDBACK), allow, Some(Pacing::Adaptive)),
-                (SyncType::Synchronous, FEEDBACK, Some(FEEDBACK), allow, Some(Pacing::Synchronous)),
+                (
+                    SyncType::Adaptive,
+                    FEEDBACK,
+                    Some(FEEDBACK),
+                    allow,
+                    Some(Pacing::Adaptive),
+                ),
+                (
+                    SyncType::Synchronous,
+                    FEEDBACK,
+                    Some(FEEDBACK),
+                    allow,
+                    Some(Pacing::Synchronous),
+                ),
                 // No synchronisation declared: nothing comes back, nominal rate.
-                (SyncType::NoSync, 0, None, allow, Some(Pacing::Unsynchronized)),
+                (
+                    SyncType::NoSync,
+                    0,
+                    None,
+                    allow,
+                    Some(Pacing::Unsynchronized),
+                ),
             ]);
         }
         rows.extend([
             // Asynchronous without feedback: refused unless the config allows the nominal rate.
             (SyncType::Asynchronous, 0, None, false, None),
-            (SyncType::Asynchronous, 0, None, true, Some(Pacing::Unsynchronized)),
+            (
+                SyncType::Asynchronous,
+                0,
+                None,
+                true,
+                Some(Pacing::Unsynchronized),
+            ),
         ]);
         rows
     }
@@ -2710,7 +3115,10 @@ mod pacing_tests {
         for (sync, synch_address, feedback, allow, expected) in table() {
             if let Some(pacing) = expected {
                 assert_eq!(admitted_pacing(sync, feedback), pacing);
-                assert_eq!(endpoint_pacing(sync, synch_address, feedback, allow), Some(pacing));
+                assert_eq!(
+                    endpoint_pacing(sync, synch_address, feedback, allow),
+                    Some(pacing)
+                );
             }
         }
     }
@@ -2736,8 +3144,14 @@ mod pacing_tests {
 
     #[test]
     fn pacing_codes_are_stable() {
-        assert_eq!(Pacing::ExplicitFeedback { endpoint: 0x83 }.code(), "explicit_feedback");
-        assert_eq!(Pacing::ExplicitFeedback { endpoint: 0x83 }.feedback_endpoint(), Some(0x83));
+        assert_eq!(
+            Pacing::ExplicitFeedback { endpoint: 0x83 }.code(),
+            "explicit_feedback"
+        );
+        assert_eq!(
+            Pacing::ExplicitFeedback { endpoint: 0x83 }.feedback_endpoint(),
+            Some(0x83)
+        );
         assert_eq!(Pacing::Adaptive.code(), "adaptive");
         assert_eq!(Pacing::Synchronous.code(), "synchronous");
         assert_eq!(Pacing::Unsynchronized.code(), "unsynchronized");
@@ -2751,43 +3165,78 @@ mod type_i_exact_tests {
 
     #[test]
     fn unsigned8_and_float32_use_the_real_ring_and_encoder_without_changing_source_bits() {
-        let _guard = PAYLOAD_LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PAYLOAD_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for encoding in [PcmEncoding::Unsigned8, PcmEncoding::Float32] {
-            let slot = if encoding == PcmEncoding::Unsigned8 { 1 } else { 4 };
+            let slot = if encoding == PcmEncoding::Unsigned8 {
+                1
+            } else {
+                4
+            };
             let stats = Arc::new(RuntimeStats::new(48_000, 2, 40, 20, 1, 10));
             let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
-            let mut format = test_pcm_format(); format.pcm_encoding = encoding; format.bit_depth = slot * 8;
+            let mut format = test_pcm_format();
+            format.pcm_encoding = encoding;
+            format.bit_depth = slot * 8;
             let hub = crate::events::EventHub::start();
             let shared = StreamShared::new(ring.clone(), stats.clone(), hub, format, slot);
             let mut candidate = super::pcm_ring_hold_tests::pcm_candidate();
-            candidate.format_tag = encoding.format_tag(); candidate.subslot_size = slot;
+            candidate.format_tag = encoding.format_tag();
+            candidate.subslot_size = slot;
             candidate.bit_resolution = slot * 8;
             let source: Vec<u8> = if encoding == PcmEncoding::Unsigned8 {
                 (0..=255u8).cycle().take(1024).collect()
             } else {
                 // Exact IEEE bit patterns: signed zero, infinities, quiet/signaling NaNs, subnormals.
-                [0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc12345, 0x7fa12345,
-                 1, 0x80000001].into_iter().cycle().take(256).flat_map(u32::to_le_bytes).collect()
+                [
+                    0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc12345, 0x7fa12345, 1, 0x80000001,
+                ]
+                .into_iter()
+                .cycle()
+                .take(256)
+                .flat_map(u32::to_le_bytes)
+                .collect()
             };
             assert_eq!(shared.write_bytes(&source).unwrap(), source.len());
             assert!(shared.write_samples(&[0, 0]).is_err());
             assert!(shared.set_software_gain(0.5).is_err());
             let mut scheduler = IsoPacketScheduler::new(48_000, usize::from(slot) * 2, 125);
-            let silence = if encoding == PcmEncoding::Unsigned8 { 0x80 } else { 0 };
+            let silence = if encoding == PcmEncoding::Unsigned8 {
+                0x80
+            } else {
+                0
+            };
             shared.set_paused(true);
-            let prepare = |scheduler: &mut IsoPacketScheduler| prepare_iso_transfer_payload(scheduler,
-                &ring, &stats, &candidate, usize::from(slot), 2, usize::from(slot) * 2,
-                DsdTransportMode::None, false, false).unwrap().unwrap();
+            let prepare = |scheduler: &mut IsoPacketScheduler| {
+                prepare_iso_transfer_payload(
+                    scheduler,
+                    &ring,
+                    &stats,
+                    &candidate,
+                    usize::from(slot),
+                    2,
+                    usize::from(slot) * 2,
+                    DsdTransportMode::None,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .unwrap()
+            };
             let held = prepare(&mut scheduler);
             assert!(held.transfer_buffer.iter().all(|byte| *byte == silence));
             assert_eq!(ring.lock().len_samples() * usize::from(slot), source.len());
-            shared.set_paused(false); shared.drain();
+            shared.set_paused(false);
+            shared.drain();
             let mut restored = Vec::new();
             while ring.lock().len_samples() > 0 {
                 let payload = prepare(&mut scheduler);
                 let music_bytes = payload.music_frames * 2 * usize::from(slot);
                 restored.extend_from_slice(&payload.transfer_buffer[..music_bytes]);
-                assert!(payload.transfer_buffer[music_bytes..].iter().all(|byte| *byte == silence));
+                assert!(payload.transfer_buffer[music_bytes..]
+                    .iter()
+                    .all(|byte| *byte == silence));
             }
             assert_eq!(restored, source);
             shared.flush();
@@ -2799,18 +3248,23 @@ mod type_i_exact_tests {
 
     #[test]
     fn unsigned_and_float_requests_are_distinct_and_type_ii_iii_never_become_pcm() {
-        for request in [crate::StreamRequest::pcm_u8(48_000, 2), crate::StreamRequest::pcm_float32(48_000, 2)] {
+        for request in [
+            crate::StreamRequest::pcm_u8(48_000, 2),
+            crate::StreamRequest::pcm_float32(48_000, 2),
+        ] {
             let format = api::playback_format_from_request(&request).unwrap();
             assert_ne!(format.pcm_encoding, PcmEncoding::Signed);
             let mut candidate = super::pcm_ring_hold_tests::pcm_candidate();
-            candidate.subslot_size = request.bit_depth / 8; candidate.bit_resolution = request.bit_depth;
+            candidate.subslot_size = request.bit_depth / 8;
+            candidate.bit_resolution = request.bit_depth;
             assert!(validate_transport_against_playback_format(&candidate, format).is_err());
             candidate.format_tag = format.pcm_encoding.format_tag();
             assert!(validate_transport_against_playback_format(&candidate, format).is_ok());
         }
         for kind in [2, 3] {
-            let bytes = [16, 0x24, 1, 1, 0, kind, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0,
-                6, 0x24, 2, kind, 4, 32];
+            let bytes = [
+                16, 0x24, 1, 1, 0, kind, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0, 6, 0x24, 2, kind, 4, 32,
+            ];
             assert!(parse_streaming_extra(0x20, &bytes).is_none());
         }
     }
@@ -2821,13 +3275,20 @@ mod ambiguous_pcm_format_tests {
     use super::*;
     #[test]
     fn equal_geometry_signed32_float32_bitmap_never_selects_a_numeric_interpretation() {
-        let mut bytes = [16, 0x24, 1, 1, 0, 1, 5, 0, 0, 0, 2, 3, 0, 0, 0, 0,
-            6, 0x24, 2, 1, 4, 32];
+        let mut bytes = [
+            16, 0x24, 1, 1, 0, 1, 5, 0, 0, 0, 2, 3, 0, 0, 0, 0, 6, 0x24, 2, 1, 4, 32,
+        ];
         assert!(parse_streaming_extra(0x20, &bytes).is_none());
         bytes[6] = 4;
-        assert_eq!(parse_streaming_extra(0x20, &bytes).unwrap().format_tag, FORMAT_TAG_IEEE_FLOAT);
+        assert_eq!(
+            parse_streaming_extra(0x20, &bytes).unwrap().format_tag,
+            FORMAT_TAG_IEEE_FLOAT
+        );
         bytes[6] = 1;
-        assert_eq!(parse_streaming_extra(0x20, &bytes).unwrap().format_tag, FORMAT_TAG_PCM);
+        assert_eq!(
+            parse_streaming_extra(0x20, &bytes).unwrap().format_tag,
+            FORMAT_TAG_PCM
+        );
     }
 }
 
@@ -2838,11 +3299,20 @@ mod empty_reconfigure_drain_tests {
     fn unprimed_empty_stream_drains_without_waiting_for_audio_that_will_never_arrive() {
         let stats = Arc::new(RuntimeStats::new(48_000, 2, 40, 20, 10, 10));
         let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
-        let shared = StreamShared::new(ring, stats.clone(), crate::events::EventHub::start(), test_pcm_format(), 2);
+        let shared = StreamShared::new(
+            ring,
+            stats.clone(),
+            crate::events::EventHub::start(),
+            test_pcm_format(),
+            2,
+        );
         assert!(!stats.started.load(Ordering::Acquire));
-        shared.drain(); assert!(shared.is_drained());
-        shared.flush(); assert!(!shared.is_drained());
+        shared.drain();
+        assert!(shared.is_drained());
+        shared.flush();
+        assert!(!shared.is_drained());
         shared.write_bytes(&[1, 2, 3, 4]).unwrap();
-        shared.drain(); assert!(!shared.is_drained());
+        shared.drain();
+        assert!(!shared.is_drained());
     }
 }

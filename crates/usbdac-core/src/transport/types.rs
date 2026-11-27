@@ -8,12 +8,19 @@ pub(crate) enum DsdTransportMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PcmEncoding { Signed, Unsigned8, Float32 }
+pub(crate) enum PcmEncoding {
+    Signed,
+    Unsigned8,
+    Float32,
+}
 
 impl PcmEncoding {
     pub(super) fn format_tag(self) -> u16 {
-        match self { Self::Signed => FORMAT_TAG_PCM, Self::Unsigned8 => FORMAT_TAG_PCM8,
-            Self::Float32 => FORMAT_TAG_IEEE_FLOAT }
+        match self {
+            Self::Signed => FORMAT_TAG_PCM,
+            Self::Unsigned8 => FORMAT_TAG_PCM8,
+            Self::Float32 => FORMAT_TAG_IEEE_FLOAT,
+        }
     }
 }
 

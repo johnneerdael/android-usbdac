@@ -52,7 +52,11 @@ fn the_configured_queue_sets_the_packets_and_a_transfer_stays_within_32() {
     let deep = IsoQueueGeometry::for_stream(125, 32, 4);
     assert_eq!(deep.packets_per_transfer, 32);
     assert_eq!(deep.transfer_slots, 4);
-    assert_eq!(deep.queued_us(), 16_000, "the 32-packet cap wins over 32 ms");
+    assert_eq!(
+        deep.queued_us(),
+        16_000,
+        "the 32-packet cap wins over 32 ms"
+    );
 
     let shallow = IsoQueueGeometry::for_stream(125, 4, 8);
     assert_eq!(shallow.packets_per_transfer, 4);
@@ -103,13 +107,19 @@ fn application_period_rounds_at_the_endpoint_and_derives_the_slot_count() {
     let slow = IsoQueueGeometry::for_config(32_000, &config);
     assert_eq!((slow.packets_per_transfer, slow.transfer_slots), (1, 2));
 
-    let capped = IsoQueueGeometry::for_config(125, &DacConfig {
-        bus_queue_ms: 64,
-        transfers_in_flight: 16,
-        transfer_period_us: Some(32_000),
-        ..config
-    });
-    assert_eq!((capped.packets_per_transfer, capped.transfer_slots), (32, 7));
+    let capped = IsoQueueGeometry::for_config(
+        125,
+        &DacConfig {
+            bus_queue_ms: 64,
+            transfers_in_flight: 16,
+            transfer_period_us: Some(32_000),
+            ..config
+        },
+    );
+    assert_eq!(
+        (capped.packets_per_transfer, capped.transfer_slots),
+        (32, 7)
+    );
     assert!(capped.packets_in_flight() < 256);
 }
 
@@ -158,9 +168,15 @@ fn consecutive_loss_is_bounded_in_time_as_well_as_in_transfers() {
     // The default geometry keeps the three-transfer bound the transport had.
     assert_eq!(default_geometry(125).max_consecutive_lossy_urbs(), 3);
     // Small transfers need more of them for the same stretch of audio...
-    assert_eq!(IsoQueueGeometry::for_stream(125, 4, 8).max_consecutive_lossy_urbs(), 12);
+    assert_eq!(
+        IsoQueueGeometry::for_stream(125, 4, 8).max_consecutive_lossy_urbs(),
+        12
+    );
     // ...and long ones never go below three.
-    assert_eq!(IsoQueueGeometry::for_stream(125, 64, 4).max_consecutive_lossy_urbs(), 3);
+    assert_eq!(
+        IsoQueueGeometry::for_stream(125, 64, 4).max_consecutive_lossy_urbs(),
+        3
+    );
 }
 
 /// What a transfer carries for each encoding the transport runs, as the output
@@ -204,7 +220,10 @@ fn pcm_dop_and_native_dsd_get_the_same_queue_at_every_interval() {
                 in_flight_packets += packets.len();
                 queued_us += packets.len() as u64 * u64::from(interval);
             }
-            assert!(in_flight_packets < 256, "{name} at {interval} us: {in_flight_packets}");
+            assert!(
+                in_flight_packets < 256,
+                "{name} at {interval} us: {in_flight_packets}"
+            );
             assert_eq!(in_flight_packets, geometry.packets_in_flight());
             assert_eq!(queued_us, 16_000, "{name} at {interval} us");
         }
@@ -366,12 +385,8 @@ fn test_scheduler_rejects_implausible_feedback() {
 #[test]
 fn test_scheduler_352800_hz_dop_carrier_accumulates_exact_second() {
     let bytes_per_frame = 6usize;
-    let mut scheduler = IsoPacketScheduler::with_geometry(
-        352_800,
-        bytes_per_frame,
-        125,
-        default_geometry(125),
-    );
+    let mut scheduler =
+        IsoPacketScheduler::with_geometry(352_800, bytes_per_frame, 125, default_geometry(125));
     let mut frames = Vec::new();
     for _ in 0..(8_000 / scheduler.packets_per_transfer()) {
         frames.extend(transfer_frames(
@@ -438,7 +453,9 @@ fn explicit_feedback_validation_preserves_phase_and_updates_ewma_once() {
     let first = scheduler.next_transfer_packet_bytes();
     let first_frames: usize = first.iter().map(|bytes| bytes / 8).sum();
     // Candidate scans validate without mutating the current rate or phase.
-    for _ in 0..10 { assert!(scheduler.feedback_rate_is_plausible(48.75)); }
+    for _ in 0..10 {
+        assert!(scheduler.feedback_rate_is_plausible(48.75));
+    }
     assert!(scheduler.update_feedback_frames_per_packet(48.75)); // 48.25 * .8 + 48.75 * .2 = 48.35
     let mut total = first_frames;
     let mut remaining_packets = 0usize;

@@ -258,7 +258,11 @@ pub mod usbfs {
             let mut raw = Vec::new();
             file.read_to_end(&mut raw)?;
             let settings = parse_settings(raw.get(18..).unwrap_or(&[]));
-            Ok(Self { file, settings, claimed: Vec::new() })
+            Ok(Self {
+                file,
+                settings,
+                claimed: Vec::new(),
+            })
         }
 
         fn ioctl<T>(&self, request: libc::Ioctl, argument: *mut T) -> io::Result<()> {
@@ -270,7 +274,11 @@ pub mod usbfs {
 
         fn claim(&mut self, interface: u8) -> io::Result<()> {
             // Takes the interface from the kernel's audio driver if it holds it.
-            let mut claim = DisconnectClaim { interface: interface.into(), flags: 0, driver: [0; 256] };
+            let mut claim = DisconnectClaim {
+                interface: interface.into(),
+                flags: 0,
+                driver: [0; 256],
+            };
             self.ioctl(DISCONNECT_CLAIM, &mut claim)?;
             self.claimed.push(interface);
             Ok(())
@@ -288,22 +296,31 @@ pub mod usbfs {
             let mut wanted: Vec<u8> = self
                 .settings
                 .iter()
-                .filter(|s| s.class == 1 && (s.subclass == 1 || (s.subclass == 2 && s.isochronous_out)))
+                .filter(|s| {
+                    s.class == 1 && (s.subclass == 1 || (s.subclass == 2 && s.isochronous_out))
+                })
                 .map(|s| s.number)
                 .collect();
             wanted.sort_unstable();
             wanted.dedup();
             if wanted.is_empty() {
-                return Err(Error::Claim("no AudioControl and playback AudioStreaming interface".into()));
+                return Err(Error::Claim(
+                    "no AudioControl and playback AudioStreaming interface".into(),
+                ));
             }
             for interface in &wanted {
-                self.claim(*interface).map_err(|e| Error::Claim(format!("interface {interface}: {e}")))?;
+                self.claim(*interface)
+                    .map_err(|e| Error::Claim(format!("interface {interface}: {e}")))?;
             }
             Ok(wanted)
         }
 
         fn claim_optional(&mut self, candidates: &[u8]) -> Vec<u8> {
-            candidates.iter().copied().filter(|n| self.claim(*n).is_ok()).collect()
+            candidates
+                .iter()
+                .copied()
+                .filter(|n| self.claim(*n).is_ok())
+                .collect()
         }
     }
 
@@ -314,7 +331,11 @@ pub mod usbfs {
             for interface in std::mem::take(&mut self.claimed) {
                 let mut number: libc::c_uint = interface.into();
                 let _ = self.ioctl(RELEASE_INTERFACE, &mut number);
-                let mut connect = IoctlTransfer { interface: interface.into(), code: CONNECT, data: std::ptr::null_mut() };
+                let mut connect = IoctlTransfer {
+                    interface: interface.into(),
+                    code: CONNECT,
+                    data: std::ptr::null_mut(),
+                };
                 let _ = self.ioctl(IOCTL, &mut connect);
             }
         }
@@ -332,7 +353,12 @@ pub mod usbfs {
             let body = &descriptors[at..at + length];
             match body[1] {
                 // Interface: number, alternate setting, endpoints, class, subclass.
-                4 if length >= 9 => settings.push(Setting { number: body[2], class: body[5], subclass: body[6], isochronous_out: false }),
+                4 if length >= 9 => settings.push(Setting {
+                    number: body[2],
+                    class: body[5],
+                    subclass: body[6],
+                    isochronous_out: false,
+                }),
                 // Endpoint: address (bit 7 is the direction), attributes (bits 0-1 are the transfer type).
                 5 if length >= 7 => {
                     if let Some(last) = settings.last_mut() {
@@ -346,7 +372,9 @@ pub mod usbfs {
         // The settings of one interface share its number: keep the flag if any alternate setting has the endpoint.
         let copy = settings.clone();
         for setting in &mut settings {
-            setting.isochronous_out = copy.iter().any(|s| s.number == setting.number && s.isochronous_out);
+            setting.isochronous_out = copy
+                .iter()
+                .any(|s| s.number == setting.number && s.isochronous_out);
         }
         settings
     }
@@ -395,7 +423,11 @@ type ClaimMore = Box<dyn FnMut(&[u8]) -> Vec<u8> + Send>;
 
 impl AndroidHost {
     pub fn new(fd: RawFd, claimed: Vec<u8>, claim_more: ClaimMore) -> Self {
-        Self { fd, claimed, claim_more }
+        Self {
+            fd,
+            claimed,
+            claim_more,
+        }
     }
 }
 
@@ -423,7 +455,8 @@ pub fn open_from_android(
     device_name: &str,
     config: DacConfig,
 ) -> Result<Dac> {
-    let identity = DeviceInfo::new(vendor_id, product_id, product_name).with_device_name(device_name);
+    let identity =
+        DeviceInfo::new(vendor_id, product_id, product_name).with_device_name(device_name);
     open_dac(host, identity, config)
 }
 ```
@@ -441,7 +474,11 @@ pub fn open_dac(host: &mut dyn UsbHost, identity: DeviceInfo, config: DacConfig)
         let (configuration, candidates) = Dac::feedback_preflight(host.fd(), &info)?;
         let got = host.claim_optional(&candidates);
         info.configuration_id = Some(configuration);
-        info.unavailable_feedback_interfaces = candidates.iter().copied().filter(|n| !got.contains(n)).collect();
+        info.unavailable_feedback_interfaces = candidates
+            .iter()
+            .copied()
+            .filter(|n| !got.contains(n))
+            .collect();
         info.claimed_interfaces.extend(got);
     }
     // Lowers the DAC to at most -40 dB, verifies it, and touches neither the clock nor the audio.
@@ -492,16 +529,30 @@ pub enum Next {
 
 pub fn next_step(error: &Error) -> Next {
     match error {
-        Error::VolumeUnavailable => Next::AskListener("the DAC has no volume control: allow a fixed level and open again"),
-        Error::Claim(_) => Next::AskListener("the system keeps the DAC: replug it and check that nothing else holds it"),
+        Error::VolumeUnavailable => {
+            Next::AskListener("the DAC has no volume control: allow a fixed level and open again")
+        }
+        Error::Claim(_) => Next::AskListener(
+            "the system keeps the DAC: replug it and check that nothing else holds it",
+        ),
         Error::Busy => Next::FixTheHost("another Dac is open in this process: close it first"),
-        Error::Unsupported { .. } => Next::OtherOutput("the DAC has no alternate setting for this format"),
-        Error::ImplicitFeedbackUnsupported => Next::OtherOutput("an asynchronous endpoint without feedback"),
+        Error::Unsupported { .. } => {
+            Next::OtherOutput("the DAC has no alternate setting for this format")
+        }
+        Error::ImplicitFeedbackUnsupported => {
+            Next::OtherOutput("an asynchronous endpoint without feedback")
+        }
         Error::ClockUnverified { .. } => Next::Report("the DAC did not confirm its sampling rate"),
         Error::DeviceLost => Next::AskListener("the DAC was unplugged"),
-        Error::PlatformUnsupported => Next::Report("direct USB needs Linux usbfs: Android or Linux"),
-        Error::InvalidState(_) | Error::InvalidArgument(_) => Next::FixTheHost("the call was not valid in this state"),
-        Error::Transfer(_) | Error::Control(_) => Next::Report("a transfer or class request failed"),
+        Error::PlatformUnsupported => {
+            Next::Report("direct USB needs Linux usbfs: Android or Linux")
+        }
+        Error::InvalidState(_) | Error::InvalidArgument(_) => {
+            Next::FixTheHost("the call was not valid in this state")
+        }
+        Error::Transfer(_) | Error::Control(_) => {
+            Next::Report("a transfer or class request failed")
+        }
         // `Error` is non-exhaustive: a newer library may add variants.
         _ => Next::Report("an error this host does not know"),
     }
@@ -536,11 +587,21 @@ pub struct Negotiated {
 /// Asks for the track's own format. With `allow_nearest` the DAC may run the nearest rate it has, and
 /// the result says so. Takes 100 ms or more: it programs the DAC's clock and reads it back.
 pub fn negotiate(dac: &Dac, track: TrackFormat, allow_nearest: bool) -> Result<Negotiated> {
-    let policy = if allow_nearest { RatePolicy::NearestSupported } else { RatePolicy::Exact };
-    let request = StreamRequest::pcm(track.sample_rate, track.channels, track.bits).with_rate_policy(policy);
+    let policy = if allow_nearest {
+        RatePolicy::NearestSupported
+    } else {
+        RatePolicy::Exact
+    };
+    let request =
+        StreamRequest::pcm(track.sample_rate, track.channels, track.bits).with_rate_policy(policy);
     let format = dac.negotiate(&request)?;
-    let resample_to = format.rate_differs_from_request().then_some(format.sample_rate);
-    Ok(Negotiated { format, resample_to })
+    let resample_to = format
+        .rate_differs_from_request()
+        .then_some(format.sample_rate);
+    Ok(Negotiated {
+        format,
+        resample_to,
+    })
 }
 
 /// Whether the DAC lists the format among its PCM alternate settings, without touching its clock. A
@@ -647,7 +708,11 @@ pub struct Tone {
 
 impl Tone {
     pub fn new(rate: u32, channels: u16) -> Self {
-        Self { rate: f64::from(rate), channels: usize::from(channels), phase: 0.0 }
+        Self {
+            rate: f64::from(rate),
+            channels: usize::from(channels),
+            phase: 0.0,
+        }
     }
 }
 
@@ -750,7 +815,9 @@ struct Shared {
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct Player<R: Ring + 'static> {
@@ -765,7 +832,13 @@ impl<R: Ring + 'static> Player<R> {
     /// Starts the writer thread. The stream starts by itself once the ring holds `start_threshold_ms`
     /// of audio (100 ms by default); `play` is only for after a pause.
     pub fn start(ring: Arc<R>, shape: Shape, source: Box<dyn Source>) -> Self {
-        let shared = Arc::new(Mutex::new(Shared { source, chunk: Vec::new(), taken: 0, ended: false, start_seconds: 0.0 }));
+        let shared = Arc::new(Mutex::new(Shared {
+            source,
+            chunk: Vec::new(),
+            taken: 0,
+            ended: false,
+            start_seconds: 0.0,
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (ring, shared, stop) = (Arc::clone(&ring), Arc::clone(&shared), Arc::clone(&stop));
@@ -774,7 +847,13 @@ impl<R: Ring + 'static> Player<R> {
                 .spawn(move || write_loop(&*ring, shape, &shared, &stop))
                 .expect("spawn the writer thread")
         };
-        Self { ring, shape, shared, stop, writer: Some(writer) }
+        Self {
+            ring,
+            shape,
+            shared,
+            stop,
+            writer: Some(writer),
+        }
     }
 
     /// Keep the writer running while paused: it fills the ring to its target and idles, so a resume
@@ -919,16 +998,29 @@ fn write_loop(ring: &dyn Ring, shape: Shape, shared: &Mutex<Shared>, stop: &Atom
 fn a_seek_drops_the_chunk_that_was_rendered_for_the_old_position() {
     // The ring takes everything, so the chunk in hand is whatever the ring has not accepted yet.
     let ring = FakeRing::new(1_000_000);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 10_000_000 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 10_000_000,
+        }),
+    );
     wait_until("some audio", || ring.written.lock().unwrap().len() > 200);
 
     player.seek(2.0).unwrap();
     assert!(ring.calls().contains(&"flush"));
     let after = ring.written.lock().unwrap().clone();
     // Everything written after the flush comes from the new position.
-    wait_until("audio at the new position", || ring.written.lock().unwrap().len() > after.len() + 100);
+    wait_until("audio at the new position", || {
+        ring.written.lock().unwrap().len() > after.len() + 100
+    });
     let written = ring.written.lock().unwrap().clone();
-    assert!(written.iter().all(|sample| *sample >= 102_000), "old audio was written after the flush: {:?}", &written[..8]);
+    assert!(
+        written.iter().all(|sample| *sample >= 102_000),
+        "old audio was written after the flush: {:?}",
+        &written[..8]
+    );
 }
 ```
 
@@ -954,7 +1046,9 @@ pub fn restore_level(volume: &VolumeControl, remembered_db: Option<f64>) -> Resu
 /// A volume key or a slider. Each call is a USB control transfer (milliseconds, up to a second):
 /// call it from a control thread and not from the writer or a UI thread.
 pub fn nudge(volume: &VolumeControl, up: bool) -> Result<f64> {
-    volume.step(if up { 1 } else { -1 }, 0).map(|state| state.db)
+    volume
+        .step(if up { 1 } else { -1 }, 0)
+        .map(|state| state.db)
 }
 ```
 
@@ -1043,7 +1137,9 @@ fn blocker_text(blocker: BitPerfectBlocker) -> &'static str {
         BitPerfectBlocker::FormatChanged => "the DAC runs another rate than the track has",
         BitPerfectBlocker::ClockUnverified => "the DAC did not confirm its sampling rate",
         BitPerfectBlocker::SoftwareGain => "software gain is on",
-        BitPerfectBlocker::UnsynchronizedAsync => "the DAC has no feedback, so it plays at the nominal rate",
+        BitPerfectBlocker::UnsynchronizedAsync => {
+            "the DAC has no feedback, so it plays at the nominal rate"
+        }
         BitPerfectBlocker::FeedbackUnlocked => "the DAC's timing has not locked yet",
         BitPerfectBlocker::PayloadUnverified => "waiting for real audio",
         BitPerfectBlocker::NoStream => "no stream is running",
@@ -1075,9 +1171,15 @@ pub fn shutdown(player: Player<DacStream>, dac: Dac, device_lost: bool) -> Resul
     let stream = player.stop(); // joins the writer thread
     let stream_result = match Arc::try_unwrap(stream) {
         Ok(stream) => stream.close(),
-        Err(_) => Err(Error::InvalidState("the stream is still shared".to_string())),
+        Err(_) => Err(Error::InvalidState(
+            "the stream is still shared".to_string(),
+        )),
     };
-    let dac_result = if device_lost { dac.close_with(CloseVolume::Forget) } else { dac.close() };
+    let dac_result = if device_lost {
+        dac.close_with(CloseVolume::Forget)
+    } else {
+        dac.close()
+    };
     if matches!(dac_result, Err(Error::Transfer(_))) {
         // The output thread did not stop in time. Keep every claim and the descriptor until it has.
         while !Dac::await_usb_retirement(Duration::from_secs(1)) {}
@@ -1247,8 +1349,11 @@ snapshot. Replace application discovery state on **every** snapshot.
 use usbdac_core::{DeviceInfo, HotplugHub, UsbPermission};
 let hub = HotplugHub::new();
 let events = hub.subscribe();
-let attachment = hub.attached("android-device-name", DeviceInfo::new(1, 2, "DAC"),
-    UsbPermission::Required);
+let attachment = hub.attached(
+    "android-device-name",
+    DeviceInfo::new(1, 2, "DAC"),
+    UsbPermission::Required,
+);
 // Pass attachment.id through the host permission request/callback.
 assert!(hub.permission_changed(attachment.id, UsbPermission::Granted));
 hub.detached(attachment.id);
@@ -1285,7 +1390,7 @@ The existing `VolumeControl` methods remain synchronous. Create one
 I/O to its dedicated worker. No async runtime dependency is required.
 
 ```rust
-use usbdac_core::{VolumeControl, Result};
+use usbdac_core::{Result, VolumeControl};
 async fn change(volume: VolumeControl) -> Result<()> {
 let controls = volume.nonblocking()?;
 let applied = controls.set_db(-45.0)?.await?;

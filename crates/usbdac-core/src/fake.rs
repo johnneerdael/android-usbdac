@@ -94,10 +94,16 @@ impl FakeDac {
         if capacity_frames == 0
             || profiles.is_empty()
             || profiles.iter().any(|r| {
-                !matches!(r.encoding, Encoding::Pcm | Encoding::PcmU8 | Encoding::PcmFloat32)
-                    || r.sample_rate == 0
+                !matches!(
+                    r.encoding,
+                    Encoding::Pcm | Encoding::PcmU8 | Encoding::PcmFloat32
+                ) || r.sample_rate == 0
                     || r.channels == 0
-                    || !match r.encoding { Encoding::PcmU8 => r.bit_depth == 8, Encoding::PcmFloat32 => r.bit_depth == 32, _ => matches!(r.bit_depth, 16 | 24 | 32) }
+                    || !match r.encoding {
+                        Encoding::PcmU8 => r.bit_depth == 8,
+                        Encoding::PcmFloat32 => r.bit_depth == 32,
+                        _ => matches!(r.bit_depth, 16 | 24 | 32),
+                    }
             })
         {
             return Err(Error::InvalidArgument(

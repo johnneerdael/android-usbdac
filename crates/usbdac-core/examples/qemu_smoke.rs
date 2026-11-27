@@ -130,28 +130,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && st.zero_packets == 0;
     stream.pause()?;
     let held_volume = volume(fd)?;
-    let replacement = dac.reconfigure_stream(&stream, &StreamRequest::pcm(48_000, 2, 16),
-        listener.clone(), Duration::from_secs(3))?;
+    let replacement = dac.reconfigure_stream(
+        &stream,
+        &StreamRequest::pcm(48_000, 2, 16),
+        listener.clone(),
+        Duration::from_secs(3),
+    )?;
     assert!(replacement.rollback_cause.is_none());
     assert_eq!(stream.state(), usbdac_core::StreamState::Closed);
     assert_eq!(replacement.stream.state(), usbdac_core::StreamState::Paused);
     assert_eq!(replacement.stream.played_frames(), 0);
-    assert_eq!(volume(fd)?, held_volume, "reconfigure changed hardware volume");
+    assert_eq!(
+        volume(fd)?,
+        held_volume,
+        "reconfigure changed hardware volume"
+    );
     stream = replacement.stream;
     println!("RECONFIGURE_SAME_OWNER_PASS rate=48000 paused=true volume=unchanged");
     // The QEMU descriptor exposes signed16 only: this is a valid request with no matching alternate.
-    let rollback = dac.reconfigure_stream(&stream, &StreamRequest::pcm_float32(48_000, 2),
-        listener.clone(), Duration::from_secs(3))?;
-    assert_eq!(rollback.rollback_cause.as_ref().map(|e| e.code()), Some("unsupported"));
+    let rollback = dac.reconfigure_stream(
+        &stream,
+        &StreamRequest::pcm_float32(48_000, 2),
+        listener.clone(),
+        Duration::from_secs(3),
+    )?;
+    assert_eq!(
+        rollback.rollback_cause.as_ref().map(|e| e.code()),
+        Some("unsupported")
+    );
     assert_eq!(stream.state(), usbdac_core::StreamState::Closed);
     assert_eq!(rollback.stream.state(), usbdac_core::StreamState::Paused);
-    assert_eq!(rollback.stream.format().request, StreamRequest::pcm(48_000, 2, 16));
+    assert_eq!(
+        rollback.stream.format().request,
+        StreamRequest::pcm(48_000, 2, 16)
+    );
     assert_eq!(volume(fd)?, held_volume, "rollback changed hardware volume");
     stream = rollback.stream;
-    for _ in 0..3 { stream.write(&data)?; }
+    for _ in 0..3 {
+        stream.write(&data)?;
+    }
     stream.play()?;
     thread::sleep(Duration::from_millis(100));
-    assert!(stream.played_frames() > 0, "rolled-back stream did not resume real completions");
+    assert!(
+        stream.played_frames() > 0,
+        "rolled-back stream did not resume real completions"
+    );
     assert_eq!(stream.stats().lost_frames, 0);
     println!("RECONFIGURE_ROLLBACK_PASS rate=48000 cause=unsupported resumed=true");
     stream.pause()?;

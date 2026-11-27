@@ -5,8 +5,8 @@
 //! through [`DacConfig::quirks`](crate::DacConfig::quirks).
 
 mod source;
-pub use source::{AlsaQuirkFlag, QuirkPolicy, SourceQuirkEntry, SOURCE_QUIRKS};
 pub(crate) use source::resolve as source_quirks;
+pub use source::{AlsaQuirkFlag, QuirkPolicy, SourceQuirkEntry, SOURCE_QUIRKS};
 
 /// One behaviour switch for a device. Only switches the transport actually
 /// honours are listed.
@@ -80,7 +80,7 @@ struct BuiltinEntry {
 const BUILTIN: &[BuiltinEntry] = &[
     // MOONDROP Dawn Pro: dual CS43131 behind an XMOS-style bridge, DSD_U32_BE.
     BuiltinEntry {
-        vendor_id: 12230, // 0x2FC6
+        vendor_id: 12230,  // 0x2FC6
         product_id: 61546, // 0xF09A
         product_name_contains: "MOONDROP Dawn Pro",
         quirks: &[

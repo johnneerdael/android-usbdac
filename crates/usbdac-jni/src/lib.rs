@@ -13,15 +13,15 @@
 //! block.
 
 mod aaudio;
-mod convert;
 mod capture;
 mod capture_json;
-mod routing;
-mod scarlett;
-mod pioneer;
+mod convert;
 mod json;
 mod listener;
+mod pioneer;
 mod registry;
+mod routing;
+mod scarlett;
 
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JByteBuffer, JObject, JString};
@@ -171,28 +171,42 @@ fn init_logging(level: i32) {
 /// Read-only exact vendor PCM proof before Android detaches its dedicated interface.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn dac_vendor_pcm_preflight<'l>(
-    mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32, device_info_json: JString<'l>,
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    device_info_json: JString<'l>,
 ) -> JString<'l> {
     run(&mut env, |env| {
         let info = json::parse_device_info(&string_of(env, &device_info_json)?)?;
         let profile = Dac::vendor_pcm_preflight(fd, &info)?;
-        java_string(env, &serde_json::json!(profile.map(|(configuration, interface)| serde_json::json!({
-            "configuration_id": configuration, "interface_id": interface,
-        }))))
+        java_string(
+            env,
+            &serde_json::json!(profile.map(|(configuration, interface)| serde_json::json!({
+                "configuration_id": configuration, "interface_id": interface,
+            }))),
+        )
     })
 }
 
 /// Read-only exact vendor PCM configuration and complete interface ownership proof.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn dac_vendor_pcm_claims_preflight<'l>(
-    mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32, device_info_json: JString<'l>,
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+    device_info_json: JString<'l>,
 ) -> JString<'l> {
     run(&mut env, |env| {
         let info = json::parse_device_info(&string_of(env, &device_info_json)?)?;
         let profile = Dac::vendor_pcm_claims_preflight(fd, &info)?;
-        java_string(env, &serde_json::json!(profile.map(|(configuration, interfaces)| serde_json::json!({
-            "configuration_id": configuration, "interfaces": interfaces,
-        }))))
+        java_string(
+            env,
+            &serde_json::json!(
+                profile.map(|(configuration, interfaces)| serde_json::json!({
+                    "configuration_id": configuration, "interfaces": interfaces,
+                }))
+            ),
+        )
     })
 }
 
@@ -246,16 +260,31 @@ pub fn dac_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, da
     run(&mut env, |_env| Ok(registry::retirement_token(dac)? as i64))
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn dac_await_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, token: i64) -> bool {
-    run(&mut env, |_env| registry::await_retirement(token).map_err(Into::into))
+pub fn dac_await_retirement_token<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    token: i64,
+) -> bool {
+    run(&mut env, |_env| {
+        registry::await_retirement(token).map_err(Into::into)
+    })
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn dac_release_retirement_token<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, token: i64) {
-    run(&mut env, |_env| registry::release_retirement(token).map_err(Into::into))
+    run(&mut env, |_env| {
+        registry::release_retirement(token).map_err(Into::into)
+    })
 }
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn dac_await_connection_retirement<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, fd: i32) -> bool {
-    run(&mut env, |_env| Dac::await_connection_retirement(fd, std::time::Duration::from_millis(500)).map_err(Into::into))
+pub fn dac_await_connection_retirement<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    fd: i32,
+) -> bool {
+    run(&mut env, |_env| {
+        Dac::await_connection_retirement(fd, std::time::Duration::from_millis(500))
+            .map_err(Into::into)
+    })
 }
 
 /// Closes the DAC and every stream opened from it. The handle is invalid
@@ -290,10 +319,16 @@ pub fn dac_capabilities<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i
 }
 
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn dac_feedback_trace<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64) -> JString<'l> {
+pub fn dac_feedback_trace<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+) -> JString<'l> {
     run(&mut env, |env| {
         let entry = registry::dac(dac)?;
-        let trace = entry.dac.feedback_trace()
+        let trace = entry
+            .dac
+            .feedback_trace()
             .map(|trace| json::feedback_trace(&trace, entry.dac.info()))
             .unwrap_or(serde_json::Value::Null);
         java_string(env, &trace)
@@ -369,15 +404,29 @@ pub fn stream_open<'l>(
 /// Drains and replaces a stream, retaining its registration on timeout. The replacement
 /// JSON is allocated before atomic registration so an allocation failure cannot leak a handle.
 #[jni_mangle("dev.usbdac.internal.Native")]
-pub fn stream_reconfigure<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>, dac: i64,
-    current: i64, request_json: JString<'l>, timeout_ms: i64, listener: JObject<'l>) -> JString<'l> {
+pub fn stream_reconfigure<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    current: i64,
+    request_json: JString<'l>,
+    timeout_ms: i64,
+    listener: JObject<'l>,
+) -> JString<'l> {
     run(&mut env, |env| {
-        let timeout = u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
+        let timeout =
+            u64::try_from(timeout_ms).map_err(|_| Failure::Bad("negative drain timeout".into()))?;
         let request = json::parse_request(&string_of(env, &request_json)?)?;
         let entry = registry::dac(dac)?;
         let old = registry::stream_for_dac(&entry, current)?;
-        let listener = listener_of(env, &listener)?.ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
-        let report = entry.dac.reconfigure_stream(&old, &request, listener, std::time::Duration::from_millis(timeout))?;
+        let listener = listener_of(env, &listener)?
+            .ok_or_else(|| Failure::Bad("stream listener is required".into()))?;
+        let report = entry.dac.reconfigure_stream(
+            &old,
+            &request,
+            listener,
+            std::time::Duration::from_millis(timeout),
+        )?;
         let id = registry::next_id();
         let format_id = entry.remember_format(report.stream.format().clone());
         let response = serde_json::json!({"stream_id": id,

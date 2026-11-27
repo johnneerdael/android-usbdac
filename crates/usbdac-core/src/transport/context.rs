@@ -5,8 +5,8 @@ use std::{cell::RefCell, collections::HashMap, marker::PhantomData, rc::Rc, sync
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct AttachmentIdentity {
-    device: u64,
-    inode: u64,
+    device: u128,
+    inode: u128,
 }
 type RememberedVolume = Arc<Mutex<OriginalVolumeSlot<HardwareVolumeControl>>>;
 #[derive(Default)]
@@ -82,8 +82,8 @@ impl SessionContext {
         // SAFETY: successful fstat initialized the entire stat structure.
         let stat = unsafe { stat.assume_init() };
         let identity = AttachmentIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
+            device: stat.st_dev as u128,
+            inode: stat.st_ino as u128,
         };
         let mut registry = REGISTRY.lock();
         registry.owners.retain(|_, owner| owner.strong_count() > 0);
@@ -185,8 +185,8 @@ pub(crate) fn await_connection_retirement(fd: RawFd, timeout: Duration) -> Resul
     // SAFETY: successful fstat initialized stat.
     let stat = unsafe { stat.assume_init() };
     let identity = AttachmentIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
+        device: stat.st_dev as u128,
+        inode: stat.st_ino as u128,
     };
     let owner = REGISTRY
         .lock()

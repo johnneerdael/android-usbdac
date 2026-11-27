@@ -159,8 +159,10 @@ impl ClockGraph {
                 // Retain an identifiable truncated multiplier as malformed.
                 // Otherwise its terminal link could become an assumed source.
                 let remainder = &descriptors[index..];
-                if remainder.len() >= 4 && remainder[1] == USB_DT_CS_INTERFACE
-                    && remainder[2] == UAC2_CLOCK_MULTIPLIER {
+                if remainder.len() >= 4
+                    && remainder[1] == USB_DT_CS_INTERFACE
+                    && remainder[2] == UAC2_CLOCK_MULTIPLIER
+                {
                     graph.multiplier_ids.insert(remainder[3]);
                     graph.entities.insert(remainder[3], ClockEntity::Malformed);
                 }
@@ -222,8 +224,11 @@ impl ClockGraph {
                 UAC2_CLOCK_MULTIPLIER if length >= 4 => {
                     graph.multiplier_ids.insert(descriptor[3]);
                     // Audio 2.0 4.7.2.3: both controls must be read-only.
-                    if length == 7 && descriptor[3] != 0 && descriptor[4] != 0
-                        && descriptor[5] == 0x05 {
+                    if length == 7
+                        && descriptor[3] != 0
+                        && descriptor[4] != 0
+                        && descriptor[5] == 0x05
+                    {
                         graph.readable_multipliers.insert(descriptor[3]);
                     }
                     let entity = AudioControlParser
@@ -253,29 +258,44 @@ impl ClockGraph {
             }
             let d = &descriptors[at..at + length];
             at += length;
-            if d[1] != USB_DT_CS_INTERFACE || d[2] == 1 { continue; }
+            if d[1] != USB_DT_CS_INTERFACE || d[2] == 1 {
+                continue;
+            }
             if d.len() < 4 || d[3] == 0 || !ids.insert(d[3]) {
                 return Err("ADC3 ambiguous clock entity ID".into());
             }
             match d[2] {
-                2 => { let t = wire::parse_input_terminal(d).map_err(|e| e.to_string())?;
-                    graph.terminal_clock.insert(t.id, t.clock_id); }
-                3 => { let t = wire::parse_output_terminal(d).map_err(|e| e.to_string())?;
-                    graph.terminal_clock.insert(t.id, t.clock_id); }
-                0x0b => { let c = wire::parse_clock_source(d).map_err(|e| e.to_string())?;
+                2 => {
+                    let t = wire::parse_input_terminal(d).map_err(|e| e.to_string())?;
+                    graph.terminal_clock.insert(t.id, t.clock_id);
+                }
+                3 => {
+                    let t = wire::parse_output_terminal(d).map_err(|e| e.to_string())?;
+                    graph.terminal_clock.insert(t.id, t.clock_id);
+                }
+                0x0b => {
+                    let c = wire::parse_clock_source(d).map_err(|e| e.to_string())?;
                     graph.entities.insert(c.id, ClockEntity::Source);
                     graph.exact_sources.insert(c.id);
-                    graph.source_controls.insert(c.id, c.controls.0); }
-                0x0c => { let c = wire::parse_clock_selector(d).map_err(|e| e.to_string())?;
+                    graph.source_controls.insert(c.id, c.controls.0);
+                }
+                0x0c => {
+                    let c = wire::parse_clock_selector(d).map_err(|e| e.to_string())?;
                     graph.selector_controls.insert(c.id, c.controls.0);
-                    graph.entities.insert(c.id, ClockEntity::Selector(c.sources)); }
-                0x0d => { let c = wire::parse_clock_multiplier(d).map_err(|e| e.to_string())?;
-                    if matches!(c.controls.0 & 3, 1 | 3)
-                        && matches!((c.controls.0 >> 2) & 3, 1 | 3)
+                    graph
+                        .entities
+                        .insert(c.id, ClockEntity::Selector(c.sources));
+                }
+                0x0d => {
+                    let c = wire::parse_clock_multiplier(d).map_err(|e| e.to_string())?;
+                    if matches!(c.controls.0 & 3, 1 | 3) && matches!((c.controls.0 >> 2) & 3, 1 | 3)
                     {
                         graph.readable_multipliers.insert(c.id);
                     }
-                    graph.entities.insert(c.id, ClockEntity::Multiplier(c.source_id)); }
+                    graph
+                        .entities
+                        .insert(c.id, ClockEntity::Multiplier(c.source_id));
+                }
                 _ => {}
             }
         }
@@ -284,39 +304,77 @@ impl ClockGraph {
 
     pub(crate) fn multiplier_choice_source_exact(&self, choice: &ClockChoice) -> bool {
         self.exact_sources.contains(&choice.source_id)
-            && matches!(self.source_controls.get(&choice.source_id).copied().unwrap_or(0) & 3, 1 | 3)
-            && choice.path.iter().all(|h| h.id != 0 && !self.duplicate_ids.contains(&h.id))
+            && matches!(
+                self.source_controls
+                    .get(&choice.source_id)
+                    .copied()
+                    .unwrap_or(0)
+                    & 3,
+                1 | 3
+            )
+            && choice
+                .path
+                .iter()
+                .all(|h| h.id != 0 && !self.duplicate_ids.contains(&h.id))
     }
 
     pub(crate) fn multiplier_readable(&self, id: u8) -> bool {
         self.readable_multipliers.contains(&id) && !self.duplicate_ids.contains(&id)
     }
 
-    pub(crate) fn choice_for_plan(&self, control: u8, terminal: u8, plan: &ClockPlan) -> ClockChoice {
-        let mut path = vec![ClockHop { id: terminal, kind: ClockHopKind::Terminal }];
+    pub(crate) fn choice_for_plan(
+        &self,
+        control: u8,
+        terminal: u8,
+        plan: &ClockPlan,
+    ) -> ClockChoice {
+        let mut path = vec![ClockHop {
+            id: terminal,
+            kind: ClockHopKind::Terminal,
+        }];
         for &id in &plan.path {
             let kind = match self.entities.get(&id) {
                 Some(ClockEntity::Multiplier(_)) => ClockHopKind::Multiplier,
                 Some(ClockEntity::Selector(inputs)) => ClockHopKind::Selector {
-                    selected_pin: plan.selectors.iter().find(|p| p.selector == id).map_or(1, |p| p.target),
+                    selected_pin: plan
+                        .selectors
+                        .iter()
+                        .find(|p| p.selector == id)
+                        .map_or(1, |p| p.target),
                     pin_count: inputs.len() as u8,
                 },
                 _ => ClockHopKind::Source,
             };
             path.push(ClockHop { id, kind });
         }
-        ClockChoice { control_interface: control, source_id: plan.source_id, path, resolution: ClockResolution::Resolved }
+        ClockChoice {
+            control_interface: control,
+            source_id: plan.source_id,
+            path,
+            resolution: ClockResolution::Resolved,
+        }
     }
 
     // Only the affected terminal branch loses legacy fallback; unrelated sparse
     // topologies retain it. Traversal is bounded and never asks hardware.
     pub(crate) fn terminal_may_use_multiplier(&self, terminal: u8) -> bool {
-        let mut pending: Vec<_> = self.terminal_clock.get(&terminal).copied().into_iter().collect();
+        let mut pending: Vec<_> = self
+            .terminal_clock
+            .get(&terminal)
+            .copied()
+            .into_iter()
+            .collect();
         let mut seen = HashSet::new();
         while let Some(id) = pending.pop() {
-            if !seen.insert(id) { continue; }
-            if self.multiplier_ids.contains(&id) { return true; }
-            if let Some(ClockEntity::Selector(inputs)) = self.entities.get(&id) { pending.extend(inputs); }
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.multiplier_ids.contains(&id) {
+                return true;
+            }
+            if let Some(ClockEntity::Selector(inputs)) = self.entities.get(&id) {
+                pending.extend(inputs);
+            }
         }
         false
     }
@@ -749,7 +807,9 @@ impl<F: FnMut(u8) -> Result<u8, String>> ClockSearch<'_, F> {
                     }
                 }
             }
-            Some(ClockEntity::Multiplier(input)) if self.graph.readable_multipliers.contains(&id) => {
+            Some(ClockEntity::Multiplier(input))
+                if self.graph.readable_multipliers.contains(&id) =>
+            {
                 self.walk(*input, path, selectors)?;
             }
             // Missing/malformed entities and unresolved multiplier ratios do
@@ -788,13 +848,25 @@ impl ResolvedClock {
     /// Shared source IDs prove equal sample cadence only without an unknown
     /// multiplier ratio, and only when the source is actually described.
     pub(crate) fn proves_identity_cadence(&self) -> bool {
-        if self.assumed_source || self.hops.iter().any(|hop| matches!(hop.kind, ClockHopKind::Multiplier)) {
+        if self.assumed_source
+            || self
+                .hops
+                .iter()
+                .any(|hop| matches!(hop.kind, ClockHopKind::Multiplier))
+        {
             return false;
         }
-        let factors: Vec<_> = self.hops.iter().filter_map(|hop| match hop.kind {
-            ClockHopKind::RateMultiplier { numerator, denominator } => Some((numerator, denominator)),
-            _ => None,
-        }).collect();
+        let factors: Vec<_> = self
+            .hops
+            .iter()
+            .filter_map(|hop| match hop.kind {
+                ClockHopKind::RateMultiplier {
+                    numerator,
+                    denominator,
+                } => Some((numerator, denominator)),
+                _ => None,
+            })
+            .collect();
         RateRatio::from_factors(&factors) == Ok(RateRatio::IDENTITY)
     }
 }
@@ -908,7 +980,10 @@ mod implicit_clock_tests {
             path: vec![11, 10],
             hops: vec![ClockHop {
                 id: 11,
-                kind: ClockHopKind::RateMultiplier { numerator: 3, denominator: 2 },
+                kind: ClockHopKind::RateMultiplier {
+                    numerator: 3,
+                    denominator: 2,
+                },
             }],
             assumed_source: false,
         };
@@ -916,13 +991,22 @@ mod implicit_clock_tests {
         assert!(!clock.proves_identity_cadence());
         clock.hops.push(ClockHop {
             id: 12,
-            kind: ClockHopKind::RateMultiplier { numerator: 2, denominator: 3 },
+            kind: ClockHopKind::RateMultiplier {
+                numerator: 2,
+                denominator: 3,
+            },
         });
         assert!(clock.proves_identity_cadence());
-        clock.hops.push(ClockHop { id: 13, kind: ClockHopKind::Multiplier });
+        clock.hops.push(ClockHop {
+            id: 13,
+            kind: ClockHopKind::Multiplier,
+        });
         assert!(!clock.proves_identity_cadence());
         clock.hops.pop();
-        clock.hops[0].kind = ClockHopKind::RateMultiplier { numerator: 0, denominator: 1 };
+        clock.hops[0].kind = ClockHopKind::RateMultiplier {
+            numerator: 0,
+            denominator: 1,
+        };
         assert!(!clock.proves_identity_cadence());
     }
 }
@@ -962,12 +1046,16 @@ mod adc3_multiplier_graph_tests {
     fn adc3_multiplier_paths_remain_bounded_and_require_described_sources() {
         let mut missing = descriptors(0x05);
         missing.truncate(31);
-        assert!(ClockGraph::parse_adc3(&missing).unwrap()
-            .enumerate_plans(1, |_| unreachable!()).is_err());
+        assert!(ClockGraph::parse_adc3(&missing)
+            .unwrap()
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
         let mut cycle = descriptors(0x05);
         cycle[24] = 11;
-        assert!(ClockGraph::parse_adc3(&cycle).unwrap()
-            .enumerate_plans(1, |_| unreachable!()).is_err());
+        assert!(ClockGraph::parse_adc3(&cycle)
+            .unwrap()
+            .enumerate_plans(1, |_| unreachable!())
+            .is_err());
     }
 }
 
@@ -1051,7 +1139,9 @@ mod selectable_clock_tests {
         assert!(clock_validity(12, || Err("advertised read failed".into())).is_err());
         assert!(clock_validity(8, || panic!("reserved must not be read")).is_err());
         assert_eq!(
-            clock_validity(0xffff_fff3, || panic!("high ADC3 bits must not imply validity")),
+            clock_validity(0xffff_fff3, || panic!(
+                "high ADC3 bits must not imply validity"
+            )),
             Ok(ClockValidity::Unreported)
         );
         let plans = selector(3).enumerate_plans(1, |_| Ok(1)).unwrap();
@@ -1247,7 +1337,9 @@ mod selectable_clock_tests {
 mod adc3_plan_tests {
     use super::*;
     fn descriptors(controls: u32) -> Vec<u8> {
-        let mut bytes = vec![20, 0x24, 2, 1, 1, 1, 0, 10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let mut bytes = vec![
+            20, 0x24, 2, 1, 1, 1, 0, 10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        ];
         bytes.extend_from_slice(&[13, 0x24, 0x0c, 10, 2, 20, 21]);
         bytes.extend_from_slice(&controls.to_le_bytes());
         bytes.extend_from_slice(&[0, 0]);
@@ -1262,9 +1354,19 @@ mod adc3_plan_tests {
     fn adc3_current_first_enumeration_preserves_wide_controls_and_pin_snapshot() {
         let graph = ClockGraph::parse_adc3(&descriptors(0x8000_0003)).unwrap();
         let plans = graph.enumerate_plans(1, |_| Ok(2)).unwrap();
-        assert_eq!(plans.iter().map(|p| p.source_id).collect::<Vec<_>>(), vec![21, 20]);
+        assert_eq!(
+            plans.iter().map(|p| p.source_id).collect::<Vec<_>>(),
+            vec![21, 20]
+        );
         assert_eq!(plans[1].source_controls, 0x8000_0007);
-        assert_eq!(plans[1].selectors, vec![ClockPinPlan { selector: 10, original: 2, target: 1 }]);
+        assert_eq!(
+            plans[1].selectors,
+            vec![ClockPinPlan {
+                selector: 10,
+                original: 2,
+                target: 1
+            }]
+        );
     }
     #[test]
     fn adc3_readonly_invalid_and_duplicate_selectors_cannot_mutate() {
@@ -1283,26 +1385,44 @@ mod adc3_plan_tests {
 mod uac2_exact_multiplier_graph_tests {
     use super::*;
     fn descriptors(controls: u8) -> Vec<u8> {
-        vec![8,0x24,2,1,0,0,0,11, 7,0x24,0x0c,11,10,controls,0, 8,0x24,0x0a,10,0,5,0,0]
+        vec![
+            8, 0x24, 2, 1, 0, 0, 0, 11, 7, 0x24, 0x0c, 11, 10, controls, 0, 8, 0x24, 0x0a, 10, 0,
+            5, 0, 0,
+        ]
     }
     #[test]
     fn only_exact_readonly_multiplier_controls_produce_plans() {
         for controls in 0..=15 {
             let graph = ClockGraph::parse(&descriptors(controls));
-            assert_eq!(graph.enumerate_plans(1, |_| unreachable!()).is_ok(), controls == 5);
+            assert_eq!(
+                graph.enumerate_plans(1, |_| unreachable!()).is_ok(),
+                controls == 5
+            );
         }
         let graph = ClockGraph::parse(&descriptors(5));
-        let plan = graph.enumerate_plans(1, |_| unreachable!()).unwrap().remove(0);
-        assert_eq!(plan.path, vec![11,10]);
-        assert!(matches!(graph.choice_for_plan(0,1,&plan).path[1].kind, ClockHopKind::Multiplier));
+        let plan = graph
+            .enumerate_plans(1, |_| unreachable!())
+            .unwrap()
+            .remove(0);
+        assert_eq!(plan.path, vec![11, 10]);
+        assert!(matches!(
+            graph.choice_for_plan(0, 1, &plan).path[1].kind,
+            ClockHopKind::Multiplier
+        ));
     }
     #[test]
     fn malformed_multiplier_branch_cannot_erase_into_fallback() {
-        let graph = ClockGraph::parse(&[8,0x24,2,1,0,0,0,11, 4,0x24,0x0c,11, 8,0x24,0x0a,10,0,5,0,0]);
-        assert!(graph.select_clock(0,Some(1), |_| unreachable!()).is_err());
+        let graph = ClockGraph::parse(&[
+            8, 0x24, 2, 1, 0, 0, 0, 11, 4, 0x24, 0x0c, 11, 8, 0x24, 0x0a, 10, 0, 5, 0, 0,
+        ]);
+        assert!(graph.select_clock(0, Some(1), |_| unreachable!()).is_err());
         // An unrelated missing terminal retains the historical source fallback.
-        assert!(graph.select_clock(0,Some(2), |_| unreachable!()).is_ok());
-        let truncated = ClockGraph::parse(&[8,0x24,2,1,0,0,0,11, 8,0x24,0x0a,10,0,5,0,0, 7,0x24,0x0c,11]);
-        assert!(truncated.select_clock(0,Some(1), |_| unreachable!()).is_err());
+        assert!(graph.select_clock(0, Some(2), |_| unreachable!()).is_ok());
+        let truncated = ClockGraph::parse(&[
+            8, 0x24, 2, 1, 0, 0, 0, 11, 8, 0x24, 0x0a, 10, 0, 5, 0, 0, 7, 0x24, 0x0c, 11,
+        ]);
+        assert!(truncated
+            .select_clock(0, Some(1), |_| unreachable!())
+            .is_err());
     }
 }

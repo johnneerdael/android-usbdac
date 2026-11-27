@@ -21,9 +21,7 @@ impl DescriptorFactory {
 
     pub fn create(&self, data: &[u8]) -> Result<DescriptorKind, DescriptorError> {
         if data.len() < 2 {
-            return Err(DescriptorError::Invalid(
-                "descriptor too short".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("descriptor too short".to_string()));
         }
         match data[1] {
             USB_DT_INTERFACE_ASSOCIATION => parse_iad_internal(data).map(DescriptorKind::Iad),

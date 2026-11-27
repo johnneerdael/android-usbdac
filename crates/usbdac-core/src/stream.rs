@@ -175,7 +175,11 @@ pub(crate) struct StreamInner {
 }
 
 impl StreamInner {
-    pub(crate) fn new(dac: Arc<DacShared>, handle: StreamHandle, format: StreamFormat) -> Arc<Self> {
+    pub(crate) fn new(
+        dac: Arc<DacShared>,
+        handle: StreamHandle,
+        format: StreamFormat,
+    ) -> Arc<Self> {
         Arc::new(Self {
             dac,
             shared: Arc::clone(&handle.shared),
@@ -298,15 +302,25 @@ impl DacStream {
     pub(crate) fn reconfigure_identity(&self, owner: &Arc<DacShared>) -> Result<usize> {
         self.ensure_open()?;
         if !Arc::ptr_eq(owner, &self.inner.dac) {
-            return Err(Error::InvalidArgument("stream belongs to another DAC session".into()));
+            return Err(Error::InvalidArgument(
+                "stream belongs to another DAC session".into(),
+            ));
         }
-        if self.inner.handle.lock().as_ref().is_some_and(|handle| handle.capture.is_some()) {
+        if self
+            .inner
+            .handle
+            .lock()
+            .as_ref()
+            .is_some_and(|handle| handle.capture.is_some())
+        {
             return Err(Error::Unsupported { reason: "reconfigure the duplex pair explicitly; playback-only reconfiguration is refused".into(), offered: vec![] });
         }
         Ok(self.inner.usb_handle_identity)
     }
 
-    pub(crate) fn retire_for_reconfigure(&self) -> Result<()> { self.inner.close() }
+    pub(crate) fn retire_for_reconfigure(&self) -> Result<()> {
+        self.inner.close()
+    }
 
     /// The wire format this stream runs.
     pub fn format(&self) -> &StreamFormat {
@@ -517,7 +531,11 @@ impl DacStream {
         let shared = self.shared();
         let stats = &shared.stats;
         let feedback_last = stats.feedback_last_report_ms.load(Relaxed);
-        let elapsed_ms = stats.started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms = stats
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         let verdicts = if self.inner.is_closed() {
             Default::default()
         } else {
@@ -556,7 +574,8 @@ impl DacStream {
             adaptive_queue_slots: stats.adaptive_queue_slots.load(Relaxed),
             adaptive_queue_us: stats.adaptive_queue_us.load(Relaxed),
 
-            effective_rate_hz: stats.effective_consumer_rate_milli_hz.load(Relaxed) as f64 / 1_000.0,
+            effective_rate_hz: stats.effective_consumer_rate_milli_hz.load(Relaxed) as f64
+                / 1_000.0,
             feedback_active: stats.feedback_locked.load(Relaxed),
             feedback_reports: stats.feedback_reports.load(Relaxed),
             feedback_timeouts: stats.feedback_timeouts.load(Relaxed),

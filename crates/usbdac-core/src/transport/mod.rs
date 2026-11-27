@@ -12,17 +12,16 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use crate::clock_resolution::{audio_control_descriptors_from_config, ClockChoice, ClockGraph};
+use crate::descriptors::{
+    AudioControlParser, DescriptorIter, FeatureUnit, InputTerminal, OutputTerminal,
+};
+use crate::endpoint::{select_explicit_feedback_endpoint, FeedbackEndpointCandidate};
 use crate::error::Error;
 use crate::events::EventSink;
 use crate::flush_cancel::{
     classify_completion, flush_cancel_targets, wait_for_acknowledgements, Completion,
     FLUSH_CANCEL_TIMEOUT,
 };
-use crate::stream::BitPerfectBlocker;
-use crate::descriptors::{
-    AudioControlParser, DescriptorIter, FeatureUnit, InputTerminal, OutputTerminal,
-};
-use crate::endpoint::{select_explicit_feedback_endpoint, FeedbackEndpointCandidate};
 use crate::iso_packet_scheduler::{IsoPacketScheduler, IsoQueueGeometry};
 use crate::iso_packet_validation::{
     account_timed_out_transfer, iso_transfer_status_label, validate_iso_packet_descriptors,
@@ -36,12 +35,12 @@ use crate::output_position::{
 };
 use crate::payload_audit_latch::PayloadAuditLatch;
 use crate::settings::settings;
+use crate::stream::BitPerfectBlocker;
 #[cfg(test)]
 use crate::volume_control::quantize_volume;
 use crate::volume_control::{
-    parse_uac2_volume_ranges,
-    read_hardware_volume_snapshot, volume_bounds, AudioControlProtocol, OriginalVolumeSlot,
-    RawRange,
+    parse_uac2_volume_ranges, read_hardware_volume_snapshot, volume_bounds, AudioControlProtocol,
+    OriginalVolumeSlot, RawRange,
 };
 use libusb1_sys::{
     constants::{
@@ -140,11 +139,11 @@ const USB_FEEDBACK_STALE_WARN_MS: u64 = 500;
 const USB_PAYLOAD_FLICKER_GRACE_MS: u64 = 1500;
 const USB_TIMING_LOG_INTERVAL: u64 = 128;
 
-pub(crate) mod api;
-pub(crate) mod capture_stream;
-mod capture_rate;
-pub(crate) mod duplex;
 mod adc3;
+pub(crate) mod api;
+mod capture_rate;
+pub(crate) mod capture_stream;
+pub(crate) mod duplex;
 use adc3::*;
 mod alternate_controls;
 mod audio_status;
@@ -153,29 +152,29 @@ mod encode;
 mod endpoint_geometry;
 mod endpoint_lock;
 mod iso;
-mod negotiate;
 mod native_dsd;
+mod negotiate;
 use native_dsd::*;
+pub(crate) mod context;
+#[cfg(test)]
+pub(crate) mod fake_dac;
 mod output;
 mod playback_map;
 mod ring;
 pub(crate) mod routing_hw;
 mod scan;
-mod vendor_pcm;
 pub(crate) mod session;
-pub(crate) mod context;
 pub(crate) mod shared;
-mod stream_open;
 mod standard_feedforward;
-mod types;
-mod uac2_live_alternate;
-mod uac1_status;
-mod usbfs;
-pub(crate) mod volume_hw;
-#[cfg(test)]
-pub(crate) mod fake_dac;
+mod stream_open;
 #[cfg(test)]
 mod tests;
+mod types;
+mod uac1_status;
+mod uac2_live_alternate;
+mod usbfs;
+mod vendor_pcm;
+pub(crate) mod volume_hw;
 
 use clock::*;
 use encode::*;
@@ -200,9 +199,9 @@ use implicit::*;
 /// Exercise the same bounded parsers used for untrusted USB control replies.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn fuzz_transport_bytes(data: &[u8]) {
-    for speed in [Speed::Full,Speed::High,Speed::Super,Speed::SuperPlus] {
-        for interval in [0,125,250,1000,4_096_000] {
-            let _ = iso::decode_feedback_report(data,interval,speed);
+    for speed in [Speed::Full, Speed::High, Speed::Super, Speed::SuperPlus] {
+        for interval in [0, 125, 250, 1000, 4_096_000] {
+            let _ = iso::decode_feedback_report(data, interval, speed);
         }
     }
     let _ = clock::parse_sampling_frequency_ranges(data);
@@ -213,7 +212,13 @@ pub(crate) fn fuzz_transport_bytes(data: &[u8]) {
 mod fuzz_transport_regression {
     #[test]
     fn malformed_short_and_extreme_replies_remain_bounded() {
-        for bytes in [&[][..], &[0][..], &[0xff,0xff][..], &[0;8][..], &[0xff;514][..]] {
+        for bytes in [
+            &[][..],
+            &[0][..],
+            &[0xff, 0xff][..],
+            &[0; 8][..],
+            &[0xff; 514][..],
+        ] {
             super::fuzz_transport_bytes(bytes);
         }
     }

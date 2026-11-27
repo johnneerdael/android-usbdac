@@ -87,23 +87,41 @@ pub(super) struct IsoTransferSlot {
 }
 
 pub(super) fn data_packet_prefix_bytes() -> usize {
-    if settings().source_has(crate::Quirk::TxLengthPrefix) {4} else {0}
+    if settings().source_has(crate::Quirk::TxLengthPrefix) {
+        4
+    } else {
+        0
+    }
 }
 
-fn add_tx_length_prefix(payload:&mut IsoTransferPayload) -> Result<(),String> {
-    let expected=payload.packet_sizes.iter().try_fold(0usize,|sum,size|sum.checked_add(*size)).ok_or("ISO payload size overflow")?;
-    if expected!=payload.transfer_buffer.len() {return Err("TX_LENGTH payload schedule changed".into());}
-    let capacity=expected.checked_add(payload.packet_sizes.len().checked_mul(4).ok_or("TX_LENGTH header count overflow")?).ok_or("TX_LENGTH wire capacity overflow")?;
-    let mut wire=Vec::with_capacity(capacity);
-    let mut offset=0;
-    for size in &mut payload.packet_sizes {
-        let length=u32::try_from(*size).map_err(|_|"TX_LENGTH audio span too large")?;
-        wire.extend_from_slice(&length.to_le_bytes());
-        wire.extend_from_slice(&payload.transfer_buffer[offset..offset+*size]);
-        offset+=*size;
-        *size+=4;
+fn add_tx_length_prefix(payload: &mut IsoTransferPayload) -> Result<(), String> {
+    let expected = payload
+        .packet_sizes
+        .iter()
+        .try_fold(0usize, |sum, size| sum.checked_add(*size))
+        .ok_or("ISO payload size overflow")?;
+    if expected != payload.transfer_buffer.len() {
+        return Err("TX_LENGTH payload schedule changed".into());
     }
-    payload.transfer_buffer=wire;
+    let capacity = expected
+        .checked_add(
+            payload
+                .packet_sizes
+                .len()
+                .checked_mul(4)
+                .ok_or("TX_LENGTH header count overflow")?,
+        )
+        .ok_or("TX_LENGTH wire capacity overflow")?;
+    let mut wire = Vec::with_capacity(capacity);
+    let mut offset = 0;
+    for size in &mut payload.packet_sizes {
+        let length = u32::try_from(*size).map_err(|_| "TX_LENGTH audio span too large")?;
+        wire.extend_from_slice(&length.to_le_bytes());
+        wire.extend_from_slice(&payload.transfer_buffer[offset..offset + *size]);
+        offset += *size;
+        *size += 4;
+    }
+    payload.transfer_buffer = wire;
     Ok(())
 }
 
@@ -124,7 +142,11 @@ pub(super) struct IsoTransferPayload {
 }
 
 impl IsoTransferSlot {
-    pub(super) fn new(slot_index: usize, packet_count: usize, buffer_capacity: usize) -> Result<Self, String> {
+    pub(super) fn new(
+        slot_index: usize,
+        packet_count: usize,
+        buffer_capacity: usize,
+    ) -> Result<Self, String> {
         let completion = Arc::new(IsoTransferCompletion::new());
         let user_data = Box::new(IsoTransferUserData {
             completion,
@@ -169,8 +191,13 @@ impl IsoTransferSlot {
         self.submit_with_timeout(handle, endpoint, payload, ISO_TRANSFER_TIMEOUT_MS)
     }
 
-    pub(super) fn submit_with_timeout(&mut self, handle: &DeviceHandle<Context>, endpoint: u8,
-        mut payload: IsoTransferPayload, timeout_ms: u32) -> Result<(), String> {
+    pub(super) fn submit_with_timeout(
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        endpoint: u8,
+        mut payload: IsoTransferPayload,
+        timeout_ms: u32,
+    ) -> Result<(), String> {
         if self.in_flight {
             return Err("isochronous transfer slot already has a transfer in flight".to_string());
         }
@@ -251,33 +278,68 @@ impl IsoTransferSlot {
     }
 
     /// Reuse the capture buffer without copying or exposing captured audio.
-    pub(super) fn submit_capture(&mut self, handle: &DeviceHandle<Context>, endpoint: u8, packet_bytes: usize,
-        trace: Option<&crate::feedback_diagnostics::FeedbackRecorder>) -> Result<(), String> {
-        if self.in_flight { return Err("capture slot already submitted".into()); }
-        if endpoint & 0x80 == 0 || packet_bytes == 0 || packet_bytes > u32::MAX as usize
-            || self.packet_sizes.len() > i32::MAX as usize {
+    pub(super) fn submit_capture(
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        endpoint: u8,
+        packet_bytes: usize,
+        trace: Option<&crate::feedback_diagnostics::FeedbackRecorder>,
+    ) -> Result<(), String> {
+        if self.in_flight {
+            return Err("capture slot already submitted".into());
+        }
+        if endpoint & 0x80 == 0
+            || packet_bytes == 0
+            || packet_bytes > u32::MAX as usize
+            || self.packet_sizes.len() > i32::MAX as usize
+        {
             return Err("invalid capture request geometry".into());
         }
         self.retirement_context = Some(handle.context().clone());
         unsafe {
             let data = &mut *self.user_data;
             data.completion.reset();
-            let bytes = packet_bytes.checked_mul(self.packet_sizes.len()).ok_or("capture size overflow")?;
-            if bytes > data.buffer.len() || bytes > i32::MAX as usize { return Err("capture buffer too small or request too large".into()); }
-            libusb_fill_iso_transfer(self.transfer.as_mut(), handle.as_raw(), endpoint,
-                data.buffer.as_mut_ptr(), bytes as i32, self.packet_sizes.len() as i32,
-                iso_transfer_callback, self.user_data as *mut c_void, ISO_TRANSFER_TIMEOUT_MS);
+            let bytes = packet_bytes
+                .checked_mul(self.packet_sizes.len())
+                .ok_or("capture size overflow")?;
+            if bytes > data.buffer.len() || bytes > i32::MAX as usize {
+                return Err("capture buffer too small or request too large".into());
+            }
+            libusb_fill_iso_transfer(
+                self.transfer.as_mut(),
+                handle.as_raw(),
+                endpoint,
+                data.buffer.as_mut_ptr(),
+                bytes as i32,
+                self.packet_sizes.len() as i32,
+                iso_transfer_callback,
+                self.user_data as *mut c_void,
+                ISO_TRANSFER_TIMEOUT_MS,
+            );
             for index in 0..self.packet_sizes.len() {
-                (*self.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(index)).length = packet_bytes as u32;
+                (*self
+                    .transfer
+                    .as_mut()
+                    .iso_packet_desc
+                    .as_mut_ptr()
+                    .add(index))
+                .length = packet_bytes as u32;
             }
             let result = libusb_submit_transfer(self.transfer.as_ptr());
             if let Some(trace) = trace {
-                trace.record(crate::FeedbackTraceEvent::Submit { slot: Some(self.slot_index), status: result });
+                trace.record(crate::FeedbackTraceEvent::Submit {
+                    slot: Some(self.slot_index),
+                    status: result,
+                });
             }
             if result != 0 {
-                return Err(if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
-                    "USB DAC disconnected (implicit capture submit)".into()
-                } else { format!("implicit capture submit failed: {}", result) });
+                return Err(
+                    if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                        "USB DAC disconnected (implicit capture submit)".into()
+                    } else {
+                        format!("implicit capture submit failed: {}", result)
+                    },
+                );
             }
             self.packet_sizes.fill(packet_bytes);
             self.generation = self.generation.saturating_add(1);
@@ -303,7 +365,10 @@ impl IsoTransferSlot {
         })
     }
 
-    pub(super) fn validate_packets(&self, acceptance: PacketAcceptance) -> Result<CompletionStats, String> {
+    pub(super) fn validate_packets(
+        &self,
+        acceptance: PacketAcceptance,
+    ) -> Result<CompletionStats, String> {
         let transfer = unsafe { self.transfer.as_ref() };
         validate_iso_packet_results(transfer, &self.packet_sizes, acceptance).map_err(|error| {
             format!(
@@ -370,9 +435,15 @@ impl Drop for IsoTransferSlot {
             if let Some(context) = self.retirement_context.clone() {
                 let mut warned = false;
                 while self.in_flight {
-                    if self.take_completion().is_some() { self.mark_completed(); break; }
+                    if self.take_completion().is_some() {
+                        self.mark_completed();
+                        break;
+                    }
                     if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
-                        if !warned { log_warn!("USB unwind cancellation retirement pending: {}", error); warned = true; }
+                        if !warned {
+                            log_warn!("USB unwind cancellation retirement pending: {}", error);
+                            warned = true;
+                        }
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -409,18 +480,25 @@ impl InterruptTransferSlot {
         endpoint: u8,
     ) -> Result<(), Error> {
         if self.slot.in_flight {
-            return Err(Error::InvalidState("interrupt transfer already in flight".into()));
+            return Err(Error::InvalidState(
+                "interrupt transfer already in flight".into(),
+            ));
         }
         if endpoint & 0x80 == 0 || endpoint & 0x70 != 0 || endpoint & 0x0f == 0 {
-            return Err(Error::InvalidArgument("invalid interrupt IN endpoint".into()));
+            return Err(Error::InvalidArgument(
+                "invalid interrupt IN endpoint".into(),
+            ));
         }
 
         unsafe {
             let data = &mut *self.slot.user_data;
-            if self.packet_bytes == 0 || self.packet_bytes > i32::MAX as usize
+            if self.packet_bytes == 0
+                || self.packet_bytes > i32::MAX as usize
                 || self.packet_bytes > data.buffer.len()
             {
-                return Err(Error::InvalidArgument("invalid interrupt transfer capacity".into()));
+                return Err(Error::InvalidArgument(
+                    "invalid interrupt transfer capacity".into(),
+                ));
             }
             data.completion.reset();
             self.slot.retirement_context = Some(handle.context().clone());
@@ -436,11 +514,13 @@ impl InterruptTransferSlot {
             );
             let result = libusb_submit_transfer(self.slot.transfer.as_ptr());
             if result != 0 {
-                return Err(if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
-                    Error::DeviceLost
-                } else {
-                    Error::Transfer(format!("interrupt submit failed with code {}", result))
-                });
+                return Err(
+                    if result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                        Error::DeviceLost
+                    } else {
+                        Error::Transfer(format!("interrupt submit failed with code {}", result))
+                    },
+                );
             }
         }
         self.slot.submitted_endpoint = endpoint;
@@ -539,17 +619,26 @@ fn feedback_poll_geometry(endpoint: FeedbackEndpoint, bus_queue_ms: u32) -> (usi
 }
 
 impl FeedbackTransfers {
-    pub(super) fn new(endpoint: FeedbackEndpoint, bus_queue_ms: u32,
-        compatibility: FeedbackCompatibility) -> Result<Self, String> {
+    pub(super) fn new(
+        endpoint: FeedbackEndpoint,
+        bus_queue_ms: u32,
+        compatibility: FeedbackCompatibility,
+    ) -> Result<Self, String> {
         let (count, packets_per_slot) = feedback_poll_geometry(endpoint, bus_queue_ms);
         let slots = (0..count)
             .map(|_| FeedbackTransferSlot::new(endpoint, packets_per_slot))
             .collect::<Result<_, _>>()?;
-        Ok(Self { slots, pending: VecDeque::with_capacity(count), compatibility })
+        Ok(Self {
+            slots,
+            pending: VecDeque::with_capacity(count),
+            compatibility,
+        })
     }
 
     pub(super) fn start(
-        &mut self, handle: &DeviceHandle<Context>, counters: &mut FeedbackCounters,
+        &mut self,
+        handle: &DeviceHandle<Context>,
+        counters: &mut FeedbackCounters,
     ) -> Result<(), FeedbackFault> {
         for index in 0..self.slots.len() {
             self.submit(index, handle, counters, index == 0)?;
@@ -567,7 +656,10 @@ impl FeedbackTransfers {
     }
 
     fn submit(
-        &mut self, index: usize, handle: &DeviceHandle<Context>, counters: &mut FeedbackCounters,
+        &mut self,
+        index: usize,
+        handle: &DeviceHandle<Context>,
+        counters: &mut FeedbackCounters,
         first: bool,
     ) -> Result<(), FeedbackFault> {
         let slot = &mut self.slots[index];
@@ -576,7 +668,10 @@ impl FeedbackTransfers {
     }
 
     fn record_submission(
-        &mut self, index: usize, result: Result<(), String>, counters: &mut FeedbackCounters,
+        &mut self,
+        index: usize,
+        result: Result<(), String>,
+        counters: &mut FeedbackCounters,
         first: bool,
     ) -> Result<(), FeedbackFault> {
         let slot = &mut self.slots[index];
@@ -585,7 +680,9 @@ impl FeedbackTransfers {
             Ok(()) => self.pending.push_back(index),
             Err(error) => {
                 counters.errors = counters.errors.saturating_add(1);
-                if let Some(fault) = feedback_submit_failure(error.clone(), slot.submit_no_device, first) {
+                if let Some(fault) =
+                    feedback_submit_failure(error.clone(), slot.submit_no_device, first)
+                {
                     return Err(fault);
                 }
                 slot.retry_at = Instant::now() + Duration::from_millis(5);
@@ -617,12 +714,10 @@ impl FeedbackTransferSlot {
     fn new(endpoint: FeedbackEndpoint, packet_count: usize) -> Result<Self, String> {
         let packet_bytes = endpoint.max_packet_bytes.max(4);
 
-        let poll_window_ms = ((packet_count as u64)
-            .saturating_mul(endpoint.service_interval_us as u64)
-            / 1_000)
-            .max(1) as u32;
-        let timeout_ms =
-            USB_FEEDBACK_TIMEOUT_MS.max(poll_window_ms.saturating_add(20));
+        let poll_window_ms =
+            ((packet_count as u64).saturating_mul(endpoint.service_interval_us as u64) / 1_000)
+                .max(1) as u32;
+        let timeout_ms = USB_FEEDBACK_TIMEOUT_MS.max(poll_window_ms.saturating_add(20));
 
         let completion = Arc::new(IsoTransferCompletion::new());
         let user_data = Box::new(IsoTransferUserData {
@@ -732,26 +827,63 @@ impl FeedbackTransferSlot {
         completion.take()
     }
 
-    fn newest_valid_report(&mut self, scheduler: &IsoPacketScheduler, service_us: u32,
-        speed: Speed, max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
-        actual_length: usize, transfer_status: i32,
-        compatibility: &mut FeedbackCompatibility) -> Option<(f64, f64)> {
+    fn newest_valid_report(
+        &mut self,
+        scheduler: &IsoPacketScheduler,
+        service_us: u32,
+        speed: Speed,
+        max_frames: usize,
+        per_service: bool,
+        counters: &mut FeedbackCounters,
+        actual_length: usize,
+        transfer_status: i32,
+        compatibility: &mut FeedbackCompatibility,
+    ) -> Option<(f64, f64)> {
         let buffer = unsafe { &(*self.user_data).buffer };
         if self.endpoint.transfer_type == TransferType::Isochronous {
             let transfer = unsafe { self.transfer.as_ref() };
-            if transfer.num_iso_packets < 0 || transfer.num_iso_packets as usize != self.packet_count {
+            if transfer.num_iso_packets < 0
+                || transfer.num_iso_packets as usize != self.packet_count
+            {
                 if transfer_status == LIBUSB_TRANSFER_COMPLETED {
                     counters.errors = counters.errors.saturating_add(1);
                 }
                 return None;
             }
-            inspect_feedback_packets_with_compatibility(buffer, (0..self.packet_count).map(|index| {
-                let packet = unsafe { &*transfer.iso_packet_desc.as_ptr().add(index) };
-                (packet.status, packet.length as usize, packet.actual_length as usize)
-            }), scheduler, service_us, speed, max_frames, per_service, counters, transfer_status, true, compatibility)
+            inspect_feedback_packets_with_compatibility(
+                buffer,
+                (0..self.packet_count).map(|index| {
+                    let packet = unsafe { &*transfer.iso_packet_desc.as_ptr().add(index) };
+                    (
+                        packet.status,
+                        packet.length as usize,
+                        packet.actual_length as usize,
+                    )
+                }),
+                scheduler,
+                service_us,
+                speed,
+                max_frames,
+                per_service,
+                counters,
+                transfer_status,
+                true,
+                compatibility,
+            )
         } else {
-            inspect_feedback_packets_with_compatibility(buffer, [(transfer_status, self.packet_bytes, actual_length)],
-                scheduler, service_us, speed, max_frames, per_service, counters, transfer_status, false, compatibility)
+            inspect_feedback_packets_with_compatibility(
+                buffer,
+                [(transfer_status, self.packet_bytes, actual_length)],
+                scheduler,
+                service_us,
+                speed,
+                max_frames,
+                per_service,
+                counters,
+                transfer_status,
+                false,
+                compatibility,
+            )
         }
     }
 
@@ -773,9 +905,15 @@ impl Drop for FeedbackTransferSlot {
             if let Some(context) = self.retirement_context.clone() {
                 let mut warned = false;
                 while self.in_flight {
-                    if self.take_completion().is_some() { self.mark_completed(); break; }
+                    if self.take_completion().is_some() {
+                        self.mark_completed();
+                        break;
+                    }
                     if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
-                        if !warned { log_warn!("USB unwind cancellation retirement pending: {}", error); warned = true; }
+                        if !warned {
+                            log_warn!("USB unwind cancellation retirement pending: {}", error);
+                            warned = true;
+                        }
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -833,7 +971,10 @@ impl FeedbackCounters {
                 self.diagnostics_dirty = true;
             }
             if let Some(trace) = &self.trace {
-                trace.record(crate::FeedbackTraceEvent::Submit { slot: Some(index), status });
+                trace.record(crate::FeedbackTraceEvent::Submit {
+                    slot: Some(index),
+                    status,
+                });
             }
         }
     }
@@ -854,10 +995,16 @@ impl FeedbackCounters {
             trace.record(crate::FeedbackTraceEvent::Timebase { unit, inferred });
         }
         if inferred && self.cached_service_interval {
-            log_info!("[USB] Explicit feedback timebase reused for DAC session: {}", unit);
+            log_info!(
+                "[USB] Explicit feedback timebase reused for DAC session: {}",
+                unit
+            );
         } else if inferred {
-            log_info!("[USB] Explicit feedback timebase inferred: {} ({} matching completions)",
-                unit, SERVICE_INTERVAL_CONFIRMATIONS);
+            log_info!(
+                "[USB] Explicit feedback timebase inferred: {} ({} matching completions)",
+                unit,
+                SERVICE_INTERVAL_CONFIRMATIONS
+            );
         }
     }
 
@@ -872,41 +1019,96 @@ impl FeedbackCounters {
 /// Validate all candidates before selecting one; update the EWMA only once per transfer.
 #[cfg(test)]
 fn select_feedback_report(
-    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
-    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
-    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
+    buffer: &[u8],
+    packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler,
+    service_us: u32,
+    speed: Speed,
+    max_frames: usize,
+    per_service: bool,
+    counters: &mut FeedbackCounters,
 ) -> Option<(f64, f64)> {
-    inspect_feedback_packets(buffer, packets, scheduler, service_us, speed, max_frames,
-        per_service, counters, LIBUSB_TRANSFER_COMPLETED, true)
+    inspect_feedback_packets(
+        buffer,
+        packets,
+        scheduler,
+        service_us,
+        speed,
+        max_frames,
+        per_service,
+        counters,
+        LIBUSB_TRANSFER_COMPLETED,
+        true,
+    )
 }
 
 #[cfg(test)]
 fn select_feedback_report_with_compatibility(
-    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
-    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
-    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
+    buffer: &[u8],
+    packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler,
+    service_us: u32,
+    speed: Speed,
+    max_frames: usize,
+    per_service: bool,
+    counters: &mut FeedbackCounters,
     compatibility: &mut FeedbackCompatibility,
 ) -> Option<(f64, f64)> {
-    inspect_feedback_packets_with_compatibility(buffer, packets, scheduler, service_us, speed,
-        max_frames, per_service, counters, LIBUSB_TRANSFER_COMPLETED, true, compatibility)
+    inspect_feedback_packets_with_compatibility(
+        buffer,
+        packets,
+        scheduler,
+        service_us,
+        speed,
+        max_frames,
+        per_service,
+        counters,
+        LIBUSB_TRANSFER_COMPLETED,
+        true,
+        compatibility,
+    )
 }
 
 #[cfg(test)]
 fn inspect_feedback_packets(
-    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
-    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
-    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
-    transfer_status: i32, is_iso: bool,
+    buffer: &[u8],
+    packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler,
+    service_us: u32,
+    speed: Speed,
+    max_frames: usize,
+    per_service: bool,
+    counters: &mut FeedbackCounters,
+    transfer_status: i32,
+    is_iso: bool,
 ) -> Option<(f64, f64)> {
-    inspect_feedback_packets_with_compatibility(buffer, packets, scheduler, service_us, speed,
-        max_frames, per_service, counters, transfer_status, is_iso, &mut FeedbackCompatibility::default())
+    inspect_feedback_packets_with_compatibility(
+        buffer,
+        packets,
+        scheduler,
+        service_us,
+        speed,
+        max_frames,
+        per_service,
+        counters,
+        transfer_status,
+        is_iso,
+        &mut FeedbackCompatibility::default(),
+    )
 }
 
 fn inspect_feedback_packets_with_compatibility(
-    buffer: &[u8], packets: impl IntoIterator<Item = (i32, usize, usize)>,
-    scheduler: &IsoPacketScheduler, service_us: u32, speed: Speed,
-    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters,
-    transfer_status: i32, is_iso: bool, compatibility: &mut FeedbackCompatibility,
+    buffer: &[u8],
+    packets: impl IntoIterator<Item = (i32, usize, usize)>,
+    scheduler: &IsoPacketScheduler,
+    service_us: u32,
+    speed: Speed,
+    max_frames: usize,
+    per_service: bool,
+    counters: &mut FeedbackCounters,
+    transfer_status: i32,
+    is_iso: bool,
+    compatibility: &mut FeedbackCompatibility,
 ) -> Option<(f64, f64)> {
     use crate::ExplicitFeedbackOutcome as Outcome;
     let mut offset = 0usize;
@@ -915,10 +1117,14 @@ fn inspect_feedback_packets_with_compatibility(
     let mut conflicting_report = false;
     // Tenor's bounded correction defines its bus units; inference must not
     // reinterpret a report rejected by that correction as a different timebase.
-    let detecting = !per_service && compatibility.tenor_nominal_q16.is_none()
-        && counters.selected_timebase.is_none() && counters.infer_service_interval
-        && speed == Speed::High && service_us > 125;
-    let inferred_service_interval = !per_service && counters.selected_timebase == Some(FeedbackTimebase::OutService);
+    let detecting = !per_service
+        && compatibility.tenor_nominal_q16.is_none()
+        && counters.selected_timebase.is_none()
+        && counters.infer_service_interval
+        && speed == Speed::High
+        && service_us > 125;
+    let inferred_service_interval =
+        !per_service && counters.selected_timebase == Some(FeedbackTimebase::OutService);
     for (index, (status, requested, actual)) in packets.into_iter().enumerate() {
         let start = offset;
         offset = offset.saturating_add(requested);
@@ -926,7 +1132,8 @@ fn inspect_feedback_packets_with_compatibility(
         // Failed/empty packet descriptors within such a transfer still count.
         let skip = transfer_status == LIBUSB_TRANSFER_COMPLETED && compatibility.skip_packet();
         let report = (actual <= requested && offset <= buffer.len())
-            .then(|| buffer.get(start..start.saturating_add(actual))).flatten();
+            .then(|| buffer.get(start..start.saturating_add(actual)))
+            .flatten();
         let mut decoded = None;
         let outcome = if transfer_status != LIBUSB_TRANSFER_COMPLETED {
             Outcome::TransferFailed
@@ -942,25 +1149,40 @@ fn inspect_feedback_packets_with_compatibility(
             }
         }) {
             if !inferred_service_interval || matches!(bytes.len(), 4 | 8) {
-                decoded = if !per_service && !inferred_service_interval && speed == Speed::High
-                    && bytes.len() == 4 && compatibility.tenor_nominal_q16.is_some()
-                {
-                    let raw = u32::from_le_bytes(bytes.try_into().unwrap());
-                    correct_tenor_feedback(raw, compatibility.tenor_nominal_q16.unwrap())
-                        .and_then(|corrected| decode_feedback_report_with_scale(
-                            &corrected.to_le_bytes(), service_us, speed, false))
-                } else {
-                    decode_feedback_report_with_scale(
-                        bytes, service_us, speed, per_service || inferred_service_interval,
-                    )
+                decoded = match compatibility.tenor_nominal_q16 {
+                    Some(nominal)
+                        if !per_service
+                            && !inferred_service_interval
+                            && speed == Speed::High
+                            && bytes.len() == 4 =>
+                    {
+                        let raw = u32::from_le_bytes(bytes.try_into().unwrap());
+                        correct_tenor_feedback(raw, nominal).and_then(|corrected| {
+                            decode_feedback_report_with_scale(
+                                &corrected.to_le_bytes(),
+                                service_us,
+                                speed,
+                                false,
+                            )
+                        })
+                    }
+                    _ => decode_feedback_report_with_scale(
+                        bytes,
+                        service_us,
+                        speed,
+                        per_service || inferred_service_interval,
+                    ),
                 };
             }
             // A selected interpretation can become stale after firmware relock.
             // Drop it and require the ordinary three-completion inference again;
             // never reinterpret Tenor or bypass the live clock cross-check.
-            if !per_service && compatibility.tenor_nominal_q16.is_none()
-                && counters.infer_service_interval && counters.selected_timebase.is_some()
-                && decoded.is_some_and(|(frames, _)| !scheduler.feedback_rate_is_plausible(frames)) {
+            if !per_service
+                && compatibility.tenor_nominal_q16.is_none()
+                && counters.infer_service_interval
+                && counters.selected_timebase.is_some()
+                && decoded.is_some_and(|(frames, _)| !scheduler.feedback_rate_is_plausible(frames))
+            {
                 counters.selected_timebase = None;
                 counters.service_interval_confirmations = 0;
                 counters.cached_service_interval = false;
@@ -969,17 +1191,26 @@ fn inspect_feedback_packets_with_compatibility(
             }
             // Startup reports cannot select units, acquire lock or renew its deadline.
             // Retain ordinary malformed/empty/failed diagnostics below.
-            if skip && decoded.is_some() { continue; }
+            if skip && decoded.is_some() {
+                continue;
+            }
             match decoded {
                 None => Outcome::InvalidEncoding,
                 Some((frames, _)) if !scheduler.feedback_rate_is_plausible(frames) => {
-                    let compatible = ((detecting || (counters.selected_timebase.is_none() && counters.infer_service_interval
-                        && !per_service && speed == Speed::High && service_us > 125
-                        && compatibility.tenor_nominal_q16.is_none())) && bytes.len() == 4)
+                    let compatible = ((detecting
+                        || (counters.selected_timebase.is_none()
+                            && counters.infer_service_interval
+                            && !per_service
+                            && speed == Speed::High
+                            && service_us > 125
+                            && compatibility.tenor_nominal_q16.is_none()))
+                        && bytes.len() == 4)
                         .then(|| decode_feedback_report_with_scale(bytes, service_us, speed, true))
                         .flatten()
-                        .filter(|(frames, _)| scheduler.feedback_rate_is_plausible(*frames)
-                            && frames.ceil() <= max_frames as f64);
+                        .filter(|(frames, _)| {
+                            scheduler.feedback_rate_is_plausible(*frames)
+                                && frames.ceil() <= max_frames as f64
+                        });
                     if let Some(rate) = compatible {
                         newest_service_interval = Some((rate, bytes));
                         decoded = Some(rate);
@@ -989,7 +1220,9 @@ fn inspect_feedback_packets_with_compatibility(
                         Outcome::RateOutOfRange
                     }
                 }
-                Some((frames, _)) if frames.ceil() > max_frames as f64 => Outcome::PacketCapacityExceeded,
+                Some((frames, _)) if frames.ceil() > max_frames as f64 => {
+                    Outcome::PacketCapacityExceeded
+                }
                 Some(_) => {
                     newest = decoded;
                     counters.record_valid_bytes(bytes);
@@ -1017,14 +1250,21 @@ fn inspect_feedback_packets_with_compatibility(
             let raw = if counters.trace.is_some() {
                 // Copy only bytes inside this packet's submitted span. A
                 // failed transfer can still report a partial IN packet.
-                buffer.get(start..offset)
+                buffer
+                    .get(start..offset)
                     .map(|span| &span[..actual.min(span.len())])
                     .unwrap_or_default()
             } else {
                 &[]
             };
             let sample = crate::ExplicitFeedbackPacket::new(
-                outcome, transfer_status, packet_status, requested, actual, raw, decoded,
+                outcome,
+                transfer_status,
+                packet_status,
+                requested,
+                actual,
+                raw,
+                decoded,
             );
             if let Some(diagnostics) = counters.diagnostics.as_mut() {
                 diagnostics.record_packet(sample, is_iso);
@@ -1052,7 +1292,9 @@ fn inspect_feedback_packets_with_compatibility(
                 FeedbackTimebase::Bus
             };
             counters.select_timebase(unit, speed, false);
-        } else if let Some((decoded, bytes)) = newest_service_interval.filter(|_| !conflicting_report) {
+        } else if let Some((decoded, bytes)) =
+            newest_service_interval.filter(|_| !conflicting_report)
+        {
             // Count once per successful completion. A batch containing many
             // identical packets is only one observation. Empty polls do not
             // count or extend the existing feedback deadline.
@@ -1083,7 +1325,8 @@ fn inspect_feedback_packets_with_compatibility(
             let delta = frames - diagnostics.rate_mean_frames;
             diagnostics.rate_mean_frames += delta / n;
             diagnostics.rate_variance_frames = (diagnostics.rate_variance_frames * (n - 1.0)
-                + delta * (frames - diagnostics.rate_mean_frames)) / n;
+                + delta * (frames - diagnostics.rate_mean_frames))
+                / n;
         }
         counters.diagnostics_dirty = true;
     }
@@ -1091,47 +1334,90 @@ fn inspect_feedback_packets_with_compatibility(
 }
 
 #[derive(Debug)]
-pub(super) enum FeedbackFault { DeviceLost, Transfer(String) }
+pub(super) enum FeedbackFault {
+    DeviceLost,
+    Transfer(String),
+}
 
 /// A selected explicit pipe cannot silently become nominal on first-submit failure.
 /// Runtime transient submissions may retry only while the health deadline remains live.
-pub(super) fn feedback_submit_failure(error: String, no_device: bool, first: bool) -> Option<FeedbackFault> {
-    if no_device { Some(FeedbackFault::DeviceLost) }
-    else if first { Some(FeedbackFault::Transfer(format!("explicit feedback initial submit failed: {}", error))) }
-    else { None }
+pub(super) fn feedback_submit_failure(
+    error: String,
+    no_device: bool,
+    first: bool,
+) -> Option<FeedbackFault> {
+    if no_device {
+        Some(FeedbackFault::DeviceLost)
+    } else if first {
+        Some(FeedbackFault::Transfer(format!(
+            "explicit feedback initial submit failed: {}",
+            error
+        )))
+    } else {
+        None
+    }
 }
 
 fn feedback_completion_fault(status: i32, stopping: bool, endpoint: u8) -> Option<FeedbackFault> {
     match status {
         LIBUSB_TRANSFER_NO_DEVICE => Some(FeedbackFault::DeviceLost),
-        LIBUSB_TRANSFER_CANCELLED if !stopping => Some(FeedbackFault::Transfer("explicit feedback unexpectedly cancelled".into())),
-        LIBUSB_TRANSFER_STALL => Some(FeedbackFault::Transfer(format!("explicit feedback endpoint 0x{:02x} stalled", endpoint))),
+        LIBUSB_TRANSFER_CANCELLED if !stopping => Some(FeedbackFault::Transfer(
+            "explicit feedback unexpectedly cancelled".into(),
+        )),
+        LIBUSB_TRANSFER_STALL => Some(FeedbackFault::Transfer(format!(
+            "explicit feedback endpoint 0x{:02x} stalled",
+            endpoint
+        ))),
         _ => None,
     }
 }
 
 pub(super) fn pump_feedback_transfers(
-    handle: &DeviceHandle<Context>, transfers: &mut FeedbackTransfers,
-    scheduler: &mut IsoPacketScheduler, data_service_interval_us: u32, speed: Speed,
-    max_frames: usize, per_service: bool, counters: &mut FeedbackCounters, stop: &AtomicBool,
-    health: ExplicitFeedbackHealth, started_at: Instant,
+    handle: &DeviceHandle<Context>,
+    transfers: &mut FeedbackTransfers,
+    scheduler: &mut IsoPacketScheduler,
+    data_service_interval_us: u32,
+    speed: Speed,
+    max_frames: usize,
+    per_service: bool,
+    counters: &mut FeedbackCounters,
+    stop: &AtomicBool,
+    health: ExplicitFeedbackHealth,
+    started_at: Instant,
 ) -> Result<(), FeedbackFault> {
     // Finished batches belong to earlier USB intervals even if libusb hands
     // a later slot back first. Process them in submission order.
-    while let Some((index, status, completed_at, actual_length)) = transfers.take_next_completion() {
+    while let Some((index, status, completed_at, actual_length)) = transfers.take_next_completion()
+    {
         let slot = &mut transfers.slots[index];
         if let Some(diagnostics) = counters.diagnostics.as_mut() {
             diagnostics.record_transfer(status);
             counters.diagnostics_dirty = true;
         }
         if let Some(trace) = &counters.trace {
-            trace.record_at(completed_at, crate::FeedbackTraceEvent::Completion {
-                slot: Some(index), status, actual_bytes: actual_length,
-            });
+            trace.record_at(
+                completed_at,
+                crate::FeedbackTraceEvent::Completion {
+                    slot: Some(index),
+                    status,
+                    actual_bytes: actual_length,
+                },
+            );
         }
-        let report = slot.newest_valid_report(scheduler, data_service_interval_us, speed,
-            max_frames, per_service, counters, actual_length, status, &mut transfers.compatibility);
-        if let Some(fault) = feedback_completion_fault(status, usb_stop_requested(stop), slot.endpoint.address) {
+        let report = slot.newest_valid_report(
+            scheduler,
+            data_service_interval_us,
+            speed,
+            max_frames,
+            per_service,
+            counters,
+            actual_length,
+            status,
+            &mut transfers.compatibility,
+        );
+        if let Some(fault) =
+            feedback_completion_fault(status, usb_stop_requested(stop), slot.endpoint.address)
+        {
             return Err(fault);
         }
         match status {
@@ -1140,15 +1426,19 @@ pub(super) fn pump_feedback_transfers(
                     // A report delivered beyond the old lease cannot restart it.
                     // Use callback time: a timely report processed slightly late is valid.
                     if !health.report_is_timely(completed_at, started_at, counters.last_report_at) {
-                        return Err(FeedbackFault::Transfer("explicit feedback report arrived after its terminal deadline".into()));
+                        return Err(FeedbackFault::Transfer(
+                            "explicit feedback report arrived after its terminal deadline".into(),
+                        ));
                     }
                     if scheduler.update_feedback_frames_per_packet(frames) {
                         counters.reports = counters.reports.saturating_add(1);
                         // Completion callbacks can run out of order. Never
                         // regress the last-report timestamp in that case.
-                        counters.last_report_at = Some(counters.last_report_at.map_or(
-                            completed_at, |last| last.max(completed_at),
-                        ));
+                        counters.last_report_at = Some(
+                            counters
+                                .last_report_at
+                                .map_or(completed_at, |last| last.max(completed_at)),
+                        );
                         counters.last_frames_per_packet = Some(frames);
                         counters.last_estimated_sample_rate = Some(rate);
                         if counters.reports == 1 || counters.reports % 128 == 0 {
@@ -1159,10 +1449,16 @@ pub(super) fn pump_feedback_transfers(
                     }
                 }
             }
-            LIBUSB_TRANSFER_TIMED_OUT => { counters.timeouts = counters.timeouts.saturating_add(1); }
+            LIBUSB_TRANSFER_TIMED_OUT => {
+                counters.timeouts = counters.timeouts.saturating_add(1);
+            }
             LIBUSB_TRANSFER_CANCELLED if usb_stop_requested(stop) => return Ok(()),
-            LIBUSB_TRANSFER_OVERFLOW => { counters.rejected = counters.rejected.saturating_add(1); }
-            _ => { counters.errors = counters.errors.saturating_add(1); }
+            LIBUSB_TRANSFER_OVERFLOW => {
+                counters.rejected = counters.rejected.saturating_add(1);
+            }
+            _ => {
+                counters.errors = counters.errors.saturating_add(1);
+            }
         }
         // Retry transient completions with a small bounded delay, not a busy resubmit loop.
         if status != LIBUSB_TRANSFER_COMPLETED {
@@ -1184,22 +1480,43 @@ pub(super) fn pump_feedback_transfers(
 /// Deadlines are measured from the first active transfer or the last actual rate.
 /// Empty successful polls and transport retries do not refresh that epoch.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ExplicitFeedbackHealth { pub(super) warning: Duration, pub(super) terminal: Duration }
+pub(super) struct ExplicitFeedbackHealth {
+    pub(super) warning: Duration,
+    pub(super) terminal: Duration,
+}
 impl ExplicitFeedbackHealth {
     pub(super) fn new(poll_us: u32, refresh: Option<u8>) -> Self {
         // UAC1 bRefresh is log2 milliseconds, valid in the range 1..=9.
-        let update_us = refresh.filter(|r| (1..=9).contains(r))
-            .map(|r| (1u64 << r) * 1000).unwrap_or(u64::from(poll_us));
+        let update_us = refresh
+            .filter(|r| (1..=9).contains(r))
+            .map(|r| (1u64 << r) * 1000)
+            .unwrap_or(u64::from(poll_us));
         let cadence = Duration::from_micros(update_us.max(u64::from(poll_us)));
-        Self { warning: Duration::from_millis(USB_FEEDBACK_STALE_WARN_MS).max(cadence * 3),
-            terminal: Duration::from_secs(1).max(cadence * 6) }
+        Self {
+            warning: Duration::from_millis(USB_FEEDBACK_STALE_WARN_MS).max(cadence * 3),
+            terminal: Duration::from_secs(1).max(cadence * 6),
+        }
     }
-    fn report_is_timely(&self, completed: Instant, started: Instant, previous: Option<Instant>) -> bool {
+    fn report_is_timely(
+        &self,
+        completed: Instant,
+        started: Instant,
+        previous: Option<Instant>,
+    ) -> bool {
         completed.saturating_duration_since(previous.unwrap_or(started)) < self.terminal
     }
-    pub(super) fn state(&self, now: Instant, started: Instant, last: Option<Instant>) -> (bool, bool, bool) {
+    pub(super) fn state(
+        &self,
+        now: Instant,
+        started: Instant,
+        last: Option<Instant>,
+    ) -> (bool, bool, bool) {
         let age = now.saturating_duration_since(last.unwrap_or(started));
-        (last.is_some() && age < self.warning, age >= self.warning, age >= self.terminal)
+        (
+            last.is_some() && age < self.warning,
+            age >= self.warning,
+            age >= self.terminal,
+        )
     }
 }
 
@@ -1220,11 +1537,22 @@ pub(super) fn decode_feedback_report(
     decode_feedback_report_with_scale(raw_bytes, data_service_interval_us, speed, false)
 }
 
-fn decode_feedback_report_with_scale(raw_bytes: &[u8], data_service_interval_us: u32,
-    speed: Speed, per_service: bool) -> Option<(f64, f64)> {
-    if data_service_interval_us == 0 { return None; }
+fn decode_feedback_report_with_scale(
+    raw_bytes: &[u8],
+    data_service_interval_us: u32,
+    speed: Speed,
+    per_service: bool,
+) -> Option<(f64, f64)> {
+    if data_service_interval_us == 0 {
+        return None;
+    }
     let high_speed = matches!(speed, Speed::High | Speed::Super | Speed::SuperPlus);
-    if !matches!(speed, Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus) { return None; }
+    if !matches!(
+        speed,
+        Speed::Full | Speed::High | Speed::Super | Speed::SuperPlus
+    ) {
+        return None;
+    }
     let per_service = per_service && speed == Speed::High && raw_bytes.len() == 4;
     let (frames_per_base_interval, base_interval_us) = match raw_bytes.len() {
         3 => {
@@ -1238,8 +1566,14 @@ fn decode_feedback_report_with_scale(raw_bytes: &[u8], data_service_interval_us:
         }
         4 => {
             let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
-            if high_speed && raw & 0xf000_0000 != 0 { return None; }
-            let base_interval_us = if per_service { f64::from(data_service_interval_us) } else { feedback_base_interval_us(speed, data_service_interval_us) };
+            if high_speed && raw & 0xf000_0000 != 0 {
+                return None;
+            }
+            let base_interval_us = if per_service {
+                f64::from(data_service_interval_us)
+            } else {
+                feedback_base_interval_us(speed, data_service_interval_us)
+            };
             (raw as f64 / 65_536.0, base_interval_us)
         }
         8 if matches!(speed, Speed::Super | Speed::SuperPlus) => {
@@ -1357,21 +1691,39 @@ pub(super) fn timed_out_packet_results(
     account_timed_out_transfer(packet_sizes, descriptors, acceptance)
 }
 
-
 #[cfg(test)]
 mod explicit_feedback_tests {
     use super::*;
 
-    fn q16(frames: f64) -> [u8; 4] { ((frames * 65536.0).round() as u32).to_le_bytes() }
-    fn q32(frames: f64) -> [u8; 8] { ((frames * 4_294_967_296.0).round() as u64).to_le_bytes() }
-    fn scheduler(service_us: u32) -> IsoPacketScheduler { IsoPacketScheduler::new(48_000, 8, service_us) }
+    fn q16(frames: f64) -> [u8; 4] {
+        ((frames * 65536.0).round() as u32).to_le_bytes()
+    }
+    fn q32(frames: f64) -> [u8; 8] {
+        ((frames * 4_294_967_296.0).round() as u64).to_le_bytes()
+    }
+    fn scheduler(service_us: u32) -> IsoPacketScheduler {
+        IsoPacketScheduler::new(48_000, 8, service_us)
+    }
 
     #[test]
     fn swinging_feedback_keeps_capacity_guard_and_reports_unsmoothed_variance() {
         let scheduler = scheduler(125);
-        let mut counters = FeedbackCounters { diagnostics: Some(Default::default()), ..Default::default() };
+        let mut counters = FeedbackCounters {
+            diagnostics: Some(Default::default()),
+            ..Default::default()
+        };
         for value in [6.0, 5.4, 6.6, 6.0] {
-            assert!(select_feedback_report(&q16(value), [(0,4,4)], &scheduler,125,Speed::High,8,false,&mut counters).is_some());
+            assert!(select_feedback_report(
+                &q16(value),
+                [(0, 4, 4)],
+                &scheduler,
+                125,
+                Speed::High,
+                8,
+                false,
+                &mut counters
+            )
+            .is_some());
         }
         let stats = counters.diagnostics.unwrap();
         assert_eq!(stats.rate_samples, 4);
@@ -1379,23 +1731,66 @@ mod explicit_feedback_tests {
         assert!((stats.rate_max_frames - 6.6).abs() < 0.0001);
         assert!((stats.rate_mean_frames - 6.0).abs() < 0.0001);
         assert!((stats.rate_variance_frames - 0.18).abs() < 0.0001);
-        assert!(select_feedback_report(&q16(9.0), [(0,4,4)], &scheduler,125,Speed::High,8,false,&mut counters).is_none());
+        assert!(select_feedback_report(
+            &q16(9.0),
+            [(0, 4, 4)],
+            &scheduler,
+            125,
+            Speed::High,
+            8,
+            false,
+            &mut counters
+        )
+        .is_none());
     }
 
     #[test]
     fn stale_inferred_units_are_redetected_against_proven_clock() {
         let scheduler = scheduler(1000);
-        let mut counters = FeedbackCounters { infer_service_interval: true, ..Default::default() };
-        for _ in 0..3 { select_feedback_report(&q16(48.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters); }
+        let mut counters = FeedbackCounters {
+            infer_service_interval: true,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            select_feedback_report(
+                &q16(48.0),
+                [(0, 4, 4)],
+                &scheduler,
+                1000,
+                Speed::High,
+                64,
+                false,
+                &mut counters,
+            );
+        }
         assert!(counters.selected_service_interval());
         // Firmware relocks to ordinary per-microframe reporting.
         for _ in 0..2 {
-            assert!(select_feedback_report(&q16(6.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters).is_none());
+            assert!(select_feedback_report(
+                &q16(6.0),
+                [(0, 4, 4)],
+                &scheduler,
+                1000,
+                Speed::High,
+                64,
+                false,
+                &mut counters
+            )
+            .is_none());
         }
-        assert!(select_feedback_report(&q16(6.0),[(0,4,4)],&scheduler,1000,Speed::High,64,false,&mut counters).is_some());
+        assert!(select_feedback_report(
+            &q16(6.0),
+            [(0, 4, 4)],
+            &scheduler,
+            1000,
+            Speed::High,
+            64,
+            false,
+            &mut counters
+        )
+        .is_some());
         assert!(!counters.selected_service_interval());
     }
-
 
     #[test]
     fn enhanced_superspeed_feedback_uses_q32_bus_units_at_every_output_interval() {
@@ -1405,10 +1800,20 @@ mod explicit_feedback_tests {
                 for service_us in [125, 250, 1000] {
                     let scheduler = IsoPacketScheduler::new(rate, 8, service_us);
                     let mut counters = FeedbackCounters {
-                        infer_service_interval: true, ..FeedbackCounters::default()
+                        infer_service_interval: true,
+                        ..FeedbackCounters::default()
                     };
-                    let (frames, decoded_rate) = select_feedback_report(&report, [(0, 8, 8)],
-                        &scheduler, service_us, speed, 128, true, &mut counters).unwrap();
+                    let (frames, decoded_rate) = select_feedback_report(
+                        &report,
+                        [(0, 8, 8)],
+                        &scheduler,
+                        service_us,
+                        speed,
+                        128,
+                        true,
+                        &mut counters,
+                    )
+                    .unwrap();
                     assert!((decoded_rate - f64::from(rate)).abs() < 0.00001);
                     let expected_frames = f64::from(rate) * f64::from(service_us) / 1_000_000.0;
                     assert!((frames - expected_frames).abs() < 0.00001);
@@ -1428,8 +1833,19 @@ mod explicit_feedback_tests {
         batch.extend_from_slice(&q16(6.0));
         batch.extend_from_slice(&[0; 4]);
         let mut counters = FeedbackCounters::default();
-        assert_eq!(select_feedback_report(&batch, [(0, 8, 8), (0, 8, 4)],
-            &scheduler(250), 250, Speed::Super, 16, false, &mut counters), Some((12.0, 48_000.0)));
+        assert_eq!(
+            select_feedback_report(
+                &batch,
+                [(0, 8, 8), (0, 8, 4)],
+                &scheduler(250),
+                250,
+                Speed::Super,
+                16,
+                false,
+                &mut counters
+            ),
+            Some((12.0, 48_000.0))
+        );
         assert_eq!(counters.last_report_bytes, report);
         assert_eq!(counters.last_report_len, 8);
         assert_eq!(counters.malformed, 1);
@@ -1440,8 +1856,17 @@ mod explicit_feedback_tests {
     fn enhanced_superspeed_feedback_retains_capacity_and_rate_rejection() {
         for (frames, max_frames) in [(6.0, 47), (48.0, 1024)] {
             let mut counters = FeedbackCounters::default();
-            assert!(select_feedback_report(&q32(frames), [(0, 8, 8)], &scheduler(1000),
-                1000, Speed::SuperPlus, max_frames, false, &mut counters).is_none());
+            assert!(select_feedback_report(
+                &q32(frames),
+                [(0, 8, 8)],
+                &scheduler(1000),
+                1000,
+                Speed::SuperPlus,
+                max_frames,
+                false,
+                &mut counters
+            )
+            .is_none());
             assert_eq!(counters.rate_rejected, 1);
             assert_eq!(counters.rejected, 1);
             assert_eq!(counters.last_report_len, 0);
@@ -1456,28 +1881,72 @@ mod explicit_feedback_tests {
         for speed in [Speed::Low, Speed::Full, Speed::High, Speed::Unknown] {
             assert!(decode_feedback_report(&report, 125, speed).is_none());
             let mut counters = FeedbackCounters::default();
-            assert!(select_feedback_report(&report, [(0, 8, 8)], &scheduler(125),
-                125, speed, 16, false, &mut counters).is_none());
+            assert!(select_feedback_report(
+                &report,
+                [(0, 8, 8)],
+                &scheduler(125),
+                125,
+                speed,
+                16,
+                false,
+                &mut counters
+            )
+            .is_none());
             assert_eq!(counters.malformed, 1);
         }
         for speed in [Speed::Super, Speed::SuperPlus] {
             for actual in [3, 4, 7] {
                 let mut counters = FeedbackCounters::default();
-                assert!(select_feedback_report(&report, [(0, 8, actual)], &scheduler(125),
-                    125, speed, 16, false, &mut counters).is_none());
+                assert!(select_feedback_report(
+                    &report,
+                    [(0, 8, actual)],
+                    &scheduler(125),
+                    125,
+                    speed,
+                    16,
+                    false,
+                    &mut counters
+                )
+                .is_none());
                 assert_eq!(counters.malformed, 1);
             }
             let mut counters = FeedbackCounters::default();
-            assert!(select_feedback_report(&report.repeat(2), [(0, 16, 8)], &scheduler(125),
-                125, speed, 16, false, &mut counters).is_none());
-            assert_eq!(select_feedback_report(&q16(6.0), [(0, 4, 4)], &scheduler(125),
-                125, speed, 16, false, &mut counters), Some((6.0, 48_000.0)));
+            assert!(select_feedback_report(
+                &report.repeat(2),
+                [(0, 16, 8)],
+                &scheduler(125),
+                125,
+                speed,
+                16,
+                false,
+                &mut counters
+            )
+            .is_none());
+            assert_eq!(
+                select_feedback_report(
+                    &q16(6.0),
+                    [(0, 4, 4)],
+                    &scheduler(125),
+                    125,
+                    speed,
+                    16,
+                    false,
+                    &mut counters
+                ),
+                Some((6.0, 48_000.0))
+            );
         }
     }
 
     fn feedback_pipe() -> FeedbackEndpoint {
-        FeedbackEndpoint { refresh: 0, address: 0x81, transfer_type: TransferType::Isochronous,
-            interval: 1, service_interval_us: 125, max_packet_bytes: 4 }
+        FeedbackEndpoint {
+            refresh: 0,
+            address: 0x81,
+            transfer_type: TransferType::Isochronous,
+            interval: 1,
+            service_interval_us: 125,
+            max_packet_bytes: 4,
+        }
     }
 
     #[test]
@@ -1494,48 +1963,107 @@ mod explicit_feedback_tests {
             let max_frames = 1024 / stride;
             let mut unproven = FeedbackCounters::default();
             for _ in 0..4 {
-                assert!(select_feedback_report(&raw, [(0, 4, 4)], &scheduler, 250,
-                    Speed::High, max_frames, false, &mut unproven).is_none());
+                assert!(select_feedback_report(
+                    &raw,
+                    [(0, 4, 4)],
+                    &scheduler,
+                    250,
+                    Speed::High,
+                    max_frames,
+                    false,
+                    &mut unproven
+                )
+                .is_none());
             }
             assert!(unproven.selected_timebase.is_none());
             let mut proven = FeedbackCounters {
-                infer_service_interval: true, ..Default::default()
+                infer_service_interval: true,
+                ..Default::default()
             };
             for _ in 0..2 {
-                assert!(select_feedback_report(&raw, [(0, 4, 4)], &scheduler, 250,
-                    Speed::High, max_frames, false, &mut proven).is_none());
+                assert!(select_feedback_report(
+                    &raw,
+                    [(0, 4, 4)],
+                    &scheduler,
+                    250,
+                    Speed::High,
+                    max_frames,
+                    false,
+                    &mut proven
+                )
+                .is_none());
             }
-            let selected = select_feedback_report(&raw, [(0, 4, 4)], &scheduler, 250,
-                Speed::High, max_frames, false, &mut proven).unwrap();
+            let selected = select_feedback_report(
+                &raw,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                max_frames,
+                false,
+                &mut proven,
+            )
+            .unwrap();
             assert!((selected.1 - expected_rate).abs() < 0.000001);
             assert!((selected.0 - expected_rate / 4000.0).abs() < 0.000001);
             assert!(proven.selected_service_interval());
             // Saved units never waive the fresh stream's capacity guard.
             let mut capacity_limited = FeedbackCounters {
-                infer_service_interval: true, cached_service_interval: true, ..Default::default()
+                infer_service_interval: true,
+                cached_service_interval: true,
+                ..Default::default()
             };
-            assert!(select_feedback_report(&raw, [(0, 4, 4)], &scheduler, 250,
-                Speed::High, 1, false, &mut capacity_limited).is_none());
+            assert!(select_feedback_report(
+                &raw,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                1,
+                false,
+                &mut capacity_limited
+            )
+            .is_none());
             assert!(!capacity_limited.selected_service_interval());
         }
     }
 
-    fn compatible_report(report: &[u8], service_us: u32, max_frames: usize, per_service: bool,
-        compatibility: &mut FeedbackCompatibility) -> Option<(f64, f64)> {
-        select_feedback_report_with_compatibility(report, [(0, report.len(), report.len())],
-            &scheduler(service_us), service_us, Speed::High, max_frames, per_service,
-            &mut FeedbackCounters::default(), compatibility)
+    fn compatible_report(
+        report: &[u8],
+        service_us: u32,
+        max_frames: usize,
+        per_service: bool,
+        compatibility: &mut FeedbackCompatibility,
+    ) -> Option<(f64, f64)> {
+        select_feedback_report_with_compatibility(
+            report,
+            [(0, report.len(), report.len())],
+            &scheduler(service_us),
+            service_us,
+            Speed::High,
+            max_frames,
+            per_service,
+            &mut FeedbackCounters::default(),
+            compatibility,
+        )
     }
 
     #[test]
     fn shared_release_keeps_device_specific_feedback_profiles_inactive() {
         for (vendor, product) in [(0x0644, 0x8038), (0x1852, 0x5034), (0x23ba, 1)] {
-            let mut compatibility = FeedbackCompatibility::for_device(vendor, product,
-                Speed::High, feedback_pipe(), 48_000);
+            let mut compatibility = FeedbackCompatibility::for_device(
+                vendor,
+                product,
+                Speed::High,
+                feedback_pipe(),
+                48_000,
+            );
             assert!(compatibility.tenor_nominal_q16.is_none());
             assert_eq!(compatibility.startup_packets_remaining, 0);
-            assert_eq!(compatible_report(&q16(6.0), 125, 7, false, &mut compatibility),
-                Some((6.0, 48_000.0)));
+            assert_eq!(
+                compatible_report(&q16(6.0), 125, 7, false, &mut compatibility),
+                Some((6.0, 48_000.0))
+            );
         }
     }
 
@@ -1548,9 +2076,15 @@ mod explicit_feedback_tests {
         assert_eq!(correct_tenor_feedback(0x68001, 0x60000), Some(0x59001));
         assert_eq!(correct_tenor_feedback(1, 0x7fff), None); // nominal bound underflow
         assert_eq!(correct_tenor_feedback(u32::MAX, u32::MAX), None); // nominal bound overflow
-        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: Some(0x60000), startup_packets_remaining: 0 };
+        let mut compatibility = FeedbackCompatibility {
+            tenor_nominal_q16: Some(0x60000),
+            startup_packets_remaining: 0,
+        };
         for raw in [0, 1, 0xf0060000, 0x80000] {
-            assert!(compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility).is_none());
+            assert!(
+                compatible_report(&u32::to_le_bytes(raw), 125, 7, false, &mut compatibility)
+                    .is_none()
+            );
         }
         // Corrected values still need fractional-ceiling capacity and nominal-rate checks.
         let report = q16(6.01 + 0.9375);
@@ -1558,63 +2092,149 @@ mod explicit_feedback_tests {
         assert!(compatible_report(&report, 1000, 49, false, &mut compatibility).is_some());
         assert!(compatible_report(&q16(11.0), 125, 16, false, &mut compatibility).is_none());
         // The explicit user scale wins and is never followed by the Tenor subtraction.
-        assert_eq!(compatible_report(&q16(48.0), 1000, 49, true, &mut compatibility), Some((48.0, 48_000.0)));
+        assert_eq!(
+            compatible_report(&q16(48.0), 1000, 49, true, &mut compatibility),
+            Some((48.0, 48_000.0))
+        );
         // A three-byte report keeps the existing Q10.14 interpretation.
-        assert_eq!(compatible_report(&[0, 0x80, 1], 125, 7, false, &mut compatibility), Some((6.0, 48_000.0)));
+        assert_eq!(
+            compatible_report(&[0, 0x80, 1], 125, 7, false, &mut compatibility),
+            Some((6.0, 48_000.0))
+        );
     }
 
     #[test]
     fn universal_inference_cannot_bypass_tenor_correction_or_playback_startup() {
-        let mut tenor = FeedbackCompatibility { tenor_nominal_q16: Some(0x60000), startup_packets_remaining: 0 };
+        let mut tenor = FeedbackCompatibility {
+            tenor_nominal_q16: Some(0x60000),
+            startup_packets_remaining: 0,
+        };
         let mut counters = FeedbackCounters {
-            infer_service_interval: true, cached_service_interval: true, ..Default::default()
+            infer_service_interval: true,
+            cached_service_interval: true,
+            ..Default::default()
         };
         // Twelve raw frames would fit OUT-service units but violate the
         // Tenor bus-unit correction and must never acquire an inferred lock.
-        assert!(select_feedback_report_with_compatibility(&q16(12.0), [(0, 4, 4)],
-            &scheduler(250), 250, Speed::High, 128, false, &mut counters,
-            &mut tenor).is_none());
+        assert!(select_feedback_report_with_compatibility(
+            &q16(12.0),
+            [(0, 4, 4)],
+            &scheduler(250),
+            250,
+            Speed::High,
+            128,
+            false,
+            &mut counters,
+            &mut tenor
+        )
+        .is_none());
         assert!(counters.selected_timebase.is_none());
 
-        let mut playback = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
+        let mut playback = FeedbackCompatibility {
+            tenor_nominal_q16: None,
+            startup_packets_remaining: 4,
+        };
         let mut counters = FeedbackCounters {
-            infer_service_interval: true, ..Default::default()
+            infer_service_interval: true,
+            ..Default::default()
         };
         let report = q16(12.0);
-        assert!(select_feedback_report_with_compatibility(&report.repeat(4), [(0, 4, 4); 4],
-            &scheduler(250), 250, Speed::High, 128, false, &mut counters,
-            &mut playback).is_none());
+        assert!(select_feedback_report_with_compatibility(
+            &report.repeat(4),
+            [(0, 4, 4); 4],
+            &scheduler(250),
+            250,
+            Speed::High,
+            128,
+            false,
+            &mut counters,
+            &mut playback
+        )
+        .is_none());
         assert_eq!(counters.service_interval_confirmations, 0);
         assert!(counters.selected_timebase.is_none());
         for _ in 0..2 {
-            assert!(select_feedback_report_with_compatibility(&report, [(0, 4, 4)],
-                &scheduler(250), 250, Speed::High, 128, false, &mut counters,
-                &mut playback).is_none());
+            assert!(select_feedback_report_with_compatibility(
+                &report,
+                [(0, 4, 4)],
+                &scheduler(250),
+                250,
+                Speed::High,
+                128,
+                false,
+                &mut counters,
+                &mut playback
+            )
+            .is_none());
         }
-        assert_eq!(select_feedback_report_with_compatibility(&report, [(0, 4, 4)],
-            &scheduler(250), 250, Speed::High, 128, false, &mut counters,
-            &mut playback), Some((12.0, 48_000.0)));
+        assert_eq!(
+            select_feedback_report_with_compatibility(
+                &report,
+                [(0, 4, 4)],
+                &scheduler(250),
+                250,
+                Speed::High,
+                128,
+                false,
+                &mut counters,
+                &mut playback
+            ),
+            Some((12.0, 48_000.0))
+        );
     }
 
     #[test]
     fn playback_designs_skips_four_completed_bus_opportunities_across_batches() {
-        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
+        let mut compatibility = FeedbackCompatibility {
+            tenor_nominal_q16: None,
+            startup_packets_remaining: 4,
+        };
         let mut counters = FeedbackCounters::default();
         let prior_lock = Instant::now();
         counters.last_report_at = Some(prior_lock);
         let report = q16(6.0);
-        assert!(select_feedback_report_with_compatibility(&report.repeat(2), [(0, 4, 4); 2],
-            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).is_none());
+        assert!(select_feedback_report_with_compatibility(
+            &report.repeat(2),
+            [(0, 4, 4); 2],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            &mut compatibility
+        )
+        .is_none());
         // Failed transfers are inspected for trace evidence but consume no skip.
-        assert!(inspect_feedback_packets_with_compatibility(&report.repeat(2), [(0, 4, 4); 2],
-            &scheduler(125), 125, Speed::High, 7, false, &mut counters,
-            LIBUSB_TRANSFER_TIMED_OUT, true, &mut compatibility).is_none());
+        assert!(inspect_feedback_packets_with_compatibility(
+            &report.repeat(2),
+            [(0, 4, 4); 2],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            LIBUSB_TRANSFER_TIMED_OUT,
+            true,
+            &mut compatibility
+        )
+        .is_none());
         assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, false, 0x81).is_none());
         assert_eq!(compatibility.startup_packets_remaining, 2);
         assert!(counters.selected_timebase.is_none());
-        assert!(select_feedback_report_with_compatibility(&report.repeat(2),
-            [(LIBUSB_TRANSFER_ERROR, 4, 4), (0, 4, 0)], &scheduler(125), 125, Speed::High,
-            7, false, &mut counters, &mut compatibility).is_none());
+        assert!(select_feedback_report_with_compatibility(
+            &report.repeat(2),
+            [(LIBUSB_TRANSFER_ERROR, 4, 4), (0, 4, 0)],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            &mut compatibility
+        )
+        .is_none());
         assert_eq!(counters.errors, 1);
         assert_eq!(counters.empty_polls, 1);
         assert_eq!(counters.last_report_at, Some(prior_lock));
@@ -1622,30 +2242,72 @@ mod explicit_feedback_tests {
         let mut bytes = report.to_vec();
         bytes.extend_from_slice(&q16(6.01));
         bytes.extend_from_slice(&q16(48.0)); // newest invalid report cannot replace the good one
-        let selected = select_feedback_report_with_compatibility(&bytes, [(0, 4, 4); 3],
-            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).unwrap();
+        let selected = select_feedback_report_with_compatibility(
+            &bytes,
+            [(0, 4, 4); 3],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            &mut compatibility,
+        )
+        .unwrap();
         assert!((selected.0 - 6.01).abs() < 1.0 / 65536.0);
         assert_eq!(counters.rejected, 1);
-        let fresh = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
+        let fresh = FeedbackCompatibility {
+            tenor_nominal_q16: None,
+            startup_packets_remaining: 4,
+        };
         assert_eq!(fresh.startup_packets_remaining, 4);
     }
 
     #[test]
     fn playback_startup_keeps_malformed_safety_and_non_iso_semantics() {
-        let mut compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
+        let mut compatibility = FeedbackCompatibility {
+            tenor_nominal_q16: None,
+            startup_packets_remaining: 4,
+        };
         let mut counters = FeedbackCounters::default();
-        assert!(select_feedback_report_with_compatibility(&[0; 16],
-            [(0, 4, 5), (0, 4, 2), (0, 4, 0), (LIBUSB_TRANSFER_ERROR, 4, 4)],
-            &scheduler(125), 125, Speed::High, 7, false, &mut counters, &mut compatibility).is_none());
+        assert!(select_feedback_report_with_compatibility(
+            &[0; 16],
+            [
+                (0, 4, 5),
+                (0, 4, 2),
+                (0, 4, 0),
+                (LIBUSB_TRANSFER_ERROR, 4, 4)
+            ],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            &mut compatibility
+        )
+        .is_none());
         assert_eq!(counters.malformed, 2);
         assert_eq!(counters.rejected, 2);
         assert_eq!(counters.empty_polls, 1);
         assert_eq!(counters.errors, 1);
         assert_eq!(compatibility.startup_packets_remaining, 0);
-        for (vendor, pipe) in [(0x23bb, feedback_pipe()), (0x23ba,
-            FeedbackEndpoint { transfer_type: TransferType::Interrupt, ..feedback_pipe() })] {
-            let mut compatibility = FeedbackCompatibility::for_device(vendor, 1, Speed::High, pipe, 48_000);
-            assert_eq!(compatible_report(&q16(6.0), 125, 7, false, &mut compatibility), Some((6.0, 48_000.0)));
+        for (vendor, pipe) in [
+            (0x23bb, feedback_pipe()),
+            (
+                0x23ba,
+                FeedbackEndpoint {
+                    transfer_type: TransferType::Interrupt,
+                    ..feedback_pipe()
+                },
+            ),
+        ] {
+            let mut compatibility =
+                FeedbackCompatibility::for_device(vendor, 1, Speed::High, pipe, 48_000);
+            assert_eq!(
+                compatible_report(&q16(6.0), 125, 7, false, &mut compatibility),
+                Some((6.0, 48_000.0))
+            );
         }
     }
 
@@ -1661,17 +2323,50 @@ mod explicit_feedback_tests {
         bytes.extend_from_slice(&[0; 4]); // successful empty poll
         bytes.extend_from_slice(&[1, 2]); // malformed trailing poll
         let mut counters = FeedbackCounters::default();
-        let packets = [(0, 4, 4), (0, 6, 6), (LIBUSB_TRANSFER_ERROR, 4, 4), (0, 4, 0), (0, 2, 2)];
-        assert_eq!(select_feedback_report(&bytes, packets, &scheduler(125), 125, Speed::High,
-            7, false, &mut counters), Some((6.0, 48_000.0)));
+        let packets = [
+            (0, 4, 4),
+            (0, 6, 6),
+            (LIBUSB_TRANSFER_ERROR, 4, 4),
+            (0, 4, 0),
+            (0, 2, 2),
+        ];
+        assert_eq!(
+            select_feedback_report(
+                &bytes,
+                packets,
+                &scheduler(125),
+                125,
+                Speed::High,
+                7,
+                false,
+                &mut counters
+            ),
+            Some((6.0, 48_000.0))
+        );
         assert_eq!(counters.empty_polls, 1);
         assert_eq!(counters.errors, 1);
         assert_eq!(counters.malformed, 2);
         assert_eq!(counters.reports, 0); // scanning never commits the EWMA
         bytes.extend_from_slice(&later);
-        let packets = [(0, 4, 4), (0, 6, 6), (LIBUSB_TRANSFER_ERROR, 4, 4), (0, 4, 0), (0, 2, 2), (0, 4, 4)];
-        let chosen = select_feedback_report(&bytes, packets, &scheduler(125), 125, Speed::High,
-            7, false, &mut counters).unwrap();
+        let packets = [
+            (0, 4, 4),
+            (0, 6, 6),
+            (LIBUSB_TRANSFER_ERROR, 4, 4),
+            (0, 4, 0),
+            (0, 2, 2),
+            (0, 4, 4),
+        ];
+        let chosen = select_feedback_report(
+            &bytes,
+            packets,
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+        )
+        .unwrap();
         assert!((chosen.0 - 6.005).abs() < 1.0 / 65536.0);
     }
 
@@ -1684,8 +2379,19 @@ mod explicit_feedback_tests {
         bytes.extend_from_slice(&bad_rate);
         bytes.extend_from_slice(&reserved);
         let mut counters = FeedbackCounters::default();
-        assert_eq!(select_feedback_report(&bytes, [(0, 4, 4), (0, 4, 4), (0, 4, 4), (0, 4, 5)],
-            &scheduler(125), 125, Speed::High, 7, false, &mut counters), Some((6.0, 48_000.0)));
+        assert_eq!(
+            select_feedback_report(
+                &bytes,
+                [(0, 4, 4), (0, 4, 4), (0, 4, 4), (0, 4, 5)],
+                &scheduler(125),
+                125,
+                Speed::High,
+                7,
+                false,
+                &mut counters
+            ),
+            Some((6.0, 48_000.0))
+        );
         assert_eq!(counters.rejected, 3);
         assert_eq!(counters.rate_rejected, 1);
         assert_eq!(counters.malformed, 2);
@@ -1697,10 +2403,28 @@ mod explicit_feedback_tests {
     fn capacity_checks_fractional_ceiling_after_out_service_scaling() {
         let mut counters = FeedbackCounters::default();
         let report = q16(48.05 / 8.0);
-        assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler(1000), 1000,
-            Speed::High, 48, false, &mut counters).is_none());
-        let selected = select_feedback_report(&report, [(0, 4, 4)], &scheduler(1000), 1000,
-            Speed::High, 49, false, &mut counters).unwrap();
+        assert!(select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler(1000),
+            1000,
+            Speed::High,
+            48,
+            false,
+            &mut counters
+        )
+        .is_none());
+        let selected = select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler(1000),
+            1000,
+            Speed::High,
+            49,
+            false,
+            &mut counters,
+        )
+        .unwrap();
         assert_eq!(selected.0.ceil(), 49.0);
         // Feedback polling interval is deliberately absent from the rate calculation.
         let mut stream = scheduler(1000);
@@ -1737,32 +2461,51 @@ mod explicit_feedback_tests {
 
     #[test]
     fn second_poll_submit_failure_retries_without_losing_the_active_poll() {
-        let mut transfers = FeedbackTransfers::new(feedback_pipe(), 4,
-            FeedbackCompatibility::default()).unwrap();
+        let mut transfers =
+            FeedbackTransfers::new(feedback_pipe(), 4, FeedbackCompatibility::default()).unwrap();
         assert_eq!(transfers.slots.len(), 2);
         let mut counters = FeedbackCounters::default();
         transfers.slots[0].last_submit_status = Some(0);
-        transfers.record_submission(0, Ok(()), &mut counters, true).unwrap();
+        transfers
+            .record_submission(0, Ok(()), &mut counters, true)
+            .unwrap();
         transfers.slots[1].last_submit_status = Some(libusb1_sys::constants::LIBUSB_ERROR_IO);
         let before_retry = Instant::now();
-        transfers.record_submission(1, Err("transient second poll".into()),
-            &mut counters, false).unwrap();
-        assert_eq!(transfers.pending.iter().copied().collect::<Vec<_>>(), vec![0]);
+        transfers
+            .record_submission(1, Err("transient second poll".into()), &mut counters, false)
+            .unwrap();
+        assert_eq!(
+            transfers.pending.iter().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
         assert!(!transfers.slots[1].in_flight);
         assert!(transfers.slots[1].retry_at >= before_retry + Duration::from_millis(5));
         assert_eq!(counters.errors, 1);
         transfers.slots[1].last_submit_status = Some(0);
-        transfers.record_submission(1, Ok(()), &mut counters, false).unwrap();
-        assert_eq!(transfers.pending.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+        transfers
+            .record_submission(1, Ok(()), &mut counters, false)
+            .unwrap();
+        assert_eq!(
+            transfers.pending.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         transfers.slots[1].submit_no_device = true;
-        assert!(matches!(transfers.record_submission(1, Err("detached".into()),
-            &mut counters, false), Err(FeedbackFault::DeviceLost)));
+        assert!(matches!(
+            transfers.record_submission(1, Err("detached".into()), &mut counters, false),
+            Err(FeedbackFault::DeviceLost)
+        ));
     }
 
     #[test]
     fn ordered_dual_polls_share_one_playback_startup_skip_budget() {
-        let endpoint = FeedbackEndpoint { service_interval_us: 1000, ..feedback_pipe() };
-        let compatibility = FeedbackCompatibility { tenor_nominal_q16: None, startup_packets_remaining: 4 };
+        let endpoint = FeedbackEndpoint {
+            service_interval_us: 1000,
+            ..feedback_pipe()
+        };
+        let compatibility = FeedbackCompatibility {
+            tenor_nominal_q16: None,
+            startup_packets_remaining: 4,
+        };
         let mut transfers = FeedbackTransfers::new(endpoint, 4, compatibility).unwrap();
         assert_eq!(transfers.slots.len(), 2);
         assert_eq!(transfers.slots[0].packet_count, 2);
@@ -1775,13 +2518,19 @@ mod explicit_feedback_tests {
                 let data = &mut *slot.user_data;
                 data.buffer.copy_from_slice(&q16(6.0).repeat(2));
                 for packet_index in 0..2 {
-                    let packet = &mut *slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(packet_index);
+                    let packet = &mut *slot
+                        .transfer
+                        .as_mut()
+                        .iso_packet_desc
+                        .as_mut_ptr()
+                        .add(packet_index);
                     packet.length = 4;
                     packet.actual_length = 4;
                     packet.status = LIBUSB_TRANSFER_COMPLETED;
                 }
                 slot.transfer.as_mut().num_iso_packets = 2;
-                *data.completion.completed_at.lock().unwrap() = Some(first + Duration::from_millis(index as u64));
+                *data.completion.completed_at.lock().unwrap() =
+                    Some(first + Duration::from_millis(index as u64));
                 *data.completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
             }
             if index == 1 {
@@ -1794,9 +2543,19 @@ mod explicit_feedback_tests {
         for expected in 0..2 {
             let (index, status, _, actual) = transfers.take_next_completion().unwrap();
             assert_eq!(index, expected);
-            assert!(transfers.slots[index].newest_valid_report(&scheduler, 1000,
-                Speed::High, 49, false, &mut counters, actual, status,
-                &mut transfers.compatibility).is_none());
+            assert!(transfers.slots[index]
+                .newest_valid_report(
+                    &scheduler,
+                    1000,
+                    Speed::High,
+                    49,
+                    false,
+                    &mut counters,
+                    actual,
+                    status,
+                    &mut transfers.compatibility
+                )
+                .is_none());
         }
         assert_eq!(transfers.compatibility.startup_packets_remaining, 0);
         assert!(counters.selected_timebase.is_none());
@@ -1804,34 +2563,67 @@ mod explicit_feedback_tests {
         unsafe {
             (&mut *transfers.slots[0].user_data).buffer[4..8].copy_from_slice(&q16(48.0));
         }
-        assert_eq!(transfers.slots[0].newest_valid_report(&scheduler, 1000,
-            Speed::High, 49, false, &mut counters, 8, LIBUSB_TRANSFER_COMPLETED,
-            &mut transfers.compatibility), Some((48.0, 48_000.0)));
+        assert_eq!(
+            transfers.slots[0].newest_valid_report(
+                &scheduler,
+                1000,
+                Speed::High,
+                49,
+                false,
+                &mut counters,
+                8,
+                LIBUSB_TRANSFER_COMPLETED,
+                &mut transfers.compatibility
+            ),
+            Some((48.0, 48_000.0))
+        );
         assert_eq!(counters.rejected, 1);
         assert!(transfers.take_next_completion().is_none());
     }
 
     #[test]
     fn dual_poll_enhanced_feedback_keeps_exact_eight_byte_reports() {
-        let endpoint = FeedbackEndpoint { max_packet_bytes: 8, service_interval_us: 1000, ..feedback_pipe() };
-        let mut transfers = FeedbackTransfers::new(endpoint, 4,
-            FeedbackCompatibility::default()).unwrap();
+        let endpoint = FeedbackEndpoint {
+            max_packet_bytes: 8,
+            service_interval_us: 1000,
+            ..feedback_pipe()
+        };
+        let mut transfers =
+            FeedbackTransfers::new(endpoint, 4, FeedbackCompatibility::default()).unwrap();
         let mut counters = FeedbackCounters::default();
         let report = (6u64 << 32).to_le_bytes();
         let slot = &mut transfers.slots[1];
         unsafe {
-            (&mut *slot.user_data).buffer.copy_from_slice(&report.repeat(2));
+            (&mut *slot.user_data)
+                .buffer
+                .copy_from_slice(&report.repeat(2));
             slot.transfer.as_mut().num_iso_packets = 2;
             for (index, actual) in [8, 4].into_iter().enumerate() {
-                let packet = &mut *slot.transfer.as_mut().iso_packet_desc.as_mut_ptr().add(index);
+                let packet = &mut *slot
+                    .transfer
+                    .as_mut()
+                    .iso_packet_desc
+                    .as_mut_ptr()
+                    .add(index);
                 packet.length = 8;
                 packet.actual_length = actual;
                 packet.status = LIBUSB_TRANSFER_COMPLETED;
             }
         }
-        assert_eq!(slot.newest_valid_report(&scheduler(1000), 1000,
-            Speed::Super, 49, false, &mut counters, 12, LIBUSB_TRANSFER_COMPLETED,
-            &mut transfers.compatibility), Some((48.0, 48_000.0)));
+        assert_eq!(
+            slot.newest_valid_report(
+                &scheduler(1000),
+                1000,
+                Speed::Super,
+                49,
+                false,
+                &mut counters,
+                12,
+                LIBUSB_TRANSFER_COMPLETED,
+                &mut transfers.compatibility
+            ),
+            Some((48.0, 48_000.0))
+        );
         assert_eq!(counters.last_report_len, 8);
         assert_eq!(counters.rejected, 1);
     }
@@ -1839,29 +2631,73 @@ mod explicit_feedback_tests {
     #[test]
     fn trace_distinguishes_rejected_rate_and_capacity_from_transport_failures() {
         use crate::ExplicitFeedbackOutcome as Outcome;
-        let recorder = Arc::new(crate::feedback_diagnostics::FeedbackRecorder::new(Instant::now()));
+        let recorder = Arc::new(crate::feedback_diagnostics::FeedbackRecorder::new(
+            Instant::now(),
+        ));
         let mut counters = FeedbackCounters {
             trace: Some(recorder),
             diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
             ..Default::default()
         };
         let rate = q16(48.0);
-        assert!(select_feedback_report(&rate, [(0, 4, 4)], &scheduler(250), 250,
-            Speed::High, 128, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &rate,
+            [(0, 4, 4)],
+            &scheduler(250),
+            250,
+            Speed::High,
+            128,
+            false,
+            &mut counters
+        )
+        .is_none());
         let capacity = q16(6.005);
-        assert!(select_feedback_report(&capacity, [(0, 4, 4)], &scheduler(125), 125,
-            Speed::High, 6, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &capacity,
+            [(0, 4, 4)],
+            &scheduler(125),
+            125,
+            Speed::High,
+            6,
+            false,
+            &mut counters
+        )
+        .is_none());
         let mut partial = q16(6.0).to_vec();
         partial.extend_from_slice(&[0; 4]);
-        assert!(inspect_feedback_packets(&partial,
-            [(0, 4, 4), (NO_FEEDBACK_PACKET_STATUS, 4, 0)], &scheduler(125), 125,
-            Speed::High, 7, false, &mut counters, LIBUSB_TRANSFER_TIMED_OUT, true).is_none());
+        assert!(inspect_feedback_packets(
+            &partial,
+            [(0, 4, 4), (NO_FEEDBACK_PACKET_STATUS, 4, 0)],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+            LIBUSB_TRANSFER_TIMED_OUT,
+            true
+        )
+        .is_none());
         let diagnostics = counters.diagnostics.unwrap();
-        let sample = |outcome| diagnostics.packet_samples().find(|sample| sample.outcome == outcome).unwrap();
-        assert_eq!(sample(Outcome::RateOutOfRange).decoded_rate_hz, Some(384_000.0));
+        let sample = |outcome| {
+            diagnostics
+                .packet_samples()
+                .find(|sample| sample.outcome == outcome)
+                .unwrap()
+        };
+        assert_eq!(
+            sample(Outcome::RateOutOfRange).decoded_rate_hz,
+            Some(384_000.0)
+        );
         assert_eq!(sample(Outcome::RateOutOfRange).raw_bytes(), rate);
-        assert_eq!(sample(Outcome::PacketCapacityExceeded).raw_bytes(), capacity);
-        assert_eq!(sample(Outcome::TransferFailed).transfer_status, LIBUSB_TRANSFER_TIMED_OUT);
+        assert_eq!(
+            sample(Outcome::PacketCapacityExceeded).raw_bytes(),
+            capacity
+        );
+        assert_eq!(
+            sample(Outcome::TransferFailed).transfer_status,
+            LIBUSB_TRANSFER_TIMED_OUT
+        );
         assert_eq!(sample(Outcome::TransferFailed).packet_status, Some(0));
         assert_eq!(sample(Outcome::TransferFailed).raw_bytes(), &partial[..4]);
         assert_eq!(diagnostics.packet_status_counts[7], 1);
@@ -1874,11 +2710,22 @@ mod explicit_feedback_tests {
             ..Default::default()
         };
         let report = q16(48.0);
-        select_feedback_report(&report, [(0, 4, 4)], &scheduler(125), 125,
-            Speed::High, 7, false, &mut counters);
+        select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters,
+        );
         let diagnostics = counters.diagnostics.unwrap();
         let sample = diagnostics.packet_samples().next().unwrap();
-        assert_eq!(sample.outcome, crate::ExplicitFeedbackOutcome::RateOutOfRange);
+        assert_eq!(
+            sample.outcome,
+            crate::ExplicitFeedbackOutcome::RateOutOfRange
+        );
         assert_eq!(sample.actual_bytes, 4);
         assert!(sample.raw_bytes().is_empty());
     }
@@ -1897,20 +2744,56 @@ mod explicit_feedback_tests {
         };
         // Two reports in a single completion still count as one observation.
         let batch = [report, report].concat();
-        assert!(select_feedback_report(&batch, [(0, 4, 4), (0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
-        assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
-        let (frames, rate) = select_feedback_report(&report, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).unwrap();
+        assert!(select_feedback_report(
+            &batch,
+            [(0, 4, 4), (0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
+        assert!(select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
+        let (frames, rate) = select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters,
+        )
+        .unwrap();
         assert!((frames - 11.036_224).abs() < 0.000_001);
         assert!((rate - 44_144.897).abs() < 0.001);
         let diagnostics = counters.diagnostics.unwrap();
         assert_eq!(diagnostics.timebase, Some("out_service_interval"));
         assert!(diagnostics.inferred_timebase);
         // A later report with different units is refused.
-        assert!(select_feedback_report(&standard, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &standard,
+            [(0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
     }
 
     #[test]
@@ -1926,11 +2809,29 @@ mod explicit_feedback_tests {
                 ..Default::default()
             };
             for _ in 0..2 {
-                assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler,
-                    250, Speed::High, 128, false, &mut counters).is_none());
+                assert!(select_feedback_report(
+                    &report,
+                    [(0, 4, 4)],
+                    &scheduler,
+                    250,
+                    Speed::High,
+                    128,
+                    false,
+                    &mut counters
+                )
+                .is_none());
             }
-            let (_, decoded) = select_feedback_report(&report, [(0, 4, 4)], &scheduler,
-                250, Speed::High, 128, false, &mut counters).unwrap();
+            let (_, decoded) = select_feedback_report(
+                &report,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                128,
+                false,
+                &mut counters,
+            )
+            .unwrap();
             assert!((decoded - f64::from(rate)).abs() < 65.0);
             assert!(counters.selected_service_interval());
         }
@@ -1943,24 +2844,60 @@ mod explicit_feedback_tests {
         let scheduler = IsoPacketScheduler::new(44_100, 4, 250);
         let mut counters = FeedbackCounters::default();
         for _ in 0..4 {
-            assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
-                250, Speed::High, 256, false, &mut counters).is_none());
+            assert!(select_feedback_report(
+                &alternate,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                256,
+                false,
+                &mut counters
+            )
+            .is_none());
         }
         assert!(counters.selected_timebase.is_none());
         counters.infer_service_interval = true;
         // The alternate interpretation needs at least 12 frames of capacity.
         for _ in 0..4 {
-            assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
-                250, Speed::High, 11, false, &mut counters).is_none());
+            assert!(select_feedback_report(
+                &alternate,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                11,
+                false,
+                &mut counters
+            )
+            .is_none());
         }
         assert!(counters.selected_timebase.is_none());
         let batch = [alternate, standard, alternate].concat();
-        let (_, rate) = select_feedback_report(&batch, [(0, 4, 4); 3], &scheduler,
-            250, Speed::High, 256, false, &mut counters).unwrap();
+        let (_, rate) = select_feedback_report(
+            &batch,
+            [(0, 4, 4); 3],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters,
+        )
+        .unwrap();
         assert!((rate - 44_100.0).abs() < 0.1);
         assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
-        assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &alternate,
+            [(0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
     }
 
     #[test]
@@ -1972,18 +2909,47 @@ mod explicit_feedback_tests {
             diagnostics: Some(crate::ExplicitFeedbackDiagnostics::default()),
             ..Default::default()
         };
-        assert!(select_feedback_report(&alternate, [(0, 4, 0)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &alternate,
+            [(0, 4, 0)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
         assert!(counters.selected_timebase.is_none());
-        assert!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters).is_none());
+        assert!(select_feedback_report(
+            &alternate,
+            [(0, 4, 4)],
+            &scheduler,
+            250,
+            Speed::High,
+            256,
+            false,
+            &mut counters
+        )
+        .is_none());
 
         // A second stream at a different rate can reuse the saved units after
         // checking them against its own readback and packet capacity.
         counters.infer_service_interval = true;
         counters.cached_service_interval = true;
-        assert_eq!(select_feedback_report(&alternate, [(0, 4, 4)], &scheduler,
-            250, Speed::High, 256, false, &mut counters), Some((12.0, 48_000.0)));
+        assert_eq!(
+            select_feedback_report(
+                &alternate,
+                [(0, 4, 4)],
+                &scheduler,
+                250,
+                Speed::High,
+                256,
+                false,
+                &mut counters
+            ),
+            Some((12.0, 48_000.0))
+        );
         assert!(counters.selected_service_interval());
         assert!(counters.diagnostics.unwrap().reused_timebase);
     }
@@ -1997,8 +2963,19 @@ mod explicit_feedback_tests {
             ..Default::default()
         };
         let batch = [q16(12.0), q16(6.0)].concat();
-        assert_eq!(select_feedback_report(&batch, [(0, 4, 4); 2], &scheduler,
-            250, Speed::High, 256, false, &mut counters), Some((12.0, 48_000.0)));
+        assert_eq!(
+            select_feedback_report(
+                &batch,
+                [(0, 4, 4); 2],
+                &scheduler,
+                250,
+                Speed::High,
+                256,
+                false,
+                &mut counters
+            ),
+            Some((12.0, 48_000.0))
+        );
         assert_eq!(counters.selected_timebase, Some(FeedbackTimebase::Bus));
     }
 
@@ -2009,16 +2986,42 @@ mod explicit_feedback_tests {
         // per USB microframe. Enable only after the device trace proves units.
         let report = q16(48.0);
         let mut counters = FeedbackCounters::default();
-        assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler(1000), 1000,
-            Speed::High, 49, false, &mut counters).is_none());
-        assert_eq!(select_feedback_report(&report, [(0, 4, 4)], &scheduler(1000), 1000,
-            Speed::High, 49, true, &mut counters), Some((48.0, 48_000.0)));
-        assert_eq!(decode_feedback_report_with_scale(&report, 1000, Speed::Super, true),
-            decode_feedback_report(&report, 1000, Speed::Super));
-        assert_eq!(decode_feedback_report_with_scale(&[0, 0, 12], 1000, Speed::High, true),
-            decode_feedback_report(&[0, 0, 12], 1000, Speed::High));
-        assert_eq!(decode_feedback_report_with_scale(&[0, 0, 12], 1000, Speed::Full, true),
-            Some((48.0, 48_000.0)));
+        assert!(select_feedback_report(
+            &report,
+            [(0, 4, 4)],
+            &scheduler(1000),
+            1000,
+            Speed::High,
+            49,
+            false,
+            &mut counters
+        )
+        .is_none());
+        assert_eq!(
+            select_feedback_report(
+                &report,
+                [(0, 4, 4)],
+                &scheduler(1000),
+                1000,
+                Speed::High,
+                49,
+                true,
+                &mut counters
+            ),
+            Some((48.0, 48_000.0))
+        );
+        assert_eq!(
+            decode_feedback_report_with_scale(&report, 1000, Speed::Super, true),
+            decode_feedback_report(&report, 1000, Speed::Super)
+        );
+        assert_eq!(
+            decode_feedback_report_with_scale(&[0, 0, 12], 1000, Speed::High, true),
+            decode_feedback_report(&[0, 0, 12], 1000, Speed::High)
+        );
+        assert_eq!(
+            decode_feedback_report_with_scale(&[0, 0, 12], 1000, Speed::Full, true),
+            Some((48.0, 48_000.0))
+        );
     }
 
     #[test]
@@ -2026,31 +3029,76 @@ mod explicit_feedback_tests {
         let health = ExplicitFeedbackHealth::new(1000, None);
         let start = Instant::now();
         assert_eq!(health.state(start, start, None), (false, false, false));
-        assert_eq!(health.state(start + Duration::from_millis(500), start, None), (false, true, false));
-        assert_eq!(health.state(start + Duration::from_secs(1), start, None), (false, true, true));
+        assert_eq!(
+            health.state(start + Duration::from_millis(500), start, None),
+            (false, true, false)
+        );
+        assert_eq!(
+            health.state(start + Duration::from_secs(1), start, None),
+            (false, true, true)
+        );
         let good = start + Duration::from_millis(100);
         assert_eq!(health.state(good, start, Some(good)), (true, false, false));
-        assert_eq!(health.state(start + Duration::from_millis(600), start, Some(good)), (false, true, false));
+        assert_eq!(
+            health.state(start + Duration::from_millis(600), start, Some(good)),
+            (false, true, false)
+        );
         let recovered = start + Duration::from_millis(900);
-        assert_eq!(health.state(recovered, start, Some(recovered)), (true, false, false));
+        assert_eq!(
+            health.state(recovered, start, Some(recovered)),
+            (true, false, false)
+        );
         // Empty success produces no report and cannot refresh the clock or last rate.
-        let mut counters = FeedbackCounters { last_report_at: Some(good), ..Default::default() };
-        assert!(select_feedback_report(&[0; 4], [(0, 4, 0)], &scheduler(125), 125,
-            Speed::High, 7, false, &mut counters).is_none());
+        let mut counters = FeedbackCounters {
+            last_report_at: Some(good),
+            ..Default::default()
+        };
+        assert!(select_feedback_report(
+            &[0; 4],
+            [(0, 4, 0)],
+            &scheduler(125),
+            125,
+            Speed::High,
+            7,
+            false,
+            &mut counters
+        )
+        .is_none());
         assert_eq!(counters.last_report_at, Some(good));
-        assert_eq!(health.state(start + Duration::from_millis(1100), start, counters.last_report_at), (false, true, true));
+        assert_eq!(
+            health.state(
+                start + Duration::from_millis(1100),
+                start,
+                counters.last_report_at
+            ),
+            (false, true, true)
+        );
     }
 
     #[test]
     fn first_submit_failure_is_terminal_and_detach_is_distinct() {
-        assert!(matches!(feedback_submit_failure("allocation/submit error".into(), false, true),
-            Some(FeedbackFault::Transfer(_))));
+        assert!(matches!(
+            feedback_submit_failure("allocation/submit error".into(), false, true),
+            Some(FeedbackFault::Transfer(_))
+        ));
         assert!(feedback_submit_failure("transient".into(), false, false).is_none());
-        assert!(matches!(feedback_submit_failure("detached".into(), true, true), Some(FeedbackFault::DeviceLost)));
-        assert!(matches!(feedback_submit_failure("detached".into(), true, false), Some(FeedbackFault::DeviceLost)));
-        assert!(matches!(feedback_completion_fault(LIBUSB_TRANSFER_NO_DEVICE, false, 0x81), Some(FeedbackFault::DeviceLost)));
+        assert!(matches!(
+            feedback_submit_failure("detached".into(), true, true),
+            Some(FeedbackFault::DeviceLost)
+        ));
+        assert!(matches!(
+            feedback_submit_failure("detached".into(), true, false),
+            Some(FeedbackFault::DeviceLost)
+        ));
+        assert!(matches!(
+            feedback_completion_fault(LIBUSB_TRANSFER_NO_DEVICE, false, 0x81),
+            Some(FeedbackFault::DeviceLost)
+        ));
         assert!(feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, true, 0x81).is_none());
-        assert!(matches!(feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, false, 0x81), Some(FeedbackFault::Transfer(_))));
+        assert!(matches!(
+            feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, false, 0x81),
+            Some(FeedbackFault::Transfer(_))
+        ));
         assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, false, 0x81).is_none());
         assert!(feedback_completion_fault(LIBUSB_TRANSFER_OVERFLOW, false, 0x81).is_none());
     }
@@ -2067,9 +3115,16 @@ mod explicit_feedback_tests {
         // Processing after the old deadline is fine if the callback was timely:
         // its new age is measured from the true completion, not processing time.
         let processed = at_deadline + Duration::from_millis(5);
-        assert_eq!(health.state(processed, start, Some(before_deadline)), (true, false, false));
+        assert_eq!(
+            health.state(processed, start, Some(before_deadline)),
+            (true, false, false)
+        );
         let prior_good = start + Duration::from_millis(200);
-        assert!(health.report_is_timely(prior_good + health.terminal - Duration::from_micros(1), start, Some(prior_good)));
+        assert!(health.report_is_timely(
+            prior_good + health.terminal - Duration::from_micros(1),
+            start,
+            Some(prior_good)
+        ));
         assert!(!health.report_is_timely(prior_good + health.terminal, start, Some(prior_good)));
     }
 
@@ -2080,7 +3135,10 @@ mod explicit_feedback_tests {
         assert_eq!(slow.terminal, Duration::from_millis(3072));
         let invalid = ExplicitFeedbackHealth::new(1000, Some(10));
         assert_eq!(invalid.warning, Duration::from_millis(500));
-        assert_eq!(ExplicitFeedbackHealth::new(1_024_000, None).terminal, Duration::from_millis(6144));
+        assert_eq!(
+            ExplicitFeedbackHealth::new(1_024_000, None).terminal,
+            Duration::from_millis(6144)
+        );
     }
 }
 
@@ -2089,17 +3147,27 @@ mod tx_length_prefix_tests {
     use super::*;
     #[test]
     fn headers_preserve_pcm_and_silence_payload_and_music_counts() {
-        for held in [false,true] {
-            let bytes=if held {vec![0;12]} else {(0..12).collect()};
-            let mut payload=IsoTransferPayload {packet_sizes:vec![6,6],packet_samples:vec![],transfer_buffer:bytes.clone(),
-                underrun:false,held,frame_count:2,music_frames:if held {0} else {2},epoch:7};
+        for held in [false, true] {
+            let bytes = if held { vec![0; 12] } else { (0..12).collect() };
+            let mut payload = IsoTransferPayload {
+                packet_sizes: vec![6, 6],
+                packet_samples: vec![],
+                transfer_buffer: bytes.clone(),
+                underrun: false,
+                held,
+                frame_count: 2,
+                music_frames: if held { 0 } else { 2 },
+                epoch: 7,
+            };
             add_tx_length_prefix(&mut payload).unwrap();
-            assert_eq!(payload.packet_sizes,vec![10,10]);
-            assert_eq!(&payload.transfer_buffer[0..4],&6u32.to_le_bytes());
-            assert_eq!(&payload.transfer_buffer[4..10],&bytes[..6]);
-            assert_eq!(&payload.transfer_buffer[10..14],&6u32.to_le_bytes());
-            assert_eq!(&payload.transfer_buffer[14..20],&bytes[6..]);
-            assert_eq!(payload.frame_count,2);assert_eq!(payload.music_frames,if held {0} else {2});assert_eq!(payload.epoch,7);
+            assert_eq!(payload.packet_sizes, vec![10, 10]);
+            assert_eq!(&payload.transfer_buffer[0..4], &6u32.to_le_bytes());
+            assert_eq!(&payload.transfer_buffer[4..10], &bytes[..6]);
+            assert_eq!(&payload.transfer_buffer[10..14], &6u32.to_le_bytes());
+            assert_eq!(&payload.transfer_buffer[14..20], &bytes[6..]);
+            assert_eq!(payload.frame_count, 2);
+            assert_eq!(payload.music_frames, if held { 0 } else { 2 });
+            assert_eq!(payload.epoch, 7);
         }
     }
 }
@@ -2107,38 +3175,49 @@ mod tx_length_prefix_tests {
 #[cfg(test)]
 mod source_wire_owner_policy_tests {
     use super::*;
-    use crate::{DacConfig,DeviceInfo,QuirkOverride,QuirkPolicy};
+    use crate::{DacConfig, DeviceInfo, QuirkOverride, QuirkPolicy};
     #[test]
     fn host_flag_names_cannot_enable_wire_framing_or_playback_bootstrap() {
-        let a=context::SessionContext::unregistered();
-        let b=context::SessionContext::unregistered();
-        let _a=a.enter();
-        crate::settings::install(crate::settings::Settings::for_device(DacConfig {
-            quirk_policy:QuirkPolicy::SourceBacked,
-            quirks:vec![QuirkOverride {vendor_id:1,product_id:2,name_contains:None,
-                quirks:vec![crate::Quirk::TxLengthPrefix,crate::Quirk::PlaybackFirst]}],
-            ..DacConfig::default()
-        },&DeviceInfo::new(1,2,"caller metadata")));
+        let a = context::SessionContext::unregistered();
+        let b = context::SessionContext::unregistered();
+        let _a = a.enter();
+        crate::settings::install(crate::settings::Settings::for_device(
+            DacConfig {
+                quirk_policy: QuirkPolicy::SourceBacked,
+                quirks: vec![QuirkOverride {
+                    vendor_id: 1,
+                    product_id: 2,
+                    name_contains: None,
+                    quirks: vec![crate::Quirk::TxLengthPrefix, crate::Quirk::PlaybackFirst],
+                }],
+                ..DacConfig::default()
+            },
+            &DeviceInfo::new(1, 2, "caller metadata"),
+        ));
         assert!(settings().has(crate::Quirk::TxLengthPrefix));
         assert!(settings().has(crate::Quirk::PlaybackFirst));
-        assert_eq!(data_packet_prefix_bytes(),0);
+        assert_eq!(data_packet_prefix_bytes(), 0);
         assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
         // The internal descriptor path, rather than caller names/overrides,
         // resolves one exact source fact under its owning context.
-        crate::settings::install_descriptor_identity(0x1686,0x00dd,0x0100);
-        assert_eq!(data_packet_prefix_bytes(),4);
+        crate::settings::install_descriptor_identity(0x1686, 0x00dd, 0x0100);
+        assert_eq!(data_packet_prefix_bytes(), 4);
         assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
         {
-            let _b=b.enter();
-            assert_eq!(data_packet_prefix_bytes(),0);
-            crate::settings::install(crate::settings::Settings::for_device(DacConfig {
-                quirk_policy:QuirkPolicy::SourceBacked,..DacConfig::default()
-            },&DeviceInfo::new(9,9,"caller metadata")));
-            crate::settings::install_descriptor_identity(0x1397,0x0507,0x0100);
+            let _b = b.enter();
+            assert_eq!(data_packet_prefix_bytes(), 0);
+            crate::settings::install(crate::settings::Settings::for_device(
+                DacConfig {
+                    quirk_policy: QuirkPolicy::SourceBacked,
+                    ..DacConfig::default()
+                },
+                &DeviceInfo::new(9, 9, "caller metadata"),
+            ));
+            crate::settings::install_descriptor_identity(0x1397, 0x0507, 0x0100);
             assert!(settings().source_has(crate::Quirk::PlaybackFirst));
-            assert_eq!(data_packet_prefix_bytes(),0);
+            assert_eq!(data_packet_prefix_bytes(), 0);
         }
-        assert_eq!(data_packet_prefix_bytes(),4);
+        assert_eq!(data_packet_prefix_bytes(), 4);
         assert!(!settings().source_has(crate::Quirk::PlaybackFirst));
     }
 }

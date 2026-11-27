@@ -30,9 +30,7 @@ impl AudioControlParser {
     pub fn parse_ac_header_v1(&self, data: &[u8]) -> Result<AcInterfaceHeaderV1, DescriptorError> {
         require_len(data, 8)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_AC_HEADER {
-            return Err(DescriptorError::Invalid(
-                "not UAC1 AC header".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not UAC1 AC header".to_string()));
         }
         let bcd_adc = read_u16_le(data, 3);
         let w_total_length = read_u16_le(data, 5);
@@ -53,11 +51,18 @@ impl AudioControlParser {
         })
     }
 
-    fn detect_and_parse_ac_header(&self, data: &[u8]) -> Result<AudioControlDescriptor, DescriptorError> {
+    fn detect_and_parse_ac_header(
+        &self,
+        data: &[u8],
+    ) -> Result<AudioControlDescriptor, DescriptorError> {
         require_len(data, 5)?;
         match read_u16_le(data, 3) {
-            UAC1_BCD_ADC => self.parse_ac_header_v1(data).map(AudioControlDescriptor::HeaderV1),
-            UAC2_BCD_ADC => self.parse_ac_header(data).map(AudioControlDescriptor::HeaderV2),
+            UAC1_BCD_ADC => self
+                .parse_ac_header_v1(data)
+                .map(AudioControlDescriptor::HeaderV1),
+            UAC2_BCD_ADC => self
+                .parse_ac_header(data)
+                .map(AudioControlDescriptor::HeaderV2),
             version => Err(DescriptorError::Invalid(format!(
                 "unsupported AudioControl version 0x{version:04x}"
             ))),
@@ -68,9 +73,7 @@ impl AudioControlParser {
         const LEN: usize = 17;
         require_len(data, LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC2_INPUT_TERMINAL {
-            return Err(DescriptorError::Invalid(
-                "not input terminal".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not input terminal".to_string()));
         }
         let t = InputTerminal {
             b_terminal_id: data[3],
@@ -89,9 +92,7 @@ impl AudioControlParser {
         const LEN: usize = 12;
         require_len(data, LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC2_OUTPUT_TERMINAL {
-            return Err(DescriptorError::Invalid(
-                "not output terminal".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not output terminal".to_string()));
         }
         let t = OutputTerminal {
             b_terminal_id: data[3],
@@ -133,7 +134,9 @@ impl AudioControlParser {
     pub fn parse_input_terminal_v1(&self, data: &[u8]) -> Result<InputTerminal, DescriptorError> {
         require_len(data, 12)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_INPUT_TERMINAL {
-            return Err(DescriptorError::Invalid("not UAC1 input terminal".to_string()));
+            return Err(DescriptorError::Invalid(
+                "not UAC1 input terminal".to_string(),
+            ));
         }
         let terminal = InputTerminal {
             b_terminal_id: data[3],
@@ -151,7 +154,9 @@ impl AudioControlParser {
     pub fn parse_output_terminal_v1(&self, data: &[u8]) -> Result<OutputTerminal, DescriptorError> {
         require_len(data, 9)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_OUTPUT_TERMINAL {
-            return Err(DescriptorError::Invalid("not UAC1 output terminal".to_string()));
+            return Err(DescriptorError::Invalid(
+                "not UAC1 output terminal".to_string(),
+            ));
         }
         let terminal = OutputTerminal {
             b_terminal_id: data[3],
@@ -167,19 +172,26 @@ impl AudioControlParser {
     pub fn parse_feature_unit_v1(&self, data: &[u8]) -> Result<FeatureUnit, DescriptorError> {
         require_len(data, 7)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_FEATURE_UNIT {
-            return Err(DescriptorError::Invalid("not UAC1 feature unit".to_string()));
+            return Err(DescriptorError::Invalid(
+                "not UAC1 feature unit".to_string(),
+            ));
         }
         let len = data[0] as usize;
         let size = data[5] as usize;
         if !(1..=4).contains(&size) || len < 7 + size || (len - 7) % size != 0 {
-            return Err(DescriptorError::Invalid("invalid UAC1 feature unit length".to_string()));
+            return Err(DescriptorError::Invalid(
+                "invalid UAC1 feature unit length".to_string(),
+            ));
         }
         require_len(data, len)?;
-        let bma_controls = data[6..len - 1].chunks_exact(size).map(|bytes| {
-            let mut word = [0u8; 4];
-            word[..size].copy_from_slice(bytes);
-            u32::from_le_bytes(word)
-        }).collect();
+        let bma_controls = data[6..len - 1]
+            .chunks_exact(size)
+            .map(|bytes| {
+                let mut word = [0u8; 4];
+                word[..size].copy_from_slice(bytes);
+                u32::from_le_bytes(word)
+            })
+            .collect();
         let unit = FeatureUnit {
             b_unit_id: data[3],
             b_source_id: data[4],
@@ -209,9 +221,7 @@ impl AudioControlParser {
         const MIN_LEN: usize = 7;
         require_len(data, MIN_LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC2_CLOCK_SELECTOR {
-            return Err(DescriptorError::Invalid(
-                "not clock selector".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not clock selector".to_string()));
         }
         let len = data[0] as usize;
         require_len(data, len)?;
@@ -239,9 +249,7 @@ impl AudioControlParser {
         const LEN: usize = 7;
         require_len(data, LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC2_CLOCK_MULTIPLIER {
-            return Err(DescriptorError::Invalid(
-                "not clock multiplier".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not clock multiplier".to_string()));
         }
         Ok(ClockMultiplier {
             b_clock_id: data[3],
@@ -291,9 +299,7 @@ impl AudioControlParser {
         const MIN_LEN: usize = 6;
         require_len(data, MIN_LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_SELECTOR_UNIT {
-            return Err(DescriptorError::Invalid(
-                "not selector unit".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not selector unit".to_string()));
         }
         let len = data[0] as usize;
         require_len(data, len)?;
@@ -329,9 +335,7 @@ impl AudioControlParser {
         const MIN_LEN: usize = 10;
         require_len(data, MIN_LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_PROCESSING_UNIT {
-            return Err(DescriptorError::Invalid(
-                "not processing unit".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not processing unit".to_string()));
         }
         let len = data[0] as usize;
         require_len(data, len)?;
@@ -354,9 +358,7 @@ impl AudioControlParser {
         const MIN_LEN: usize = 13;
         require_len(data, MIN_LEN)?;
         if data[1] != USB_DT_CS_INTERFACE || data[2] != UAC_EXTENSION_UNIT {
-            return Err(DescriptorError::Invalid(
-                "not extension unit".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("not extension unit".to_string()));
         }
         let len = data[0] as usize;
         require_len(data, len)?;
@@ -385,9 +387,7 @@ impl DescriptorParser for AudioControlParser {
 
     fn parse(&self, data: &[u8]) -> Result<Self::Output, DescriptorError> {
         if data.len() < 3 {
-            return Err(DescriptorError::Invalid(
-                "descriptor too short".to_string(),
-            ));
+            return Err(DescriptorError::Invalid("descriptor too short".to_string()));
         }
         if data[1] != USB_DT_CS_INTERFACE {
             return Err(DescriptorError::Invalid("not CS interface".to_string()));

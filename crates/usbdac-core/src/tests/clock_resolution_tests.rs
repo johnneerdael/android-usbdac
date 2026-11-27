@@ -52,7 +52,10 @@ fn a_terminal_fed_directly_by_a_clock_source_needs_no_request() {
     let resolved = resolve(&bytes, 1, no_request).unwrap();
     assert_eq!(resolved.clock_id, 4);
     assert_eq!(resolved.path, vec![4]);
-    assert!(!resolved.assumed_source, "a described Clock Source is not assumed");
+    assert!(
+        !resolved.assumed_source,
+        "a described Clock Source is not assumed"
+    );
 }
 
 #[test]
@@ -154,7 +157,10 @@ fn a_loop_is_reported_instead_of_walked_forever() {
         clock_multiplier(6, 7),
         clock_multiplier(7, 6),
     ]);
-    assert_eq!(resolve(&bytes, 1, no_request), Err(ClockResolveError::Loop(6)));
+    assert_eq!(
+        resolve(&bytes, 1, no_request),
+        Err(ClockResolveError::Loop(6))
+    );
 
     // A selector whose selected pin points back at itself.
     let bytes = descriptors(&[
@@ -162,7 +168,10 @@ fn a_loop_is_reported_instead_of_walked_forever() {
         clock_source(4),
         clock_selector(9, &[4, 9]),
     ]);
-    assert_eq!(resolve(&bytes, 1, |_| Ok(2)), Err(ClockResolveError::Loop(9)));
+    assert_eq!(
+        resolve(&bytes, 1, |_| Ok(2)),
+        Err(ClockResolveError::Loop(9))
+    );
 }
 
 #[test]
@@ -250,19 +259,31 @@ fn bad_pins_are_rejected() {
 
 #[test]
 fn a_selector_without_inputs_or_pointing_at_clock_zero_is_malformed() {
-    let bytes = descriptors(&[input_terminal(1, 9), clock_source(4), clock_selector(9, &[])]);
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_source(4),
+        clock_selector(9, &[]),
+    ]);
     assert_eq!(
         resolve(&bytes, 1, no_request),
         Err(ClockResolveError::SelectorWithoutInputs(9))
     );
 
-    let bytes = descriptors(&[input_terminal(1, 9), clock_source(4), clock_selector(9, &[0, 4])]);
+    let bytes = descriptors(&[
+        input_terminal(1, 9),
+        clock_source(4),
+        clock_selector(9, &[0, 4]),
+    ]);
     assert_eq!(
         resolve(&bytes, 1, |_| Ok(1)),
         Err(ClockResolveError::MalformedEntity(9))
     );
 
-    let bytes = descriptors(&[input_terminal(1, 7), clock_source(4), clock_multiplier(7, 0)]);
+    let bytes = descriptors(&[
+        input_terminal(1, 7),
+        clock_source(4),
+        clock_multiplier(7, 0),
+    ]);
     assert_eq!(
         resolve(&bytes, 1, no_request),
         Err(ClockResolveError::MalformedEntity(7))
@@ -328,7 +349,10 @@ fn the_raw_fallback_collects_only_the_audio_control_interfaces_class_descriptors
     let graph = ClockGraph::parse(&ac0);
     assert_eq!(graph.first_clock_source(), Some(4));
     let resolved = graph.resolve_terminal_clock(1, |_| Ok(2)).unwrap();
-    assert_eq!(resolved.clock_id, 5, "the raw path honours the selector too");
+    assert_eq!(
+        resolved.clock_id, 5,
+        "the raw path honours the selector too"
+    );
 
     let ac2 = audio_control_descriptors_from_config(&raw, 2);
     assert_eq!(ClockGraph::parse(&ac2).first_clock_source(), Some(88));
@@ -378,7 +402,10 @@ fn resolved(choice: ClockChoice, source_id: u8, path: Vec<ClockHop>) {
     assert_eq!(choice.resolution, ClockResolution::Resolved);
     assert_eq!(choice.path, path);
     // The path ends at the Clock Source the rate is set on.
-    assert_eq!(choice.path.last(), Some(&hop(source_id, ClockHopKind::Source)));
+    assert_eq!(
+        choice.path.last(),
+        Some(&hop(source_id, ClockHopKind::Source))
+    );
 }
 
 #[test]
@@ -500,7 +527,10 @@ fn an_id_taken_to_be_the_source_is_still_a_resolved_choice() {
 
 fn fallback_to_the_first_source(choice: &ClockChoice) {
     assert_eq!(choice.control_interface, AC);
-    assert_eq!(choice.source_id, 4, "the first Clock Source in descriptor order");
+    assert_eq!(
+        choice.source_id, 4,
+        "the first Clock Source in descriptor order"
+    );
     assert_eq!(choice.resolution, ClockResolution::FallbackFirstSource);
     // Nothing was followed, so only the source is on the path.
     assert_eq!(choice.path, vec![hop(4, ClockHopKind::Source)]);
@@ -550,7 +580,10 @@ fn a_stream_without_a_terminal_link_falls_back_too() {
     let bytes = descriptors(&[input_terminal(1, 4), clock_source(4)]);
     let selection = choose(&bytes, None, no_request).unwrap();
     fallback_to_the_first_source(&selection.choice);
-    assert!(selection.unresolved.expect("reason").contains("bTerminalLink"));
+    assert!(selection
+        .unresolved
+        .expect("reason")
+        .contains("bTerminalLink"));
 }
 
 #[test]
@@ -577,7 +610,10 @@ fn a_uac1_device_has_no_clock_to_choose() {
 #[test]
 fn clock_codes_are_stable() {
     assert_eq!(ClockResolution::Resolved.code(), "resolved");
-    assert_eq!(ClockResolution::FallbackFirstSource.code(), "fallback_first_source");
+    assert_eq!(
+        ClockResolution::FallbackFirstSource.code(),
+        "fallback_first_source"
+    );
     assert_eq!(ClockHopKind::Terminal.code(), "terminal");
     assert_eq!(
         ClockHopKind::Selector {

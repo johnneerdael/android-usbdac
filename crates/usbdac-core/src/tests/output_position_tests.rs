@@ -1,8 +1,7 @@
 use crate::iso_packet_validation::{account_timed_out_transfer, PacketAcceptance};
 use crate::iso_transport_loss::{LossLimits, LossTracker, UrbLoss};
 use crate::output_position::{
-    inflight_music_frames, music_frames_delivered, output_latency_frames,
-    PlayedMusicCounter,
+    inflight_music_frames, music_frames_delivered, output_latency_frames, PlayedMusicCounter,
 };
 use libusb1_sys::{constants::LIBUSB_TRANSFER_COMPLETED, libusb_iso_packet_descriptor};
 
@@ -41,7 +40,11 @@ fn lost_frames_come_off_the_padding_before_the_music() {
 
 #[test]
 fn nonsense_inputs_never_overflow_or_exceed_the_transfer() {
-    assert_eq!(music_frames_delivered(32, 99, 0), 32, "music cannot exceed the transfer");
+    assert_eq!(
+        music_frames_delivered(32, 99, 0),
+        32,
+        "music cannot exceed the transfer"
+    );
     assert_eq!(music_frames_delivered(32, 32, 99), 0);
     assert_eq!(music_frames_delivered(0, 0, 0), 0);
     assert_eq!(music_frames_delivered(u64::MAX, u64::MAX, u64::MAX), 0);
@@ -216,14 +219,24 @@ fn a_timed_out_transfer_counts_only_what_went_out_and_its_resubmission_counts_on
     };
     assert_eq!(timed_out.urb.lost_frames, SCHEDULE_FRAMES - 11);
 
-    let after_clean = complete(&mut played, &mut tracker, 0, &Completed::music(SCHEDULE_FRAMES));
+    let after_clean = complete(
+        &mut played,
+        &mut tracker,
+        0,
+        &Completed::music(SCHEDULE_FRAMES),
+    );
     assert_eq!(after_clean, 44);
     let after_timeout = complete(&mut played, &mut tracker, 0, &timed_out);
     assert_eq!(after_timeout, 44 + 11, "only the delivered packets count");
 
     // The slot is resubmitted with the next audio from the ring. Its frames are
     // new frames, so the lost URB's audio is not counted a second time.
-    let after_resubmit = complete(&mut played, &mut tracker, 0, &Completed::music(SCHEDULE_FRAMES));
+    let after_resubmit = complete(
+        &mut played,
+        &mut tracker,
+        0,
+        &Completed::music(SCHEDULE_FRAMES),
+    );
     assert_eq!(after_resubmit, 44 + 11 + 44);
     assert_eq!(tracker.lost_frames(), SCHEDULE_FRAMES - 11);
 }
@@ -232,7 +245,12 @@ fn a_timed_out_transfer_counts_only_what_went_out_and_its_resubmission_counts_on
 fn a_timed_out_hold_adds_nothing_and_loses_no_music() {
     let mut played = PlayedMusicCounter::default();
     let mut tracker = tracker();
-    complete(&mut played, &mut tracker, 0, &Completed::music(SCHEDULE_FRAMES));
+    complete(
+        &mut played,
+        &mut tracker,
+        0,
+        &Completed::music(SCHEDULE_FRAMES),
+    );
 
     let held_timeout = Completed {
         urb: UrbLoss {

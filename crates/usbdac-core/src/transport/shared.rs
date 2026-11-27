@@ -77,17 +77,26 @@ impl StreamShared {
         self.ensure_writable()?;
         let taken = {
             let mut ring = self.ring.lock();
-            let taken = ring.push_bytes_encoding(bytes, self.subslot_bytes, self.native_dsd(),
-                self.pcm_encoding == PcmEncoding::Unsigned8);
+            let taken = ring.push_bytes_encoding(
+                bytes,
+                self.subslot_bytes,
+                self.native_dsd(),
+                self.pcm_encoding == PcmEncoding::Unsigned8,
+            );
             self.stats
                 .buffered_samples
                 .store(ring.len_samples(), Ordering::Release);
             taken
         };
-        let ring_samples = if self.native_dsd() { taken } else { taken / self.subslot_bytes };
-        self.stats
-            .producer_frames
-            .fetch_add((ring_samples / self.channels.max(1)) as u64, Ordering::Relaxed);
+        let ring_samples = if self.native_dsd() {
+            taken
+        } else {
+            taken / self.subslot_bytes
+        };
+        self.stats.producer_frames.fetch_add(
+            (ring_samples / self.channels.max(1)) as u64,
+            Ordering::Relaxed,
+        );
         Ok(taken)
     }
 
@@ -96,7 +105,10 @@ impl StreamShared {
     pub(crate) fn write_samples(&self, samples: &[i32]) -> Result<usize, Error> {
         self.ensure_writable()?;
         if self.pcm_encoding != PcmEncoding::Signed {
-            return Err(Error::Unsupported { reason: "unsigned8/float32 require exact wire-byte write, not write_i32".into(), offered: vec![] });
+            return Err(Error::Unsupported {
+                reason: "unsigned8/float32 require exact wire-byte write, not write_i32".into(),
+                offered: vec![],
+            });
         }
         let granule = self.wire_frame_samples();
         let taken = {
@@ -133,7 +145,11 @@ impl StreamShared {
         if !needs_refill(queued, target) {
             return 0;
         }
-        let bytes_per_sample = if self.native_dsd() { 1 } else { self.subslot_bytes };
+        let bytes_per_sample = if self.native_dsd() {
+            1
+        } else {
+            self.subslot_bytes
+        };
         (target - queued) * bytes_per_sample / self.wire_frame_bytes() * self.wire_frame_bytes()
     }
 
@@ -163,12 +179,17 @@ impl StreamShared {
                 "software gain must be a finite value between 0.0 and 16.0".into(),
             ));
         }
-        if gain != 1.0 && (self.dsd_transport != DsdTransportMode::None || self.pcm_encoding != PcmEncoding::Signed) {
+        if gain != 1.0
+            && (self.dsd_transport != DsdTransportMode::None
+                || self.pcm_encoding != PcmEncoding::Signed)
+        {
             return Err(Error::InvalidState(
                 "software gain is supported only for signed integer PCM; exact unsigned8/float32/DSD bytes are preserved".into(),
             ));
         }
-        self.stats.gain_bits.store(gain.to_bits(), Ordering::Release);
+        self.stats
+            .gain_bits
+            .store(gain.to_bits(), Ordering::Release);
         set_software_volume_active(gain != 1.0);
         self.note_bit_perfect();
         Ok(())

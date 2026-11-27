@@ -4,7 +4,9 @@ use super::types::AudioControlDescriptor;
 
 #[test]
 fn standard_uac2_feature_unit_has_no_control_size_byte() {
-    let bytes = [18, 0x24, 6, 2, 1, 0x0f, 0, 0, 0, 0x0c, 0, 0, 0, 0x0c, 0, 0, 0, 0];
+    let bytes = [
+        18, 0x24, 6, 2, 1, 0x0f, 0, 0, 0, 0x0c, 0, 0, 0, 0x0c, 0, 0, 0, 0,
+    ];
     let unit = AudioControlParser.parse_feature_unit(&bytes).unwrap();
     assert_eq!(unit.b_unit_id, 2);
     assert_eq!(unit.b_source_id, 1);
@@ -14,7 +16,9 @@ fn standard_uac2_feature_unit_has_no_control_size_byte() {
 
 #[test]
 fn uac1_feature_unit_keeps_single_bit_controls() {
-    let unit = AudioControlParser.parse_feature_unit_v1(&[10, 0x24, 6, 2, 1, 1, 3, 2, 2, 0]).unwrap();
+    let unit = AudioControlParser
+        .parse_feature_unit_v1(&[10, 0x24, 6, 2, 1, 1, 3, 2, 2, 0])
+        .unwrap();
     assert_eq!(unit.b_control_size, 1);
     assert_eq!(unit.bma_controls, vec![3, 2, 2]);
 }
@@ -35,7 +39,9 @@ fn terminal_and_clock_selector_offsets_follow_uac2() {
     assert_eq!(terminal.b_nr_channels, 2);
     assert_eq!(terminal.w_channel_config, 3);
     assert_eq!(terminal.i_terminal, 7);
-    let selector = AudioControlParser.parse_clock_selector(&[9, 0x24, 0x0b, 6, 2, 4, 5, 3, 7]).unwrap();
+    let selector = AudioControlParser
+        .parse_clock_selector(&[9, 0x24, 0x0b, 6, 2, 4, 5, 3, 7])
+        .unwrap();
     assert_eq!(selector.ba_c_source_id, vec![4, 5]);
     assert_eq!(selector.bm_controls, 3);
 }

@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 use usbdac_core::{
-    BitPerfectBlocker, Dac, DacConfig, DacEvent, DacListener, DacStream, DeviceInfo, Encoding, Error,
-    HandBack,
-    Quirk, QuirkOverride, RatePolicy, StartupVolume, StartupVolumeReport, StreamFormat,
-    StreamRequest, StreamState, VolumeControl,
+    BitPerfectBlocker, Dac, DacConfig, DacEvent, DacListener, DacStream, DeviceInfo, Encoding,
+    Error, HandBack, Quirk, QuirkOverride, RatePolicy, StartupVolume, StartupVolumeReport,
+    StreamFormat, StreamRequest, StreamState, VolumeControl,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -49,7 +48,10 @@ fn errors_have_stable_codes_and_a_readable_message() {
             },
             "clock_unverified",
         ),
-        (Error::ImplicitFeedbackUnsupported, "implicit_feedback_unsupported"),
+        (
+            Error::ImplicitFeedbackUnsupported,
+            "implicit_feedback_unsupported",
+        ),
         (Error::DeviceLost, "device_lost"),
         (Error::Transfer("x".into()), "transfer"),
         (Error::Control("x".into()), "control"),
@@ -59,7 +61,10 @@ fn errors_have_stable_codes_and_a_readable_message() {
     ];
     for (error, code) in cases {
         assert_eq!(error.code(), code);
-        assert!(error.to_string().starts_with(&format!("{code}: ")), "{error}");
+        assert!(
+            error.to_string().starts_with(&format!("{code}: ")),
+            "{error}"
+        );
     }
     let unverified = Error::ClockUnverified {
         requested_hz: 96_000,
@@ -84,13 +89,19 @@ fn a_config_is_built_from_the_defaults_with_struct_update_syntax() {
     };
     assert!(config.validate().is_ok());
     assert_eq!(config.buffer_capacity_ms, 500);
-    assert!(!config.allow_unsynchronized_async, "implicit feedback is refused by default");
+    assert!(
+        !config.allow_unsynchronized_async,
+        "implicit feedback is refused by default"
+    );
 }
 
 #[test]
 fn the_dac_is_protected_at_open_by_default_and_a_host_can_opt_out() {
     let config = DacConfig::default();
-    assert_eq!(config.startup_volume, StartupVolume::Attenuate { max_db: -40.0 });
+    assert_eq!(
+        config.startup_volume,
+        StartupVolume::Attenuate { max_db: -40.0 }
+    );
     assert!(config.require_hardware_volume);
 
     let fixed = DacConfig {
@@ -190,18 +201,30 @@ fn the_clock_and_pacing_diagnostics_have_stable_codes_and_are_plain_data() {
         control_interface: 0,
         source_id: 5,
         path: vec![
-            ClockHop { id: 1, kind: ClockHopKind::Terminal },
+            ClockHop {
+                id: 1,
+                kind: ClockHopKind::Terminal,
+            },
             ClockHop {
                 id: 9,
-                kind: ClockHopKind::Selector { selected_pin: 2, pin_count: 2 },
+                kind: ClockHopKind::Selector {
+                    selected_pin: 2,
+                    pin_count: 2,
+                },
             },
-            ClockHop { id: 5, kind: ClockHopKind::Source },
+            ClockHop {
+                id: 5,
+                kind: ClockHopKind::Source,
+            },
         ],
         resolution: ClockResolution::Resolved,
     };
     assert_eq!(choice.clone(), choice);
     assert_eq!(choice.resolution.code(), "resolved");
-    assert_eq!(ClockResolution::FallbackFirstSource.code(), "fallback_first_source");
+    assert_eq!(
+        ClockResolution::FallbackFirstSource.code(),
+        "fallback_first_source"
+    );
     let kinds: Vec<&str> = choice.path.iter().map(|hop| hop.kind.code()).collect();
     assert_eq!(kinds, ["terminal", "selector", "source"]);
 
@@ -214,5 +237,13 @@ fn the_clock_and_pacing_diagnostics_have_stable_codes_and_are_plain_data() {
     .iter()
     .map(|pacing| pacing.code())
     .collect();
-    assert_eq!(codes, ["explicit_feedback", "adaptive", "synchronous", "unsynchronized"]);
+    assert_eq!(
+        codes,
+        [
+            "explicit_feedback",
+            "adaptive",
+            "synchronous",
+            "unsynchronized"
+        ]
+    );
 }

@@ -354,14 +354,21 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(closer.0.lock().is_none(), "the listener ran and shut the hub down");
+        assert!(
+            closer.0.lock().is_none(),
+            "the listener ran and shut the hub down"
+        );
         hub.shutdown();
     }
 
     #[test]
     fn an_event_from_before_any_listener_goes_to_the_first_dac_listener_once() {
         let hub = EventHub::start();
-        let startup = DacEvent::VolumeChanged(VolumeState { db: -40.0, fraction: 0.5, muted: None });
+        let startup = DacEvent::VolumeChanged(VolumeState {
+            db: -40.0,
+            fraction: 0.5,
+            muted: None,
+        });
         hub.emit_dac_or_hold(startup.clone());
         // Held, not lost, while nobody listens (a stream listener is not a DAC one).
         let stream = Arc::new(Collector::default());

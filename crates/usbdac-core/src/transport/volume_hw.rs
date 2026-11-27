@@ -1,15 +1,20 @@
 use super::*;
-use crate::volume::{raw_to_db, VolumeRange as PublicVolumeRange, VolumeState};
 use crate::config::StartupVolume;
 use crate::volume::StartupVolumeReport;
+use crate::volume::{raw_to_db, VolumeRange as PublicVolumeRange, VolumeState};
 use crate::volume_control::{
-    plan_startup_attenuation, single_level, step_target_raw, HardwareVolumeSnapshot,
-    SameRoute, VolumeCurve,
+    plan_startup_attenuation, single_level, step_target_raw, HardwareVolumeSnapshot, SameRoute,
+    VolumeCurve,
 };
 
 fn playback_volume_curve() -> VolumeCurve {
-    if settings().has(crate::Quirk::MixerPlaybackLinearVolume) { VolumeCurve::LinearAmplitude }
-    else { VolumeCurve::Decibels { minimum_is_mute: settings().has(crate::Quirk::MixerPlaybackMinMute) } }
+    if settings().has(crate::Quirk::MixerPlaybackLinearVolume) {
+        VolumeCurve::LinearAmplitude
+    } else {
+        VolumeCurve::Decibels {
+            minimum_is_mute: settings().has(crate::Quirk::MixerPlaybackMinMute),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,33 +47,59 @@ pub(super) fn parse_audio_control_topologies(
 
             if descriptor.protocol_code() == 0x30 {
                 let mut topology = AudioControlTopology {
-                    interface_number: descriptor.interface_number(), protocol: AudioControlProtocol::Uac3,
-                    streaming_interfaces: Vec::new(), input_terminals: Vec::new(), feature_units: Vec::new(),
-                    output_terminals: Vec::new(), sources: Vec::new(),
+                    interface_number: descriptor.interface_number(),
+                    protocol: AudioControlProtocol::Uac3,
+                    streaming_interfaces: Vec::new(),
+                    input_terminals: Vec::new(),
+                    feature_units: Vec::new(),
+                    output_terminals: Vec::new(),
+                    sources: Vec::new(),
                 };
-                for d in DescriptorIter::new(descriptor.extra()).filter(|d|d.get(1)==Some(&0x24)) {
+                for d in DescriptorIter::new(descriptor.extra()).filter(|d| d.get(1) == Some(&0x24))
+                {
                     match d.get(2).copied() {
                         Some(2) => {
-                            let t=crate::descriptors::uac3::parse_input_terminal(d).map_err(|e|e.to_string())?;
-                            topology.input_terminals.push(InputTerminal{b_terminal_id:t.id,w_terminal_type:t.terminal_type,
-                                b_assoc_terminal:t.associated_terminal,b_c_source_id:t.clock_id,b_nr_channels:0,w_channel_config:0,i_terminal:0});
+                            let t = crate::descriptors::uac3::parse_input_terminal(d)
+                                .map_err(|e| e.to_string())?;
+                            topology.input_terminals.push(InputTerminal {
+                                b_terminal_id: t.id,
+                                w_terminal_type: t.terminal_type,
+                                b_assoc_terminal: t.associated_terminal,
+                                b_c_source_id: t.clock_id,
+                                b_nr_channels: 0,
+                                w_channel_config: 0,
+                                i_terminal: 0,
+                            });
                         }
                         Some(3) => {
-                            let t=crate::descriptors::uac3::parse_output_terminal(d).map_err(|e|e.to_string())?;
-                            topology.sources.push((t.id,vec![t.source_id]));
-                            topology.output_terminals.push(OutputTerminal{b_terminal_id:t.id,w_terminal_type:t.terminal_type,
-                                b_assoc_terminal:t.associated_terminal,b_source_id:t.source_id,i_terminal:0});
+                            let t = crate::descriptors::uac3::parse_output_terminal(d)
+                                .map_err(|e| e.to_string())?;
+                            topology.sources.push((t.id, vec![t.source_id]));
+                            topology.output_terminals.push(OutputTerminal {
+                                b_terminal_id: t.id,
+                                w_terminal_type: t.terminal_type,
+                                b_assoc_terminal: t.associated_terminal,
+                                b_source_id: t.source_id,
+                                i_terminal: 0,
+                            });
                         }
                         Some(7) => {
-                            let f=crate::descriptors::uac3::parse_feature_unit(d).map_err(|e|e.to_string())?;
-                            topology.sources.push((f.id,vec![f.source_id]));
-                            topology.feature_units.push(FeatureUnit{b_unit_id:f.id,b_source_id:f.source_id,b_control_size:4,
-                                bma_controls:f.controls.iter().map(|c|c.0).collect()});
+                            let f = crate::descriptors::uac3::parse_feature_unit(d)
+                                .map_err(|e| e.to_string())?;
+                            topology.sources.push((f.id, vec![f.source_id]));
+                            topology.feature_units.push(FeatureUnit {
+                                b_unit_id: f.id,
+                                b_source_id: f.source_id,
+                                b_control_size: 4,
+                                bma_controls: f.controls.iter().map(|c| c.0).collect(),
+                            });
                         }
-                        _=>{}
+                        _ => {}
                     }
                 }
-                if !topology.input_terminals.is_empty() { topologies.push(topology); }
+                if !topology.input_terminals.is_empty() {
+                    topologies.push(topology);
+                }
                 continue;
             }
 
@@ -93,24 +124,42 @@ pub(super) fn parse_audio_control_topologies(
                 let is_v1 = topology.protocol == AudioControlProtocol::Uac1;
                 match extra.get(2).copied() {
                     Some(1) if is_v1 => {
-                        let header = parser.parse_ac_header_v1(extra).map_err(|e| e.to_string())?;
+                        let header = parser
+                            .parse_ac_header_v1(extra)
+                            .map_err(|e| e.to_string())?;
                         topology.streaming_interfaces = header.ba_interface_nr;
                     }
                     Some(UAC2_INPUT_TERMINAL) => {
-                        let terminal = if is_v1 { parser.parse_input_terminal_v1(extra) }
-                            else { parser.parse_input_terminal(extra) }.map_err(|e| e.to_string())?;
+                        let terminal = if is_v1 {
+                            parser.parse_input_terminal_v1(extra)
+                        } else {
+                            parser.parse_input_terminal(extra)
+                        }
+                        .map_err(|e| e.to_string())?;
                         topology.input_terminals.push(terminal);
                     }
                     Some(UAC2_OUTPUT_TERMINAL) => {
-                        let terminal = if is_v1 { parser.parse_output_terminal_v1(extra) }
-                            else { parser.parse_output_terminal(extra) }.map_err(|e| e.to_string())?;
-                        topology.sources.push((terminal.b_terminal_id, vec![terminal.b_source_id]));
+                        let terminal = if is_v1 {
+                            parser.parse_output_terminal_v1(extra)
+                        } else {
+                            parser.parse_output_terminal(extra)
+                        }
+                        .map_err(|e| e.to_string())?;
+                        topology
+                            .sources
+                            .push((terminal.b_terminal_id, vec![terminal.b_source_id]));
                         topology.output_terminals.push(terminal);
                     }
                     Some(UAC2_FEATURE_UNIT) => {
-                        let unit = if is_v1 { parser.parse_feature_unit_v1(extra) }
-                            else { parser.parse_feature_unit(extra) }.map_err(|e| e.to_string())?;
-                        topology.sources.push((unit.b_unit_id, vec![unit.b_source_id]));
+                        let unit = if is_v1 {
+                            parser.parse_feature_unit_v1(extra)
+                        } else {
+                            parser.parse_feature_unit(extra)
+                        }
+                        .map_err(|e| e.to_string())?;
+                        topology
+                            .sources
+                            .push((unit.b_unit_id, vec![unit.b_source_id]));
                         topology.feature_units.push(unit);
                     }
                     Some(4 | 5) => {
@@ -120,7 +169,9 @@ pub(super) fn parse_audio_control_topologies(
                         }
                         // Do not guess the active branch of a multi-input selector.
                         if extra[2] == 4 || count == 1 {
-                            topology.sources.push((extra[3], extra[5..5 + count].to_vec()));
+                            topology
+                                .sources
+                                .push((extra[3], extra[5..5 + count].to_vec()));
                         }
                     }
                     _ => {}
@@ -283,8 +334,7 @@ pub(super) fn read_feature_unit_volume_range(
         return parse_uac2_volume_ranges(&data[..transferred]);
     }
     Ok(vec![RawRange {
-        min:
-        read_feature_unit_i16_control(
+        min: read_feature_unit_i16_control(
             device,
             interface_number,
             feature_unit_id,
@@ -292,8 +342,7 @@ pub(super) fn read_feature_unit_volume_range(
             UAC1_REQUEST_GET_MIN,
             UAC2_FEATURE_UNIT_VOLUME_CONTROL,
         )?,
-        max:
-        read_feature_unit_i16_control(
+        max: read_feature_unit_i16_control(
             device,
             interface_number,
             feature_unit_id,
@@ -301,8 +350,7 @@ pub(super) fn read_feature_unit_volume_range(
             UAC1_REQUEST_GET_MAX,
             UAC2_FEATURE_UNIT_VOLUME_CONTROL,
         )?,
-        resolution:
-        read_feature_unit_i16_control(
+        resolution: read_feature_unit_i16_control(
             device,
             interface_number,
             feature_unit_id,
@@ -310,7 +358,8 @@ pub(super) fn read_feature_unit_volume_range(
             UAC1_REQUEST_GET_RES,
             UAC2_FEATURE_UNIT_VOLUME_CONTROL,
         )?,
-    }.validate()?])
+    }
+    .validate()?])
 }
 
 pub(super) fn build_hardware_volume_control_from_feature_unit(
@@ -319,16 +368,27 @@ pub(super) fn build_hardware_volume_control_from_feature_unit(
     feature_unit: &FeatureUnit,
     channels: u16,
 ) -> Result<Option<HardwareVolumeControl>, String> {
-    let Some(volume_channels) = topology.protocol.volume_channels(&feature_unit.bma_controls, channels)
-        else { return Ok(None); };
+    let Some(volume_channels) = topology
+        .protocol
+        .volume_channels(&feature_unit.bma_controls, channels)
+    else {
+        return Ok(None);
+    };
     let mut ranges = Vec::new();
     for &channel in &volume_channels {
         let channel_ranges = read_feature_unit_volume_range(
-            device, topology.interface_number, feature_unit.b_unit_id, channel, topology.protocol,
+            device,
+            topology.interface_number,
+            feature_unit.b_unit_id,
+            channel,
+            topology.protocol,
         )?;
-        if ranges.is_empty() { ranges = channel_ranges; }
-        else if ranges != channel_ranges {
-            return Err("per-channel USB volume ranges differ; unified control refused".to_string());
+        if ranges.is_empty() {
+            ranges = channel_ranges;
+        } else if ranges != channel_ranges {
+            return Err(
+                "per-channel USB volume ranges differ; unified control refused".to_string(),
+            );
         }
     }
     let (min_volume_raw, max_volume_raw) = volume_bounds(&ranges);
@@ -336,8 +396,15 @@ pub(super) fn build_hardware_volume_control_from_feature_unit(
         return Ok(None);
     }
     // Master mute only: muting one channel would not mute playback.
-    let mute_channel = topology.protocol.writable(feature_unit.bma_controls[0], 1).then_some(0);
-    let resolution_raw = ranges.iter().map(|range| range.resolution).min().unwrap_or(0);
+    let mute_channel = topology
+        .protocol
+        .writable(feature_unit.bma_controls[0], 1)
+        .then_some(0);
+    let resolution_raw = ranges
+        .iter()
+        .map(|range| range.resolution)
+        .min()
+        .unwrap_or(0);
     Ok(Some(HardwareVolumeControl {
         interface_number: topology.interface_number,
         feature_unit_id: feature_unit.b_unit_id,
@@ -358,13 +425,18 @@ pub(super) fn discover_hardware_volume_control_for_terminal(
     channels: u16,
 ) -> Result<Option<HardwareVolumeControl>, String> {
     // An OUT streaming terminal must be a USB input terminal, not capture.
-    if !topology.input_terminals.iter().any(|terminal|
+    if !topology.input_terminals.iter().any(|terminal| {
         terminal.b_terminal_id == terminal_link && terminal.w_terminal_type == 0x0101
-    ) { return Ok(None); }
+    }) {
+        return Ok(None);
+    }
     let mut ancestors = HashSet::new();
-    let mut pending: Vec<u8> = topology.output_terminals.iter()
+    let mut pending: Vec<u8> = topology
+        .output_terminals
+        .iter()
         .filter(|terminal| terminal.w_terminal_type != 0x0101)
-        .map(|terminal| terminal.b_terminal_id).collect();
+        .map(|terminal| terminal.b_terminal_id)
+        .collect();
     while let Some(entity) = pending.pop() {
         if ancestors.insert(entity) {
             for (_, sources) in topology.sources.iter().filter(|(id, _)| *id == entity) {
@@ -386,11 +458,18 @@ pub(super) fn discover_hardware_volume_control_for_terminal(
             .find(|feature_unit| feature_unit.b_unit_id == entity_id)
         {
             if ancestors.contains(&entity_id) {
-                match build_hardware_volume_control_from_feature_unit(device,topology,feature_unit,channels) {
+                match build_hardware_volume_control_from_feature_unit(
+                    device,
+                    topology,
+                    feature_unit,
+                    channels,
+                ) {
                     Ok(Some(control)) => return Ok(Some(control)),
                     Ok(None) => (),
-                    Err(error) if settings().has(crate::Quirk::IgnoreOptionalControlErrors)
-                        && !crate::error::is_device_gone(&error) => {
+                    Err(error)
+                        if settings().has(crate::Quirk::IgnoreOptionalControlErrors)
+                            && !crate::error::is_device_gone(&error) =>
+                    {
                         log_warn!("[USB] Optional mixer unit {} unavailable: {}; startup attenuation and mandatory control failures remain strict",
                             feature_unit.b_unit_id,error);
                     }
@@ -417,22 +496,42 @@ pub(super) fn discover_android_usb_hardware_volume_control(
     channels: u16,
     clock_interface: Option<u8>,
 ) -> Result<Option<HardwareVolumeControl>, String> {
-    let terminal = terminal_link.ok_or_else(|| "no playback terminal link for USB volume".to_string())?;
-    let config = descriptors.active_config_descriptor().map_err(|e|e.to_string())?;
-    let is_adc3 = config.interfaces().flat_map(|i|i.descriptors()).any(|d|d.interface_number()==interface_number&&d.protocol_code()==0x30);
+    let terminal =
+        terminal_link.ok_or_else(|| "no playback terminal link for USB volume".to_string())?;
+    let config = descriptors
+        .active_config_descriptor()
+        .map_err(|e| e.to_string())?;
+    let is_adc3 = config
+        .interfaces()
+        .flat_map(|i| i.descriptors())
+        .any(|d| d.interface_number() == interface_number && d.protocol_code() == 0x30);
     if is_adc3 {
-        let claimed=wrap_android_usb_handle(device)?;
-        if let Some(topology)=adc3_badd_volume_topology(descriptors,&claimed.handle,interface_number,terminal,channels)? {
-            return discover_hardware_volume_control_for_terminal(device,&topology,terminal,channels);
+        let claimed = wrap_android_usb_handle(device)?;
+        if let Some(topology) = adc3_badd_volume_topology(
+            descriptors,
+            &claimed.handle,
+            interface_number,
+            terminal,
+            channels,
+        )? {
+            return discover_hardware_volume_control_for_terminal(
+                device, &topology, terminal, channels,
+            );
         }
     }
     let topologies = parse_audio_control_topologies(descriptors)?;
-    let matches: Vec<_> = topologies.iter().filter(|topology| {
-        clock_interface.map_or(true, |interface| topology.interface_number == interface)
-            && (topology.protocol != AudioControlProtocol::Uac1
-                || topology.streaming_interfaces.contains(&interface_number))
-            && topology.input_terminals.iter().any(|input| input.b_terminal_id == terminal)
-    }).collect();
+    let matches: Vec<_> = topologies
+        .iter()
+        .filter(|topology| {
+            clock_interface.map_or(true, |interface| topology.interface_number == interface)
+                && (topology.protocol != AudioControlProtocol::Uac1
+                    || topology.streaming_interfaces.contains(&interface_number))
+                && topology
+                    .input_terminals
+                    .iter()
+                    .any(|input| input.b_terminal_id == terminal)
+        })
+        .collect();
     if matches.len() != 1 {
         return Err("USB playback AudioControl topology is missing or ambiguous".to_string());
     }
@@ -451,20 +550,37 @@ pub(super) fn refresh_android_usb_hardware_volume_snapshot(
         let read = read_hardware_volume_snapshot(
             &control.volume_channels,
             &control.ranges,
-            |channel| read_feature_unit_i16_control(
-                device, control.interface_number, control.feature_unit_id, channel,
-                control.protocol.current_request(), UAC2_FEATURE_UNIT_VOLUME_CONTROL,
-            ),
-            || control.mute_channel.map(|channel| read_feature_unit_bool_control(
-                device, control.interface_number, control.feature_unit_id, channel,
-                control.protocol, UAC2_FEATURE_UNIT_MUTE_CONTROL,
-            )).transpose(),
+            |channel| {
+                read_feature_unit_i16_control(
+                    device,
+                    control.interface_number,
+                    control.feature_unit_id,
+                    channel,
+                    control.protocol.current_request(),
+                    UAC2_FEATURE_UNIT_VOLUME_CONTROL,
+                )
+            },
+            || {
+                control
+                    .mute_channel
+                    .map(|channel| {
+                        read_feature_unit_bool_control(
+                            device,
+                            control.interface_number,
+                            control.feature_unit_id,
+                            channel,
+                            control.protocol,
+                            UAC2_FEATURE_UNIT_MUTE_CONTROL,
+                        )
+                    })
+                    .transpose()
+            },
         );
         match read {
             Ok(mut snapshot) => {
                 let curve = playback_volume_curve();
-                snapshot.db = curve.db(snapshot.raw,&control.ranges);
-                snapshot.volume = curve.fraction(snapshot.raw,&control.ranges);
+                snapshot.db = curve.db(snapshot.raw, &control.ranges);
+                snapshot.volume = curve.fraction(snapshot.raw, &control.ranges);
                 if let Some(error) = &snapshot.mute_error {
                     log_warn!("[USB] Hardware volume remains available; optional mute unavailable: {error}");
                 }
@@ -523,25 +639,49 @@ pub(super) fn apply_android_usb_hardware_volume(
 ) -> Result<HardwareVolumeSnapshot, String> {
     dev_eprintln!(
         "[VolFlow] min={} max={} res={} -> raw={target_raw}",
-        control.min_volume_raw, control.max_volume_raw, control.resolution_raw
+        control.min_volume_raw,
+        control.max_volume_raw,
+        control.resolution_raw
     );
     // Snapshot every channel before a grouped write, for best-effort rollback.
-    let previous = control.volume_channels.iter().map(|&channel| read_feature_unit_i16_control(
-        device, control.interface_number, control.feature_unit_id, channel,
-        control.protocol.current_request(), UAC2_FEATURE_UNIT_VOLUME_CONTROL,
-    )).collect::<Result<Vec<_>, _>>()?;
+    let previous = control
+        .volume_channels
+        .iter()
+        .map(|&channel| {
+            read_feature_unit_i16_control(
+                device,
+                control.interface_number,
+                control.feature_unit_id,
+                channel,
+                control.protocol.current_request(),
+                UAC2_FEATURE_UNIT_VOLUME_CONTROL,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for (index, &channel) in control.volume_channels.iter().enumerate() {
-        let unchanged = SESSION_STATE.lock().as_ref()
+        let unchanged = SESSION_STATE
+            .lock()
+            .as_ref()
             .is_some_and(|current| current.hardware_volume_generation == generation);
-        if !unchanged { return Err("USB volume route changed before write".to_string()); }
+        if !unchanged {
+            return Err("USB volume route changed before write".to_string());
+        }
         if let Err(error) = write_feature_unit_i16_control(
-            device, control.interface_number, control.feature_unit_id, channel,
-            UAC2_FEATURE_UNIT_VOLUME_CONTROL, target_raw,
+            device,
+            control.interface_number,
+            control.feature_unit_id,
+            channel,
+            UAC2_FEATURE_UNIT_VOLUME_CONTROL,
+            target_raw,
         ) {
             for (&channel, &raw) in control.volume_channels[..=index].iter().zip(&previous) {
                 let _ = write_feature_unit_i16_control(
-                    device, control.interface_number, control.feature_unit_id, channel,
-                    UAC2_FEATURE_UNIT_VOLUME_CONTROL, raw,
+                    device,
+                    control.interface_number,
+                    control.feature_unit_id,
+                    channel,
+                    UAC2_FEATURE_UNIT_VOLUME_CONTROL,
+                    raw,
                 );
             }
             return Err(error);
@@ -588,10 +728,13 @@ pub(crate) fn hardware_volume_range() -> Option<PublicVolumeRange> {
     let guard = SESSION_STATE.lock();
     let control = guard.as_ref()?.hardware_volume_control.as_ref()?;
     Some(PublicVolumeRange {
-        min_db: playback_volume_curve().db(control.min_volume_raw,&control.ranges),
-        max_db: playback_volume_curve().db(control.max_volume_raw,&control.ranges),
-        res_db: if playback_volume_curve() == VolumeCurve::LinearAmplitude { 0.0 }
-            else { raw_to_db(control.resolution_raw.max(1)) },
+        min_db: playback_volume_curve().db(control.min_volume_raw, &control.ranges),
+        max_db: playback_volume_curve().db(control.max_volume_raw, &control.ranges),
+        res_db: if playback_volume_curve() == VolumeCurve::LinearAmplitude {
+            0.0
+        } else {
+            raw_to_db(control.resolution_raw.max(1))
+        },
     })
 }
 
@@ -661,9 +804,24 @@ pub(crate) fn step_volume(direction: i8, steps: u8) -> Result<VolumeState, Strin
         return Ok(volume);
     }
     let target_raw = if playback_volume_curve() == VolumeCurve::LinearAmplitude {
-        let target = playback_volume_curve().target_fraction(snapshot.volume + f64::from(direction.signum()) / f64::from(steps.max(1)),&control.ranges);
-        if target == snapshot.raw { crate::volume_control::adjacent_raw(snapshot.raw,direction,&control.ranges) } else {target}
-    } else { step_target_raw(snapshot.raw, snapshot.volume, direction, steps, &control.ranges) };
+        let target = playback_volume_curve().target_fraction(
+            snapshot.volume + f64::from(direction.signum()) / f64::from(steps.max(1)),
+            &control.ranges,
+        );
+        if target == snapshot.raw {
+            crate::volume_control::adjacent_raw(snapshot.raw, direction, &control.ranges)
+        } else {
+            target
+        }
+    } else {
+        step_target_raw(
+            snapshot.raw,
+            snapshot.volume,
+            direction,
+            steps,
+            &control.ranges,
+        )
+    };
     if target_raw == snapshot.raw {
         let volume = volume_state_of(&snapshot);
         publish_hardware_volume_snapshot(state.hardware_volume_generation, volume)?;
@@ -679,8 +837,9 @@ pub(crate) fn write_mute(muted: bool) -> Result<VolumeState, String> {
     let mute_channel = control
         .mute_channel
         .ok_or_else(|| "the DAC has no writable mute".to_string())?;
-    if !SESSION_STATE.lock().as_ref()
-        .is_some_and(|current| current.hardware_volume_generation == state.hardware_volume_generation) {
+    if !SESSION_STATE.lock().as_ref().is_some_and(|current| {
+        current.hardware_volume_generation == state.hardware_volume_generation
+    }) {
         return Err("USB mute route changed before write".to_string());
     }
     write_feature_unit_bool_control(
@@ -797,7 +956,11 @@ pub(super) fn adopt_volume_control(device: &UsbDevice, control: Option<HardwareV
                     status.report.original_db,
                     status.report.applied_db,
                     status.report.limit_db,
-                    if status.report.clamped_to_minimum { " (clamped to the DAC's minimum)" } else { "" },
+                    if status.report.clamped_to_minimum {
+                        " (clamped to the DAC's minimum)"
+                    } else {
+                        ""
+                    },
                 );
                 set_startup_volume(status);
             }
@@ -806,7 +969,9 @@ pub(super) fn adopt_volume_control(device: &UsbDevice, control: Option<HardwareV
                 // a stream through it would play at whatever the DAC had.
                 log_error!("[USB] Start-up volume protection failed, the volume control is unusable: {error}");
                 install_volume_control(None);
-                set_hardware_volume_error(Some(format!("start-up volume protection failed: {error}")));
+                set_hardware_volume_error(Some(format!(
+                    "start-up volume protection failed: {error}"
+                )));
                 return;
             }
         }
@@ -843,7 +1008,11 @@ pub(super) fn adopt_volume_control(device: &UsbDevice, control: Option<HardwareV
 /// At open, before any stream: finds the volume control through the first PCM
 /// playback stream so volume works without one.
 pub(crate) fn discover_idle_volume_control() {
-    let Some(device) = SESSION_STATE.lock().as_ref().map(|state| state.device.clone()) else {
+    let Some(device) = SESSION_STATE
+        .lock()
+        .as_ref()
+        .map(|state| state.device.clone())
+    else {
         return;
     };
     let usb_device = {
@@ -868,7 +1037,9 @@ pub(crate) fn discover_idle_volume_control() {
 }
 
 pub(super) fn original_volume_device_key(device: &UsbDevice) -> String {
-    if let Some(key) = context::current().volume_key() { return key; }
+    if let Some(key) = context::current().volume_key() {
+        return key;
+    }
     format!(
         "{}:{:04x}:{:04x}",
         device.device_name.as_deref().unwrap_or_default(),
@@ -900,18 +1071,23 @@ pub(super) fn read_channel_volumes(
 /// Remembers the level every channel of a DAC has the first time its volume
 /// control is found during an attachment, which is before this library has
 /// written to it. Caller holds HARDWARE_VOLUME_MUTEX.
-pub(super) fn note_original_hardware_volume(
-    device: &UsbDevice,
-    control: &HardwareVolumeControl,
-) {
+pub(super) fn note_original_hardware_volume(device: &UsbDevice, control: &HardwareVolumeControl) {
     let key = original_volume_device_key(device);
-    if ORIGINAL_HARDWARE_VOLUME.lock().is_route_recorded(&key, control) {
+    if ORIGINAL_HARDWARE_VOLUME
+        .lock()
+        .is_route_recorded(&key, control)
+    {
         return;
     }
     match read_channel_volumes(device, control) {
         Ok(channels) => {
-            log_info!("[USB] Original hardware volume of '{}': raw={channels:?}", device.product_name);
-            ORIGINAL_HARDWARE_VOLUME.lock().note(&key, control.clone(), channels);
+            log_info!(
+                "[USB] Original hardware volume of '{}': raw={channels:?}",
+                device.product_name
+            );
+            ORIGINAL_HARDWARE_VOLUME
+                .lock()
+                .note(&key, control.clone(), channels);
         }
         Err(error) => log_warn!("[USB] Original hardware volume not recorded: {error}"),
     }
@@ -941,7 +1117,7 @@ pub(crate) fn original_volume_db() -> Option<f64> {
         .lock()
         .peek(&original_volume_device_key(&device), &control)
         .and_then(|original| original.common())
-        .map(|raw| playback_volume_curve().db(raw,&control.ranges))
+        .map(|raw| playback_volume_curve().db(raw, &control.ranges))
 }
 
 /// Writes the recorded original level of every channel back now and ends the
@@ -978,15 +1154,26 @@ pub(super) fn finish_original_hardware_volume() {
     match ORIGINAL_VOLUME_ACTION.swap(ORIGINAL_VOLUME_KEEP, Ordering::SeqCst) {
         ORIGINAL_VOLUME_FORGET => ORIGINAL_HARDWARE_VOLUME.lock().forget(),
         ORIGINAL_VOLUME_RESTORE => {
-            let Some(device) = SESSION_STATE.lock().as_ref().map(|state| state.device.clone()) else {
+            let Some(device) = SESSION_STATE
+                .lock()
+                .as_ref()
+                .map(|state| state.device.clone())
+            else {
                 return;
             };
             let originals = ORIGINAL_HARDWARE_VOLUME
                 .lock()
                 .take_all(&original_volume_device_key(&device));
             for original in originals {
-                match restore_original_hardware_volume(&device, &original.control, &original.channels) {
-                    Ok(true) => log_info!("[USB] Restored original hardware volume: raw={:?}", original.channels),
+                match restore_original_hardware_volume(
+                    &device,
+                    &original.control,
+                    &original.channels,
+                ) {
+                    Ok(true) => log_info!(
+                        "[USB] Restored original hardware volume: raw={:?}",
+                        original.channels
+                    ),
                     Ok(false) => {}
                     Err(error) => log_warn!("[USB] Original hardware volume not restored: {error}"),
                 }
@@ -1082,7 +1269,11 @@ pub(super) fn run_startup_volume(
         },
         || read_channel_volumes(device, control),
     )
-    .map(|(report, lowered)| StartupVolumeStatus { route: control.clone(), report, lowered })
+    .map(|(report, lowered)| StartupVolumeStatus {
+        route: control.clone(),
+        report,
+        lowered,
+    })
 }
 
 /// The start-up step against any DAC that can write and read a channel. Returns
@@ -1107,13 +1298,20 @@ pub(super) fn apply_startup_volume(
     let (targets, clamped_to_minimum, max_db) = match startup {
         StartupVolume::Keep => (current.clone(), false, None),
         StartupVolume::Attenuate { max_db } => {
-            if matches!(curve,VolumeCurve::Decibels { .. }) {
-                let plan = plan_startup_attenuation(&current,ranges,max_db);
-                (single_level(plan.targets),plan.clamped_to_minimum,Some(max_db))
+            if matches!(curve, VolumeCurve::Decibels { .. }) {
+                let plan = plan_startup_attenuation(&current, ranges, max_db);
+                (
+                    single_level(plan.targets),
+                    plan.clamped_to_minimum,
+                    Some(max_db),
+                )
             } else {
                 let min = volume_bounds(ranges).0;
-                let ceiling = curve.floor_db(max_db,ranges);
-                let targets = current.iter().map(|raw| (*raw).min(ceiling.unwrap_or(min))).collect();
+                let ceiling = curve.floor_db(max_db, ranges);
+                let targets = current
+                    .iter()
+                    .map(|raw| (*raw).min(ceiling.unwrap_or(min)))
+                    .collect();
                 (single_level(targets), ceiling.is_none(), Some(max_db))
             }
         }
@@ -1133,15 +1331,23 @@ pub(super) fn apply_startup_volume(
             ));
         }
     }
-    let db = |raws: &[i16]| raws.iter().map(|&raw| curve.db(raw,ranges)).collect::<Vec<_>>();
+    let db = |raws: &[i16]| {
+        raws.iter()
+            .map(|&raw| curve.db(raw, ranges))
+            .collect::<Vec<_>>()
+    };
     let original_db = db(originals);
-    let limit_db = original_db
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let limit_db = original_db.iter().copied().fold(f64::INFINITY, f64::min);
     let report = StartupVolumeReport {
-        attenuated: targets.iter().zip(originals).any(|(&applied, &original)| applied < original),
-        limit_db: if limit_db.is_finite() { limit_db } else { db(&targets).first().copied().unwrap_or(0.0) },
+        attenuated: targets
+            .iter()
+            .zip(originals)
+            .any(|(&applied, &original)| applied < original),
+        limit_db: if limit_db.is_finite() {
+            limit_db
+        } else {
+            db(&targets).first().copied().unwrap_or(0.0)
+        },
         original_db,
         applied_db: db(&targets),
         clamped_to_minimum,
@@ -1167,7 +1373,10 @@ pub(crate) fn startup_report() -> Option<StartupVolumeReport> {
 pub(crate) fn startup_lowered_volume() -> Option<VolumeState> {
     let guard = SESSION_STATE.lock();
     let state = guard.as_ref()?;
-    state.startup_volume.as_ref().filter(|status| status.lowered)?;
+    state
+        .startup_volume
+        .as_ref()
+        .filter(|status| status.lowered)?;
     state.hardware_volume_state
 }
 

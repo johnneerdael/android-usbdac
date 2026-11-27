@@ -2,7 +2,6 @@
 //! `docs/sdk/guide-rust.md`) against a fake ring, so the rules the guide states are checked with no DAC.
 
 #[path = "../examples/guide_player.rs"]
-#[allow(dead_code)]
 mod guide;
 
 use guide::{Player, Ring, Shape, Source};
@@ -72,7 +71,12 @@ impl Ring for FakeRing {
 // endregion
 
 /// Stereo, 4 bytes per sample, 1 kHz: a render call is 10 frames, 20 samples, 80 bytes.
-const SHAPE: Shape = Shape { channels: 2, bytes_per_sample: 4, sample_rate: 1_000, counter_rate_hz: 1_000 };
+const SHAPE: Shape = Shape {
+    channels: 2,
+    bytes_per_sample: 4,
+    sample_rate: 1_000,
+    counter_rate_hz: 1_000,
+};
 
 /// A source whose samples say where it is: every sample is the index of its frame, counting from the
 /// last seek. It ends after `frames` frames.
@@ -110,22 +114,44 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 #[test]
 fn renders_only_when_the_ring_asks_for_audio() {
     let ring = FakeRing::new(0);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 1_000 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 1_000,
+        }),
+    );
     std::thread::sleep(Duration::from_millis(50));
-    assert!(ring.written.lock().unwrap().is_empty(), "nothing is rendered while the ring has no room");
+    assert!(
+        ring.written.lock().unwrap().is_empty(),
+        "nothing is rendered while the ring has no room"
+    );
 
     ring.room_bytes.store(10_000, Ordering::SeqCst);
-    wait_until("the first audio", || !ring.written.lock().unwrap().is_empty());
+    wait_until("the first audio", || {
+        !ring.written.lock().unwrap().is_empty()
+    });
     drop(player);
 }
 
 #[test]
 fn drains_once_at_the_end_and_finishes_when_the_ring_has_played_out() {
     let ring = FakeRing::new(1_000_000);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 50 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 50,
+        }),
+    );
     wait_until("the drain", || ring.calls().contains(&"drain"));
     assert_eq!(ring.written.lock().unwrap().len(), 100); // 50 frames of two samples
-    assert!(!player.finished(), "not finished until the ring has played the tail");
+    assert!(
+        !player.finished(),
+        "not finished until the ring has played the tail"
+    );
     ring.drained.store(true, Ordering::SeqCst);
     assert!(player.finished());
     assert_eq!(ring.calls().iter().filter(|c| **c == "drain").count(), 1);
@@ -136,23 +162,43 @@ fn drains_once_at_the_end_and_finishes_when_the_ring_has_played_out() {
 fn a_seek_drops_the_chunk_that_was_rendered_for_the_old_position() {
     // The ring takes everything, so the chunk in hand is whatever the ring has not accepted yet.
     let ring = FakeRing::new(1_000_000);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 10_000_000 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 10_000_000,
+        }),
+    );
     wait_until("some audio", || ring.written.lock().unwrap().len() > 200);
 
     player.seek(2.0).unwrap();
     assert!(ring.calls().contains(&"flush"));
     let after = ring.written.lock().unwrap().clone();
     // Everything written after the flush comes from the new position.
-    wait_until("audio at the new position", || ring.written.lock().unwrap().len() > after.len() + 100);
+    wait_until("audio at the new position", || {
+        ring.written.lock().unwrap().len() > after.len() + 100
+    });
     let written = ring.written.lock().unwrap().clone();
-    assert!(written.iter().all(|sample| *sample >= 102_000), "old audio was written after the flush: {:?}", &written[..8]);
+    assert!(
+        written.iter().all(|sample| *sample >= 102_000),
+        "old audio was written after the flush: {:?}",
+        &written[..8]
+    );
 }
 // endregion
 
 #[test]
 fn the_position_is_the_last_seek_plus_what_the_dac_has_played() {
     let ring = FakeRing::new(0);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 1_000 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 1_000,
+        }),
+    );
     player.seek(30.0).unwrap();
     ring.played.store(2_500, Ordering::SeqCst); // 2.5 s at 1 kHz
     assert!((player.position_seconds() - 32.5).abs() < 1e-9);
@@ -161,9 +207,18 @@ fn the_position_is_the_last_seek_plus_what_the_dac_has_played() {
 #[test]
 fn pause_and_resume_reach_the_ring_and_the_writer_keeps_running() {
     let ring = FakeRing::new(1_000_000);
-    let player = Player::start(ring.clone(), SHAPE, Box::new(Counter { next: 0, frames: 100_000 }));
+    let player = Player::start(
+        ring.clone(),
+        SHAPE,
+        Box::new(Counter {
+            next: 0,
+            frames: 100_000,
+        }),
+    );
     player.pause().unwrap();
     player.resume().unwrap();
     assert_eq!(ring.calls(), vec!["pause", "play"]);
-    wait_until("audio while paused and resumed", || ring.written.lock().unwrap().len() > 100);
+    wait_until("audio while paused and resumed", || {
+        ring.written.lock().unwrap().len() > 100
+    });
 }

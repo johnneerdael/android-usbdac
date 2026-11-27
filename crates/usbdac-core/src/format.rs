@@ -63,12 +63,18 @@ impl StreamRequest {
 
     /// Unsigned Type I PCM with one byte per channel sample.
     pub fn pcm_u8(sample_rate: u32, channels: u16) -> Self {
-        Self { encoding: Encoding::PcmU8, ..Self::pcm(sample_rate, channels, 8) }
+        Self {
+            encoding: Encoding::PcmU8,
+            ..Self::pcm(sample_rate, channels, 8)
+        }
     }
 
     /// IEEE-754 binary32 Type I PCM, retained as exact wire bits.
     pub fn pcm_float32(sample_rate: u32, channels: u16) -> Self {
-        Self { encoding: Encoding::PcmFloat32, ..Self::pcm(sample_rate, channels, 32) }
+        Self {
+            encoding: Encoding::PcmFloat32,
+            ..Self::pcm(sample_rate, channels, 32)
+        }
     }
 
     /// DoP for a DSD stream of `dsd_bit_rate` (2822400 for DSD64) in a 24-bit
@@ -189,6 +195,9 @@ mod tests {
                 bit_rate: 2_822_400
             }
         );
-        assert_eq!(StreamRequest::pcm(44_100, 2, 16).rate_policy, RatePolicy::Exact);
+        assert_eq!(
+            StreamRequest::pcm(44_100, 2, 16).rate_policy,
+            RatePolicy::Exact
+        );
     }
 }

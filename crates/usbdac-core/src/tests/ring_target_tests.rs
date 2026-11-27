@@ -124,11 +124,19 @@ impl Ring {
 fn a_steady_ring_stays_at_the_target_of_its_mode() {
     let mut ring = Ring::new(0);
     ring.run(false, 100);
-    assert!(ring.fill >= DEEP - CHUNK && ring.fill <= DEEP + CHUNK, "{}", ring.fill);
+    assert!(
+        ring.fill >= DEEP - CHUNK && ring.fill <= DEEP + CHUNK,
+        "{}",
+        ring.fill
+    );
 
     let mut ring = Ring::new(0);
     ring.run(true, 100);
-    assert!(ring.fill >= LIVE - CHUNK && ring.fill <= LIVE + CHUNK, "{}", ring.fill);
+    assert!(
+        ring.fill >= LIVE - CHUNK && ring.fill <= LIVE + CHUNK,
+        "{}",
+        ring.fill
+    );
 }
 
 #[test]
@@ -148,14 +156,21 @@ fn going_live_stops_refilling_until_the_output_has_drained_to_the_shallow_target
         .position(|&fill| fill <= LIVE)
         .expect("the ring drains to the shallow target");
     for pair in after[..=reached].windows(2) {
-        assert_eq!(pair[0] - pair[1], CHUNK, "{pair:?}: one chunk drained, none written");
+        assert_eq!(
+            pair[0] - pair[1],
+            CHUNK,
+            "{pair:?}: one chunk drained, none written"
+        );
     }
     // It takes about the difference between the depths: no sooner.
     let drained_chunks = (DEEP - LIVE) / CHUNK;
-    assert!(reached >= drained_chunks - 1 && reached <= drained_chunks + 2, "{reached}");
+    assert!(
+        reached >= drained_chunks - 1 && reached <= drained_chunks + 2,
+        "{reached}"
+    );
     // Then it holds at the shallow target.
     for &fill in &after[reached..] {
-        assert!(fill >= LIVE - CHUNK && fill <= LIVE + CHUNK, "{fill}");
+        assert!((LIVE - CHUNK..=LIVE + CHUNK).contains(&fill), "{fill}");
     }
 }
 
@@ -173,7 +188,9 @@ fn leaving_live_processing_fills_the_ring_on_to_the_deep_target() {
     // And it gets there within a few steps, not at the output's pace.
     let reached = after.iter().position(|&fill| fill >= DEEP - CHUNK).unwrap();
     assert!(reached <= 4, "took {reached} steps");
-    assert!(after[reached..].iter().all(|&fill| fill >= DEEP - CHUNK && fill <= DEEP + CHUNK));
+    assert!(after[reached..]
+        .iter()
+        .all(|&fill| (DEEP - CHUNK..=DEEP + CHUNK).contains(&fill)));
 }
 
 #[test]

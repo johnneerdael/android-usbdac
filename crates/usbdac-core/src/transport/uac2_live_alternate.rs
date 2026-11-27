@@ -342,7 +342,8 @@ mod tests {
     use super::*;
 
     fn format() -> PlaybackFormat {
-        PlaybackFormat { pcm_encoding: crate::transport::PcmEncoding::Signed,
+        PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
             sample_rate: 96_000,
             bit_depth: 24,
             channels: 2,

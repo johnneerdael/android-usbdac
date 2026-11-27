@@ -57,12 +57,16 @@ impl PacketAcceptance {
     }
 
     /// Prefix bytes are transport metadata, never samples or lost audio.
-    pub(crate) fn with_packet_prefix(mut self, prefix_bytes:usize) -> Self {
-        self.prefix_bytes=prefix_bytes;
-        self.legal_sizes=self.legal_sizes.map(|size|size.saturating_add(prefix_bytes));
+    pub(crate) fn with_packet_prefix(mut self, prefix_bytes: usize) -> Self {
+        self.prefix_bytes = prefix_bytes;
+        self.legal_sizes = self
+            .legal_sizes
+            .map(|size| size.saturating_add(prefix_bytes));
         self
     }
-    fn audio_bytes(&self,wire_bytes:usize) -> usize {wire_bytes.saturating_sub(self.prefix_bytes)}
+    fn audio_bytes(&self, wire_bytes: usize) -> usize {
+        wire_bytes.saturating_sub(self.prefix_bytes)
+    }
 
     pub(crate) fn legal_sizes(&self) -> [usize; 2] {
         self.legal_sizes
@@ -79,7 +83,8 @@ impl PacketAcceptance {
     }
 
     fn is_frame_aligned(&self, actual_length: usize) -> bool {
-        actual_length >= self.prefix_bytes && self.audio_bytes(actual_length) % self.bytes_per_frame == 0
+        actual_length >= self.prefix_bytes
+            && self.audio_bytes(actual_length) % self.bytes_per_frame == 0
     }
 }
 
@@ -129,15 +134,18 @@ pub(crate) fn validate_iso_packet_descriptors(
     for (&requested, packet) in packet_sizes.iter().zip(descriptors) {
         let actual = packet.actual_length as usize;
         if packet.status != LIBUSB_TRANSFER_COMPLETED {
-            if matches!(packet.status, LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_TIMED_OUT | LIBUSB_TRANSFER_OVERFLOW)
-                && !acceptance.exact
+            if matches!(
+                packet.status,
+                LIBUSB_TRANSFER_ERROR | LIBUSB_TRANSFER_TIMED_OUT | LIBUSB_TRANSFER_OVERFLOW
+            ) && !acceptance.exact
                 && requested > 0
                 && acceptance.is_frame_aligned(requested)
                 && packet.length as usize == requested
                 && actual == 0
             {
                 failed_packet_bytes += acceptance.audio_bytes(requested);
-                stats.zero_packets += usize::from(actual == 0 && acceptance.audio_bytes(requested) > 0);
+                stats.zero_packets +=
+                    usize::from(actual == 0 && acceptance.audio_bytes(requested) > 0);
                 continue;
             }
             return Err(format_diagnostics(
@@ -217,9 +225,17 @@ pub(crate) fn validate_iso_packet_descriptors(
     // Never credit neighbouring packets for a known failed request. Their
     // larger legal sizes can reflect repacketisation, not delivery of the
     // specific audio that was scheduled in the failed packet.
-    let requested_audio:usize=packet_sizes.iter().map(|bytes|acceptance.audio_bytes(*bytes)).sum();
-    let actual_audio:usize=descriptors.iter().map(|packet|acceptance.audio_bytes(packet.actual_length as usize)).sum();
-    stats.lost_bytes = requested_audio.saturating_sub(actual_audio).max(failed_packet_bytes) as u64;
+    let requested_audio: usize = packet_sizes
+        .iter()
+        .map(|bytes| acceptance.audio_bytes(*bytes))
+        .sum();
+    let actual_audio: usize = descriptors
+        .iter()
+        .map(|packet| acceptance.audio_bytes(packet.actual_length as usize))
+        .sum();
+    stats.lost_bytes = requested_audio
+        .saturating_sub(actual_audio)
+        .max(failed_packet_bytes) as u64;
     stats.shortfall_frames = stats.lost_bytes / acceptance.bytes_per_frame.max(1) as u64;
 
     Ok(stats)
@@ -246,7 +262,10 @@ pub(crate) fn account_timed_out_transfer(
     descriptors: &[libusb_iso_packet_descriptor],
     acceptance: PacketAcceptance,
 ) -> CompletionStats {
-    let requested_total: u64 = packet_sizes.iter().map(|length| acceptance.audio_bytes(*length) as u64).sum();
+    let requested_total: u64 = packet_sizes
+        .iter()
+        .map(|length| acceptance.audio_bytes(*length) as u64)
+        .sum();
     let delivered_total: u64 = if packet_sizes.len() == descriptors.len() {
         packet_sizes
             .iter()

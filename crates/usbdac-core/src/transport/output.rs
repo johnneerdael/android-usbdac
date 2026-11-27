@@ -2,30 +2,67 @@ use super::*;
 
 /// Bootstrap the exact PLAYBACK_FIRST pair without touching application PCM,
 /// playback position, loss accounting, or payload verification.
-pub(super) fn nominal_pcm_silence(scheduler: &mut IsoPacketScheduler, max_packet: usize,
-    stride: usize, epoch: u64) -> Result<IsoTransferPayload, String> {
+pub(super) fn nominal_pcm_silence(
+    scheduler: &mut IsoPacketScheduler,
+    max_packet: usize,
+    stride: usize,
+    epoch: u64,
+) -> Result<IsoTransferPayload, String> {
     let packet_sizes = scheduler.next_transfer_packet_bytes();
-    if stride == 0 || packet_sizes.is_empty() || packet_sizes.iter().any(|&n| n == 0 || n > max_packet || n % stride != 0) {
+    if stride == 0
+        || packet_sizes.is_empty()
+        || packet_sizes
+            .iter()
+            .any(|&n| n == 0 || n > max_packet || n % stride != 0)
+    {
         return Err("invalid PLAYBACK_FIRST nominal silence geometry".into());
     }
     let bytes = packet_sizes.iter().sum();
-    Ok(IsoTransferPayload { packet_sizes, transfer_buffer: vec![0; bytes], packet_samples: vec![],
-        underrun: false, held: true, frame_count: 0, music_frames: 0, epoch })
+    Ok(IsoTransferPayload {
+        packet_sizes,
+        transfer_buffer: vec![0; bytes],
+        packet_samples: vec![],
+        underrun: false,
+        held: true,
+        frame_count: 0,
+        music_frames: 0,
+        epoch,
+    })
 }
 
-pub(super) fn retire_bootstrap(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) -> Result<bool, Error> {
+pub(super) fn retire_bootstrap(
+    slot: &mut IsoTransferSlot,
+    acceptance: PacketAcceptance,
+) -> Result<bool, Error> {
     retire_bootstrap_completion(slot, acceptance).map(|completion| completion.is_some())
 }
 
-pub(super) fn retire_bootstrap_completion(slot: &mut IsoTransferSlot, acceptance: PacketAcceptance) -> Result<Option<Instant>, Error> {
-    let Some((status, completed, _)) = slot.take_completion() else { return Ok(None); };
+pub(super) fn retire_bootstrap_completion(
+    slot: &mut IsoTransferSlot,
+    acceptance: PacketAcceptance,
+) -> Result<Option<Instant>, Error> {
+    let Some((status, completed, _)) = slot.take_completion() else {
+        return Ok(None);
+    };
     let result = if status == LIBUSB_TRANSFER_COMPLETED {
-        slot.validate_packets(acceptance).map_err(Error::Transfer).and_then(|stats| if stats == CompletionStats::default() {
-            Ok(())
-        } else { Err(Error::Transfer("PLAYBACK_FIRST silence was not accepted unchanged".into())) })
+        slot.validate_packets(acceptance)
+            .map_err(Error::Transfer)
+            .and_then(|stats| {
+                if stats == CompletionStats::default() {
+                    Ok(())
+                } else {
+                    Err(Error::Transfer(
+                        "PLAYBACK_FIRST silence was not accepted unchanged".into(),
+                    ))
+                }
+            })
     } else if status == LIBUSB_TRANSFER_NO_DEVICE {
         Err(Error::DeviceLost)
-    } else { Err(Error::Transfer(format!("PLAYBACK_FIRST silence transfer status {status}"))) };
+    } else {
+        Err(Error::Transfer(format!(
+            "PLAYBACK_FIRST silence transfer status {status}"
+        )))
+    };
     slot.mark_completed();
     result.map(|()| Some(completed))
 }
@@ -44,10 +81,14 @@ fn implicit_out_queue_failure(
         return Some("implicit feedback observed an empty OUT bus queue");
     }
     let coverage = pending_submissions
-        .map(|at| (at + Duration::from_micros(geometry.transfer_us())).saturating_duration_since(now))
-        .max().unwrap_or_default();
+        .map(|at| {
+            (at + Duration::from_micros(geometry.transfer_us())).saturating_duration_since(now)
+        })
+        .max()
+        .unwrap_or_default();
     if now.saturating_duration_since(last_valid) > Duration::from_micros(geometry.queued_us())
-        && coverage <= Duration::from_micros(u64::from(geometry.service_interval_us)) {
+        && coverage <= Duration::from_micros(u64::from(geometry.service_interval_us))
+    {
         return Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)");
     }
     None
@@ -66,9 +107,19 @@ pub(super) fn prepare_iso_transfer_payload(
     dsd_big_endian: bool,
     dsd_bit_reverse: bool,
 ) -> Result<Option<IsoTransferPayload>, String> {
-    prepare_iso_transfer_payload_held(scheduler, pcm_buffer, runtime_stats, candidate,
-        slot_bytes, channels, bytes_per_frame, dsd_transport, dsd_big_endian,
-        dsd_bit_reverse, false)
+    prepare_iso_transfer_payload_held(
+        scheduler,
+        pcm_buffer,
+        runtime_stats,
+        candidate,
+        slot_bytes,
+        channels,
+        bytes_per_frame,
+        dsd_transport,
+        dsd_big_endian,
+        dsd_bit_reverse,
+        false,
+    )
 }
 
 /// Build startup lock silence through the normal transport encoder, retaining
@@ -159,7 +210,9 @@ fn prepare_iso_transfer_payload_held(
             .store(guard.len_samples(), Ordering::Release);
         (underrun, held, music_samples, guard.flush_epoch())
     };
-    runtime_stats.last_transfer_held.store(held, Ordering::Release);
+    runtime_stats
+        .last_transfer_held
+        .store(held, Ordering::Release);
     runtime_stats
         .last_transfer_underrun
         .store(underrun, Ordering::Release);
@@ -174,16 +227,16 @@ fn prepare_iso_transfer_payload_held(
         }
         encode_unsigned8_slots(&packet_samples, &mut transfer_buffer)?;
     } else {
-    encode_usb_pcm_slots(
-        &packet_samples,
-        &mut transfer_buffer,
-        candidate.subslot_size,
-        candidate.bit_resolution,
-        dsd_transport,
-        candidate.channels,
-        dsd_big_endian,
-        dsd_bit_reverse,
-    )?;
+        encode_usb_pcm_slots(
+            &packet_samples,
+            &mut transfer_buffer,
+            candidate.subslot_size,
+            candidate.bit_resolution,
+            dsd_transport,
+            candidate.channels,
+            dsd_big_endian,
+            dsd_bit_reverse,
+        )?;
     }
     if held {
         // Expected silence: leave the audit latch alone.
@@ -266,7 +319,9 @@ pub(super) fn qualifies_implicit_feedforward_completion(
         && queued_frames > 0
         && bytes_per_frame > 0
         && packet_sizes.iter().any(|&bytes| bytes > 0)
-        && packet_sizes.iter().all(|bytes| bytes % bytes_per_frame == 0)
+        && packet_sizes
+            .iter()
+            .all(|bytes| bytes % bytes_per_frame == 0)
 }
 
 pub(super) fn update_transfer_timing_stats(
@@ -317,11 +372,17 @@ pub(super) fn drain_iso_transfer_slots(context: &Context, slots: &mut [IsoTransf
 }
 
 /// Retire a pool after its complete owner batch has requested cancellation.
-pub(super) fn retire_cancelled_iso_transfer_slots(context: &Context, slots: &mut [IsoTransferSlot]) {
+pub(super) fn retire_cancelled_iso_transfer_slots(
+    context: &Context,
+    slots: &mut [IsoTransferSlot],
+) {
     let mut warned = false;
     while slots.iter().any(|slot| slot.in_flight) {
         if let Err(error) = context.handle_events(Some(Duration::from_millis(10))) {
-            if !warned { log_warn!("USB cancellation retirement pending: {}", error); warned = true; }
+            if !warned {
+                log_warn!("USB cancellation retirement pending: {}", error);
+                warned = true;
+            }
             thread::sleep(Duration::from_millis(10));
         }
         for slot in slots.iter_mut() {
@@ -330,8 +391,6 @@ pub(super) fn retire_cancelled_iso_transfer_slots(context: &Context, slots: &mut
             }
         }
     }
-
-
 }
 
 pub(super) fn drain_feedback_transfer_slots(context: &Context, slots: &mut [FeedbackTransferSlot]) {
@@ -455,7 +514,11 @@ pub(super) fn submit_next_transfer(
     let scheduled = payload.transfer_buffer.len() / bytes_per_frame;
     slot.submit(handle, candidate.endpoint_address, payload)
         .map_err(|error| format!("USB direct transfer failed: {}", error))?;
-    if candidate.implicit_feedback.is_some() { runtime_stats.implicit_scheduled_frames.fetch_add(scheduled as u64, Ordering::Relaxed); }
+    if candidate.implicit_feedback.is_some() {
+        runtime_stats
+            .implicit_scheduled_frames
+            .fetch_add(scheduled as u64, Ordering::Relaxed);
+    }
     Ok(true)
 }
 
@@ -521,11 +584,21 @@ pub(super) fn note_underrun_edge(shared: &StreamShared, was_underrun: &mut bool,
 
 /// Copies the feedback loop's local counters into the shared statistics.
 pub(super) fn publish_feedback_counters(stats: &RuntimeStats, counters: &FeedbackCounters) {
-    stats.feedback_reports.store(counters.reports, Ordering::Relaxed);
-    stats.feedback_empty.store(counters.empty_polls, Ordering::Relaxed);
-    stats.feedback_timeouts.store(counters.timeouts, Ordering::Relaxed);
-    stats.feedback_errors.store(counters.errors, Ordering::Relaxed);
-    stats.feedback_rejected.store(counters.rejected, Ordering::Relaxed);
+    stats
+        .feedback_reports
+        .store(counters.reports, Ordering::Relaxed);
+    stats
+        .feedback_empty
+        .store(counters.empty_polls, Ordering::Relaxed);
+    stats
+        .feedback_timeouts
+        .store(counters.timeouts, Ordering::Relaxed);
+    stats
+        .feedback_errors
+        .store(counters.errors, Ordering::Relaxed);
+    stats
+        .feedback_rejected
+        .store(counters.rejected, Ordering::Relaxed);
     if let Some(reported_at) = counters.last_report_at {
         let since_start = reported_at
             .saturating_duration_since(stats.started_at)
@@ -542,8 +615,14 @@ pub(super) fn publish_feedback_counters(stats: &RuntimeStats, counters: &Feedbac
     }
 }
 
-fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounters, final_snapshot: bool) {
-    let Some(mut diagnostics) = counters.diagnostics else { return };
+fn publish_feedback_evidence(
+    stats: &RuntimeStats,
+    counters: &mut FeedbackCounters,
+    final_snapshot: bool,
+) {
+    let Some(mut diagnostics) = counters.diagnostics else {
+        return;
+    };
     diagnostics.accepted_reports = counters.reports;
     diagnostics.empty_polls = counters.empty_polls;
     diagnostics.rejected_reports = counters.rejected;
@@ -559,9 +638,14 @@ fn publish_feedback_evidence(stats: &RuntimeStats, counters: &mut FeedbackCounte
 
 /// Process status only on the USB event owner, before any completed data is
 /// exposed or rearmed. Preserve the original typed detach/failure for duplex.
-fn poll_playback_status(status: &mut audio_status::AudioStatus, claimed: &ClaimedHandle,
-    shared: &StreamShared) -> Result<(), Error> {
-    status.poll(claimed).map_err(|error| invalidate_playback_status(error, shared))
+fn poll_playback_status(
+    status: &mut audio_status::AudioStatus,
+    claimed: &ClaimedHandle,
+    shared: &StreamShared,
+) -> Result<(), Error> {
+    status
+        .poll(claimed)
+        .map_err(|error| invalidate_playback_status(error, shared))
 }
 
 fn invalidate_playback_status(error: Error, shared: &StreamShared) -> Error {
@@ -572,9 +656,14 @@ fn invalidate_playback_status(error: Error, shared: &StreamShared) -> Error {
     error
 }
 
-fn arm_playback_endpoint(status: &mut audio_status::AudioStatus, claimed: &ClaimedHandle,
-    address: u8, shared: &StreamShared) -> Result<(), Error> {
-    status.arm_endpoint(claimed, address)
+fn arm_playback_endpoint(
+    status: &mut audio_status::AudioStatus,
+    claimed: &ClaimedHandle,
+    address: u8,
+    shared: &StreamShared,
+) -> Result<(), Error> {
+    status
+        .arm_endpoint(claimed, address)
         .map_err(|error| invalidate_playback_status(error, shared))
 }
 
@@ -630,7 +719,9 @@ pub(super) fn run_usb_output_loop(
         Err(error) => {
             invalidate_clock_verification();
             shared.note_bit_perfect();
-            if let Some(capture) = capture.as_ref() { capture.finish(Some(error.clone())); }
+            if let Some(capture) = capture.as_ref() {
+                capture.finish(Some(error.clone()));
+            }
             set_last_error(Some(error.to_string()));
             set_engine_state(EngineState::Error, Some(error.to_string()));
             shared.fail(error);
@@ -640,12 +731,24 @@ pub(super) fn run_usb_output_loop(
             return;
         }
     };
-    let (vendor_playback_first, programmed_vendor_rate) = match vendor_pcm::for_candidate(&handle, &candidate) {
-        Ok(profile) => (profile.is_some(), profile.as_ref().is_some_and(|profile| profile.rate_control)),
-        Err(message) => { set_last_error(Some(message.clone())); set_engine_state(EngineState::Error, Some(message.clone())); shared.fail(Error::Transfer(message)); set_stream_active(false); return; }
-    };
-    let playback_first=vendor_playback_first || (settings().source_has(crate::Quirk::PlaybackFirst)
-        && candidate.implicit_feedback.is_some() && playback_format.dsd_transport==DsdTransportMode::None);
+    let (vendor_playback_first, programmed_vendor_rate) =
+        match vendor_pcm::for_candidate(handle, &candidate) {
+            Ok(profile) => (
+                profile.is_some(),
+                profile.as_ref().is_some_and(|profile| profile.rate_control),
+            ),
+            Err(message) => {
+                set_last_error(Some(message.clone()));
+                set_engine_state(EngineState::Error, Some(message.clone()));
+                shared.fail(Error::Transfer(message));
+                set_stream_active(false);
+                return;
+            }
+        };
+    let playback_first = vendor_playback_first
+        || (settings().source_has(crate::Quirk::PlaybackFirst)
+            && candidate.implicit_feedback.is_some()
+            && playback_format.dsd_transport == DsdTransportMode::None);
     let channels = candidate.channels as usize;
     let bytes_per_frame = slot_bytes.saturating_mul(channels);
     let mut bus_config = settings().config.clone();
@@ -662,21 +765,28 @@ pub(super) fn run_usb_output_loop(
         geometry,
     );
     // Implicit feedback owns a matched IN/OUT pool and must retain its geometry.
-    let mut adaptive_queue = crate::iso_packet_scheduler::AdaptiveQueue::new(geometry,
-        bus_config.adaptive_queue && candidate.implicit_feedback.is_none());
+    let mut adaptive_queue = crate::iso_packet_scheduler::AdaptiveQueue::new(
+        geometry,
+        bus_config.adaptive_queue && candidate.implicit_feedback.is_none(),
+    );
     let transfer_slot_count = adaptive_queue.slots;
     let allocated_slot_count = adaptive_queue.max_slots;
-    runtime_stats.adaptive_queue_slots.store(adaptive_queue.slots as u64, Ordering::Relaxed);
-    runtime_stats.adaptive_queue_us.store(geometry.queued_us(), Ordering::Relaxed);
+    runtime_stats
+        .adaptive_queue_slots
+        .store(adaptive_queue.slots as u64, Ordering::Relaxed);
+    runtime_stats
+        .adaptive_queue_us
+        .store(geometry.queued_us(), Ordering::Relaxed);
     // Only declared startup delays need ordered retirement. Reuse this storage
     // until the one-shot proof completes; ordinary streams allocate nothing.
-    let mut lock_retirement_order = lock_gate.pending()
+    let mut lock_retirement_order = lock_gate
+        .pending()
         .then(|| Vec::<usize>::with_capacity(transfer_slot_count));
     // One-shot: prove whether the sink links a feedback endpoint at all. If this
     // dump shows a FeedbackData IN endpoint that descriptor parsing missed, the
     // discovery path is wrong; if it shows none, host-side feedback is
     // impossible for this device and only bus-side cushioning can help.
-    log_iso_endpoint_descriptors(&handle, &candidate);
+    log_iso_endpoint_descriptors(handle, &candidate);
     let feedback_endpoint = candidate.feedback_endpoint;
     let mut feedback_transfers = None;
     let mut feedback_start_error = None;
@@ -684,24 +794,30 @@ pub(super) fn run_usb_output_loop(
     if let Some(endpoint) = feedback_endpoint {
         if candidate.sync_type == SyncType::Asynchronous {
             let device = handle.device();
-            let compatibility = device.device_descriptor().map(|descriptor| {
-                FeedbackCompatibility::for_device(
-                    descriptor.vendor_id(),
-                    descriptor.product_id(),
-                    candidate.usb_speed,
-                    endpoint,
-                    playback_format.sample_rate,
-                )
-            }).unwrap_or_default();
+            let compatibility = device
+                .device_descriptor()
+                .map(|descriptor| {
+                    FeedbackCompatibility::for_device(
+                        descriptor.vendor_id(),
+                        descriptor.product_id(),
+                        candidate.usb_speed,
+                        endpoint,
+                        playback_format.sample_rate,
+                    )
+                })
+                .unwrap_or_default();
             let feedback_window_ms = if bus_config.transfer_period_us.is_some() {
-                bus_config.bus_queue_ms.min(geometry.queued_us().div_ceil(1_000) as u32)
+                bus_config
+                    .bus_queue_ms
+                    .min(geometry.queued_us().div_ceil(1_000) as u32)
             } else {
                 bus_config.bus_queue_ms
             };
             match FeedbackTransfers::new(endpoint, feedback_window_ms, compatibility) {
                 Ok(transfers) => feedback_transfers = Some(transfers),
                 Err(error) => {
-                    feedback_start_error = Some(format!("explicit feedback allocation failed: {}", error));
+                    feedback_start_error =
+                        Some(format!("explicit feedback allocation failed: {}", error));
                 }
             }
         } else {
@@ -711,7 +827,8 @@ pub(super) fn run_usb_output_loop(
                 candidate.sync_type
             );
         }
-    } else if candidate.sync_type == SyncType::Asynchronous && candidate.implicit_feedback.is_none() {
+    } else if candidate.sync_type == SyncType::Asynchronous && candidate.implicit_feedback.is_none()
+    {
         let bus_cushion_ms = geometry.queued_us() / 1000;
         log_warn!(
             "[USB] Async sink exposes no feedback endpoint; host-paced nominal timing with {} \
@@ -732,19 +849,31 @@ pub(super) fn run_usb_output_loop(
     let mut underrun_count = 0u64;
     let mut feedback_counters = FeedbackCounters::default();
     feedback_counters.trace = runtime_stats.feedback_trace.clone();
-    feedback_counters.infer_service_interval = post_alt_readback_hz == Some(playback_format.sample_rate);
+    feedback_counters.infer_service_interval =
+        post_alt_readback_hz == Some(playback_format.sample_rate);
     let mut feedback_stale_warned = false;
-    let feedback_health = feedback_endpoint.filter(|_| candidate.sync_type == SyncType::Asynchronous).map(|endpoint| ExplicitFeedbackHealth::new(
-        endpoint.service_interval_us, candidate.is_uac1.then_some(endpoint.refresh)));
+    let feedback_health = feedback_endpoint
+        .filter(|_| candidate.sync_type == SyncType::Asynchronous)
+        .map(|endpoint| {
+            ExplicitFeedbackHealth::new(
+                endpoint.service_interval_us,
+                candidate.is_uac1.then_some(endpoint.refresh),
+            )
+        });
     let mut feedback_route = feedback_endpoint
-        .filter(|_| feedback_health.is_some()
-            && !feedback_per_service
-            && feedback_counters.infer_service_interval
-            && candidate.usb_speed == Speed::High
-            && candidate.service_interval_us > 125)
+        .filter(|_| {
+            feedback_health.is_some()
+                && !feedback_per_service
+                && feedback_counters.infer_service_interval
+                && candidate.usb_speed == Speed::High
+                && candidate.service_interval_us > 125
+        })
         .map(|endpoint| FeedbackTimebaseRoute::new(&candidate, endpoint));
     if let Some(route) = feedback_route {
-        feedback_counters.cached_service_interval = state.service_interval_feedback_routes.lock().contains(&route);
+        feedback_counters.cached_service_interval = state
+            .service_interval_feedback_routes
+            .lock()
+            .contains(&route);
     }
     if let Some(endpoint) = feedback_endpoint.filter(|_| feedback_health.is_some()) {
         feedback_counters.diagnostics = Some(crate::ExplicitFeedbackDiagnostics {
@@ -770,10 +899,18 @@ pub(super) fn run_usb_output_loop(
             feedback_refresh: endpoint.refresh,
             feedback_service_interval_us: endpoint.service_interval_us,
             feedback_max_packet_bytes: endpoint.max_packet_bytes,
-            transfer_slots: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots.len()),
-            requested_packet_bytes: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].packet_bytes),
-            packets_per_transfer: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].packet_count),
-            transfer_timeout_ms: feedback_transfers.as_ref().map_or(0, |transfers| transfers.slots[0].timeout_ms),
+            transfer_slots: feedback_transfers
+                .as_ref()
+                .map_or(0, |transfers| transfers.slots.len()),
+            requested_packet_bytes: feedback_transfers
+                .as_ref()
+                .map_or(0, |transfers| transfers.slots[0].packet_bytes),
+            packets_per_transfer: feedback_transfers
+                .as_ref()
+                .map_or(0, |transfers| transfers.slots[0].packet_count),
+            transfer_timeout_ms: feedback_transfers
+                .as_ref()
+                .map_or(0, |transfers| transfers.slots[0].timeout_ms),
             per_service_interval_quirk: feedback_per_service,
             ..Default::default()
         });
@@ -787,7 +924,8 @@ pub(super) fn run_usb_output_loop(
         playback_format.sample_rate,
         candidate.service_interval_us,
         bytes_per_frame,
-    ).with_packet_prefix(data_packet_prefix_bytes());
+    )
+    .with_packet_prefix(data_packet_prefix_bytes());
     // Lost audio is counted in the unit `consumer_frames` uses, which for native
     // DSD is one byte per channel rather than a transport frame.
     let ring_frame_bytes = ring_bytes_per_frame(
@@ -797,25 +935,20 @@ pub(super) fn run_usb_output_loop(
     );
     let mut loss_tracker = LossTracker::new(LossLimits {
         max_consecutive_lossy_urbs: geometry.max_consecutive_lossy_urbs(),
-        max_lost_frames: lost_frame_budget(
-            runtime_stats.sample_rate,
-            USB_MAX_LOST_AUDIO_MS,
-        ),
+        max_lost_frames: lost_frame_budget(runtime_stats.sample_rate, USB_MAX_LOST_AUDIO_MS),
     });
     // Separate gates so benign repacketisation cannot use up the budget for
     // lines that report real loss.
     let mut played_music = PlayedMusicCounter::default();
-    let mut loss_log_gate = LossLogGate::new(
-        USB_LOSS_LOG_BURST,
-        USB_LOSS_LOG_MIN_INTERVAL_MS,
+    let mut loss_log_gate = LossLogGate::new(USB_LOSS_LOG_BURST, USB_LOSS_LOG_MIN_INTERVAL_MS);
+    let mut repacketised_log_gate =
+        LossLogGate::new(USB_LOSS_LOG_BURST, USB_LOSS_LOG_MIN_INTERVAL_MS);
+    let transfer_buffer_capacity = scheduler.packets_per_transfer().saturating_mul(
+        candidate
+            .max_packet_bytes
+            .max(1)
+            .saturating_add(data_packet_prefix_bytes()),
     );
-    let mut repacketised_log_gate = LossLogGate::new(
-        USB_LOSS_LOG_BURST,
-        USB_LOSS_LOG_MIN_INTERVAL_MS,
-    );
-    let transfer_buffer_capacity = scheduler
-        .packets_per_transfer()
-        .saturating_mul(candidate.max_packet_bytes.max(1).saturating_add(data_packet_prefix_bytes()));
     let mut slots = Vec::with_capacity(allocated_slot_count);
     let mut active_slots = 0usize;
     let mut explicit_feedback_fault = feedback_start_error.is_some();
@@ -855,10 +988,14 @@ pub(super) fn run_usb_output_loop(
                 fatal_error = Some(format!("status prime event pump: {error}"));
                 break;
             }
-            if usb_stop_requested(&stop) { break; }
+            if usb_stop_requested(&stop) {
+                break;
+            }
             if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
                 device_lost = error == Error::DeviceLost;
-                fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                fatal_error = Some(error.to_string());
+                capture_failure = Some(error);
+                break;
             }
         }
         let buffered = runtime_stats.buffered_samples.load(Ordering::Acquire);
@@ -873,7 +1010,9 @@ pub(super) fn run_usb_output_loop(
             );
             break;
         }
-        if !audio_status.is_active() { thread::sleep(Duration::from_millis(2)); }
+        if !audio_status.is_active() {
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     for slot_index in 0..allocated_slot_count {
@@ -901,53 +1040,92 @@ pub(super) fn run_usb_output_loop(
     let mut bootstrap = vec![false; slots.len()];
     if playback_first && fatal_error.is_none() && !usb_stop_requested(&stop) {
         for (index, slot) in slots.iter_mut().enumerate() {
-            let result = nominal_pcm_silence(&mut scheduler, candidate.max_packet_bytes, bytes_per_frame,
-                runtime_stats.flush_epoch.load(Ordering::Acquire))
-                .and_then(|payload| slot.submit(&handle, candidate.endpoint_address, payload));
+            let result = nominal_pcm_silence(
+                &mut scheduler,
+                candidate.max_packet_bytes,
+                bytes_per_frame,
+                runtime_stats.flush_epoch.load(Ordering::Acquire),
+            )
+            .and_then(|payload| slot.submit(handle, candidate.endpoint_address, payload));
             match result {
-                Ok(()) => { bootstrap[index] = true; active_slots += 1; }
-                Err(error) => { device_lost = matches!(classify_stream_failure(Some(&error), false, None), Some(Error::DeviceLost)); implicit_feedback_fault = true; fatal_error = Some(error); break; }
+                Ok(()) => {
+                    bootstrap[index] = true;
+                    active_slots += 1;
+                }
+                Err(error) => {
+                    device_lost = matches!(
+                        classify_stream_failure(Some(&error), false, None),
+                        Some(Error::DeviceLost)
+                    );
+                    implicit_feedback_fault = true;
+                    fatal_error = Some(error);
+                    break;
+                }
             }
         }
     }
 
     let stream_started_at = Instant::now();
     let mut capture_pool = None;
-    if let Some(attachment) = capture.as_ref().filter(|a| !a.shared_implicit
-        && fatal_error.is_none() && !usb_stop_requested(&stop)) {
+    if let Some(attachment) = capture
+        .as_ref()
+        .filter(|a| !a.shared_implicit && fatal_error.is_none() && !usb_stop_requested(&stop))
+    {
         match duplex::InputPool::new(Arc::clone(attachment)) {
             Ok(mut pool) => {
-                let start = arm_playback_endpoint(&mut audio_status, claimed_handle,
-                    attachment.endpoint.address, &shared)
-                    .and_then(|()| pool.start(&handle, &stop));
+                let start = arm_playback_endpoint(
+                    &mut audio_status,
+                    claimed_handle,
+                    attachment.endpoint.address,
+                    &shared,
+                )
+                .and_then(|()| pool.start(handle, &stop));
                 if let Err(error) = start {
-                    device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error);
+                    device_lost = error == Error::DeviceLost;
+                    fatal_error = Some(error.to_string());
+                    capture_failure = Some(error);
                 }
                 capture_pool = Some(pool);
             }
             Err(error) => fatal_error = Some(error),
         }
     }
-    let capture_uses_implicit_feedforward = capture_pool.as_ref()
+    let capture_uses_implicit_feedforward = capture_pool
+        .as_ref()
         .is_some_and(|pool| pool.uses_implicit_feedforward());
     // Duplex readiness requires a completed, fully valid adaptive-source
     // feedforward send and, for no-control UAC1 capture, measured IN cadence
     // after the declared lock delay, under this same USB event owner.
-    while fatal_error.is_none() && !usb_stop_requested(&stop)
-        && capture_pool.as_ref().is_some_and(|pool| !pool.primed()) {
+    while fatal_error.is_none()
+        && !usb_stop_requested(&stop)
+        && capture_pool.as_ref().is_some_and(|pool| !pool.primed())
+    {
         if let Err(error) = context.handle_events(Some(Duration::from_millis(1))) {
-            let failure = if error == rusb::Error::NoDevice { Error::DeviceLost }
-                else { Error::Transfer(format!("duplex feedforward event pump: {error}")) };
-            device_lost = failure == Error::DeviceLost; fatal_error = Some(failure.to_string()); capture_failure = Some(failure); break;
+            let failure = if error == rusb::Error::NoDevice {
+                Error::DeviceLost
+            } else {
+                Error::Transfer(format!("duplex feedforward event pump: {error}"))
+            };
+            device_lost = failure == Error::DeviceLost;
+            fatal_error = Some(failure.to_string());
+            capture_failure = Some(failure);
+            break;
         }
-        if usb_stop_requested(&stop) { break; }
+        if usb_stop_requested(&stop) {
+            break;
+        }
         if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
             device_lost = error == Error::DeviceLost;
-            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            fatal_error = Some(error.to_string());
+            capture_failure = Some(error);
+            break;
         }
         if let Some(pool) = capture_pool.as_mut() {
-            if let Err(error) = pool.pump(&handle, &stop) {
-                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            if let Err(error) = pool.pump(handle, &stop) {
+                device_lost = error == Error::DeviceLost;
+                fatal_error = Some(error.to_string());
+                capture_failure = Some(error);
+                break;
             }
         }
     }
@@ -964,35 +1142,64 @@ pub(super) fn run_usb_output_loop(
                     bytes_per_frame: source.bytes_per_frame,
                 });
             }
-            match ImplicitFeedback::new(source, geometry, bytes_per_frame, candidate.max_packet_bytes, playback_format.sample_rate) {
+            match ImplicitFeedback::new(
+                source,
+                geometry,
+                bytes_per_frame,
+                candidate.max_packet_bytes,
+                playback_format.sample_rate,
+            ) {
                 Ok(mut engine) => {
-                    if programmed_vendor_rate { engine.require_vendor_rate_proof(); }
+                    if programmed_vendor_rate {
+                        engine.require_vendor_rate_proof();
+                    }
                     if !playback_first {
-                        engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
+                        engine.attach_capture(
+                            capture.as_ref().filter(|a| a.shared_implicit).cloned(),
+                        );
                     }
                     log_info!("[USB] Implicit feedback source interface={} alt={} endpoint=0x{:02x} inStride={} outStride={} service={}us packetCapacity={}",
                         source.interface_number, source.alt_setting, source.address, source.bytes_per_frame, bytes_per_frame,
                         source.service_interval_us, source.max_packet_bytes);
-                    if let Err(error) = arm_playback_endpoint(&mut audio_status, claimed_handle,
-                        source.address, &shared) {
+                    if let Err(error) = arm_playback_endpoint(
+                        &mut audio_status,
+                        claimed_handle,
+                        source.address,
+                        &shared,
+                    ) {
                         device_lost = error == Error::DeviceLost;
-                        fatal_error = Some(error.to_string()); capture_failure = Some(error);
-                    } else if let Err(error) = engine.start(&handle, &runtime_stats, &stop) {
-                        implicit_feedback_fault = true; fatal_error = Some(error);
+                        fatal_error = Some(error.to_string());
+                        capture_failure = Some(error);
+                    } else if let Err(error) = engine.start(handle, &runtime_stats, &stop) {
+                        implicit_feedback_fault = true;
+                        fatal_error = Some(error);
                     }
                     while fatal_error.is_none() && !usb_stop_requested(&stop) && !engine.primed() {
-                        if let Err(error) = context.handle_events(Some(Duration::from_micros(u64::from(candidate.service_interval_us).min(1000)))) {
+                        if let Err(error) = context.handle_events(Some(Duration::from_micros(
+                            u64::from(candidate.service_interval_us).min(1000),
+                        ))) {
                             device_lost = error == rusb::Error::NoDevice;
-                            implicit_feedback_fault = true; fatal_error = Some(format!("implicit event pump failed: {}", error)); break;
+                            implicit_feedback_fault = true;
+                            fatal_error = Some(format!("implicit event pump failed: {}", error));
+                            break;
                         }
-                        if usb_stop_requested(&stop) { break; }
-                        if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+                        if usb_stop_requested(&stop) {
+                            break;
+                        }
+                        if let Err(error) =
+                            poll_playback_status(&mut audio_status, claimed_handle, &shared)
+                        {
                             device_lost = error == Error::DeviceLost;
-                            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                            fatal_error = Some(error.to_string());
+                            capture_failure = Some(error);
+                            break;
                         }
                         if let Some(pool) = capture_pool.as_mut() {
-                            if let Err(error) = pool.pump(&handle, &stop) {
-                                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                            if let Err(error) = pool.pump(handle, &stop) {
+                                device_lost = error == Error::DeviceLost;
+                                fatal_error = Some(error.to_string());
+                                capture_failure = Some(error);
+                                break;
                             }
                         }
                         if playback_first && !usb_stop_requested(&stop) {
@@ -1001,21 +1208,50 @@ pub(super) fn run_usb_output_loop(
                                     Ok(true) => {
                                         active_slots = active_slots.saturating_sub(1);
                                         bootstrap[index] = false;
-                                        let result = nominal_pcm_silence(&mut scheduler, candidate.max_packet_bytes, bytes_per_frame,
-                                            runtime_stats.flush_epoch.load(Ordering::Acquire))
-                                            .and_then(|payload| slot.submit(&handle, candidate.endpoint_address, payload));
+                                        let result = nominal_pcm_silence(
+                                            &mut scheduler,
+                                            candidate.max_packet_bytes,
+                                            bytes_per_frame,
+                                            runtime_stats.flush_epoch.load(Ordering::Acquire),
+                                        )
+                                        .and_then(|payload| {
+                                            slot.submit(handle, candidate.endpoint_address, payload)
+                                        });
                                         match result {
-                                            Ok(()) => { active_slots += 1; bootstrap[index] = true; }
-                                            Err(error) => { device_lost = matches!(classify_stream_failure(Some(&error), false, None), Some(Error::DeviceLost)); implicit_feedback_fault = true; fatal_error = Some(error); break; }
+                                            Ok(()) => {
+                                                active_slots += 1;
+                                                bootstrap[index] = true;
+                                            }
+                                            Err(error) => {
+                                                device_lost = matches!(
+                                                    classify_stream_failure(
+                                                        Some(&error),
+                                                        false,
+                                                        None
+                                                    ),
+                                                    Some(Error::DeviceLost)
+                                                );
+                                                implicit_feedback_fault = true;
+                                                fatal_error = Some(error);
+                                                break;
+                                            }
                                         }
                                     }
                                     Ok(false) => (),
-                                    Err(error) => { device_lost = error == Error::DeviceLost; implicit_feedback_fault = true; fatal_error = Some(error.to_string()); break; }
+                                    Err(error) => {
+                                        device_lost = error == Error::DeviceLost;
+                                        implicit_feedback_fault = true;
+                                        fatal_error = Some(error.to_string());
+                                        break;
+                                    }
                                 }
                             }
                         }
                         if fatal_error.is_none() && !usb_stop_requested(&stop) {
-                            if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); }
+                            if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
+                                implicit_feedback_fault = true;
+                                fatal_error = Some(error);
+                            }
                         }
                     }
                     if fatal_error.is_none() && !usb_stop_requested(&stop) && engine.primed() {
@@ -1026,16 +1262,24 @@ pub(super) fn run_usb_output_loop(
                             set_clock_verification(true, true, true, None);
                         }
                         if playback_first {
-                            engine.attach_capture(capture.as_ref().filter(|a| a.shared_implicit).cloned());
+                            engine.attach_capture(
+                                capture.as_ref().filter(|a| a.shared_implicit).cloned(),
+                            );
                         }
                     }
                     implicit = Some(engine);
                 }
-                Err(error) => { implicit_feedback_fault = true; fatal_error = Some(error); },
+                Err(error) => {
+                    implicit_feedback_fault = true;
+                    fatal_error = Some(error);
+                }
             }
         }
     }
-    if let Some(transfers) = feedback_transfers.as_mut().filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop)) {
+    if let Some(transfers) = feedback_transfers
+        .as_mut()
+        .filter(|_| fatal_error.is_none() && !usb_stop_requested(&stop))
+    {
         match transfers.start(handle, &mut feedback_counters) {
             Ok(()) => {
                 let slot = &transfers.slots[0];
@@ -1055,7 +1299,8 @@ pub(super) fn run_usb_output_loop(
             Err(FeedbackFault::DeviceLost) => {
                 explicit_feedback_fault = true;
                 device_lost = true;
-                fatal_error = Some("explicit feedback device disconnected during initial submit".into());
+                fatal_error =
+                    Some("explicit feedback device disconnected during initial submit".into());
             }
             Err(FeedbackFault::Transfer(error)) => {
                 explicit_feedback_fault = true;
@@ -1065,22 +1310,37 @@ pub(super) fn run_usb_output_loop(
     }
 
     if fatal_error.is_none() && !usb_stop_requested(&stop) {
-        if let Err(error) = arm_playback_endpoint(&mut audio_status, claimed_handle,
-            candidate.endpoint_address, &shared) {
+        if let Err(error) = arm_playback_endpoint(
+            &mut audio_status,
+            claimed_handle,
+            candidate.endpoint_address,
+            &shared,
+        ) {
             device_lost = error == Error::DeviceLost;
-            fatal_error = Some(error.to_string()); capture_failure = Some(error);
+            fatal_error = Some(error.to_string());
+            capture_failure = Some(error);
         }
     }
     if fatal_error.is_none() {
         for slot in slots.iter_mut().take(transfer_slot_count) {
-            if slot.in_flight { continue; }
+            if slot.in_flight {
+                continue;
+            }
             if usb_stop_requested(&stop) {
                 break;
             }
             if let Some(engine) = implicit.as_mut() {
                 engine.running = true;
-                if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) { implicit_feedback_fault = true; fatal_error = Some(error); break; }
-                let Some(pattern) = engine.take_pattern(&runtime_stats) else { implicit_feedback_fault = true; fatal_error = Some("implicit prime lost its complete pattern".into()); break; };
+                if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
+                    implicit_feedback_fault = true;
+                    fatal_error = Some(error);
+                    break;
+                }
+                let Some(pattern) = engine.take_pattern(&runtime_stats) else {
+                    implicit_feedback_fault = true;
+                    fatal_error = Some("implicit prime lost its complete pattern".into());
+                    break;
+                };
                 scheduler.set_packet_pattern(pattern);
             }
             let payload = match prepare_iso_transfer_payload_held(
@@ -1094,15 +1354,16 @@ pub(super) fn run_usb_output_loop(
                 playback_format.dsd_transport,
                 dsd_big_endian,
                 dsd_bit_reverse,
-                lock_gate.pending() || implicit.as_ref().is_some_and(|engine|engine.pattern_is_silence()),
+                lock_gate.pending()
+                    || implicit
+                        .as_ref()
+                        .is_some_and(|engine| engine.pattern_is_silence()),
             ) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => continue,
                 Err(error) => {
-                    fatal_error = Some(format!(
-                        "USB direct transfer preparation failed: {}",
-                        error
-                    ));
+                    fatal_error =
+                        Some(format!("USB direct transfer preparation failed: {}", error));
                     break;
                 }
             };
@@ -1120,15 +1381,20 @@ pub(super) fn run_usb_output_loop(
             note_underrun_edge(&shared, &mut was_underrun, payload.underrun);
 
             let scheduled = payload.transfer_buffer.len() / bytes_per_frame;
-            if let Err(error) = slot.submit(&handle, candidate.endpoint_address, payload) {
+            if let Err(error) = slot.submit(handle, candidate.endpoint_address, payload) {
                 fatal_error = Some(format!("USB direct transfer failed: {}", error));
                 break;
             }
-            if candidate.implicit_feedback.is_some() { runtime_stats.implicit_scheduled_frames.fetch_add(scheduled as u64, Ordering::Relaxed); }
+            if candidate.implicit_feedback.is_some() {
+                runtime_stats
+                    .implicit_scheduled_frames
+                    .fetch_add(scheduled as u64, Ordering::Relaxed);
+            }
             if active_slots == 0 {
                 if let Some(pool) = capture_pool.as_mut() {
                     pool.note_playback_submitted(
-                        slot.submitted_at.expect("successful OUT submit records its timestamp"),
+                        slot.submitted_at
+                            .expect("successful OUT submit records its timestamp"),
                         Duration::from_micros(geometry.transfer_us()),
                     );
                 }
@@ -1144,36 +1410,52 @@ pub(super) fn run_usb_output_loop(
         shared.refresh_state();
     }
 
-    if fatal_error.is_none() && !usb_stop_requested(&stop)
-        && capture_uses_implicit_feedforward && active_slots == 0 {
-        let error = Error::Transfer("implicit feedforward started with an empty OUT bus queue".into());
+    if fatal_error.is_none()
+        && !usb_stop_requested(&stop)
+        && capture_uses_implicit_feedforward
+        && active_slots == 0
+    {
+        let error =
+            Error::Transfer("implicit feedforward started with an empty OUT bus queue".into());
         fatal_error = Some(error.to_string());
         capture_failure = Some(error);
     }
-    if let Some(engine) = implicit.as_mut() { engine.running = active_slots > 0; }
+    if let Some(engine) = implicit.as_mut() {
+        engine.running = active_slots > 0;
+    }
     let mut previous_worker_at = Instant::now();
-    let nominal_guarded = candidate.is_uac1 && candidate.usb_speed == Speed::Full
-        && candidate.sync_type == SyncType::Asynchronous && candidate.feedback_endpoint.is_none()
+    let nominal_guarded = candidate.is_uac1
+        && candidate.usb_speed == Speed::Full
+        && candidate.sync_type == SyncType::Asynchronous
+        && candidate.feedback_endpoint.is_none()
         && candidate.implicit_feedback.is_none();
     let mut nominal_starvation = crate::iso_packet_scheduler::NominalStarvation::default();
     while fatal_error.is_none() && !usb_stop_requested(&stop) {
-        if active_slots == 0 && implicit.is_none() { break; }
+        if active_slots == 0 && implicit.is_none() {
+            break;
+        }
         // Retire and refill the whole event batch with the startup decision
         // taken once, so lock proof cannot start application data mid-batch.
         let batch_lock_pending = lock_gate.pending();
 
         if let Err(error) = context.handle_events(Some(if implicit.is_some() {
             Duration::from_micros(u64::from(candidate.service_interval_us).min(1000))
-        } else { Duration::from_millis(50) })) {
+        } else {
+            Duration::from_millis(50)
+        })) {
             device_lost = error == rusb::Error::NoDevice;
             fatal_error = Some(format!("libusb_handle_events failed: {}", error));
             break;
         }
 
-        if usb_stop_requested(&stop) { break; }
+        if usb_stop_requested(&stop) {
+            break;
+        }
         if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
             device_lost = error == Error::DeviceLost;
-            fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+            fatal_error = Some(error.to_string());
+            capture_failure = Some(error);
+            break;
         }
         // A flush since the last look: cut what is still queued of the old
         // position. Only transfers filled before the flush are touched; their
@@ -1183,20 +1465,36 @@ pub(super) fn run_usb_output_loop(
             handled_flush_epoch = flush_epoch;
             if bus_config.cancel_in_flight_on_flush {
                 let started = Instant::now();
-                let cancel_result = if implicit.is_some() || feedback_transfers.is_some()
-                    || capture_uses_implicit_feedforward {
-                    let targets = flush_cancel_targets(flush_epoch, slots.iter().map(|slot| (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)));
-                    for &index in &targets { slots[index].cancel_for_flush(); }
+                let cancel_result = if implicit.is_some()
+                    || feedback_transfers.is_some()
+                    || capture_uses_implicit_feedforward
+                {
+                    let targets = flush_cancel_targets(
+                        flush_epoch,
+                        slots.iter().map(|slot| {
+                            (slot.in_flight, slot.queued_epoch, slot.queued_music_frames)
+                        }),
+                    );
+                    for &index in &targets {
+                        slots[index].cancel_for_flush();
+                    }
                     if !targets.is_empty() {
                         out_flush_deadline.get_or_insert(started + FLUSH_CANCEL_TIMEOUT);
                     }
                     Ok(targets.len())
-                } else { cancel_stale_transfers_for_flush(&context, &mut slots, flush_epoch) };
+                } else {
+                    cancel_stale_transfers_for_flush(context, &mut slots, flush_epoch)
+                };
                 // Synchronous flush retirement can pump another event batch.
-                if usb_stop_requested(&stop) { break; }
-                if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared) {
+                if usb_stop_requested(&stop) {
+                    break;
+                }
+                if let Err(error) = poll_playback_status(&mut audio_status, claimed_handle, &shared)
+                {
                     device_lost = error == Error::DeviceLost;
-                    fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+                    fatal_error = Some(error.to_string());
+                    capture_failure = Some(error);
+                    break;
                 }
                 match cancel_result {
                     Ok(0) => {}
@@ -1220,14 +1518,23 @@ pub(super) fn run_usb_output_loop(
         // Adaptive implicit feedforward must see this event batch's validated
         // OUT completions before it decides whether capture timing is stale.
         // Preserve the established order for explicit and ordinary capture.
-        if let Some(pool) = capture_pool.as_mut().filter(|pool| !pool.uses_implicit_feedforward()) {
-            if let Err(error) = pool.pump(&handle, &stop) {
-                device_lost = error == Error::DeviceLost; fatal_error = Some(error.to_string()); capture_failure = Some(error); break;
+        if let Some(pool) = capture_pool
+            .as_mut()
+            .filter(|pool| !pool.uses_implicit_feedforward())
+        {
+            if let Err(error) = pool.pump(handle, &stop) {
+                device_lost = error == Error::DeviceLost;
+                fatal_error = Some(error.to_string());
+                capture_failure = Some(error);
+                break;
             }
         }
         if let Some(engine) = implicit.as_mut() {
-            if let Err(error) = engine.pump(&handle, &runtime_stats, &stop) {
-                device_lost = error.contains("disconnected"); implicit_feedback_fault = true; fatal_error = Some(error); break;
+            if let Err(error) = engine.pump(handle, &runtime_stats, &stop) {
+                device_lost = error.contains("disconnected");
+                implicit_feedback_fault = true;
+                fatal_error = Some(error);
+                break;
             }
         }
         if let Some(transfers) = feedback_transfers.as_mut() {
@@ -1261,13 +1568,22 @@ pub(super) fn run_usb_output_loop(
             if let Err(error) = result {
                 explicit_feedback_fault = true;
                 match error {
-                    FeedbackFault::DeviceLost => { device_lost = true; fatal_error = Some("explicit feedback device disconnected".into()); }
-                    FeedbackFault::Transfer(error) => { fatal_error = Some(error); }
+                    FeedbackFault::DeviceLost => {
+                        device_lost = true;
+                        fatal_error = Some("explicit feedback device disconnected".into());
+                    }
+                    FeedbackFault::Transfer(error) => {
+                        fatal_error = Some(error);
+                    }
                 }
                 break;
             }
             if let Some(health) = feedback_health {
-                let (locked, stale, terminal) = health.state(Instant::now(), stream_started_at, feedback_counters.last_report_at);
+                let (locked, stale, terminal) = health.state(
+                    Instant::now(),
+                    stream_started_at,
+                    feedback_counters.last_report_at,
+                );
                 let old_lock = runtime_stats.feedback_locked.swap(locked, Ordering::AcqRel);
                 let old_stale = runtime_stats.feedback_stale.swap(stale, Ordering::AcqRel);
                 if old_lock != locked || old_stale != stale {
@@ -1275,51 +1591,90 @@ pub(super) fn run_usb_output_loop(
                         trace.record(crate::FeedbackTraceEvent::Lock { locked, stale });
                     }
                 }
-                if !locked { set_usb_stream_stable(false); }
+                if !locked {
+                    set_usb_stream_stable(false);
+                }
                 if stale && !feedback_stale_warned {
-                    shared.events.emit_stream(crate::events::DacEvent::FeedbackStale);
+                    shared
+                        .events
+                        .emit_stream(crate::events::DacEvent::FeedbackStale);
                 }
                 feedback_stale_warned = stale;
                 shared.note_bit_perfect();
                 if terminal {
                     explicit_feedback_fault = true;
-                    fatal_error = Some("explicit feedback deadline expired without a valid rate report".into());
+                    fatal_error = Some(
+                        "explicit feedback deadline expired without a valid rate report".into(),
+                    );
                     break;
                 }
             }
         }
 
         let now = Instant::now();
-        let gap_us = now.saturating_duration_since(previous_worker_at).as_micros().min(u128::from(u64::MAX)) as u64;
+        let gap_us = now
+            .saturating_duration_since(previous_worker_at)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         previous_worker_at = now;
-        runtime_stats.max_worker_gap_us.fetch_max(gap_us, Ordering::Relaxed);
-        if gap_us > 10_000 { runtime_stats.worker_gap_over_10ms.fetch_add(1, Ordering::Relaxed); }
-        if gap_us > 50_000 { runtime_stats.worker_gap_over_50ms.fetch_add(1, Ordering::Relaxed); }
+        runtime_stats
+            .max_worker_gap_us
+            .fetch_max(gap_us, Ordering::Relaxed);
+        if gap_us > 10_000 {
+            runtime_stats
+                .worker_gap_over_10ms
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if gap_us > 50_000 {
+            runtime_stats
+                .worker_gap_over_50ms
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Ring occupancy describes the producer, not the DAC FIFO. A full
         // ring is normal and must never terminate nominal playback.
-        if nominal_guarded && nominal_starvation.observe(stream_started_at.elapsed().as_millis() as u64,
-            runtime_stats.buffered_samples.load(Ordering::Acquire),
-            !runtime_stats.paused.load(Ordering::Acquire) && !runtime_stats.draining.load(Ordering::Acquire)) {
+        if nominal_guarded
+            && nominal_starvation.observe(
+                stream_started_at.elapsed().as_millis() as u64,
+                runtime_stats.buffered_samples.load(Ordering::Acquire),
+                !runtime_stats.paused.load(Ordering::Acquire)
+                    && !runtime_stats.draining.load(Ordering::Acquire),
+            )
+        {
             log_warn!("[USB] Nominal asynchronous producer ring empty for 5 seconds; DAC FIFO drift is unobservable from host occupancy");
         }
         let mut batch_lossy = false;
         let mut latest_playback_completion = None;
         let retirement_count = if batch_lock_pending {
-            let order = lock_retirement_order.as_mut().expect("pending lock has retirement storage");
+            let order = lock_retirement_order
+                .as_mut()
+                .expect("pending lock has retirement storage");
             order.clear();
-            order.extend(slots.iter().enumerate().filter(|(_, slot)| slot.in_flight)
-                .map(|(index, _)| index));
+            order.extend(
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.in_flight)
+                    .map(|(index, _)| index),
+            );
             order.sort_unstable_by_key(|&index| slots[index].submitted_at);
             order.len()
-        } else { slots.len() };
+        } else {
+            slots.len()
+        };
         for position in 0..retirement_count {
             let index = if batch_lock_pending {
-                lock_retirement_order.as_ref().expect("pending lock has retirement storage")[position]
-            } else { position };
+                lock_retirement_order
+                    .as_ref()
+                    .expect("pending lock has retirement storage")[position]
+            } else {
+                position
+            };
             let slot = &mut slots[index];
             // Do not prove contiguous startup silence beyond an older URB
             // whose outcome is still unknown, including a possible loss.
-            if batch_lock_pending && !slot.completion_ready() { break; }
+            if batch_lock_pending && !slot.completion_ready() {
+                break;
+            }
             if bootstrap[slot.slot_index] {
                 match retire_bootstrap(slot, acceptance) {
                     Ok(true) => {
@@ -1328,7 +1683,12 @@ pub(super) fn run_usb_output_loop(
                         active_slots = active_slots.saturating_sub(1);
                     }
                     Ok(false) => (),
-                    Err(error) => { device_lost = error == Error::DeviceLost; implicit_feedback_fault = true; fatal_error = Some(error.to_string()); break; }
+                    Err(error) => {
+                        device_lost = error == Error::DeviceLost;
+                        implicit_feedback_fault = true;
+                        fatal_error = Some(error.to_string());
+                        break;
+                    }
                 }
                 continue;
             }
@@ -1336,8 +1696,11 @@ pub(super) fn run_usb_output_loop(
                 continue;
             };
 
-            if slot.cancelled_for_flush && out_flush_deadline.is_some_and(|deadline| completed_at >= deadline) {
-                fatal_error = Some("OUT flush cancellation acknowledgement deadline expired".into());
+            if slot.cancelled_for_flush
+                && out_flush_deadline.is_some_and(|deadline| completed_at >= deadline)
+            {
+                fatal_error =
+                    Some("OUT flush cancellation acknowledgement deadline expired".into());
             }
 
             // Cancelled because the stream was flushed: the audio was never
@@ -1345,8 +1708,11 @@ pub(super) fn run_usb_output_loop(
             // played, and it must not touch the loss or stability bounds. The
             // slot is free again; refill it (wire silence until the ring has
             // refilled) like any other.
-            if classify_completion(status, slot.cancelled_for_flush) == Completion::CancelledByFlush {
-                if lock_gate.pending() { lock_gate.observe(false, 0, 0); }
+            if classify_completion(status, slot.cancelled_for_flush) == Completion::CancelledByFlush
+            {
+                if lock_gate.pending() {
+                    lock_gate.observe(false, 0, 0);
+                }
                 runtime_stats
                     .flush_cancelled_transfers
                     .fetch_add(1, Ordering::Relaxed);
@@ -1355,7 +1721,7 @@ pub(super) fn run_usb_output_loop(
                 if fatal_error.is_none() && !usb_stop_requested(&stop) && implicit.is_none() {
                     match submit_next_transfer(
                         slot,
-                        &handle,
+                        handle,
                         &mut scheduler,
                         &pcm_buffer,
                         &runtime_stats,
@@ -1446,25 +1812,40 @@ pub(super) fn run_usb_output_loop(
             };
 
             if lock_gate.pending() {
-                let accepted = completed_held && status == LIBUSB_TRANSFER_COMPLETED
+                let accepted = completed_held
+                    && status == LIBUSB_TRANSFER_COMPLETED
                     && completion_stats == CompletionStats::default()
                     && !slot.packet_sizes.is_empty()
                     && slot.packet_sizes.iter().any(|&bytes| bytes > 0)
-                    && slot.packet_sizes.iter().all(|bytes| bytes % bytes_per_frame == 0);
+                    && slot
+                        .packet_sizes
+                        .iter()
+                        .all(|bytes| bytes % bytes_per_frame == 0);
                 let service_us = (slot.packet_sizes.len() as u64)
                     .saturating_mul(u64::from(candidate.service_interval_us));
-                let sample_frames = slot.packet_sizes.iter()
-                    .map(|bytes| (bytes / bytes_per_frame) as u64).sum();
+                let sample_frames = slot
+                    .packet_sizes
+                    .iter()
+                    .map(|bytes| (bytes / bytes_per_frame) as u64)
+                    .sum();
                 lock_gate.observe(accepted, service_us, sample_frames);
             }
 
-            if capture_uses_implicit_feedforward && qualifies_implicit_feedforward_completion(
-                status, &completion_stats, &slot.packet_sizes, bytes_per_frame, queued_frame_count,
-            ) {
+            if capture_uses_implicit_feedforward
+                && qualifies_implicit_feedforward_completion(
+                    status,
+                    &completion_stats,
+                    &slot.packet_sizes,
+                    bytes_per_frame,
+                    queued_frame_count,
+                )
+            {
                 // Slot iteration is not callback order. Publish the freshest
                 // accepted timestamp once, without substituting wall time.
-                latest_playback_completion = Some(latest_playback_completion
-                    .map_or(completed_at, |previous: Instant| previous.max(completed_at)));
+                latest_playback_completion = Some(
+                    latest_playback_completion
+                        .map_or(completed_at, |previous: Instant| previous.max(completed_at)),
+                );
             }
 
             let urb_loss = UrbLoss::from_completion(&completion_stats, timed_out, ring_frame_bytes)
@@ -1492,7 +1873,11 @@ pub(super) fn run_usb_output_loop(
                     "[USB] ISO transfer timed out; its {} is lost and not re-sent \
                      (consecutiveLossyUrbs={}, dataUrbTimeouts={}, queueDepth={}, \
                      urbLostFrames={}/{}, lostFrames={}, heldLostFrames={})",
-                    if completed_held { "held silence" } else { "audio" },
+                    if completed_held {
+                        "held silence"
+                    } else {
+                        "audio"
+                    },
                     loss_tracker.consecutive_lossy_urbs(),
                     loss_tracker.data_urb_timeouts(),
                     active_slots,
@@ -1511,7 +1896,11 @@ pub(super) fn run_usb_output_loop(
                              shortPackets={} zeroPackets={} consecutiveLossyUrbs={} \
                              lastShort={} lastZero={} descriptorRewrites={} legal={}/{} bytes \
                              frame={}B",
-                            if completed_held { "held silence" } else { "audio" },
+                            if completed_held {
+                                "held silence"
+                            } else {
+                                "audio"
+                            },
                             urb_loss.lost_frames,
                             queued_frame_count,
                             loss_tracker.lost_frames(),
@@ -1591,10 +1980,14 @@ pub(super) fn run_usb_output_loop(
             }
 
             let mut submit_gap_us = 0u64;
-            if fatal_error.is_none() && !usb_stop_requested(&stop) && implicit.is_none() && active_slots < adaptive_queue.slots {
+            if fatal_error.is_none()
+                && !usb_stop_requested(&stop)
+                && implicit.is_none()
+                && active_slots < adaptive_queue.slots
+            {
                 match submit_next_transfer(
                     slot,
-                    &handle,
+                    handle,
                     &mut scheduler,
                     &pcm_buffer,
                     &runtime_stats,
@@ -1613,11 +2006,8 @@ pub(super) fn run_usb_output_loop(
                     &mut was_underrun,
                 ) {
                     Ok(true) => {
-                        submit_gap_us = completed_at
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX))
-                            as u64;
+                        submit_gap_us =
+                            completed_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                         active_slots = active_slots.saturating_add(1);
                         runtime_stats
                             .transfer_queue_depth
@@ -1644,11 +2034,17 @@ pub(super) fn run_usb_output_loop(
                     .load(Ordering::Relaxed)
                     as f64
                     / 1_000.0;
-                let last_feedback_ms = runtime_stats.feedback_last_report_ms.load(Ordering::Relaxed);
-                let feedback_age_ms = if last_feedback_ms == u64::MAX { -1 } else {
-                    (runtime_stats.started_at.elapsed().as_millis() as u64).saturating_sub(last_feedback_ms) as i64
+                let last_feedback_ms = runtime_stats
+                    .feedback_last_report_ms
+                    .load(Ordering::Relaxed);
+                let feedback_age_ms = if last_feedback_ms == u64::MAX {
+                    -1
+                } else {
+                    (runtime_stats.started_at.elapsed().as_millis() as u64)
+                        .saturating_sub(last_feedback_ms) as i64
                 };
-                let feedback_rate_hz = runtime_stats.feedback_rate_milli_hz.load(Ordering::Relaxed) as f64 / 1000.0;
+                let feedback_rate_hz =
+                    runtime_stats.feedback_rate_milli_hz.load(Ordering::Relaxed) as f64 / 1000.0;
                 dev_eprintln!(
                     "[USB-TIMING] completed={} queueDepth={} minQueueDepth={} configuredQueueDepth={} effectiveRateHz={:.3} lastTurnaroundUs={} maxTurnaroundUs={} lastSubmitGapUs={} maxSubmitGapUs={} feedbackActive={} reports={} timeouts={} errors={} rejected={} feedbackAgeMs={} feedbackRateHz={:.2} lostFrames={} shortPackets={} zeroPackets={} dataUrbTimeouts={} transportLoss={} playedMusicFrames={} outputLatencyMs={:.1}",
                     completed_transfers,
@@ -1675,12 +2071,17 @@ pub(super) fn run_usb_output_loop(
                     runtime_stats.played_music_frames.load(Ordering::Relaxed),
                     runtime_stats.output_latency_ms(),
                 );
-
             }
 
             if successful_transfers >= geometry.stable_transfers {
                 // A stream that has lost audio never asserts stability again.
-                if !batch_lock_pending && !lock_gate.pending() && !completed_underrun && !loss_tracker.is_latched() && ((implicit.is_none() && feedback_transfers.is_none()) || runtime_stats.feedback_locked.load(Ordering::Acquire)) {
+                if !batch_lock_pending
+                    && !lock_gate.pending()
+                    && !completed_underrun
+                    && !loss_tracker.is_latched()
+                    && ((implicit.is_none() && feedback_transfers.is_none())
+                        || runtime_stats.feedback_locked.load(Ordering::Acquire))
+                {
                     set_usb_stream_stable(true);
                     if !logged_usb_stabilized {
                         if feedback_transfers.is_none() && implicit.is_none() {
@@ -1707,62 +2108,127 @@ pub(super) fn run_usb_output_loop(
             }
         }
         if adaptive_queue.observe(stream_started_at.elapsed().as_millis() as u64, batch_lossy) {
-            runtime_stats.adaptive_queue_changes.fetch_add(1, Ordering::Relaxed);
-            runtime_stats.adaptive_queue_slots.store(adaptive_queue.slots as u64, Ordering::Relaxed);
-            runtime_stats.adaptive_queue_us.store(adaptive_queue.slots as u64 * geometry.transfer_us(), Ordering::Relaxed);
-            log_info!("[USB] Adaptive queue: {} active slots, {} us coverage (packet cap {})",
-                adaptive_queue.slots, adaptive_queue.slots as u64 * geometry.transfer_us(),
-                crate::iso_packet_scheduler::PACKET_FLIGHT_LIMIT - 1);
+            runtime_stats
+                .adaptive_queue_changes
+                .fetch_add(1, Ordering::Relaxed);
+            runtime_stats
+                .adaptive_queue_slots
+                .store(adaptive_queue.slots as u64, Ordering::Relaxed);
+            runtime_stats.adaptive_queue_us.store(
+                adaptive_queue.slots as u64 * geometry.transfer_us(),
+                Ordering::Relaxed,
+            );
+            log_info!(
+                "[USB] Adaptive queue: {} active slots, {} us coverage (packet cap {})",
+                adaptive_queue.slots,
+                adaptive_queue.slots as u64 * geometry.transfer_us(),
+                crate::iso_packet_scheduler::PACKET_FLIGHT_LIMIT - 1
+            );
         }
         if implicit.is_none() && fatal_error.is_none() && !usb_stop_requested(&stop) {
             for slot in slots.iter_mut().filter(|slot| !slot.in_flight) {
-                if active_slots >= adaptive_queue.slots { break; }
-                match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
-                    &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
-                    dsd_bit_reverse, batch_lock_pending, &mut logged_transfer_preview, &mut logged_usb_encode_format,
-                    &mut underrun_count, &shared, &mut was_underrun) {
+                if active_slots >= adaptive_queue.slots {
+                    break;
+                }
+                match submit_next_transfer(
+                    slot,
+                    handle,
+                    &mut scheduler,
+                    &pcm_buffer,
+                    &runtime_stats,
+                    &candidate,
+                    slot_bytes,
+                    channels,
+                    bytes_per_frame,
+                    playback_format,
+                    dsd_big_endian,
+                    dsd_bit_reverse,
+                    batch_lock_pending,
+                    &mut logged_transfer_preview,
+                    &mut logged_usb_encode_format,
+                    &mut underrun_count,
+                    &shared,
+                    &mut was_underrun,
+                ) {
                     Ok(true) => active_slots += 1,
                     Ok(false) => (),
-                    Err(error) => { fatal_error = Some(error); break; }
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
                 }
             }
-            runtime_stats.transfer_queue_depth.store(active_slots, Ordering::Relaxed);
+            runtime_stats
+                .transfer_queue_depth
+                .store(active_slots, Ordering::Relaxed);
         }
         if let Some(deadline) = out_flush_deadline {
-            if !slots.iter().any(|slot| slot.in_flight && slot.cancelled_for_flush) {
+            if !slots
+                .iter()
+                .any(|slot| slot.in_flight && slot.cancelled_for_flush)
+            {
                 out_flush_deadline = None;
             } else if Instant::now() >= deadline {
-                fatal_error = Some("OUT flush cancellation acknowledgement deadline expired".into());
+                fatal_error =
+                    Some("OUT flush cancellation acknowledgement deadline expired".into());
             }
         }
         if fatal_error.is_none() && !usb_stop_requested(&stop) {
             if let Some(engine) = implicit.as_mut() {
                 let now = Instant::now();
-                if let Some(error) = implicit_out_queue_failure(now, engine.last_valid, active_slots,
-                    slots.iter().filter(|slot| slot.in_flight).filter_map(|slot| slot.submitted_at),
-                    &geometry) {
-                    runtime_stats.implicit_empty_bus.fetch_add(1, Ordering::Relaxed);
+                if let Some(error) = implicit_out_queue_failure(
+                    now,
+                    engine.last_valid,
+                    active_slots,
+                    slots
+                        .iter()
+                        .filter(|slot| slot.in_flight)
+                        .filter_map(|slot| slot.submitted_at),
+                    &geometry,
+                ) {
+                    runtime_stats
+                        .implicit_empty_bus
+                        .fetch_add(1, Ordering::Relaxed);
                     implicit_feedback_fault = true;
                     fatal_error = Some(error.into());
                     break;
                 }
                 for slot in slots.iter_mut().filter(|slot| !slot.in_flight) {
-                    if usb_stop_requested(&stop) { break; }
+                    if usb_stop_requested(&stop) {
+                        break;
+                    }
                     let promoting_bootstrap = bootstrap[slot.slot_index];
                     let Some(pattern) = engine.take_pattern(&runtime_stats) else {
                         if promoting_bootstrap {
                             implicit_feedback_fault = true;
-                            fatal_error = Some("PLAYBACK_FIRST promotion lost measured timing".into());
+                            fatal_error =
+                                Some("PLAYBACK_FIRST promotion lost measured timing".into());
                         } else {
                             runtime_stats.implicit_waits.fetch_add(1, Ordering::Relaxed);
                         }
                         break;
                     };
                     scheduler.set_packet_pattern(pattern);
-                    match submit_next_transfer(slot, &handle, &mut scheduler, &pcm_buffer, &runtime_stats,
-                        &candidate, slot_bytes, channels, bytes_per_frame, playback_format, dsd_big_endian,
-                        dsd_bit_reverse, batch_lock_pending || engine.pattern_is_silence(), &mut logged_transfer_preview, &mut logged_usb_encode_format,
-                        &mut underrun_count, &shared, &mut was_underrun) {
+                    match submit_next_transfer(
+                        slot,
+                        handle,
+                        &mut scheduler,
+                        &pcm_buffer,
+                        &runtime_stats,
+                        &candidate,
+                        slot_bytes,
+                        channels,
+                        bytes_per_frame,
+                        playback_format,
+                        dsd_big_endian,
+                        dsd_bit_reverse,
+                        batch_lock_pending || engine.pattern_is_silence(),
+                        &mut logged_transfer_preview,
+                        &mut logged_usb_encode_format,
+                        &mut underrun_count,
+                        &shared,
+                        &mut was_underrun,
+                    ) {
                         Ok(true) => {
                             active_slots += 1;
                             bootstrap[slot.slot_index] = false;
@@ -1776,7 +2242,10 @@ pub(super) fn run_usb_output_loop(
                         }
                         Err(error) => {
                             if promoting_bootstrap {
-                                device_lost = matches!(classify_stream_failure(Some(&error), false, None), Some(Error::DeviceLost));
+                                device_lost = matches!(
+                                    classify_stream_failure(Some(&error), false, None),
+                                    Some(Error::DeviceLost)
+                                );
                                 implicit_feedback_fault = true;
                             }
                             fatal_error = Some(error);
@@ -1784,19 +2253,26 @@ pub(super) fn run_usb_output_loop(
                         }
                     }
                 }
-                runtime_stats.transfer_queue_depth.store(active_slots, Ordering::Relaxed);
+                runtime_stats
+                    .transfer_queue_depth
+                    .store(active_slots, Ordering::Relaxed);
             }
         }
         if fatal_error.is_none() && !usb_stop_requested(&stop) {
-            if let Some(pool) = capture_pool.as_mut().filter(|pool| pool.uses_implicit_feedforward()) {
+            if let Some(pool) = capture_pool
+                .as_mut()
+                .filter(|pool| pool.uses_implicit_feedforward())
+            {
                 // An absent OUT queue cannot clock an adaptive IN endpoint.
                 // Fail the shared owner before pumping any further capture.
                 let result = if active_slots == 0 {
-                    Err(Error::Transfer("implicit feedforward observed an empty OUT bus queue".into()))
+                    Err(Error::Transfer(
+                        "implicit feedforward observed an empty OUT bus queue".into(),
+                    ))
                 } else {
                     latest_playback_completion
                         .map_or(Ok(()), |at| pool.note_playback_completed(at))
-                        .and_then(|()| pool.pump(&handle, &stop))
+                        .and_then(|()| pool.pump(handle, &stop))
                 };
                 if let Err(error) = result {
                     device_lost = error == Error::DeviceLost;
@@ -1821,28 +2297,44 @@ pub(super) fn run_usb_output_loop(
             error.push_str(&format!(" | {diagnostics}"));
         }
     }
-    let failure = classify_stream_failure(fatal_error.as_deref(), device_lost,
-        capture_failure.or_else(|| capture.as_ref().and_then(|attachment| attachment.failure())));
+    let failure = classify_stream_failure(
+        fatal_error.as_deref(),
+        device_lost,
+        capture_failure.or_else(|| capture.as_ref().and_then(|attachment| attachment.failure())),
+    );
     device_lost = matches!(&failure, Some(Error::DeviceLost));
     if let Some(attachment) = capture.as_ref() {
         attachment.finish(failure.clone());
     }
     if let Some(error) = fatal_error {
         let was_locked = runtime_stats.feedback_locked.swap(false, Ordering::AcqRel);
-        if feedback_health.is_some() { publish_feedback_counters(&runtime_stats, &feedback_counters); }
+        if feedback_health.is_some() {
+            publish_feedback_counters(&runtime_stats, &feedback_counters);
+        }
         if (explicit_feedback_fault || implicit_feedback_fault) && !device_lost {
             let was_stale = runtime_stats.feedback_stale.swap(true, Ordering::AcqRel);
             if was_locked || !was_stale {
                 if let Some(trace) = &runtime_stats.feedback_trace {
-                    trace.record(crate::FeedbackTraceEvent::Lock { locked: false, stale: true });
+                    trace.record(crate::FeedbackTraceEvent::Lock {
+                        locked: false,
+                        stale: true,
+                    });
                 }
             }
-            if !feedback_stale_warned { shared.events.emit_stream(crate::events::DacEvent::FeedbackStale); }
+            if !feedback_stale_warned {
+                shared
+                    .events
+                    .emit_stream(crate::events::DacEvent::FeedbackStale);
+            }
             shared.note_bit_perfect();
         }
         if implicit_feedback_fault && !device_lost {
-            if programmed_vendor_rate { set_clock_verification(true, true, false, None); }
-            runtime_stats.feedback_errors.fetch_add(1, Ordering::Relaxed);
+            if programmed_vendor_rate {
+                set_clock_verification(true, true, false, None);
+            }
+            runtime_stats
+                .feedback_errors
+                .fetch_add(1, Ordering::Relaxed);
         }
         if let Some(trace) = &runtime_stats.feedback_trace {
             trace.fail(&error);
@@ -1854,21 +2346,39 @@ pub(super) fn run_usb_output_loop(
         shared.fail(failure.expect("fatal output error has a shared failure classification"));
     }
 
-    runtime_stats.feedback_locked.store(false, Ordering::Release);
+    runtime_stats
+        .feedback_locked
+        .store(false, Ordering::Release);
     shared.note_bit_perfect();
-    for slot in &mut slots { slot.cancel(); }
-    if let Some(pool) = capture_pool.as_mut() { pool.cancel(); }
-    if let Some(engine) = implicit.as_mut() { for slot in &mut engine.slots { slot.cancel(); } }
-    if let Some(transfers) = feedback_transfers.as_mut() {
-        for slot in &mut transfers.slots { slot.cancel(); }
+    for slot in &mut slots {
+        slot.cancel();
     }
-    drain_iso_transfer_slots(&context, &mut slots);
-    if let Some(pool) = capture_pool.as_mut() { pool.drain(&context); }
-    if let Some(engine) = implicit.as_mut() { drain_iso_transfer_slots(&context, &mut engine.slots); }
+    if let Some(pool) = capture_pool.as_mut() {
+        pool.cancel();
+    }
+    if let Some(engine) = implicit.as_mut() {
+        for slot in &mut engine.slots {
+            slot.cancel();
+        }
+    }
+    if let Some(transfers) = feedback_transfers.as_mut() {
+        for slot in &mut transfers.slots {
+            slot.cancel();
+        }
+    }
+    drain_iso_transfer_slots(context, &mut slots);
+    if let Some(pool) = capture_pool.as_mut() {
+        pool.drain(context);
+    }
+    if let Some(engine) = implicit.as_mut() {
+        drain_iso_transfer_slots(context, &mut engine.slots);
+    }
     if let Some(transfers) = feedback_transfers.as_mut() {
         drain_feedback_transfer_slots(context, &mut transfers.slots);
     }
-    runtime_stats.feedback_locked.store(false, Ordering::Release);
+    runtime_stats
+        .feedback_locked
+        .store(false, Ordering::Release);
 
     drop(audio_status);
     drop(usb_owner);
@@ -1959,11 +2469,16 @@ pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Str
     }
 }
 
-
 /// Classify once before notifying either direction of the shared worker.
-fn classify_stream_failure(message: Option<&str>, device_lost: bool, capture: Option<Error>) -> Option<Error> {
-    if device_lost || message.is_some_and(|message| message.contains("disconnected"))
-        || matches!(&capture, Some(Error::DeviceLost)) {
+fn classify_stream_failure(
+    message: Option<&str>,
+    device_lost: bool,
+    capture: Option<Error>,
+) -> Option<Error> {
+    if device_lost
+        || message.is_some_and(|message| message.contains("disconnected"))
+        || matches!(&capture, Some(Error::DeviceLost))
+    {
         Some(Error::DeviceLost)
     } else {
         capture.or_else(|| message.map(|message| Error::Transfer(message.to_owned())))
@@ -1975,11 +2490,25 @@ mod duplex_failure_tests {
     use super::*;
     #[test]
     fn classify_disconnect_before_notifying_playback_and_capture() {
-        let failure = classify_stream_failure(Some("USB DAC disconnected (implicit feedback)"), false, None);
+        let failure = classify_stream_failure(
+            Some("USB DAC disconnected (implicit feedback)"),
+            false,
+            None,
+        );
         assert_eq!(failure, Some(Error::DeviceLost));
         let typed = Error::Transfer("capture packet geometry changed".into());
-        assert_eq!(classify_stream_failure(Some(&typed.to_string()), false, Some(typed.clone())), Some(typed));
-        assert_eq!(classify_stream_failure(Some("capture completion failed"), false, Some(Error::DeviceLost)), Some(Error::DeviceLost));
+        assert_eq!(
+            classify_stream_failure(Some(&typed.to_string()), false, Some(typed.clone())),
+            Some(typed)
+        );
+        assert_eq!(
+            classify_stream_failure(
+                Some("capture completion failed"),
+                false,
+                Some(Error::DeviceLost)
+            ),
+            Some(Error::DeviceLost)
+        );
         assert_eq!(classify_stream_failure(None, false, None), None);
     }
 }
@@ -1994,21 +2523,38 @@ mod implicit_out_coverage_tests {
         let now = Instant::now();
         let last_valid = now - Duration::from_micros(geometry.queued_us() + 1);
         let existing_submission = now - Duration::from_micros(geometry.transfer_us());
-        let failure = implicit_out_queue_failure(now, last_valid, 1,
-            [existing_submission].into_iter(), &geometry);
-        assert_eq!(failure, Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)"));
+        let failure = implicit_out_queue_failure(
+            now,
+            last_valid,
+            1,
+            [existing_submission].into_iter(),
+            &geometry,
+        );
+        assert_eq!(
+            failure,
+            Some("implicit feedback continuity deadline expired (OUT bus coverage exhausted)")
+        );
         // The old post-refill check would see this fresh timestamp and miss it.
-        assert_eq!(implicit_out_queue_failure(now, last_valid, 2,
-            [existing_submission, now].into_iter(), &geometry), None);
+        assert_eq!(
+            implicit_out_queue_failure(
+                now,
+                last_valid,
+                2,
+                [existing_submission, now].into_iter(),
+                &geometry
+            ),
+            None
+        );
     }
 
     #[test]
     fn observed_empty_queue_fails_even_with_fresh_feedback_and_promotable_slots() {
         let geometry = IsoQueueGeometry::for_stream(125, 8, 4);
         let now = Instant::now();
-        assert_eq!(implicit_out_queue_failure(now, now, 0,
-            std::iter::empty(), &geometry),
-            Some("implicit feedback observed an empty OUT bus queue"));
+        assert_eq!(
+            implicit_out_queue_failure(now, now, 0, std::iter::empty(), &geometry),
+            Some("implicit feedback observed an empty OUT bus queue")
+        );
     }
 
     #[test]
@@ -2017,13 +2563,17 @@ mod implicit_out_coverage_tests {
         let now = Instant::now();
         let stale = now - Duration::from_micros(geometry.queued_us() + 1);
         // Stale feedback alone does not fail while existing OUT coverage remains.
-        assert_eq!(implicit_out_queue_failure(now, stale, 1,
-            [now].into_iter(), &geometry), None);
+        assert_eq!(
+            implicit_out_queue_failure(now, stale, 1, [now].into_iter(), &geometry),
+            None
+        );
         // The age threshold is strict; at its boundary the FIFO can still wait.
         let boundary = now - Duration::from_micros(geometry.queued_us());
         let exhausted = now - Duration::from_micros(geometry.transfer_us());
-        assert_eq!(implicit_out_queue_failure(now, boundary, 1,
-            [exhausted].into_iter(), &geometry), None);
+        assert_eq!(
+            implicit_out_queue_failure(now, boundary, 1, [exhausted].into_iter(), &geometry),
+            None
+        );
     }
 
     #[test]
@@ -2032,11 +2582,15 @@ mod implicit_out_coverage_tests {
         let now = Instant::now();
         let stale = now - Duration::from_micros(geometry.queued_us() + 1);
         let submission = now - Duration::from_micros(geometry.transfer_us() - 125);
-        assert!(implicit_out_queue_failure(now, stale, 1,
-            [submission].into_iter(), &geometry).is_some());
+        assert!(
+            implicit_out_queue_failure(now, stale, 1, [submission].into_iter(), &geometry)
+                .is_some()
+        );
         let submission = submission + Duration::from_micros(1);
-        assert_eq!(implicit_out_queue_failure(now, stale, 1,
-            [submission].into_iter(), &geometry), None);
+        assert_eq!(
+            implicit_out_queue_failure(now, stale, 1, [submission].into_iter(), &geometry),
+            None
+        );
     }
 }
 
@@ -2048,26 +2602,51 @@ mod implicit_feedforward_completion_tests {
     fn accepts_complete_integral_cadence_including_requested_empty_intervals() {
         // A low-rate cadence may deliberately request an empty service interval.
         assert!(qualifies_implicit_feedforward_completion(
-            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[0, 4, 0, 4], 4, 2,
+            LIBUSB_TRANSFER_COMPLETED,
+            &CompletionStats::default(),
+            &[0, 4, 0, 4],
+            4,
+            2,
         ));
         assert!(!qualifies_implicit_feedforward_completion(
-            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[0, 0], 4, 0,
+            LIBUSB_TRANSFER_COMPLETED,
+            &CompletionStats::default(),
+            &[0, 0],
+            4,
+            0,
         ));
         assert!(!qualifies_implicit_feedforward_completion(
-            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[5, 3], 4, 2,
+            LIBUSB_TRANSFER_COMPLETED,
+            &CompletionStats::default(),
+            &[5, 3],
+            4,
+            2,
         ));
         assert!(!qualifies_implicit_feedforward_completion(
-            LIBUSB_TRANSFER_COMPLETED, &CompletionStats::default(), &[4], 0, 1,
+            LIBUSB_TRANSFER_COMPLETED,
+            &CompletionStats::default(),
+            &[4],
+            0,
+            1,
         ));
     }
 
     #[test]
     fn rejects_every_noncompleted_status_even_with_full_packet_accounting() {
-        for status in [LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_CANCELLED,
-            LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_STALL,
-            LIBUSB_TRANSFER_OVERFLOW] {
+        for status in [
+            LIBUSB_TRANSFER_TIMED_OUT,
+            LIBUSB_TRANSFER_CANCELLED,
+            LIBUSB_TRANSFER_ERROR,
+            LIBUSB_TRANSFER_NO_DEVICE,
+            LIBUSB_TRANSFER_STALL,
+            LIBUSB_TRANSFER_OVERFLOW,
+        ] {
             assert!(!qualifies_implicit_feedforward_completion(
-                status, &CompletionStats::default(), &[24, 24], 4, 12,
+                status,
+                &CompletionStats::default(),
+                &[24, 24],
+                4,
+                12,
             ));
         }
     }
@@ -2075,14 +2654,33 @@ mod implicit_feedforward_completion_tests {
     #[test]
     fn rejects_loss_short_packets_and_lossless_repacketization() {
         for stats in [
-            CompletionStats { short_packets: 1, ..CompletionStats::default() },
-            CompletionStats { zero_packets: 1, ..CompletionStats::default() },
-            CompletionStats { descriptor_rewrites: 1, ..CompletionStats::default() },
-            CompletionStats { shortfall_frames: 1, ..CompletionStats::default() },
-            CompletionStats { lost_bytes: 1, ..CompletionStats::default() },
+            CompletionStats {
+                short_packets: 1,
+                ..CompletionStats::default()
+            },
+            CompletionStats {
+                zero_packets: 1,
+                ..CompletionStats::default()
+            },
+            CompletionStats {
+                descriptor_rewrites: 1,
+                ..CompletionStats::default()
+            },
+            CompletionStats {
+                shortfall_frames: 1,
+                ..CompletionStats::default()
+            },
+            CompletionStats {
+                lost_bytes: 1,
+                ..CompletionStats::default()
+            },
         ] {
             assert!(!qualifies_implicit_feedforward_completion(
-                LIBUSB_TRANSFER_COMPLETED, &stats, &[24, 24], 4, 12,
+                LIBUSB_TRANSFER_COMPLETED,
+                &stats,
+                &[24, 24],
+                4,
+                12,
             ));
         }
     }
@@ -2097,12 +2695,18 @@ mod playback_first_tests {
         let mut scheduler = IsoPacketScheduler::with_geometry(48_000, 24, 125, geometry);
         let payload = nominal_pcm_silence(&mut scheduler, 168, 24, 17).unwrap();
         assert!(payload.packet_sizes.iter().all(|&n| n == 144));
-        assert_eq!(payload.transfer_buffer.len(), payload.packet_sizes.iter().sum::<usize>());
+        assert_eq!(
+            payload.transfer_buffer.len(),
+            payload.packet_sizes.iter().sum::<usize>()
+        );
         assert!(payload.transfer_buffer.iter().all(|&byte| byte == 0));
         assert!(payload.packet_samples.is_empty());
         assert!(payload.held);
         assert!(!payload.underrun);
-        assert_eq!((payload.frame_count, payload.music_frames, payload.epoch), (0, 0, 17));
+        assert_eq!(
+            (payload.frame_count, payload.music_frames, payload.epoch),
+            (0, 0, 17)
+        );
     }
     #[test]
     fn roland_nominal_silence_preserves_44100_fractional_frame_cadence() {
@@ -2118,7 +2722,9 @@ mod playback_first_tests {
                 assert_eq!((payload.frame_count, payload.music_frames), (0, 0));
                 sizes.extend(payload.packet_sizes);
             }
-            assert!(sizes.iter().all(|&size| size == 5 * stride || size == 6 * stride));
+            assert!(sizes
+                .iter()
+                .all(|&size| size == 5 * stride || size == 6 * stride));
             assert_eq!(sizes.iter().sum::<usize>() / stride, 44_100);
         }
     }

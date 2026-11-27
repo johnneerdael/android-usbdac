@@ -6,7 +6,7 @@ Software delivery may proceed with physical acceptance waived; pending rows must
 
 ## Implementation boundaries
 
-Shipped boundaries: UAC versions [1, 2, 3]; playback True; PCM capture True; duplex True; simultaneous open devices 1; Type I formats signed_pcm; vendor protocols False. USB host tests and virtual guests do not establish physical or audible behavior. Source-backed compatibility candidates are distinct from hardware-verified device rules.
+Shipped boundaries: UAC versions [1, 2, 3]; playback True; PCM capture True; duplex True; simultaneous open devices no process-wide limit; one owner per attachment; Type I formats signed_pcm, unsigned_pcm8, float32; vendor protocols False. USB host tests and virtual guests do not establish physical or audible behavior. Source-backed compatibility candidates are distinct from hardware-verified device rules.
 
 | Feature | Device / host | Evidence tier | Result | Revision and limits |
 |---|---|---|---|---|
@@ -37,7 +37,7 @@ These are annotations in current sources, not counts of passing tests. CI and ar
 
 | Source | Test annotations |
 |---|---|
-| Rust core | 850 |
-| Rust JNI | 96 |
-| Kotlin SDK | 282 |
-| Media3 library | 17 |
+| Rust core | 872 |
+| Rust JNI | 98 |
+| Kotlin SDK | 287 |
+| Media3 library | 20 |

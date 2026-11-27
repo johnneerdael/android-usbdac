@@ -90,12 +90,16 @@ impl UsbDevice {
         // This synchronous ioctl does not reap URBs. A separate libusb control
         // context on the same fd could consume the output context's completions.
         let result = unsafe { libc::ioctl(self.fd, USBDEVFS_CONTROL, &transfer) };
-        let failure=(result<0).then(std::io::Error::last_os_error);
+        let failure = (result < 0).then(std::io::Error::last_os_error);
         if request_type & 0x60 == USB_TYPE_CLASS {
             let delay = settings().control_delay_us();
-            if delay > 0 { thread::sleep(Duration::from_micros(delay)); }
+            if delay > 0 {
+                thread::sleep(Duration::from_micros(delay));
+            }
         }
-        if let Some(error)=failure {return Err(error);}
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok(result as usize)
     }
 }
@@ -289,7 +293,9 @@ impl ClaimedHandle {
             .descriptors()
             .find(|descriptor| descriptor.setting_number() == alternate_setting)
             .ok_or_else(|| {
-                format!("USB interface {interface_number} alternate {alternate_setting} disappeared")
+                format!(
+                    "USB interface {interface_number} alternate {alternate_setting} disappeared"
+                )
             })?;
         if descriptor.class_code() != 1 || descriptor.sub_class_code() != 2 {
             return Ok((AlternateControls::default(), true));
@@ -389,12 +395,20 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
     let handle = unsafe { context.open_device_with_fd(device.fd) }
         .map_err(|error| format!("Failed to wrap USB file descriptor: {}", error))?;
 
-    let descriptor = handle.device().device_descriptor()
+    let descriptor = handle
+        .device()
+        .device_descriptor()
         .map_err(|error| format!("Failed to read actual USB identity: {error}"))?;
     let version = descriptor.device_version();
-    let revision = (u16::from(version.major() / 10) << 12) | (u16::from(version.major() % 10) << 8)
-        | (u16::from(version.minor()) << 4) | u16::from(version.sub_minor());
-    crate::settings::install_descriptor_identity(descriptor.vendor_id(), descriptor.product_id(), revision);
+    let revision = (u16::from(version.major() / 10) << 12)
+        | (u16::from(version.major() % 10) << 8)
+        | (u16::from(version.minor()) << 4)
+        | u16::from(version.sub_minor());
+    crate::settings::install_descriptor_identity(
+        descriptor.vendor_id(),
+        descriptor.product_id(),
+        revision,
+    );
     Ok(ClaimedHandle {
         itf_mode: ItfModeLease::new(device.fd),
         adc3_power: Adc3PowerLease::new(device.fd),

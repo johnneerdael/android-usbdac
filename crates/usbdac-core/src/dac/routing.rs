@@ -4,8 +4,8 @@ use crate::routing::{
 };
 use crate::transport::routing_hw;
 
-    /// Unavailable in this release; retained for source compatibility.
-    ///
+/// Unavailable in this release; retained for source compatibility.
+///
 impl Dac {
     /// Discover source-backed DJM choices on an exact, idle vendor PCM session.
     /// Discovery leaves the mixer's routing intact.
@@ -48,8 +48,11 @@ impl Dac {
     /// Apply bounded typed Gen1 controls against a fresh readback on the live DAC.
     /// Verify each write and restore attempted controls on failure. Configured
     /// hand-back preserves external edits; no clock, preamp or persistent writes.
-    pub fn scarlett_gen1_apply(&self, expected: &crate::scarlett::Gen1Readback,
-        edits: &[crate::scarlett::Gen1Edit]) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
+    pub fn scarlett_gen1_apply(
+        &self,
+        expected: &crate::scarlett::Gen1Readback,
+        edits: &[crate::scarlett::Gen1Edit],
+    ) -> Result<crate::scarlett::Gen1Report, RoutingSessionError> {
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_gen1_apply(expected, edits)
     }
@@ -94,9 +97,12 @@ impl Dac {
     /// Requires idle ownership and explicit vendor claim. Verify every affected target,
     /// restore attempted targets on failure, and preserve external edits at hand-back.
     /// No persistent configuration commands are sent. Physically unvalidated.
-    pub fn fcp_routing_apply(&self, expected: &crate::scarlett::FcpReadback,
-        routes: &[crate::scarlett::FcpRouteEdit], mixes: &[crate::scarlett::FcpMixEdit])
-        -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
+    pub fn fcp_routing_apply(
+        &self,
+        expected: &crate::scarlett::FcpReadback,
+        routes: &[crate::scarlett::FcpRouteEdit],
+        mixes: &[crate::scarlett::FcpMixEdit],
+    ) -> Result<crate::scarlett::FcpWriteReport, RoutingSessionError> {
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::fcp_apply(expected, routes, mixes)
     }
@@ -132,8 +138,10 @@ impl Dac {
     /// read equals the expected snapshot. Restore each attempted raw bank after
     /// any uncertain write. Configured hand-back preserves external edits.
     /// Source-backed; physical routing has not been validated.
-    pub fn scarlett_mux_apply(&self, edit: &crate::scarlett::MuxEdit)
-        -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
+    pub fn scarlett_mux_apply(
+        &self,
+        edit: &crate::scarlett::MuxEdit,
+    ) -> Result<crate::scarlett::MuxWriteReport, RoutingSessionError> {
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::scarlett_mux_apply(edit)
     }
@@ -156,8 +164,11 @@ impl Dac {
 
     /// Revalidate the snapshot and acquire a fresh scoped ADC3 routing lease.
     /// Preserve external power drift instead of overwriting it on hand-back.
-    pub fn routing_read_powered(&self, snapshot: &RoutingSnapshot, key: ControlKey)
-        -> Result<RouteValue, RoutingSessionError> {
+    pub fn routing_read_powered(
+        &self,
+        snapshot: &RoutingSnapshot,
+        key: ControlKey,
+    ) -> Result<RouteValue, RoutingSessionError> {
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::read_with_power(snapshot, key, true)
     }
@@ -165,8 +176,11 @@ impl Dac {
     /// Apply the ordinary verified routing transaction with explicit scoped
     /// ADC3 wake. Restore original power after success or failure. Configured
     /// route hand-back reacquires power only for these opted-in edits.
-    pub fn routing_apply_powered(&self, snapshot: &RoutingSnapshot, edits: &[RouteEdit])
-        -> Result<RouteReport, RoutingSessionError> {
+    pub fn routing_apply_powered(
+        &self,
+        snapshot: &RoutingSnapshot,
+        edits: &[RouteEdit],
+    ) -> Result<RouteReport, RoutingSessionError> {
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
         routing_hw::apply_with_power(snapshot, edits, true)
     }
