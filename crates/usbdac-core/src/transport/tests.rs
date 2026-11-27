@@ -2528,8 +2528,8 @@ mod startup_volume_tests {
     }
 }
 
-/// Asynchronous endpoints without an explicit feedback endpoint need implicit
-/// feedback, which is not supported: they are refused unless the configuration
+/// Asynchronous endpoints without an explicit feedback endpoint or a compatible
+/// implicit feedback source are refused unless the configuration
 /// allows streaming them at the nominal rate, and then never bit-perfect.
 #[cfg(test)]
 mod unsynchronized_async_tests {

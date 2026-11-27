@@ -1,10 +1,10 @@
 //! Bit-perfect direct USB DAC output for Android and Linux.
 //!
-//! `usbdac-core` drives a USB Audio Class 1.0/2.0 DAC through usbfs, without the
+//! `usbdac-core` drives a USB Audio Class 1.0, 2.0 or 3.0 DAC through usbfs, without the
 //! platform audio stack: PCM at the DAC's native depth, DSD over PCM (DoP) and
 //! native DSD, feedback-paced isochronous transfers, loss accounting, and the
 //! DAC's own hardware volume. Asynchronous streams can follow explicit rate
-//! reports or frame counts from a compatible UAC2 input stream. Use
+//! reports or frame counts from a compatible UAC2 or UAC3 input stream. Use
 //! [`StreamFormat::pacing`] for the selected mechanism and
 //! [`DacStream::stats`] for live lock and feedback counters.
 //!

@@ -39,7 +39,7 @@ technically, and in plain terms. In short:
 | Area | What usbdac adds | In plain terms |
 |---|---|---|
 | Clock handling | Resolves selectors and multipliers, verifies rates, and restores owned changes | A compatible alternate clock can serve a rate the current clock cannot |
-| USB feedback | Uses the newest valid explicit rate report and supports compatible UAC2 implicit feedback | Playback can follow the device clock through a dedicated rate endpoint or a matching input stream |
+| USB feedback | Uses the newest valid explicit rate report and supports compatible UAC2 and UAC3 implicit feedback | Playback can follow the device clock through a dedicated rate endpoint or a matching input stream |
 | Transfer queue | Always 16 ms on the bus, never 256 packets | Avoids a stall seen on real hardware; controls feel equally quick on every DAC |
 | Fault handling | Recovers from timed-out transfers and counts lost audio exactly | A brief USB hiccup no longer stops the music |
 | Buffering | 250 ms reserve that shrinks while software volume is active | More protection against gaps without slower controls |
@@ -63,8 +63,8 @@ and BitChord, behave with the same DACs. No code from either was used.
 in Flick and with a Hidizs AP80 Pro-X in the SDK sample. The AP80 Pro-X also
 verified native DSD64 through DSD256 and the transition back to PCM.
 See [hardware status](docs/sdk/evidence.md#hardware-status) for the tested
-formats and paths. Release preparation uses software validation and QEMU
-USB enumeration; it adds no physical streaming checks. Broader hardware
+formats and paths. Release preparation uses software validation and PCM playback to a
+virtual QEMU USB audio device; it adds no physical streaming checks. Broader hardware
 acceptance and additional models are tracked in
 [device compatibility candidates](https://github.com/johnneerdael/android-usbdac/blob/main/docs/design/device-compatibility-candidates.md).
 

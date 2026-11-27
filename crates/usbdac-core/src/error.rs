@@ -95,7 +95,7 @@ impl Error {
             Self::Unsupported { reason, offered } => {
                 format!("{reason} ({} alternate setting(s) offered)", offered.len())
             }
-            Self::ImplicitFeedbackUnsupported => "the DAC's asynchronous endpoint has no explicit feedback endpoint and would need implicit feedback, which is not supported (DacConfig::allow_unsynchronized_async streams it at the nominal rate, never bit-perfect)".to_string(),
+            Self::ImplicitFeedbackUnsupported => "the DAC's asynchronous endpoint has no explicit feedback endpoint and no compatible input stream to take implicit feedback from (DacConfig::allow_unsynchronized_async streams it at the nominal rate, never bit-perfect)".to_string(),
             Self::ClockUnverified {
                 requested_hz,
                 reported_hz,

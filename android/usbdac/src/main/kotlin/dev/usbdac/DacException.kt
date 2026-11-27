@@ -25,7 +25,7 @@ public enum class DacErrorCode(internal val wireName: String?) {
 
     /**
      * The DAC would stream the request only through an asynchronous endpoint that has no
-     * explicit feedback endpoint (it would need implicit feedback, which is not supported).
+     * explicit feedback endpoint and has no compatible input stream to take implicit feedback from.
      * [DacConfig.allowUnsynchronizedAsync] streams it anyway, never bit-perfect.
      */
     IMPLICIT_FEEDBACK_UNSUPPORTED("implicit_feedback_unsupported"),
