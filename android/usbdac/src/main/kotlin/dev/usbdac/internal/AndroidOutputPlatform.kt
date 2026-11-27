@@ -161,6 +161,8 @@ internal class SessionLink(override val session: DacSession) : DirectLink {
 
     override fun negotiate(request: StreamRequest): StreamFormat = session.negotiate(request)
 
+    override fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat = session.negotiateCandidates(requests)
+
     override fun openStream(format: StreamFormat): PcmOutput = session.openStream(format).also { stream = it }
 
     override fun close() {

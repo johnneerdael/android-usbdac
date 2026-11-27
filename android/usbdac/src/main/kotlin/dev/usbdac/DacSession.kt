@@ -141,6 +141,12 @@ public class DacSession private constructor(
         return nativeCall { parseStreamFormat(Native.dacNegotiate(dac, request.toJson())) }
     }
 
+    internal fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat {
+        checkOpen()
+        val json = JSONArray().apply { requests.forEach { put(JSONObject(it.toJson())) } }
+        return nativeCall { parseStreamFormat(Native.dacNegotiateCandidates(dac, json.toString())) }
+    }
+
     /**
      * Export the most recent stream's USB feedback support report as JSON.
      * Available after the stream fails or closes. Closing an opted-in session

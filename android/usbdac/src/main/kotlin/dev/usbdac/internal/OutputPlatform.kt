@@ -41,6 +41,9 @@ internal interface DirectLink : Closeable {
     /** Programs the DAC's clock and settles the wire format. 100 ms or more. */
     fun negotiate(request: StreamRequest): StreamFormat
 
+    /** An implementation without a native clean-refusal coordinator attempts only the first request. */
+    fun negotiateCandidates(requests: List<StreamRequest>): StreamFormat = negotiate(requests.first())
+
     /** Opens the stream in a format [negotiate] returned. */
     fun openStream(format: StreamFormat): PcmOutput
 

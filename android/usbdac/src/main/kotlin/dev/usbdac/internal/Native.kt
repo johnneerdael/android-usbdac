@@ -68,6 +68,7 @@ internal object Native {
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacFeedbackTrace(dac: Long): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
+    @JvmStatic external fun dacNegotiateCandidates(dac: Long, requestsJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)
 
     @JvmStatic external fun streamOpen(dac: Long, formatId: Long, listener: Any): Long

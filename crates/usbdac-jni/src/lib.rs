@@ -386,6 +386,36 @@ pub fn dac_negotiate<'l>(
     })
 }
 
+/// Negotiate a bounded ordered candidate list using one retained-owner reservation.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn dac_negotiate_candidates<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    dac: i64,
+    requests_json: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |env| {
+        let value: Value = serde_json::from_str(&string_of(env, &requests_json)?)
+            .map_err(|error| Failure::Bad(format!("invalid candidate list: {error}")))?;
+        let array = value
+            .as_array()
+            .ok_or_else(|| Failure::Bad("candidate list must be an array".into()))?;
+        if array.is_empty() || array.len() > 8 {
+            return Err(Failure::Bad("expected one to eight PCM candidates".into()));
+        }
+        let requests = array
+            .iter()
+            .map(|item| json::parse_request(&item.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let entry = registry::dac(dac)?;
+        let format = entry.dac.negotiate_candidates(&requests)?;
+        let mut description = json::stream_format(0, &format);
+        let id = entry.remember_format(format);
+        description["format_id"] = Value::from(id);
+        java_string(env, &description)
+    })
+}
+
 /// Sets the listener for device-level events (volume, device loss); `null`
 /// clears it.
 #[jni_mangle("dev.usbdac.internal.Native")]

@@ -501,6 +501,15 @@ impl Dac {
         self.negotiate_locked(request)
     }
 
+    /// Negotiate a bounded, ordered list of exact PCM formats on one retained owner.
+    /// A later candidate is considered only after a certified clean refusal.
+    pub fn negotiate_candidates(&self, requests: &[StreamRequest]) -> Result<StreamFormat> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.reject_reconfigure()?;
+        let _scope = self.shared.enter()?;
+        transport::api::negotiate_candidates(requests)
+    }
+
     fn negotiate_locked(&self, request: &StreamRequest) -> Result<StreamFormat> {
         let _scope = self.shared.enter()?;
         transport::api::negotiate(request)

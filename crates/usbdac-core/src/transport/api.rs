@@ -211,6 +211,76 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     }))
 }
 
+/// Negotiate a pre-ranked, bounded set without releasing the retained owner between attempts.
+pub(crate) fn negotiate_candidates(requests: &[StreamRequest]) -> Result<StreamFormat, Error> {
+    if requests.is_empty() || requests.len() > MAX_RANKED_RATE_ATTEMPTS {
+        return Err(Error::InvalidArgument(
+            "expected one to eight PCM candidates".into(),
+        ));
+    }
+    let first = requests[0];
+    let mut seen = Vec::new();
+    for request in requests {
+        playback_format_from_request(request)?;
+        if request.encoding != Encoding::Pcm
+            || request.rate_policy != RatePolicy::Exact
+            || request.channels != first.channels
+            || seen.contains(request)
+        {
+            return Err(Error::InvalidArgument(
+                "candidates must be distinct exact PCM formats with matching channels".into(),
+            ));
+        }
+        seen.push(*request);
+    }
+    let Some(owner) = retained_usb_handle_identity() else {
+        // Without a retained owner there can be no clean certificate for another attempt.
+        return negotiate_impl(&first, None, false);
+    };
+    let _reservation = reserve_candidates()?;
+    if retained_usb_handle_identity() != Some(owner) {
+        return Err(Error::InvalidState(
+            "retained USB owner changed before candidate reservation".into(),
+        ));
+    }
+    let mut batch = negotiate::RetryBaseline::new(owner);
+    let mut initial_error = None;
+    let started = Instant::now();
+    let mut attempted = 0;
+    for (attempts, request) in requests.iter().enumerate() {
+        if !ranked_attempt_available(attempts, started.elapsed()) {
+            break;
+        }
+        if retained_usb_handle_identity() != Some(owner) {
+            return Err(Error::InvalidState(
+                "retained USB owner changed between candidates".into(),
+            ));
+        }
+        attempted += 1;
+        match negotiate_attempt(request, &mut batch, owner) {
+            Ok(format) => return Ok(format),
+            Err(failure) => {
+                if !failure.clean.is_some_and(|proof| proof.belongs_to(owner)) {
+                    return Err(failure.error);
+                }
+                if initial_error.is_none() {
+                    initial_error = Some(failure.error);
+                }
+            }
+        }
+    }
+    Err(Error::Unsupported {
+        reason: format!(
+            "ranked PCM candidates exhausted after {attempted} attempts; first refusal: {}",
+            initial_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "none".into())
+        ),
+        offered: offered_alt_settings(),
+    })
+}
+
 pub(crate) fn negotiate_attempt(
     request: &StreamRequest,
     batch: &mut negotiate::RetryBaseline,
@@ -705,6 +775,19 @@ pub(crate) fn await_usb_retirement(timeout: Duration) -> bool {
 #[cfg(test)]
 mod dsd_summary_tests {
     use super::*;
+
+    #[test]
+    fn ranked_pcm_entry_rejects_unbounded_duplicate_and_non_exact_requests() {
+        let exact = crate::StreamRequest::pcm(48_000, 2, 16);
+        assert!(negotiate_candidates(&[]).is_err());
+        assert!(negotiate_candidates(&[exact, exact]).is_err());
+        assert!(negotiate_candidates(&[exact; 9]).is_err());
+        assert!(negotiate_candidates(&[exact, crate::StreamRequest::pcm(48_000, 1, 24)]).is_err());
+        assert!(negotiate_candidates(&[
+            exact.with_rate_policy(crate::RatePolicy::NearestSupported)
+        ])
+        .is_err());
+    }
 
     #[test]
     fn ranked_candidate_budget_never_interrupts_the_first_attempt() {

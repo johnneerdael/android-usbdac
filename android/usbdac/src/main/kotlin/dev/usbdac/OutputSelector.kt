@@ -627,6 +627,11 @@ public class OutputSelector internal constructor(
 
     /** Settle [request] exactly first, then try permitted conversions in ranked order. */
     private fun negotiate(link: DirectLink, request: StreamRequest, bypassLimits: Boolean): Negotiated {
+        if (request.encoding == StreamEncoding.PCM) return negotiatePcmCandidates(link, request, bypassLimits)
+        if (request.encoding == StreamEncoding.PCM_FLOAT32 && policy.allowConversion &&
+            link.capabilities.altSettings.isNotEmpty() && !hasFloatAlternate(link.capabilities.altSettings, request)) {
+            return negotiatePcmCandidates(link, request, bypassLimits)
+        }
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
         val first = if (request.encoding == StreamEncoding.DOP && policy.dopSupport != DopSupport.CONFIRMED) {
             DacException(DacErrorCode.UNSUPPORTED, "DoP decoder support has not been confirmed")
@@ -664,8 +669,36 @@ public class OutputSelector internal constructor(
             }
             throw first
         }
-        if ((!policy.allowConversion && !policy.allowWidening) || request.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32)) throw first
+        throw first
+    }
 
+    private fun hasFloatAlternate(alts: List<AltSetting>, request: StreamRequest): Boolean = alts.any { alt ->
+        val rate = request.sampleRate
+        val rateSupported = rate in alt.sampleRates || alt.rateRanges.any { range ->
+            rate in range.minHz..range.maxHz && if (range.stepHz > 0) (rate.toLong() - range.minHz) % range.stepHz == 0L
+            else range.stepHz == 0 && range.minHz == range.maxHz
+        }
+        val frames = (rate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
+        alt.format == AltFormat.PCM_FLOAT32 && alt.channels == request.channels && alt.validBits == 32 &&
+            alt.subslotBytes == 4 && alt.pacing != null && alt.serviceIntervalUs > 0 &&
+            alt.maxPacketBytes > 0 && frames * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && rateSupported
+    }
+
+    /** Construct and validate the complete PCM candidate set before programming a clock. */
+    private fun negotiatePcmCandidates(link: DirectLink, request: StreamRequest, bypassLimits: Boolean): Negotiated {
+        val exact = request.copy(ratePolicy = RatePolicy.EXACT)
+        if (link.capabilities.altSettings.isEmpty()) {
+            val limit = if (bypassLimits) null else policy.downstreamLimits
+            if (limit != null && (request.sampleRate > limit.maxSampleRateHz || request.bitDepth !in limit.allowedValidBits)) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "exact PCM request exceeds downstream limits")
+            }
+            val format = link.negotiate(exact)
+            if (!permitsWire(format, bypassLimits) || format.encoding != StreamEncoding.PCM ||
+                format.sampleRate != request.sampleRate || format.channels != request.channels || format.validBits != request.bitDepth) {
+                throw DacException(DacErrorCode.UNSUPPORTED, "unknown descriptors did not provide the exact PCM request")
+            }
+            return Negotiated(format, null)
+        }
         val alts = link.capabilities.altSettings.filter { it.format == AltFormat.PCM && it.channels == request.channels }
         val pairs = mutableSetOf<Pair<Int, Int>>()
         val standardRates = listOf(8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000,
@@ -681,7 +714,7 @@ public class OutputSelector internal constructor(
             } else {
                 val step = range.stepHz.toLong()
                 val n = ((request.sampleRate.toLong() - range.minHz) / step).coerceAtLeast(0)
-                val ceiling = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz)
+                val ceiling = minOf(range.maxHz, (if (bypassLimits) null else policy.downstreamLimits?.maxSampleRateHz) ?: range.maxHz)
                 val limitIndex = ((ceiling.toLong() - range.minHz) / step).coerceAtLeast(0)
                 for (index in listOf(0L, n, n + 1, limitIndex, (range.maxHz.toLong() - range.minHz) / step)) {
                     val value = range.minHz.toLong() + index * step
@@ -697,7 +730,7 @@ public class OutputSelector internal constructor(
                 }
                 val familyStep = if (request.sampleRate % 11025 == 0) 11025 else if (request.sampleRate % 8000 == 0) 8000 else 0
                 if (familyStep > 0) {
-                    val maximum = minOf(range.maxHz, policy.downstreamLimits?.maxSampleRateHz ?: range.maxHz, 768_000)
+                    val maximum = minOf(range.maxHz, (if (bypassLimits) null else policy.downstreamLimits?.maxSampleRateHz) ?: range.maxHz, 768_000)
                     for (rate in familyStep..maximum step familyStep) add(rate)
                 }
             }
@@ -707,16 +740,11 @@ public class OutputSelector internal constructor(
             alt.sampleRates.forEach { if (it > 0) pairs += it to alt.validBits }
             alt.rateRanges.forEach { addRange(alt.validBits, it) }
         }
-        // Older native libraries may only expose the capability unions, not per-alt entries.
-        if (link.capabilities.altSettings.isEmpty()) {
-            for (depth in link.capabilities.pcmBitDepths) {
-                for (rate in link.capabilities.pcmSampleRates + request.sampleRate) pairs += rate to depth
-            }
-        }
         val eligible = pairs.filter { (rate, depth) ->
             rate > 0 && depth in listOf(16, 24, 32) &&
-                (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true) &&
-                (policy.allowConversion || (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth > request.bitDepth))
+                (bypassLimits || (policy.downstreamLimits?.let { rate <= it.maxSampleRateHz && depth in it.allowedValidBits } ?: true)) &&
+                ((rate == request.sampleRate && depth == request.bitDepth) || policy.allowConversion ||
+                    (policy.allowWidening && rate == request.sampleRate && depth > request.bitDepth))
         }
         val rank = platform.rankRates(request.sampleRate, eligible.map { it.first }).withIndex().associate { it.value to it.index }
         val ordered = eligible.sortedWith(compareBy<Pair<Int, Int>>(
@@ -724,24 +752,48 @@ public class OutputSelector internal constructor(
             { if (it.second >= request.bitDepth) 0 else 1 },
             { kotlin.math.abs(it.second - request.bitDepth) },
         ))
-        for ((rate, depth) in ordered) {
-            if (request.encoding == StreamEncoding.PCM && rate == request.sampleRate && depth == request.bitDepth) continue
-            val target = exact.copy(sampleRate = rate, bitDepth = depth, encoding = StreamEncoding.PCM)
-            try {
-                val format = link.negotiate(target)
-                if (!permitsWire(format, bypassLimits) || format.encoding != StreamEncoding.PCM || format.sampleRate != rate || format.channels != request.channels) continue
-                val options = if (request.sampleRate == format.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0)
-                    else policy.conversionOptions
-                val plan = platform.plan(request, format, options)
-                if (plan.preservesBitPerfect && !policy.allowWidening) continue
-                if (!plan.preservesBitPerfect && !policy.allowConversion) continue
-                if (plan.kind == ConversionKind.NONE) continue
-                return Negotiated(format, plan)
-            } catch (error: DacException) {
-                if (error.code != DacErrorCode.UNSUPPORTED) throw error
+        fun supports(alt: AltSetting, rate: Int, depth: Int): Boolean {
+            val rateSupported = rate in alt.sampleRates || alt.rateRanges.any { range ->
+                rate in range.minHz..range.maxHz && if (range.stepHz > 0) (rate.toLong() - range.minHz) % range.stepHz == 0L
+                else range.stepHz == 0 && range.minHz == range.maxHz
             }
+            val frames = (rate.toLong() * alt.serviceIntervalUs + 999_999L) / 1_000_000L
+            return alt.validBits == depth && alt.subslotBytes in 1..4 && depth <= alt.subslotBytes * 8 &&
+                alt.pacing != null && alt.serviceIntervalUs > 0 && alt.maxPacketBytes > 0 &&
+                frames * alt.channels * alt.subslotBytes <= alt.maxPacketBytes && rateSupported
         }
-        throw first
+        val candidates = mutableListOf<StreamRequest>()
+        for ((rate, depth) in ordered) {
+            val alt = alts.firstOrNull { supports(it, rate, depth) } ?: continue
+            val target = exact.copy(sampleRate = rate, bitDepth = depth, encoding = StreamEncoding.PCM)
+            if (request.encoding != StreamEncoding.PCM || rate != request.sampleRate || depth != request.bitDepth) {
+                val layout = StreamFormat(0, StreamEncoding.PCM, null, rate, alt.channels, depth,
+                    alt.subslotBytes, alt.subslotBytes * alt.channels, rate, alt.interfaceNumber,
+                    alt.altSetting, alt.endpointAddress, alt.syncType, alt.feedbackEndpoint != null,
+                    link.capabilities.linkSpeed, alt.serviceIntervalUs, false, alt.pacing ?: Pacing.Unknown)
+                val options = if (rate == request.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0) else policy.conversionOptions
+                // A failed origin transform is terminal; do not guess that a different target fixes it.
+                val plan = platform.plan(request, layout, options)
+                if ((plan.preservesBitPerfect && !policy.allowWidening) ||
+                    (!plan.preservesBitPerfect && !policy.allowConversion) || plan.kind == ConversionKind.NONE) continue
+            }
+            candidates += target
+            if (candidates.size == 8) break
+        }
+        if (candidates.isEmpty()) throw DacException(DacErrorCode.UNSUPPORTED, "no descriptor-proven permitted PCM candidate")
+        val format = link.negotiateCandidates(candidates)
+        val selected = candidates.firstOrNull { it.sampleRate == format.sampleRate && it.bitDepth == format.validBits }
+            ?: throw DacException(DacErrorCode.UNSUPPORTED, "negotiation returned an unplanned PCM format")
+        if (!permitsWire(format, bypassLimits) || format.encoding != StreamEncoding.PCM || format.channels != request.channels) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "negotiation returned an incompatible PCM layout")
+        }
+        if (request.encoding == StreamEncoding.PCM && selected.sampleRate == request.sampleRate && selected.bitDepth == request.bitDepth) return Negotiated(format, null)
+        val options = if (selected.sampleRate == request.sampleRate) policy.conversionOptions.copy(headroomDb = 0.0) else policy.conversionOptions
+        val plan = platform.plan(request, format, options)
+        if ((plan.preservesBitPerfect && !policy.allowWidening) || (!plan.preservesBitPerfect && !policy.allowConversion) || plan.kind == ConversionKind.NONE) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "negotiated conversion is not permitted")
+        }
+        return Negotiated(format, plan)
     }
 
     private fun directCandidate(request: StreamRequest, dac: DacDeviceInfo, link: DirectLink, negotiated: Negotiated, bypassLimits: Boolean): Candidate {
