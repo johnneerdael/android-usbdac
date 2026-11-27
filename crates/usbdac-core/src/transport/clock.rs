@@ -248,6 +248,8 @@ pub(super) fn apply_wire_frequency(
         reported_sample_rate,
         known_mismatch: !clock_ok,
         set_cur_succeeded: false,
+        write_attempted: false,
+        uncertain_write_seen: false,
         message,
     }
 }
@@ -1151,7 +1153,11 @@ pub(super) fn format_sampling_frequency_ranges(ranges: &[SamplingFrequencySubran
         .join(", ")
 }
 
-fn uac2_source_controls(handle: &DeviceHandle<Context>, interface: u8, source: u8) -> Option<u32> {
+pub(super) fn uac2_source_controls(
+    handle: &DeviceHandle<Context>,
+    interface: u8,
+    source: u8,
+) -> Option<u32> {
     let config = handle.device().active_config_descriptor().ok()?;
     let raw = read_active_configuration_bytes(handle, &config)?;
     let bytes = audio_control_descriptors_from_config(&raw, interface);
@@ -1209,6 +1215,8 @@ pub(super) fn apply_sampling_frequency(
                 reported_sample_rate: get_sampling_frequency(handle, interface_number, clock_id).ok(),
                 known_mismatch: true,
                 set_cur_succeeded: false,
+                write_attempted: false,
+                uncertain_write_seen: false,
                 message: Some(format!(
                     "Requested {} Hz is not supported by clock {} on interface {}; supported rates: {}",
                     sample_rate,
@@ -1258,6 +1266,8 @@ pub(super) fn apply_sampling_frequency(
                         reported_sample_rate: Some(current_rate),
                         known_mismatch: false,
                         set_cur_succeeded: false,
+                        write_attempted: false,
+                        uncertain_write_seen: false,
                         message: Some(
                             "fixed descriptor and live clock proof; no SET required".into(),
                         ),
@@ -1292,6 +1302,7 @@ pub(super) fn apply_sampling_frequency(
     let mut last_readback_error = None;
     let mut last_reported_rate = None;
     let mut set_cur_succeeded = false;
+    let mut uncertain_write_seen = false;
 
     for attempt in 1..=attempts {
         log::info!(
@@ -1309,6 +1320,7 @@ pub(super) fn apply_sampling_frequency(
             Err(error) => {
                 log::error!("[USB] SET_CUR attempt {}/3: failed: {}", attempt, error);
                 set_cur_succeeded = false;
+                uncertain_write_seen = true;
                 last_set_error = Some(error);
                 thread::sleep(Duration::from_millis(settle_delay_ms));
                 continue;
@@ -1377,6 +1389,8 @@ pub(super) fn apply_sampling_frequency(
                         reported_sample_rate: Some(reported_sample_rate),
                         known_mismatch: false,
                         set_cur_succeeded,
+                        write_attempted: true,
+                        uncertain_write_seen,
                         message: None,
                     };
                 }
@@ -1411,6 +1425,8 @@ pub(super) fn apply_sampling_frequency(
             reported_sample_rate: Some(reported_sample_rate),
             known_mismatch: reported_sample_rate > 0 && reported_sample_rate != sample_rate,
             set_cur_succeeded,
+            write_attempted: true,
+            uncertain_write_seen,
             message: Some(match last_readback_error {
                 Some(error) if reported_sample_rate == sample_rate => error,
                 _ => format!(
@@ -1427,6 +1443,8 @@ pub(super) fn apply_sampling_frequency(
         reported_sample_rate: None,
         known_mismatch: false,
         set_cur_succeeded,
+        write_attempted: true,
+        uncertain_write_seen,
         message: Some(format!(
             "Failed to set USB clock {} on interface {} to {} Hz{}{}",
             clock_id,
@@ -2524,6 +2542,10 @@ pub(super) fn verify_requested_clock_route(
             allow_program: false,
         })
         .map_err(|e| format!("negotiated clock route changed or became invalid: {e}"))
+}
+
+pub(super) fn requested_clock_route_active() -> bool {
+    SELECTED_CLOCK_ROUTE.lock().is_some()
 }
 
 /// Restore the first saved selector state before renegotiation or hand-back.

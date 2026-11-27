@@ -147,6 +147,8 @@ pub(super) struct ClockApplyOutcome {
     pub(super) reported_sample_rate: Option<u32>,
     pub(super) known_mismatch: bool,
     pub(super) set_cur_succeeded: bool,
+    pub(super) write_attempted: bool,
+    pub(super) uncertain_write_seen: bool,
     pub(super) message: Option<String>,
 }
 

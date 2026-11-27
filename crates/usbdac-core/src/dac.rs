@@ -24,6 +24,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// settings.
 static OPEN_GUARD: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
 fn reconfigure_or_restore<T>(
     requested: &StreamRequest,
     previous: &StreamRequest,
@@ -37,6 +38,45 @@ fn reconfigure_or_restore<T>(
                 "requested format failed: {error}; rollback failed: {rollback}"
             ))),
         },
+    }
+}
+
+enum CandidateFailure {
+    Clean(Error),
+    Terminal(Error),
+}
+
+// The attempt closure is the production negotiate/open boundary. Only its
+// private transport certificate permits the next candidate or final rollback.
+fn reconfigure_candidates_or_restore<T>(
+    requests: &[StreamRequest],
+    previous: &StreamRequest,
+    mut attempt: impl FnMut(&StreamRequest) -> std::result::Result<T, CandidateFailure>,
+) -> Result<(T, Option<Error>)> {
+    let mut first = None;
+    for request in requests {
+        match attempt(request) {
+            Ok(stream) => return Ok((stream, None)),
+            Err(CandidateFailure::Clean(error)) => {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
+            Err(CandidateFailure::Terminal(error)) => {
+                return Err(Error::ReconfigureUnusable(format!(
+                    "candidate outcome is not proven idle; explicit close required: {error}"
+                )))
+            }
+        }
+    }
+    let first = first.expect("validated nonempty candidate list");
+    match attempt(previous) {
+        Ok(stream) => Ok((stream, Some(first))),
+        Err(CandidateFailure::Clean(rollback) | CandidateFailure::Terminal(rollback)) => {
+            Err(Error::ReconfigureUnusable(format!(
+                "requested format failed: {first}; rollback failed: {rollback}"
+            )))
+        }
     }
 }
 
@@ -544,8 +584,8 @@ impl Dac {
     }
 
     /// Replace once using a bounded list of equivalent-rate lossless widening candidates.
-    /// The first admitted candidate is attempted. Later candidates are retained for future
-    /// clean-refusal evidence; an uncertain runtime failure triggers a single rollback.
+    /// Continue only after a certified clean refusal. A terminal failure requires
+    /// explicit close; exhaustion restores the previous request once.
     pub fn reconfigure_stream_candidates(
         &self,
         current: &DacStream,
@@ -630,41 +670,69 @@ impl Dac {
                 "old USB owner was not retained after retirement".into(),
             ));
         }
-        let mut attempt = |target: &StreamRequest| -> Result<DacStream> {
-            if transport::api::retained_usb_handle_identity() != Some(identity) {
-                return Err(Error::ReconfigureUnusable(
-                    "retained USB owner was lost before negotiation".into(),
-                ));
-            }
-            let format = self.negotiate_locked(target)?;
-            if transport::api::retained_usb_handle_identity() != Some(identity) {
-                return Err(Error::ReconfigureUnusable(
-                    "negotiation replaced or lost the USB owner".into(),
-                ));
-            }
-            let opened = self.open_stream_locked(&format, listener.clone())?;
-            if !matches!(opened.reconfigure_identity(&self.shared), Ok(found) if found == identity)
-            {
-                let _ = opened.retire_for_reconfigure();
-                drop(opened);
-                return Err(Error::ReconfigureUnusable(
-                    "replacement used a different physical USB owner".into(),
-                ));
-            }
-            if let Err(error) = opened.pause() {
-                let _ = opened.retire_for_reconfigure();
-                return Err(error);
-            }
-            if transport::api::volume_route_signature() != volume_route {
-                let _ = opened.retire_for_reconfigure();
-                drop(opened);
-                return Err(Error::Control(
-                    "reconfiguration changed the hardware volume route; rollback required".into(),
-                ));
-            }
-            Ok(opened)
-        };
-        let (stream, rollback_cause) = reconfigure_or_restore(request, &previous, &mut attempt)?;
+        let mut batch = transport::negotiate::RetryBaseline::new(identity);
+        let mut candidate_reservation = Some(
+            transport::api::reserve_candidates()
+                .map_err(|error| Error::ReconfigureUnusable(error.to_string()))?,
+        );
+        let mut attempt =
+            |target: &StreamRequest| -> std::result::Result<DacStream, CandidateFailure> {
+                if transport::api::retained_usb_handle_identity() != Some(identity) {
+                    return Err(CandidateFailure::Terminal(Error::ReconfigureUnusable(
+                        "retained USB owner was lost before negotiation".into(),
+                    )));
+                }
+                let format = match transport::api::negotiate_attempt(target, &mut batch, identity) {
+                    Ok(format) => format,
+                    Err(failure) => {
+                        return if failure
+                            .clean
+                            .is_some_and(|proof| proof.belongs_to(identity))
+                            && transport::api::retained_usb_handle_identity() == Some(identity)
+                            && transport::api::volume_route_signature() == volume_route
+                            && !self.shared.events.device_lost()
+                            && !self.shared.closed.load(Ordering::Acquire)
+                        {
+                            Err(CandidateFailure::Clean(failure.error))
+                        } else {
+                            Err(CandidateFailure::Terminal(failure.error))
+                        };
+                    }
+                };
+                if transport::api::retained_usb_handle_identity() != Some(identity) {
+                    return Err(CandidateFailure::Terminal(Error::ReconfigureUnusable(
+                        "negotiation replaced or lost the USB owner".into(),
+                    )));
+                }
+                // Stream start acquires its own session guard; all candidate
+                // negotiations above share the reservation until this commit.
+                drop(candidate_reservation.take());
+                let opened = self
+                    .open_stream_locked(&format, listener.clone())
+                    .map_err(CandidateFailure::Terminal)?;
+                if !matches!(opened.reconfigure_identity(&self.shared), Ok(found) if found == identity)
+                {
+                    let _ = opened.retire_for_reconfigure();
+                    drop(opened);
+                    return Err(CandidateFailure::Terminal(Error::ReconfigureUnusable(
+                        "replacement used a different physical USB owner".into(),
+                    )));
+                }
+                if let Err(error) = opened.pause() {
+                    let _ = opened.retire_for_reconfigure();
+                    return Err(CandidateFailure::Terminal(error));
+                }
+                if transport::api::volume_route_signature() != volume_route {
+                    let _ = opened.retire_for_reconfigure();
+                    drop(opened);
+                    return Err(CandidateFailure::Terminal(Error::Control(
+                    "reconfiguration changed the hardware volume route; explicit close required".into(),
+                )));
+                }
+                Ok(opened)
+            };
+        let (stream, rollback_cause) =
+            reconfigure_candidates_or_restore(requests, &previous, &mut attempt)?;
         Ok(StreamReconfiguration {
             stream,
             rollback_cause,
@@ -1183,6 +1251,54 @@ mod tests {
         assert!(dac.shared.reject_reconfigure().is_ok());
         dac.close().unwrap();
         drop(fake);
+    }
+
+    #[test]
+    fn reconfigure_coordinator_tries_only_certified_refusals_and_rolls_back_once() {
+        let old = StreamRequest::pcm(48_000, 2, 32);
+        let requests = [
+            StreamRequest::pcm(48_000, 2, 16),
+            StreamRequest::pcm(48_000, 2, 24),
+        ];
+        let mut calls = Vec::new();
+        let (value, cause) = reconfigure_candidates_or_restore(&requests, &old, |request| {
+            calls.push(request.bit_depth);
+            if request.bit_depth == 16 {
+                Err(CandidateFailure::Clean(Error::Control(
+                    "unavailable".into(),
+                )))
+            } else {
+                Ok(request.bit_depth)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, 24);
+        assert!(cause.is_none());
+        assert_eq!(calls, vec![16, 24]);
+        calls.clear();
+        let (_, cause) = reconfigure_candidates_or_restore(&requests, &old, |request| {
+            calls.push(request.bit_depth);
+            if request.bit_depth == 32 {
+                Ok(())
+            } else {
+                Err(CandidateFailure::Clean(Error::Control(
+                    "unavailable".into(),
+                )))
+            }
+        })
+        .unwrap();
+        assert!(cause.is_some());
+        assert_eq!(calls, vec![16, 24, 32]);
+        calls.clear();
+        let result: Result<((), Option<Error>)> =
+            reconfigure_candidates_or_restore(&requests, &old, |request| {
+                calls.push(request.bit_depth);
+                Err(CandidateFailure::Terminal(Error::Control(
+                    "unknown SET".into(),
+                )))
+            });
+        assert!(matches!(result, Err(Error::ReconfigureUnusable(_))));
+        assert_eq!(calls, vec![16]);
     }
 
     #[test]
