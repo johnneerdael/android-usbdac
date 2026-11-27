@@ -511,6 +511,7 @@ pub(super) fn transport_compatibility_penalty_for_candidate(
     transport_compatibility_penalty(
         &StreamingInterfaceFormat {
             format_tag: candidate.format_tag,
+            uac2_formats: None,
             channels: candidate.channels,
             subslot_size: candidate.subslot_size,
             bit_resolution: candidate.bit_resolution,

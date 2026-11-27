@@ -466,7 +466,9 @@ pub(super) fn build_usb_capability_model(
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
-    let dsd_subslot_override = settings().dsd_subslot_override();
+    let device_settings = settings();
+    let dsd_subslot_override = device_settings.dsd_subslot_override();
+    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
     let mut effective_speed = speed;
 
     for interface in config_descriptor.interfaces() {
@@ -481,6 +483,9 @@ pub(super) fn build_usb_capability_model(
             else {
                 continue;
             };
+            let ap80_dsd = apply_ap80_raw_dsd(
+                usb_id, config_descriptor.number(), &descriptor, &mut stream_format,
+            );
             if stream_format.format_tag == FORMAT_TAG_DSD {
                 if let Some(ss) = dsd_subslot_override {
                     stream_format.subslot_size = ss;
@@ -500,6 +505,11 @@ pub(super) fn build_usb_capability_model(
                     )
                 })
                 .clone();
+            let sample_rate_ranges = if ap80_dsd {
+                ap80_native_dsd_clock_rates(&sample_rate_ranges)
+            } else {
+                sample_rate_ranges
+            };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
             let speed = if speed == Speed::Unknown {
@@ -651,7 +661,9 @@ pub(super) fn select_stream_candidate(
     let allow_unsynchronized_async = settings().allow_unsynchronized_async();
     let mut candidates = Vec::new();
     let prefer_padded_24bit_transport = settings().prefer_padded_24bit();
-    let dsd_subslot_override = settings().dsd_subslot_override();
+    let device_settings = settings();
+    let dsd_subslot_override = device_settings.dsd_subslot_override();
+    let usb_id = device.device_descriptor().ok().map(|d| (d.vendor_id(), d.product_id()));
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
     for interface in config_descriptor.interfaces() {
@@ -666,6 +678,9 @@ pub(super) fn select_stream_candidate(
                 Some(format) => format,
                 None => continue,
             };
+            let ap80_dsd = apply_ap80_raw_dsd(
+                usb_id, config_descriptor.number(), &descriptor, &mut stream_format,
+            );
             if stream_format.format_tag == FORMAT_TAG_DSD {
                 if let Some(ss) = dsd_subslot_override {
                     stream_format.subslot_size = ss;
@@ -692,6 +707,11 @@ pub(super) fn select_stream_candidate(
                     )
                 })
                 .clone();
+            let sample_rate_ranges = if ap80_dsd {
+                ap80_native_dsd_clock_rates(&sample_rate_ranges)
+            } else {
+                sample_rate_ranges
+            };
             let sample_rates = representative_sample_rates_from_ranges(&sample_rate_ranges);
 
             let effective_sample_rate = if playback_format.dsd_transport == DsdTransportMode::Native
@@ -895,6 +915,9 @@ pub(super) fn select_stream_candidate(
                     sync_type: endpoint.sync_type(),
                     usage_type: endpoint.usage_type(),
                     format_tag: stream_format.format_tag,
+                    dsd_big_endian: device_settings.config.dsd_big_endian.unwrap_or(
+                        ap80_dsd || device_settings.dsd_big_endian(),
+                    ),
                     channels: stream_format.channels,
                     subslot_size: stream_format.subslot_size,
                     bit_resolution: stream_format.bit_resolution,
@@ -1332,19 +1355,81 @@ pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
     }
 }
 
+const UAC2_RAW_DATA: u32 = 1 << 31;
+
+fn ap80_native_dsd_clock_rates(ranges: &[SamplingFrequencySubrange]) -> Vec<SamplingFrequencySubrange> {
+    // DSD64, DSD128 and DSD256 in 32-bit words. The shared clock also
+    // lists PCM rates, which are not native DSD modes on this player.
+    [88_200, 176_400, 352_800]
+        .into_iter()
+        .filter(|rate| ranges.is_empty() || sampling_frequency_ranges_support_rate(ranges, *rate))
+        .map(|rate| SamplingFrequencySubrange { min: rate, max: rate, res: 0 })
+        .collect()
+}
+
+
+fn is_ap80_raw_dsd(
+    usb_id: Option<(u16, u16)>,
+    route: (u8, u8, u8),
+    format: &StreamingInterfaceFormat,
+) -> bool {
+    usb_id == Some((0xc502, 0x0072))
+        && route == (1, 1, 4)
+        && format.uac2_formats == Some(UAC2_RAW_DATA)
+        && format.channels == 2
+        && format.subslot_size == 4
+        && format.bit_resolution == 32
+}
+
+// This is the AP80 Pro-X layout confirmed by the ALSA parity run.
+// Confirm the device, alternate and OUT geometry before interpreting RAW_DATA.
+fn apply_ap80_raw_dsd(
+    usb_id: Option<(u16, u16)>,
+    configuration: u8,
+    descriptor: &rusb::InterfaceDescriptor,
+    format: &mut StreamingInterfaceFormat,
+) -> bool {
+    if !is_ap80_raw_dsd(
+        usb_id,
+        (configuration, descriptor.interface_number(), descriptor.setting_number()),
+        format,
+    ) {
+        return false;
+    }
+    let mut outputs = descriptor.endpoint_descriptors()
+        .filter(|endpoint| endpoint.direction() == Direction::Out);
+    let proven_out = outputs.next().is_some_and(|endpoint|
+        endpoint.address() == 0x01
+            && endpoint.transfer_type() == TransferType::Isochronous
+            && endpoint.usage_type() == UsageType::Data
+            && endpoint.interval() == 2
+            && endpoint.max_packet_size() == 1024);
+    if !proven_out || outputs.next().is_some() {
+        return false;
+    }
+    format.format_tag = FORMAT_TAG_DSD;
+    format.bit_resolution = 1;
+    true
+}
+
 pub(super) fn parse_android_streaming_interface_format(
     descriptor: &rusb::InterfaceDescriptor,
 ) -> Option<StreamingInterfaceFormat> {
+    parse_streaming_extra(descriptor.protocol_code(), descriptor.extra())
+}
+
+fn parse_streaming_extra(protocol: u8, extra_bytes: &[u8]) -> Option<StreamingInterfaceFormat> {
     let mut channels = None;
     let mut format_tag = None;
+    let mut uac2_formats = None;
     let mut subslot_size = None;
     let mut bit_resolution = None;
     let mut terminal_link = None;
     let mut sample_rate_ranges = Vec::new();
 
-    let is_uac1 = descriptor.protocol_code() != 0x20;
+    let is_uac1 = protocol != 0x20;
 
-    for extra in DescriptorIter::new(descriptor.extra()) {
+    for extra in DescriptorIter::new(extra_bytes) {
         if extra.len() < 3 || extra[1] != USB_DT_CS_INTERFACE {
             continue;
         }
@@ -1360,8 +1445,11 @@ pub(super) fn parse_android_streaming_interface_format(
                     }
                 } else if extra.len() >= 16 {
                     channels = Some(extra[10] as u16);
-                    format_tag =
-                        Some(u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]) as u16);
+                    let formats = u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]);
+                    if extra[5] == UAC2_FORMAT_TYPE_I {
+                        uac2_formats = Some(formats);
+                    }
+                    format_tag = Some(formats as u16);
                 } else if extra.len() >= 7 {
                     format_tag = Some(u16::from_le_bytes([extra[5], extra[6]]));
                 }
@@ -1428,6 +1516,7 @@ pub(super) fn parse_android_streaming_interface_format(
 
     Some(StreamingInterfaceFormat {
         format_tag,
+        uac2_formats,
         channels: channels.unwrap_or(2),
         subslot_size,
         bit_resolution,
@@ -1705,5 +1794,34 @@ mod implicit_discovery_tests {
         assert!(audio_functions(&raw[..7]).is_empty());
         assert!(audio_functions(&[8, 0x0b, 255, 2, 1, 0, 0x20, 0]).is_empty());
         assert!(audio_functions(&[8, 0x0b, 4, 3, 1, 0, 0, 0]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ap80_raw_data_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_uac2_raw_data_without_reclassifying_other_devices_or_pcm() {
+        let mut extra = [16, 0x24, 1, 2, 0, 1, 0, 0, 0, 0x80, 2, 3, 0, 0, 0, 0,
+                         6, 0x24, 2, 1, 4, 32];
+        let raw = parse_streaming_extra(0x20, &extra).unwrap();
+        assert_eq!(raw.uac2_formats, Some(0x8000_0000));
+        assert_eq!(alt_format(raw.format_tag), AltFormat::Other);
+        assert!(is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &raw));
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0073)), (1, 1, 4), &raw));
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 3), &raw));
+        extra[6] = 1;
+        extra[9] = 0;
+        let pcm = parse_streaming_extra(0x20, &extra).unwrap();
+        assert_eq!(alt_format(pcm.format_tag), AltFormat::Pcm);
+        assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &pcm));
+    }
+
+    #[test]
+    fn ap80_advertises_verified_native_modes_from_the_shared_clock() {
+        let clock = [SamplingFrequencySubrange { min: 44_100, max: 384_000, res: 0 }];
+        let rates = ap80_native_dsd_clock_rates(&clock);
+        assert_eq!(rates.iter().map(|r| r.min).collect::<Vec<_>>(), [88_200, 176_400, 352_800]);
     }
 }

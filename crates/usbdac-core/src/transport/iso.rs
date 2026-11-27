@@ -1176,6 +1176,29 @@ mod explicit_feedback_tests {
     }
 
     #[test]
+    fn ap80_native_dsd_feedback_calibrates_at_all_measured_wire_rates() {
+        for (rate, report) in [
+            (88_200, [0xa2, 0x10, 0x16, 0]),
+            (176_400, [0x2e, 0x1d, 0x2c, 0]),
+            (352_800, [0x0a, 0x37, 0x58, 0]),
+        ] {
+            let scheduler = IsoPacketScheduler::new(rate, 8, 250);
+            let mut counters = FeedbackCounters {
+                infer_service_interval: true,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                assert!(select_feedback_report(&report, [(0, 4, 4)], &scheduler,
+                    250, Speed::High, 128, false, &mut counters).is_none());
+            }
+            let (_, decoded) = select_feedback_report(&report, [(0, 4, 4)], &scheduler,
+                250, Speed::High, 128, false, &mut counters).unwrap();
+            assert!((decoded - f64::from(rate)).abs() < 65.0);
+            assert!(counters.selected_service_interval());
+        }
+    }
+
+    #[test]
     fn calibration_requires_verified_rate_and_prefers_a_valid_standard_report() {
         let alternate = q16(11.025);
         let standard = q16(5.5125);

@@ -555,6 +555,7 @@ mod pcm_ring_hold_tests {
             sync_type: SyncType::Adaptive,
             usage_type: UsageType::Data,
             format_tag: FORMAT_TAG_PCM,
+            dsd_big_endian: false,
             channels: 2,
             subslot_size: 2,
             bit_resolution: 16,
