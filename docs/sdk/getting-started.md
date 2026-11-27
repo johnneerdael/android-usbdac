@@ -37,7 +37,7 @@ Add the dependency in your app module's `build.gradle.kts`.
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac:0.1.6")
+    implementation("dev.usbdac:usbdac:0.1.7")
 }
 ```
 
@@ -45,27 +45,27 @@ For ExoPlayer/Media3, add the optional integration at the same version. It bring
 
 ```gradle
 dependencies {
-    implementation("dev.usbdac:usbdac-media3:0.1.6")
+    implementation("dev.usbdac:usbdac-media3:0.1.7")
 }
 ```
 
 See [the Kotlin player guide](guide-kotlin.md) for the integer-precision sink, gapless trimming and session volume. The base AAR and sample app do not depend on Media3. When downloading AARs directly, include both core and integration AARs plus their declared Maven dependencies; a standalone AAR does not resolve dependencies automatically.
 
-For a download without registry credentials, put `usbdac-0.1.6.aar`
-from the [0.1.6 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.6)
+For a download without registry credentials, put `usbdac-0.1.7.aar`
+from the [0.1.7 release](https://github.com/johnneerdael/android-usbdac/releases/tag/v0.1.7)
 in your app module's `libs/` directory. Use these dependencies in place of
 the registry coordinate.
 
 ```gradle
 dependencies {
-    implementation(files("libs/usbdac-0.1.6.aar"))
+    implementation(files("libs/usbdac-0.1.7.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
 ```
 
 If you build from source, run `./gradlew :usbdac:publishToMavenLocal` in
 `android/`, add `mavenLocal()` to your repositories and depend on
-`dev.usbdac:usbdac:0.1.6`. The Maven metadata brings in coroutines.
+`dev.usbdac:usbdac:0.1.7`. The Maven metadata brings in coroutines.
 
 The library needs Android 8.0 (API 26) or later. An app that uses the published AAR needs no Rust and no NDK; [building from source](#building-from-source) does.
 
