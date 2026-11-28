@@ -142,7 +142,13 @@ pub fn playback_u8_to_i16<'l>(
         if a_start < b_start.saturating_add(count * 2) && b_start < a_start.saturating_add(count) {
             return Err(Failure::Bad("buffers overlap".into()));
         }
+        // SAFETY: `count` bytes lie inside the input direct buffer (checked
+        // against its capacity above), which the caller keeps alive and
+        // unmodified for this call.
         let source = unsafe { std::slice::from_raw_parts(a, count) };
+        // SAFETY: `count * 2` bytes lie inside the output direct buffer (checked
+        // against its capacity above) and do not overlap the input (checked
+        // above); the caller keeps it alive and exclusive for this call.
         let target = unsafe { std::slice::from_raw_parts_mut(b, count * 2) };
         Ok(usbdac_core::playback::pcm_u8_to_i16(source, target) as i32)
     })
@@ -179,7 +185,13 @@ pub fn playback_dsd_mono_to_stereo<'l>(
         if a_start < b_start.saturating_add(count * 2) && b_start < a_start.saturating_add(count) {
             return Err(Failure::Bad("buffers overlap".into()));
         }
+        // SAFETY: `count` bytes lie inside the input direct buffer (checked
+        // against its capacity above), which the caller keeps alive and
+        // unmodified for this call.
         let source = unsafe { std::slice::from_raw_parts(a, count) };
+        // SAFETY: `count * 2` bytes lie inside the output direct buffer (checked
+        // against its capacity above) and do not overlap the input (checked
+        // above); the caller keeps it alive and exclusive for this call.
         let target = unsafe { std::slice::from_raw_parts_mut(b, count * 2) };
         Ok(usbdac_core::playback::duplicate_mono_dsd(source, target) as i32)
     })
