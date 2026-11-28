@@ -626,6 +626,7 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     Ok(Capabilities {
         exclusion_snapshot_complete: model.exclusion_snapshot_complete,
         native_only_aliases: model.native_only_aliases.clone(),
+        complete_uac1_rate_alternates: model.complete_uac1_rate_alternates.clone(),
         uac_version,
         link_speed: model.link_speed.unwrap_or(LinkSpeed::Unknown),
         alt_settings: alts.clone(),

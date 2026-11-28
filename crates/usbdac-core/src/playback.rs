@@ -472,6 +472,7 @@ fn descriptor_exclusion(
     complete: bool,
     alts: &[crate::AltSetting],
     native_only_aliases: &[(u8, u8, u8)],
+    complete_uac1_rate_alternates: &[(u8, u8, u8)],
     source: &StreamRequest,
 ) -> Option<String> {
     if !complete || alts.is_empty() || matches!(source.encoding, Encoding::DoP) {
@@ -509,8 +510,15 @@ fn descriptor_exclusion(
         );
     }
     let possibly_supported = matching.iter().any(|alt| {
-        // UAC1 descriptor rate lists can be incomplete; missing range evidence is unknown.
-        if alt.uac_version != crate::UacVersion::V2
+        // UAC1 rates are trusted only with the strict raw Type-I completeness witness.
+        let uac1_proven = alt.uac_version == crate::UacVersion::V1
+            && !matches!(source.encoding, Encoding::DsdNative { .. })
+            && complete_uac1_rate_alternates.contains(&(
+                alt.interface_number,
+                alt.alt_setting,
+                alt.endpoint_address,
+            ));
+        if (alt.uac_version != crate::UacVersion::V2 && !uac1_proven)
             || alt.rate_ranges.is_empty()
             || alt
                 .rate_ranges
@@ -540,8 +548,11 @@ fn descriptor_exclusion(
         None
     } else {
         Some(
-            "complete UAC2 descriptor snapshot and clock ranges exclude the exact source rate"
-                .into(),
+            if matching.iter().all(|alt| alt.uac_version == crate::UacVersion::V1) {
+                "complete UAC1 Type-I descriptor rate list/range excludes the exact source rate"
+            } else {
+                "complete UAC1 Type-I/UAC2 descriptor snapshot and rate ranges exclude the exact source rate"
+            }.into(),
         )
     }
 }
@@ -597,6 +608,7 @@ impl Dac {
                 caps.exclusion_snapshot_complete,
                 &caps.alt_settings,
                 &caps.native_only_aliases,
+                &caps.complete_uac1_rate_alternates,
                 source,
             )
         } else {
@@ -1328,30 +1340,43 @@ mod tests {
         let native = descriptor_alt(AltFormat::Dsd, 2, 1);
         let alts = vec![pcm.clone(), native.clone()];
         assert!(
-            descriptor_exclusion(false, &alts, &[], &StreamRequest::pcm(8_000, 1, 16)).is_none()
+            descriptor_exclusion(false, &alts, &[], &[], &StreamRequest::pcm(8_000, 1, 16))
+                .is_none()
         );
         assert!(
-            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(8_000, 1, 16)).is_some()
-        );
-        assert!(
-            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(8_000, 2, 32)).is_some()
-        );
-        assert!(
-            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(44_100, 2, 32)).is_none()
-        );
-        assert!(
-            descriptor_exclusion(true, &alts, &[], &StreamRequest::dsd_native(2_822_400, 1))
+            descriptor_exclusion(true, &alts, &[], &[], &StreamRequest::pcm(8_000, 1, 16))
                 .is_some()
         );
         assert!(
-            descriptor_exclusion(true, &alts, &[], &StreamRequest::dsd_native(2_822_400, 2))
+            descriptor_exclusion(true, &alts, &[], &[], &StreamRequest::pcm(8_000, 2, 32))
                 .is_some()
         );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &[], &StreamRequest::pcm(44_100, 2, 32))
+                .is_none()
+        );
+        assert!(descriptor_exclusion(
+            true,
+            &alts,
+            &[],
+            &[],
+            &StreamRequest::dsd_native(2_822_400, 1)
+        )
+        .is_some());
+        assert!(descriptor_exclusion(
+            true,
+            &alts,
+            &[],
+            &[],
+            &StreamRequest::dsd_native(2_822_400, 2)
+        )
+        .is_some());
         let mut unknown = native.clone();
         unknown.rate_ranges.clear();
         assert!(descriptor_exclusion(
             true,
             &[pcm.clone(), unknown],
+            &[],
             &[],
             &StreamRequest::dsd_native(2_822_400, 2)
         )
@@ -1362,6 +1387,7 @@ mod tests {
             true,
             &[pcm.clone(), opaque.clone()],
             &[],
+            &[],
             &StreamRequest::pcm_u8(44_100, 2)
         )
         .is_none());
@@ -1369,9 +1395,48 @@ mod tests {
             true,
             &[pcm, opaque],
             &[(1, 1, 1)],
+            &[],
             &StreamRequest::pcm_u8(44_100, 2)
         )
         .is_some());
+    }
+    #[test]
+    fn uac1_exact_rate_exclusion_requires_complete_descriptor_witness() {
+        let mut alt = descriptor_alt(AltFormat::Pcm, 2, 16);
+        alt.uac_version = crate::UacVersion::V1;
+        alt.subslot_bytes = 2;
+        alt.rate_ranges = vec![
+            crate::RateRange {
+                min_hz: 44_100,
+                max_hz: 44_100,
+                step_hz: 0,
+            },
+            crate::RateRange {
+                min_hz: 48_000,
+                max_hz: 48_000,
+                step_hz: 0,
+            },
+        ];
+        alt.sample_rates = vec![44_100, 48_000];
+        let source = StreamRequest::pcm(8_000, 2, 16);
+        assert!(
+            descriptor_exclusion(true, std::slice::from_ref(&alt), &[], &[], &source).is_none()
+        );
+        let excluded =
+            descriptor_exclusion(true, std::slice::from_ref(&alt), &[], &[(1, 1, 1)], &source)
+                .unwrap();
+        assert!(excluded.contains("UAC1 Type-I"));
+        assert!(descriptor_exclusion(
+            true,
+            std::slice::from_ref(&alt),
+            &[],
+            &[(1, 1, 1)],
+            &StreamRequest::pcm(44_100, 2, 16)
+        )
+        .is_none());
+        alt.rate_ranges.clear();
+        alt.sample_rates.clear();
+        assert!(descriptor_exclusion(true, &[alt], &[], &[(1, 1, 1)], &source).is_none());
     }
     #[test]
     fn policy_blocks_exact_before_negotiation() {

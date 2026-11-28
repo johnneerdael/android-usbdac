@@ -830,7 +830,7 @@ fn required_fallbacks_verified(report: &Report) -> bool {
     })
 }
 fn fallback_summary(value: &Value) -> Value {
-    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_generation": value.get("source_generation"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
 }
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];

@@ -234,6 +234,8 @@ pub struct Capabilities {
     pub exclusion_snapshot_complete: bool,
     /// Other alternatives whose descriptor proves a native-only DSD alias.
     pub native_only_aliases: Vec<(u8, u8, u8)>,
+    /// UAC1 output alternates with a complete standard Type-I rate descriptor.
+    pub complete_uac1_rate_alternates: Vec<(u8, u8, u8)>,
     pub uac_version: UacVersion,
     pub link_speed: LinkSpeed,
     pub alt_settings: Vec<AltSetting>,

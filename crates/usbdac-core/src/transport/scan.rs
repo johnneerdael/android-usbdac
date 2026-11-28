@@ -1017,6 +1017,7 @@ pub(super) fn build_usb_capability_model(
         return Ok(CapabilityModel {
             exclusion_snapshot_complete: false,
             native_only_aliases: Vec::new(),
+            complete_uac1_rate_alternates: Vec::new(),
             supported_sample_rates: sample_rates.clone(),
             link_speed: Some(link_speed_of(profile.speed)),
             alt_settings: vec![AltSetting {
@@ -1063,6 +1064,7 @@ pub(super) fn build_usb_capability_model(
     let mut exclusion_snapshot_complete = true;
     let mut playback_endpoints = Vec::new();
     let mut native_only_aliases = Vec::new();
+    let mut complete_uac1_rate_alternates = Vec::new();
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
@@ -1391,6 +1393,15 @@ pub(super) fn build_usb_capability_model(
                         endpoint.address(),
                     ));
                 }
+                if stream_format.is_uac1
+                    && super::negotiate::complete_uac1_type_i(descriptor.extra())
+                {
+                    complete_uac1_rate_alternates.push((
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        endpoint.address(),
+                    ));
+                }
                 let base_alt = AltSetting {
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
@@ -1699,6 +1710,7 @@ pub(super) fn build_usb_capability_model(
     Ok(CapabilityModel {
         exclusion_snapshot_complete,
         native_only_aliases,
+        complete_uac1_rate_alternates,
         supported_sample_rates,
         alt_settings,
         link_speed: Some(link_speed_of(effective_speed)),

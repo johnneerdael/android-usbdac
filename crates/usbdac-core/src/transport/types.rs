@@ -171,6 +171,8 @@ pub(crate) struct CapabilityModel {
     pub(super) exclusion_snapshot_complete: bool,
     /// Physical Other aliases known to be native-only descriptors.
     pub(super) native_only_aliases: Vec<(u8, u8, u8)>,
+    /// UAC1 Type-I alternates whose complete descriptor rate list was verified.
+    pub(super) complete_uac1_rate_alternates: Vec<(u8, u8, u8)>,
     pub(super) supported_sample_rates: Vec<u32>,
     pub(super) alt_settings: Vec<crate::capabilities::AltSetting>,
     pub(super) link_speed: Option<crate::capabilities::LinkSpeed>,

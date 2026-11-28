@@ -50,6 +50,79 @@ fn emit_dop_markers(data: &mut [u8], channels: usize, slot: usize, phase: &mut b
     }
 }
 
+const PREGENERATED_SOURCE_LIMIT: usize = 32 * 1024 * 1024;
+
+enum PreparedSource {
+    Ready(Vec<u8>),
+    OnDemand(&'static str),
+}
+
+/// Prepare only high-rate DSD-family stimulus. The source is still handed
+/// unchanged to production playback; this is not a conversion or USB write.
+fn prepare_high_rate_source(
+    source: &StreamRequest,
+    frames: u64,
+    frame_bytes: usize,
+    signal: &mut Signal,
+    marker: &mut bool,
+    stop: impl Fn() -> Option<&'static str>,
+    deadline: Instant,
+) -> Result<PreparedSource, &'static str> {
+    let high_rate = match source.encoding {
+        Encoding::DsdNative { bit_rate } => bit_rate >= 22_579_200,
+        Encoding::DoP => source.sample_rate >= 1_411_200,
+        _ => false,
+    };
+    if !high_rate {
+        return Ok(PreparedSource::OnDemand(
+            "source is not high-rate DSD or DoP",
+        ));
+    }
+    if let Some(reason) = stop() {
+        return Err(reason);
+    }
+    if Instant::now() >= deadline {
+        return Err("timeout");
+    }
+    let Some(total) = usize::try_from(frames)
+        .ok()
+        .and_then(|n| n.checked_mul(frame_bytes))
+        .filter(|&n| n <= PREGENERATED_SOURCE_LIMIT)
+    else {
+        return Ok(PreparedSource::OnDemand(
+            "source exceeds the 32 MiB preparation limit",
+        ));
+    };
+    let mut output = Vec::new();
+    if output.try_reserve_exact(total).is_err() {
+        return Ok(PreparedSource::OnDemand(
+            "bounded source allocation unavailable",
+        ));
+    }
+    let mut remaining = frames;
+    while remaining > 0 {
+        if let Some(reason) = stop() {
+            return Err(reason);
+        }
+        if Instant::now() >= deadline {
+            return Err("timeout");
+        }
+        let count = remaining.min(1024) as usize;
+        let mut bytes = signal.frames(count);
+        if source.encoding == Encoding::DoP {
+            emit_dop_markers(
+                &mut bytes,
+                usize::from(source.channels),
+                frame_bytes / usize::from(source.channels),
+                marker,
+            );
+        }
+        output.extend_from_slice(&bytes);
+        remaining -= count as u64;
+    }
+    Ok(PreparedSource::Ready(output))
+}
+
 pub(super) fn run_fallback(
     dac: &Dac,
     _caps: &Capabilities,
@@ -131,6 +204,66 @@ pub(super) fn run_fallback(
         evidence["status"] = json!(reason);
         return evidence;
     }
+    let (signal_rate, slot, bits) = match source.encoding {
+        Encoding::DsdNative { bit_rate } => (bit_rate / 8, 1, 1),
+        Encoding::DoP => (
+            source.sample_rate,
+            if source.bit_depth == 32 { 4 } else { 3 },
+            source.bit_depth,
+        ),
+        Encoding::PcmU8 => (source.sample_rate, 1, 8),
+        Encoding::PcmFloat32 => (source.sample_rate, 4, 32),
+        Encoding::Pcm => (source.sample_rate, source.bit_depth / 8, source.bit_depth),
+    };
+    if signal_rate == 0 || decision.source_frame_bytes == 0 || source.channels == 0 {
+        evidence["status"] = json!("inconclusive");
+        evidence["error"] = json!({"stage":"source_signal", "code":"invalid_geometry"});
+        return evidence;
+    }
+    let frames = u64::from(signal_rate) * options.duration_ms.clamp(300, 10000) / 1000;
+    let expected_bytes = frames * decision.source_frame_bytes as u64;
+    let mut signal = Signal::from_spec(source.encoding, signal_rate, source.channels, slot, bits);
+    let mut marker = false;
+    let generation_started = Instant::now();
+    let generation_deadline =
+        generation_started + Duration::from_millis(options.leg_timeout_ms.max(100));
+    let prepared = match prepare_high_rate_source(
+        source,
+        frames,
+        decision.source_frame_bytes,
+        &mut signal,
+        &mut marker,
+        || stop_reason(cancel, device_lost),
+        generation_deadline,
+    ) {
+        Ok(value) => value,
+        Err(reason) => {
+            evidence["source_generation"] = json!({"mode":"pre_generation_interrupted", "phase":"before_stream_open", "reason":reason, "limit_bytes":PREGENERATED_SOURCE_LIMIT, "elapsed_ms":generation_started.elapsed().as_millis()});
+            evidence["status"] = json!(if reason == "timeout" {
+                "inconclusive"
+            } else {
+                reason
+            });
+            if reason != "timeout" {
+                evidence["termination_reason"] = json!(reason);
+            }
+            evidence["error"] = json!({"stage":"source_generation", "code":reason, "message":"Source generation ended before opening playback"});
+            return evidence;
+        }
+    };
+    evidence["source_generation"] = match &prepared {
+        PreparedSource::Ready(bytes) => {
+            json!({"mode":"pre_generated", "phase":"before_stream_open", "bytes":bytes.len(), "limit_bytes":PREGENERATED_SOURCE_LIMIT, "elapsed_ms":generation_started.elapsed().as_millis()})
+        }
+        PreparedSource::OnDemand(reason) => {
+            json!({"mode":"on_demand", "phase":"during_stream", "reason":reason, "limit_bytes":PREGENERATED_SOURCE_LIMIT})
+        }
+    };
+    if let Some(reason) = stop_reason(cancel, device_lost) {
+        evidence["termination_reason"] = json!(reason);
+        evidence["status"] = json!(reason);
+        return evidence;
+    }
     let lost = Arc::new(AtomicBool::new(false));
     let listener_lost = lost.clone();
     let async_error: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
@@ -193,29 +326,15 @@ pub(super) fn run_fallback(
             check.observe(bytes);
         }
     })));
-    let (signal_rate, slot, bits) = match source.encoding {
-        Encoding::DsdNative { bit_rate } => (bit_rate / 8, 1, 1),
-        Encoding::DoP => (
-            source.sample_rate,
-            if source.bit_depth == 32 { 4 } else { 3 },
-            source.bit_depth,
-        ),
-        Encoding::PcmU8 => (source.sample_rate, 1, 8),
-        Encoding::PcmFloat32 => (source.sample_rate, 4, 32),
-        Encoding::Pcm => (source.sample_rate, source.bit_depth / 8, source.bit_depth),
+    let mut remaining = if matches!(prepared, PreparedSource::Ready(_)) {
+        0
+    } else {
+        frames
     };
-    if signal_rate == 0 || decision.source_frame_bytes == 0 || source.channels == 0 {
-        evidence["status"] = json!("inconclusive");
-        evidence["error"] = json!({"stage":"source_signal", "code":"invalid_geometry"});
-        let _ = stream.close();
-        return evidence;
-    }
-    let frames = u64::from(signal_rate) * options.duration_ms.clamp(300, 10000) / 1000;
-    let expected_bytes = frames * decision.source_frame_bytes as u64;
-    let mut remaining = frames;
-    let mut signal = Signal::from_spec(source.encoding, signal_rate, source.channels, slot, bits);
-    let mut marker = false;
-    let mut buffer = Vec::new();
+    let mut buffer = match prepared {
+        PreparedSource::Ready(bytes) => bytes,
+        PreparedSource::OnDemand(_) => Vec::new(),
+    };
     let mut offset = 0usize;
     let mut accepted = 0u64;
     let mut source_hash = Sha256::new();
@@ -431,6 +550,85 @@ pub(super) fn run_fallback(
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[test]
+    fn high_rate_dop_preparation_preserves_streaming_signal_and_markers() {
+        let mut source = StreamRequest::dop(24_576_000, 2);
+        source.bit_depth = 32;
+        let mut prepared_signal = Signal::from_spec(Encoding::DoP, source.sample_rate, 2, 4, 32);
+        let mut phase = false;
+        let cancel = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        let result = prepare_high_rate_source(
+            &source,
+            2500,
+            8,
+            &mut prepared_signal,
+            &mut phase,
+            || stop_reason(&cancel, &lost),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let PreparedSource::Ready(actual) = result else {
+            panic!("high-rate source should be prepared");
+        };
+        let mut reference = Signal::from_spec(Encoding::DoP, source.sample_rate, 2, 4, 32);
+        let mut reference_phase = false;
+        let mut expected = Vec::new();
+        for count in [256, 256, 256, 256, 256, 256, 256, 256, 256, 196] {
+            let mut bytes = reference.frames(count);
+            emit_dop_markers(&mut bytes, 2, 4, &mut reference_phase);
+            expected.extend_from_slice(&bytes);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2500 * 8);
+    }
+
+    #[test]
+    fn preparation_is_bounded_and_obeys_stop_before_stream_open() {
+        let source = StreamRequest::dsd_native(24_576_000, 2);
+        let mut signal = Signal::from_spec(source.encoding, 3_072_000, 2, 1, 1);
+        let mut marker = false;
+        let cancel = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        let oversized = prepare_high_rate_source(
+            &source,
+            (PREGENERATED_SOURCE_LIMIT / 2 + 1) as u64,
+            2,
+            &mut signal,
+            &mut marker,
+            || stop_reason(&cancel, &lost),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(oversized, PreparedSource::OnDemand(_)));
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            prepare_high_rate_source(
+                &source,
+                1,
+                2,
+                &mut signal,
+                &mut marker,
+                || stop_reason(&cancel, &lost),
+                Instant::now() + Duration::from_secs(10)
+            ),
+            Err("cancelled")
+        ));
+        cancel.store(false, Ordering::Release);
+        assert!(matches!(
+            prepare_high_rate_source(
+                &source,
+                1,
+                2,
+                &mut signal,
+                &mut marker,
+                || stop_reason(&cancel, &lost),
+                Instant::now() - Duration::from_millis(1)
+            ),
+            Err("timeout")
+        ));
+    }
+
     #[test]
     fn only_exact_attempted_prefix_proves_selection() {
         let source = StreamRequest::pcm(8_000, 1, 16);
