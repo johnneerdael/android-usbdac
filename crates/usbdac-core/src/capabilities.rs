@@ -232,7 +232,9 @@ pub struct Capabilities {
     /// All claimed playback OUT alternates in the cached descriptor snapshot parsed.
     /// False means an absent shape cannot be inferred from the snapshot.
     pub exclusion_snapshot_complete: bool,
-    /// Other alternatives whose descriptor proves a native-only DSD alias.
+    /// `Other` alternates whose descriptor proves they can never carry PCM:
+    /// native-only DSD aliases and UAC2 alternates whose bmFormats has none of
+    /// the PCM, PCM8 and IEEE_FLOAT bits (such as a RAW_DATA-only alternate).
     pub native_only_aliases: Vec<(u8, u8, u8)>,
     /// UAC1 output alternates with a complete standard Type-I rate descriptor.
     pub complete_uac1_rate_alternates: Vec<(u8, u8, u8)>,

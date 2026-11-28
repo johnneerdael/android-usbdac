@@ -1356,12 +1356,7 @@ pub(super) fn build_usb_capability_model(
                         ),
                     )
                 };
-                if stream_format.format_tag == FORMAT_TAG_DSD
-                    && stream_format.native_dsd.is_some()
-                    && stream_format
-                        .uac2_formats
-                        .map_or(true, |bits| bits & 0b111 == 0)
-                {
+                if pcm_incapable_alias(&stream_format) {
                     native_only_aliases.push((
                         descriptor.interface_number(),
                         descriptor.setting_number(),
@@ -2851,6 +2846,23 @@ pub(super) fn bytes_per_sample(bit_depth: u8) -> Option<usize> {
 
 const UAC2_RAW_DATA: u32 = 1 << 31;
 
+/// Whether the model's `Other` entry for this alternate can never be selected
+/// for PCM, U8 or float: a native-only DSD alias, or any UAC2 alternate whose
+/// bmFormats has none of the PCM, PCM8 and IEEE_FLOAT bits, which
+/// `select_stream_candidates` requires before it considers an alternate. A
+/// RAW_DATA-only alternate without an active DSD quirk (Topping/Thesycon
+/// 152a vendor-wide DSD_RAW is reference-only) is in the second group; ALSA
+/// gives it only FMTBIT_SPECIAL or, under that quirk, DSD_U32_BE
+/// (references/linux/sound/usb/format.c:60-65, quirks.c:2341), never PCM.
+/// A native DSD use of the alternate is modelled by its own `Dsd` twin.
+fn pcm_incapable_alias(format: &StreamingInterfaceFormat) -> bool {
+    let no_pcm_bits = format.uac2_formats.map(|bits| bits & 0b111 == 0);
+    no_pcm_bits == Some(true)
+        || (format.format_tag == FORMAT_TAG_DSD
+            && format.native_dsd.is_some()
+            && no_pcm_bits.is_none())
+}
+
 // Preserve the shipped AP80 default and the existing explicit width/order
 // overrides after the exact route/endpoint predicate has admitted this layout.
 fn ap80_native_dsd_profile(policy: &crate::settings::Settings) -> Option<NativeDsdProfile> {
@@ -3800,10 +3812,18 @@ mod ap80_raw_data_tests {
         assert!(is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &raw));
         assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0073)), (1, 1, 4), &raw));
         assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 3), &raw));
+        // Without an active DSD quirk the RAW_DATA alternate still cannot
+        // carry PCM, so the preflights may skip its Other entry.
+        assert!(raw.native_dsd.is_none());
+        assert!(pcm_incapable_alias(&raw));
         extra[6] = 1;
         extra[9] = 0;
         let pcm = parse_streaming_extra(0x20, &extra).unwrap();
         assert_eq!(alt_format(pcm.format_tag), AltFormat::Pcm);
+        assert!(!pcm_incapable_alias(&pcm));
+        extra[9] = 0x80;
+        let mixed = parse_streaming_extra(0x20, &extra).unwrap();
+        assert!(!pcm_incapable_alias(&mixed));
         assert!(!is_ap80_raw_dsd(Some((0xc502, 0x0072)), (1, 1, 4), &pcm));
     }
 
