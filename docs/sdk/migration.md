@@ -19,6 +19,10 @@ These changes are on the development branch and in no published release yet.
 - **Rust `PlaybackStream` only:** `writable_bytes` reports the ring's real room up to the active target, in source frames, for direct, converted and repacked streams alike, and `write` takes the whole chunk that fits instead of 256 frames at a time. A converted or repacked stream therefore stays near the ring target instead of filling the whole ring. `drain` pads an incomplete final native DSD word or DoP pair with the DSD idle byte `0x69` instead of refusing it. An error after a `write` accepted input returns the accepted count, and the next call reports the error. The Kotlin adapters keep their own rules: they still refuse to drain an incomplete DSD group.
 - **`DacErrorCode.HOST_USB`** is new; it decoded as `UNKNOWN` before. It comes from the macOS libusb host and is not raised on Android. An `Error` event whose message cannot be read now takes its code from the event's stable number, including 14 `RECONFIGURE_DRAIN_TIMEOUT` and 15 `RECONFIGURE_UNUSABLE`, instead of `UNKNOWN`. An exhaustive `when` over `DacErrorCode` without an `else` branch needs the new value.
 
+## Changed in 0.1.18
+
+No SDK or core library changes. The Android validator keeps its reports complete on large runs (#23).
+
 ## Changed in 0.1.17
 
 - **An unplug keeps the example player on direct USB.** In the Media3 example, once a track has opened on direct USB, `DirectOutputController` forces direct USB until the user selects Android output (turns off `takeOverDac`). An unplugged DAC ends the track with `DEVICE_LOST` instead of continuing on the phone speaker; `canRecover` now recovers only `TRANSFER`. Copy that rule if your controller recovers write failures by reopening.
