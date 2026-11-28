@@ -131,7 +131,7 @@ def verify(root, expected):
 def validator_subject(archive_bytes, platform, artifact_id, archive_digest, run_id, attempt, version, source_sha, repository_id):
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', archive_digest or '') or 'sha256:' + hashlib.sha256(archive_bytes).hexdigest() != archive_digest:
         raise SystemExit('Validator artifact archive digest mismatch')
-    filename = f'usbdac-validator-{version}-' + ('android.apk' if platform == 'android' else 'macos-arm64.zip')
+    filename = f'usbdac-validator-{version}-' + ('android.apk' if platform == 'android' else 'macos-arm64.dmg')
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
         entries = archive.infolist()
         if len(entries) != 1 or entries[0].filename != filename or entries[0].is_dir() or (entries[0].external_attr >> 16) & 0o170000 == 0o120000:
@@ -154,7 +154,7 @@ def verify_validator_subjects(receipt, root, version, source_sha, repository_id,
     expected_files = set()
     for subject in subjects:
         platform = subject['platform']
-        filename = f'usbdac-validator-{version}-' + ('android.apk' if platform == 'android' else 'macos-arm64.zip')
+        filename = f'usbdac-validator-{version}-' + ('android.apk' if platform == 'android' else 'macos-arm64.dmg')
         expected = dict(filename=filename, version=version, source_sha=source_sha, repository_id=int(repository_id),
                         run_id=int(run_id), artifact_id=int(ids[platform]))
         producing_attempt = subject.get('run_attempt')

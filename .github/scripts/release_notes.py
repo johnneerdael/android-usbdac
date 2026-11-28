@@ -49,7 +49,7 @@ def render(version, source, changes, repository, validator=False, banner=False):
             'test outcomes and debug logs. Remove headphones and mute the amplifier first.',
             '',
             f'- `usbdac-validator-{version}-android.apk`: Android validator, signed with the pinned validator key (certificate SHA-256 2989c5a4...3a46588e), so it installs over the previous release.',
-            f'- `usbdac-validator-{version}-macos-arm64.zip`: Apple Silicon validator, ad hoc signed and not notarized.',
+            f'- `usbdac-validator-{version}-macos-arm64.dmg`: Apple Silicon validator, Developer ID signed and notarized.',
         ])
     lines.extend([
         '', '## Provenance', '',

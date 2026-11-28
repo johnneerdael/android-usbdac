@@ -534,7 +534,7 @@ class PayloadAndPublicationTests(unittest.TestCase):
             root = Path(tmp)
             subjects = []
             ids = {'android': 9, 'mac': 10}
-            for platform, attempt, suffix in (('android', 1, 'android.apk'), ('mac', 2, 'macos-arm64.zip')):
+            for platform, attempt, suffix in (('android', 1, 'android.apk'), ('mac', 2, 'macos-arm64.dmg')):
                 filename = f'usbdac-validator-0.1.11-{suffix}'
                 (root / filename).write_bytes(platform.encode())
                 subjects.append(dict(platform=platform, artifact_id=ids[platform], artifact_digest='sha256:' + 'a' * 64,
@@ -667,7 +667,7 @@ class PayloadAndPublicationTests(unittest.TestCase):
         text = notes.render('0.1.11', 'a' * 40, ['- Fix'], 'x/y', True)
         for fragment in ('dev.usbdac:usbdac:0.1.11', '/releases/download/v0.1.11/manifest.json',
                          '/releases/download/v0.1.11/receipt.json', '/commit/' + 'a' * 40,
-                         'usbdac-validator-0.1.11-macos-arm64.zip'):
+                         'usbdac-validator-0.1.11-macos-arm64.dmg'):
             self.assertIn(fragment, text)
 
 

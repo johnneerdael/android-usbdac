@@ -147,7 +147,7 @@ jobs:
     needs: prepare
     if: ${{ needs.prepare.outputs.recovered != 'true' && needs.prepare.outputs.version != '' && needs.prepare.outputs.validator == 'true' }}
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
@@ -157,25 +157,74 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
-      - name: Build and verify the Apple Silicon app
+      # Developer ID signing and notarization. The certificate, its key and
+      # the App Store Connect API key live only in repository secrets; the
+      # team identifier is checked below.
+      - name: Install the Developer ID identity and notary key
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$P12_BASE64" && test -n "$P12_PASSWORD" && test -n "$NOTARY_KEY_BASE64"
+          umask 077
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          printf '%s' "$P12_BASE64" | base64 -d > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)
+          test -n "$identity"
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/notary-key.p8"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary-key.p8" >> "$GITHUB_ENV"
+      - name: Build, sign, notarize and verify the Apple Silicon app
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          SIGNING_IDENTITY: ""
           SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          TEAM_ID: 6DF93UDRBJ
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -n "$NOTARY_KEY_ID" && test -n "$NOTARY_ISSUER_ID"
           rustup target add aarch64-apple-darwin
           macos/validator/build.sh
           app="macos/validator/build/USB DAC Validator.app"
+          dmg=macos/validator/build/USB-DAC-Validator-macOS.dmg
           codesign --verify --deep --strict --verbose=2 "$app"
+          for target in "$app" "$app/Contents/MacOS/usbdac-validator-worker" "$dmg"; do
+            codesign -dvv "$target" 2>&1 | grep -Fx "TeamIdentifier=$TEAM_ID"
+            codesign -dvv "$target" 2>&1 | grep -Eq "^Authority=Developer ID Application: .* \($TEAM_ID\)$"
+          done
+          codesign -dvv "$app" 2>&1 | grep -q 'flags=0x10000(runtime)'
           test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
-          cp macos/validator/build/USB-DAC-Validator-macOS.zip "$RUNNER_TEMP/usbdac-validator-$VERSION-macos-arm64.zip"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          mount="$RUNNER_TEMP/validator-dmg"
+          mkdir -p "$mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          spctl --assess --type execute --verbose=2 "$mount/USB DAC Validator.app"
+          test -L "$mount/Applications"
+          hdiutil detach "$mount"
+          cp "$dmg" "$RUNNER_TEMP/usbdac-validator-$VERSION-macos-arm64.dmg"
+      - name: Remove the signing keychain and notary key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/developer-id.p12"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         with:
           name: mac-validator-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/usbdac-validator-${{ needs.prepare.outputs.version }}-macos-arm64.zip
+          path: ${{ runner.temp }}/usbdac-validator-${{ needs.prepare.outputs.version }}-macos-arm64.dmg
           overwrite: true
           if-no-files-found: error
           retention-days: 14
@@ -424,7 +473,7 @@ jobs:
         run: |
           set -euo pipefail
           test -s "validator-assets/usbdac-validator-$VERSION-android.apk"
-          test -s "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip"
+          test -s "validator-assets/usbdac-validator-$VERSION-macos-arm64.dmg"
           python3 - <<'PYVALIDATOR'
           import json, os, sys
           from pathlib import Path
@@ -436,7 +485,8 @@ jobs:
               verify_validator_subjects(receipt, Path('validator-assets'), e['VERSION'], e['SOURCE_SHA'], e['GITHUB_REPOSITORY_ID'], e['SOURCE_RUN_ID'], e['RECEIPT_RUN_ATTEMPT'], {'android': e['ANDROID_VALIDATOR_ID'], 'mac': e['MAC_VALIDATOR_ID']})
           PYVALIDATOR
           unzip -tq "validator-assets/usbdac-validator-$VERSION-android.apk" >/dev/null
-          unzip -tq "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip" >/dev/null
+          # A UDIF disk image ends with its 512-byte "koly" trailer.
+          test "$(tail -c 512 "validator-assets/usbdac-validator-$VERSION-macos-arm64.dmg" | head -c 4)" = koly
       - name: Assemble release assets from the verified payload
         run: |
           set -euo pipefail
@@ -446,7 +496,7 @@ jobs:
             cp release-payload/maven/dev/usbdac/"$artifact"/"$VERSION"/* release-assets/
           done
           if [ "$VALIDATOR" = true ]; then
-            cp "validator-assets/usbdac-validator-$VERSION-android.apk" "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip" release-assets/
+            cp "validator-assets/usbdac-validator-$VERSION-android.apk" "validator-assets/usbdac-validator-$VERSION-macos-arm64.dmg" release-assets/
           fi
           (cd release-assets && sha256sum -- * > SHA256SUMS.txt)
           python3 .github/scripts/release_notes.py --output release-notes.md

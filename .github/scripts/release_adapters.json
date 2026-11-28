@@ -37,5 +37,18 @@
     },
     "gate_identity": "usbdac-release-gates/v1",
     "schema": 3
+  },
+  {
+    "files": {
+      ".github/scripts/prepare_release.py": "7893eedf5bf6f9d80ae438042917a4bf128092f8af80b7ad5cb2f36a1193983e",
+      ".github/scripts/publish_release.py": "fc1cd2b6b6f5e6bc1a1482c665536e4108dfba96e8ff9d4bc68ee8cccc3ba8c0",
+      ".github/scripts/recover_release.py": "690c3ace9b927bf66c2143fa67a7df2b6081b162d016364dc7302b695b595ede",
+      ".github/scripts/release_artifact.py": "c51e5460e6b0836067b157bbe25d5f7b999199bcd9bc6d843fc7defb56704f52",
+      ".github/scripts/release_notes.py": "ccf0b6c06217cd597df5e8d75a1685aa525bb6cb1448d9373b18a7a19f5f791e",
+      ".github/workflows/ci.yml": "0adb61851f2b96102fd71d0ba248e51f4b667996a72ff37c182168f43ab03ef6",
+      ".github/workflows/release.yml": "4cb069f3880f1644eeb34e387d32394efac448a2e1e588be62a0bc45f1d13e84"
+    },
+    "gate_identity": "usbdac-release-gates/v1",
+    "schema": 3
   }
 ]
