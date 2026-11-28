@@ -185,6 +185,8 @@ struct Retirement {
     power_writes: Vec<u8>,
     selector_writes: Vec<u8>,
     selector_current: u8,
+    // Playback interface 1 SET_INTERFACE and clock 16 SET_CUR writes in bus order.
+    sequence: Vec<String>,
     out_submits: u64,
     out_completions: u64,
     unlinks: u64,
@@ -293,6 +295,9 @@ impl Device {
                 shared.active = self.alt == 1;
                 if shared.alt_writes.len() < 256 {
                     shared.alt_writes.push(self.alt);
+                }
+                if shared.sequence.len() < 256 {
+                    shared.sequence.push(format!("alt{}", self.alt));
                 }
                 eprintln!("SET_INTERFACE alt={}", self.alt);
                 vec![]
@@ -531,6 +536,9 @@ impl Device {
                     let mut state = self.shared.lock().unwrap();
                     if state.rate_sets.len() < 256 {
                         state.rate_sets.push(rate);
+                    }
+                    if state.sequence.len() < 256 {
+                        state.sequence.push(format!("rate{rate}"));
                     }
                 }
                 if env::var("RV_REFUSE_RATE")
@@ -884,6 +892,7 @@ fn control_connection(mut stream: TcpStream, shared: &Arc<Mutex<Retirement>>) ->
                 state.unlinks
             )
         }
+        "sequence\n" => format!("seq=[{}]\n", shared.lock().unwrap().sequence.join(", ")),
         "mixed\n" => {
             shared.lock().unwrap().mixed_capture = true;
             "ok\n".to_string()
@@ -894,6 +903,7 @@ fn control_connection(mut stream: TcpStream, shared: &Arc<Mutex<Retirement>>) ->
             state.alt_writes.clear();
             state.power_writes.clear();
             state.selector_writes.clear();
+            state.sequence.clear();
             state.out_submits = 0;
             state.out_completions = 0;
             state.unlinks = 0;
@@ -910,7 +920,7 @@ fn control_connection(mut stream: TcpStream, shared: &Arc<Mutex<Retirement>>) ->
 fn control_client(port: u16, command: &str) -> io::Result<()> {
     if !matches!(
         command,
-        "status" | "release" | "snapshot" | "reset" | "mixed"
+        "status" | "release" | "snapshot" | "reset" | "mixed" | "sequence"
     ) {
         return Err(invalid("control must be status or release"));
     }

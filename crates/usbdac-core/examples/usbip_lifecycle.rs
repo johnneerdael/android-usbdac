@@ -588,9 +588,55 @@ mod linux {
             ["0", "1"],
             "unexpected alternate transitions: {transitions}"
         );
+        // USB-level count of the live 96 -> 48 kHz replacement on interface 1 and
+        // clock 16. ALSA's UAC2 prepare deselects the alternate first, writes the
+        // rate, and enables the alternate last (sound/usb/endpoint.c
+        // snd_usb_endpoint_prepare:1498-1530, endpoint_set_interface:917-951).
+        // ALSA elides a SET_INTERFACE to the alternate it already holds
+        // (endpoint.c:926-927); usbdac re-asserts alt 0 at stop, before and after
+        // the read-only negotiation and before activation, which is idempotent.
+        let sequence = out_of_band("sequence")?;
+        let writes: Vec<_> = sequence
+            .strip_prefix("seq=[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or("missing write sequence")?
+            .split(", ")
+            .collect();
+        let count = |w: &str| writes.iter().filter(|x| **x == w).count();
+        assert_eq!(
+            (
+                count("alt0"),
+                count("alt1"),
+                count("rate48000"),
+                writes.len()
+            ),
+            (4, 1, 2, 7),
+            "unexpected replacement write counts: {sequence}"
+        );
+        assert_eq!(
+            writes.first(),
+            Some(&"alt0"),
+            "old alternate not deselected first: {sequence}"
+        );
+        assert_eq!(
+            writes.last(),
+            Some(&"alt1"),
+            "alternate not enabled last: {sequence}"
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|w| w.starts_with("rate") && *w != "rate48000"),
+            "a rate other than 48 kHz was written: {sequence}"
+        );
+        // Fresh post-replacement evidence: the DAC's clock reads back 48 kHz at alt 1.
         let mut current = [0u8; 4];
         assert_eq!(control(fd, 0xa1, 1, 0x0100, 0x1000, &mut current)?, 4);
         assert_eq!(u32::from_le_bytes(current), 48_000);
+        println!(
+            "RECONFIGURE_USB_WRITES {sequence} clock_readback=48000 alt={}",
+            alt(fd)?
+        );
         let stream = replacement.stream;
         for _ in 0..3 {
             stream.write(&pcm)?;
@@ -613,6 +659,13 @@ mod linux {
         assert!(
             stats.underruns <= 50,
             "USB/IP replacement exceeded 50 underruns: {stats:?}"
+        );
+        let mut current = [0u8; 4];
+        assert_eq!(control(fd, 0xa1, 1, 0x0100, 0x1000, &mut current)?, 4);
+        assert_eq!(
+            u32::from_le_bytes(current),
+            48_000,
+            "clock drifted during replacement playback"
         );
         let fixture_stats = out_of_band("snapshot")?;
         assert!(
