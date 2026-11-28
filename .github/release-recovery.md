@@ -10,7 +10,7 @@ The Pages workflow deploys only verified published release source. Documentation
 gh workflow run docs.yml --repo johnneerdael/usbdac --ref main -f published_version=VERSION -f source_sha=COMMIT_SHA
 ```
 
-The workflow checks the stable tag, published release, evidence and download coordinates before building. Legacy releases whose receipts do not contain a repository ID cannot use this deployment path; deploy a newer release with current evidence instead.
+The workflow checks the stable tag, published release, evidence and download coordinates before building. It requires the manifest and receipt to identify this repository by ID. 0.1.17 is the first release whose evidence records `repository_id`; for older releases the workflow resolves the recorded repository name to an ID instead, so that name must still resolve to this repository.
 
 ## Re-pinning the release implementation
 
