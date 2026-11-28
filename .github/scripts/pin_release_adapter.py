@@ -61,7 +61,8 @@ def pin(args):
         return
     if args.check:
         raise SystemExit('The release implementation differs from every reviewed pin. Review the change, then run '
-                         '`python3 -I .github/scripts/pin_release_adapter.py` (see .github/release-recovery.md)')
+                         '`python3 -I .github/scripts/pin_release_adapter.py`, with --amend if the newest pin is '
+                         'unreleased (see .github/release-recovery.md)')
     entry = {'files': files, 'gate_identity': GATE_IDENTITY, 'schema': SCHEMA}
     if args.amend:
         if not stable_tags():

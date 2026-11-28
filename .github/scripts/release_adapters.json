@@ -19,7 +19,7 @@
       ".github/scripts/recover_release.py": "690c3ace9b927bf66c2143fa67a7df2b6081b162d016364dc7302b695b595ede",
       ".github/scripts/release_artifact.py": "d901130bf7ed0898e59d535b6486e4ee9b5b5db58404d49c94dd05ce4fc57cc2",
       ".github/scripts/release_notes.py": "f6967c60eacfd24e2cf9c0cf0941c96058be8892ef3d765add01a1e9f75cb1f4",
-      ".github/workflows/ci.yml": "bec21e421d8716abf8d34c32901f458940f9d674e2ea0f04bc70d150fdc160db",
+      ".github/workflows/ci.yml": "0adb61851f2b96102fd71d0ba248e51f4b667996a72ff37c182168f43ab03ef6",
       ".github/workflows/release.yml": "62121bc83639545b656f93a73c78ff8374caff8fedf2079a46f014e60b0964b2"
     },
     "gate_identity": "usbdac-release-gates/v1",
