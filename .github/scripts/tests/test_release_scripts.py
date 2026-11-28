@@ -13,6 +13,9 @@ from unittest.mock import patch
 import zipfile
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+# Resolve repository files from here, not the working directory, so the tests
+# pass from the repository root, .github/scripts and .github/scripts/tests.
+REPO = SCRIPTS.parent.parent
 sys.path.insert(0, str(SCRIPTS))
 import prepare_release as prepare
 import recover_release as recover
@@ -24,7 +27,7 @@ import release_notes as notes
 class ReservationTests(unittest.TestCase):
     def test_reviewed_adapter_matches_current_files_and_rejects_changes(self):
         adapter = next(item for item in prepare.reviewed_adapters() if item['schema'] == 3)
-        repo = SCRIPTS.parent.parent
+        repo = REPO
         def git_show(args, **kwargs):
             path = args[-1].split(':', 1)[1]
             return (repo / path).read_bytes()
@@ -116,7 +119,7 @@ class ReceiptTests(unittest.TestCase):
             receipt['gate_identity'] = identity
         def command(args, **kwargs):
             if args[0] == 'git':
-                return b'historical-layout' if historical else Path(args[-1].split(':', 1)[1]).read_bytes()
+                return b'historical-layout' if historical else (REPO / args[-1].split(':', 1)[1]).read_bytes()
             data = io.BytesIO()
             with zipfile.ZipFile(data, 'w') as archive:
                 archive.writestr('receipt.json', json.dumps(receipt))
