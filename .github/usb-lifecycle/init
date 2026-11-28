@@ -126,13 +126,17 @@ run_mode() {
     return 0
 }
 
-entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex:3245 retire:3246 jni-retire:3247 full-uac3-clock:3248 reconfigure:3249 selector:3250 zero-res:3251 full-uac3-clock-bad:3252 full-uac3-clock-stale:3253 full-uac3-volatile:3254 refuse-set:3255 full-uac3-nearest:3256'
+entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex:3245 retire:3246 jni-retire:3247 full-uac3-clock:3248 reconfigure:3249 selector:3250 zero-res:3251 full-uac3-clock-bad:3252 full-uac3-clock-stale:3253 full-uac3-volatile:3254 refuse-set:3255 full-uac3-nearest:3256 dop-carrier32:3257 dop-stereo24:3258 dop-no-carrier:3259'
 IFS= read -r cmdline < /proc/cmdline
 for arg in $cmdline; do
     case "$arg" in
         usbip.mode=clock-faults) entries=full-uac3-clock-bad:3252\ full-uac3-clock-stale:3253 ;;
         usbip.mode=refuse-set) entries=refuse-set:3255 ;;
         usbip.mode=full-uac3-nearest) entries=full-uac3-nearest:3256 ;;
+        usbip.mode=dop) entries=dop-carrier32:3257\ dop-stereo24:3258\ dop-no-carrier:3259 ;;
+        usbip.mode=dop-carrier32) entries=dop-carrier32:3257 ;;
+        usbip.mode=dop-stereo24) entries=dop-stereo24:3258 ;;
+        usbip.mode=dop-no-carrier) entries=dop-no-carrier:3259 ;;
         usbip.mode=full-uac3-volatile) entries=full-uac3-volatile:3254 ;;
         usbip.mode=full-uac3-clock-bad) entries=full-uac3-clock-bad:3252 ;;
         usbip.mode=full-uac3-clock-stale) entries=full-uac3-clock-stale:3253 ;;
