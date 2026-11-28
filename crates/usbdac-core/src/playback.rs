@@ -685,12 +685,9 @@ fn descriptor_exclusion(
             }
             _ => source.sample_rate,
         };
-        alt.sample_rates.contains(&rate)
-            || alt.rate_ranges.iter().any(|r| {
-                rate >= r.min_hz
-                    && rate <= r.max_hz
-                    && (r.step_hz == 0 || (rate - r.min_hz).checked_rem(r.step_hz) == Some(0))
-            })
+        // Same rate rule as transport model_excludes (negotiate.rs): a
+        // zero-resolution range yields only its minimum (ALSA format.c:448-478).
+        supported_rate(alt, rate)
     });
     if possibly_supported {
         None
@@ -2760,6 +2757,25 @@ mod tests {
         );
         assert_eq!(attempts.first(), Some(&source));
         assert_eq!(exact.unwrap().transform, PlaybackTransform::Direct);
+    }
+    #[test]
+    fn preflight_reads_a_zero_resolution_range_as_its_minimum() {
+        let mut alt = descriptor_alt(AltFormat::Pcm, 2, 24);
+        alt.sample_rates.clear();
+        alt.rate_ranges = vec![crate::RateRange {
+            min_hz: 44_100,
+            max_hz: 96_000,
+            step_hz: 0,
+        }];
+        let alts = std::slice::from_ref(&alt);
+        assert!(
+            descriptor_exclusion(true, alts, &[], &[], &StreamRequest::pcm(44_100, 2, 24))
+                .is_none()
+        );
+        assert!(
+            descriptor_exclusion(true, alts, &[], &[], &StreamRequest::pcm(48_000, 2, 24))
+                .is_some()
+        );
     }
     #[test]
     fn zero_resolution_range_admits_only_its_minimum() {
