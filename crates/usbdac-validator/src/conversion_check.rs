@@ -26,6 +26,8 @@ pub(super) struct ConversionCheck {
     expected_headroom_db: f64,
     source_dsd: DsdDigest,
     target_dsd: DsdDigest,
+    /// Per-channel audio-band low-pass for DSD sources, applied before the tone projection.
+    audio_band: Option<(f64, Vec<AudioBand>)>,
 }
 
 impl ConversionCheck {
@@ -43,6 +45,18 @@ impl ConversionCheck {
         };
         let expected_amplitude = source_fundamental(source) * 10f64.powf(headroom_db / 20.0);
         let expand_mono = source.channels == 1 && target.channels == 2;
+        // DSD carries its modulation noise above the audio band by design; the validator's
+        // first-order test signal puts most of its power there at DSD64 and DSD128. Judge the
+        // tone within the audio band so that noise does not count against a correct conversion.
+        let audio_band = (!preserve_samples
+            && matches!(source.encoding, Encoding::DsdNative { .. } | Encoding::DoP))
+        .then(|| {
+            let cutoff = AUDIO_BAND_HZ.min(0.45 * f64::from(target.sample_rate));
+            let filters = (0..channels)
+                .map(|_| AudioBand::new(cutoff, f64::from(target.sample_rate)))
+                .collect();
+            (cutoff, filters)
+        });
         let target_dsd = DsdDigest::new(
             target.encoding,
             target.channels,
@@ -78,6 +92,7 @@ impl ConversionCheck {
                 expand_mono,
             ),
             target_dsd,
+            audio_band,
         }
     }
     /// Feed exactly the source bytes accepted by production playback.
@@ -153,11 +168,23 @@ impl ConversionCheck {
         for frame in self.pending[..complete].chunks_exact(frame_bytes) {
             let frame_index = self.frames;
             self.frames += 1;
-            if !frame_index.is_multiple_of(self.stride) {
-                continue;
-            }
             // Exclude the start transient from filter-based tone measurements.
-            if !self.preserve_samples && frame_index < u64::from(self.target.sample_rate) / 50 {
+            let measured = frame_index.is_multiple_of(self.stride)
+                && (self.preserve_samples
+                    || frame_index >= u64::from(self.target.sample_rate) / 50);
+            if !measured {
+                // The audio-band filter runs on every frame so the stride cannot alias noise.
+                if let Some((_, filters)) = &mut self.audio_band {
+                    for (ch, filter) in filters.iter_mut().enumerate() {
+                        if let Some(value) = decode_pcm(
+                            &frame[ch * slot..(ch + 1) * slot],
+                            self.target.encoding,
+                            self.target.valid_bits,
+                        ) {
+                            filter.process(value);
+                        }
+                    }
+                }
                 continue;
             }
             let phase = std::f64::consts::TAU * TONE_HZ * frame_index as f64
@@ -165,7 +192,7 @@ impl ConversionCheck {
             let (s, c) = phase.sin_cos();
             let mut valid = true;
             for ch in 0..channels {
-                let Some(value) = decode_pcm(
+                let Some(mut value) = decode_pcm(
                     &frame[ch * slot..(ch + 1) * slot],
                     self.target.encoding,
                     self.target.valid_bits,
@@ -173,6 +200,9 @@ impl ConversionCheck {
                     valid = false;
                     continue;
                 };
+                if let Some((_, filters)) = &mut self.audio_band {
+                    value = filters[ch].process(value);
+                }
                 if self.preserve_samples {
                     if self.observed_samples.len() < 65_536 {
                         self.observed_samples.push_back(value);
@@ -265,7 +295,52 @@ impl ConversionCheck {
             "passed":passed, "frames":self.frames, "checked_frames":self.checked, "stride":self.stride,
             "duration_expected_frames":expected_frames, "duration_tolerance_frames":16, "duration_ok":duration_ok,
             "sample_comparison":"strict normalized value equality", "sample_mismatches":self.mismatches, "unmatched_source_samples":self.expected_samples.len(), "unmatched_target_samples":self.observed_samples.len(), "queue_overflow":self.queue_overflow, "source_reference_frames":self.source_pcm_frames, "source_reference_mismatches":self.source_pcm_mismatches, "tone_hz":TONE_HZ,
-            "expected_amplitude":self.expected_amplitude, "headroom_db":self.expected_headroom_db, "amplitude_tolerance":"15 percent plus 0.0001", "minimum_tone_coherence":0.65, "channels":channels, "trailing_bytes":self.pending.len()})
+            "expected_amplitude":self.expected_amplitude, "headroom_db":self.expected_headroom_db, "amplitude_tolerance":"15 percent plus 0.0001", "minimum_tone_coherence":0.65, "tone_band_limit_hz":self.audio_band.as_ref().map(|(cutoff, _)| *cutoff), "channels":channels, "trailing_bytes":self.pending.len()})
+    }
+}
+
+/// Upper edge of the audio band used to judge DSD-sourced tones.
+const AUDIO_BAND_HZ: f64 = 20_000.0;
+
+/// Fourth-order Butterworth low-pass as two cookbook biquads; unity gain at the test tone.
+struct AudioBand {
+    stages: [Biquad; 2],
+}
+impl AudioBand {
+    fn new(cutoff: f64, rate: f64) -> Self {
+        Self {
+            stages: [
+                Biquad::low_pass(cutoff, rate, 0.541_196_100_146_197),
+                Biquad::low_pass(cutoff, rate, 1.306_562_964_876_377),
+            ],
+        }
+    }
+    fn process(&mut self, x: f64) -> f64 {
+        self.stages.iter_mut().fold(x, |x, stage| stage.process(x))
+    }
+}
+struct Biquad {
+    b: [f64; 3],
+    a: [f64; 2],
+    z: [f64; 2],
+}
+impl Biquad {
+    fn low_pass(cutoff: f64, rate: f64, q: f64) -> Self {
+        let (sin, cos) = (std::f64::consts::TAU * cutoff / rate).sin_cos();
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let b0 = (1.0 - cos) / 2.0 / a0;
+        Self {
+            b: [b0, 2.0 * b0, b0],
+            a: [-2.0 * cos / a0, (1.0 - alpha) / a0],
+            z: [0.0; 2],
+        }
+    }
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b[0] * x + self.z[0];
+        self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
+        self.z[1] = self.b[2] * x - self.a[1] * y;
+        y
     }
 }
 
@@ -550,5 +625,99 @@ mod tests {
         target.add(&[0x11, 0x11, 0x22, 0x22, 0x33, 0x33]);
         assert_eq!(source.bytes, target.bytes);
         assert_eq!(source.hash.finalize()[..], target.hash.finalize()[..]);
+    }
+    /// Runs the validator's own DSD tone through the production DSD-to-PCM converter, as the
+    /// hardware fallback legs do, and returns the independent check's verdict.
+    fn dsd_to_pcm_verdict(bit_rate: u32, target_rate: u32, tone_hz: Option<f64>) -> Value {
+        use usbdac_core::convert::{ConvertOptions, PcmFormat, SampleFormat};
+        use usbdac_core::dsd_pcm::DsdPcmConverter;
+        use usbdac_core::fake::FakeDac;
+        use usbdac_core::{DeviceInfo, PlaybackDevice};
+        let source = StreamRequest::dsd_native(bit_rate, 2);
+        let wire = StreamRequest::pcm(target_rate, 2, 32);
+        let format = FakeDac::new(DeviceInfo::new(1, 2, "fake"), vec![wire], 16)
+            .unwrap()
+            .negotiate(&wire)
+            .unwrap();
+        let options = ConvertOptions::default();
+        let target = PcmFormat::new(target_rate, 2, SampleFormat::int(32, 4).unwrap());
+        let mut converter = DsdPcmConverter::with_options(bit_rate, 2, target, &options).unwrap();
+        let mut check = ConversionCheck::new(source, format, false, options.headroom_db);
+        let signal_rate = bit_rate / 8;
+        let frames = u64::from(signal_rate) * 1500 / 1000;
+        let mut signal = Signal::from_spec(source.encoding, signal_rate, 2, 1, 1);
+        let mut output = vec![0u8; 1 << 16];
+        let mut emitted = 0u64;
+        let mut written = 0;
+        while written < frames {
+            let n = (frames - written).min(4096);
+            let input = signal.frames(n as usize);
+            written += n;
+            check.source(&input);
+            let mut offset = 0;
+            while offset < input.len() {
+                let done = converter.process(&input[offset..], &mut output).unwrap();
+                offset += done.consumed;
+                let bytes = match tone_hz {
+                    // A wrong-frequency tone of the same level, so only the tone check can fail.
+                    Some(hz) => wrong_tone(&mut emitted, done.produced / 8, hz, target_rate),
+                    None => output[..done.produced].to_vec(),
+                };
+                check.observe(&bytes);
+                if done.consumed == 0 && done.produced == 0 {
+                    break;
+                }
+            }
+        }
+        loop {
+            let produced = converter.finish(&mut output).unwrap();
+            if produced == 0 {
+                break;
+            }
+            let bytes = match tone_hz {
+                Some(hz) => wrong_tone(&mut emitted, produced / 8, hz, target_rate),
+                None => output[..produced].to_vec(),
+            };
+            check.observe(&bytes);
+        }
+        check.result(frames, signal_rate)
+    }
+    fn wrong_tone(emitted: &mut u64, frames: usize, hz: f64, rate: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frames * 8);
+        for _ in 0..frames {
+            let x = AMPLITUDE
+                * 10f64.powf(-3.5 / 20.0)
+                * (std::f64::consts::TAU * hz * *emitted as f64 / f64::from(rate)).sin();
+            for polarity in [1.0, -1.0] {
+                let v = (x * polarity * f64::from(i32::MAX)).round() as i32;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            *emitted += 1;
+        }
+        out
+    }
+    #[test]
+    fn low_rate_dsd_tone_survives_production_conversion_to_pcm() {
+        // DSD64 and DSD128 in both rate families failed on a DAC without native DSD
+        // (tone coherence 0.39 to 0.53) although level, polarity and duration were right.
+        for (bit_rate, target_rate) in [
+            (2_822_400, 192_000),
+            (3_072_000, 176_400),
+            (5_644_800, 192_000),
+            (6_144_000, 192_000),
+            (2_822_400, 44_100),
+            (3_072_000, 48_000),
+        ] {
+            let verdict = dsd_to_pcm_verdict(bit_rate, target_rate, None);
+            assert_eq!(
+                verdict["passed"], true,
+                "DSD {bit_rate} to {target_rate} Hz: {verdict}"
+            );
+        }
+    }
+    #[test]
+    fn dsd_tone_check_still_rejects_a_wrong_frequency() {
+        let verdict = dsd_to_pcm_verdict(2_822_400, 192_000, Some(TONE_HZ * 1.5));
+        assert_eq!(verdict["passed"], false, "{verdict}");
     }
 }
