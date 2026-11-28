@@ -11,6 +11,25 @@ pub(crate) const MAX_PACKETS_PER_TRANSFER: usize = 32;
 /// Packets in flight never reach this count. On the one phone and DAC this was
 /// measured on, 255 or fewer always played and exactly 256 always stalled.
 pub(crate) const PACKET_FLIGHT_LIMIT: usize = 256;
+/// Shortest transfer [`IsoQueueGeometry::capped_to_feedback_period`] produces.
+const MIN_FEEDBACK_CAPPED_TRANSFER_US: u32 = 1_000;
+/// ALSA's period of a sync (explicit feedback) endpoint, in microseconds
+/// (references/linux/sound/usb/endpoint.c:743-752): `bRefresh` when it is 1
+/// to 9, else 2 ms at full speed, else `2^(bInterval - 1)` microframes, and 8
+/// microframes for an out-of-range `bInterval`.
+pub(crate) fn alsa_sync_period_us(full_speed: bool, refresh: u8, interval: u8) -> u32 {
+    let syncinterval = if (1..=9).contains(&refresh) {
+        refresh
+    } else if full_speed {
+        1
+    } else if (1..=16).contains(&interval) {
+        interval - 1
+    } else {
+        3
+    };
+    let frame_us: u32 = if full_speed { 1_000 } else { 125 };
+    frame_us << syncinterval
+}
 /// Completed-transfer time after which a stream counts as stable.
 const STABLE_WINDOW_US: u64 = 256_000;
 /// Consecutive lossy transfers are bounded in time as well as in number: at
@@ -83,6 +102,27 @@ impl IsoQueueGeometry {
             .clamp(1, MAX_PACKETS_PER_TRANSFER as u64)
             .min(flight_cap.max(1));
         Self::from_packets(interval as u32, packets as usize, slots as usize)
+    }
+
+    /// Limit a transfer to one feedback period ([`alsa_sync_period_us`]), as
+    /// ALSA limits a playback URB with a sync endpoint to `1 << syncinterval`
+    /// packets (references/linux/sound/usb/endpoint.c:1196-1198), so each
+    /// feedback report steers at most one transfer's packet sizes. The time queued on the bus
+    /// is kept: the slots grow as the transfers shrink, within
+    /// [`PACKET_FLIGHT_LIMIT`]. A transfer is never cut below one millisecond,
+    /// so a feedback endpoint polled every microframe does not turn into
+    /// thousands of completions a second for the user-space worker.
+    pub(crate) fn capped_to_feedback_period(self, feedback_period_us: u32) -> Self {
+        let interval = self.service_interval_us.max(1);
+        let period = feedback_period_us.max(MIN_FEEDBACK_CAPPED_TRANSFER_US);
+        let packets = ((period / interval).max(1) as usize).min(MAX_PACKETS_PER_TRANSFER);
+        if packets >= self.packets_per_transfer {
+            return self;
+        }
+        let slots = (self.packets_in_flight() / packets)
+            .min((PACKET_FLIGHT_LIMIT - 1) / packets)
+            .max(self.transfer_slots);
+        Self::from_packets(interval, packets, slots)
     }
 
     fn from_packets(service_interval_us: u32, packets: usize, slots: usize) -> Self {
@@ -287,8 +327,11 @@ pub(crate) struct AdaptiveQueue {
 impl AdaptiveQueue {
     pub(crate) fn new(geometry: IsoQueueGeometry, enabled: bool) -> Self {
         let baseline = geometry.transfer_slots;
+        // Twice the starting depth: 16 slots at the default eight, and the
+        // same time when a feedback period halves the transfers.
         let max_slots = if enabled {
-            16usize
+            baseline
+                .saturating_mul(2)
                 .min((PACKET_FLIGHT_LIMIT - 1) / geometry.packets_per_transfer)
                 .min((64_000 / geometry.transfer_us().max(1)) as usize)
                 .max(baseline)
@@ -329,6 +372,45 @@ impl AdaptiveQueue {
 #[cfg(test)]
 mod adaptive_tests {
     use super::*;
+    #[test]
+    fn feedback_period_caps_transfers_and_keeps_the_queue() {
+        // D10 Balanced: 125 us data packets, explicit feedback every 1 ms.
+        // ALSA: min(MAX_PACKS_HS, 1 << (bInterval 4 - 1)) = 8 packets a URB.
+        let g = IsoQueueGeometry::default_for(125).capped_to_feedback_period(1_000);
+        assert_eq!((g.packets_per_transfer, g.transfer_slots), (8, 16));
+        assert_eq!(g.queued_us(), 16_000);
+        // Never below one millisecond, even with microframe feedback.
+        let g = IsoQueueGeometry::default_for(125).capped_to_feedback_period(125);
+        assert_eq!((g.packets_per_transfer, g.transfer_slots), (8, 16));
+        // A feedback period at or above the transfer changes nothing.
+        let base = IsoQueueGeometry::default_for(125);
+        assert_eq!(base.capped_to_feedback_period(2_000), base);
+        assert_eq!(base.capped_to_feedback_period(8_000), base);
+        // ALSA's sync periods: D10 (HS, bInterval 4), full speed without and
+        // with bRefresh, and HS microframe feedback.
+        assert_eq!(alsa_sync_period_us(false, 0, 4), 1_000);
+        assert_eq!(alsa_sync_period_us(true, 0, 1), 2_000);
+        assert_eq!(alsa_sync_period_us(true, 5, 1), 32_000);
+        assert_eq!(alsa_sync_period_us(false, 0, 1), 125);
+        assert_eq!(alsa_sync_period_us(false, 0, 0), 1_000);
+        // Full speed keeps its 2 ms transfers: ALSA's 2 ms sync period.
+        let full_speed = IsoQueueGeometry::default_for(1_000);
+        assert_eq!(
+            full_speed.capped_to_feedback_period(alsa_sync_period_us(true, 0, 1)),
+            full_speed
+        );
+        // The packet flight limit still wins on a deep queue.
+        let deep = IsoQueueGeometry::for_stream(125, 64, 8).capped_to_feedback_period(1_000);
+        assert!(deep.packets_in_flight() < PACKET_FLIGHT_LIMIT);
+        assert_eq!(deep.packets_per_transfer, 8);
+        // The adaptive ceiling keeps the same time as before the cap.
+        let capped = AdaptiveQueue::new(
+            IsoQueueGeometry::default_for(125).capped_to_feedback_period(1_000),
+            true,
+        );
+        assert_eq!((capped.slots, capped.max_slots), (16, 31));
+        assert_eq!(AdaptiveQueue::new(base, true).max_slots, 15);
+    }
     #[test]
     fn loss_bursts_deepen_and_quiet_periods_shrink_without_changing_packets() {
         let g = IsoQueueGeometry::default_for(125);
