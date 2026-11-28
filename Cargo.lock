@@ -603,7 +603,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "usbdac-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "usbdac-jni"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "android_logger",
  "jni",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "usbdac-validator"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "serde",
  "serde_json",

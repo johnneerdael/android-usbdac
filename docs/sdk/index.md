@@ -41,7 +41,7 @@ For support captures, use the [USB playback report guide](support-diagnostics.md
 
 ## Status
 
-This guide covers usbdac 0.1.19.
+This guide covers usbdac 0.1.20.
 
 - **Software coverage is recorded by revision.** Rust and Kotlin tests cover protocol and control behavior without a DAC; Android checks and builds cover the library and sample for four processor types. See the [release validation scope](evidence.md#release-validation-scope) for the limits of those checks and for the QEMU playback check, which ran in a virtual machine and not on a DAC.
 - **Hardware testing is still limited.** On a OnePlus 15, the Android validator played its exact-format matrix on four DACs with explicit feedback, and every format passed USB delivery bit-perfect: the iBasso DC04U and an SMSL USB AUDIO (PCM to 768 kHz, native DSD to DSD512 under the source-backed quirk policy), a Schiit Unison Modius E (PCM to 192 kHz), and the Hidizs AP80 Pro-X (PCM to 384 kHz, native DSD to DSD256). The DoP rows prove the carrier only; nothing on the analog side was observed. Earlier builds played the AP80 Pro-X and the DC04U in the SDK sample and in Flick. Those are the only physical streaming results. Implicit feedback, UAC3 and BADD, capture and duplex, routing controls, DoP decoding by the DAC, the Android-managed output, AAudio and the macOS playback path have not been run on a device. [Hardware status](evidence.md#hardware-status)
