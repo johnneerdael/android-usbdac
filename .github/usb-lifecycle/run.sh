@@ -89,23 +89,50 @@ if [ "${1:-}" = build ]; then
     } > "$out/manifest.txt"
     sha256sum "$out/vmlinuz-lts" "$out/initramfs.gz" > "$out/runtime.SHA256"
     echo "USBIP_BUILD_READY $out"
-elif [ "${1:-}" = run ]; then
-    test -f "$out/manifest.txt" && test -f "$out/runtime.SHA256" && test -f "$out/initramfs.gz" && test -f "$out/vmlinuz-lts"
-    sha256sum -c "$out/runtime.SHA256"
-    deadline=$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
-    printf 'stop_deadline_utc=%s\n' "$deadline" | tee "$out/acceptance-window.txt"
-    set +e
-    timeout --kill-after=5 600 qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 -nographic -no-reboot -nic none -kernel "$out/vmlinuz-lts" -initrd "$out/initramfs.gz" -append 'console=ttyAMA0 rdinit=/init panic=-1' > "$out/serial.log" 2>&1
-    status=$?
-    set -e
-    mkdir -p "$out/modes"
-    python3 - "$out/serial.log" "$out/modes" <<'SPLIT'
+elif [ "${1:-}" = run ] || [ "${1:-}" = check ]; then
+    action=$1
+    selection=${2:-full}
+    if [ "$#" -gt 2 ]; then echo "select at most one mode" >&2; exit 2; fi
+    full_modes='normal bad-cur stale-cur badd full-uac3 duplex retire jni-retire full-uac3-clock reconfigure selector zero-res full-uac3-clock-bad full-uac3-clock-stale full-uac3-volatile refuse-set'
+    case "$selection" in
+        full) expected=$full_modes ;;
+        clock-faults) expected='full-uac3-clock-bad full-uac3-clock-stale' ;;
+        *)
+            case " $full_modes " in
+                *" $selection "*) expected=$selection ;;
+                *) echo "unknown mode: $selection" >&2; exit 2 ;;
+            esac ;;
+    esac
+    serial="$out/serial.log"
+    mode_dir="$out/modes"
+    window="$out/acceptance-window.txt"
+    if [ "$selection" != full ]; then
+        serial="$out/serial-$selection.log"
+        mode_dir="$out/modes-$selection"
+        window="$out/acceptance-window-$selection.txt"
+    fi
+    if [ "$action" = run ]; then
+        test -f "$out/manifest.txt" && test -f "$out/runtime.SHA256" && test -f "$out/initramfs.gz" && test -f "$out/vmlinuz-lts"
+        sha256sum -c "$out/runtime.SHA256"
+        if [ -e "$serial" ]; then echo "refusing to overwrite existing evidence: $serial" >&2; exit 1; fi
+        deadline=$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+        printf 'stop_deadline_utc=%s\nselection=%s\n' "$deadline" "$selection" | tee "$window"
+        kernel_args='console=ttyAMA0 rdinit=/init panic=-1'
+        if [ "$selection" != full ]; then kernel_args="$kernel_args usbip.mode=$selection"; fi
+        set +e
+        timeout --kill-after=5 600 qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 1024 -nographic -no-reboot -nic none -kernel "$out/vmlinuz-lts" -initrd "$out/initramfs.gz" -append "$kernel_args" > "$serial" 2>&1
+        status=$?
+        set -e
+        mkdir -p "$mode_dir"
+        python3 - "$serial" "$mode_dir" <<'SPLIT'
 import pathlib, re, sys
 source, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 current = None
 for line in source.read_text(errors="replace").splitlines(keepends=True):
     match = re.match(r"USBIP_MODE_START mode=([a-z0-9-]+) ", line)
     if match:
+        if current:
+            current.close()
         current = (output / (match.group(1) + ".log")).open("w")
     if current:
         current.write(line)
@@ -115,15 +142,28 @@ for line in source.read_text(errors="replace").splitlines(keepends=True):
 if current:
     current.close()
 SPLIT
-    test "$status" -eq 0 || { echo "QEMU failed or timed out: $status"; exit 1; }
-    for mode in normal bad-cur stale-cur badd full-uac3 duplex retire jni-retire full-uac3-clock reconfigure selector zero-res full-uac3-clock-bad full-uac3-clock-stale full-uac3-volatile refuse-set; do
-        test "$(grep -c "^USBIP_MODE_PASS mode=$mode$" "$out/serial.log")" -eq 1
-    done
-    test "$(grep -c '^USBIP_AGGREGATE failures=0$' "$out/serial.log")" -eq 1
-    ! grep -Eq 'USBIP_(MODE_FAIL|BOOT_FAIL|CLEANUP_FAIL)' "$out/serial.log"
-    grep -q 'reboot: Power down' "$out/serial.log"
-    echo "USBIP_ACCEPTANCE_PASS $out"
+        test "$status" -eq 0 || { echo "QEMU failed or timed out: $status"; exit 1; }
+    fi
+    python3 - "$serial" "$expected" <<'CHECK'
+import collections, pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+# splitlines normalizes CRLF for verification; the raw serial file is never changed.
+lines = path.read_text(errors="replace").splitlines()
+expected = sys.argv[2].split()
+starts = [match.group(1) for line in lines if (match := re.fullmatch(r"USBIP_MODE_START mode=([a-z0-9-]+) port=[0-9]+", line))]
+passes = [match.group(1) for line in lines if (match := re.fullmatch(r"USBIP_MODE_PASS mode=([a-z0-9-]+)", line))]
+if collections.Counter(starts) != collections.Counter(expected) or collections.Counter(passes) != collections.Counter(expected):
+    raise SystemExit(f"mode mismatch: expected={expected}, started={starts}, passed={passes}")
+aggregates = [line for line in lines if line.startswith("USBIP_AGGREGATE ")]
+if aggregates != ["USBIP_AGGREGATE failures=0"]:
+    raise SystemExit(f"aggregate failure: {aggregates}")
+if any(re.search(r"USBIP_(MODE_FAIL|BOOT_FAIL|CLEANUP_FAIL)", line) for line in lines):
+    raise SystemExit("fixture reported failure")
+if not any("reboot: Power down" in line for line in lines):
+    raise SystemExit("guest poweroff not observed")
+print(f"USBIP_ACCEPTANCE_PASS {path} modes={len(expected)}")
+CHECK
 else
-    echo "usage: $0 build|run" >&2
+    echo "usage: $0 build|run [mode]|check [mode]" >&2
     exit 2
 fi

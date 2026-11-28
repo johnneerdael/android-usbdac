@@ -3062,12 +3062,103 @@ pub(super) fn verify_adc3_capture_activation(
     validate_adc3_clock(handle, route, rate, false)
 }
 
+#[derive(Debug)]
+enum Adc3ClockFailure {
+    Other(String),
+    DeviceLost,
+    Frequency(Option<u32>),
+}
+impl From<String> for Adc3ClockFailure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<&str> for Adc3ClockFailure {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl std::fmt::Display for Adc3ClockFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(error) => f.write_str(error),
+            Self::DeviceLost => f.write_str("ADC3 device disconnected"),
+            Self::Frequency(rate) => write!(f, "ADC3 source frequency unverified: {rate:?}"),
+        }
+    }
+}
+
+fn adc3_frequency_evidence(
+    result: Result<usize, rusb::Error>,
+    bytes: [u8; 4],
+) -> Result<u32, Adc3ClockFailure> {
+    match result {
+        Err(rusb::Error::NoDevice) => Err(Adc3ClockFailure::DeviceLost),
+        Ok(4) if u32::from_le_bytes(bytes) != 0 => Ok(u32::from_le_bytes(bytes)),
+        Ok(_) | Err(rusb::Error::Pipe | rusb::Error::Timeout) => {
+            Err(Adc3ClockFailure::Frequency(None))
+        }
+        Err(error) => Err(Adc3ClockFailure::Other(format!(
+            "ADC3 frequency read: {error}"
+        ))),
+    }
+}
+
+fn read_adc3_frequency(
+    handle: &DeviceHandle<Context>,
+    control: u8,
+    source: u8,
+) -> Result<u32, Adc3ClockFailure> {
+    let mut bytes = [0; 4];
+    let result = handle.read_control(
+        0xa1,
+        1,
+        0x0100,
+        u16::from(control) | (u16::from(source) << 8),
+        &mut bytes,
+        Duration::from_secs(1),
+    );
+    itf_class_control_delay(handle);
+    adc3_frequency_evidence(result, bytes)
+}
+
+pub(super) fn configure_adc3_post_activation(
+    handle: &DeviceHandle<Context>,
+    route: &Adc3Route,
+    rate: u32,
+) -> Result<(), crate::Error> {
+    validate_adaptive_capture_rate(route, rate).map_err(crate::Error::Transfer)?;
+    validate_adc3_clock_detailed(handle, route, rate, true)
+        .map_err(|failure| adc3_post_activation_error(rate, failure))
+}
+
+fn adc3_post_activation_error(rate: u32, failure: Adc3ClockFailure) -> crate::Error {
+    match failure {
+        Adc3ClockFailure::DeviceLost => crate::Error::DeviceLost,
+        Adc3ClockFailure::Frequency(reported_hz) => crate::Error::ClockUnverified {
+            requested_hz: rate,
+            reported_hz,
+        },
+        Adc3ClockFailure::Other(error) => crate::Error::Transfer(error),
+    }
+}
+
 fn validate_adc3_clock(
     handle: &DeviceHandle<Context>,
     route: &Adc3Route,
     rate: u32,
     allow_frequency_write: bool,
 ) -> Result<(), String> {
+    validate_adc3_clock_detailed(handle, route, rate, allow_frequency_write)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_adc3_clock_detailed(
+    handle: &DeviceHandle<Context>,
+    route: &Adc3Route,
+    rate: u32,
+    allow_frequency_write: bool,
+) -> Result<(), Adc3ClockFailure> {
     if matches!(route.profile, wire::FunctionProfile::Badd(_)) {
         return if rate == 48000 {
             Ok(())
@@ -3087,9 +3178,8 @@ fn validate_adc3_clock(
     if !sampling_frequency_ranges_support_rate(&wire_ranges, wire_rate) {
         return Err("ADC3 rate outside source ranges".into());
     }
-    let mut current = [0; 4];
-    read_exact(handle, route.control, source.id, 1, 1, &mut current)?;
-    if u32::from_le_bytes(current) != rate {
+    let current = read_adc3_frequency(handle, route.control, source.id)?;
+    if current != rate {
         if !allow_frequency_write {
             return Err("ADC3 source frequency changed before activation".into());
         }
@@ -3100,9 +3190,12 @@ fn validate_adc3_clock(
         write_exact(handle, route.control, source.id, 1, &rate.to_le_bytes())?;
         thread::sleep(Duration::from_millis(settings().settle_delay_ms()));
     }
-    read_exact(handle, route.control, source.id, 1, 1, &mut current)?;
-    if route.wire_rate(u32::from_le_bytes(current))? != wire_rate {
-        return Err("ADC3 source frequency verification failed".into());
+    let current = read_adc3_frequency(handle, route.control, source.id)?;
+    let reported = route.wire_rate(current)?;
+    if reported != wire_rate {
+        return Err(Adc3ClockFailure::Frequency(
+            (reported > 0).then_some(reported),
+        ));
     }
     verify_adc3_rate_route(handle, route)?;
     let validity = crate::clock_resolution::clock_validity(source.controls.0, || {
@@ -4539,6 +4632,49 @@ pub(super) fn adc3_badd_volume_topology(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_activation_frequency_errors_preserve_typed_evidence() {
+        use super::{adc3_frequency_evidence, adc3_post_activation_error, Adc3ClockFailure};
+        let bad = adc3_frequency_evidence(Err(rusb::Error::Pipe), [0; 4]).unwrap_err();
+        assert_eq!(
+            adc3_post_activation_error(96_000, bad),
+            crate::Error::ClockUnverified {
+                requested_hz: 96_000,
+                reported_hz: None,
+            }
+        );
+        assert_eq!(
+            adc3_post_activation_error(96_000, Adc3ClockFailure::Frequency(Some(48_000))),
+            crate::Error::ClockUnverified {
+                requested_hz: 96_000,
+                reported_hz: Some(48_000)
+            }
+        );
+        let detached = adc3_frequency_evidence(Err(rusb::Error::NoDevice), [0; 4]).unwrap_err();
+        assert_eq!(
+            adc3_post_activation_error(96_000, detached),
+            crate::Error::DeviceLost
+        );
+        assert!(matches!(
+            adc3_post_activation_error(96_000, Adc3ClockFailure::Other("route".into())),
+            crate::Error::Transfer(_)
+        ));
+        for result in [
+            Err(rusb::Error::Pipe),
+            Err(rusb::Error::Timeout),
+            Ok(2),
+            Ok(4),
+        ] {
+            let failure = adc3_frequency_evidence(result, [0; 4]).unwrap_err();
+            assert!(matches!(failure, Adc3ClockFailure::Frequency(None)));
+        }
+        let failure = adc3_frequency_evidence(Err(rusb::Error::Access), [0; 4]).unwrap_err();
+        assert!(matches!(
+            adc3_post_activation_error(96_000, failure),
+            crate::Error::Transfer(_)
+        ));
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn badd_witness_rejects_registered_owner_and_duplicate_fd() {

@@ -129,6 +129,7 @@ entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex
 IFS= read -r cmdline < /proc/cmdline
 for arg in $cmdline; do
     case "$arg" in
+        usbip.mode=clock-faults) entries=full-uac3-clock-bad:3252\ full-uac3-clock-stale:3253 ;;
         usbip.mode=refuse-set) entries=refuse-set:3255 ;;
         usbip.mode=full-uac3-volatile) entries=full-uac3-volatile:3254 ;;
         usbip.mode=full-uac3-clock-bad) entries=full-uac3-clock-bad:3252 ;;
