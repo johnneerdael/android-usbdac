@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/usbdac-core", "crates/usbdac-jni", "crates/usbdac-validator"]
 
 [workspace.package]
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 license = "MIT"
 
