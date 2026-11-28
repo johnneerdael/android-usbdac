@@ -87,4 +87,35 @@ class DriverPlaybackSelectorTest {
         assertTrue(recorded.closed)
     }
 
+    // PcmOutput.writableBytes is "the room up to the target depth"; the staged partial wire word
+    // already uses part of the target's room, as in the other driver adapters.
+    @Test fun nativeDsdWritableBytesFollowsTargetRoom() {
+        val recording = RecordingOutput()
+        val wire = object : PcmOutput by recording {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                val complete = minOf(buffer.remaining(), recording.writable) / 8 * 8
+                if (complete == 0) return 0
+                val view = buffer.duplicate().apply { limit(position() + complete) }
+                val count = recording.write(view)
+                buffer.position(buffer.position() + count)
+                recording.writable -= count
+                return count
+            }
+        }
+        val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = 4)
+        recording.writable = 16
+        assertEquals(16, output.writableBytes)
+        assertEquals(2, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2))))
+        assertEquals(14, output.writableBytes)
+        recording.writable = 0
+        assertEquals(0, output.writableBytes)
+        assertEquals(6, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(3, 4, 5, 6, 7, 8))))
+        assertEquals(0, output.writableBytes)
+        recording.writable = 8
+        assertEquals(0, output.writableBytes)
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8), recording.received.toByteArray())
+        recording.writable = 100_000
+        assertEquals(64 * 1024, output.writableBytes)
+        output.close()
+    }
 }

@@ -64,4 +64,22 @@ class DsdDopOutputTest {
         assertEquals(5, target.received.last().toInt())
     }
 
+    // PcmOutput.write: the return value equals the position delta, and Media3's
+    // AudioSink.handleBuffer must report consumed bytes, so a target failure after the input
+    // advanced is returned as the accepted count and rethrown on the next call.
+    @Test fun targetFailureAfterAcceptingInputReturnsTheCountAndRethrowsLater() {
+        val target = FailsAfterPartialWrite(RecordingOutput(), acceptBytes = 3)
+        val output = DsdDopOutput(target, 2, 3, true)
+        val input = heapOf(0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc)
+        assertEquals(6, output.write(input))
+        assertEquals(6, input.position())
+        assertEquals(listOf(0x56, 0x12, 0x05), target.recorded.received.map { it.toInt() and 255 })
+        assertSame(target.failure, assertThrows(DacException::class.java) { output.write(heapOf(1, 2)) })
+        assertSame(target.failure, assertThrows(DacException::class.java) { output.writableBytes })
+        assertSame(target.failure, assertThrows(DacException::class.java) { output.flush() })
+        assertSame(target.failure, assertThrows(DacException::class.java) { output.play() })
+        assertEquals(1, target.attempts)
+        output.close()
+        assertTrue(target.recorded.closed)
+    }
 }

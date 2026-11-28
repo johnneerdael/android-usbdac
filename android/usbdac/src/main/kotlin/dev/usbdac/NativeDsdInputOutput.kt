@@ -37,7 +37,10 @@ internal class NativeDsdInputOutput(private val target: PcmOutput, private val c
         if (closed) return 0
         targetFailure?.let { throw it }
         if (draining) return 0
-        pump(); pending.remaining().let { it - it % channels }
+        // PcmOutput.writableBytes is the room up to the target depth: the staged bytes of an
+        // incomplete wire word already use part of the target's room, as in the other adapters.
+        pump()
+        minOf(pending.remaining(), (targetCall { target.writableBytes } - pending.position()).coerceAtLeast(0)).let { it - it % channels }
     }
     override fun play() = synchronized(lock) { if (closed) throw DacException(DacErrorCode.INVALID_STATE, "output closed"); targetCall { target.play() } }
     override fun pause() = synchronized(lock) { if (closed) throw DacException(DacErrorCode.INVALID_STATE, "output closed"); targetCall { target.pause() } }

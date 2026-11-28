@@ -163,3 +163,25 @@ internal fun directOf(vararg bytes: Int): ByteBuffer =
     }
 
 internal fun heapOf(vararg bytes: Int): ByteBuffer = ByteBuffer.wrap(ByteArray(bytes.size) { bytes[it].toByte() })
+
+/**
+ * A target that takes [acceptBytes] of the first non-empty write, advances the buffer by them and
+ * then throws [failure], as a stream that fails partway through a transfer does. Every later call
+ * goes to [recorded] so a test can see whether the adapter called the target again.
+ */
+internal class FailsAfterPartialWrite(
+    val recorded: RecordingOutput,
+    private val acceptBytes: Int,
+    val failure: DacException = DacException(DacErrorCode.TRANSFER, "target failed"),
+) : PcmOutput by recorded {
+    var attempts = 0
+    override fun write(buffer: ByteBuffer): Int {
+        if (!buffer.hasRemaining()) return 0
+        attempts++
+        if (attempts > 1) return recorded.write(buffer)
+        val limit = buffer.limit()
+        buffer.limit(buffer.position() + minOf(acceptBytes, buffer.remaining()))
+        try { recorded.write(buffer) } finally { buffer.limit(limit) }
+        throw failure
+    }
+}

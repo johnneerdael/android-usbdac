@@ -76,6 +76,28 @@ class RealCoreRankingTest {
         }
     }
 
+    // PcmOutput.write: the return value equals the position delta, and Media3's
+    // AudioSink.handleBuffer must report consumed bytes. The converter consumed source bytes
+    // before the target failed, so the count is returned and the failure is rethrown later.
+    @Test fun dsdPcmReturnsConsumedSourceBeforeTargetFailure() {
+        assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val target = FailsAfterPartialWrite(RecordingOutput(), acceptBytes = 4)
+        val output = DsdPcmOutput(target, 2_822_400, 2, 176_400, 2, PcmLayout.PCM_16)
+        try {
+            val input = ByteBuffer.allocateDirect(8192 * 2).apply { repeat(capacity()) { put(0x69.toByte()) }; flip() }
+            val accepted = output.write(input)
+            assertTrue(accepted > 0)
+            assertEquals(accepted, input.position())
+            assertEquals(4, target.recorded.received.size)
+            assertTrue(org.junit.Assert.assertThrows(DacException::class.java) { output.write(input) } === target.failure)
+            assertTrue(org.junit.Assert.assertThrows(DacException::class.java) { output.writableBytes } === target.failure)
+            assertTrue(org.junit.Assert.assertThrows(DacException::class.java) { output.drain() } === target.failure)
+            assertEquals(accepted, input.position())
+            assertEquals(1, target.attempts)
+        } finally { output.close() }
+        assertTrue(target.recorded.closed)
+    }
+
     @Test fun productionConverterCanTargetFloat32Wire() {
         assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
         val target = StreamFormat(

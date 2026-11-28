@@ -29,14 +29,25 @@ public class DsdDopOutput(
     private var draining = false
     private var targetDrained = false
     private var closed = false
+    // PcmOutput.write returns the position delta, and Media3's AudioSink.handleBuffer must report
+    // what it consumed: a target failure after this call accepted input is returned as that count
+    // and rethrown, unchanged, by the next call.
+    private var targetFailure: DacException? = null
+
+    private inline fun <T> targetCall(block: () -> T): T {
+        targetFailure?.let { throw it }
+        return try { block() } catch (error: DacException) { targetFailure = error; throw error }
+    }
     override val bitPerfect: StateFlow<BitPerfectState> get() = target.bitPerfect
 
     private fun pump() {
-        if (pending.hasRemaining()) target.write(pending)
+        if (pending.hasRemaining()) targetCall { target.write(pending) }
     }
 
     override fun write(buffer: ByteBuffer): Int = synchronized(lock) {
-        check(!closed && !draining)
+        check(!closed)
+        targetFailure?.let { throw it }
+        check(!draining)
         pump()
         if (pending.hasRemaining()) return 0
         val start = buffer.position()
@@ -59,12 +70,14 @@ public class DsdDopOutput(
             marker = marker xor 0xff
         }
         pending.flip()
-        pump()
+        try { pump() } catch (_: DacException) { return@synchronized buffer.position() - start }
         buffer.position() - start
     }
 
     override val writableBytes: Int get() = synchronized(lock) {
-        if (closed || draining) return 0
+        if (closed) return 0
+        targetFailure?.let { throw it }
+        if (draining) return 0
         pump()
         if (pending.hasRemaining()) return 0
         val frames = target.writableBytes / carrierFrame
@@ -74,17 +87,17 @@ public class DsdDopOutput(
 
     override fun play(): Unit = synchronized(lock) {
         check(!closed)
-        target.play()
+        targetCall { target.play() }
     }
 
     override fun pause(): Unit = synchronized(lock) {
         check(!closed)
-        target.pause()
+        targetCall { target.pause() }
     }
 
     override fun flush(): Unit = synchronized(lock) {
         check(!closed)
-        target.flush()
+        targetCall { target.flush() }
         pending.clear()
         pending.limit(0)
         marker = 0x05
@@ -96,7 +109,7 @@ public class DsdDopOutput(
     private fun pumpDrain() {
         pump()
         if (!pending.hasRemaining() && !targetDrained) {
-            target.drain()
+            targetCall { target.drain() }
             targetDrained = true
         }
     }
@@ -109,9 +122,11 @@ public class DsdDopOutput(
     }
 
     override val isDrained: Boolean get() = synchronized(lock) {
-        if (closed || !draining) return false
+        if (closed) return false
+        targetFailure?.let { throw it }
+        if (!draining) return false
         pumpDrain()
-        targetDrained && target.isDrained
+        targetDrained && targetCall { target.isDrained }
     }
 
     override val playedFrames: Long get() = synchronized(lock) {
