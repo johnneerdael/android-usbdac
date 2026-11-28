@@ -3,7 +3,7 @@ use crate::{
     capture_json, java_string, json, optional_string_of, registry, run, string_of, Failure,
 };
 use jni::objects::{JByteBuffer, JObject, JString};
-use jni::{jni_mangle, jni_sig, jni_str, EnvUnowned};
+use jni::{jni_mangle, EnvUnowned};
 use usbdac_core::Dac;
 
 #[jni_mangle("dev.usbdac.internal.Native")]
@@ -158,10 +158,7 @@ pub fn capture_read<'l>(
         if buffer.is_null() {
             return Err(Failure::Bad("capture buffer is null".into()));
         }
-        if env
-            .call_method(&buffer, jni_str!("isReadOnly"), jni_sig!("()Z"), &[])?
-            .z()?
-        {
+        if crate::convert::is_read_only(env, &buffer)? {
             return Err(Failure::Bad("capture buffer is read-only".into()));
         }
         let offset = usize::try_from(offset)
