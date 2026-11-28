@@ -15,6 +15,8 @@ import org.mockito.Mockito
 import java.nio.ByteBuffer
 
 class DirectOutputControllerTest {
+    private fun <T> anyValue(): T = Mockito.any<T>()
+
     @Test fun unplugRemainsDirectAcrossFlushUntilExplicitAndroidSelection() {
         for (unplug in listOf(true, false)) {
         val events = MutableSharedFlow<DacEvent>(extraBufferCapacity = 8)
@@ -27,7 +29,7 @@ class DirectOutputControllerTest {
             Mockito.`when`(selected.decision).thenReturn(decision)
             Mockito.`when`(selected.format).thenReturn(WriteFormat(44_100, 2, 2, 16, 44_100))
             Mockito.`when`(selected.writableBytes).thenReturn(4096)
-            Mockito.`when`(selected.write(Mockito.any(ByteBuffer::class.java))).thenAnswer {
+            Mockito.`when`(selected.write(anyValue<ByteBuffer>())).thenAnswer {
                 val buffer = it.getArgument<ByteBuffer>(0)
                 val count = buffer.remaining()
                 buffer.position(buffer.limit())
@@ -45,7 +47,7 @@ class DirectOutputControllerTest {
             val selector = Mockito.mock(OutputSelector::class.java)
             val snapshot = Mockito.mock(OutputSelector.PcmSupportSnapshot::class.java)
             Mockito.`when`(selector.pcmSupportSnapshot()).thenReturn(snapshot)
-            Mockito.`when`(selector.open(Mockito.any(StreamRequest::class.java))).thenAnswer {
+            Mockito.`when`(selector.open(anyValue<StreamRequest>())).thenAnswer {
                 attempts++
                 if (attached && policy.allowDirectUsb) direct
                 else if (policy.force == OutputKind.DIRECT_USB) throw DacException(DacErrorCode.DEVICE_LOST, "absent")
