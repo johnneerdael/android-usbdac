@@ -729,7 +729,7 @@ impl Capture {
                 "ring_enqueue",
                 started,
                 started.elapsed(),
-                pending.len() - offset,
+                write.as_ref().copied().unwrap_or(0),
                 write.as_ref().copied().unwrap_or(0),
                 matches!(&write, Ok(0)),
             );

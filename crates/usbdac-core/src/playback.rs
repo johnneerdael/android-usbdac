@@ -293,6 +293,22 @@ fn candidates(
                     rates.push(rate);
                 }
             }
+            if range.step_hz > 0 {
+                if let Some(maximum) = policy.max_pcm_rate {
+                    let ceiling = maximum.min(range.max_hz);
+                    if ceiling >= range.min_hz {
+                        let index = (ceiling - range.min_hz) / range.step_hz;
+                        if let Some(rate) = index
+                            .checked_mul(range.step_hz)
+                            .and_then(|v| range.min_hz.checked_add(v))
+                        {
+                            if supported_rate(alt, rate) {
+                                rates.push(rate);
+                            }
+                        }
+                    }
+                }
+            }
             if range.step_hz > 0 && source_rate >= range.min_hz {
                 let n = (source_rate - range.min_hz) / range.step_hz;
                 for i in [n, n.saturating_add(1)] {
@@ -381,7 +397,7 @@ fn candidates(
             } else {
                 StreamRequest::pcm(rate, alt.channels, alt.valid_bits)
             };
-            if source.encoding == Encoding::Pcm && req == *source {
+            if req == *source {
                 continue;
             }
             if !found.iter().any(|(r, _)| *r == req) {
@@ -424,7 +440,7 @@ fn candidates(
                     }
                     StreamRequest::dsd_native(bit_rate, alt.channels)
                 } else if policy.dop_confirmed
-                    && matches!(source.encoding, Encoding::DsdNative { .. })
+                    && matches!(source.encoding, Encoding::DsdNative { .. } | Encoding::DoP)
                     && matches!(alt.format, AltFormat::Pcm | AltFormat::Dop)
                     && [24, 32].contains(&alt.valid_bits)
                 {
@@ -992,6 +1008,12 @@ impl Dac {
         listener: Arc<dyn DacListener>,
     ) -> Result<PlaybackStream> {
         let engine = match &decision.transform {
+            PlaybackTransform::Direct
+                if matches!(decision.source.encoding, Encoding::DsdNative { .. })
+                    && decision.source_frame_bytes < decision.format.bytes_per_frame() =>
+            {
+                Engine::DsdRepack
+            }
             PlaybackTransform::Direct => Engine::Direct,
             PlaybackTransform::Pcm {
                 plan,
@@ -1023,13 +1045,15 @@ impl Dac {
                 let mut opts = *options;
                 opts.source_sample = None;
                 Engine::Dsd {
-                    converter: DsdPcmConverter::with_options(
-                        *bit_rate,
-                        decision.source.channels,
-                        target,
-                        &opts,
-                    )
-                    .map_err(conversion_error)?,
+                    converter: Box::new(
+                        DsdPcmConverter::with_options(
+                            *bit_rate,
+                            decision.source.channels,
+                            target,
+                            &opts,
+                        )
+                        .map_err(conversion_error)?,
+                    ),
                     dop: *dop_input,
                 }
             }
@@ -1046,7 +1070,7 @@ impl Dac {
             input_offset: 0,
             output: Vec::with_capacity(65536),
             output_offset: 0,
-            marker: false,
+            marker: None,
             finishing: false,
             drain_called: false,
             source_bytes: 0,
@@ -1065,7 +1089,7 @@ enum Engine {
         unsigned: bool,
     },
     Dsd {
-        converter: DsdPcmConverter,
+        converter: Box<DsdPcmConverter>,
         dop: bool,
     },
 }
@@ -1121,7 +1145,7 @@ pub struct PlaybackStream {
     input_offset: usize,
     output: Vec<u8>,
     output_offset: usize,
-    marker: bool,
+    marker: Option<bool>,
     finishing: bool,
     drain_called: bool,
     source_bytes: u64,
@@ -1348,61 +1372,17 @@ impl PlaybackStream {
         Ok(n)
     }
     fn write_dsd_repack(&mut self, data: &[u8]) -> Result<usize> {
-        let src_ch = usize::from(self.decision.source.channels);
-        let dst_ch = usize::from(self.decision.format.channels);
-        let source_dop = self.decision.source.encoding == Encoding::DoP;
-        let target_dop = self.decision.format.encoding == Encoding::DoP;
-        let source_frame = self.decision.source_frame_bytes;
-        let target_slot = usize::from(self.decision.format.subslot_bytes);
-        let group = if source_dop {
-            if target_dop {
-                1
-            } else {
-                target_slot.div_ceil(2)
-            }
-        } else if target_dop {
-            2
-        } else {
-            target_slot
-        };
-        let frames = (data.len() / source_frame).min(256) / group * group;
-        let taken = frames * source_frame;
-        if taken == 0 {
-            return Ok(0);
-        }
         let start = self.timing_start();
-        self.input.clear();
-        if source_dop {
-            unpack_dop_into(
-                &data[..taken],
-                src_ch,
-                source_frame / src_ch,
-                &mut self.marker,
-                &mut self.input,
-            )?;
-        } else {
-            self.input.extend_from_slice(&data[..taken]);
-        }
-        self.output.clear();
+        let taken = repack_dsd_input(
+            &self.decision.source,
+            &self.decision.format,
+            self.decision.source_frame_bytes,
+            data,
+            &mut self.marker,
+            &mut self.input,
+            &mut self.output,
+        )?;
         self.output_offset = 0;
-        if target_dop {
-            for pair in self.input.chunks_exact(src_ch * 2) {
-                for ch in 0..dst_ch {
-                    let input_ch = if src_ch == 1 { 0 } else { ch };
-                    if target_slot == 4 {
-                        self.output.push(0);
-                    }
-                    self.output.push(pair[src_ch + input_ch]);
-                    self.output.push(pair[input_ch]);
-                    self.output.push(0);
-                }
-            }
-        } else if src_ch == 1 && dst_ch == 2 {
-            self.output.resize(self.input.len() * 2, 0);
-            duplicate_mono_dsd(&self.input, &mut self.output);
-        } else {
-            self.output.extend_from_slice(&self.input);
-        }
         self.timing_end(
             start,
             ProducerTimingPhase::SourceFormat,
@@ -1410,8 +1390,6 @@ impl PlaybackStream {
             self.output.len(),
             false,
         );
-        self.input.clear();
-        self.input_offset = 0;
         self.source_bytes += taken as u64;
         let _ = self.flush_output()?;
         Ok(taken)
@@ -1419,11 +1397,18 @@ impl PlaybackStream {
     /// Begin or progress drain. Returns false when the caller must retry after
     /// the USB ring makes space; `is_drained` reports actual USB completion.
     pub fn drain(&mut self) -> Result<bool> {
+        if matches!(self.engine, Engine::DsdRepack) {
+            ensure_repack_complete(&self.input)?;
+        }
         self.finishing = true;
         if self.drain_called {
             return Ok(true);
         }
-        if !self.pump()? {
+        if matches!(self.engine, Engine::DsdRepack) {
+            if !self.flush_output()? {
+                return Ok(false);
+            }
+        } else if !self.pump()? {
             return Ok(false);
         }
         if !matches!(self.engine, Engine::Direct | Engine::DsdRepack) {
@@ -1473,7 +1458,7 @@ impl PlaybackStream {
         self.output.clear();
         self.input_offset = 0;
         self.output_offset = 0;
-        self.marker = false;
+        self.marker = None;
         self.finishing = false;
         self.drain_called = false;
         self.source_bytes = 0;
@@ -1481,11 +1466,18 @@ impl PlaybackStream {
         Ok(())
     }
     pub fn writable_bytes(&self) -> usize {
-        if self.finishing
-            || self.output_offset < self.output.len()
-            || self.input_offset < self.input.len()
-        {
+        if self.finishing {
             0
+        } else if self.output_offset < self.output.len()
+            || (!matches!(self.engine, Engine::DsdRepack) && self.input_offset < self.input.len())
+        {
+            // A writer that polls writable_bytes must get a chance to call write(), which pumps
+            // retained data. The target's capacity remains the backpressure authority.
+            staged_retry_capacity(
+                self.stream.writable_bytes(),
+                self.decision.format.bytes_per_frame(),
+                self.decision.source_frame_bytes,
+            )
         } else if matches!(self.engine, Engine::Direct) {
             self.stream
                 .writable_bytes()
@@ -1550,6 +1542,85 @@ impl PlaybackStream {
         self.stream.close()
     }
 }
+fn staged_retry_capacity(wire_room: usize, wire_frame: usize, source_frame: usize) -> usize {
+    if wire_frame > 0 && wire_room >= wire_frame {
+        source_frame
+    } else {
+        0
+    }
+}
+fn ensure_repack_complete(pending: &[u8]) -> Result<()> {
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(
+            "incomplete final native DSD word or DoP pair".into(),
+        ))
+    }
+}
+
+/// Accept complete source frames, buffering incomplete target groups for the next write.
+fn repack_dsd_input(
+    source: &StreamRequest,
+    format: &StreamFormat,
+    source_frame: usize,
+    data: &[u8],
+    marker: &mut Option<bool>,
+    pending: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+) -> Result<usize> {
+    let src_ch = usize::from(source.channels);
+    let dst_ch = usize::from(format.channels);
+    if src_ch == 0 || (src_ch != dst_ch && !(src_ch == 1 && dst_ch == 2)) || source_frame == 0 {
+        return Err(Error::InvalidArgument("invalid DSD channel layout".into()));
+    }
+    let source_dop = source.encoding == Encoding::DoP;
+    let target_dop = format.encoding == Encoding::DoP;
+    let slot = usize::from(format.subslot_bytes);
+    if slot == 0 || (target_dop && !matches!(slot, 3 | 4)) {
+        return Err(Error::InvalidArgument(
+            "invalid target DSD word layout".into(),
+        ));
+    }
+    let taken = (data.len() / source_frame).min(256) * source_frame;
+    if taken == 0 {
+        return Ok(0);
+    }
+    if source_dop {
+        unpack_dop_into(
+            &data[..taken],
+            src_ch,
+            source_frame / src_ch,
+            marker,
+            pending,
+        )?;
+    } else {
+        pending.extend_from_slice(&data[..taken]);
+    }
+    let group = if target_dop { 2 } else { slot };
+    let complete = pending.len() / (src_ch * group) * src_ch * group;
+    output.clear();
+    if target_dop {
+        for pair in pending[..complete].chunks_exact(src_ch * 2) {
+            for ch in 0..dst_ch {
+                let input_ch = if src_ch == 1 { 0 } else { ch };
+                if slot == 4 {
+                    output.push(0);
+                }
+                output.push(pair[src_ch + input_ch]);
+                output.push(pair[input_ch]);
+                output.push(0);
+            }
+        }
+    } else if src_ch == 1 && dst_ch == 2 {
+        output.resize(complete * 2, 0);
+        duplicate_mono_dsd(&pending[..complete], output);
+    } else {
+        output.extend_from_slice(&pending[..complete]);
+    }
+    pending.drain(..complete);
+    Ok(taken)
+}
 /// Duplicate chronological mono DSD bytes into stereo channel-interleaved bytes.
 /// Returns the source bytes consumed, bounded by output capacity.
 pub fn duplicate_mono_dsd(input: &[u8], output: &mut [u8]) -> usize {
@@ -1570,34 +1641,41 @@ pub fn pcm_u8_to_i16(input: &[u8], output: &mut [u8]) -> usize {
     }
     count
 }
-fn validate_dop(data: &[u8], channels: usize, slot: usize, phase: &mut bool) -> Result<()> {
+fn validate_dop(data: &[u8], channels: usize, slot: usize, phase: &mut Option<bool>) -> Result<()> {
     if channels == 0 || !matches!(slot, 3 | 4) || data.len() % (channels * slot) != 0 {
         return Err(Error::InvalidArgument("invalid DoP frame layout".into()));
     }
+    let mut next = *phase;
     for frame in data.chunks_exact(channels * slot) {
-        let marker = if *phase { 0xfa } else { 0x05 };
-        if frame
-            .chunks_exact(slot)
-            .any(|w| w[slot - 1] != marker || (slot == 4 && w[0] != 0))
+        let marker = frame[slot - 1];
+        if !matches!(marker, 0x05 | 0xfa)
+            || next.is_some_and(|expected| marker != if expected { 0xfa } else { 0x05 })
+            || frame
+                .chunks_exact(slot)
+                .any(|word| word[slot - 1] != marker || (slot == 4 && word[0] != 0))
         {
             return Err(Error::InvalidArgument(
                 "invalid DoP markers or padding".into(),
             ));
         }
-        *phase = !*phase;
+        next = Some(marker == 0x05);
     }
+    *phase = next;
     Ok(())
 }
+/// Unpack from a caller-specified expected marker phase. On error, phase is unchanged.
 pub fn unpack_dop(data: &[u8], channels: usize, slot: usize, phase: &mut bool) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
-    unpack_dop_into(data, channels, slot, phase, &mut out)?;
+    let mut next = Some(*phase);
+    unpack_dop_into(data, channels, slot, &mut next, &mut out)?;
+    *phase = next.unwrap_or(*phase);
     Ok(out)
 }
 fn unpack_dop_into(
     data: &[u8],
     channels: usize,
     slot: usize,
-    phase: &mut bool,
+    phase: &mut Option<bool>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut next = *phase;
@@ -1643,6 +1721,201 @@ mod tests {
             synch_address: 0,
             pacing: Some(crate::Pacing::ExplicitFeedback { endpoint: 0x81 }),
         }
+    }
+    fn capabilities_for(alts: Vec<crate::AltSetting>) -> crate::Capabilities {
+        crate::Capabilities {
+            exclusion_snapshot_complete: true,
+            native_only_aliases: vec![],
+            complete_uac1_rate_alternates: vec![],
+            uac_version: crate::UacVersion::V2,
+            link_speed: crate::LinkSpeed::High,
+            alt_settings: alts,
+            pcm_sample_rates: vec![],
+            pcm_bit_depths: vec![],
+            channel_counts: vec![1, 2],
+            supports_pcm: true,
+            supports_dop: true,
+            dop_max_dsd_bit_rate: None,
+            supports_native_dsd: false,
+            native_dsd_bit_rates: vec![],
+            has_explicit_feedback: true,
+            volume: None,
+            has_hardware_volume: false,
+            has_mute: false,
+        }
+    }
+    fn wire_format(request: StreamRequest, subslot: u8) -> StreamFormat {
+        StreamFormat {
+            request,
+            encoding: request.encoding,
+            sample_rate: request.sample_rate,
+            channels: request.channels,
+            channel_map: crate::capture::ChannelMap::uac2(request.channels, 0).unwrap(),
+            valid_bits: request.bit_depth,
+            subslot_bytes: subslot,
+            interface_number: 1,
+            alt_setting: 1,
+            endpoint_address: 1,
+            sync_type: crate::SyncKind::Synchronous,
+            explicit_feedback: false,
+            link_speed: crate::LinkSpeed::High,
+            service_interval_us: 125,
+            pacing: crate::Pacing::Synchronous,
+            clock: None,
+            native_dsd_signature: None,
+        }
+    }
+    #[test]
+    fn exact_float_request_is_not_duplicated_in_fallback_candidates() {
+        let mut alt = descriptor_alt(AltFormat::PcmFloat32, 2, 32);
+        alt.sample_rates = vec![48_000];
+        alt.rate_ranges.clear();
+        let source = StreamRequest::pcm_float32(48_000, 2);
+        let found = candidates(
+            &capabilities_for(vec![alt]),
+            &source,
+            &PlaybackPolicy::default(),
+        )
+        .unwrap();
+        assert!(found.iter().all(|candidate| candidate.request != source));
+    }
+    #[test]
+    fn stepped_candidate_includes_largest_rate_within_policy_ceiling() {
+        let mut alt = descriptor_alt(AltFormat::Pcm, 2, 16);
+        alt.subslot_bytes = 2;
+        alt.sample_rates.clear();
+        alt.rate_ranges = vec![crate::RateRange {
+            min_hz: 8_000,
+            max_hz: 96_000,
+            step_hz: 1_000,
+        }];
+        let policy = PlaybackPolicy {
+            max_pcm_rate: Some(47_000),
+            ..PlaybackPolicy::default()
+        };
+        let source = StreamRequest::pcm(96_000, 2, 16);
+        let found = candidates(&capabilities_for(vec![alt]), &source, &policy).unwrap();
+        assert!(found
+            .iter()
+            .any(|candidate| candidate.request.sample_rate == 47_000));
+        assert!(found
+            .iter()
+            .all(|candidate| candidate.request.sample_rate <= 47_000));
+    }
+    #[test]
+    fn confirmed_dop_can_repack_to_stereo_but_unconfirmed_never_forwards() {
+        let mut alt = descriptor_alt(AltFormat::Pcm, 2, 24);
+        alt.sample_rates = vec![176_400];
+        alt.rate_ranges.clear();
+        let source = StreamRequest::dop(2_822_400, 1);
+        let confirmed = PlaybackPolicy {
+            dop_confirmed: true,
+            ..PlaybackPolicy::default()
+        };
+        let caps = capabilities_for(vec![alt]);
+        let found = candidates(&caps, &source, &confirmed).unwrap();
+        assert!(found
+            .iter()
+            .any(|candidate| candidate.request.encoding == Encoding::DoP
+                && candidate.request.channels == 2));
+        let unconfirmed = candidates(&caps, &source, &PlaybackPolicy::default()).unwrap();
+        assert!(unconfirmed
+            .iter()
+            .all(|candidate| candidate.request.encoding != Encoding::DoP));
+    }
+    #[test]
+    fn staged_output_advertises_retry_after_wire_capacity_returns() {
+        assert_eq!(staged_retry_capacity(0, 8, 2), 0);
+        assert_eq!(staged_retry_capacity(7, 8, 2), 0);
+        assert_eq!(staged_retry_capacity(8, 8, 2), 2);
+    }
+    #[test]
+    fn partial_dsd_byte_frames_are_retained_until_complete_wire_word() {
+        let source = StreamRequest::dsd_native(2_822_400, 1);
+        let format = wire_format(StreamRequest::dsd_native(2_822_400, 2), 4);
+        let (mut phase, mut pending, mut output) = (None, Vec::new(), Vec::new());
+        for byte in [0x11, 0x22, 0x33] {
+            assert_eq!(
+                repack_dsd_input(
+                    &source,
+                    &format,
+                    1,
+                    &[byte],
+                    &mut phase,
+                    &mut pending,
+                    &mut output
+                )
+                .unwrap(),
+                1
+            );
+            assert!(output.is_empty());
+        }
+        assert!(ensure_repack_complete(&pending).is_err());
+        assert_eq!(
+            repack_dsd_input(
+                &source,
+                &format,
+                1,
+                &[0x44],
+                &mut phase,
+                &mut pending,
+                &mut output
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(output, [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44]);
+        assert!(ensure_repack_complete(&pending).is_ok());
+    }
+    #[test]
+    fn dop_start_phase_is_inferred_and_failed_batch_does_not_advance() {
+        let source = StreamRequest::dop(2_822_400, 1);
+        let format = wire_format(StreamRequest::dsd_native(2_822_400, 2), 4);
+        let (mut phase, mut pending, mut output) = (None, Vec::new(), Vec::new());
+        assert_eq!(
+            repack_dsd_input(
+                &source,
+                &format,
+                3,
+                &[0x11, 0x22, 0xfa],
+                &mut phase,
+                &mut pending,
+                &mut output
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(phase, Some(false));
+        assert_eq!(pending, [0x22, 0x11]);
+        assert!(repack_dsd_input(
+            &source,
+            &format,
+            3,
+            &[0x33, 0x44, 0xfa],
+            &mut phase,
+            &mut pending,
+            &mut output
+        )
+        .is_err());
+        assert_eq!(phase, Some(false));
+        assert_eq!(pending, [0x22, 0x11]);
+        assert_eq!(
+            repack_dsd_input(
+                &source,
+                &format,
+                3,
+                &[0x33, 0x44, 0x05],
+                &mut phase,
+                &mut pending,
+                &mut output
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(output, [0x22, 0x22, 0x11, 0x11, 0x44, 0x44, 0x33, 0x33]);
+        phase = None;
+        assert!(validate_dop(&[0x11, 0x22, 0xfa], 1, 3, &mut phase).is_ok());
+        assert_eq!(phase, Some(false));
     }
     #[test]
     fn descriptor_preflight_only_excludes_proven_shapes_and_rates() {

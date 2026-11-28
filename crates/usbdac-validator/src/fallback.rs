@@ -374,7 +374,11 @@ pub(super) fn run_fallback(
                 phase,
                 event.started,
                 event.elapsed,
-                event.input_bytes,
+                if matches!(event.phase, ProducerTimingPhase::RingEnqueue) {
+                    event.output_bytes
+                } else {
+                    event.input_bytes
+                },
                 event.output_bytes,
                 event.blocked,
             );
@@ -495,7 +499,7 @@ pub(super) fn run_fallback(
                 "producer_call_inclusive",
                 write_started,
                 write_started.elapsed(),
-                buffer.len() - offset,
+                write_result.as_ref().copied().unwrap_or(0),
                 write_result.as_ref().copied().unwrap_or(0),
                 matches!(&write_result, Ok(0)),
             );

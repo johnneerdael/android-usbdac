@@ -14,6 +14,7 @@ use crate::convert::{
 const TAPS: usize = 704;
 const HISTORY: usize = TAPS / 8;
 const DELAY: usize = TAPS / 32;
+const DSD_PCM_BATCH_FRAMES: usize = 128;
 
 pub struct DsdPcmConverter {
     channels: usize,
@@ -23,6 +24,7 @@ pub struct DsdPcmConverter {
     first: Option<[u8; 8]>,
     skipped: usize,
     pending: Vec<u8>,
+    pending_offset: usize,
     pcm: Converter,
     finishing: bool,
     tail_left: usize,
@@ -115,7 +117,8 @@ impl DsdPcmConverter {
             head: 0,
             first: None,
             skipped: 0,
-            pending: Vec::with_capacity(channels as usize * 4),
+            pending: Vec::with_capacity(channels as usize * 4 * DSD_PCM_BATCH_FRAMES),
+            pending_offset: 0,
             pcm,
             finishing: false,
             tail_left: DELAY,
@@ -154,10 +157,16 @@ impl DsdPcmConverter {
             self.skipped += 1;
             return;
         }
-        self.pending.clear();
         for channel in &self.history {
-            let sample: f64 = (0..HISTORY)
-                .map(|i| self.table[i][channel[(self.head + HISTORY - i) % HISTORY] as usize])
+            // Preserve the original newest-to-oldest summation order without
+            // a modulo operation for each filter table lookup.
+            let (older, newer) = channel.split_at(self.head + 1);
+            let sample: f64 = older
+                .iter()
+                .rev()
+                .chain(newer.iter().rev())
+                .enumerate()
+                .map(|(i, byte)| self.table[i][usize::from(*byte)])
                 .sum();
             self.pending
                 .extend_from_slice(&((sample * self.first_stage_gain) as f32).to_le_bytes());
@@ -170,9 +179,13 @@ impl DsdPcmConverter {
                 produced: 0,
             });
         }
-        let done = self.pcm.process(&self.pending, output)?;
-        if done.consumed == self.pending.len() {
+        let done = self
+            .pcm
+            .process(&self.pending[self.pending_offset..], output)?;
+        self.pending_offset += done.consumed;
+        if self.pending_offset == self.pending.len() {
             self.pending.clear();
+            self.pending_offset = 0;
         }
         Ok(done)
     }
@@ -184,18 +197,20 @@ impl DsdPcmConverter {
         }
         let mut consumed = 0;
         let mut produced = 0;
+        let batch_bytes = self.channels * 4 * DSD_PCM_BATCH_FRAMES;
         loop {
-            if !self.pending.is_empty() {
+            let no_more_input = input.len() - consumed < self.channels;
+            if !self.pending.is_empty()
+                && (self.pending_offset > 0 || self.pending.len() >= batch_bytes || no_more_input)
+            {
                 let done = self.emit_pending(&mut output[produced..])?;
                 produced += done.produced;
                 if !self.pending.is_empty() {
                     break;
                 }
+                continue;
             }
-            if input.len() - consumed < self.channels {
-                break;
-            }
-            if output.len() - produced < self.min_output_bytes() {
+            if no_more_input || output.len() - produced < self.min_output_bytes() {
                 break;
             }
             let frame = &input[consumed..consumed + self.channels];
@@ -295,6 +310,7 @@ impl DsdPcmConverter {
         self.first = None;
         self.skipped = 0;
         self.pending.clear();
+        self.pending_offset = 0;
         self.pcm.reset();
         self.finishing = false;
         self.tail_left = DELAY;
@@ -316,6 +332,91 @@ mod tests {
             PcmFormat::new(44_100, 2, SampleFormat::Float32),
         )
         .unwrap()
+    }
+    // Reference for the original one-intermediate-frame-at-a-time pump.
+    fn legacy_process(
+        c: &mut DsdPcmConverter,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<Processed, ConvertError> {
+        let mut consumed = 0;
+        let mut produced = 0;
+        loop {
+            if !c.pending.is_empty() {
+                let done = c.emit_pending(&mut output[produced..])?;
+                produced += done.produced;
+                if !c.pending.is_empty() {
+                    break;
+                }
+            }
+            if input.len() - consumed < c.channels || output.len() - produced < c.min_output_bytes()
+            {
+                break;
+            }
+            c.push_frame(&input[consumed..consumed + c.channels]);
+            consumed += c.channels;
+            if c.first.take().is_some() {
+                c.synthesize();
+            } else {
+                c.first = Some([0; 8]);
+            }
+        }
+        c.input_frames += (consumed / c.channels) as u64;
+        c.output_frames += (produced / c.output_frame_bytes) as u64;
+        Ok(Processed { consumed, produced })
+    }
+    fn run_dsd512_pump(
+        bit_rate: u32,
+        input_frames: usize,
+        chunk_frames: usize,
+        output_frames: usize,
+        legacy: bool,
+    ) -> (Vec<u8>, u64) {
+        let target = PcmFormat::new(48_000, 2, SampleFormat::I24);
+        let mut converter = DsdPcmConverter::new(bit_rate, 2, target).unwrap();
+        let input: Vec<u8> = (0..input_frames * 2)
+            .map(|i| ((i.wrapping_mul(73) ^ (i >> 4) ^ 0x69) & 255) as u8)
+            .collect();
+        let mut output = vec![0; output_frames * target.bytes_per_frame()];
+        assert!(output.len() >= converter.min_output_bytes());
+        let mut decoded = Vec::new();
+        let mut position = 0;
+        while position < input.len() {
+            let end = (position + chunk_frames * 2).min(input.len());
+            let done = if legacy {
+                legacy_process(&mut converter, &input[position..end], &mut output)
+            } else {
+                converter.process(&input[position..end], &mut output)
+            }
+            .unwrap();
+            assert!(done.consumed > 0 || done.produced > 0);
+            position += done.consumed;
+            decoded.extend_from_slice(&output[..done.produced]);
+        }
+        loop {
+            let count = converter.finish(&mut output).unwrap();
+            if count == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&output[..count]);
+        }
+        let clipped = converter.clipped_samples();
+        converter.reset();
+        assert!(converter.process(&[0x69, 0x69], &mut output).is_ok());
+        (decoded, clipped)
+    }
+    #[test]
+    fn dsd512_batched_pump_matches_single_frame_reference_with_backpressure() {
+        for bit_rate in [22_579_200, 24_576_000] {
+            let reference = run_dsd512_pump(bit_rate, 24_000, 256, 256, true);
+            assert_eq!(
+                run_dsd512_pump(bit_rate, 24_000, 256, 256, false),
+                reference
+            );
+            assert_eq!(run_dsd512_pump(bit_rate, 24_000, 37, 1, false), reference);
+            let expected_frames = (24_000u64 * 48_000).div_ceil(u64::from(bit_rate / 8));
+            assert_eq!(reference.0.len(), expected_frames as usize * 6);
+        }
     }
     #[test]
     fn filter_rejects_decimation_aliases_and_preserves_passband() {
