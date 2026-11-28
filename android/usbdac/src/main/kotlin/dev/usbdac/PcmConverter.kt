@@ -206,10 +206,10 @@ public class ConversionPlan internal constructor(
             target: StreamFormat,
             options: ConversionOptions,
         ): ConversionPlan {
-            if (source.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32) || target.encoding != StreamEncoding.PCM) {
+            if (source.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32) || target.encoding !in listOf(StreamEncoding.PCM, StreamEncoding.PCM_FLOAT32)) {
                 throw DacException(
                     DacErrorCode.UNSUPPORTED,
-                    "DoP and native DSD are never converted: a sample-rate or bit-depth change would destroy them",
+                    "PCM conversion requires signed integer or float source and target formats",
                 )
             }
             if (source.encoding == StreamEncoding.PCM_FLOAT32 && options.sourceLayout != null && options.sourceLayout != PcmLayout.FLOAT_32) {
@@ -223,7 +223,7 @@ public class ConversionPlan internal constructor(
             }
             val request = JSONObject()
                 .put("source", formatJson(source.sampleRate, source.channels, sourceLayout.bits, sourceLayout.slotBytes, sourceLayout == PcmLayout.FLOAT_32))
-                .put("target", formatJson(target.sampleRate, target.channels, target.validBits, target.subslotBytes, false))
+                .put("target", formatJson(target.sampleRate, target.channels, target.validBits, target.subslotBytes, target.encoding == StreamEncoding.PCM_FLOAT32))
                 .put("options", optionsJson(options))
                 .toString()
             return parsePlan(backend, request)

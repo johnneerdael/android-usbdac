@@ -370,9 +370,19 @@ impl Resampler {
         let lead = self.half as i64 - 1;
         let wanted = self.output_len_for(n);
 
+        // Keep already-consumed history in place until the fixed allocation
+        // needs room. Compacting once per block avoids copying the long FIR
+        // window for every small producer call.
+        if self.history[0].len() + n > taps + self.max_block {
+            let discard = ((self.k - lead - self.base).max(0) as usize).min(self.history[0].len());
+            for history in &mut self.history {
+                history.copy_within(discard.., 0);
+                history.truncate(history.len() - discard);
+            }
+            self.base += discard as i64;
+        }
         let mut next_k = self.k;
         let mut next_p = self.p;
-        let mut dropped = 0usize;
         for (channel, history) in self.history.iter_mut().enumerate() {
             history.extend_from_slice(&input[channel][..n]);
             let out = &mut output[channel];
@@ -398,17 +408,9 @@ impl Resampler {
                 p %= l;
             }
             debug_assert_eq!(count, wanted);
-            // Drop what no later output needs.
-            let next_start = (k - lead - self.base) as usize;
-            let drop = next_start.min(history.len());
-            history.copy_within(drop.., 0);
-            let kept = history.len() - drop;
-            history.truncate(kept);
             next_k = k;
             next_p = p;
-            dropped = drop;
         }
-        self.base += dropped as i64;
         self.k = next_k;
         self.p = next_p;
         self.in_total += n as u64;

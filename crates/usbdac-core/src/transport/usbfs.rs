@@ -884,39 +884,28 @@ fn host_usb_failure_kind(error: rusb::Error) -> crate::HostUsbFailureKind {
 #[cfg(target_os = "macos")]
 pub(crate) fn open_darwin_device(
     attachment: &crate::darwin_discovery::Attachment,
+    config: &crate::DacConfig,
     allow_capture: bool,
+    probe_capture_inputs: bool,
 ) -> Result<(UsbDevice, crate::DeviceInfo), crate::Error> {
     let usb = attachment.device();
     let before = usb.active_config_descriptor().map_err(|error| {
         crate::Error::Claim(format!("active configuration before claim: {error}"))
     })?;
     let expected = before.number();
-    let mut interfaces = Vec::new();
-    for interface in before.interfaces() {
-        if interface.descriptors().any(|alt| {
-            (alt.class_code() == USB_CLASS_AUDIO
-                && matches!(
-                    alt.sub_class_code(),
-                    USB_SUBCLASS_AUDIOCONTROL | USB_SUBCLASS_AUDIOSTREAMING
-                ))
-                || (alt.class_code() == 0xff
-                    && alt.endpoint_descriptors().any(|ep| {
-                        ep.direction() == Direction::Out
-                            && ep.transfer_type() == TransferType::Isochronous
-                    }))
-        }) {
-            interfaces.push(interface.number());
-        }
-    }
-    if interfaces.is_empty() {
-        return Err(crate::Error::Claim(
-            "active configuration has no eligible playback interfaces".into(),
-        ));
-    }
     let handle = Arc::new(
         usb.open()
             .map_err(|error| host_usb_error("open USB attachment", error))?,
     );
+    // Vendor admission is descriptor-only and retains its exact claim contract.
+    let vendor_profile =
+        vendor_pcm::discover(&handle, &before, resolve_device_speed(&handle.device()))
+            .map_err(crate::Error::Claim)?;
+    let interfaces = if let Some(profile) = vendor_profile {
+        profile.claimed_interfaces()
+    } else {
+        scan::required_playback_claims(&before).map_err(crate::Error::Claim)?
+    };
     let mut owner = DarwinOwner {
         handle: handle.clone(),
         claimed: Vec::new(),
@@ -999,6 +988,37 @@ pub(crate) fn open_darwin_device(
                 after_capture.number()
             )));
         }
+        let captured_descriptor = handle
+            .device()
+            .device_descriptor()
+            .map_err(|e| crate::Error::Claim(format!("USB identity after capture: {e}")))?;
+        if captured_descriptor.vendor_id() != attachment.evidence.vendor_id
+            || captured_descriptor.product_id() != attachment.evidence.product_id
+        {
+            return Err(crate::Error::Claim(
+                "USB identity changed during whole-device capture".into(),
+            ));
+        }
+        if let Some(original) = vendor_profile {
+            if vendor_pcm::discover(
+                &handle,
+                &after_capture,
+                resolve_device_speed(&handle.device()),
+            )
+            .map_err(crate::Error::Claim)?
+                != Some(original)
+            {
+                return Err(crate::Error::Claim(
+                    "vendor PCM profile changed during whole-device capture".into(),
+                ));
+            }
+        } else if scan::required_playback_claims(&after_capture).map_err(crate::Error::Claim)?
+            != interfaces
+        {
+            return Err(crate::Error::Claim(
+                "required playback claims changed during whole-device capture".into(),
+            ));
+        }
         for &interface in &interfaces {
             log_info!("[USB] host_usb_claim phase=reclaim interface={interface} result=attempt");
             match handle.claim_interface(interface) {
@@ -1041,20 +1061,168 @@ pub(crate) fn open_darwin_device(
             )
         });
     let manufacturer = handle.read_manufacturer_string_ascii(&descriptor).ok();
+    // Settings and descriptor-backed quirks must match registration before
+    // asking for optional topology. Base AudioControl claims are already held.
+    let preliminary = crate::DeviceInfo::new(
+        descriptor.vendor_id(),
+        descriptor.product_id(),
+        product_name.clone(),
+    );
+    crate::settings::install(crate::settings::Settings::for_device(
+        config.clone(),
+        &preliminary,
+    ));
+    let version = descriptor.device_version();
+    let revision = (u16::from(version.major() / 10) << 12)
+        | (u16::from(version.major() % 10) << 8)
+        | (u16::from(version.minor()) << 4)
+        | u16::from(version.sub_minor());
+    crate::settings::install_descriptor_identity(
+        descriptor.vendor_id(),
+        descriptor.product_id(),
+        revision,
+    );
+    if descriptor.vendor_id() != attachment.evidence.vendor_id
+        || descriptor.product_id() != attachment.evidence.product_id
+    {
+        return Err(crate::Error::Claim(
+            "USB identity changed during capture or claim".into(),
+        ));
+    }
+    if let Some(original) = vendor_profile {
+        let now = vendor_pcm::discover(&handle, &actual, resolve_device_speed(&handle.device()))
+            .map_err(crate::Error::Claim)?;
+        if now != Some(original) {
+            return Err(crate::Error::Claim(
+                "vendor PCM profile changed during capture or claim".into(),
+            ));
+        }
+    } else if scan::required_playback_claims(&actual).map_err(crate::Error::Claim)? != interfaces {
+        return Err(crate::Error::Claim(
+            "required playback claims changed during capture or claim".into(),
+        ));
+    }
+    let mut unavailable_feedback = Vec::new();
+    if vendor_profile.is_none() {
+        let feedback = scan::structural_feedback_interfaces(
+            &actual,
+            &handle,
+            resolve_device_speed(&handle.device()),
+            &owner.claimed,
+        );
+        let routing = routing_hw::scarlett_claim_interface(
+            &actual,
+            descriptor.vendor_id(),
+            descriptor.product_id(),
+        );
+        for interface in scan::optional_playback_claims(&interfaces, &feedback, routing) {
+            log_info!("[USB] host_usb_claim phase=optional interface={interface} result=attempt");
+            match handle.claim_interface(interface) {
+                Ok(()) => {
+                    owner.claimed.push(interface);
+                    log_info!(
+                        "[USB] host_usb_claim phase=optional interface={interface} result=success"
+                    );
+                }
+                Err(error) => {
+                    log_warn!("[USB] host_usb_claim phase=optional interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error));
+                    if error == rusb::Error::NoDevice {
+                        return Err(host_usb_error(
+                            format!("claim optional USB interface {interface}"),
+                            error,
+                        ));
+                    }
+                    if feedback.contains(&interface) {
+                        unavailable_feedback.push(interface);
+                    }
+                }
+            }
+        }
+        // Only report a denied interface if it is still on the final strict allowlist.
+        let final_feedback = scan::structural_feedback_interfaces(
+            &actual,
+            &handle,
+            resolve_device_speed(&handle.device()),
+            &owner.claimed,
+        );
+        unavailable_feedback.retain(|id| final_feedback.contains(id));
+    }
+    if probe_capture_inputs {
+        let mut input_interfaces: Vec<u8> = actual
+            .interfaces()
+            .flat_map(|interface| interface.descriptors())
+            .filter(|alt| {
+                alt.class_code() == USB_CLASS_AUDIO
+                    && alt.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+                    && alt.endpoint_descriptors().any(|ep| {
+                        ep.direction() == Direction::In
+                            && ep.transfer_type() == TransferType::Isochronous
+                            && matches!(ep.usage_type(), UsageType::Data | UsageType::FeedbackData)
+                    })
+            })
+            .map(|alt| alt.interface_number())
+            .collect();
+        input_interfaces.sort_unstable();
+        input_interfaces.dedup();
+        for interface in input_interfaces {
+            if owner.claimed.contains(&interface) {
+                log_info!("[USB] host_usb_capture_probe interface={interface} result=already_held");
+                continue;
+            }
+            log_info!("[USB] host_usb_capture_probe interface={interface} result=attempt");
+            match handle.claim_interface(interface) {
+                Ok(()) => {
+                    owner.claimed.push(interface);
+                    log_info!("[USB] host_usb_capture_probe interface={interface} result=success");
+                    match handle.release_interface(interface) {
+                        Ok(()) => {
+                            owner.claimed.retain(|id| *id != interface);
+                            log_info!("[USB] host_usb_capture_probe interface={interface} result=released");
+                        }
+                        Err(error) => {
+                            log_error!("[USB] host_usb_capture_probe interface={interface} result=release_error kind={:?} detail={error}", host_usb_failure_kind(error));
+                            return Err(host_usb_error(
+                                format!("release capture probe interface {interface}"),
+                                error,
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    log_warn!("[USB] host_usb_capture_probe interface={interface} result=error kind={:?} detail={error}", host_usb_failure_kind(error));
+                    if error == rusb::Error::NoDevice {
+                        return Err(host_usb_error(
+                            format!("claim capture probe interface {interface}"),
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let final_config = handle.device().active_config_descriptor().map_err(|e| {
+        crate::Error::Claim(format!("active configuration after optional claims: {e}"))
+    })?;
+    if final_config.number() != expected {
+        return Err(crate::Error::Claim(
+            "active configuration changed during optional claims".into(),
+        ));
+    }
     let mut info = crate::DeviceInfo::new(
         descriptor.vendor_id(),
         descriptor.product_id(),
         product_name.clone(),
     )
-    .with_claimed_interfaces(interfaces.clone());
+    .with_claimed_interfaces(owner.claimed.clone());
+    info.unavailable_feedback_interfaces = unavailable_feedback;
     info.configuration_id = Some(expected);
     info.manufacturer_name = manufacturer;
     let owner = Arc::new(owner);
     let device = UsbDevice {
         fd: DeviceKey::Darwin(usb.as_raw() as usize),
-        darwin: Some(owner),
+        darwin: Some(owner.clone()),
         _fd_owner: None,
-        claimed_interfaces: interfaces.into(),
+        claimed_interfaces: owner.claimed.clone().into(),
         vendor_id: descriptor.vendor_id(),
         product_id: descriptor.product_id(),
         product_name,

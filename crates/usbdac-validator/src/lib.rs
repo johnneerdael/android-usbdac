@@ -1,8 +1,12 @@
 //! Bounded, append-on-disk evidence and exact-format USB DAC acceptance runs.
 //! The host must warn users to turn down the amplifier before starting. This
 //! crate never changes hardware volume. USB delivery does not prove audibility.
+mod conversion_check;
 mod fallback;
+mod producer_timing;
+mod report_html;
 use fallback::run_fallback;
+pub use report_html::write_html_report;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -386,8 +390,12 @@ impl Capture {
             report.status = "device_lost".into();
         } else if report.cancelled {
             report.status = "cancelled".into();
-        } else if report.termination_reason.as_deref() == Some("retirement_failed") {
-            report.status = "completed_with_findings".into();
+        } else if report.termination_reason.as_deref() == Some("retirement_failed")
+            || !required_fallbacks_verified(&report)
+            || report.legs.len() != plans.len()
+            || report.admission_results.len() != probes.len()
+        {
+            report.status = "failed".into();
         } else if plans.is_empty()
             && report
                 .admission_results
@@ -444,6 +452,14 @@ impl Capture {
         let mut warnings = Vec::new();
         if let Err(error) = self.flush_debug() {
             warnings.push(format!("capture flush: {error}"));
+            self.record(
+                "capture_warning",
+                json!({"message":format!("capture flush: {error}")}),
+            );
+        }
+        if let Err(error) = write_html_report(&self.dir) {
+            let _ = fs::remove_file(self.dir.join("report.html"));
+            warnings.push(format!("HTML report unavailable: {error}"));
         }
         let destination = path.as_ref();
         let parent = destination
@@ -466,11 +482,17 @@ impl Capture {
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             let mut buffer = [0u8; 32 * 1024];
-            for name in ["timeline.jsonl", "debug.jsonl", "report.json"] {
+            for name in [
+                "timeline.jsonl",
+                "debug.jsonl",
+                "report.json",
+                "report.html",
+            ] {
                 let mut source = match File::open(self.dir.join(name)) {
                     Ok(file) => file,
                     Err(error)
-                        if name == "report.json" && error.kind() == io::ErrorKind::NotFound =>
+                        if (name == "report.json" || name == "report.html")
+                            && error.kind() == io::ErrorKind::NotFound =>
                     {
                         continue
                     }
@@ -517,6 +539,8 @@ impl Capture {
         cancel: &AtomicBool,
         device_lost: &AtomicBool,
     ) -> LegResult {
+        let timing_origin = Instant::now();
+        let mut timing = producer_timing::ProducerTimingCapture::new(timing_origin);
         let mut result = LegResult {
             request: format!("{:?}", plan.request),
             advertised_alt: plan.alt.clone(),
@@ -532,7 +556,17 @@ impl Capture {
             payload_bytes: 0,
             evidence: json!({}),
         };
-        let format = match dac.negotiate(&plan.request) {
+        let negotiation_started = Instant::now();
+        let negotiation = dac.negotiate(&plan.request);
+        timing.record(
+            "negotiation",
+            negotiation_started,
+            negotiation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+        let format = match negotiation {
             Ok(f) => f,
             Err(e) => {
                 if is_device_lost(&e) {
@@ -644,7 +678,22 @@ impl Capture {
         let mut pending = Vec::new();
         let mut offset = 0;
         let mut prefix = Vec::new();
+        let mut next_sample = Instant::now();
         while remaining > 0 || offset < pending.len() {
+            if Instant::now() >= next_sample {
+                let started = Instant::now();
+                let sample = stream.stats();
+                timing.sample(&sample, false);
+                timing.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+                next_sample = Instant::now() + Duration::from_millis(20);
+            }
             if event_lost.load(Ordering::Acquire) {
                 mark_stop(&mut result, "device_lost", "stream");
                 break;
@@ -661,13 +710,37 @@ impl Capture {
             }
             if offset == pending.len() {
                 let count = remaining.min(256) as usize;
+                let started = Instant::now();
                 pending = generator.frames(count);
+                timing.record(
+                    "generation_on_demand",
+                    started,
+                    started.elapsed(),
+                    0,
+                    pending.len(),
+                    false,
+                );
                 offset = 0;
                 remaining -= count as u64;
             }
-            match stream.write(&pending[offset..]) {
-                Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+            let started = Instant::now();
+            let write = stream.write(&pending[offset..]);
+            timing.record(
+                "ring_enqueue",
+                started,
+                started.elapsed(),
+                write.as_ref().copied().unwrap_or(0),
+                write.as_ref().copied().unwrap_or(0),
+                matches!(&write, Ok(0)),
+            );
+            match write {
+                Ok(0) => {
+                    let started = Instant::now();
+                    std::thread::sleep(Duration::from_millis(2));
+                    timing.record("backpressure_wait", started, started.elapsed(), 0, 0, true);
+                }
                 Ok(n) => {
+                    let started = Instant::now();
                     if prefix.len() < 64 {
                         let count = n.min(64 - prefix.len());
                         prefix.extend_from_slice(&pending[offset..offset + count]);
@@ -675,6 +748,14 @@ impl Capture {
                     hash.update(&pending[offset..offset + n]);
                     result.payload_bytes += n as u64;
                     offset += n;
+                    timing.record(
+                        "source_verification_hash",
+                        started,
+                        started.elapsed(),
+                        n,
+                        n,
+                        false,
+                    );
                 }
                 Err(e) => {
                     if is_device_lost(&e) {
@@ -700,6 +781,20 @@ impl Capture {
             }
         }
         while result.error.is_none() && !stream.is_drained() {
+            if Instant::now() >= next_sample {
+                let started = Instant::now();
+                let sample = stream.stats();
+                timing.sample(&sample, false);
+                timing.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+                next_sample = Instant::now() + Duration::from_millis(20);
+            }
             if event_lost.load(Ordering::Acquire) {
                 mark_stop(&mut result, "device_lost", "stream");
                 break;
@@ -714,13 +809,18 @@ impl Capture {
                 result.error = Some("drain deadline exceeded".into());
                 break;
             }
+            let started = Instant::now();
             std::thread::sleep(Duration::from_millis(5));
+            timing.record("drain_wait", started, started.elapsed(), 0, 0, false);
         }
         let stats = stream.stats();
+        timing.sample(&stats, true);
+        let (edges, edge_dropped) = producer_timing::worker_edges(dac, timing_origin);
+        let producer_timing = timing.finish(stats.underruns, &edges, edge_dropped, 0);
         let feedback = stream.explicit_feedback_diagnostics();
         result.payload_sha256 = Some(format!("{:x}", hash.finalize()));
         let prefix_hex: String = prefix.iter().map(|b| format!("{b:02x}")).collect();
-        result.evidence = json!({"format": format_json(&format), "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed"});
+        result.evidence = json!({"format": format_json(&format), "producer_timing":producer_timing, "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed"});
         if result.error.is_none()
             && stats.bit_perfect
             && stats.payload_verified
@@ -768,8 +868,48 @@ impl Capture {
         result
     }
 }
+/// Exact refusals remain independently recorded; overall success additionally
+/// requires every requested fallback to be present and independently verified.
+fn required_fallbacks_verified(report: &Report) -> bool {
+    let verified = |fallback: &Value| {
+        fallback.get("status").and_then(Value::as_str) == Some("passed_usb")
+            && fallback
+                .pointer("/selection_verification/passed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && fallback
+                .pointer("/conversion_verification/passed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && fallback
+                .get("target_wire_integrity")
+                .and_then(Value::as_str)
+                == Some("verified")
+    };
+    if !report.fallback_results.iter().all(verified) {
+        return false;
+    }
+    let required = report
+        .legs
+        .iter()
+        .filter(|leg| {
+            leg.status == "unsupported" && leg.error_stage.as_deref() == Some("negotiate")
+        })
+        .chain(
+            report
+                .admission_results
+                .iter()
+                .filter(|leg| leg.admission.as_deref() == Some("expected_rejected")),
+        );
+    required.into_iter().all(|leg| {
+        report.fallback_results.iter().any(|fallback| {
+            fallback.get("source_request").and_then(Value::as_str) == Some(leg.request.as_str())
+                && verified(fallback)
+        })
+    })
+}
 fn fallback_summary(value: &Value) -> Value {
-    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_generation": value.get("source_generation"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
 }
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];
@@ -847,7 +987,7 @@ fn mark_stop(result: &mut LegResult, reason: &str, stage: &str) {
     );
 }
 fn format_json(f: &StreamFormat) -> Value {
-    json!({"encoding": format!("{:?}", f.encoding), "sample_rate": f.sample_rate, "counter_rate_hz": f.counter_rate_hz(), "channels": f.channels, "valid_bits": f.valid_bits, "subslot_bytes": f.subslot_bytes, "interface_number": f.interface_number, "alt_setting": f.alt_setting, "endpoint_address": f.endpoint_address, "service_interval_us": f.service_interval_us, "explicit_feedback": f.explicit_feedback, "pacing": format!("{:?}", f.pacing)})
+    json!({"encoding": format!("{:?}", f.encoding), "sample_rate": f.sample_rate, "counter_rate_hz": f.counter_rate_hz(), "channels": f.channels, "valid_bits": f.valid_bits, "subslot_bytes": f.subslot_bytes, "interface_number": f.interface_number, "alt_setting": f.alt_setting, "endpoint_address": f.endpoint_address, "service_interval_us": f.service_interval_us, "explicit_feedback": f.explicit_feedback, "pacing": format!("{:?}", f.pacing), "clock": f.clock.as_ref().map(|clock| json!({"control_interface":clock.control_interface, "source_id":clock.source_id, "resolution":clock.resolution.code(), "path":clock.path.iter().map(|hop| json!({"id":hop.id, "kind":hop.kind.code(), "detail":format!("{:?}",hop.kind)})).collect::<Vec<_>>() }))})
 }
 
 fn unix_ms() -> u128 {
@@ -1371,6 +1511,58 @@ mod tests {
         assert_eq!(native_dsd_rate(705_600, 4), Some(22_579_200));
         assert_eq!(native_dsd_rate(u32::MAX, 4), None);
         assert_eq!(native_dsd_rate(88_200, 0), None);
+    }
+    #[test]
+    fn required_fallback_requires_selection_conversion_and_usb_proof() {
+        let rejected = LegResult {
+            request: "source".into(),
+            advertised_alt: String::new(),
+            negotiated: None,
+            status: "expected_rejected".into(),
+            admission: Some("expected_rejected".into()),
+            error: None,
+            termination_reason: None,
+            error_stage: Some("negotiate".into()),
+            error_code: Some("unsupported".into()),
+            close_outcome: json!({"status":"not_opened"}),
+            payload_sha256: None,
+            payload_bytes: 0,
+            evidence: json!({}),
+        };
+        let mut report = Report {
+            schema_version: 1,
+            started_unix_ms: 0,
+            coverage: String::new(),
+            signal: Value::Null,
+            capabilities: Value::Null,
+            mode_coverage: Value::Null,
+            status: "running".into(),
+            plan: vec![],
+            unattempted_plan: vec![],
+            admission_plan: vec![],
+            unattempted_admission_plan: vec![],
+            admission_results: vec![rejected],
+            fallback_results: vec![],
+            termination_reason: None,
+            legs: vec![],
+            cancelled: false,
+            error: None,
+        };
+        assert!(!required_fallbacks_verified(&report));
+        report
+            .fallback_results
+            .push(json!({"source_request":"source", "status":"no_fallback"}));
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0] = json!({"source_request":"source", "status":"passed_usb", "selection_verification":{"passed":true}, "conversion_verification":{"passed":true}, "target_wire_integrity":"verified"});
+        assert!(required_fallbacks_verified(&report));
+        report.fallback_results[0]["selection_verification"]["passed"] = json!(false);
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0]["selection_verification"]["passed"] = json!(true);
+        report.fallback_results[0]["conversion_verification"]["passed"] = json!(false);
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0]["conversion_verification"]["passed"] = json!(true);
+        report.fallback_results[0]["target_wire_integrity"] = json!("unverified");
+        assert!(!required_fallbacks_verified(&report));
     }
     #[test]
     fn mode_coverage_reports_admission_and_decoder_boundary() {

@@ -130,6 +130,17 @@ fn send_archive(path: &std::path::Path) -> io::Result<()> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--render-report") {
+        let Some(path) = args.get(2) else {
+            eprintln!("Missing capture directory");
+            std::process::exit(2);
+        };
+        if let Err(error) = usbdac_validator::write_html_report(std::path::Path::new(path)) {
+            eprintln!("HTML report: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let privileged = args.get(1).is_some_and(|v| v == "--privileged-socket");
     let (dir, mut input): (PathBuf, Box<dyn BufRead + Send>) = if privileged {
         match privileged_channel(&args) {
@@ -301,8 +312,8 @@ fn run(
         capture_feedback_trace: true,
         ..DacConfig::default()
     };
-    c.record("open_options", json!({"startup_volume":"keep", "hand_back":"keep", "require_hardware_volume":false, "allow_device_capture":allow_capture, "quirk_policy":format!("{policy:?}")}));
-    let dac = Dac::open_darwin(attachment, config, allow_capture).map_err(|e| {
+    c.record("open_options", json!({"probe_capture_inputs":true,"startup_volume":"keep", "hand_back":"keep", "require_hardware_volume":false, "allow_device_capture":allow_capture, "quirk_policy":format!("{policy:?}")}));
+    let dac = Dac::open_darwin_with_capture_probe(attachment, config, allow_capture, true).map_err(|e| {
         if matches!(&e, usbdac_core::Error::DeviceLost | usbdac_core::Error::HostUsb { kind: usbdac_core::HostUsbFailureKind::DeviceLost, .. }) { device_lost.store(true, Ordering::Release); }
         let host_usb = match &e {
             usbdac_core::Error::HostUsb { operation, kind, detail } => json!({"operation":operation, "kind":format!("{kind:?}"), "detail":detail}),

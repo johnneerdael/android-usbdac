@@ -12,6 +12,8 @@ import dev.usbdac.DacSession
 import dev.usbdac.DacStream
 import dev.usbdac.DacVolume
 import dev.usbdac.DownstreamBinding
+import dev.usbdac.OutputPolicy
+import dev.usbdac.DriverPlaybackDecision
 import dev.usbdac.OutputChange
 import dev.usbdac.OutputRoute
 import dev.usbdac.PcmOutput
@@ -37,6 +39,11 @@ internal interface DirectLink : Closeable {
 
     /** The stream opened by [openStream]; `null` before that, and for a fake. */
     val stream: DacStream?
+
+    /** Real USB links use the driver's unified playback resolver. Fakes retain their existing path. */
+    val supportsDriverPlayback: Boolean get() = false
+    fun resolvePlayback(request: StreamRequest, policy: OutputPolicy, bypassLimits: Boolean): DriverPlaybackDecision =
+        throw UnsupportedOperationException("driver playback unavailable")
 
     /** Programs the DAC's clock and settles the wire format. 100 ms or more. */
     fun negotiate(request: StreamRequest): StreamFormat

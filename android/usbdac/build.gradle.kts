@@ -88,6 +88,8 @@ val skipNative = providers.gradleProperty("usbdac.skipNative").map { it.toBoolea
 val repoRoot = rootProject.projectDir.parentFile
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 val ndkDirectory = androidComponents.sdkComponents.ndkDirectory
+val validatorEnabled = gradle.startParameter.taskNames.any { it.contains("validator", ignoreCase = true) } ||
+    providers.gradleProperty("usbdac.validator").orNull == "true"
 
 val buildUsbdacNative by tasks.registering(Exec::class) {
     group = "build"
@@ -96,7 +98,7 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
     workingDir = repoRoot
     onlyIf { !skipNative.get() }
 
-    inputs.property("validatorEnabled", gradle.startParameter.taskNames.any { it.contains("validator", ignoreCase = true) } || providers.gradleProperty("usbdac.validator").orNull == "true")
+    inputs.property("validatorEnabled", validatorEnabled)
     inputs.property("abis", abis)
     inputs.property("ndkVersion", ndkVersionPin)
     inputs.files(
@@ -104,6 +106,22 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
             include("Cargo.toml", "Cargo.lock", "crates/**/Cargo.toml", "crates/**/*.rs")
         },
     ).withPropertyName("rustSources").withPathSensitivity(PathSensitivity.RELATIVE)
+    if (validatorEnabled) {
+        inputs.files(
+            fileTree(repoRoot) {
+                include(
+                    "crates/usbdac-validator/src/report_html/template.html",
+                    "branding/tokens/usbdac.css",
+                    "branding/logos/usbdac-mark-dark.svg",
+                    "branding/logos/usbdac-mark-light.svg",
+                    "branding/fonts/Manrope.woff",
+                    "branding/fonts/IBMPlexMono-Regular.woff",
+                    "branding/fonts/manrope-OFL.txt",
+                    "branding/fonts/ibmplexmono-OFL.txt",
+                )
+            },
+        ).withPropertyName("validatorReportAssets").withPathSensitivity(PathSensitivity.RELATIVE)
+    }
     outputs.dir(jniLibsDir).withPropertyName("jniLibs")
 
     doFirst {
@@ -115,7 +133,7 @@ val buildUsbdacNative by tasks.registering(Exec::class) {
         val arguments = mutableListOf("cargo", "ndk")
         abis.get().forEach { arguments += listOf("-t", it) }
         arguments += listOf("-o", jniLibsDir.asFile.absolutePath, "build", "-p", "usbdac-jni", "--release")
-        if (gradle.startParameter.taskNames.any { it.contains("validator", ignoreCase = true) } || providers.gradleProperty("usbdac.validator").orNull == "true") arguments += listOf("--features", "validator")
+        if (validatorEnabled) arguments += listOf("--features", "validator")
         commandLine(arguments)
     }
 }

@@ -63,7 +63,7 @@ fn bad(message: impl Into<String>) -> ConvertError {
 
 // ---- JSON -------------------------------------------------------------------------------------
 
-fn sample_from_json(value: &Value) -> Result<SampleFormat, ConvertError> {
+pub(crate) fn sample_from_json(value: &Value) -> Result<SampleFormat, ConvertError> {
     match value.get("kind").and_then(Value::as_str) {
         Some("float") => Ok(SampleFormat::Float32),
         Some("int") => {
@@ -120,7 +120,7 @@ fn format_to_json(format: PcmFormat) -> Value {
     })
 }
 
-fn options_from_json(value: &Value) -> Result<ConvertOptions, ConvertError> {
+pub(crate) fn options_from_json(value: &Value) -> Result<ConvertOptions, ConvertError> {
     let mut options = ConvertOptions::default();
     let Some(section) = value.get("options").filter(|options| !options.is_null()) else {
         return Ok(options);

@@ -55,6 +55,12 @@ final class ValidatorModel: ObservableObject {
             try output.write(to: staging.appendingPathComponent("worker-output.txt"), atomically: true, encoding: .utf8)
             let status: [String: Any] = ["partial": true, "reason": reason, "warnings": warnings]
             try JSONSerialization.data(withJSONObject: status, options: [.prettyPrinted, .sortedKeys]).write(to: staging.appendingPathComponent("capture-status.json"), options: .atomic)
+            if let executable = Bundle.main.url(forAuxiliaryExecutable: "usbdac-validator-worker") {
+                let renderer = Process(); renderer.executableURL = executable; renderer.arguments = ["--render-report", staging.path]
+                renderer.standardOutput = FileHandle.nullDevice; renderer.standardError = FileHandle.nullDevice
+                do { try renderer.run(); renderer.waitUntilExit(); if renderer.terminationStatus != 0 { try "HTML report could not be generated. Raw evidence is retained.\n".write(to: staging.appendingPathComponent("HTML_REPORT_UNAVAILABLE.txt"), atomically: true, encoding: .utf8) } }
+                catch { try? "HTML report could not be generated. Raw evidence is retained.\n".write(to: staging.appendingPathComponent("HTML_REPORT_UNAVAILABLE.txt"), atomically: true, encoding: .utf8) }
+            } else { try? "HTML report worker is unavailable. Raw evidence is retained.\n".write(to: staging.appendingPathComponent("HTML_REPORT_UNAVAILABLE.txt"), atomically: true, encoding: .utf8) }
             let zipper = Process(); zipper.executableURL = URL(fileURLWithPath: "/usr/bin/ditto"); zipper.arguments = ["-c", "-k", staging.path, zip.path]
             try zipper.run(); zipper.waitUntilExit()
             guard zipper.terminationStatus == 0 else { try? fm.removeItem(at: zip); return nil }

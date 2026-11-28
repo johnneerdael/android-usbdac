@@ -1,202 +1,59 @@
-//! Validator-owned direct USB fallback: production converters, without platform routing claims.
+//! Exercise the production playback resolver and source-domain stream.
 use super::*;
-use usbdac_core::convert::{
-    ConversionPlan, ConvertOptions, Converter, PcmFormat, SampleFormat, MAX_RATE, MIN_RATE,
+use crate::conversion_check::ConversionCheck;
+use crate::producer_timing::{callback_dropped, worker_edges, ProducerTimingCapture};
+use usbdac_core::playback::{
+    PlaybackCandidateQuality, PlaybackFidelity, PlaybackPolicy, PlaybackTransform,
+    ProducerTimingPhase,
 };
-use usbdac_core::dsd_pcm::DsdPcmConverter;
 
-fn source_rate(request: &StreamRequest) -> Option<u32> {
-    match request.encoding {
-        Encoding::Pcm | Encoding::PcmFloat32
-            if (MIN_RATE..=MAX_RATE).contains(&request.sample_rate)
-                && (1..=8).contains(&request.channels) =>
-        {
-            Some(request.sample_rate)
-        }
-        Encoding::DsdNative { bit_rate }
-            if matches!(bit_rate, 2_822_400 | 5_644_800 | 11_289_600)
-                && (1..=8).contains(&request.channels) =>
-        {
-            Some(bit_rate / 16)
-        }
-        Encoding::DoP
-            if request.bit_depth == 24
-                && matches!(request.sample_rate * 16, 2_822_400 | 5_644_800 | 11_289_600)
-                && (1..=8).contains(&request.channels) =>
-        {
-            Some(request.sample_rate)
-        }
-        _ => None,
-    }
+fn quality_evidence(value: &PlaybackCandidateQuality) -> Value {
+    json!({"request":format!("{:?}",value.request), "fidelity":format!("{:?}",value.fidelity),
+        "retained_bandwidth_hz":value.retained_bandwidth_hz, "meaningful_depth_bits":value.meaningful_depth_bits,
+        "resampling":value.resampling, "resampler_passband_hz":value.resampler_passband_hz,
+        "resampler_attenuation_db":value.resampler_attenuation_db,
+        "dsd_first_stage_passband_hz":value.dsd_first_stage_passband_hz,
+        "dsd_first_stage_attenuation_db":value.dsd_first_stage_attenuation_db, "reason":value.reason})
 }
-fn candidates(caps: &Capabilities, source: &StreamRequest, rate: u32) -> Vec<StreamRequest> {
-    let source_depth = if matches!(source.encoding, Encoding::DsdNative { .. } | Encoding::DoP) {
-        24
+
+fn selection_proof(
+    source: &StreamRequest,
+    candidates: &[StreamRequest],
+    selected: &StreamRequest,
+    attempted: usize,
+    refusals: &[usbdac_core::Error],
+    exact_refusal: Option<&usbdac_core::Error>,
+    preflight: Option<&str>,
+) -> Value {
+    let selected_index = candidates
+        .iter()
+        .position(|candidate| candidate == selected);
+    let source_was_planned = candidates.first() == Some(source);
+    let source_refusal_kind = if preflight.is_some() {
+        "descriptor_preflight"
+    } else if exact_refusal.is_some() && !source_was_planned {
+        "policy"
+    } else if exact_refusal.is_some() {
+        "certified_clean_unsupported"
     } else {
-        source.bit_depth
+        "none"
     };
-    let mut pairs = Vec::new();
-    for alt in caps.alt_settings.iter().filter(|a| {
-        a.format == AltFormat::Pcm
-            && a.channels == source.channels
-            && [16, 24, 32].contains(&a.valid_bits)
-    }) {
-        let mut rates = alt.sample_rates.clone();
-        for r in &alt.rate_ranges {
-            for candidate in PCM_RATES.iter().copied().chain([r.min_hz, r.max_hz, rate]) {
-                if range_contains(r, candidate) && (r.step_hz > 0 || r.min_hz == r.max_hz) {
-                    rates.push(candidate);
-                }
-            }
-            if r.step_hz > 0 && rate >= r.min_hz {
-                let n = (rate - r.min_hz) / r.step_hz;
-                for index in [n, n.saturating_add(1)] {
-                    if let Some(candidate) = index
-                        .checked_mul(r.step_hz)
-                        .and_then(|v| r.min_hz.checked_add(v))
-                    {
-                        if range_contains(r, candidate) {
-                            rates.push(candidate);
-                        }
-                    }
-                }
-            }
-        }
-        for candidate in rates {
-            let geometry = alt.subslot_bytes > 0
-                && alt.subslot_bytes <= 4
-                && u32::from(alt.valid_bits) <= u32::from(alt.subslot_bytes) * 8
-                && alt.pacing.is_some()
-                && alt.service_interval_us > 0
-                && alt.max_packet_bytes > 0
-                && (u64::from(candidate) * u64::from(alt.service_interval_us)).div_ceil(1_000_000)
-                    * u64::from(alt.channels)
-                    * u64::from(alt.subslot_bytes)
-                    <= alt.max_packet_bytes as u64;
-            let source_sample = match source.encoding {
-                Encoding::PcmFloat32 | Encoding::DoP | Encoding::DsdNative { .. } => {
-                    Some(SampleFormat::Float32)
-                }
-                Encoding::Pcm => match source.bit_depth {
-                    16 => Some(SampleFormat::I16),
-                    24 => Some(SampleFormat::I24),
-                    32 => Some(SampleFormat::I32),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let plan_valid = source_sample
-                .zip(SampleFormat::int(alt.valid_bits, alt.subslot_bytes).ok())
-                .is_some_and(|(from, to)| {
-                    let mut opts = ConvertOptions::default();
-                    if candidate == rate {
-                        opts.headroom_db = 0.0;
-                    }
-                    ConversionPlan::pcm(
-                        PcmFormat::new(rate, source.channels, from),
-                        PcmFormat::new(candidate, source.channels, to),
-                        &opts,
-                    )
-                    .is_ok()
-                });
-            if (MIN_RATE..=MAX_RATE).contains(&candidate)
-                && geometry
-                && plan_valid
-                && !(source.encoding == Encoding::Pcm
-                    && candidate == source.sample_rate
-                    && alt.valid_bits == source.bit_depth)
-            {
-                pairs.push((candidate, alt.valid_bits));
-            }
-        }
-    }
-    rank_pairs(&mut pairs, rate, source_depth);
-    pairs
-        .into_iter()
-        .map(|(hz, depth)| StreamRequest::pcm(hz, source.channels, depth))
-        .take(8)
-        .collect()
+    let source_evidence_ok = if source_was_planned {
+        selected_index == Some(0) || exact_refusal.is_some()
+    } else {
+        exact_refusal.is_some()
+    };
+    let passed = selected_index.is_some_and(|index| {
+        index + 1 == attempted
+            && refusals.len() == index
+            && refusals
+                .iter()
+                .all(|error| matches!(error, usbdac_core::Error::Unsupported { .. }))
+    }) && source_evidence_ok;
+    let higher_ranks = candidates.iter().zip(refusals).map(|(request, error)| json!({"request":format!("{request:?}"), "outcome":"certified_clean_unsupported", "code":error.code(), "message":error.to_string()})).collect::<Vec<_>>();
+    json!({"passed":passed, "selected_request":format!("{selected:?}"), "selected_index":selected_index, "index_base":0, "attempted_candidates":attempted, "higher_ranked_refusals":higher_ranks, "source_refusal_kind":source_refusal_kind, "source_preflight_refusal":preflight, "basis":"strict ranked prefix; driver advances only after same-owner clean Unsupported"})
 }
 
-fn rank_pairs(pairs: &mut Vec<(u32, u8)>, rate: u32, source_depth: u8) {
-    pairs.sort_unstable();
-    pairs.dedup();
-    let mut rates: Vec<_> = pairs.iter().map(|p| p.0).collect();
-    usbdac_core::rank_sample_rates(&mut rates, rate);
-    pairs.sort_by_key(|(hz, depth)| {
-        (
-            rates.iter().position(|v| v == hz).unwrap_or(usize::MAX),
-            u8::from(*depth < source_depth),
-            depth.abs_diff(source_depth),
-        )
-    });
-}
-
-enum Engine {
-    Pcm(Converter),
-    Dsd(DsdPcmConverter),
-}
-impl Engine {
-    fn process(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> Result<usbdac_core::convert::Processed, usbdac_core::convert::ConvertError> {
-        match self {
-            Self::Pcm(c) => c.process(input, output),
-            Self::Dsd(c) => c.process(input, output),
-        }
-    }
-    fn finish(&mut self, output: &mut [u8]) -> Result<usize, usbdac_core::convert::ConvertError> {
-        match self {
-            Self::Pcm(c) => c.finish(output),
-            Self::Dsd(c) => c.finish(output),
-        }
-    }
-    fn clipped(&self) -> u64 {
-        match self {
-            Self::Pcm(c) => c.clipped_samples(),
-            Self::Dsd(c) => c.clipped_samples(),
-        }
-    }
-    fn min_output(&self) -> usize {
-        match self {
-            Self::Pcm(c) => c.min_output_bytes(),
-            Self::Dsd(c) => c.min_output_bytes(),
-        }
-    }
-}
-
-/// Validate genuine alternating DoP markers and convert carrier order into native chronological bytes.
-fn unpack_dop(
-    input: &[u8],
-    channels: usize,
-    slot: usize,
-    marker_phase: &mut bool,
-) -> Result<Vec<u8>, String> {
-    let frame = channels * slot;
-    if frame == 0 || ![3, 4].contains(&slot) || !input.len().is_multiple_of(frame) {
-        return Err("invalid DoP input frame length".into());
-    }
-    let mut output = Vec::with_capacity(input.len() / slot * 2);
-    for group in input.chunks_exact(frame) {
-        let marker = if *marker_phase { 0xfa } else { 0x05 };
-        if group
-            .chunks_exact(slot)
-            .any(|word| word[slot - 1] != marker || (slot == 4 && word[0] != 0))
-        {
-            return Err("invalid DoP marker sequence".into());
-        }
-        for word in group.chunks_exact(slot) {
-            output.push(word[slot - 2]);
-        }
-        for word in group.chunks_exact(slot) {
-            output.push(word[slot - 3]);
-        }
-        *marker_phase = !*marker_phase;
-    }
-    Ok(output)
-}
 fn emit_dop_markers(data: &mut [u8], channels: usize, slot: usize, phase: &mut bool) {
     for frame in data.chunks_exact_mut(channels * slot) {
         for word in frame.chunks_exact_mut(slot) {
@@ -206,43 +63,117 @@ fn emit_dop_markers(data: &mut [u8], channels: usize, slot: usize, phase: &mut b
     }
 }
 
+const PREGENERATED_SOURCE_LIMIT: usize = 32 * 1024 * 1024;
+
+enum PreparedSource {
+    Ready(Vec<u8>),
+    OnDemand(&'static str),
+}
+
+/// Prepare only high-rate DSD-family stimulus. The source is still handed
+/// unchanged to production playback; this is not a conversion or USB write.
+fn prepare_high_rate_source(
+    source: &StreamRequest,
+    frames: u64,
+    frame_bytes: usize,
+    signal: &mut Signal,
+    marker: &mut bool,
+    stop: impl Fn() -> Option<&'static str>,
+    deadline: Instant,
+) -> Result<PreparedSource, &'static str> {
+    let high_rate = match source.encoding {
+        Encoding::DsdNative { bit_rate } => bit_rate >= 22_579_200,
+        Encoding::DoP => source.sample_rate >= 1_411_200,
+        _ => false,
+    };
+    if !high_rate {
+        return Ok(PreparedSource::OnDemand(
+            "source is not high-rate DSD or DoP",
+        ));
+    }
+    if let Some(reason) = stop() {
+        return Err(reason);
+    }
+    if Instant::now() >= deadline {
+        return Err("timeout");
+    }
+    let Some(total) = usize::try_from(frames)
+        .ok()
+        .and_then(|n| n.checked_mul(frame_bytes))
+        .filter(|&n| n <= PREGENERATED_SOURCE_LIMIT)
+    else {
+        return Ok(PreparedSource::OnDemand(
+            "source exceeds the 32 MiB preparation limit",
+        ));
+    };
+    let mut output = Vec::new();
+    if output.try_reserve_exact(total).is_err() {
+        return Ok(PreparedSource::OnDemand(
+            "bounded source allocation unavailable",
+        ));
+    }
+    let mut remaining = frames;
+    while remaining > 0 {
+        if let Some(reason) = stop() {
+            return Err(reason);
+        }
+        if Instant::now() >= deadline {
+            return Err("timeout");
+        }
+        let count = remaining.min(1024) as usize;
+        let mut bytes = signal.frames(count);
+        if source.encoding == Encoding::DoP {
+            emit_dop_markers(
+                &mut bytes,
+                usize::from(source.channels),
+                frame_bytes / usize::from(source.channels),
+                marker,
+            );
+        }
+        output.extend_from_slice(&bytes);
+        remaining -= count as u64;
+    }
+    Ok(PreparedSource::Ready(output))
+}
+
 pub(super) fn run_fallback(
     dac: &Dac,
-    caps: &Capabilities,
+    _caps: &Capabilities,
     source: &StreamRequest,
     options: &RunOptions,
     cancel: &AtomicBool,
     device_lost: &AtomicBool,
 ) -> Value {
-    let mut evidence = json!({"source_request":format!("{source:?}"), "resolver":"portable direct USB validator policy; not a platform OutputSelector route; DoP conversion is explicitly requested for validation", "status":"no_fallback", "source_fidelity":"not_tested", "target_wire_integrity":"not_tested", "dop_decoder":"not_observed"});
-    let Some(rate) = source_rate(source) else {
-        let reason = if source.encoding == Encoding::PcmU8 {
-            "U8 source conversion is not provided by the released PCM converter"
-        } else if matches!(source.encoding, Encoding::DoP) && source.bit_depth != 24 {
-            "DoP fallback accepts canonical 24-bit carrier input only"
-        } else if !(1..=8).contains(&source.channels) {
-            "Released converters support one to eight channels"
-        } else {
-            "Source rate is outside the released PCM or DSD64/128/256 converter support"
-        };
-        evidence["reason"] = json!(reason);
-        return evidence;
+    let timing_origin = Instant::now();
+    let timing = Arc::new(Mutex::new(ProducerTimingCapture::new(timing_origin)));
+    let dropped_timing = callback_dropped();
+    let policy = PlaybackPolicy {
+        allow_lossless: true,
+        allow_lossy: true,
+        dop_confirmed: false,
+        allow_dop_pcm: true,
+        ..PlaybackPolicy::default()
     };
-    let targets = candidates(caps, source, rate);
-    evidence["candidate_requests"] =
-        json!(targets.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>());
-    if targets.is_empty() {
-        evidence["reason"] = json!("No descriptor-proven signed PCM target meets converter rate, channel and packet geometry requirements");
-        return evidence;
-    }
+    let mut evidence = json!({"source_request":format!("{source:?}"), "resolver":"production Dac::resolve_playback", "policy":format!("{policy:?}"), "status":"no_fallback", "source_fidelity":"not_tested", "target_wire_integrity":"not_tested", "conversion_verification":{"status":"not_tested", "passed":false}, "selection_verification":{"status":"not_verified", "passed":false}, "clock_feedback":{"clock":null, "clock_verified":null, "feedback_kind":null, "feedback_locked":null, "feedback_reports":null, "feedback_rate_hz":null, "payload_verified":null}, "dop_decoder":"not_observed"});
     if let Some(reason) = stop_reason(cancel, device_lost) {
         evidence["termination_reason"] = json!(reason);
         evidence["status"] = json!(reason);
         return evidence;
     }
-    // One bounded, driver-owned negotiation preserves the retained USB owner.
-    let format = match dac.negotiate_candidates(&targets) {
-        Ok(format) => format,
+    let negotiation_started = Instant::now();
+    let decision_result = dac.resolve_playback(source, &policy);
+    if let Ok(mut capture) = timing.lock() {
+        capture.record(
+            "negotiation",
+            negotiation_started,
+            negotiation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+    }
+    let decision = match decision_result {
+        Ok(decision) => decision,
         Err(error) => {
             let lost = is_device_lost(&error);
             evidence["status"] = json!(if lost {
@@ -255,86 +186,127 @@ pub(super) fn run_fallback(
             if lost {
                 evidence["termination_reason"] = json!("device_lost");
             }
-            evidence["error"] = json!({"stage":"target_negotiate", "code":error.code(), "message":error.to_string()});
+            evidence["error"] = json!({"stage":"production_resolve", "code":error.code(), "message":error.to_string()});
             return evidence;
         }
     };
-    let Some(target) = targets
-        .iter()
-        .find(|candidate| exact_format(candidate, &format))
-        .copied()
-    else {
-        evidence["status"] = json!("inconclusive");
-        evidence["error"] = json!({"stage":"target_negotiate", "code":"format_drift", "message":"Negotiated format is not an exact candidate"});
-        evidence["wire_format"] = format_json(&format);
-        return evidence;
-    };
-    evidence["target_request"] = json!(format!("{target:?}"));
-    evidence["wire_format"] = format_json(&format);
-    let mut conversion_options = ConvertOptions::default();
-    let is_dsd = matches!(source.encoding, Encoding::DsdNative { .. } | Encoding::DoP);
-    if rate == format.sample_rate {
-        conversion_options.headroom_db = 0.0;
+    let format = decision.format.clone();
+    let fidelity = decision.fidelity;
+    let preserve = matches!(
+        fidelity,
+        PlaybackFidelity::Exact | PlaybackFidelity::BitExact | PlaybackFidelity::Lossless
+    );
+    if decision.exact_refusal.is_none() {
+        evidence["selection_note"] = json!("production resolver admitted the exact source on retry; compare the separately recorded exact result");
     }
-    evidence["conversion_options"] = json!(format!("{conversion_options:?}"));
-    let engine = if is_dsd {
-        let bit_rate = match source.encoding {
-            Encoding::DsdNative { bit_rate } => bit_rate,
-            _ => source.sample_rate * 16,
-        };
-        let sample = match SampleFormat::int(format.valid_bits, format.subslot_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                evidence["status"] = json!("inconclusive");
-                evidence["error"] =
-                    json!({"stage":"target_layout", "code":e.code(), "message":e.to_string()});
-                return evidence;
+    evidence["target_request"] = json!(format!("{:?}", format.request));
+    evidence["wire_format"] = format_json(&format);
+    evidence["clock_feedback"] = json!({"clock": evidence["wire_format"]["clock"], "feedback_kind": format.pacing.code(), "clock_verified":null, "feedback_locked":null, "feedback_reports":null, "feedback_rate_hz":null, "payload_verified":null});
+    evidence["planned_candidates"] = json!(decision
+        .candidates
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>());
+    evidence["attempted_candidate_count"] = json!(decision.attempted_candidates);
+    evidence["planned_candidate_quality"] = json!(decision
+        .candidate_quality
+        .iter()
+        .map(quality_evidence)
+        .collect::<Vec<_>>());
+    evidence["selected_quality"] = quality_evidence(&decision.selected_quality);
+    evidence["candidate_order_note"] =
+        json!("ordered planned candidates; only the reported prefix was attempted");
+    evidence["exact_refusal"] = json!(decision
+        .exact_refusal
+        .as_ref()
+        .map(|e| json!({"code":e.code(), "message":e.to_string()})));
+    let verification = selection_proof(
+        source,
+        &decision.candidates,
+        &format.request,
+        decision.attempted_candidates,
+        &decision.candidate_refusals,
+        decision.exact_refusal.as_ref(),
+        decision.source_preflight_refusal.as_deref(),
+    );
+    let selection_pass = verification.get("passed").and_then(Value::as_bool) == Some(true);
+    evidence["selection_verification"] = verification;
+    evidence["conversion"] = json!({"kind":format!("{fidelity:?}"), "description":format!("{:?}", decision.transform), "policy":format!("{:?}", policy.conversion_options)});
+    evidence["source_fidelity"] = json!(format!("{fidelity:?}"));
+    if let Some(reason) = stop_reason(cancel, device_lost) {
+        evidence["termination_reason"] = json!(reason);
+        evidence["status"] = json!(reason);
+        return evidence;
+    }
+    let (signal_rate, slot, bits) = match source.encoding {
+        Encoding::DsdNative { bit_rate } => (bit_rate / 8, 1, 1),
+        Encoding::DoP => (
+            source.sample_rate,
+            if source.bit_depth == 32 { 4 } else { 3 },
+            source.bit_depth,
+        ),
+        Encoding::PcmU8 => (source.sample_rate, 1, 8),
+        Encoding::PcmFloat32 => (source.sample_rate, 4, 32),
+        Encoding::Pcm => (source.sample_rate, source.bit_depth / 8, source.bit_depth),
+    };
+    if signal_rate == 0 || decision.source_frame_bytes == 0 || source.channels == 0 {
+        evidence["status"] = json!("inconclusive");
+        evidence["error"] = json!({"stage":"source_signal", "code":"invalid_geometry"});
+        return evidence;
+    }
+    let frames = u64::from(signal_rate) * options.duration_ms.clamp(300, 10000) / 1000;
+    let expected_bytes = frames * decision.source_frame_bytes as u64;
+    let mut signal = Signal::from_spec(source.encoding, signal_rate, source.channels, slot, bits);
+    let mut marker = false;
+    let generation_started = Instant::now();
+    let generation_deadline =
+        generation_started + Duration::from_millis(options.leg_timeout_ms.max(100));
+    let prepared_result = prepare_high_rate_source(
+        source,
+        frames,
+        decision.source_frame_bytes,
+        &mut signal,
+        &mut marker,
+        || stop_reason(cancel, device_lost),
+        generation_deadline,
+    );
+    if let Ok(mut capture) = timing.lock() {
+        capture.record(
+            if matches!(&prepared_result, Ok(PreparedSource::Ready(_))) {
+                "generation_preopen"
+            } else {
+                "generation_planning_preopen"
+            },
+            generation_started,
+            generation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+    }
+    let prepared = match prepared_result {
+        Ok(value) => value,
+        Err(reason) => {
+            evidence["source_generation"] = json!({"mode":"pre_generation_interrupted", "phase":"before_stream_open", "reason":reason, "limit_bytes":PREGENERATED_SOURCE_LIMIT, "elapsed_ms":generation_started.elapsed().as_millis()});
+            evidence["status"] = json!(if reason == "timeout" {
+                "inconclusive"
+            } else {
+                reason
+            });
+            if reason != "timeout" {
+                evidence["termination_reason"] = json!(reason);
             }
-        };
-        let target_pcm = PcmFormat::new(format.sample_rate, format.channels, sample);
-        match DsdPcmConverter::with_options(
-            bit_rate,
-            source.channels,
-            target_pcm,
-            &conversion_options,
-        ) {
-            Ok(c) => {
-                evidence["conversion"] = json!({"kind":"Lossy", "description":"DSD to PCM decimation and PCM conversion", "source_fidelity":"lossy"});
-                Engine::Dsd(c)
-            }
-            Err(e) => {
-                evidence["status"] = json!("inconclusive");
-                evidence["error"] =
-                    json!({"stage":"converter", "code":e.code(), "message":e.to_string()});
-                return evidence;
-            }
-        }
-    } else {
-        match ConversionPlan::between(source, &format, &conversion_options) {
-            Ok(plan) => {
-                evidence["conversion"] = json!({"kind":format!("{:?}", plan.kind()), "description":plan.description(), "preserves_bit_perfect":plan.preserves_bit_perfect()});
-                match Converter::new(&plan) {
-                    Ok(c) => Engine::Pcm(c),
-                    Err(e) => {
-                        evidence["status"] = json!("inconclusive");
-                        evidence["error"] =
-                            json!({"stage":"converter", "code":e.code(), "message":e.to_string()});
-                        return evidence;
-                    }
-                }
-            }
-            Err(e) => {
-                evidence["status"] = json!("inconclusive");
-                evidence["error"] =
-                    json!({"stage":"plan", "code":e.code(), "message":e.to_string()});
-                return evidence;
-            }
+            evidence["error"] = json!({"stage":"source_generation", "code":reason, "message":"Source generation ended before opening playback"});
+            return evidence;
         }
     };
-    evidence["source_fidelity"] = if is_dsd {
-        json!("lossy")
-    } else {
-        json!(evidence["conversion"]["kind"])
+    evidence["source_generation"] = match &prepared {
+        PreparedSource::Ready(bytes) => {
+            json!({"mode":"pre_generated", "phase":"before_stream_open", "bytes":bytes.len(), "limit_bytes":PREGENERATED_SOURCE_LIMIT, "elapsed_ms":generation_started.elapsed().as_millis()})
+        }
+        PreparedSource::OnDemand(reason) => {
+            json!({"mode":"on_demand", "phase":"during_stream", "reason":reason, "limit_bytes":PREGENERATED_SOURCE_LIMIT})
+        }
     };
     if let Some(reason) = stop_reason(cancel, device_lost) {
         evidence["termination_reason"] = json!(reason);
@@ -345,8 +317,8 @@ pub(super) fn run_fallback(
     let listener_lost = lost.clone();
     let async_error: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let listener_error = async_error.clone();
-    let stream = match dac.open_stream(
-        &format,
+    let mut stream = match dac.open_playback(
+        &decision,
         Arc::new(move |event: DacEvent| {
             if matches!(&event, DacEvent::DeviceLost)
                 || matches!(&event, DacEvent::Error(e) if is_device_lost(e))
@@ -374,291 +346,380 @@ pub(super) fn run_fallback(
             }
         }),
     ) {
-        Ok(s) => s,
-        Err(e) => {
-            evidence["status"] = json!(if is_device_lost(&e) {
-                "device_lost"
-            } else {
-                "failed"
-            });
-            if is_device_lost(&e) {
+        Ok(stream) => stream,
+        Err(error) => {
+            let lost = is_device_lost(&error);
+            evidence["status"] = json!(if lost { "device_lost" } else { "failed" });
+            if lost {
                 evidence["termination_reason"] = json!("device_lost");
             }
-            evidence["error"] = json!({"stage":"open", "code":e.code(), "message":e.to_string()});
+            evidence["error"] =
+                json!({"stage":"open_playback", "code":error.code(), "message":error.to_string()});
             return evidence;
         }
     };
-    let mut engine = engine;
-    let (encoding, sample_rate, subslot, bits) = match source.encoding {
-        Encoding::DsdNative { bit_rate } => (source.encoding, bit_rate / 8, 1, 1),
-        Encoding::DoP => (
-            source.encoding,
-            source.sample_rate,
-            if source.bit_depth == 32 { 4 } else { 3 },
-            source.bit_depth,
-        ),
-        Encoding::PcmFloat32 => (source.encoding, source.sample_rate, 4, 32),
-        _ => (
-            source.encoding,
-            source.sample_rate,
-            source.bit_depth / 8,
-            source.bit_depth,
-        ),
+    let timing_observer = timing.clone();
+    let callback_drops = dropped_timing.clone();
+    stream.set_timing_observer(Some(Arc::new(move |event| {
+        let phase = match event.phase {
+            ProducerTimingPhase::SourceFormat => "source_format",
+            ProducerTimingPhase::ConverterProcess => "converter_process",
+            ProducerTimingPhase::ConverterFinish => "converter_finish",
+            ProducerTimingPhase::RingEnqueue => "ring_enqueue",
+            ProducerTimingPhase::Observer => "observer_verification",
+        };
+        let diagnostic_started = Instant::now();
+        if let Ok(mut capture) = timing_observer.try_lock() {
+            capture.record(
+                phase,
+                event.started,
+                event.elapsed,
+                if matches!(event.phase, ProducerTimingPhase::RingEnqueue) {
+                    event.output_bytes
+                } else {
+                    event.input_bytes
+                },
+                event.output_bytes,
+                event.blocked,
+            );
+            capture.record(
+                "diagnostic_callback",
+                diagnostic_started,
+                diagnostic_started.elapsed(),
+                0,
+                0,
+                false,
+            );
+        } else {
+            callback_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    })));
+    let applied_headroom_db = match &decision.transform {
+        PlaybackTransform::Pcm { plan, .. } if plan.resamples() => plan.options().headroom_db,
+        PlaybackTransform::DsdToPcm { options, .. } => options.headroom_db,
+        _ => 0.0,
     };
-    let mut signal = Signal::from_spec(encoding, sample_rate, source.channels, subslot, bits);
-    let mut remaining = u64::from(sample_rate) * options.duration_ms.clamp(300, 10000) / 1000;
-    let source_frames = remaining;
-    let converter_input_frame_bytes = if is_dsd {
-        u64::from(source.channels)
+    let check = Arc::new(Mutex::new(ConversionCheck::new(
+        *source,
+        format.clone(),
+        preserve,
+        applied_headroom_db,
+    )));
+    let observed = check.clone();
+    stream.set_observer(Some(Arc::new(move |bytes| {
+        if let Ok(mut check) = observed.lock() {
+            check.observe(bytes);
+        }
+    })));
+    let mut remaining = if matches!(prepared, PreparedSource::Ready(_)) {
+        0
     } else {
-        u64::from(source.channels) * u64::from(subslot)
+        frames
     };
-    let converter_input_frames = if matches!(encoding, Encoding::DoP) {
-        source_frames * 2
-    } else {
-        source_frames
+    let mut buffer = match prepared {
+        PreparedSource::Ready(bytes) => bytes,
+        PreparedSource::OnDemand(_) => Vec::new(),
     };
-    let converter_rate = if is_dsd {
-        u64::from(rate) * 2
-    } else {
-        u64::from(rate)
-    };
-    let expected_input = converter_input_frames * converter_input_frame_bytes;
-    let expected_frames = (u128::from(converter_input_frames) * u128::from(format.sample_rate))
-        .div_ceil(u128::from(converter_rate)) as u64;
-    let expected_output = expected_frames * format.bytes_per_frame() as u64;
-    let mut source_hash = Sha256::new();
-    let mut output_hash = Sha256::new();
-    let mut produced_bytes = 0u64;
-    let mut input_bytes = 0u64;
-    let mut source_framed_bytes = 0u64;
-    let mut output_bytes = 0u64;
-    let mut marker_phase = false;
-    let mut read_phase = false;
-    let mut output = vec![0u8; 65536usize.max(engine.min_output())];
-    let deadline = Instant::now() + Duration::from_millis(options.leg_timeout_ms.max(100));
-    let mut failure: Option<(String, String)> = None;
-    let mut failure_stage = "stream";
-    let mut finishing = false;
-    let mut source_bytes = Vec::new();
     let mut offset = 0usize;
-    loop {
+    let mut accepted = 0u64;
+    let mut source_hash = Sha256::new();
+    let deadline = Instant::now() + Duration::from_millis(options.leg_timeout_ms.max(100));
+    let mut failure: Option<(String, String, String)> = None;
+    let mut next_sample = Instant::now();
+    while remaining > 0 || offset < buffer.len() {
+        if Instant::now() >= next_sample {
+            let started = Instant::now();
+            let sample = stream.target_stats();
+            if let Ok(mut capture) = timing.lock() {
+                capture.sample(&sample, false);
+                capture.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            next_sample = Instant::now() + Duration::from_millis(20);
+        }
         if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
-            failure_stage = "usb_event";
-            failure = Some(error);
+            failure = Some(("usb_event".into(), error.0, error.1));
             break;
         }
         if lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
-            failure = Some(("device_lost".into(), "Selected device was lost".into()));
-            break;
-        }
-        if cancel.load(Ordering::Acquire) {
-            failure = Some(("cancelled".into(), "cancelled".into()));
-            break;
-        }
-        if Instant::now() >= deadline {
-            failure = Some(("timeout".into(), "fallback deadline exceeded".into()));
-            break;
-        }
-        if offset == source_bytes.len() && remaining > 0 {
-            let count = remaining.min(256) as usize;
-            remaining -= count as u64;
-            let mut bytes = signal.frames(count);
-            source_framed_bytes += bytes.len() as u64;
-            if matches!(encoding, Encoding::DoP) {
-                emit_dop_markers(
-                    &mut bytes,
-                    source.channels as usize,
-                    subslot as usize,
-                    &mut marker_phase,
-                );
-                source_hash.update(&bytes);
-                match unpack_dop(
-                    &bytes,
-                    source.channels as usize,
-                    subslot as usize,
-                    &mut read_phase,
-                ) {
-                    Ok(v) => bytes = v,
-                    Err(e) => {
-                        failure_stage = "source_framing";
-                        failure = Some(("dop_framing".into(), e));
-                        break;
-                    }
-                }
-            } else {
-                source_hash.update(&bytes);
-            }
-            source_bytes = bytes;
-            offset = 0;
-        }
-        if offset == source_bytes.len() && remaining == 0 {
-            finishing = true;
-        }
-        let converted = if finishing {
-            engine
-                .finish(&mut output)
-                .map(|produced| usbdac_core::convert::Processed {
-                    consumed: 0,
-                    produced,
-                })
-        } else {
-            engine.process(&source_bytes[offset..], &mut output)
-        };
-        let converted = match converted {
-            Ok(v) => v,
-            Err(e) => {
-                failure_stage = if finishing {
-                    "converter_finish"
-                } else {
-                    "converter_process"
-                };
-                failure = Some((e.code().into(), e.to_string()));
-                break;
-            }
-        };
-        offset += converted.consumed;
-        produced_bytes += converted.produced as u64;
-        input_bytes += converted.consumed as u64;
-        if !finishing && converted.consumed == 0 && converted.produced == 0 {
-            failure_stage = "converter_process";
             failure = Some((
-                "conversion_stalled".into(),
-                "Converter made no progress".into(),
+                "write".into(),
+                "device_lost".into(),
+                "Selected device was lost".into(),
             ));
             break;
         }
-        if finishing && converted.produced == 0 {
+        if cancel.load(Ordering::Acquire) {
+            failure = Some(("write".into(), "cancelled".into(), "Cancelled".into()));
             break;
         }
-        let mut written = 0;
-        while written < converted.produced {
-            if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
-                failure_stage = "usb_event";
-                failure = Some(error);
-                break;
+        if Instant::now() >= deadline {
+            failure = Some((
+                "write".into(),
+                "timeout".into(),
+                "Playback deadline exceeded".into(),
+            ));
+            break;
+        }
+        if offset == buffer.len() {
+            let count = remaining.min(256) as usize;
+            remaining -= count as u64;
+            let started = Instant::now();
+            buffer = signal.frames(count);
+            offset = 0;
+            if source.encoding == Encoding::DoP {
+                emit_dop_markers(
+                    &mut buffer,
+                    source.channels as usize,
+                    slot as usize,
+                    &mut marker,
+                );
             }
-            if lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
-                failure = Some(("device_lost".into(), "Selected device was lost".into()));
-                break;
+            if let Ok(mut capture) = timing.lock() {
+                capture.record(
+                    "generation_on_demand",
+                    started,
+                    started.elapsed(),
+                    0,
+                    buffer.len(),
+                    false,
+                );
             }
-            if cancel.load(Ordering::Acquire) {
-                failure = Some(("cancelled".into(), "cancelled".into()));
-                break;
-            }
-            if Instant::now() >= deadline {
-                failure_stage = "write";
-                failure = Some(("timeout".into(), "fallback write deadline exceeded".into()));
-                break;
-            }
-            match stream.write(&output[written..converted.produced]) {
-                Ok(0) => std::thread::sleep(Duration::from_millis(2)),
-                Ok(n) => {
-                    output_hash.update(&output[written..written + n]);
-                    written += n;
-                    output_bytes += n as u64;
+        }
+        let write_started = Instant::now();
+        let write_result = stream.write(&buffer[offset..]);
+        if let Ok(mut capture) = timing.lock() {
+            capture.record(
+                "producer_call_inclusive",
+                write_started,
+                write_started.elapsed(),
+                write_result.as_ref().copied().unwrap_or(0),
+                write_result.as_ref().copied().unwrap_or(0),
+                matches!(&write_result, Ok(0)),
+            );
+        }
+        match write_result {
+            Ok(0) => {
+                let started = Instant::now();
+                std::thread::sleep(Duration::from_millis(2));
+                if let Ok(mut capture) = timing.lock() {
+                    capture.record("backpressure_wait", started, started.elapsed(), 0, 0, true);
                 }
-                Err(e) => {
-                    failure_stage = "write";
+            }
+            Ok(n) => {
+                let started = Instant::now();
+                source_hash.update(&buffer[offset..offset + n]);
+                if let Ok(mut check) = check.lock() {
+                    check.source(&buffer[offset..offset + n]);
+                }
+                offset += n;
+                accepted += n as u64;
+                if let Ok(mut capture) = timing.lock() {
+                    capture.record(
+                        "source_verification_hash",
+                        started,
+                        started.elapsed(),
+                        n,
+                        n,
+                        false,
+                    );
+                }
+            }
+            Err(error) => {
+                failure = Some((
+                    "write".into(),
+                    if is_device_lost(&error) {
+                        "device_lost".into()
+                    } else {
+                        error.code().into()
+                    },
+                    error.to_string(),
+                ));
+                break;
+            }
+        }
+    }
+    let mut drain_started = false;
+    while failure.is_none() && !stream.is_drained() {
+        if Instant::now() >= next_sample {
+            let started = Instant::now();
+            let sample = stream.target_stats();
+            if let Ok(mut capture) = timing.lock() {
+                capture.sample(&sample, false);
+                capture.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            next_sample = Instant::now() + Duration::from_millis(20);
+        }
+        if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
+            failure = Some(("usb_event".into(), error.0, error.1));
+            break;
+        }
+        if lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
+            failure = Some((
+                "drain".into(),
+                "device_lost".into(),
+                "Selected device was lost".into(),
+            ));
+            break;
+        }
+        if cancel.load(Ordering::Acquire) {
+            failure = Some(("drain".into(), "cancelled".into(), "Cancelled".into()));
+            break;
+        }
+        if Instant::now() >= deadline {
+            failure = Some((
+                "drain".into(),
+                "timeout".into(),
+                "Drain deadline exceeded".into(),
+            ));
+            break;
+        }
+        if !drain_started {
+            let started = Instant::now();
+            let drain_result = stream.drain();
+            if let Ok(mut capture) = timing.lock() {
+                capture.record(
+                    "producer_call_inclusive",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            match drain_result {
+                Ok(started) => drain_started = started,
+                Err(error) => {
                     failure = Some((
-                        if is_device_lost(&e) {
+                        "drain".into(),
+                        if is_device_lost(&error) {
                             "device_lost".into()
                         } else {
-                            e.code().into()
+                            error.code().into()
                         },
-                        e.to_string(),
+                        error.to_string(),
                     ));
                     break;
                 }
             }
         }
-        if failure.is_some() {
-            break;
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        if let Ok(mut capture) = timing.lock() {
+            capture.record("drain_wait", started, started.elapsed(), 0, 0, false);
         }
     }
-    if failure.is_none() {
-        if let Err(e) = stream.drain() {
-            failure_stage = "drain";
-            failure = Some((
-                if is_device_lost(&e) {
-                    "device_lost".into()
-                } else {
-                    e.code().into()
-                },
-                e.to_string(),
-            ));
-        }
+    let stats = stream.target_stats();
+    let (edges, worker_dropped) = worker_edges(dac, timing_origin);
+    if let Ok(mut capture) = timing.lock() {
+        capture.sample(&stats, true);
+        evidence["producer_timing"] = capture.finish(
+            stats.underruns,
+            &edges,
+            worker_dropped,
+            dropped_timing.load(Ordering::Relaxed),
+        );
     }
-    while failure.is_none() && !stream.is_drained() {
-        if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
-            failure_stage = "usb_event";
-            failure = Some(error);
-        } else if lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
-            failure = Some(("device_lost".into(), "Selected device was lost".into()));
-        } else if cancel.load(Ordering::Acquire) {
-            failure = Some(("cancelled".into(), "cancelled".into()));
-        } else if Instant::now() >= deadline {
-            failure_stage = "drain";
-            failure = Some(("timeout".into(), "fallback drain deadline exceeded".into()));
-        } else {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    if failure.is_none() && (lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire)) {
-        failure = Some(("device_lost".into(), "Selected device was lost".into()));
-    }
-    if failure.is_none() {
-        if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
-            failure_stage = "usb_event";
-            failure = Some(error);
-        }
-    }
-    let stats = stream.stats();
+    let conversion = stream.conversion_stats();
     let drained = stream.is_drained();
-    let counts_match = input_bytes == expected_input
-        && output_bytes == expected_output
-        && produced_bytes == output_bytes
-        && output_bytes > 0
-        && output_bytes.is_multiple_of(format.bytes_per_frame() as u64)
-        && stats.frames_written == output_bytes / format.bytes_per_frame() as u64
+    let target_frame_bytes = if matches!(format.encoding, Encoding::DsdNative { .. }) {
+        usize::from(format.channels)
+    } else {
+        format.bytes_per_frame()
+    };
+    let count_ok = accepted == expected_bytes
+        && conversion.source_bytes == accepted
+        && target_frame_bytes > 0
+        && conversion.target_bytes > 0
+        && conversion
+            .target_bytes
+            .is_multiple_of(target_frame_bytes as u64)
+        && stats.frames_written == conversion.target_bytes / target_frame_bytes as u64
         && stats.played_frames == stats.frames_written
         && stats.completed_transfers > 0
         && drained;
-    let pass = counts_match
-        && failure.is_none()
-        && stats.bit_perfect
+    let pacing_ok = match format.pacing {
+        usbdac_core::Pacing::ExplicitFeedback { .. }
+        | usbdac_core::Pacing::ImplicitFeedback { .. } => stats.feedback_locked,
+        usbdac_core::Pacing::Unsynchronized => false,
+        _ => true,
+    };
+    let usb_pass = failure.is_none()
+        && count_ok
         && stats.payload_verified
         && stats.clock_verified
+        && pacing_ok
         && stats.lost_frames == 0
         && stats.underruns == 0
         && stats.short_packets == 0
         && stats.zero_packets == 0
-        && stats.urb_timeouts == 0
-        && stats.played_frames == stats.frames_written;
-    evidence["status"] = json!(if pass {
+        && stats.urb_timeouts == 0;
+    let verification = check
+        .lock()
+        .map(|check| check.result(frames, signal_rate))
+        .unwrap_or_else(|_| json!({"passed":false, "error":"observer state unavailable"}));
+    let conversion_pass = verification.get("passed").and_then(Value::as_bool) == Some(true)
+        && conversion.clipped_samples == 0;
+    let enough_samples = verification
+        .get("checked_frames")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n >= 64)
+        || verification
+            .get("source_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0);
+    evidence["clock_feedback"] = json!({
+        "clock": evidence["wire_format"]["clock"], "clock_verified":stats.clock_verified,
+        "feedback_kind":format.pacing.code(), "feedback_locked":stats.feedback_locked,
+        "feedback_reports":stats.feedback_reports, "feedback_rate_hz":stats.feedback_rate_hz,
+        "feedback_stale":stats.feedback_stale, "feedback_errors":stats.feedback_errors,
+        "feedback_timeouts":stats.feedback_timeouts, "feedback_rejected":stats.feedback_rejected,
+        "payload_verified":stats.payload_verified, "effective_rate_hz":stats.effective_rate_hz,
+        "completed_transfers":stats.completed_transfers, "lost_frames":stats.lost_frames,
+        "underruns":stats.underruns, "short_packets":stats.short_packets,
+        "zero_packets":stats.zero_packets, "urb_timeouts":stats.urb_timeouts,
+        "max_turnaround_us":stats.max_turnaround_us, "max_submit_gap_us":stats.max_submit_gap_us,
+        "max_worker_gap_us":stats.max_worker_gap_us
+    });
+    evidence["conversion_verification"] = verification;
+    evidence["conversion_verification"]["clipped_samples"] = json!(conversion.clipped_samples);
+    evidence["conversion_verification"]["passed"] = json!(conversion_pass);
+    evidence["target_wire_integrity"] = json!(if usb_pass { "verified" } else { "unverified" });
+    evidence["status"] = json!(if usb_pass && conversion_pass && selection_pass {
         "passed_usb"
-    } else if failure.is_none() && counts_match {
+    } else if usb_pass && ((!conversion_pass && enough_samples) || !selection_pass) {
+        "failed"
+    } else if failure.is_none() {
         "inconclusive"
     } else {
         "failed"
     });
-    evidence["target_wire_integrity"] = json!(if pass { "verified" } else { "unverified" });
-    evidence["digests"] = json!({"source_generated_sha256":format!("{:x}", source_hash.finalize()), "target_written_sha256":format!("{:x}", output_hash.finalize())});
-    evidence["counts"] = json!({"expected_converter_input_bytes":expected_input, "expected_target_frames":expected_frames, "expected_target_bytes":expected_output, "converter_output_bytes":produced_bytes, "drained":drained, "completed_transfers":stats.completed_transfers, "source_framed_bytes":source_framed_bytes, "converter_input_bytes":input_bytes, "target_bytes_written":output_bytes, "clipped_samples":engine.clipped(), "frames_written":stats.frames_written, "played_frames":stats.played_frames, "lost_frames":stats.lost_frames, "underruns":stats.underruns, "payload_verified":stats.payload_verified, "clock_verified":stats.clock_verified, "feedback_locked":stats.feedback_locked, "stats_debug":format!("{stats:?}")});
-    if let Some((ref code, ref message)) = failure {
+    evidence["digests"] = json!({"source_accepted_sha256":format!("{:x}",source_hash.finalize())});
+    evidence["counts"] = json!({"expected_source_bytes":expected_bytes, "source_bytes_accepted":accepted, "source_frames":frames, "source_rate_hz":signal_rate, "target_bytes_accepted":conversion.target_bytes, "clipped_samples":conversion.clipped_samples, "drained":drained, "stats":format!("{stats:?}"), "pacing_verified":pacing_ok});
+    if let Some((stage, code, message)) = failure {
         if code == "device_lost" || code == "cancelled" {
             evidence["termination_reason"] = json!(code);
             evidence["status"] = json!(code);
         }
-        evidence["error"] = json!({"stage":failure_stage,"code":code,"message":message});
-    }
-    if failure.is_none() && !counts_match {
-        evidence["error"] = json!({"stage":"evidence", "code":"count_mismatch", "message":"Converter or completed USB frame counts did not match expected output"});
+        evidence["error"] = json!({"stage":stage, "code":code, "message":message});
     }
     let close = stream.close();
     evidence["close"] = json!(format!("{close:?}"));
-    if let Err(e) = close {
-        if is_device_lost(&e) {
+    if let Err(error) = close {
+        if is_device_lost(&error) {
             evidence["termination_reason"] = json!("device_lost");
             evidence["status"] = json!("device_lost");
         } else {
@@ -671,93 +732,134 @@ pub(super) fn run_fallback(
 }
 
 #[cfg(test)]
-mod tests {
+mod selection_tests {
     use super::*;
     #[test]
-    fn production_rate_order_and_sufficient_depth_are_preserved() {
-        let mut pairs = vec![
-            (48_000, 16),
-            (96_000, 16),
-            (48_000, 32),
-            (48_000, 24),
-            (192_000, 24),
-        ];
-        rank_pairs(&mut pairs, 48_000, 24);
-        assert_eq!(
-            pairs,
-            vec![
-                (48_000, 24),
-                (48_000, 32),
-                (48_000, 16),
-                (96_000, 16),
-                (192_000, 24)
-            ]
-        );
-    }
-    #[test]
-    fn conversion_plan_distinguishes_bit_exact_widening_and_resample() {
-        let source = PcmFormat::new(48_000, 2, SampleFormat::I16);
-        let wide = ConversionPlan::pcm(
-            source,
-            PcmFormat::new(48_000, 2, SampleFormat::I24),
-            &ConvertOptions::default(),
-        )
-        .unwrap();
-        assert!(wide.preserves_bit_perfect());
-        let resampled = ConversionPlan::pcm(
-            source,
-            PcmFormat::new(96_000, 2, SampleFormat::I24),
-            &ConvertOptions::default(),
-        )
-        .unwrap();
-        assert!(!resampled.preserves_bit_perfect());
-    }
-    #[test]
-    fn pcm_engine_process_and_finish_preserve_widened_samples() {
-        let source = PcmFormat::new(48_000, 1, SampleFormat::I16);
-        let target = PcmFormat::new(48_000, 1, SampleFormat::I24);
-        let plan = ConversionPlan::pcm(source, target, &ConvertOptions::default()).unwrap();
-        let mut engine = Engine::Pcm(Converter::new(&plan).unwrap());
-        let input = [0x34, 0x12, 0xfe, 0xff];
-        let mut output = [0u8; 64];
-        let result = engine.process(&input, &mut output).unwrap();
-        assert_eq!((result.consumed, result.produced), (4, 6));
-        assert_eq!(&output[..6], &[0x00, 0x34, 0x12, 0x00, 0xfe, 0xff]);
-        assert_eq!(engine.finish(&mut output).unwrap(), 0);
-        assert_eq!(engine.clipped(), 0);
-    }
-    #[test]
-    fn dsd_engine_process_and_finish_produce_expected_frames() {
-        let target = PcmFormat::new(176_400, 2, SampleFormat::I24);
-        let mut engine = Engine::Dsd(DsdPcmConverter::new(2_822_400, 2, target).unwrap());
-        let input = vec![0x69; 512];
-        let mut output = vec![0u8; 16_384];
-        let step = engine.process(&input, &mut output).unwrap();
-        assert_eq!(step.consumed, input.len());
-        let mut produced = step.produced;
-        loop {
-            let count = engine.finish(&mut output).unwrap();
-            if count == 0 {
-                break;
-            }
-            produced += count;
-        }
-        assert_eq!(produced, 128 * target.bytes_per_frame());
-    }
-    #[test]
-    fn dop_marker_validation_restores_chronological_interleaving() {
-        let input = [
-            0x12, 0x34, 0x05, 0x56, 0x78, 0x05, 0x9a, 0xbc, 0xfa, 0xde, 0xf0, 0xfa,
-        ];
+    fn high_rate_dop_preparation_preserves_streaming_signal_and_markers() {
+        let mut source = StreamRequest::dop(24_576_000, 2);
+        source.bit_depth = 32;
+        let mut prepared_signal = Signal::from_spec(Encoding::DoP, source.sample_rate, 2, 4, 32);
         let mut phase = false;
-        assert_eq!(
-            unpack_dop(&input, 2, 3, &mut phase).unwrap(),
-            [0x34, 0x78, 0x12, 0x56, 0xbc, 0xf0, 0x9a, 0xde]
+        let cancel = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        let result = prepare_high_rate_source(
+            &source,
+            2500,
+            8,
+            &mut prepared_signal,
+            &mut phase,
+            || stop_reason(&cancel, &lost),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let PreparedSource::Ready(actual) = result else {
+            panic!("high-rate source should be prepared");
+        };
+        let mut reference = Signal::from_spec(Encoding::DoP, source.sample_rate, 2, 4, 32);
+        let mut reference_phase = false;
+        let mut expected = Vec::new();
+        for count in [256, 256, 256, 256, 256, 256, 256, 256, 256, 196] {
+            let mut bytes = reference.frames(count);
+            emit_dop_markers(&mut bytes, 2, 4, &mut reference_phase);
+            expected.extend_from_slice(&bytes);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2500 * 8);
+    }
+
+    #[test]
+    fn preparation_is_bounded_and_obeys_stop_before_stream_open() {
+        let source = StreamRequest::dsd_native(24_576_000, 2);
+        let mut signal = Signal::from_spec(source.encoding, 3_072_000, 2, 1, 1);
+        let mut marker = false;
+        let cancel = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        let oversized = prepare_high_rate_source(
+            &source,
+            (PREGENERATED_SOURCE_LIMIT / 2 + 1) as u64,
+            2,
+            &mut signal,
+            &mut marker,
+            || stop_reason(&cancel, &lost),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(oversized, PreparedSource::OnDemand(_)));
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(
+            prepare_high_rate_source(
+                &source,
+                1,
+                2,
+                &mut signal,
+                &mut marker,
+                || stop_reason(&cancel, &lost),
+                Instant::now() + Duration::from_secs(10)
+            ),
+            Err("cancelled")
+        ));
+        cancel.store(false, Ordering::Release);
+        assert!(matches!(
+            prepare_high_rate_source(
+                &source,
+                1,
+                2,
+                &mut signal,
+                &mut marker,
+                || stop_reason(&cancel, &lost),
+                Instant::now() - Duration::from_millis(1)
+            ),
+            Err("timeout")
+        ));
+    }
+
+    #[test]
+    fn only_exact_attempted_prefix_proves_selection() {
+        let source = StreamRequest::pcm(8_000, 1, 16);
+        let a = StreamRequest::pcm(44_100, 2, 24);
+        let b = StreamRequest::pcm(48_000, 2, 24);
+        let refusal = usbdac_core::Error::Unsupported {
+            reason: "descriptor preflight".into(),
+            offered: vec![],
+        };
+        let passed = selection_proof(
+            &source,
+            &[a, b],
+            &b,
+            2,
+            std::slice::from_ref(&refusal),
+            Some(&refusal),
+            Some("no source shape"),
         );
-        assert!(!phase);
-        let mut invalid = input;
-        invalid[8] = 0x05;
-        let mut initial_phase = false;
-        assert!(unpack_dop(&invalid, 2, 3, &mut initial_phase).is_err());
+        assert_eq!(passed["passed"], true);
+        assert_eq!(
+            passed["higher_ranked_refusals"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(passed["source_refusal_kind"], "descriptor_preflight");
+        assert_eq!(
+            selection_proof(
+                &source,
+                &[a, b],
+                &b,
+                1,
+                std::slice::from_ref(&refusal),
+                Some(&refusal),
+                None
+            )["passed"],
+            false
+        );
+        assert_eq!(
+            selection_proof(
+                &source,
+                &[a, b],
+                &b,
+                2,
+                std::slice::from_ref(&refusal),
+                None,
+                None
+            )["passed"],
+            false
+        );
     }
 }

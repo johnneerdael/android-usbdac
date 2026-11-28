@@ -1,0 +1,1243 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:; img-src data:"
+    />
+    <title>usbdac · Diagnostics</title>
+    <style>
+      @@TOKENS@@
+      @font-face {
+        font-family: Manrope;
+        src: url(data:font/woff;base64,@@MANROPE@@) format("woff");
+        font-weight: 200 800;
+      }
+      @font-face {
+        font-family: "IBM Plex Mono";
+        src: url(data:font/woff;base64,@@MONO@@) format("woff");
+        font-weight: 400;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--dac-canvas);
+        color: var(--dac-text);
+        font: 15px/1.55 var(--dac-font);
+      }
+      a {
+        color: var(--dac-primary);
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+        color: var(--dac-text);
+        background: var(--dac-raised);
+        border: 1px solid var(--dac-controlBorder);
+        border-radius: 8px;
+        padding: 9px 12px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      summary:focus-visible {
+        outline: 3px solid var(--dac-focus);
+        outline-offset: 2px;
+      }
+      .shell {
+        max-width: 1200px;
+        margin: auto;
+        padding: 30px 28px 70px;
+      }
+      .mast {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        border-bottom: 1px solid var(--dac-border);
+        padding-bottom: 21px;
+      }
+      .mark {
+        width: 42px;
+        height: 42px;
+        flex: none;
+      }
+      .mark svg {
+        width: 100%;
+        height: 100%;
+      }
+      .mark-light {
+        display: none;
+      }
+      [data-theme="light"] .mark-dark {
+        display: none;
+      }
+      [data-theme="light"] .mark-light {
+        display: block;
+      }
+      .brand {
+        font-weight: 800;
+        font-size: 22px;
+        letter-spacing: -0.04em;
+      }
+      .tag {
+        color: var(--dac-muted);
+        font: 11px var(--dac-mono);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .theme {
+        margin-left: auto;
+      }
+      .hero {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 38px 0 23px;
+      }
+      .hero h1 {
+        font-size: clamp(28px, 4vw, 45px);
+        line-height: 1.12;
+        letter-spacing: -0.045em;
+        margin: 8px 0;
+      }
+      .muted {
+        color: var(--dac-muted);
+      }
+      .hero p {
+        margin: 0;
+      }
+      .hero .verdict {
+        font-size: 15px;
+        padding: 10px 16px;
+      }
+      .overview {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+      }
+      .stat,
+      .card {
+        background: var(--dac-surface);
+        border: 1px solid var(--dac-border);
+        border-radius: var(--dac-panel-radius);
+      }
+      .stat {
+        padding: 17px 19px;
+      }
+      .stat .n {
+        font-size: 27px;
+        font-weight: 800;
+        letter-spacing: -0.04em;
+      }
+      .stat .l {
+        font-size: 12px;
+        color: var(--dac-muted);
+      }
+      nav {
+        display: flex;
+        gap: 8px;
+        overflow: auto;
+        padding: 22px 0 2px;
+      }
+      nav a {
+        text-decoration: none;
+        white-space: nowrap;
+        padding: 7px 11px;
+        border-radius: 8px;
+        background: var(--dac-raised);
+        font-size: 12px;
+        color: var(--dac-secondary);
+      }
+      section {
+        padding-top: 38px;
+        scroll-margin-top: 15px;
+      }
+      .section-head {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        margin-bottom: 13px;
+      }
+      .section-head h2 {
+        font-size: 21px;
+        letter-spacing: -0.025em;
+        margin: 0;
+      }
+      .section-head span {
+        font-size: 12px;
+        color: var(--dac-muted);
+      }
+      .card {
+        padding: 18px;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+      .kv dt {
+        font: 10px var(--dac-mono);
+        color: var(--dac-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .kv dd {
+        margin: 4px 0 0;
+        overflow-wrap: anywhere;
+      }
+      .rows {
+        padding: 0;
+        overflow: hidden;
+      }
+      .row {
+        border-bottom: 1px solid var(--dac-border);
+      }
+      .row:last-child {
+        border: 0;
+      }
+      summary {
+        cursor: pointer;
+        list-style: none;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 13px 17px;
+      }
+      summary::-webkit-details-marker {
+        display: none;
+      }
+      summary:after {
+        content: "+";
+        margin-left: auto;
+        color: var(--dac-muted);
+        font: 18px var(--dac-mono);
+      }
+      details[open] > summary:after {
+        content: "−";
+      }
+      .rowtitle {
+        overflow-wrap: anywhere;
+        min-width: 0;
+      }
+      .meta {
+        font: 11px var(--dac-mono);
+        color: var(--dac-muted);
+        margin-top: 3px;
+        overflow-wrap: anywhere;
+      }
+      .badge {
+        display: inline-flex;
+        border-radius: 999px;
+        padding: 3px 9px;
+        font: 700 10px var(--dac-mono);
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+      .pass {
+        color: var(--dac-success);
+        background: var(--dac-successSoft);
+      }
+      .fail {
+        color: var(--dac-danger);
+        background: var(--dac-dangerSoft);
+      }
+      .info {
+        color: var(--dac-primary);
+        background: var(--dac-primarySoft);
+      }
+      .raw {
+        border-top: 1px solid var(--dac-border);
+        padding: 14px 18px;
+        background: var(--dac-canvas);
+      }
+      pre {
+        font: 11px/1.5 var(--dac-mono);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        margin: 0;
+        color: var(--dac-secondary);
+      }
+      .tools {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      .tools input {
+        flex: 1;
+        min-width: 200px;
+      }
+      .notice {
+        padding: 13px 16px;
+        border: 1px solid var(--dac-controlBorder);
+        border-radius: 10px;
+        color: var(--dac-secondary);
+        margin-top: 15px;
+      }
+      .warning {
+        border-color: var(--dac-warning);
+        color: var(--dac-warning);
+      }
+      .empty {
+        padding: 18px;
+        color: var(--dac-muted);
+      }
+      footer {
+        border-top: 1px solid var(--dac-border);
+        margin-top: 45px;
+        padding-top: 20px;
+        color: var(--dac-muted);
+        font-size: 12px;
+      }
+      .sr {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+      }
+      @media (max-width: 700px) {
+        .shell {
+          padding: 20px 16px 55px;
+        }
+        .overview {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .hero {
+          align-items: start;
+          flex-direction: column;
+        }
+        .kv {
+          grid-template-columns: 1fr 1fr;
+        }
+        .mast {
+          gap: 10px;
+        }
+        summary {
+          align-items: flex-start;
+        }
+      }
+      @media print {
+        button,
+        .tools,
+        nav {
+          display: none;
+        }
+        body {
+          background: white;
+          color: #111;
+        }
+        .card,
+        .stat {
+          break-inside: avoid;
+          border: 1px solid #aaa;
+        }
+        section {
+          padding-top: 20px;
+        }
+        .shell {
+          max-width: none;
+        }
+        details[open] pre {
+          font-size: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="mast">
+        <div class="mark mark-dark" aria-hidden="true">@@MARK@@</div>
+        <div class="mark mark-light" aria-hidden="true">@@MARK_LIGHT@@</div>
+        <div>
+          <div class="brand">usbdac</div>
+          <div class="tag">Direct USB · Diagnostics</div>
+        </div>
+        <button
+          class="theme"
+          id="theme"
+          type="button"
+          aria-label="Toggle light and dark theme"
+        >
+          Light theme
+        </button>
+      </header>
+      <main>
+        <div class="hero">
+          <div>
+            <div class="tag">Offline evidence report</div>
+            <h1>USB DAC diagnostics</h1>
+            <p id="identity" class="muted">Reading captured evidence…</p>
+          </div>
+          <span id="overall" class="badge fail verdict">FAIL</span>
+        </div>
+        <div id="warnings" aria-live="polite"></div>
+        <div id="overview" class="overview"></div>
+        <nav aria-label="Report sections">
+          <a href="#initialization">Initialization</a
+          ><a href="#formats">Formats</a><a href="#playback">Playback</a
+          ><a href="#clock">Clock &amp; feedback</a
+          ><a href="#cleanup">Cleanup</a><a href="#timeline">Evidence</a>
+        </nav>
+        <section id="initialization">
+          <div class="section-head">
+            <h2>Initialization &amp; ownership</h2>
+            <span>Host, attachment and claims</span>
+          </div>
+          <div class="card">
+            <dl class="kv" id="identity-grid"></dl>
+            <div id="init-rows" class="rows"></div>
+          </div>
+        </section>
+        <section id="formats">
+          <div class="section-head">
+            <h2>Supported formats</h2>
+            <span>Driver-reported capabilities</span>
+          </div>
+          <div id="formats-content" class="card"></div>
+        </section>
+        <section id="playback">
+          <div class="section-head">
+            <h2>Playback checks</h2>
+            <span>Exact delivery, admission and converted playback</span>
+          </div>
+          <div class="tools">
+            <label class="sr" for="case-search">Search playback checks</label
+            ><input
+              id="case-search"
+              type="search"
+              placeholder="Search requests or outcomes"
+            /><label class="sr" for="case-filter">Filter checks</label
+            ><select id="case-filter">
+              <option value="all">All checks</option>
+              <option value="pass">Passed</option>
+              <option value="fail">Failed or incomplete</option>
+            </select>
+          </div>
+          <div id="cases" class="card rows"></div>
+        </section>
+        <section id="clock">
+          <div class="section-head">
+            <h2>Clock &amp; feedback</h2>
+            <span>Per-playback transport evidence</span>
+          </div>
+          <div id="clock-rows" class="card rows"></div>
+        </section>
+        <section id="cleanup">
+          <div class="section-head">
+            <h2>Cleanup</h2>
+            <span>Close and hand-back evidence</span>
+          </div>
+          <div id="cleanup-rows" class="card rows"></div>
+        </section>
+        <section id="timeline">
+          <div class="section-head">
+            <h2>Searchable evidence</h2>
+            <span>Timeline and debug records</span>
+          </div>
+          <div class="tools">
+            <label class="sr" for="log-search">Search evidence</label
+            ><input
+              id="log-search"
+              type="search"
+              placeholder="Search timeline and debug logs"
+            /><select id="log-filter" aria-label="Evidence source">
+              <option value="all">All evidence</option>
+              <option value="timeline">Timeline</option>
+              <option value="android">Android lifecycle</option>
+              <option value="debug">Debug</option>
+            </select>
+          </div>
+          <p id="log-count" class="meta"></p>
+          <div id="logs" class="card rows"></div>
+          <p><button type="button" id="more">Show more evidence</button></p>
+          <details class="card">
+            <summary>Raw structured report</summary>
+            <div class="raw"><pre id="raw-report"></pre></div>
+          </details>
+        </section>
+      </main>
+      <footer>
+        <p>
+          USB delivery does not establish analog output or DoP decoder lock.
+          Preserve the original ZIP for complete technical evidence.
+        </p>
+        <details>
+          <summary>Font licenses and attribution</summary>
+          <pre>@@LICENSE@@</pre>
+        </details>
+      </footer>
+    </div>
+    <script type="application/json" id="capture">
+      @@PAYLOAD@@
+    </script>
+    <script>
+      "use strict";
+      const data = JSON.parse(document.getElementById("capture").textContent),
+        report = data.report || {},
+        $ = (id) => document.getElementById(id);
+      const el = (tag, text, cls) => {
+        const n = document.createElement(tag);
+        if (text !== undefined) n.textContent = String(text);
+        if (cls) n.className = cls;
+        return n;
+      };
+      const arr = (v) => (Array.isArray(v) ? v : []),
+        obj = (v) => (v && typeof v === "object" ? v : {});
+      function badge(label, good) {
+        return el("span", label, "badge " + (good ? "pass" : "fail"));
+      }
+      function row(parent, title, sub, raw, verdict) {
+        const d = el("details", undefined, "row");
+        const s = el("summary");
+        if (verdict)
+          s.append(
+            badge(verdict === "PASS" ? "PASS" : verdict, verdict === "PASS"),
+          );
+        const t = el("div", undefined, "rowtitle");
+        t.append(el("div", title));
+        if (sub) t.append(el("div", sub, "meta"));
+        s.append(t);
+        d.append(s);
+        let filled = false;
+        d.addEventListener("toggle", () => {
+          if (d.open && !filled) {
+            const box = el("div", undefined, "raw");
+            box.append(
+              el(
+                "pre",
+                typeof raw === "string" ? raw : JSON.stringify(raw, null, 2),
+              ),
+            );
+            d.append(box);
+            filled = true;
+          }
+        });
+        parent.append(d);
+      }
+      function statsPass(v) {
+        const s = obj(obj(v.evidence).stats);
+        return (
+          s.clock_verified === true &&
+          s.payload_verified === true &&
+          Number(s.frames_written) > 0 &&
+          s.played_frames === s.frames_written &&
+          s.completed_transfers > 0 &&
+          [
+            "lost_frames",
+            "underruns",
+            "short_packets",
+            "zero_packets",
+            "urb_timeouts",
+          ].every((k) => s[k] === 0)
+        );
+      }
+      function exactMatch(v) {
+        const f = obj(obj(v.evidence).format),
+          req = String(v.request || "");
+        const get = (k) => {
+          let x = req.match(new RegExp("\\b" + k + ":\\s*(\\d+)"));
+          return x ? Number(x[1]) : null;
+        };
+        let enc = (req.match(
+          /encoding:\s*(PcmFloat32|PcmU8|Pcm|DoP|DsdNative)/,
+        ) || [])[1];
+        if (
+          !enc ||
+          !f.encoding ||
+          !f.channels ||
+          get("channels") !== f.channels
+        )
+          return false;
+        if (enc === "DsdNative") {
+          let rate = get("bit_rate");
+          return (
+            String(f.encoding).includes("DsdNative") &&
+            rate !== null &&
+            String(f.encoding).includes(String(rate))
+          );
+        }
+        return (
+          f.encoding === enc &&
+          get("sample_rate") === f.sample_rate &&
+          get("bit_depth") === f.valid_bits
+        );
+      }
+      // StreamRequest is retained in each expandable record; the label is only
+      // a readable view and is never used to decide a verdict.
+      function requestLabel(request) {
+        const raw = String(request || "");
+        const field = (key) => {
+          const match = raw.match(new RegExp("\\b" + key + ":\\s*(\\d+)"));
+          return match ? Number(match[1]) : null;
+        };
+        const encoding = (raw.match(
+          /encoding:\s*(PcmFloat32|PcmU8|Pcm|DoP|DsdNative)/,
+        ) || [])[1];
+        if (!encoding) return raw || "Format unavailable";
+        const channels = field("channels");
+        const channelLabel =
+          channels === 1
+            ? "mono"
+            : channels === 2
+              ? "stereo"
+              : channels
+                ? channels + " channels"
+                : "channels unavailable";
+        if (encoding === "DsdNative") {
+          const rate = field("bit_rate");
+          const multiplier =
+            rate &&
+            (rate % 2822400 === 0
+              ? rate / 2822400
+              : rate % 3072000 === 0
+                ? rate / 3072000
+                : null);
+          return [
+            multiplier ? "DSD" + 64 * multiplier : "Native DSD",
+            rate
+              ? (rate / 1000000)
+                  .toFixed(4)
+                  .replace(/0+$/, "")
+                  .replace(/\.$/, "") + " Mbit/s"
+              : "rate unavailable",
+            channelLabel,
+          ].join(" · ");
+        }
+        const rate = field("sample_rate");
+        const bits = field("bit_depth");
+        const name =
+          encoding === "DoP"
+            ? "DoP carrier"
+            : encoding === "PcmFloat32"
+              ? "PCM Float32"
+              : encoding === "PcmU8"
+                ? "PCM U8"
+                : "PCM";
+        return [
+          name,
+          rate ? (rate / 1000).toString() + " kHz" : "rate unavailable",
+          bits ? bits + "-bit" : "depth unavailable",
+          channelLabel,
+        ].join(" · ");
+      }
+      function exactVerdict(v) {
+        return v.status === "passed_usb" && statsPass(v) && exactMatch(v)
+          ? "PASS"
+          : "FAIL";
+      }
+      function admitVerdict(v) {
+        return v.admission === "expected_rejected" &&
+          v.error_code === "unsupported"
+          ? "PASS"
+          : "FAIL";
+      }
+      function selection(v) {
+        if (v.selection_verification != null)
+          return obj(v.selection_verification).passed === true;
+        const p = arr(v.planned_candidates);
+        return (
+          String(v.resolver || "").includes(
+            "production Dac::resolve_playback",
+          ) &&
+          v.attempted_candidate_count === 1 &&
+          p.length > 0 &&
+          typeof v.target_request === "string" &&
+          v.target_request === p[0]
+        );
+      }
+      function fallbackVerdict(v) {
+        return v.status === "passed_usb" &&
+          selection(v) &&
+          obj(v.conversion_verification).passed === true &&
+          v.target_wire_integrity === "verified"
+          ? "PASS"
+          : "FAIL";
+      }
+      const exact = arr(report.legs).map(obj),
+        probes = arr(report.admission_results).map(obj),
+        fallback = arr(report.fallback_results).map(obj),
+        items = [];
+      exact.forEach((v, i) =>
+        items.push({
+          kind: "exact",
+          title: requestLabel(v.request),
+          search: v.request || "",
+          sub:
+            "Exact playback · " +
+            (v.error ||
+              (exactVerdict(v) === "PASS"
+                ? "USB transport verified"
+                : "exact format, clock or delivery proof missing")),
+          v,
+          verdict: exactVerdict(v),
+          id: "exact-" + i,
+        }),
+      );
+      probes.forEach((v, i) =>
+        items.push({
+          kind: "admission",
+          title: requestLabel(v.request),
+          search: v.request || "",
+          sub:
+            admitVerdict(v) === "PASS"
+              ? "Admission · expected typed refusal"
+              : "Admission · " + (v.error || "incomplete evidence"),
+          v,
+          verdict: admitVerdict(v),
+          id: "admission-" + i,
+        }),
+      );
+      function qualitySummary(value) {
+        const quality = obj(value.selected_quality);
+        if (!Object.keys(quality).length) return "";
+        const parts = [];
+        if (typeof quality.retained_bandwidth_hz === "number") parts.push("retained " + (quality.retained_bandwidth_hz / 1000).toFixed(1) + " kHz");
+        if (quality.meaningful_depth_bits != null) parts.push(quality.meaningful_depth_bits + "-bit meaningful depth");
+        if (quality.resampling === true) parts.push("resampling");
+        return parts.length ? " · " + parts.join(" · ") : "";
+      }
+      fallback.forEach((v, i) =>
+        items.push({
+          kind: "fallback",
+          title: requestLabel(v.source_request),
+          search:
+            String(v.source_request || "") +
+            " " +
+            String(v.target_request || ""),
+          sub:
+            "Converted playback · " +
+            (v.target_request
+              ? requestLabel(v.target_request)
+              : "no selected target") +
+            " · " +
+            (selection(v)
+              ? "selection evidenced"
+              : "selection evidence incomplete") + qualitySummary(v),
+          v,
+          verdict: fallbackVerdict(v),
+          id: "fallback-" + i,
+        }),
+      );
+      let unmatched = 0;
+      for (const item of items.filter(
+        (x) => x.kind === "admission" && x.verdict === "PASS",
+      )) {
+        const match = fallback.findIndex(
+          (x) => x.source_request === item.v.request,
+        );
+        if (match >= 0) {
+          item.relatedId = "fallback-" + match;
+          item.relatedLabel = "View separate playback result";
+          item.sub += " · see separate playback result";
+        } else {
+          item.sub += " · no playback result captured";
+          unmatched++;
+        }
+      }
+      for (const item of items.filter((x) => x.kind === "fallback")) {
+        const admission = probes.findIndex(
+          (x) => x.request === item.v.source_request,
+        );
+        const original = exact.findIndex(
+          (x) => x.request === item.v.source_request,
+        );
+        if (admission >= 0) {
+          item.relatedId = "admission-" + admission;
+          item.relatedLabel = "View exact admission result";
+        } else if (original >= 0) {
+          item.relatedId = "exact-" + original;
+          item.relatedLabel = "View exact playback result";
+        }
+      }
+      const missing =
+        arr(report.unattempted_plan).length +
+        arr(report.unattempted_admission_plan).length;
+      for (const [kind, plans] of [
+        ["exact", arr(report.unattempted_plan).map(obj)],
+        ["admission", arr(report.unattempted_admission_plan).map(obj)],
+      ])
+        plans.forEach((v, i) =>
+          items.push({
+            kind,
+            title: requestLabel(v.request),
+            search: v.request || "",
+            sub: "Planned but not attempted",
+            v,
+            verdict: "FAIL",
+            id: "unattempted-" + kind + "-" + i,
+          }),
+        );
+      const pass = items.filter((x) => x.verdict === "PASS").length,
+        incomplete = items.length - pass;
+      const timeline = arr(data.timeline)
+          .map((v) => ({ source: "timeline", v }))
+          .concat(
+            arr(data.android).map((v) => ({
+              source: "android",
+              v: { kind: v.kind, elapsed_ms: v.time_ms, value: v.data },
+            })),
+          ),
+        debug = arr(data.debug).map((v) => ({ source: "debug", v })),
+        records = timeline.concat(debug);
+      if (timeline.some((x) => x.v.kind === "capture_warning"))
+        data.warnings.push("The capture reported a diagnostic warning.");
+      if (arr(data.debug).some((x) => x.kind === "debug_truncated"))
+        data.warnings.push(
+          "The captured debug log reached its retention limit.",
+        );
+      if (obj(data.aux["capture-status.json"]).partial === true)
+        data.warnings.push("Capture status reports incomplete evidence.");
+      if (data.aux["interrupted.json"])
+        data.warnings.push("This capture was recovered after interruption.");
+      if (data.aux["capture-warning.json"])
+        data.warnings.push("The host recorded a capture or recovery warning.");
+      const requiredArrays = [
+        "plan",
+        "legs",
+        "unattempted_plan",
+        "admission_plan",
+        "admission_results",
+        "unattempted_admission_plan",
+        "fallback_results",
+      ];
+      const matrixPresent = requiredArrays.every((key) =>
+        Array.isArray(report[key]),
+      );
+      const matrixConsistent =
+        matrixPresent &&
+        report.plan.length ===
+          report.legs.length + report.unattempted_plan.length &&
+        report.admission_plan.length ===
+          report.admission_results.length +
+            report.unattempted_admission_plan.length;
+      if (!matrixPresent)
+        data.warnings.push(
+          "Full playback and admission matrix evidence is absent from this capture.",
+        );
+      else if (!matrixConsistent)
+        data.warnings.push(
+          "The recorded matrix and completed checks do not reconcile.",
+        );
+      const closed = timeline.some(
+        (x) =>
+          (x.v.kind === "dac_close" && obj(x.v.value).result === "Ok(())") ||
+          (x.v.kind === "session_close" && obj(x.v.value).status === "closed"),
+      );
+      const terminal = timeline.some((x) =>
+        ["terminal", "finished"].includes(x.v.kind),
+      );
+      if (!closed)
+        data.warnings.push("Successful session close is not evidenced.");
+      if (!terminal)
+        data.warnings.push("A terminal capture event is not evidenced.");
+      const complete =
+        closed &&
+        terminal &&
+        matrixConsistent &&
+        items.some(
+          (x) =>
+            (x.kind === "exact" || x.kind === "fallback") &&
+            x.verdict === "PASS",
+        ) &&
+        incomplete === 0 &&
+        missing === 0 &&
+        unmatched === 0 &&
+        report.cancelled !== true &&
+        !report.termination_reason &&
+        !report.error &&
+        data.warnings.length === 0;
+      $("overall").textContent = complete ? "PASS" : "FAIL";
+      $("overall").className = "badge verdict " + (complete ? "pass" : "fail");
+      for (const [n, l] of [
+        [items.length, "Checks recorded"],
+        [pass, "Checks passed"],
+        [incomplete, "Failed or incomplete"],
+        [missing, "Planned but not attempted"],
+      ]) {
+        let d = el("div", undefined, "stat");
+        d.append(el("div", n, "n"), el("div", l, "l"));
+        $("overview").append(d);
+      }
+      let selected = timeline.find((x) =>
+        ["attachment", "selected", "attached"].includes(x.v.kind),
+      );
+      let host = timeline.find((x) => x.v.kind === "host");
+      const started = timeline.find((x) => x.v.kind === "run_started");
+      const runInfo = obj(started && started.v.value).info;
+      let runProduct = obj(runInfo).product_name;
+      if (!runProduct && typeof runInfo === "string") {
+        const match = runInfo.match(/\bproduct_name:\s*("(?:\\.|[^"\\])*")/);
+        if (match) {
+          try { runProduct = JSON.parse(match[1]); } catch (_) { /* Ignore malformed debug text. */ }
+        }
+      }
+      let identity = obj(selected && selected.v.value),
+        hostInfo = obj(host && host.v.value),
+        ev = obj(identity.evidence || identity);
+      let device =
+        ev.product_name || ev.product || identity.product || runProduct || "Selected USB DAC";
+      let ids =
+        ev.vendor_id != null && ev.product_id != null
+          ? " · " +
+            Number(ev.vendor_id).toString(16).padStart(4, "0") +
+            ":" +
+            Number(ev.product_id).toString(16).padStart(4, "0")
+          : "";
+      $("identity").textContent =
+        (selected ? device + ids : "No selected USB attachment") +
+        " · " +
+        (report.started_unix_ms
+          ? new Date(report.started_unix_ms).toLocaleString()
+          : "Start time unavailable");
+      for (const [k, v] of [
+        ["Device", device + ids],
+        ["Host", hostInfo.os || "Unavailable"],
+        ["Architecture", hostInfo.arch || "Unavailable"],
+        ["Driver", hostInfo.driver_version || "Unavailable"],
+        ["USB configuration", ev.active_configuration ?? "Unavailable"],
+        ["Overall result", complete ? "PASS" : "FAIL"],
+      ]) {
+        let wrap = el("div");
+        wrap.append(el("dt", k), el("dd", v));
+        $("identity-grid").append(wrap);
+      }
+      if (!data.report)
+        data.warnings.push(
+          "Structured playback report unavailable. The timeline may contain only initialization or recovery evidence.",
+        );
+      if (missing)
+        data.warnings.push(missing + " planned checks were not attempted.");
+      if (unmatched)
+        data.warnings.push(
+          unmatched + " expected refusals have no separate playback result.",
+        );
+      if (!items.length)
+        data.warnings.push(
+          "No completed playback or admission checks were captured.",
+        );
+      for (const w of data.warnings)
+        $("warnings").append(el("div", w, "notice warning"));
+      // A claim failure must remain visible even when the driver never
+      // produced a structured playback report.
+      for (const entry of timeline.filter((x) => x.v.kind === "open_error")) {
+        const failure = obj(entry.v.value);
+        const detail = failure.error || obj(failure.host_usb).detail || failure.code || "Opening the selected USB device failed.";
+        $("init-rows").append(el("div", "USB open failed. " + String(detail), "notice warning"));
+      }
+      const optionalClaims = timeline.filter((x) => ["duplex_claim_attempt", "duplex_claim_confirmed", "duplex_claim_fallback"].includes(x.v.kind));
+      const macInputProbes = debug.filter((x) => String(obj(x.v.value).message || "").includes("host_usb_capture_probe"));
+      const inputTitle = el("h3", "Optional microphone interface claim");
+      inputTitle.style.margin = "20px 0 5px";
+      $("init-rows").append(inputTitle);
+      $("init-rows").append(el("p", "These are interface ownership checks, separate from playback. They do not establish microphone recording or duplex audio.", "muted"));
+      if (!optionalClaims.length && !macInputProbes.length) {
+        $("init-rows").append(el("p", "No optional input claim evidence was captured.", "muted"));
+      }
+      for (const event of optionalClaims) {
+        row($("init-rows"), String(event.v.kind).replaceAll("_", " "), "Android host claim evidence", event.v, null);
+      }
+      for (const event of macInputProbes) {
+        const message = String(obj(event.v.value).message || "");
+        row($("init-rows"), "macOS optional input claim", message, event.v, null);
+      }
+      const initKinds = [
+        "capture_started",
+        "compatibility_policy",
+        "host",
+        "baseline",
+        "attachment",
+        "selected",
+        "attached",
+        "permission_requested",
+        "permission_confirmed",
+        "permission_result",
+        "descriptor_device",
+        "descriptor_config",
+        "claim_started",
+        "claim_confirmed",
+        "sdk_opened",
+        "open_options",
+        "open_error",
+        "run_started",
+        "error",
+        "capture_warning",
+      ];
+      for (const r of timeline.filter((x) => initKinds.includes(x.v.kind)))
+        row(
+          $("init-rows"),
+          String(r.v.kind).replaceAll("_", " "),
+          "Timeline evidence",
+          r.v,
+          null,
+        );
+      const caps = obj(report.capabilities);
+      if (Object.keys(caps).length)
+        row(
+          $("formats-content"),
+          "Driver capability snapshot",
+          "Open for rates, encodings and reported formats",
+          caps,
+          null,
+        );
+      else
+        $("formats-content").append(
+          el("div", "No capability snapshot was captured.", "muted"),
+        );
+      function renderCases() {
+        const target = $("cases");
+        target.replaceChildren();
+        const q = $("case-search").value.toLowerCase(),
+          f = $("case-filter").value;
+        const matches = items.filter(
+          (x) =>
+            (f === "all" || f === x.kind || f === x.verdict.toLowerCase()) &&
+            (x.title + " " + x.sub + " " + x.verdict + " " + (x.search || ""))
+              .toLowerCase()
+              .includes(q),
+        );
+        if (!matches.length)
+          target.append(el("div", "No matching checks.", "empty"));
+        for (const x of matches) {
+          let holder = el("div");
+          holder.id = x.id;
+          row(holder, x.title, x.sub, x.v, x.verdict);
+          if (x.relatedId) {
+            const link = el("a", x.relatedLabel || "View related result");
+            link.href = "#" + x.relatedId;
+            link.addEventListener("click", (event) => {
+              event.preventDefault();
+              $("case-filter").value = "all";
+              $("case-search").value = "";
+              renderCases();
+              document
+                .getElementById(x.relatedId)
+                ?.scrollIntoView({ block: "center" });
+            });
+            link.style.cssText =
+              "display:block;padding:0 17px 12px;font-size:12px";
+            holder.append(link);
+          }
+          target.append(holder);
+        }
+      }
+      $("case-search").addEventListener("input", renderCases);
+      $("case-filter").addEventListener("change", renderCases);
+      renderCases();
+      for (const [i, v] of exact.entries()) {
+        const st = obj(obj(v.evidence).stats),
+          f = obj(obj(v.evidence).format);
+        row(
+          $("clock-rows"),
+          requestLabel(v.request),
+          "Clock " +
+            String(st.clock_verified ?? "unavailable") +
+            " · payload " +
+            String(st.payload_verified ?? "unavailable") +
+            " · " +
+            String(f.pacing || "pacing unavailable"),
+          {
+            format: f,
+            stats: st,
+            feedback: obj(v.evidence).feedback,
+            trace: obj(v.evidence).dac_feedback_trace,
+          },
+          null,
+        );
+      }
+      let fallbackClockCount = 0;
+      for (const [i, value] of fallback.entries()) {
+        const counts = obj(value.counts);
+        const structured = obj(value.clock_feedback);
+        const legacy =
+          typeof counts.stats === "string"
+            ? counts.stats
+            : typeof counts.stats_debug === "string"
+              ? counts.stats_debug
+              : "";
+        const played =
+          Number(
+            counts.target_bytes_accepted ||
+              counts.target_bytes_written ||
+              counts.played_frames ||
+              0,
+          ) > 0 || value.target_wire_integrity === "verified";
+        const hasMetrics = Object.values(structured).some(
+          (v) => v !== null && v !== undefined,
+        );
+        if (!played && !hasMetrics && !legacy) continue;
+        fallbackClockCount++;
+        const legacyField = (name) => {
+          const match = legacy.match(
+            new RegExp("\\b" + name + ":\\s*([^,}]+)"),
+          );
+          return match ? match[1].trim() : "unavailable";
+        };
+        const clock =
+          structured.clock_verified ?? legacyField("clock_verified");
+        const feedback =
+          structured.feedback_locked ?? legacyField("feedback_locked");
+        const pacing =
+          structured.feedback_kind ||
+          obj(value.wire_format).pacing ||
+          "pacing unavailable";
+        row(
+          $("clock-rows"),
+          requestLabel(value.source_request),
+          "Converted playback · clock " +
+            String(clock) +
+            " · feedback lock " +
+            String(feedback) +
+            " · " +
+            String(pacing) +
+            (hasMetrics ? " · structured" : " · legacy raw stats"),
+          {
+            source_request: value.source_request,
+            target_request: value.target_request,
+            wire_format: value.wire_format,
+            clock_feedback: value.clock_feedback,
+            legacy_stats: legacy,
+            counts,
+          },
+          null,
+        );
+      }
+      function showProducerIncidents(request, timing, underruns) {
+        const evidence = obj(timing);
+        if (Number(underruns) > 0 && !arr(evidence.incident_details).length) {
+          row($("clock-rows"), "Underrun · " + requestLabel(request), "Stage unresolved · worker edge or producer timing was not captured", {underruns, producer_timing:timing}, null);
+        }
+        for (const incident of arr(evidence.incident_details)) {
+          const worker = obj(incident.worker);
+          const knownStage = incident.classification === "observed_producer_stage_at_empty_edge" && incident.observed_stage;
+          const label = knownStage ? "Observed stage: " + String(incident.observed_stage).replaceAll("_", " ") : "Stage unresolved";
+          const buffered = worker.buffered_samples == null ? "queue unavailable" : "queue " + worker.buffered_samples + "/" + String(worker.capacity_samples ?? "?") + " interleaved samples";
+          const age = incident.last_accepted_enqueue_age_us == null ? "last enqueue unavailable" : "last accepted enqueue " + (incident.last_accepted_enqueue_age_us / 1000).toFixed(1) + " ms earlier";
+          row($("clock-rows"), "Underrun · " + requestLabel(request), label + " · " + buffered + " · " + age, {incident, retention:evidence.retention, stage_totals:evidence.stages, timeline:evidence.detail}, null);
+        }
+      }
+      for (const value of exact) showProducerIncidents(value.request, obj(value.evidence).producer_timing, obj(obj(value.evidence).stats).underruns);
+      for (const value of fallback) {
+        const raw = String(obj(value.counts).stats || "");
+        const match = raw.match(/\bunderruns:\s*(\d+)/);
+        showProducerIncidents(value.source_request, value.producer_timing, obj(value.clock_feedback).underruns ?? (match ? Number(match[1]) : null));
+      }
+      const clockMessages = debug.filter((r) => {
+        const message = String(obj(r.v.value).message || "");
+        return /clock|feedback|negotiat|first.?lock/i.test(message);
+      });
+      for (const event of clockMessages.slice(0, 30)) {
+        const message = String(obj(event.v.value).message || "");
+        row(
+          $("clock-rows"),
+          "Driver initialization and lock evidence",
+          message.slice(0, 240),
+          event.v,
+          null,
+        );
+      }
+      if (clockMessages.length > 30)
+        $("clock-rows").append(
+          el(
+            "p",
+            "Showing 30 of " +
+              clockMessages.length +
+              " matching driver messages here. Search all captured debug evidence below.",
+            "empty",
+          ),
+        );
+      if (!exact.length && !fallbackClockCount && !clockMessages.length)
+        $("clock-rows").append(
+          el(
+            "div",
+            "No playback clock or feedback evidence was captured.",
+            "empty",
+          ),
+        );
+      for (const [name, value] of Object.entries(obj(data.aux)))
+        row($("init-rows"), name, "Additional captured evidence", value, null);
+      const cleanup = timeline.filter((x) =>
+        [
+          "dac_close",
+          "session_close",
+          "run_termination",
+          "terminal",
+          "finished",
+          "capture_status",
+        ].includes(x.v.kind),
+      );
+      for (const r of cleanup)
+        row(
+          $("cleanup-rows"),
+          String(r.v.kind).replaceAll("_", " "),
+          "Timeline evidence",
+          r.v,
+          null,
+        );
+      if (!cleanup.length)
+        $("cleanup-rows").append(
+          el("div", "No teardown record was captured.", "empty"),
+        );
+      let limit = 100;
+      function renderLogs() {
+        const q = $("log-search").value.toLowerCase(),
+          f = $("log-filter").value;
+        const matches = records.filter(
+          (x) =>
+            (f === "all" || f === x.source) &&
+            (!q || JSON.stringify(x.v).toLowerCase().includes(q)),
+        );
+        $("logs").replaceChildren();
+        for (const r of matches.slice(0, limit))
+          row(
+            $("logs"),
+            String(r.v.kind || r.source).replaceAll("_", " "),
+            r.source + " · " + String(r.v.elapsed_ms ?? "—") + " ms",
+            r.v,
+            null,
+          );
+        $("log-count").textContent =
+          "Showing " +
+          Math.min(limit, matches.length) +
+          " of " +
+          matches.length +
+          " records";
+        $("more").hidden = limit >= matches.length;
+      }
+      for (const id of ["log-search", "log-filter"])
+        $(id).addEventListener(id === "log-search" ? "input" : "change", () => {
+          limit = 100;
+          renderLogs();
+        });
+      $("more").addEventListener("click", () => {
+        limit += 100;
+        renderLogs();
+      });
+      renderLogs();
+      $("raw-report").parentElement.parentElement.addEventListener(
+        "toggle",
+        (e) => {
+          if (e.currentTarget.open && !$("raw-report").textContent)
+            $("raw-report").textContent = data.report
+              ? JSON.stringify(data.report, null, 2)
+              : "No structured report was captured.";
+        },
+      );
+      $("theme").addEventListener("click", () => {
+        const next =
+          document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        $("theme").textContent = next === "dark" ? "Light theme" : "Dark theme";
+      });
+    </script>
+  </body>
+</html>

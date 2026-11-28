@@ -25,6 +25,9 @@ import dev.usbdac.DownstreamBinding
 import dev.usbdac.DacException
 import dev.usbdac.DacErrorCode
 import dev.usbdac.RouteKind
+import dev.usbdac.OutputPolicy
+import dev.usbdac.DriverPlaybackDecision
+import dev.usbdac.resolveDriverPlayback
 import dev.usbdac.OutputChange
 import dev.usbdac.OutputRoute
 import dev.usbdac.PcmConverter
@@ -158,6 +161,10 @@ internal class SessionLink(override val session: DacSession) : DirectLink {
 
     override var stream: DacStream? = null
         private set
+
+    override val supportsDriverPlayback: Boolean get() = true
+    override fun resolvePlayback(request: StreamRequest, policy: OutputPolicy, bypassLimits: Boolean): DriverPlaybackDecision =
+        session.resolveDriverPlayback(request, policy, bypassLimits)
 
     override fun negotiate(request: StreamRequest): StreamFormat = session.negotiate(request)
 

@@ -241,6 +241,20 @@ fn negotiate_ranked<T>(
 
 /// Negotiate a pre-ranked, bounded set without releasing the retained owner between attempts.
 pub(crate) fn negotiate_candidates(requests: &[StreamRequest]) -> Result<StreamFormat, Error> {
+    negotiate_candidate_batch(requests, false).map(|result| result.0)
+}
+
+/// Source playback may additionally admit mono-to-stereo in the same owner scope.
+pub(crate) fn negotiate_playback_candidates(
+    requests: &[StreamRequest],
+) -> Result<(StreamFormat, usize, Option<Error>, Vec<Error>), Error> {
+    negotiate_candidate_batch(requests, true)
+}
+
+fn negotiate_candidate_batch(
+    requests: &[StreamRequest],
+    allow_mono_stereo: bool,
+) -> Result<(StreamFormat, usize, Option<Error>, Vec<Error>), Error> {
     if requests.is_empty() || requests.len() > MAX_RANKED_RATE_ATTEMPTS {
         return Err(Error::InvalidArgument(
             "expected one to eight PCM candidates".into(),
@@ -250,20 +264,36 @@ pub(crate) fn negotiate_candidates(requests: &[StreamRequest]) -> Result<StreamF
     let mut seen = Vec::new();
     for request in requests {
         playback_format_from_request(request)?;
-        if request.encoding != Encoding::Pcm
+        if (!allow_mono_stereo && request.encoding != Encoding::Pcm)
+            || (allow_mono_stereo
+                && !matches!(
+                    request.encoding,
+                    Encoding::Pcm
+                        | Encoding::PcmU8
+                        | Encoding::PcmFloat32
+                        | Encoding::DoP
+                        | Encoding::DsdNative { .. }
+                ))
             || request.rate_policy != RatePolicy::Exact
-            || request.channels != first.channels
+            || (request.channels != first.channels
+                && !(allow_mono_stereo
+                    && matches!((first.channels, request.channels), (1, 2) | (2, 1))))
             || seen.contains(request)
         {
             return Err(Error::InvalidArgument(
-                "candidates must be distinct exact PCM formats with matching channels".into(),
+                if allow_mono_stereo {
+                    "candidates must be distinct, exact and have permitted channel counts"
+                } else {
+                    "candidates must be distinct exact PCM formats with matching channels"
+                }
+                .into(),
             ));
         }
         seen.push(*request);
     }
     let Some(owner) = retained_usb_handle_identity() else {
         // Without a retained owner there can be no clean certificate for another attempt.
-        return negotiate_impl(&first, None, false);
+        return negotiate_impl(&first, None, false).map(|format| (format, 1, None, Vec::new()));
     };
     let _reservation = reserve_candidates()?;
     if retained_usb_handle_identity() != Some(owner) {
@@ -273,6 +303,7 @@ pub(crate) fn negotiate_candidates(requests: &[StreamRequest]) -> Result<StreamF
     }
     let mut batch = negotiate::RetryBaseline::new(owner);
     let mut initial_error = None;
+    let mut refusals = Vec::new();
     let started = Instant::now();
     let mut attempted = 0;
     for (attempts, request) in requests.iter().enumerate() {
@@ -286,15 +317,23 @@ pub(crate) fn negotiate_candidates(requests: &[StreamRequest]) -> Result<StreamF
         }
         attempted += 1;
         match negotiate_attempt(request, &mut batch, owner) {
-            Ok(format) => return Ok(format),
+            Ok(format) => return Ok((format, attempted, initial_error, refusals)),
             Err(failure) => {
-                if !failure.clean.is_some_and(|proof| proof.belongs_to(owner)) {
+                if (allow_mono_stereo && !matches!(&failure.error, Error::Unsupported { .. }))
+                    || !failure.clean.is_some_and(|proof| proof.belongs_to(owner))
+                {
                     return Err(failure.error);
                 }
+                refusals.push(failure.error.clone());
                 if initial_error.is_none() {
                     initial_error = Some(failure.error);
                 }
             }
+        }
+    }
+    if allow_mono_stereo {
+        if let Some(error) = initial_error.clone() {
+            return Err(error);
         }
     }
     Err(Error::Unsupported {
@@ -585,6 +624,9 @@ pub(crate) fn capabilities() -> Result<Capabilities, Error> {
     };
     let control = state.hardware_volume_control.as_ref();
     Ok(Capabilities {
+        exclusion_snapshot_complete: model.exclusion_snapshot_complete,
+        native_only_aliases: model.native_only_aliases.clone(),
+        complete_uac1_rate_alternates: model.complete_uac1_rate_alternates.clone(),
         uac_version,
         link_speed: model.link_speed.unwrap_or(LinkSpeed::Unknown),
         alt_settings: alts.clone(),
