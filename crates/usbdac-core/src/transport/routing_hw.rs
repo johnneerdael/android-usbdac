@@ -1558,6 +1558,39 @@ fn routing_recovery_budget(_attempted: usize) -> Duration {
     ROUTING_RECOVERY_BUDGET
 }
 
+/// Per-transfer cap for a rollback: each attempted control needs a SET and its
+/// verifying GET inside the recovery window, so the cap is
+/// `min(1 s, recovery_remaining / (2 × attempted))` with the 10 ms floor. The
+/// forward cap (`ROUTING_RECOVERY_BUDGET / 2N`) is not reused: it was sized for
+/// all N edits, so a slow SET that fits the window would still time out.
+/// USB 2.0 §9.2.6.4 lets a request with a host-to-device data stage take up to
+/// 5 s and a read return its first packet within 500 ms; ALSA's snd_usb_ctl_msg
+/// (helper.c:77-94) waits USB_CTRL_GET/SET_TIMEOUT (5 s). The floor never
+/// outlives the window: every transfer is still clamped by `remaining()`. A
+/// timed-out rollback SET stays uncertain because write_verified reports it.
+fn routing_recovery_timeout(deadline: Instant, now: Instant, attempted: usize) -> Duration {
+    let operations = u32::try_from(attempted.max(1))
+        .unwrap_or(u32::MAX)
+        .saturating_mul(2);
+    (deadline.saturating_duration_since(now) / operations)
+        .min(Duration::from_secs(1))
+        .max(ROUTING_MIN_CONTROL_TIMEOUT)
+}
+
+/// Open (or join) the shared recovery window and return its deadline and the
+/// per-transfer cap the rollback must use.
+fn enter_routing_recovery(
+    recovery: &Mutex<Option<Instant>>,
+    deadline: Instant,
+    now: Instant,
+    attempted: usize,
+) -> (Instant, Duration) {
+    let deadline = *recovery
+        .lock()
+        .get_or_insert_with(|| deadline + routing_recovery_budget(attempted));
+    (deadline, routing_recovery_timeout(deadline, now, attempted))
+}
+
 fn remaining(deadline: Instant) -> Result<Duration, RoutingSessionError> {
     let left = deadline.saturating_duration_since(Instant::now());
     // rusb truncates sub-millisecond durations to zero, which means infinite.
@@ -1696,9 +1729,8 @@ impl RoutingIo for UsbRoutingIo<'_> {
         admit_routing_write(self.deadline, Instant::now(), self.control_timeout)
     }
     fn begin_recovery_for(&mut self, attempted: usize) {
-        let mut recovery = self.recovery.lock();
-        self.deadline =
-            *recovery.get_or_insert_with(|| self.deadline + routing_recovery_budget(attempted));
+        (self.deadline, self.control_timeout) =
+            enter_routing_recovery(&self.recovery, self.deadline, Instant::now(), attempted);
     }
 }
 
@@ -4058,6 +4090,166 @@ mod tests {
         assert_eq!(routing_recovery_budget(0), Duration::from_secs(4));
         assert_eq!(routing_recovery_budget(1024), Duration::from_secs(4));
         assert!(admit_routing_plan(deadline, now, Duration::ZERO, 1024).is_err());
+        // Rollback caps come from the recovery window, never the forward plan.
+        assert_eq!(
+            routing_recovery_timeout(deadline, now, 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            routing_recovery_timeout(deadline, now, 32),
+            Duration::from_micros(62_500)
+        );
+        assert_eq!(
+            routing_recovery_timeout(deadline, now, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            routing_recovery_timeout(deadline, deadline, 32),
+            ROUTING_MIN_CONTROL_TIMEOUT
+        );
+        let shared = Mutex::new(None);
+        let (joined, cap) = enter_routing_recovery(&shared, deadline, now, 1);
+        assert_eq!(joined, deadline + ROUTING_RECOVERY_BUDGET);
+        assert_eq!(cap, Duration::from_secs(1));
+        // A second caller joins the same window instead of extending it.
+        let (again, _) = enter_routing_recovery(&shared, deadline + Duration::from_secs(9), now, 1);
+        assert_eq!(again, joined);
+    }
+
+    /// Virtual-time selector DAC around the production budget helpers: GET and
+    /// SET latencies are fixed, a transfer longer than its cap times out after
+    /// the cap and (worst case) the device still applies a timed-out SET.
+    struct TimedRoutingIo {
+        clock: Instant,
+        deadline: Instant,
+        recovery: Arc<Mutex<Option<Instant>>>,
+        max_observed: Duration,
+        control_timeout: Duration,
+        current: BTreeMap<u16, u8>,
+        get_latency: Duration,
+        set_latency: Duration,
+        recovery_set_latency: Duration,
+        stall_set: Option<usize>,
+        sets: usize,
+        recovering: bool,
+    }
+
+    impl TimedRoutingIo {
+        fn new(get_ms: u64, set_ms: u64, recovery_set_ms: u64, stall_set: Option<usize>) -> Self {
+            let clock = Instant::now();
+            Self {
+                clock,
+                deadline: clock + ROUTING_OPERATION_BUDGET,
+                recovery: Arc::new(Mutex::new(None)),
+                max_observed: Duration::ZERO,
+                control_timeout: Duration::from_secs(1),
+                current: (1..=32u16).map(|id| ((id << 8) | 3, 1)).collect(),
+                get_latency: Duration::from_millis(get_ms),
+                set_latency: Duration::from_millis(set_ms),
+                recovery_set_latency: Duration::from_millis(recovery_set_ms),
+                stall_set,
+                sets: 0,
+                recovering: false,
+            }
+        }
+
+        /// Mirror UsbRoutingIo: clamp by `remaining()` and the plan cap.
+        fn transfer(&mut self, latency: Duration) -> Result<(), String> {
+            let left = self.deadline.saturating_duration_since(self.clock);
+            if left < Duration::from_millis(1) {
+                return Err("routing deadline expired".into());
+            }
+            let timeout = left.min(Duration::from_secs(1)).min(self.control_timeout);
+            if latency > timeout {
+                self.clock += timeout;
+                self.max_observed = self.max_observed.max(timeout);
+                return Err(format!("timed out after {timeout:?}"));
+            }
+            self.clock += latency;
+            self.max_observed = self.max_observed.max(latency);
+            Ok(())
+        }
+    }
+
+    impl RoutingIo for TimedRoutingIo {
+        type Error = String;
+        fn read(&mut self, r: ControlRequest, bytes: &mut [u8]) -> Result<usize, String> {
+            self.transfer(self.get_latency)?;
+            bytes[0] = *self.current.get(&r.index).ok_or("missing control")?;
+            Ok(1)
+        }
+        fn write(&mut self, r: ControlRequest, bytes: &[u8]) -> Result<usize, String> {
+            let index = self.sets;
+            self.sets += 1;
+            if !self.recovering && self.stall_set == Some(index) {
+                self.transfer(self.get_latency)?;
+                return Err("SET_CUR stalled".into());
+            }
+            let latency = if self.recovering {
+                self.recovery_set_latency
+            } else {
+                self.set_latency
+            };
+            let result = self.transfer(latency);
+            // Worst case for the host: the DAC applies a SET it did not ack in time.
+            self.current.insert(r.index, bytes[0]);
+            result.map(|()| 1)
+        }
+        fn admit_plan(&mut self, changed: usize) -> Result<(), String> {
+            self.control_timeout =
+                admit_routing_plan(self.deadline, self.clock, self.max_observed, changed)?;
+            Ok(())
+        }
+        fn admit_write(&mut self) -> Result<(), String> {
+            admit_routing_write(self.deadline, self.clock, self.control_timeout)
+        }
+        fn begin_recovery_for(&mut self, attempted: usize) {
+            self.recovering = true;
+            (self.deadline, self.control_timeout) =
+                enter_routing_recovery(&self.recovery, self.deadline, self.clock, attempted);
+        }
+    }
+
+    #[test]
+    fn slow_set_rollback_uses_the_recovery_window_and_verifies() {
+        let owner = context::SessionContext::unregistered();
+        let _scope = owner.enter();
+        let mut inventory = RoutingInventory::default();
+        for id in 1..=32 {
+            inventory
+                .insert(RoutingUnit::Selector(
+                    SelectorUnit::parse(3, &[9, 0x24, 5, id, 2, 1, 2, 3, 0]).unwrap(),
+                ))
+                .unwrap();
+        }
+        let change = |id, pin| RouteChange {
+            key: ControlKey::Selector(Entity { interface: 3, id }),
+            value: RouteValue::SelectorPin(pin),
+        };
+        let edits = (1..=32).map(|id| change(id, 2)).collect::<Vec<_>>();
+        let originals = (1..=32).map(|id| change(id, 1)).collect::<Vec<_>>();
+        // 5 ms GET / 100 ms SET: the first SET exceeds the ~60 ms forward cap
+        // and is ambiguous; one attempted control gets a 1 s rollback cap.
+        // Then a DAC that is fast forward but slows to 100 ms SETs after a
+        // stall on edit 32: 32 rollbacks share ~7.5 s, ~117 ms per transfer.
+        for (set_ms, stall, failed, rolled_back) in [(100, None, 0, 1), (5, Some(31), 31, 32)] {
+            let mut io = TimedRoutingIo::new(5, set_ms, 100, stall);
+            let started = io.clock;
+            let result = routing::apply_routes_traced(&inventory, &mut io, &edits, &mut Vec::new());
+            let Err(RoutingSessionError::Transaction(failure)) = finish_route_transaction(result)
+            else {
+                panic!("the forward edit must fail");
+            };
+            assert_eq!(failure.failed_change, Some(failed));
+            assert!(
+                failure.rollback_failures.is_empty(),
+                "rollback ended uncertain: {:?}",
+                failure.rollback_failures
+            );
+            assert_eq!(io.sets, failed + 1 + rolled_back);
+            assert!(io.clock <= started + ROUTING_OPERATION_BUDGET + ROUTING_RECOVERY_BUDGET);
+            verify_values(&inventory, &mut io, &originals).unwrap();
+        }
     }
 
     #[test]
