@@ -2679,6 +2679,56 @@ mod tests {
         assert!(decision.source_preflight_refusal.is_some());
     }
     #[test]
+    fn raw_data_alias_lets_stereo_sources_fall_back_on_a_topping_d10() {
+        // D10 Balanced (152a:8750): 32- and 24-bit PCM plus a RAW_DATA-only
+        // native DSD alternate that scans as Other and, with the vendor-wide
+        // DSD_RAW quirk reference-only, as a PCM-incapable alias.
+        const RATES: &[u32] = &[
+            44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        ];
+        let mut alt1 = fixed_alt(AltFormat::Pcm, 2, 4, 32, RATES);
+        alt1.alt_setting = 1;
+        let mut alt2 = fixed_alt(AltFormat::Pcm, 2, 4, 24, RATES);
+        alt2.alt_setting = 2;
+        let mut alt3 = fixed_alt(AltFormat::Other, 2, 4, 32, RATES);
+        alt3.alt_setting = 3;
+        let mut caps = capabilities_for(vec![alt1, alt2, alt3]);
+        caps.native_only_aliases = vec![(1, 3, 1)];
+        let alts = caps.alt_settings.clone();
+        let aliases = caps.native_only_aliases.clone();
+        for source in [
+            StreamRequest::pcm(44_100, 2, 16),
+            StreamRequest::pcm(8_000, 2, 16),
+            StreamRequest::pcm(705_600, 2, 24),
+            StreamRequest::pcm_u8(44_100, 2),
+            StreamRequest::pcm_float32(176_400, 2),
+            StreamRequest::dsd_native(2_822_400, 2),
+        ] {
+            assert!(
+                descriptor_exclusion(true, &alts, &aliases, &[], &source).is_some(),
+                "{source:?} should be excluded by the descriptors"
+            );
+            let (decision, attempts) = resolve_model(&caps, &source, &PlaybackPolicy::default());
+            let decision = decision.unwrap_or_else(|e| panic!("{source:?}: {e}"));
+            assert!(!attempts.contains(&source), "{source:?} attempted exactly");
+            assert!(decision.source_preflight_refusal.is_some());
+        }
+        // Shapes the PCM alternates carry are still attempted exactly.
+        assert!(descriptor_exclusion(
+            true,
+            &alts,
+            &aliases,
+            &[],
+            &StreamRequest::pcm(44_100, 2, 32)
+        )
+        .is_none());
+        // Without the alias the opaque alternate keeps the preflight open.
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &[], &StreamRequest::pcm(44_100, 2, 16))
+                .is_none()
+        );
+    }
+    #[test]
     fn dsd_to_pcm_is_refused_on_a_dsd_wire() {
         let dop_wire = wire_format(StreamRequest::dop(2_822_400, 2), 4);
         let native_wire = wire_format(StreamRequest::dsd_native(2_822_400, 2), 4);

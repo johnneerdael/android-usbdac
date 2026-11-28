@@ -169,7 +169,7 @@ pub(crate) struct HardwareVolumeControl {
 pub(crate) struct CapabilityModel {
     /// Every playback OUT alternate in the claimed descriptor snapshot parsed successfully.
     pub(super) exclusion_snapshot_complete: bool,
-    /// Physical Other aliases known to be native-only descriptors.
+    /// Physical Other aliases whose descriptors prove they never carry PCM.
     pub(super) native_only_aliases: Vec<(u8, u8, u8)>,
     /// UAC1 Type-I alternates whose complete descriptor rate list was verified.
     pub(super) complete_uac1_rate_alternates: Vec<(u8, u8, u8)>,

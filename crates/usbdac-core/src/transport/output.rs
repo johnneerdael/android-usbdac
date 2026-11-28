@@ -851,7 +851,27 @@ pub(super) fn run_usb_output_loop(
         bus_config.bus_queue_ms = bus_config.bus_queue_ms.max(48);
         bus_config.transfers_in_flight = bus_config.transfers_in_flight.max(12);
     }
-    let geometry = IsoQueueGeometry::for_config(candidate.service_interval_us, &bus_config);
+    let mut geometry = IsoQueueGeometry::for_config(candidate.service_interval_us, &bus_config);
+    // Explicit feedback, at the default geometry: one transfer per feedback
+    // period as in ALSA, with the same time queued. A custom depth, period or
+    // the PlaybackUrbFixup depth above is kept as configured.
+    let default_geometry = bus_config.transfers_in_flight
+        == crate::iso_packet_scheduler::DEFAULT_TRANSFERS_IN_FLIGHT
+        && bus_config.bus_queue_ms == crate::iso_packet_scheduler::DEFAULT_BUS_QUEUE_MS
+        && bus_config.transfer_period_us.is_none();
+    if let Some(endpoint) = candidate.feedback_endpoint.filter(|endpoint| {
+        default_geometry
+            && candidate.sync_type == SyncType::Asynchronous
+            && candidate.implicit_feedback.is_none()
+            && endpoint.transfer_type == TransferType::Isochronous
+    }) {
+        geometry =
+            geometry.capped_to_feedback_period(crate::iso_packet_scheduler::alsa_sync_period_us(
+                candidate.usb_speed == Speed::Full,
+                endpoint.refresh,
+                endpoint.interval,
+            ));
+    }
     let mut scheduler = IsoPacketScheduler::with_geometry(
         playback_format.sample_rate,
         bytes_per_frame,

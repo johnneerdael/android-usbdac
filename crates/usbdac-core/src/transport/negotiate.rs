@@ -396,7 +396,15 @@ fn complete_uac2_type_i(extra: &[u8]) -> bool {
                         return false;
                     }
                     let bits = u32::from_le_bytes([d[6], d[7], d[8], d[9]]);
-                    if bits == 0 || bits & !0x7 != 0 {
+                    // PCM, PCM8 or IEEE_FLOAT mixed with any other bit is
+                    // ambiguous. An alternate with none of those three bits,
+                    // such as RAW_DATA alone (Topping/Thesycon native DSD),
+                    // completely rules PCM out: the selector needs one of them
+                    // (scan.rs select_stream_candidates), and ALSA only ever
+                    // exposes such an alternate as FMTBIT_SPECIAL or, under
+                    // QUIRK_FLAG_DSD_RAW, as DSD_U32_BE
+                    // (references/linux/sound/usb/format.c:60-65, quirks.c:2341).
+                    if bits == 0 || (bits & 0x7 != 0 && bits & !0x7 != 0) {
                         return false;
                     }
                     general = true;
@@ -1885,6 +1893,11 @@ mod evidence_tests {
         let mut private = descriptor;
         private[9] = 0x80;
         assert!(!super::complete_uac2_type_i(&private));
+        // RAW_DATA alone (D10 Balanced alt 3) is complete: it rules PCM out.
+        let mut raw = descriptor;
+        raw[6] = 0;
+        raw[9] = 0x80;
+        assert!(super::complete_uac2_type_i(&raw));
         let mut bad_format = descriptor;
         bad_format[21] = 24;
         assert!(!super::complete_uac2_type_i(&bad_format));
@@ -2199,5 +2212,73 @@ mod evidence_tests {
             false,
             48_000
         ));
+    }
+}
+
+#[cfg(test)]
+mod raw_data_shape_tests {
+    use super::{alt_shape_evidence, shape_absent, AltShapeEvidence};
+    use crate::transport::types::{DsdTransportMode, PcmEncoding, PlaybackFormat};
+
+    // Topping D10 Balanced (152a:8750) interface 1 class-specific bytes, as
+    // captured by the macOS validator: alt 1 is 32-bit PCM, alt 2 24-bit PCM
+    // and alt 3 the RAW_DATA (bmFormats 0x80000000) native DSD alternate.
+    const D10_ALT1: [u8; 22] = [
+        0x10, 0x24, 1, 2, 0, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0x0b, 6, 0x24, 2, 1, 4, 32,
+    ];
+    const D10_ALT2: [u8; 22] = [
+        0x10, 0x24, 1, 2, 0, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0x0b, 6, 0x24, 2, 1, 4, 24,
+    ];
+    const D10_ALT3: [u8; 22] = [
+        0x10, 0x24, 1, 2, 0, 1, 0, 0, 0, 0x80, 2, 0, 0, 0, 0, 0x0b, 6, 0x24, 2, 1, 4, 32,
+    ];
+
+    fn pcm(sample_rate: u32, bit_depth: u8) -> PlaybackFormat {
+        PlaybackFormat {
+            pcm_encoding: PcmEncoding::Signed,
+            sample_rate,
+            bit_depth,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0,
+        }
+    }
+
+    fn d10() -> [(&'static (), u8, u8, u8, &'static [u8]); 3] {
+        [
+            (&(), 1, 2, 0x20, &D10_ALT1),
+            (&(), 1, 2, 0x20, &D10_ALT2),
+            (&(), 1, 2, 0x20, &D10_ALT3),
+        ]
+    }
+
+    #[test]
+    fn raw_data_only_alternate_is_absent_for_pcm() {
+        let request = pcm(44_100, 16);
+        assert_eq!(
+            alt_shape_evidence(1, 2, 0x20, &D10_ALT3, request),
+            AltShapeEvidence::Absent
+        );
+        // No alternate carries 16-bit stereo, so the refusal is certified
+        // clean and the ranked fallback may continue.
+        assert!(shape_absent(d10(), request, |_, _, _| true));
+        // 32-bit stereo is carried by alt 1, whose rate only a live read can
+        // rule out; alt 3 never stands in for it.
+        assert!(matches!(
+            alt_shape_evidence(1, 2, 0x20, &D10_ALT1, pcm(44_100, 32)),
+            AltShapeEvidence::Uac2Rate { .. }
+        ));
+        assert!(!shape_absent(d10(), pcm(44_100, 32), |_, _, _| false));
+    }
+
+    #[test]
+    fn pcm_mixed_with_raw_data_stays_uncertified() {
+        let mut mixed = D10_ALT3;
+        mixed[6] = 1;
+        assert_eq!(
+            alt_shape_evidence(1, 2, 0x20, &mixed, pcm(44_100, 16)),
+            AltShapeEvidence::Uncertified
+        );
     }
 }

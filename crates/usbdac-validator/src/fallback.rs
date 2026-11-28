@@ -648,9 +648,10 @@ pub(super) fn run_fallback(
             .target_bytes
             .is_multiple_of(target_frame_bytes as u64)
         && stats.frames_written == conversion.target_bytes / target_frame_bytes as u64
-        && stats.played_frames == stats.frames_written
         && stats.completed_transfers > 0
         && drained;
+    let count_ok_except_loss = count_ok;
+    let count_ok = count_ok && stats.played_frames == stats.frames_written;
     let pacing_ok = match format.pacing {
         usbdac_core::Pacing::ExplicitFeedback { .. }
         | usbdac_core::Pacing::ImplicitFeedback { .. } => stats.feedback_locked,
@@ -667,6 +668,29 @@ pub(super) fn run_fallback(
         && stats.short_packets == 0
         && stats.zero_packets == 0
         && stats.urb_timeouts == 0;
+    // One transfer the host put on the bus too late, with every other USB
+    // check intact, is recorded and not counted as a wire failure; the run
+    // accepts at most one (crate::required_fallbacks_verified).
+    let host_timing_loss = if !usb_pass
+        && failure.is_none()
+        && count_ok_except_loss
+        && stats.payload_verified
+        && stats.clock_verified
+        && pacing_ok
+    {
+        crate::host_timing::lone_host_timing_loss(
+            &(&stats).into(),
+            format.encoding,
+            format.counter_rate_hz(),
+            format.service_interval_us,
+        )
+    } else {
+        None
+    };
+    let usb_pass = usb_pass || host_timing_loss.is_some();
+    if let Some(loss) = host_timing_loss {
+        evidence["host_timing_loss"] = loss;
+    }
     let verification = check
         .lock()
         .map(|check| check.result(frames, signal_rate))

@@ -206,7 +206,7 @@ adb logcat -d -v threadtime -s usbdac > usbdac-log.txt
 
 When a listener can install a separate app, the validator gives support a
 report that does not depend on your player. From 0.1.11 each release lists
-`usbdac-validator-<version>-android.apk`, signed with the CI debug key, and
+`usbdac-validator-<version>-android.apk`, signed with the pinned validator key (every release after 0.1.20 installs over the previous one; uninstall an older APK once), and
 `usbdac-validator-<version>-macos-arm64.zip`, an Apple Silicon app that is ad
 hoc signed and not notarized. Both are built from the same commit as the
 library and use the same direct USB driver; neither plays through the system

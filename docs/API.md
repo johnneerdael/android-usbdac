@@ -295,15 +295,25 @@ between two transfers so the endpoint can keep polling while the worker
 processes the previous completion. The log line
 `[USB] Isochronous queue:` states the resulting geometry.
 
+**Feedback-period transfers.** With explicit isochronous feedback and the
+default geometry, a transfer also carries no more than one feedback period,
+as ALSA limits a playback URB with a sync endpoint to `1 << syncinterval`
+packets (`references/linux/sound/usb/endpoint.c:1196-1198`), and never less
+than 1 ms. The number of transfers grows to keep the same time queued: a DAC
+polled for feedback every 1 ms at a 125 us service interval (the Topping D10
+Balanced) runs 8 x 16, 16 ms, instead of 16 x 8. Each feedback report then
+steers the packet sizes of one transfer instead of two.
+
 **Adaptive depth.** With `adaptive_queue` on (the default), the default
 geometry (`bus_queue_ms` 16, eight transfers, no `transfer_period_us`) and no
 implicit feedback, the worker changes only the number of active transfers; the
 packets per transfer stay as above. A completion batch that lost audio adds two
-slots; each 30 s without loss removes one, never below the configured eight. The
-ceiling is the smallest of 16 slots, fewer than 256 packets in flight and 64 ms.
-With the default 2 ms transfers that is 15 slots, 30 ms, at a 125 us service
-interval, and 16 slots, 32 ms, at 250 us, 500 us and 1 ms; the 64 ms bound is
-not reached. Any other geometry, a queue profile other than `Balanced`, or
+slots; each 30 s without loss removes one, never below the starting count. The
+ceiling is the smallest of twice the starting slots, fewer than 256 packets in
+flight and 64 ms. With the default 2 ms transfers that is 15 slots, 30 ms, at a
+125 us service interval, and 16 slots, 32 ms, at 250 us, 500 us and 1 ms; with
+1 ms feedback-period transfers it is 31 slots, 31 ms. The 64 ms bound is not
+reached. Any other geometry, a queue profile other than `Balanced`, or
 implicit feedback keeps the configured depth.
 
 `Quirk` values: `SkipClockValidation`, `IgnoreInvalidSampleRate`,

@@ -3,6 +3,7 @@
 //! crate never changes hardware volume. USB delivery does not prove audibility.
 mod conversion_check;
 mod fallback;
+mod host_timing;
 mod producer_timing;
 mod report_html;
 use fallback::run_fallback;
@@ -80,6 +81,10 @@ pub struct Report {
     pub fallback_results: Vec<Value>,
     pub termination_reason: Option<String>,
     pub legs: Vec<LegResult>,
+    /// Fallback cases that passed despite one transfer the host put on the
+    /// bus too late (see `host_timing`): each case's request and loss evidence.
+    /// More than one fails the run.
+    pub host_timing_incidents: Vec<Value>,
     pub cancelled: bool,
     pub error: Option<String>,
 }
@@ -212,7 +217,7 @@ impl Capture {
         device_lost: &AtomicBool,
         progress: impl Fn(&Progress),
     ) -> Report {
-        let mut report = Report { schema_version: 1, started_unix_ms: unix_ms(), coverage: "Each advertised alternate: all discrete rates and standard points within ranges. Separate standard admission probes challenge unrepresented exact requests; unexpected admission is not evidence of decoding. DoP transport is not proof of DAC decoding.".into(), signal: json!({"frequency_hz": TONE_HZ, "amplitude_peak": AMPLITUDE, "channel_polarity": "even positive, odd inverted", "dsd": "first-order delta-sigma, initial integrator zero, chronological MSB-first", "digest": "SHA-256 of bytes accepted by stream.write; DoP marker supplied by driver"}), capabilities: Value::Null, mode_coverage: Value::Null, status: "running".into(), plan: vec![], unattempted_plan: vec![], admission_plan: vec![], unattempted_admission_plan: vec![], admission_results: vec![], fallback_results: vec![], termination_reason: None, legs: vec![], cancelled: false, error: None };
+        let mut report = Report { schema_version: 1, started_unix_ms: unix_ms(), coverage: "Each advertised alternate: all discrete rates and standard points within ranges. Separate standard admission probes challenge unrepresented exact requests; unexpected admission is not evidence of decoding. DoP transport is not proof of DAC decoding.".into(), signal: json!({"frequency_hz": TONE_HZ, "amplitude_peak": AMPLITUDE, "channel_polarity": "even positive, odd inverted", "dsd": "first-order delta-sigma, initial integrator zero, chronological MSB-first", "digest": "SHA-256 of bytes accepted by stream.write; DoP marker supplied by driver"}), capabilities: Value::Null, mode_coverage: Value::Null, status: "running".into(), plan: vec![], unattempted_plan: vec![], admission_plan: vec![], unattempted_admission_plan: vec![], admission_results: vec![], fallback_results: vec![], termination_reason: None, legs: vec![], host_timing_incidents: vec![], cancelled: false, error: None };
         self.record("run_started", json!({"options": options, "info": format!("{:?}", dac.info()), "volume": format!("{:?}", dac.volume().map(|v| v.get()))}));
         let caps = match dac.capabilities() {
             Ok(c) => c,
@@ -385,6 +390,7 @@ impl Capture {
                 .or(report.termination_reason);
         }
         report.unattempted_plan = unattempted_plan(&report.plan, report.legs.len());
+        report.host_timing_incidents = host_timing_incidents(&report.fallback_results);
         report.cancelled = report.termination_reason.as_deref() == Some("cancelled");
         if report.termination_reason.as_deref() == Some("device_lost") {
             report.status = "device_lost".into();
@@ -870,7 +876,19 @@ impl Capture {
 }
 /// Exact refusals remain independently recorded; overall success additionally
 /// requires every requested fallback to be present and independently verified.
+fn host_timing_incidents(fallbacks: &[Value]) -> Vec<Value> {
+    fallbacks
+        .iter()
+        .filter_map(|fallback| {
+            let loss = fallback.get("host_timing_loss")?;
+            Some(json!({"source_request": fallback.get("source_request"), "target_request": fallback.get("target_request"), "host_timing_loss": loss}))
+        })
+        .collect()
+}
 fn required_fallbacks_verified(report: &Report) -> bool {
+    if host_timing_incidents(&report.fallback_results).len() > host_timing::MAX_ACCEPTED_INCIDENTS {
+        return false;
+    }
     let verified = |fallback: &Value| {
         fallback.get("status").and_then(Value::as_str) == Some("passed_usb")
             && fallback
@@ -1545,6 +1563,7 @@ mod tests {
             fallback_results: vec![],
             termination_reason: None,
             legs: vec![],
+            host_timing_incidents: vec![],
             cancelled: false,
             error: None,
         };
@@ -1562,6 +1581,15 @@ mod tests {
         assert!(!required_fallbacks_verified(&report));
         report.fallback_results[0]["conversion_verification"]["passed"] = json!(true);
         report.fallback_results[0]["target_wire_integrity"] = json!("unverified");
+        assert!(!required_fallbacks_verified(&report));
+        // One lone host-timing loss passes and is reported; a second fails.
+        report.fallback_results[0]["target_wire_integrity"] = json!("verified");
+        report.fallback_results[0]["host_timing_loss"] = json!({"lost_frames": 353});
+        assert!(required_fallbacks_verified(&report));
+        assert_eq!(host_timing_incidents(&report.fallback_results).len(), 1);
+        let mut second = report.fallback_results[0].clone();
+        second["source_request"] = json!("second");
+        report.fallback_results.push(second);
         assert!(!required_fallbacks_verified(&report));
     }
     #[test]
