@@ -22,7 +22,7 @@ and gives the device a bounded recovery window when reports stop. Read
 Find published versions on [crates.io](https://crates.io/crates/usbdac-core).
 
 ```sh
-cargo add usbdac-core@0.1.20
+cargo add usbdac-core@0.1.21
 ```
 
 1. Open the USB device, claim its AudioControl and playback AudioStreaming
