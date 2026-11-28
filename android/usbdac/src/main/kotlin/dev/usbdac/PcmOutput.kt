@@ -22,7 +22,10 @@ public interface PcmOutput : Closeable {
      * Writes whole frames from the buffer's position and advances the position by the bytes taken.
      * Direct buffers are read in place; a heap buffer is copied. Returns the bytes taken, which can
      * be less than `buffer.remaining()` (the output is full: keep the rest and try again), and 0
-     * for a partial frame.
+     * for a partial frame. On success the return value equals the position delta. Accepted source
+     * frames may be held in a converter before playback; use [playedFrames] for playback position.
+     * Keep the remaining buffer after a failure. For INVALID_ARGUMENT, correct the layout or padding
+     * before retrying; do not silently truncate or mask samples.
      *
      * @throws DacException with [DacErrorCode.INVALID_STATE] after [drain] (until [flush]), after
      *   the output closed, or after it failed.

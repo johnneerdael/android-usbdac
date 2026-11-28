@@ -56,6 +56,7 @@ public class ConvertingOutput(
     private var tailDone = false
     private var targetDrained = false
     private var closed = false
+    private var targetFailure: DacException? = null
 
     override val bitPerfect: StateFlow<BitPerfectState> =
         if (plan.preservesBitPerfect) {
@@ -71,34 +72,37 @@ public class ConvertingOutput(
         pump()
         if (pending.hasRemaining()) return 0
         var total = 0
+        val chunkBytes = maxOf(sourceFrameBytes, STAGE_BYTES / sourceFrameBytes * sourceFrameBytes)
         while (buffer.hasRemaining()) {
             pending.clear()
+            val input = buffer.duplicate().apply { limit(position() + minOf(remaining(), chunkBytes)) }
             val consumed = try {
-                if (buffer.isDirect) {
-                    converter.convert(buffer, pending).consumed
-                } else {
-                    val staged = stageFrom(buffer)
-                    val done = converter.convert(staged, pending)
-                    buffer.position(buffer.position() + done.consumed)
-                    done.consumed
-                }
+                val source = if (buffer.isDirect) input else stageFrom(input)
+                converter.convert(source, pending).consumed
             } catch (error: Throwable) {
                 pending.clear()
                 pending.limit(0)
+                if (total > 0 && error is DacException && error.code == DacErrorCode.INVALID_ARGUMENT) return total
                 throw error
             }
+            buffer.position(buffer.position() + consumed)
             pending.flip()
             total += consumed
-            if (consumed == 0 && !pending.hasRemaining()) break // a partial frame, or nothing fits
-            target.write(pending)
-            if (pending.hasRemaining()) break // the target is full: the rest waits in `pending`
+            if (consumed == 0 && !pending.hasRemaining()) break
+            try {
+                pump()
+            } catch (error: DacException) {
+                if (total > 0) return total
+                throw error
+            }
+            if (pending.hasRemaining()) break
         }
         total
     }
 
     /** Copies the next chunk of a heap buffer into a direct staging buffer, ready to be read. */
     private fun stageFrom(buffer: ByteBuffer): ByteBuffer {
-        val staged = stage ?: ByteBuffer.allocateDirect(STAGE_BYTES).also { stage = it }
+        val staged = stage ?: ByteBuffer.allocateDirect(maxOf(STAGE_BYTES, sourceFrameBytes)).also { stage = it }
         staged.clear()
         val count = minOf(buffer.remaining(), staged.capacity())
         staged.put(buffer.duplicate().apply { limit(position() + count) })
@@ -109,6 +113,7 @@ public class ConvertingOutput(
     override val writableBytes: Int
         get() = synchronized(lock) {
             if (closed) return 0
+            checkTarget()
             if (passthrough) return target.writableBytes
             if (draining) return 0
             pump()
@@ -162,6 +167,7 @@ public class ConvertingOutput(
     override val isDrained: Boolean
         get() = synchronized(lock) {
             if (closed) return false
+            checkTarget()
             if (passthrough) return target.isDrained
             pump()
             draining && tailDone && targetDrained && !pending.hasRemaining() && target.isDrained
@@ -201,13 +207,21 @@ public class ConvertingOutput(
 
     private fun checkOpen() {
         if (closed) throw DacException(DacErrorCode.INVALID_STATE, "the output is closed")
+        checkTarget()
     }
+
+    private fun checkTarget() { targetFailure?.let { throw it } }
 
     /** Moves converted audio to the target, then the resampler's tail after a [drain], then drains the target. */
     private fun pump() {
         while (true) {
             if (pending.hasRemaining()) {
-                target.write(pending)
+                try {
+                    target.write(pending)
+                } catch (error: DacException) {
+                    targetFailure = error
+                    throw error
+                }
                 if (pending.hasRemaining()) return
             }
             if (!draining) return

@@ -44,6 +44,12 @@ pub(super) fn retire_bootstrap_completion(
     let Some((status, completed, _)) = slot.take_completion() else {
         return Ok(None);
     };
+    let Some(completed) = completed else {
+        slot.mark_completed();
+        return Err(Error::Transfer(
+            "bootstrap callback timestamp missing".into(),
+        ));
+    };
     let result = if status == LIBUSB_TRANSFER_COMPLETED {
         slot.validate_packets(acceptance)
             .map_err(Error::Transfer)
@@ -1837,16 +1843,11 @@ pub(super) fn run_usb_output_loop(
                 continue;
             };
 
-            // This timestamp is set in the libusb callback, not by the kernel.
-            let callback_age_us = duration_us(completed_at.elapsed());
-            runtime_stats
-                .max_callback_retirement_us
-                .fetch_max(callback_age_us, Ordering::Relaxed);
-            if callback_retirement_is_late(callback_age_us) {
-                runtime_stats
-                    .callback_retirement_over_10ms
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            let Some(completed_at) = completed_at else {
+                slot.mark_completed();
+                fatal_error = Some("OUT callback timestamp missing".into());
+                break;
+            };
 
             if slot.cancelled_for_flush
                 && out_flush_deadline.is_some_and(|deadline| completed_at >= deadline)
@@ -1910,6 +1911,17 @@ pub(super) fn run_usb_output_loop(
             runtime_stats
                 .transfer_queue_depth
                 .store(active_slots, Ordering::Relaxed);
+            // This timestamp is set in the libusb callback, not by the kernel.
+            let callback_age_us = duration_us(completed_at.elapsed());
+            runtime_stats
+                .max_callback_retirement_us
+                .fetch_max(callback_age_us, Ordering::Relaxed);
+            if callback_retirement_is_late(callback_age_us) {
+                runtime_stats
+                    .callback_retirement_over_10ms
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+
             let turnaround_us = slot.turnaround_us(completed_at).unwrap_or_default();
             let queued_frame_count = slot.queued_frame_count as u64;
             let completed_underrun = slot.queued_underrun;

@@ -574,6 +574,13 @@ impl ImplicitFeedback {
             else {
                 break;
             };
+            let Some(completed_at) = completed_at else {
+                self.slots[index].mark_completed();
+                self.order.pop_front();
+                return Err(ImplicitFault::Transport(
+                    "implicit callback timestamp missing".into(),
+                ));
+            };
             if let Some(trace) = &stats.feedback_trace {
                 trace.record_at(
                     completed_at,

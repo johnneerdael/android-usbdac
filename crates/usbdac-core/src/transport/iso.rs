@@ -54,7 +54,7 @@ impl IsoTransferCompletion {
             .store(self.generation.load(Ordering::Acquire), Ordering::Release);
     }
 
-    pub(super) fn take(&self) -> Option<(i32, Instant, usize)> {
+    pub(super) fn take(&self) -> Option<(i32, Option<Instant>, usize)> {
         if !self.is_published() || self.consumed.swap(true, Ordering::AcqRel) {
             return None;
         }
@@ -66,8 +66,7 @@ impl IsoTransferCompletion {
         let completed_at = match self.completed_at.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
-        }
-        .unwrap_or_else(Instant::now);
+        };
         Some((
             status,
             completed_at,
@@ -434,10 +433,11 @@ impl IsoTransferSlot {
         let completion = unsafe { &(*self.user_data).completion };
         completion.reset();
         *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
+        *completion.completed_at.lock().unwrap() = Some(Instant::now());
         completion.publish_for_test();
     }
 
-    pub(super) fn take_completion(&mut self) -> Option<(i32, Instant, usize)> {
+    pub(super) fn take_completion(&mut self) -> Option<(i32, Option<Instant>, usize)> {
         let completion = unsafe { &(*self.user_data).completion };
         if !completion.is_published() {
             return None;
@@ -815,7 +815,7 @@ impl FeedbackTransfers {
         Ok(())
     }
 
-    fn take_next_completion(&mut self) -> Option<(usize, i32, Instant, usize)> {
+    fn take_next_completion(&mut self) -> Option<(usize, i32, Option<Instant>, usize)> {
         let index = *self.pending.front()?;
         let slot = &mut self.slots[index];
         let (status, completed_at, actual_length) = slot.take_completion()?;
@@ -1018,7 +1018,7 @@ impl FeedbackTransferSlot {
         Ok(())
     }
 
-    pub(super) fn take_completion(&mut self) -> Option<(i32, Instant, usize)> {
+    pub(super) fn take_completion(&mut self) -> Option<(i32, Option<Instant>, usize)> {
         let completion = unsafe { &(*self.user_data).completion };
         if !completion.is_published() {
             return None;
@@ -1609,6 +1609,11 @@ pub(super) fn pump_feedback_transfers(
     // a later slot back first. Process them in submission order.
     while let Some((index, status, completed_at, actual_length)) = transfers.take_next_completion()
     {
+        let Some(completed_at) = completed_at else {
+            return Err(FeedbackFault::Transfer(
+                "feedback callback timestamp missing".into(),
+            ));
+        };
         let slot = &mut transfers.slots[index];
         if let Some(diagnostics) = counters.diagnostics.as_mut() {
             diagnostics.record_transfer(status);
@@ -2860,6 +2865,15 @@ mod explicit_feedback_tests {
             generation: second,
         });
         assert_eq!(completion.take().unwrap().0, LIBUSB_TRANSFER_NO_DEVICE);
+    }
+
+    #[test]
+    fn missing_callback_stamp_is_not_a_zero_age_completion() {
+        let completion = IsoTransferCompletion::new();
+        completion.reset();
+        *completion.status.lock().unwrap() = Some(LIBUSB_TRANSFER_COMPLETED);
+        completion.publish_for_test();
+        assert!(completion.take().unwrap().1.is_none());
     }
 
     #[test]

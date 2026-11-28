@@ -1,6 +1,8 @@
 """Offline release provenance and publication boundary tests."""
 
 import hashlib
+import os
+import textwrap
 import io
 import json
 from pathlib import Path
@@ -20,6 +22,19 @@ import release_notes as notes
 
 
 class ReservationTests(unittest.TestCase):
+    def test_reviewed_adapter_matches_current_files_and_rejects_changes(self):
+        adapter = next(item for item in prepare.reviewed_adapters() if item['schema'] == 3)
+        repo = SCRIPTS.parent.parent
+        def git_show(args, **kwargs):
+            path = args[-1].split(':', 1)[1]
+            return (repo / path).read_bytes()
+        with patch.object(prepare.subprocess, 'check_output', side_effect=git_show):
+            self.assertTrue(prepare.matches_adapter('reviewed-source', adapter['files']))
+            changed = dict(adapter['files'])
+            changed['.github/workflows/ci.yml'] = '0' * 64
+            self.assertFalse(prepare.matches_adapter('reviewed-source', changed))
+            self.assertFalse(prepare.matches_adapter('reviewed-source', {}))
+
     def test_current_and_superseded(self):
         with patch.object(prepare, 'reservations', return_value=[('new', 2), ('old', 1)]):
             prepare.require_latest_reservation('main', '0.1.12', 'new')
@@ -60,6 +75,27 @@ class ReservationTests(unittest.TestCase):
              patch.dict(prepare.os.environ, {'GITHUB_REPOSITORY': 'x/y'}):
             self.assertFalse(prepare.can_adopt('main', '0.1.12', '0.1.11'))
 
+    def test_reserved_version_requires_adoption_after_ordinary_edit(self):
+        def exercise(records, adopted, absent):
+            calls = []
+            def git(*args):
+                calls.append(args)
+                if args[:2] == ('rev-parse', 'FETCH_HEAD'): return 'source'
+                if args[:2] == ('log', 'source'): return ''
+                if args[:2] == ('diff', '--name-only'): return 'changed'
+                return ''
+            with patch.object(prepare, 'git', side_effect=git), patch.object(prepare, 'stable_tags', return_value=['v0.1.14']), \
+                 patch.object(prepare, 'declared_version', return_value='0.1.15'), patch.object(prepare, 'reservations', return_value=records), \
+                 patch.object(prepare, 'can_adopt', return_value=adopted), patch.object(prepare, 'registry_absent', return_value=absent), \
+                 patch.object(prepare, 'set_version'), patch.object(prepare.subprocess, 'run') as push, \
+                 patch.dict(prepare.os.environ, {'GITHUB_REPOSITORY': 'x/y'}):
+                push.return_value.returncode = 0
+                return prepare.select_automatic(42, 'source')
+        self.assertEqual(exercise([('reserved', 1)], False, True), '0.1.16')
+        self.assertEqual(exercise([('reserved', 1)], True, False), '0.1.15')
+        self.assertEqual(exercise([], False, True), '0.1.15')
+        self.assertEqual(exercise([], False, False), '0.1.16')
+
 
 class ReceiptTests(unittest.TestCase):
     def check_receipt(self, schema, historical=False, identity='usbdac-release-gates/v1',
@@ -78,12 +114,13 @@ class ReceiptTests(unittest.TestCase):
             reservation_run_id=42, manifest_sha256='d' * 64)
         if schema == 2:
             receipt['gate_identity'] = identity
-        def command(args):
+        def command(args, **kwargs):
             if args[0] == 'git':
                 return b'historical-layout' if historical else Path(args[-1].split(':', 1)[1]).read_bytes()
             data = io.BytesIO()
             with zipfile.ZipFile(data, 'w') as archive:
                 archive.writestr('receipt.json', json.dumps(receipt))
+            items[1]['digest'] = 'sha256:' + hashlib.sha256(data.getvalue()).hexdigest()
             return data.getvalue()
         def api(*args):
             if args == (f'repos/{source_repo}',):
@@ -92,6 +129,91 @@ class ReceiptTests(unittest.TestCase):
         with patch.object(recover.subprocess, 'check_output', side_effect=command), \
              patch.object(recover, 'api', side_effect=api):
             return recover.verify_staged(run, jobs, items, 'x/y', '0.1.11', candidate, 42, 1, 42)
+
+    def test_main_reuses_receipt_from_original_attempt(self):
+        candidate, parent = 'b' * 40, 'a' * 40
+        run = dict(id=42, run_attempt=2, path='.github/workflows/release.yml', event='push', head_branch='main',
+                   status='completed', conclusion='failure', head_sha=parent,
+                   repository={'id': 17}, head_repository={'id': 17})
+        prepare_job = dict(name=recover.PREPARE, status='completed', conclusion='success', id=100)
+        def api(*args):
+            path = args[-1]
+            if path == 'repos/x/y': return json.dumps({'id': 17})
+            if path == 'repos/x/y/actions/runs/42': return json.dumps(run)
+            if '/attempts/1/jobs' in path: return json.dumps([{'jobs': [prepare_job]}])
+            if '/artifacts?' in path: return json.dumps([{'artifacts': [{'name': 'release-gate-receipt-42-1'}]}])
+            if '/actions/jobs/100/logs' in path: return f'Release 0.1.11 from {candidate}'
+            raise AssertionError(path)
+        def git(*args):
+            if args[:2] == ('log', 'origin/main'): return candidate
+            if args[:3] == ('show', '-s', '--format=%B'): return 'Release-Run: 42'
+            if args[:3] == ('show', '-s', '--format=%P'): return parent
+            if args[0] == 'show': return 'version = "0.1.11"'
+            return ''
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'out'
+            args = ['recover_release.py', '--failed-run-id', '42', '--version', '0.1.11', '--output', str(output)]
+            with patch.object(sys, 'argv', args), patch.dict(recover.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main', 'GITHUB_REPOSITORY': 'x/y'}), \
+                 patch.object(recover, 'api', side_effect=api), patch.object(recover, 'git', side_effect=git), \
+                 patch.object(recover, 'require_latest_reservation'), \
+                 patch.object(recover, 'version_files', return_value={Path('Cargo.toml'): (prepare.WORKER_VERSION, 1)}), \
+                 patch.object(recover.subprocess, 'run') as cat_file, \
+                 patch.object(recover, 'verify_staged', return_value=({'id': 9}, {'id': 10}, {'repository': 'x/y', 'schema_version': 2})) as staged:
+                cat_file.return_value.returncode = 1
+                recover.main()
+                self.assertEqual(staged.call_args.args[7], 1)
+                self.assertIn('source_run_attempt=1', output.read_text())
+
+    def test_main_recovers_earlier_receipt_with_mixed_validator_attempts(self):
+        candidate, parent = 'b' * 40, 'a' * 40
+        run = dict(id=42, run_attempt=3, path='.github/workflows/release.yml', event='push', head_branch='main',
+                   status='completed', conclusion='failure', head_sha=parent,
+                   repository={'id': 17}, head_repository={'id': 17})
+        prepare_job = dict(name=recover.PREPARE, status='completed', conclusion='success', id=100)
+        validator_jobs = {1: dict(name='Build the Android validator', status='completed', conclusion='success'),
+                          2: dict(name='Build the macOS validator', status='completed', conclusion='success')}
+        items, subjects = [], []
+        for platform, attempt, artifact_id in (('android', 1, 9), ('mac', 2, 10)):
+            digest = 'sha256:' + ('a' if platform == 'android' else 'b') * 64
+            items.append(dict(name=f'{platform}-validator-42-{attempt}', id=artifact_id, digest=digest, workflow_run={'id': 42}))
+            subjects.append(dict(platform=platform, artifact_id=artifact_id, artifact_digest=digest, run_id=42,
+                                 run_attempt=attempt, source_sha=candidate, version='0.1.11', repository_id=17))
+        items.append({'name': 'release-gate-receipt-42-2'})
+        receipt = dict(repository='x/y', schema_version=3, validators=subjects)
+        def api(*args):
+            path = args[-1]
+            if path == 'repos/x/y': return json.dumps({'id': 17})
+            if path == 'repos/x/y/actions/runs/42': return json.dumps(run)
+            if '/attempts/1/jobs' in path: return json.dumps([{'jobs': [prepare_job, validator_jobs[1]]}])
+            if '/attempts/2/jobs' in path: return json.dumps([{'jobs': [validator_jobs[2]]}])
+            if '/artifacts?' in path: return json.dumps([{'artifacts': items}])
+            if '/actions/jobs/100/logs' in path: return f'Release 0.1.11 from {candidate}'
+            raise AssertionError(path)
+        def git(*args):
+            if args[:2] == ('log', 'origin/main'): return candidate
+            if args[:3] == ('show', '-s', '--format=%B'): return 'Release-Run: 42'
+            if args[:3] == ('show', '-s', '--format=%P'): return parent
+            if args[0] == 'show': return 'version = "0.1.11"'
+            return ''
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'out'
+            args = ['recover_release.py', '--failed-run-id', '42', '--version', '0.1.11', '--output', str(output)]
+            with patch.object(sys, 'argv', args), patch.dict(recover.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main', 'GITHUB_REPOSITORY': 'x/y'}), \
+                 patch.object(recover, 'api', side_effect=api), patch.object(recover, 'git', side_effect=git), \
+                 patch.object(recover, 'require_latest_reservation'), \
+                 patch.object(recover, 'version_files', return_value={Path('Cargo.toml'): (prepare.WORKER_VERSION, 1)}), \
+                 patch.object(recover.subprocess, 'run') as cat_file, \
+                 patch.object(recover, 'verify_staged', return_value=({'id': 11}, {'id': 12}, receipt)) as staged:
+                cat_file.return_value.returncode = 0
+                recover.main()
+                self.assertEqual(staged.call_args.args[7], 2)
+                result = output.read_text()
+                self.assertIn('source_run_attempt=2', result)
+                self.assertIn('android_validator_id=9', result)
+                self.assertIn('mac_validator_id=10', result)
+                subjects[0]['run_attempt'] = 4
+                with self.assertRaises(SystemExit):
+                    recover.main()
 
     def test_schema_two_identity_and_digest(self):
         self.assertEqual(self.check_receipt(2)[0]['id'], 9)
@@ -144,13 +266,132 @@ class PayloadAndPublicationTests(unittest.TestCase):
             for suffix in ('.aar', '.pom', '.module', '-sources.jar'):
                 (folder / f'usbdac-0.1.11{suffix}').write_bytes(b'content')
             with patch.object(publish, 'fetch', return_value=b'content'):
-                self.assertTrue(publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac'))
+                self.assertEqual(publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac')['state'], 'complete_match')
             with patch.object(publish, 'fetch', side_effect=[b'content', None, None, None]):
-                with self.assertRaises(SystemExit):
-                    publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac')
+                state = publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac')
+                self.assertEqual(state['state'], 'partial_match')
+                self.assertEqual(len(state['missing']), 3)
             with patch.object(publish, 'fetch', return_value=b'conflict'):
-                with self.assertRaises(SystemExit):
-                    publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac')
+                self.assertEqual(publish.classify_maven(root, '0.1.11', 'x/y', 'auth', 'usbdac')['state'], 'conflict')
+
+    def test_validator_receipt_binds_exact_bytes_and_archive(self):
+        data = b'validator bytes'
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, 'w') as z:
+            z.writestr('usbdac-validator-0.1.11-android.apk', data)
+        digest = 'sha256:' + hashlib.sha256(raw.getvalue()).hexdigest()
+        subject = artifact.validator_subject(raw.getvalue(), 'android', 9, digest, 42, 1, '0.1.11', 'b' * 40, 17)
+        self.assertEqual(subject['sha256'], hashlib.sha256(data).hexdigest())
+        with self.assertRaises(SystemExit):
+            artifact.validator_subject(raw.getvalue(), 'android', 9, 'sha256:' + '0' * 64, 42, 1, '0.1.11', 'b' * 40, 17)
+        with zipfile.ZipFile(raw, 'a') as z:
+            z.writestr('../escape', b'bad')
+        with self.assertRaises(SystemExit):
+            artifact.validator_subject(raw.getvalue(), 'android', 9, 'sha256:' + hashlib.sha256(raw.getvalue()).hexdigest(), 42, 1, '0.1.11', 'b' * 40, 17)
+
+    def test_validator_subjects_allow_different_producing_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subjects = []
+            ids = {'android': 9, 'mac': 10}
+            for platform, attempt, suffix in (('android', 1, 'android.apk'), ('mac', 2, 'macos-arm64.zip')):
+                filename = f'usbdac-validator-0.1.11-{suffix}'
+                (root / filename).write_bytes(platform.encode())
+                subjects.append(dict(platform=platform, artifact_id=ids[platform], artifact_digest='sha256:' + 'a' * 64,
+                    run_id=42, run_attempt=attempt, filename=filename, size=len(platform),
+                    sha256=hashlib.sha256(platform.encode()).hexdigest(), version='0.1.11', source_sha='b' * 40, repository_id=17))
+            artifact.verify_validator_subjects({'validators': subjects}, root, '0.1.11', 'b' * 40, 17, 42, 2, ids)
+            subjects[0]['run_attempt'] = 3
+            with self.assertRaises(SystemExit):
+                artifact.verify_validator_subjects({'validators': subjects}, root, '0.1.11', 'b' * 40, 17, 42, 2, ids)
+
+    def test_crate_index_lag_after_upload_is_pending(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(publish, 'fetch', side_effect=[b'', b'archive']):
+            with self.assertRaises(SystemExit):
+                publish.classify_crate(Path(tmp), '0.1.11')
+        with tempfile.TemporaryDirectory() as tmp, patch.object(publish, 'fetch', return_value=b''):
+            self.assertFalse(publish.classify_crate(Path(tmp), '0.1.11', post_upload=True))
+
+    def test_release_preflight_rejects_wrong_tag_and_duplicate_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'file').write_bytes(b'x')
+            notes = root / 'notes.txt'
+            notes.write_text('notes')
+            tag = {'ref': 'refs/tags/v0.1.11', 'object': {'type': 'commit', 'sha': 'b' * 40}}
+            def wrong(url, auth):
+                return json.dumps(tag).encode() if '/git/ref/' in url else None
+            with patch.object(publish, 'fetch', side_effect=wrong), self.assertRaises(SystemExit):
+                publish.preflight_release('x/y', '0.1.11', 'a' * 40, root, notes, 'token')
+            tag['object']['sha'] = 'a' * 40
+            release = {'assets': [{'name': 'file'}, {'name': 'file'}], 'body': 'notes'}
+            def duplicate(url, auth):
+                return json.dumps(tag if '/git/ref/' in url else release).encode()
+            with patch.object(publish, 'fetch', side_effect=duplicate), self.assertRaises(SystemExit):
+                publish.preflight_release('x/y', '0.1.11', 'a' * 40, root, notes, 'token')
+
+    def test_publication_entrypoint_preflight_failure_never_uploads(self):
+        env = {'VERSION': '0.1.11', 'PUBLISH_REPOSITORY': 'x/y', 'SOURCE_REPOSITORY': 'x/y',
+               'SOURCE_SHA': 'a' * 40, 'WORKFLOW_SHA': 'b' * 40, 'SOURCE_RUN_ID': '42',
+               'SOURCE_RUN_ATTEMPT': '1', 'RESERVATION_RUN_ID': '42', 'GITHUB_ACTOR': 'actor',
+               'GITHUB_TOKEN': 'token', 'CARGO_REGISTRY_TOKEN': 'token'}
+        events = []
+        def classify(root, version, repo, auth, name):
+            events.append(name)
+            return {'state': 'absent'}
+        def preflight(*args):
+            events.append('release')
+            raise SystemExit('conflicting tag')
+        with patch.dict(publish.os.environ, env), patch.object(publish, 'verify'), \
+             patch.object(publish, 'classify_maven', side_effect=classify), \
+             patch.object(publish, 'classify_crate', side_effect=lambda *args: events.append('crate') or False), \
+             patch.object(publish, 'preflight_release', side_effect=preflight), \
+             patch.object(publish, 'publish_crate') as crate_upload, patch.object(publish, 'publish_maven') as maven_upload:
+            with self.assertRaises(SystemExit):
+                publish.main()
+            self.assertEqual(events, ['usbdac', 'usbdac-media3', 'crate', 'release'])
+            crate_upload.assert_not_called()
+            maven_upload.assert_not_called()
+
+    def test_docs_embedded_gate_requires_published_matching_source(self):
+        workflow = (SCRIPTS.parent / 'workflows' / 'docs.yml').read_text()
+        program = textwrap.dedent(workflow.split("          python3 - <<'PYDOCS'\n", 1)[1].split('          PYDOCS\n', 1)[0])
+        source = 'a' * 40
+        version = '0.1.16'
+        manifest = {'version': version, 'source_sha': source, 'repository_id': 17, 'files': {}}
+        for name in ('usbdac', 'usbdac-media3'):
+            manifest['files'][f'maven/dev/usbdac/{name}/{version}/{name}-{version}.aar'] = {'sha256': 'c' * 64}
+        manifest_bytes = json.dumps(manifest).encode()
+        receipt = {'version': version, 'source_sha': source, 'repository_id': 17, 'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest()}
+        receipt_bytes = json.dumps(receipt).encode()
+        release = {'published_at': '2026-01-01T00:00:00Z', 'assets': [
+            {'name': 'manifest.json', 'digest': 'sha256:' + hashlib.sha256(manifest_bytes).hexdigest()},
+            {'name': 'receipt.json', 'digest': 'sha256:' + hashlib.sha256(receipt_bytes).hexdigest()},
+            *[{'name': f'{name}-{version}.aar', 'digest': 'sha256:' + 'c' * 64} for name in ('usbdac', 'usbdac-media3')]]}
+        state = {'tag': source}
+        def command(args, **kwargs):
+            if args[:2] == ['gh', 'api']: return json.dumps(release).encode()
+            if args[:2] == ['git', 'rev-parse']: return state['tag'] + '\n'
+            if args[:2] == ['git', 'show']: return ' '.join(f'dev.usbdac:{name}:{version}' for name in ('usbdac', 'usbdac-media3'))
+            raise AssertionError(args)
+        def download(args, **kwargs):
+            target = Path(args[args.index('--dir') + 1])
+            (target / 'manifest.json').write_bytes(manifest_bytes)
+            (target / 'receipt.json').write_bytes(receipt_bytes)
+        env = {'VERSION': version, 'SOURCE_SHA': source, 'GITHUB_REPOSITORY': 'x/y', 'GITHUB_REPOSITORY_ID': '17', 'GITHUB_REF': 'refs/heads/main'}
+        with patch.dict(os.environ, env), patch('subprocess.check_output', side_effect=command), patch('subprocess.run', side_effect=download):
+            exec(compile(program, 'docs.yml:PYDOCS', 'exec'), {})
+            state['tag'] = 'b' * 40
+            with self.assertRaises(SystemExit):
+                exec(compile(program, 'docs.yml:PYDOCS', 'exec'), {})
+            state['tag'] = source
+            os.environ['GITHUB_REF'] = 'refs/heads/other'
+            with self.assertRaises(SystemExit):
+                exec(compile(program, 'docs.yml:PYDOCS', 'exec'), {})
+            os.environ['GITHUB_REF'] = 'refs/heads/main'
+            release['draft'] = True
+            with self.assertRaises(SystemExit):
+                exec(compile(program, 'docs.yml:PYDOCS', 'exec'), {})
 
     def test_release_notes_bind_coordinates_and_provenance(self):
         text = notes.render('0.1.11', 'a' * 40, ['- Fix'], 'x/y', True)

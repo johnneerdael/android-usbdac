@@ -45,12 +45,12 @@ pub fn badd_descriptor_witness(fd: RawFd, active_id: u8, snapshot: &[u8]) -> u8 
 /// On Linux and Android, libusb wraps the fd only to cache descriptors and
 /// query speed; witness controls use synchronous usbfs ioctl, never an event
 /// pump or asynchronous URB. Descriptor caching may change the file offset.
+/// The caller must keep `fd` live until its initial duplication completes.
 pub fn try_badd_descriptor_witness(
     fd: RawFd,
     active_id: u8,
     snapshot: &[u8],
 ) -> Result<u8, crate::Error> {
-    let _reservation = super::context::SessionContext::reserve(fd)?;
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         return Ok(0);
     }
@@ -62,6 +62,9 @@ pub fn try_badd_descriptor_witness(
         return Ok(0);
     }
     let owned = OwnedUsbFd(duplicated);
+    // Reserve the stable duplicate, not a caller-owned descriptor that may be reused.
+    let _reservation = super::context::SessionContext::reserve(owned.0)?;
+    prepare_direct_usb_libusb();
     let result = (|| -> Option<u8> {
         let context = Context::new().ok()?;
         let handle = unsafe { context.open_device_with_fd(owned.0) }.ok()?;

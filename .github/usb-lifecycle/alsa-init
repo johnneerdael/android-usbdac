@@ -1,0 +1,56 @@
+#!/bin/sh
+bb=/bin/busybox
+set -eu
+fail() { echo "ALSA_FAIL phase=$1"; exec "$bb" poweroff -f; }
+"$bb" mount -t proc proc /proc || fail proc
+"$bb" mount -t sysfs sysfs /sys || fail sys
+"$bb" mount -t devtmpfs devtmpfs /dev || fail dev
+"$bb" ip link set lo up || fail lo
+for module in usbcore usbip-core vhci-hcd; do
+    "$bb" insmod "/fixture/$module.ko" || fail "$module"
+done
+while IFS= read -r module; do
+    "$bb" insmod "/fixture/alsa/$module" || fail "$module"
+done < /fixture/alsa/order
+for entry in normal:1:3250 badd:2:3251 full-uac3-clock:3:3252; do
+    profile=${entry%%:*}
+    middle=${entry#*:}
+    value=${middle%%:*}
+    port=${entry##*:}
+    /fixture/usbip_uac --mode "$profile" --port "$port" &
+    daemon=$!
+    "$bb" sleep 1
+    "$bb" timeout 10 /fixture/usbip_uac --attach --port "$port" || fail "$profile-attach"
+    device=
+    for attempt in 1 2 3 4 5; do
+        for node in /sys/bus/usb/devices/*; do
+            [ -r "$node/idVendor" ] && [ -r "$node/idProduct" ] || continue
+            IFS= read -r vendor < "$node/idVendor"
+            IFS= read -r product < "$node/idProduct"
+            [ "$vendor:$product" = 1209:daca ] || continue
+            case $("$bb" readlink -f "$node") in */vhci_hcd.0/*) device=$node;; esac
+        done
+        [ -z "$device" ] || break
+        "$bb" sleep 1
+    done
+    [ -n "$device" ] || fail "$profile-enumerate"
+    printf '%s\n' "$value" > "$device/bConfigurationValue" || fail "$profile-select"
+    stream=
+    for attempt in 1 2 3 4 5; do
+        for proc in /proc/asound/card*/stream0; do
+            [ -r "$proc" ] && stream=$proc
+        done
+        [ -z "$stream" ] || break
+        "$bb" sleep 1
+    done
+    [ -n "$stream" ] || fail "$profile-alsa-bind"
+    echo "ALSA_PROFILE_BEGIN $profile config=$value"
+    "$bb" cat "$stream"
+    echo "ALSA_PROFILE_END $profile"
+    printf '0\n' > /sys/devices/platform/vhci_hcd.0/detach || fail "$profile-detach"
+    kill "$daemon" 2>/dev/null || :
+    wait "$daemon" 2>/dev/null || :
+    "$bb" sleep 1
+done
+echo ALSA_PROFILES_COMPLETE
+exec "$bb" poweroff -f

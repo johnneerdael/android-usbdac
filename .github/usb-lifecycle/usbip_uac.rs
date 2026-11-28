@@ -22,6 +22,65 @@ const CONFIG: &[u8] = &[
     2, 16, 7, 5, 1, 0x0d, 48, 0, 1, 8, 0x25, 1, 0, 0, 0, 0, 0,
 ];
 
+fn rv_rates() -> Vec<u32> {
+    env::var("RV_RATES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![48_000, 96_000])
+}
+fn rv_range() -> Option<(u32, u32, u32)> {
+    let s = env::var("RV_RANGE").ok()?;
+    let v: Vec<u32> = s.split(':').filter_map(|x| x.parse().ok()).collect();
+    (v.len() == 3).then(|| (v[0], v[1], v[2]))
+}
+fn rv_supports(rate: u32) -> bool {
+    match rv_range() {
+        Some((min, max, res)) => {
+            if res == 0 {
+                rate == min
+            } else {
+                rate >= min && rate <= max && (rate - min) % res == 0
+            }
+        }
+        None => rv_rates().contains(&rate),
+    }
+}
+fn rv_range_reply() -> Vec<u8> {
+    let mut v = Vec::new();
+    match rv_range() {
+        Some((min, max, res)) => {
+            v.extend([1u8, 0]);
+            v.extend(min.to_le_bytes());
+            v.extend(max.to_le_bytes());
+            v.extend(res.to_le_bytes());
+        }
+        None => {
+            let rates = rv_rates();
+            v.extend((rates.len() as u16).to_le_bytes());
+            for rate in rates {
+                v.extend(rate.to_le_bytes());
+                v.extend(rate.to_le_bytes());
+                v.extend(0u32.to_le_bytes());
+            }
+        }
+    }
+    v
+}
+// RV_SELECTOR=1 inserts a one-input Clock Selector 40 -> source 16 (XMOS-like).
+fn rv_config0() -> Vec<u8> {
+    let mut c = CONFIG.to_vec();
+    if env::var("RV_SELECTOR").is_ok() {
+        assert_eq!(&c[35..43], &[8, 0x24, 0x0a, 16, 7, 7, 0, 0]);
+        assert_eq!(c[50], 16);
+        assert_eq!(c[68], 16);
+        c[50] = 40;
+        c[68] = 40;
+        c[32] += 8;
+        c.splice(43..43, [8u8, 0x24, 0x0b, 40, 1, 16, 0x03, 0]);
+    }
+    c
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Normal,
@@ -71,7 +130,7 @@ fn full_uac3_clock_configuration() -> Vec<u8> {
 
 fn configuration(index: u8) -> Option<Vec<u8>> {
     let mut c = match index {
-        0 => CONFIG.to_vec(),
+        0 => rv_config0(),
         1 => vec![
             9, 2, 0, 0, 2, 2, 0, 0x80, 50, 8, 11, 0, 2, 1, 0x22, 0x30, 0, 9, 4, 0, 0, 0, 1, 1,
             0x30, 0, 9, 4, 1, 0, 0, 1, 2, 0x30, 0, 9, 4, 1, 1, 2, 1, 2, 0x30, 0, 7, 5, 1, 0x05,
@@ -117,9 +176,18 @@ struct Retirement {
     held_submit: Option<u32>,
     held_unlink: Option<u32>,
     capture_fault: bool,
+    mixed_capture: bool,
     active: bool,
     release_pending: bool,
     writer: Option<Arc<Mutex<TcpStream>>>,
+    rate_sets: Vec<u32>,
+    alt_writes: Vec<u8>,
+    power_writes: Vec<u8>,
+    selector_writes: Vec<u8>,
+    selector_current: u8,
+    out_submits: u64,
+    out_completions: u64,
+    unlinks: u64,
 }
 impl Retirement {
     fn status(&self) -> u8 {
@@ -221,7 +289,11 @@ impl Device {
             (0x82, 0, 0, 1) => vec![0, 0],
             (0x01, 11, 0..=2, 1) if self.config != 0 && (value <= 1 || self.config == 2) => {
                 self.alt = value as u8;
-                self.shared.lock().unwrap().active = self.alt == 1;
+                let mut shared = self.shared.lock().unwrap();
+                shared.active = self.alt == 1;
+                if shared.alt_writes.len() < 256 {
+                    shared.alt_writes.push(self.alt);
+                }
                 eprintln!("SET_INTERFACE alt={}", self.alt);
                 vec![]
             }
@@ -303,6 +375,16 @@ impl Device {
                     && data[0] <= 2 =>
             {
                 self.power = data[0];
+                if self.power == 2 && env::var("RV_VOLATILE_SELECTOR").is_ok() {
+                    self.selector = 1;
+                    self.shared.lock().unwrap().selector_current = 1;
+                }
+                {
+                    let mut state = self.shared.lock().unwrap();
+                    if state.power_writes.len() < 256 {
+                        state.power_writes.push(self.power);
+                    }
+                }
                 eprintln!("POWER {}", self.power);
                 vec![]
             }
@@ -320,16 +402,31 @@ impl Device {
                     && (1..=2).contains(&data[0]) =>
             {
                 self.selector = data[0];
+                {
+                    let mut state = self.shared.lock().unwrap();
+                    state.selector_current = self.selector;
+                    if state.selector_writes.len() < 256 {
+                        state.selector_writes.push(self.selector);
+                    }
+                }
                 eprintln!("SELECTOR {}", self.selector);
                 vec![]
             }
-            (0xa1, 1, 0x0100, 0x0900) if self.config >= 2 => if self.mode == Mode::FullUac3Clock {
-                self.rate
-            } else {
-                48_000
+            (0xa1, 1, 0x0100, 0x0900) if self.config >= 2 => {
+                let fault = env::var("RV_CLOCK_FAULT").unwrap_or_default();
+                if self.mode == Mode::FullUac3Clock && self.alt == 1 && fault == "bad" {
+                    return Err(());
+                }
+                let rate = if self.mode == Mode::FullUac3Clock && self.alt == 1 && fault == "stale"
+                {
+                    self.old_rate
+                } else if self.mode == Mode::FullUac3Clock {
+                    self.rate
+                } else {
+                    48_000
+                };
+                rate.to_le_bytes().to_vec()
             }
-            .to_le_bytes()
-            .to_vec(),
             (0xa1, 1, 0x0200, 0x0900) if self.config >= 2 => vec![1],
             (0xa1, 2, 0x0100, 0x0900) if self.config >= 2 => {
                 let mut v = vec![
@@ -362,6 +459,9 @@ impl Device {
                 if ![48_000, 96_000].contains(&rate) {
                     return Err(());
                 }
+                if rate != self.rate {
+                    self.old_rate = self.rate;
+                }
                 self.rate = rate;
                 vec![]
             }
@@ -392,17 +492,35 @@ impl Device {
             }
             (0xa1, 1, 0x0200, 0x1000) => vec![1],
             (0xa1, 2, 0x0100, 0x1000) => {
-                let mut v = vec![2, 0];
-                for rate in [48_000u32, 96_000] {
-                    v.extend(rate.to_le_bytes());
-                    v.extend(rate.to_le_bytes());
-                    v.extend(0u32.to_le_bytes());
-                }
-                v
+                eprintln!("GET_RANGE clock=16");
+                rv_range_reply()
+            }
+            (0xa1, 1, 0x0100, 0x2800) if env::var("RV_SELECTOR").is_ok() => {
+                eprintln!("GET_CUR selector=40");
+                vec![1]
+            }
+            (0x21, 1, 0x0100, 0x2800) if env::var("RV_SELECTOR").is_ok() && data == [1] => {
+                eprintln!("SET_CUR selector=40 pin=1");
+                vec![]
             }
             (0x21, 1, 0x0100, 0x1000) if len == 4 && data.len() == 4 => {
                 let rate = u32::from_le_bytes(data.try_into().unwrap());
-                if ![48_000, 96_000].contains(&rate) {
+                {
+                    let mut state = self.shared.lock().unwrap();
+                    if state.rate_sets.len() < 256 {
+                        state.rate_sets.push(rate);
+                    }
+                }
+                if env::var("RV_REFUSE_RATE")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    == Some(rate)
+                {
+                    eprintln!("SET_CUR rate={rate} ARMED_STALL");
+                    return Err(());
+                }
+                if !rv_supports(rate) {
+                    eprintln!("SET_CUR rate={rate} STALL");
                     return Err(());
                 }
                 if rate != self.rate {
@@ -521,6 +639,7 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
         if cmd == 2 {
             let target = be32(&h[20..24]);
             let mut state = dev.shared.lock().unwrap();
+            state.unlinks += 1;
             if state.held_submit == Some(target) && state.held_unlink.is_none() {
                 state.held_unlink = Some(seq);
                 eprintln!("held unlink seq={seq} target={target}");
@@ -560,6 +679,7 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
                 Err(()) => (-32i32, 0, vec![]),
             }
         } else if ep == 1 && dir == 0 && packets > 0 && dev.config != 0 && dev.alt != 0 {
+            dev.shared.lock().unwrap().out_submits += 1;
             let mut total = 0usize;
             let max_packet = match (dev.config, dev.alt) {
                 (1, 1) => 48,
@@ -592,6 +712,7 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
                     continue;
                 }
             }
+            dev.shared.lock().unwrap().out_completions += 1;
             (0, total, vec![])
         } else if ep == 2
             && dir == 1
@@ -602,6 +723,10 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
         {
             let mut state = dev.shared.lock().unwrap();
             let fault = state.armed;
+            let mixed = state.mixed_capture && packets >= 3 && !fault;
+            if mixed {
+                state.mixed_capture = false;
+            }
             if fault {
                 state.armed = false;
                 state.capture_fault = true;
@@ -609,7 +734,7 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
             }
             drop(state);
             let mut payload = Vec::new();
-            for packet in iso.chunks_exact_mut(16) {
+            for (index, packet) in iso.chunks_exact_mut(16).enumerate() {
                 let offset = be32(&packet[..4]) as usize;
                 let length = be32(&packet[4..8]) as usize;
                 if length > 24
@@ -621,12 +746,26 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
                 {
                     return Err(invalid("invalid capture packet"));
                 }
-                let actual = if fault { 0 } else { length };
+                let actual = if fault || (mixed && index == 1) {
+                    0
+                } else if mixed && index == 0 {
+                    (length / 8) * 4
+                } else if mixed && index == 2 {
+                    length.saturating_sub(2)
+                } else {
+                    length
+                };
+                let packet_status = if fault || (mixed && index == 1) {
+                    -32i32
+                } else {
+                    0
+                };
                 packet[8..12].copy_from_slice(&(actual as u32).to_be_bytes());
-                packet[12..16].copy_from_slice(&(if fault { -32i32 } else { 0 }).to_be_bytes());
+                packet[12..16].copy_from_slice(&packet_status.to_be_bytes());
                 for _ in 0..actual / 4 {
                     payload.extend([0x34, 0x12, 0xcc, 0xed]);
                 }
+                payload.extend(std::iter::repeat_n(0x99, actual % 4));
             }
             (if fault { -32i32 } else { 0 }, payload.len(), payload)
         } else if ep == 1 && dir == 1 && packets > 0 && dev.config >= 2 && dev.alt != 0 {
@@ -709,6 +848,35 @@ fn control_connection(mut stream: TcpStream, shared: &Arc<Mutex<Retirement>>) ->
     BufReader::new(stream.try_clone()?.take(32)).read_line(&mut command)?;
     let response = match command.as_str() {
         "status\n" => format!("{}\n", shared.lock().unwrap().status()),
+        "snapshot\n" => {
+            let state = shared.lock().unwrap();
+            format!(
+                "rates={:?};alts={:?};power={:?};selector={:?};selector_state={};out_submits={};out_completions={};unlinks={}\n",
+                state.rate_sets,
+                state.alt_writes,
+                state.power_writes,
+                state.selector_writes,
+                state.selector_current,
+                state.out_submits,
+                state.out_completions,
+                state.unlinks
+            )
+        }
+        "mixed\n" => {
+            shared.lock().unwrap().mixed_capture = true;
+            "ok\n".to_string()
+        }
+        "reset\n" => {
+            let mut state = shared.lock().unwrap();
+            state.rate_sets.clear();
+            state.alt_writes.clear();
+            state.power_writes.clear();
+            state.selector_writes.clear();
+            state.out_submits = 0;
+            state.out_completions = 0;
+            state.unlinks = 0;
+            "ok\n".to_string()
+        }
         "release\n" => match shared.lock().unwrap().release() {
             Ok(()) => "ok\n".to_string(),
             Err(e) => format!("error {e}\n"),
@@ -718,7 +886,10 @@ fn control_connection(mut stream: TcpStream, shared: &Arc<Mutex<Retirement>>) ->
     stream.write_all(response.as_bytes())
 }
 fn control_client(port: u16, command: &str) -> io::Result<()> {
-    if !matches!(command, "status" | "release") {
+    if !matches!(
+        command,
+        "status" | "release" | "snapshot" | "reset" | "mixed"
+    ) {
         return Err(invalid("control must be status or release"));
     }
     let control_port = port
@@ -728,7 +899,7 @@ fn control_client(port: u16, command: &str) -> io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
     writeln!(stream, "{command}")?;
     let mut response = String::new();
-    BufReader::new(stream.take(128)).read_line(&mut response)?;
+    BufReader::new(stream.take(8192)).read_line(&mut response)?;
     if response.starts_with("error") || response.is_empty() {
         return Err(io::Error::other(response));
     }
@@ -780,7 +951,7 @@ fn main() -> io::Result<()> {
     }
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
     let shared = Arc::new(Mutex::new(Retirement::default()));
-    if mode == Mode::Retire {
+    {
         let control_port = port
             .checked_add(100)
             .ok_or_else(|| invalid("control port overflow"))?;

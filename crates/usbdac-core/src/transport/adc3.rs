@@ -3160,6 +3160,8 @@ impl Adc3PowerLease {
         if remaining.is_zero() {
             return Err("ADC3 routing deadline expired".into());
         }
+        // Round upward by less than one millisecond: zero means an infinite
+        // usbfs timeout, and the deadline must remain bounded.
         Ok(remaining
             .as_millis()
             .saturating_add(if remaining.subsec_nanos() % 1_000_000 != 0 {
@@ -4538,9 +4540,21 @@ pub(super) fn adc3_badd_volume_topology(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn badd_witness_rejects_registered_owner_and_duplicate_fd() {
         use std::os::fd::AsRawFd;
-        let file = std::fs::File::open("/dev/null").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "usbdac-witness-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
         let fd = file.as_raw_fd();
         let owner = super::super::context::SessionContext::reserve(fd).unwrap();
         let duplicate = unsafe { libc::dup(fd) };

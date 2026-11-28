@@ -394,6 +394,21 @@ impl Converter {
     /// Converts whole frames. Declared integer padding is checked before any output or state change.
     /// Nonzero padding returns `InvalidArgument`; after `finish`, call `reset` first.
     pub fn process(&mut self, input: &[u8], output: &mut [u8]) -> Result<Processed, ConvertError> {
+        if matches!(&self.engine, Engine::Float(engine) if engine.finishing) {
+            return Err(ConvertError::InvalidState(
+                "finish() was called: reset() before converting more".into(),
+            ));
+        }
+        let input_frames = input.len() / self.source_frame;
+        let output_frames = output.len() / self.target_frame;
+        let capacity = match &self.engine {
+            Engine::Float(engine) => engine
+                .resampler
+                .as_ref()
+                .map_or(output_frames, |r| r.max_input_for_output(output_frames)),
+            _ => output_frames,
+        };
+        let input = &input[..input_frames.min(capacity) * self.source_frame];
         if let SampleFormat::Int { bits, slot_bytes } = self.plan.source().sample {
             let padding = u32::from(slot_bytes) * 8 - u32::from(bits);
             if padding > 0 {
@@ -526,6 +541,95 @@ mod tests {
 
     fn i16_bytes(values: &[i16]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn padding_validation_only_scans_the_consumable_prefix() {
+        let padded = SampleFormat::Int {
+            bits: 20,
+            slot_bytes: 3,
+        };
+        for target in [padded, SampleFormat::I32] {
+            let mut c = converter(
+                fmt(48_000, 1, padded),
+                fmt(48_000, 1, target),
+                ConvertOptions::default(),
+            );
+            let input = [0x10, 0x12, 0x34, 0x11, 0x12, 0x34];
+            let mut output = [0x55; 8];
+            let width = c.target_frame_bytes();
+            let done = c.process(&input, &mut output[..width]).unwrap();
+            assert_eq!(done.consumed, 3);
+            let before = output;
+            assert!(matches!(
+                c.process(&input[3..], &mut output),
+                Err(ConvertError::InvalidArgument(_))
+            ));
+            assert_eq!(output, before);
+            assert_eq!(c.clipped_samples(), 0);
+            assert_eq!(c.process(&input[3..], &mut []).unwrap().consumed, 0);
+        }
+    }
+
+    #[test]
+    fn src_padding_boundaries_follow_current_phase_without_mutation_on_error() {
+        let padded = SampleFormat::Int {
+            bits: 20,
+            slot_bytes: 3,
+        };
+        for (source_rate, target_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            let mut actual = converter(
+                fmt(source_rate, 1, padded),
+                fmt(target_rate, 1, SampleFormat::I16),
+                ConvertOptions::default(),
+            );
+            let mut reference = converter(
+                fmt(source_rate, 1, padded),
+                fmt(target_rate, 1, SampleFormat::I16),
+                ConvertOptions::default(),
+            );
+            let prefix = vec![0u8; 3 * 103];
+            let mut a = vec![0u8; 512];
+            let mut b = vec![0u8; 512];
+            let first = actual.process(&prefix, &mut a).unwrap();
+            let ref_first = reference.process(&prefix, &mut b).unwrap();
+            assert_eq!(
+                (first.consumed, first.produced),
+                (ref_first.consumed, ref_first.produced)
+            );
+            assert_eq!(&a[..first.produced], &b[..ref_first.produced]);
+            let capacity = match &actual.engine {
+                Engine::Float(engine) => engine.resampler.as_ref().unwrap().max_input_for_output(7),
+                _ => panic!("expected resampling"),
+            };
+            assert!(capacity > 0);
+            let mut input = vec![0u8; (capacity + 1) * 3];
+            input[capacity * 3] = 1;
+            let mut small = [0u8; 14];
+            let done = actual.process(&input, &mut small).unwrap();
+            assert_eq!(done.consumed, capacity * 3);
+            let ref_done = reference
+                .process(&input[..capacity * 3], &mut b[..14])
+                .unwrap();
+            assert_eq!(&small[..done.produced], &b[..ref_done.produced]);
+            let mut invalid = vec![0u8; 3 * 100];
+            invalid[0] = 1;
+            let mut untouched = [0x55u8; 14];
+            assert!(matches!(
+                actual.process(&invalid, &mut untouched),
+                Err(ConvertError::InvalidArgument(_))
+            ));
+            assert_eq!(untouched, [0x55; 14]);
+            invalid[0] = 0;
+            let next = actual.process(&invalid, &mut untouched).unwrap();
+            let expected = reference.process(&invalid, &mut b[..14]).unwrap();
+            assert_eq!(
+                (next.consumed, next.produced),
+                (expected.consumed, expected.produced)
+            );
+            assert_eq!(&untouched[..next.produced], &b[..expected.produced]);
+            assert_eq!(actual.clipped_samples(), reference.clipped_samples());
+        }
     }
 
     #[test]

@@ -1,16 +1,27 @@
-# Upgrading from 0.1.10
+# Upgrading from 0.1.10 to 0.1.14
 
-What an Android app built against 0.1.10 has to check when it moves to 0.1.11. Change both coordinates, `dev.usbdac:usbdac` and `dev.usbdac:usbdac-media3`, to `0.1.11` together. None of the changes below has a new hardware result; [evidence](evidence.md#hardware-status) lists what has run on a DAC.
+What an Android app built against 0.1.10 has to check when upgrading. Change both coordinates, `dev.usbdac:usbdac` and `dev.usbdac:usbdac-media3`, to `0.1.14` together. See the 0.1.14 changes immediately below; the 0.1.11 history is retained afterward. None of the changes below has a new hardware result; [evidence](evidence.md#hardware-status) lists what has run on a DAC.
+
+## Changed in 0.1.14
+
+Version 0.1.14 supersedes the 0.1.11 behavior described below. Custom `OutputSource.formatSupport` implementations now default to `UNKNOWN`, allowing an open attempt; the sink reports it as supported with transcoding rather than promising direct output. The sample controller consults cached USB capabilities first, including rates above 192 kHz, before a managed fallback. Capability queries remain side-effect-free.
+
+For Android DSD-to-PCM fallback, API 31 and later try 24-bit and 32-bit integer targets before 16-bit when the route supports them; exclusive AAudio with `floatSamples` uses float. Older Android versions retain 16-bit integer targets. These are candidate preferences, not a promise that any particular output accepts them.
+
+Media3 write recovery is opt-in through `OutputSource.canRecover` for a typed failure and requires successful output closure. Sources unable to recreate the output keep the default nonrecoverable behavior. Downstream limits still require a suitable bound exclusive AAudio route for Android output; the selector may bypass limits for a direct DAC only when an explicit binding establishes a distinct route.
+
+
+## Changes in 0.1.11
 
 ## Changes that need code
 
 ### Media3: override `OutputSource.formatSupport`
 
-0.1.11 adds `OutputSource.formatSupport(request): OutputSupport`. `UsbDacAudioSink.getFormatSupport` and `supportsFormat` now ask it for every raw PCM format; in 0.1.10 the sink reported every mono or stereo PCM encoding it knew as supported directly. The default implementation answers `OutputFormatSupport.UNSUPPORTED` for every request.
+0.1.11 adds `OutputSource.formatSupport(request): OutputSupport`. `UsbDacAudioSink.getFormatSupport` and `supportsFormat` now ask it for every raw PCM format; in 0.1.10 the sink reported every mono or stereo PCM encoding it knew as supported directly. The 0.1.11 default answered `OutputFormatSupport.UNSUPPORTED` for every request; this changed to `UNKNOWN` in 0.1.14.
 
 **A custom `OutputSource` that implements only `open`, `close`, `takeLookAgain` and `setVolumeMultiplier` still compiles, and then plays nothing:** the renderer is told that no format is supported. Override `formatSupport` with an answer from cached capabilities: `DIRECT`, `WITH_TRANSCODING` or `UNSUPPORTED`. Do not open, negotiate or probe a device in it. `DacSessionOutputSource` already implements it from the session's alternate settings.
 
-The example's `DirectOutputController` answers from `OutputSelector.managedPcmFallbackSnapshot()` only. It never reports `DIRECT`, and it reports `UNSUPPORTED` for formats the Android-managed output cannot carry (above 192 kHz, unsigned8, float32) even when the attached DAC could play them. See [Media3 integration](media3.md#capability-migration) before copying it.
+In 0.1.11 the example's `DirectOutputController` answered from `OutputSelector.managedPcmFallbackSnapshot()` only; 0.1.14 uses cached USB capabilities. The 0.1.11 snapshot never reported `DIRECT`, and reported `UNSUPPORTED` for formats the Android-managed output could not carry (above 192 kHz, unsigned8, float32) even when the attached DAC could play them. See [Media3 integration](media3.md#capability-migration) before copying it.
 
 ### DoP input converted to PCM needs `allowDopPcmConversion`
 
@@ -24,7 +35,7 @@ While `DacSession.reconfigure` or `reconfigureCandidates` runs, including the dr
 
 | Area | 0.1.11 |
 |---|---|
-| DSD on Android outputs | With `allowConversion`, native DSD (and DoP with `allowDopPcmConversion`) can now be converted to PCM for the bit-perfect mixer, exclusive AAudio and standard outputs. 0.1.10 rejected DSD on all three. The PCM target is 16-bit, or 32-bit float for AAudio with `AAudioConfig.floatSamples`, at a standard rate ranked from the DSD bit rate over 16. The decision's guarantee is `NONE` |
+| DSD on Android outputs | With `allowConversion`, native DSD (and DoP with `allowDopPcmConversion`) can now be converted to PCM for the bit-perfect mixer, exclusive AAudio and standard outputs. 0.1.10 rejected DSD on all three. In 0.1.11 the PCM target was 16-bit (changed in 0.1.14), or 32-bit float for AAudio with `AAudioConfig.floatSamples`, at a standard rate ranked from the DSD bit rate over 16. The decision's guarantee is `NONE` |
 | DSD on direct USB | Unchanged in kind: DoP framing for native DSD needs `dopSupport = CONFIRMED`; otherwise PCM conversion is negotiated starting at 24-bit and the DSD bit rate over 16 (176.4 kHz for DSD64), through the PCM ranking below |
 | Downstream limits | `DownstreamLimits` still refuse every Android output, except that exclusive AAudio is now allowed on a built-in speaker or earpiece bound with `OutputSelector.bindDownstream(...)` and passed as `OutputPolicy.downstreamBinding` (API 28 and later). Without a binding, limits and no usable DAC, such as after an unplug, leave no output: `select` and `open` throw `UNSUPPORTED` |
 | Managed output rates | `AndroidManagedOutput.open` refuses a rate outside 4,000 to 192,000 Hz, and a format `AudioFormat.Builder` rejects, with `UNSUPPORTED` before creating a track. The selector skips the managed outputs for such a request |
@@ -64,11 +75,3 @@ val exactOnly = OutputPolicy(
 ```
 
 With both flags off, a request the DAC cannot run exactly is passed to the next output, or fails with `UNSUPPORTED` when it is forced. For direct `PcmConverter` or `ConvertingOutput` use, pass `ConversionOptions(headroomDb = 0.0)` to keep unity gain; in Rust, set `ConvertOptions::headroom_db` to `0.0`.
-
-## Unreleased follow-up
-
-The current development version changes the published 0.1.11 behavior described above. Custom `OutputSource.formatSupport` implementations now default to `UNKNOWN`, allowing an open attempt; the sink reports it as supported with transcoding rather than promising direct output. The sample controller consults cached USB capabilities first, including rates above 192 kHz, before a managed fallback. Capability queries remain side-effect-free.
-
-For Android DSD-to-PCM fallback, API 31 and later try 24-bit and 32-bit integer targets before 16-bit when the route supports them; exclusive AAudio with `floatSamples` uses float. Older Android versions retain 16-bit integer targets. These are candidate preferences, not a promise that any particular output accepts them.
-
-Media3 write recovery is opt-in through `OutputSource.canRecover` for a typed failure and requires successful output closure. Sources unable to recreate the output keep the default nonrecoverable behavior. Downstream limits still require a suitable bound exclusive AAudio route for Android output; the selector may bypass limits for a direct DAC only when an explicit binding establishes a distinct route.

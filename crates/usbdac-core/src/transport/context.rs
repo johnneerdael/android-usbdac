@@ -416,7 +416,18 @@ mod tests {
     #[test]
     fn duplicate_fds_are_refused_until_that_owner_retires() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        let file = std::fs::File::open("/dev/null").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "usbdac-context-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
         let duplicate = unsafe { OwnedFd::from_raw_fd(libc::dup(file.as_raw_fd())) };
         let first = SessionContext::reserve(file.as_raw_fd()).unwrap();
         assert!(matches!(

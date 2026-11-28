@@ -2814,6 +2814,12 @@ impl FeedforwardPool {
         }
         for index in 0..self.slots.len() {
             if let Some((status, completed, _)) = self.slots[index].take_completion() {
+                let Some(completed) = completed else {
+                    self.slots[index].mark_completed();
+                    return Err(Error::Transfer(
+                        "feedforward callback timestamp missing".into(),
+                    ));
+                };
                 let result = validate_feedforward_slot(
                     &self.slots[index],
                     status,
@@ -3380,6 +3386,10 @@ fn run_capture(
             };
             order.pop_front();
             reordered_seen[index] = false;
+            let Some(completed) = completed else {
+                slots[index].mark_completed();
+                return Err(Error::Transfer("capture callback timestamp missing".into()));
+            };
             let mut queue = buffer.lock();
             if usb_stop_requested(stop) {
                 slots[index].mark_completed();

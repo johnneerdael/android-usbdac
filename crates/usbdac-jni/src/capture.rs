@@ -142,6 +142,8 @@ pub fn capture_stats<'l>(
 }
 
 /// Fill caller-owned writable direct memory, returning bytes, never partial frames.
+/// The caller must not read or write the selected memory concurrently, including through
+/// duplicate or sliced buffers that alias it, until this call returns.
 #[jni_mangle("dev.usbdac.internal.Native")]
 pub fn capture_read<'l>(
     mut env: EnvUnowned<'l>,
@@ -189,7 +191,8 @@ pub fn capture_read<'l>(
             return Err(Failure::Bad("capture buffer has no writable memory".into()));
         }
         // SAFETY: Java keeps this writable direct buffer alive for the call,
-        // bounds were checked, and the SDK serializes reads of its stream.
+        // bounds were checked, and the documented caller contract exclusively
+        // borrows this memory for the call, including all aliased buffers and streams.
         let bytes = unsafe { std::slice::from_raw_parts_mut(base.add(offset), count) };
         let frames = stream.read(bytes)?;
         Ok((frames * stride) as i32)

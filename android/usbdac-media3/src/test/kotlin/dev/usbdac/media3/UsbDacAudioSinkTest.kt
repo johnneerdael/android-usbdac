@@ -368,6 +368,53 @@ class UsbDacAudioSinkTest {
     }
 
     @Test
+    fun recoverablePartialWriteReportsLatestPositionBeforeClose() {
+        val fake = FakeOutputSource()
+        val positions = mutableListOf<Long>()
+        val source = object : OutputSource by fake {
+            override fun canRecover(error: DacException) = error.code == DacErrorCode.TRANSFER
+            override fun onRecoveryPosition(output: OpenedOutput, positionUs: Long) {
+                assertFalse(fake.opened.single().closed)
+                positions += positionUs
+            }
+        }
+        val sink = UsbDacAudioSink(source)
+        sink.configure(AudioSink.AudioSinkConfig.Builder(pcm(16)).build())
+        sink.play()
+        sink.handleBuffer(audio(1, 4), 0, 1)
+        val output = fake.opened.single()
+        sink.getCurrentPositionUs(false)
+        output.played = 3
+        output.failAfterFrames = 2
+        output.failWith = DacException(DacErrorCode.TRANSFER, "failure")
+        val failure = assertThrows(AudioSink.WriteException::class.java) {
+            sink.handleBuffer(audio(4, 4), 0, 1)
+        }
+        assertTrue(failure.isRecoverable)
+        assertEquals(3 * 1_000_000L / 44_100, positions.last())
+        assertTrue(output.closed)
+    }
+
+    @Test
+    fun failedWriteAccountsForAcceptedPrefixInBothLayouts() {
+        for (wireBytes in listOf(2, 4)) {
+            val source = FakeOutputSource(wireBytes = wireBytes)
+            val sink = configured(source)
+            sink.play()
+            val first = audio(1, 4)
+            assertTrue(sink.handleBuffer(first, 0, 1))
+            val output = source.opened.single()
+            output.failAfterFrames = 2
+            output.failWith = DacException(DacErrorCode.DEVICE_LOST, "unplugged")
+            val input = audio(4, 4)
+            assertThrows(AudioSink.WriteException::class.java) { sink.handleBuffer(input, 0, 1) }
+            assertEquals(16, input.position()) // the sink has staged the decoder buffer
+            output.played = 100
+            assertEquals(3 * 1_000_000L / 44_100, sink.getCurrentPositionUs(false))
+        }
+    }
+
+    @Test
     fun drainedFormatChangeUsesTransactionalSourceAndResetsPosition() {
         val fake = FakeOutputSource()
         var reconfigured = 0

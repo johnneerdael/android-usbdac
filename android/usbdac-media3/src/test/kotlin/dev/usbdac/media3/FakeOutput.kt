@@ -16,7 +16,7 @@ import java.nio.ByteBuffer
 // region fake-output
 /**
  * A [PcmOutput] that records what the player does to it, so the sink, the seek order and the track
- * changes can be tested with no DAC. It lives in main source only so that the guide can quote it; put
+ * changes can be tested with no DAC. It lives in test source only so that the guide can quote it; put
  * it in your test source set.
  */
 class FakePcmOutput(private val bytesPerFrame: Int, private val room: Int = Int.MAX_VALUE) : PcmOutput {
@@ -31,15 +31,17 @@ class FakePcmOutput(private val bytesPerFrame: Int, private val room: Int = Int.
     var drained = false
     var closed = false
     var failWith: DacException? = null
+    var failAfterFrames: Int? = null
 
     override fun write(buffer: ByteBuffer): Int {
-        failWith?.let { throw it }
+        if (failAfterFrames == null) failWith?.let { throw it }
         if (closed) throw DacException(DacErrorCode.INVALID_STATE, "closed")
-        val taken = buffer.remaining() / bytesPerFrame * bytesPerFrame
+        val taken = minOf(buffer.remaining() / bytesPerFrame, failAfterFrames ?: Int.MAX_VALUE) * bytesPerFrame
         val bytes = ByteArray(taken)
         buffer.get(bytes)
         written.write(bytes)
         calls += "write $taken"
+        failWith?.let { throw it }
         return taken
     }
 

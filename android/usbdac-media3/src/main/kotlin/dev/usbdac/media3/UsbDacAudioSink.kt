@@ -251,9 +251,12 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         if (!frames.needsRepack) {
             val limit = buffer.limit()
             buffer.limit(buffer.position() + count * frames.inputFrameBytes)
+            val start = buffer.position()
             try {
-                submittedFrames += out.output.write(buffer) / frames.inputFrameBytes
+                val returned = out.output.write(buffer)
+                check(returned == buffer.position() - start) { "output returned a count different from its position delta" }
             } finally {
+                submittedFrames += (buffer.position() - start) / frames.inputFrameBytes
                 buffer.limit(limit)
             }
         } else {
@@ -262,9 +265,15 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
             stage.clear()
             repack(buffer, frames.inputBytes, frames.outputBytes, count * frames.channels, stage)
             stage.flip()
-            val taken = out.output.write(stage) / frames.outputFrameBytes // whole frames the output took
-            buffer.position(buffer.position() + taken * frames.inputFrameBytes)
-            submittedFrames += taken
+            val start = stage.position()
+            try {
+                val returned = out.output.write(stage)
+                check(returned == stage.position() - start) { "output returned a count different from its position delta" }
+            } finally {
+                val taken = (stage.position() - start) / frames.outputFrameBytes
+                buffer.position(buffer.position() + taken * frames.inputFrameBytes)
+                submittedFrames += taken
+            }
         }
         return !buffer.hasRemaining()
     }
@@ -273,6 +282,19 @@ class UsbDacAudioSink(private val outputs: OutputSource) : AudioSink {
         val format = activeFormat ?: wanted?.format ?: Format.Builder().build()
         var recoverable = outputs.canRecover(error)
         if (recoverable) {
+            val out = active
+            val frames = layout
+            if (out != null && frames != null && !startMediaTimeUsNeedsInit) {
+                try {
+                    val played = out.output.playedFrames.coerceAtLeast(0)
+                    val position = startMediaTimeUs + minOf(
+                        durationUs(played, frames.counterRateHz), durationUs(submittedFrames, frames.rateHz),
+                    )
+                    outputs.onRecoveryPosition(out, position)
+                } catch (positionError: DacException) {
+                    error.addSuppressed(positionError)
+                }
+            }
             try {
                 closeActive()
             } catch (closeError: Throwable) {

@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 pub use crate::transport::routing_hw::{
-    RouteEdit, RoutingDiagnostic, RoutingHandBackOutcome, RoutingHandBackReport,
+    RouteEdit, RoutingApplyError, RoutingDiagnostic, RoutingHandBackOutcome, RoutingHandBackReport,
     RoutingSessionError, RoutingSnapshot,
 };
 
@@ -707,7 +707,7 @@ pub struct TransactionError<E> {
     pub rollback_failures: Vec<(ControlKey, RoutingError<E>)>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteReport {
     pub changed: Vec<ControlKey>,
     pub unchanged: Vec<ControlKey>,
@@ -1406,6 +1406,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0x0703, 2), (0x0703, 1)]
         );
+    }
+
+    #[test]
+    fn stalled_set_and_expired_rollback_report_every_attempt_without_more_writes() {
+        struct DeadlineIo {
+            inner: MockIo,
+            recovering: bool,
+        }
+        impl RoutingIo for DeadlineIo {
+            type Error = &'static str;
+            fn read(
+                &mut self,
+                request: ControlRequest,
+                data: &mut [u8],
+            ) -> Result<usize, Self::Error> {
+                if self.recovering {
+                    return Err("deadline");
+                }
+                self.inner.read(request, data)
+            }
+            fn write(
+                &mut self,
+                request: ControlRequest,
+                data: &[u8],
+            ) -> Result<usize, Self::Error> {
+                if self.recovering {
+                    return Err("deadline");
+                }
+                self.inner.write(request, data)
+            }
+            fn begin_recovery_for(&mut self, _: usize) {
+                self.recovering = true;
+            }
+        }
+        let mut inner = MockIo::selectors();
+        inner.fail_writes = vec![2];
+        let mut io = DeadlineIo {
+            inner,
+            recovering: false,
+        };
+        let changes = [select(7, 2), select(8, 2)];
+        let failure = apply_routes(&inventory(), &mut io, &changes).unwrap_err();
+        assert_eq!(io.inner.writes.len(), 2);
+        assert_eq!(
+            failure
+                .rollback_failures
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            vec![changes[1].key, changes[0].key]
+        );
+        assert!(failure
+            .rollback_failures
+            .iter()
+            .all(|(_, error)| *error == RoutingError::Io("deadline")));
     }
 
     #[test]

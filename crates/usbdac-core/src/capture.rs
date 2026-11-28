@@ -366,7 +366,9 @@ pub struct CaptureBuffer {
 
 /// Standalone PCM capture running through the direct USB session. A caller may
 /// read from any thread; reads copy complete interleaved wire frames without
-/// conversion. Slow readers drop old queued frames and expose that in stats.
+/// conversion. Standalone capture drops old queued frames when readers fall
+/// behind. The synchronized duplex producer instead drops new frames on overflow;
+/// both policies report dropped frames in capture statistics.
 pub struct DacCaptureStream {
     dac: std::sync::Arc<crate::dac::DacShared>,
     format: CaptureFormat,

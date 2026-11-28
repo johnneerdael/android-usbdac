@@ -88,7 +88,11 @@ public class DacCaptureStream internal constructor(
     private val closed = AtomicBoolean(false)
     private var scratch: ByteBuffer? = null
 
-    /** Fill writable remaining bytes and advance position; return bytes, or zero when active and empty. */
+    /**
+     * Fill writable remaining bytes and advance position; return bytes, or zero when active and empty.
+     * Do not read or write the selected direct memory concurrently, including through aliased
+     * duplicate or sliced buffers, until this call returns.
+     */
     @Synchronized
     public fun read(destination: ByteBuffer): Int {
         checkOpen()

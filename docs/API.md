@@ -343,8 +343,8 @@ AltSetting { interface_number, alt_setting, endpoint_address, format: AltFormat 
 
 UAC2 clock rates come from the Clock Source's `GET_RANGE`. A UAC2 subrange
 with MIN below MAX and a resolution of 0 is ambiguous; the library keeps only
-its MIN and logs it. UAC3 range reads are used as returned, so on UAC3 such a
-subrange offers no rate.
+its MIN and logs it. Full UAC3 rejects the entire RANGE reply if any
+member is ambiguous; no rates from that reply are admitted.
 
 ### `StreamRequest`, `StreamFormat`
 

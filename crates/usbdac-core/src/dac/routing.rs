@@ -293,6 +293,16 @@ impl Dac {
         snapshot: &RoutingSnapshot,
         edits: &[RouteEdit],
     ) -> Result<RouteReport, RoutingSessionError> {
+        self.routing_apply_powered_detailed(snapshot, edits)
+            .map_err(|failure| *failure.error)
+    }
+
+    /// Apply with the committed report retained if power restoration fails.
+    pub fn routing_apply_powered_detailed(
+        &self,
+        snapshot: &RoutingSnapshot,
+        edits: &[RouteEdit],
+    ) -> Result<RouteReport, crate::routing::RoutingApplyError> {
         let _control = self
             .shared
             .control_guard
@@ -302,7 +312,7 @@ impl Dac {
             .reject_reconfigure()
             .map_err(RoutingSessionError::Session)?;
         let _scope = self.shared.enter().map_err(RoutingSessionError::Session)?;
-        routing_hw::apply_with_power(snapshot, edits, true)
+        routing_hw::apply_with_power_detailed(snapshot, edits, true)
     }
 
     /// Read a descriptor-backed control after checking the attachment,

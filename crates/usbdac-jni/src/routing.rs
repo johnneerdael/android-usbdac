@@ -328,14 +328,24 @@ pub fn routing_apply_powered<'l>(
             .collect::<Outcome<Vec<_>>>()?;
         let entry = registry::dac(dac)?;
         let snapshot = entry.routing(snapshot)?;
-        let result = match entry.dac.routing_apply_powered(&snapshot, &edits) {
+        let result = match entry.dac.routing_apply_powered_detailed(&snapshot, &edits) {
             Ok(v) => success(
                 json!({"changed":v.changed.into_iter().map(key_json).collect::<Vec<_>>(),"unchanged":v.unchanged.into_iter().map(key_json).collect::<Vec<_>>()}),
             ),
-            Err(e) => failure(e),
+            Err(e) => detailed_apply_failure(e),
         };
         java_string(env, &result)
     })
+}
+fn detailed_apply_failure(error: usbdac_core::routing::RoutingApplyError) -> Value {
+    let mut value = failure(*error.error);
+    if let Some(report) = error.report {
+        value["error"]["route_report"] = json!({
+            "changed": report.changed.into_iter().map(key_json).collect::<Vec<_>>(),
+            "unchanged": report.unchanged.into_iter().map(key_json).collect::<Vec<_>>()
+        });
+    }
+    value
 }
 #[cfg(test)]
 mod tests {
@@ -389,6 +399,21 @@ mod tests {
         assert_eq!(value["error"]["kind"], "session");
         assert_eq!(value["error"]["session_code"], "control");
         assert_eq!(value["error"]["power_restore_failure"], "power restore");
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 8,
+        });
+        let value = detailed_apply_failure(usbdac_core::routing::RoutingApplyError {
+            error: Box::new(RoutingSessionError::PowerRestore {
+                operation: None,
+                detail: "power restore".into(),
+            }),
+            report: Some(usbdac_core::routing::RouteReport {
+                changed: vec![key],
+                unchanged: vec![],
+            }),
+        });
+        assert_eq!(value["error"]["route_report"]["changed"][0], key_json(key));
     }
     #[test]
     fn hand_back_json_keeps_control_keys_uncertainty_and_absence_distinct() {

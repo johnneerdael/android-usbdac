@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,8 +74,7 @@ def set_version(old, new, last_release):
     for path, (pattern, _) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         path.write_text(pattern.sub(lambda match: match[1] + new + match[3], path.read_text()))
 
-    # Examples and release links must refer to a published version, not the
-    # reservation that has yet to pass gates and publication.
+    # The sealed package and its source examples must carry the selected version.
     examples = {
         "README.md": ["usbdac-core@{version}"],
         "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
@@ -92,7 +92,7 @@ def set_version(old, new, last_release):
         updated = content
         for template in literals:
             pattern = re.escape(template).replace(re.escape("{version}"), STABLE_VERSION.pattern)
-            updated = re.sub(pattern, lambda _: template.format(version=last_release), updated)
+            updated = re.sub(pattern, lambda _: template.format(version=new), updated)
         if updated != content:
             path.write_text(updated)
 
@@ -133,12 +133,29 @@ def require_latest_reservation(head, version, candidate):
         raise SystemExit('Reservation has been superseded or cannot be verified')
 
 
+def matches_adapter(sha, adapter):
+    if not isinstance(adapter, dict) or set(adapter) != set(RELEASE_IMPLEMENTATION) or any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None for value in adapter.values()):
+        return False
+    try:
+        return all(hashlib.sha256(subprocess.check_output(['git', 'show', f'{sha}:{path}'], stderr=subprocess.PIPE)).hexdigest() == digest
+                   for path, digest in adapter.items())
+    except subprocess.CalledProcessError:
+        return False
+
+
+def reviewed_adapters():
+    return json.loads(Path(__file__).with_name('release_adapters.json').read_text())
+
+
 def trusted_workflow(sha):
-    def contents(ref, path):
-        return subprocess.check_output(['git', 'show', f'{ref}:{path}'], stderr=subprocess.PIPE)
-    for ref in ('HEAD', *HISTORICAL_WORKFLOWS):
+    for adapter in reviewed_adapters():
+        if matches_adapter(sha, adapter['files']):
+            return True
+    for ref in HISTORICAL_WORKFLOWS:
         try:
-            if all(contents(sha, path) == contents(ref, path) for path in RELEASE_IMPLEMENTATION):
+            if all(subprocess.check_output(['git', 'show', f'{sha}:{path}'], stderr=subprocess.PIPE)
+                   == subprocess.check_output(['git', 'show', f'{ref}:{path}'], stderr=subprocess.PIPE)
+                   for path in RELEASE_IMPLEMENTATION):
                 return True
         except subprocess.CalledProcessError:
             continue
@@ -154,6 +171,11 @@ def never_published(repo, version, records):
     if not records:
         return False
     earliest = None
+    repo_id = os.environ.get('GITHUB_REPOSITORY_ID')
+    if repo_id:
+        if not repo_id.isdigit() or api_json(f'repositories/{repo_id}').get('full_name') != repo:
+            return False
+        repo_id = int(repo_id)
     for commit, run_id in records:
         run = api_json(f'repos/{repo}/actions/runs/{run_id}')
         parent = git('show', '-s', '--format=%P', commit).split()
@@ -161,8 +183,8 @@ def never_published(repo, version, records):
                 or run.get('path') != '.github/workflows/release.yml' or run.get('event') != 'push'
                 or run.get('head_branch') != 'main' or run.get('status') != 'completed'
                 or run.get('conclusion') != 'failure'
-                or run.get('repository', {}).get('full_name') != repo
-                or run.get('head_repository', {}).get('full_name') != repo
+                or (repo_id is not None and (run.get('repository', {}).get('id') != repo_id or run.get('head_repository', {}).get('id') != repo_id))
+                or (repo_id is None and (run.get('repository', {}).get('full_name') != repo or run.get('head_repository', {}).get('full_name') != repo))
                 or not trusted_workflow(parent[0])):
             return False
         created = run.get('created_at')
@@ -254,11 +276,14 @@ def select_automatic(run_id, source):
         numeric = version_tuple(current)
         tags = stable_tags()
         newest = version_tuple(tags[-1][1:]) if tags else (0, 0, 0)
-        version_commit = git("log", "-1", "--format=%B", "--", "Cargo.toml")
-        if numeric > newest and not any(line.startswith("Release-Run: ") for line in version_commit.splitlines()):
-            # A maintainer can declare the next major or minor version in a merge.
-            version = current
-        elif numeric > newest and can_adopt(head, current, previous[-1][1:] if previous else None):
+        reference = previous[-1][1:] if previous else None
+        try:
+            records = reservations(head, current) if numeric > newest else []
+            eligible = (can_adopt(head, current, reference) if records else
+                        registry_absent(os.environ['GITHUB_REPOSITORY'], current, reference)) if numeric > newest else False
+        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+            eligible = False
+        if eligible:
             version = current
         else:
             major, minor, patch = max(numeric, newest)

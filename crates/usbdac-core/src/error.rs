@@ -20,10 +20,9 @@ pub enum HostUsbFailureKind {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
-    /// Another [`Dac`](crate::Dac) is already open in this process (v0.1
-    /// supports one DAC at a time), or a previous one is still shutting down.
+    /// The requested device or operation has a retained owner, or a previous owner is still shutting down.
     Busy,
-    /// Opening a DAC needs the Linux usbfs interface (Android or Linux).
+    /// The platform or requested USB backend is unavailable.
     PlatformUnsupported,
     /// The file descriptor could not be used, or the interfaces the host
     /// claimed do not match what the library needs to drive the device.
@@ -82,7 +81,8 @@ pub enum Error {
 impl Error {
     /// Stable identifier: `busy`, `platform_unsupported`, `claim`,
     /// `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
-    /// `control`, `invalid_state`, `invalid_argument`, `volume_unavailable`.
+    /// `control`, `invalid_state`, `invalid_argument`, `volume_unavailable`, `host_usb`,
+    /// `reconfigure_drain_timeout`, `reconfigure_unusable`.
     pub fn code(&self) -> &'static str {
         match self {
             Self::Busy => "busy",
@@ -106,9 +106,9 @@ impl Error {
     /// Human-readable description without the code prefix.
     pub fn message(&self) -> String {
         match self {
-            Self::Busy => "another DAC session is open in this process".to_string(),
+            Self::Busy => "the device or operation is busy, or a prior owner is shutting down".to_string(),
             Self::PlatformUnsupported => {
-                "direct USB output needs Linux usbfs (Android or Linux)".to_string()
+                "the requested USB backend is unavailable on this platform".to_string()
             }
             Self::HostUsb { operation, kind, detail } => format!("{operation}: {kind:?}: {detail}"),
             Self::Claim(m)

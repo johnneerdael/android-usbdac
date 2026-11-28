@@ -108,6 +108,58 @@ class RealCoreRankingTest {
         }
     }
 
+    @Test fun largePaddedWritesPreserveProgressAcrossInvalidChunks() {
+        assumeTrue("host converter gate requires USBDAC_TEST_DSD_PCM=1", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val bytes = 200_000 * 4
+        fun output(): Pair<ConvertingOutput, RecordingOutput> {
+            val target = RecordingOutput()
+            val plan = ConversionPlan.between(StreamRequest.pcm(48_000, 1, 16), fakeFormat(48_000, 16, 2, 1),
+                ConversionOptions(sourceLayout = PcmLayout.PCM_16_IN_32))
+            return ConvertingOutput(target, PcmConverter.create(plan)) to target
+        }
+        for (badFrame in listOf(0, 100_000, 199_999)) {
+            val traces = mutableListOf<List<Int>>()
+            val results = mutableListOf<List<Byte>>()
+            for (direct in listOf(false, true)) {
+                val input = if (direct) ByteBuffer.allocateDirect(bytes + 16) else ByteBuffer.allocate(bytes + 16)
+                input.position(8); input.limit(8 + bytes)
+                input.put(8 + badFrame * 4, 1)
+                val (converter, target) = output()
+                val trace = mutableListOf<Int>()
+                var accepted = 0
+                var failed = false
+                try {
+                    while (input.hasRemaining()) {
+                        target.room = 8192
+                        val before = input.position()
+                        try {
+                            val count = converter.write(input)
+                            assertEquals(count, input.position() - before)
+                            accepted += count
+                            trace += count
+                        } catch (error: DacException) {
+                            assertEquals(DacErrorCode.INVALID_ARGUMENT, error.code)
+                            assertEquals(before, input.position())
+                            assertTrue(!failed)
+                            failed = true
+                            input.put(8 + badFrame * 4, 0)
+                        }
+                    }
+                    target.room = Int.MAX_VALUE
+                    converter.write(input) // pump final pending output
+                    assertTrue(failed)
+                    assertEquals(bytes, accepted)
+                    traces += trace
+                    results += target.received.toList()
+                } finally { converter.close() }
+            }
+            assertEquals(traces[0], traces[1])
+            assertEquals(results[0], results[1])
+            assertEquals(200_000 * 2, results[0].size)
+            assertTrue(results[0].all { it == 0.toByte() })
+        }
+    }
+
     @Test fun androidDsdFallsBackWhenPreferredManagedPrecisionCannotOpen() {
         assumeTrue("host converter gate requires USBDAC_TEST_DSD_PCM=1 and java.library.path",
             System.getenv("USBDAC_TEST_DSD_PCM") == "1")

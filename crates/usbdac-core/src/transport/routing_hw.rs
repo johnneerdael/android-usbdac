@@ -118,6 +118,32 @@ pub enum RoutingSessionError {
     Gen1(crate::scarlett::Gen1WriteError<String>),
 }
 
+/// Detailed apply failure, including a committed transaction if only power hand-back failed.
+#[derive(Debug)]
+pub struct RoutingApplyError {
+    pub error: Box<RoutingSessionError>,
+    pub report: Option<RouteReport>,
+}
+impl From<RoutingSessionError> for RoutingApplyError {
+    fn from(error: RoutingSessionError) -> Self {
+        Self {
+            error: Box::new(error),
+            report: None,
+        }
+    }
+}
+
+impl std::fmt::Display for RoutingApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+impl std::error::Error for RoutingApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 impl std::fmt::Display for RoutingSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -1499,35 +1525,43 @@ fn finish_scarlett_hand_back() {
 }
 
 const ROUTING_OPERATION_BUDGET: Duration = Duration::from_secs(4);
-const ROUTING_RECOVERY_BUDGET: Duration = Duration::from_secs(2);
+const ROUTING_RECOVERY_BUDGET: Duration = Duration::from_secs(4);
+const ROUTING_POWER_BUDGET: Duration = Duration::from_secs(2);
+const ROUTING_MIN_CONTROL_TIMEOUT: Duration = Duration::from_millis(10);
 fn admit_routing_plan(
     deadline: Instant,
     now: Instant,
     observed: Duration,
     changed: usize,
-) -> Result<(), String> {
-    let cost = observed.max(Duration::from_millis(1));
-    let estimate = cost.saturating_mul((changed as u32).saturating_mul(4));
-    if deadline.saturating_duration_since(now) < estimate {
-        return Err("routing plan exceeds remaining deadline".into());
+) -> Result<Duration, String> {
+    if changed == 0 {
+        return Ok(Duration::from_secs(1));
     }
-    Ok(())
+    let operations = u32::try_from(changed).unwrap_or(u32::MAX).saturating_mul(2);
+    let cap = (deadline.saturating_duration_since(now) / operations)
+        .min(ROUTING_RECOVERY_BUDGET / operations)
+        .min(Duration::from_secs(1));
+    if cap < ROUTING_MIN_CONTROL_TIMEOUT || cap < observed {
+        return Err("routing plan cannot reserve bounded control transfers".into());
+    }
+    Ok(cap)
 }
 
-fn admit_routing_write(deadline: Instant, now: Instant) -> Result<(), String> {
-    if deadline.saturating_duration_since(now) < Duration::from_secs(2) {
+fn admit_routing_write(deadline: Instant, now: Instant, timeout: Duration) -> Result<(), String> {
+    if deadline.saturating_duration_since(now) < timeout.saturating_mul(2) {
         return Err("routing deadline cannot accommodate SET and readback".into());
     }
     Ok(())
 }
 
-fn routing_recovery_budget(attempted: usize) -> Duration {
-    ROUTING_RECOVERY_BUDGET + Duration::from_secs(2 * attempted as u64)
+fn routing_recovery_budget(_attempted: usize) -> Duration {
+    ROUTING_RECOVERY_BUDGET
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, RoutingSessionError> {
     let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
+    // rusb truncates sub-millisecond durations to zero, which means infinite.
+    if left < Duration::from_millis(1) {
         return Err(RoutingSessionError::Session(Error::Control(
             "routing deadline expired".into(),
         )));
@@ -1541,6 +1575,7 @@ struct UsbRoutingIo<'a> {
     device: &'a UsbDevice,
     descriptors: &'a [u8],
     max_observed: Duration,
+    control_timeout: Duration,
 }
 
 /// Enforce the small set of setup packets this adapter is allowed to issue.
@@ -1624,7 +1659,9 @@ impl RoutingIo for UsbRoutingIo<'_> {
                 r.value,
                 r.index,
                 bytes,
-                remaining(self.deadline).map_err(|e| e.to_string())?,
+                remaining(self.deadline)
+                    .map_err(|e| e.to_string())?
+                    .min(self.control_timeout),
             )
             .map_err(|e| e.to_string());
         self.max_observed = self.max_observed.max(started.elapsed());
@@ -1642,29 +1679,26 @@ impl RoutingIo for UsbRoutingIo<'_> {
                 r.value,
                 r.index,
                 &mut data,
-                remaining(self.deadline).map_err(|e| e.to_string())?,
+                remaining(self.deadline)
+                    .map_err(|e| e.to_string())?
+                    .min(self.control_timeout),
             )
             .map_err(|e| e.to_string());
         self.max_observed = self.max_observed.max(started.elapsed());
         result
     }
     fn admit_plan(&mut self, changed: usize) -> Result<(), String> {
-        // Estimate all remaining SET/readback pairs using the slowest measured
-        // preflight transfer, doubled for variance. The strict per-SET guard
-        // below remains authoritative if a later command is slower.
-        admit_routing_plan(self.deadline, Instant::now(), self.max_observed, changed)
+        self.control_timeout =
+            admit_routing_plan(self.deadline, Instant::now(), self.max_observed, changed)?;
+        Ok(())
     }
     fn admit_write(&mut self) -> Result<(), String> {
-        // Reserve time for both the SET and its verification read.
-        admit_routing_write(self.deadline, Instant::now())
+        admit_routing_write(self.deadline, Instant::now(), self.control_timeout)
     }
     fn begin_recovery_for(&mut self, attempted: usize) {
         let mut recovery = self.recovery.lock();
-        // Each attempted SET may have changed the device, including a failed
-        // transfer. Reserve a SET and readback timeout for every such control,
-        // plus the existing allowance for power hand-back.
-        let budget = routing_recovery_budget(attempted);
-        self.deadline = *recovery.get_or_insert_with(|| Instant::now() + budget);
+        self.deadline =
+            *recovery.get_or_insert_with(|| self.deadline + routing_recovery_budget(attempted));
     }
 }
 
@@ -2698,8 +2732,8 @@ fn with_routing_power<T>(
     })();
     let recovery_deadline = *recovery
         .lock()
-        .get_or_insert_with(|| Instant::now() + ROUTING_RECOVERY_BUDGET);
-    lease.set_routing_deadline(recovery_deadline);
+        .get_or_insert_with(|| deadline + ROUTING_RECOVERY_BUDGET);
+    lease.set_routing_deadline(recovery_deadline + ROUTING_POWER_BUDGET);
     finish_routing_power(result, lease.restore_checked())
 }
 
@@ -3019,6 +3053,7 @@ fn verify_snapshot(
         device,
         descriptors: &snapshot.descriptors,
         max_observed: Duration::ZERO,
+        control_timeout: Duration::from_secs(1),
     };
     for &key in keys {
         let expected = selector_dependencies(snapshot, key)?;
@@ -3075,6 +3110,7 @@ fn collect_discovery_function(
         device,
         descriptors: raw,
         max_observed: Duration::ZERO,
+        control_timeout: Duration::from_secs(1),
     };
     for unit in inventory.units() {
         if let RoutingUnit::Selector(selector) = unit {
@@ -3295,6 +3331,7 @@ pub(crate) fn discover_with_power(powered: bool) -> Result<RoutingSnapshot, Rout
                 device: &device,
                 descriptors: &descriptors,
                 max_observed: Duration::ZERO,
+                control_timeout: Duration::from_secs(1),
             };
             for unit in inventory.units() {
                 if let RoutingUnit::Selector(selector) = unit {
@@ -3377,6 +3414,7 @@ pub(crate) fn read_with_power(
                     device: &device,
                     descriptors: &snapshot.descriptors,
                     max_observed: Duration::ZERO,
+                    control_timeout: Duration::from_secs(1),
                 })
                 .map_err(RoutingSessionError::Control)
         },
@@ -3457,14 +3495,21 @@ pub(crate) fn apply_with_power(
     edits: &[RouteEdit],
     powered: bool,
 ) -> Result<RouteReport, RoutingSessionError> {
+    apply_with_power_detailed(snapshot, edits, powered).map_err(|failure| *failure.error)
+}
+pub(crate) fn apply_with_power_detailed(
+    snapshot: &RoutingSnapshot,
+    edits: &[RouteEdit],
+    powered: bool,
+) -> Result<RouteReport, RoutingApplyError> {
     // Validate the complete request and dependency metadata before power or writes.
     if edits.len() > MAX_ROUTE_CHANGES {
-        return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges));
+        return Err(RoutingSessionError::Invalid(InvalidRoute::TooManyChanges).into());
     }
     let mut dependencies = BTreeMap::new();
     for edit in edits {
         if dependencies.contains_key(&edit.key) {
-            return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateChange));
+            return Err(RoutingSessionError::Invalid(InvalidRoute::DuplicateChange).into());
         }
         let control = snapshot
             .inventory
@@ -3493,7 +3538,8 @@ pub(crate) fn apply_with_power(
         })?;
     let device = idle_device_until(Some(deadline))?;
     verify_descriptor_identity(snapshot, &device, deadline)?;
-    with_routing_power(
+    let mut successful_report = None;
+    let result = with_routing_power(
         &device,
         &snapshot.descriptors,
         powered,
@@ -3577,6 +3623,7 @@ pub(crate) fn apply_with_power(
                 device: &device,
                 descriptors: &snapshot.descriptors,
                 max_observed: Duration::ZERO,
+                control_timeout: Duration::from_secs(1),
             };
             verify_values(&snapshot.inventory, &mut io, &expected)?;
             if let Some(recorded) = originals.as_mut() {
@@ -3629,9 +3676,24 @@ pub(crate) fn apply_with_power(
                 });
                 entry.record_attempt(before, target, success, rollback_failed);
             }
-            finish_route_transaction(result)
+            let result = finish_route_transaction(result);
+            if let Ok(report) = &result {
+                successful_report = Some(report.clone());
+            }
+            result
         },
-    )
+    );
+    attach_apply_report(result, successful_report)
+}
+
+fn attach_apply_report(
+    result: Result<RouteReport, RoutingSessionError>,
+    successful_report: Option<RouteReport>,
+) -> Result<RouteReport, RoutingApplyError> {
+    result.map_err(|error| RoutingApplyError {
+        error: Box::new(error),
+        report: successful_report,
+    })
 }
 
 fn finish_route_transaction(
@@ -3665,6 +3727,14 @@ fn invalidate_route_caches() {
         state.playback_format = None;
         state.requested_playback_format = None;
         state.clock_verification_passed = false;
+    }
+}
+
+fn deadline_hand_back_report(keys: impl Iterator<Item = ControlKey>) -> RoutingHandBackReport {
+    RoutingHandBackReport {
+        controls: keys
+            .map(|key| (key, RoutingHandBackOutcome::DeadlineExpired))
+            .collect(),
     }
 }
 
@@ -3707,16 +3777,9 @@ pub(super) fn finish_routing_hand_back() {
         *sink.lock() = Some(report);
         return;
     };
-    // Each entry can require a current read, SET and verification, with a
-    // second pass after selector restoration. Each dependency may also be
-    // read on both passes. All individual transfers have a one-second cap.
-    let transfer_allowance: u64 = record
-        .values
-        .values()
-        .map(|saved| 6u64.saturating_add(2 * saved.selectors.len() as u64))
-        .sum();
-    let deadline =
-        Instant::now() + ROUTING_RECOVERY_BUDGET + Duration::from_secs(transfer_allowance);
+    // Hand-back and its power restoration share a fixed six-second bound,
+    // independent of the number of saved controls or dependencies.
+    let deadline = Instant::now() + ROUTING_RECOVERY_BUDGET;
     let recovery = Arc::new(Mutex::new(Some(deadline)));
     let mut restore = || -> Result<RoutingHandBackReport, RoutingSessionError> {
         if !record.snapshot.device.same_owner(&device) {
@@ -3750,6 +3813,7 @@ pub(super) fn finish_routing_hand_back() {
                     device: &device,
                     descriptors: &record.snapshot.descriptors,
                     max_observed: Duration::ZERO,
+                    control_timeout: Duration::from_secs(1),
                 };
                 let mut entries: Vec<_> = record.values.iter().collect();
                 // Selectors are independent addressable controls; mixer mappings must
@@ -3837,7 +3901,13 @@ pub(super) fn finish_routing_hand_back() {
     };
     match restore() {
         Ok(result) => report = result,
-        Err(error) if report.controls.is_empty() => fail_all(&mut report, error.to_string()),
+        Err(error) if report.controls.is_empty() => {
+            if Instant::now() >= deadline {
+                report = deadline_hand_back_report(record.values.keys().copied());
+            } else {
+                fail_all(&mut report, error.to_string());
+            }
+        }
         Err(error) => {
             for (_, outcome) in &mut report.controls {
                 if *outcome == RoutingHandBackOutcome::Restored {
@@ -3962,24 +4032,32 @@ mod tests {
     }
 
     #[test]
+    fn expired_close_records_every_unvisited_control() {
+        let keys = (0..=255)
+            .map(|id| ControlKey::Selector(Entity { interface: 3, id }))
+            .collect::<Vec<_>>();
+        let report = deadline_hand_back_report(keys.iter().copied());
+        assert_eq!(report.controls.len(), keys.len());
+        assert!(report
+            .controls
+            .iter()
+            .zip(keys)
+            .all(|((actual, outcome), expected)| *actual == expected
+                && *outcome == RoutingHandBackOutcome::DeadlineExpired));
+    }
+
+    #[test]
     fn routing_budget_admission_and_recovery_are_bounded() {
         let now = Instant::now();
         let deadline = now + Duration::from_secs(4);
-        assert!(
-            admit_routing_plan(deadline, now, Duration::from_millis(100), MAX_ROUTE_CHANGES)
-                .is_err()
-        );
-        assert!(
-            admit_routing_plan(deadline, now, Duration::from_millis(10), MAX_ROUTE_CHANGES).is_ok()
-        );
-        assert!(admit_routing_write(deadline, deadline - Duration::from_secs(2)).is_ok());
-        assert!(admit_routing_write(deadline, deadline - Duration::from_millis(1999)).is_err());
-        assert_eq!(routing_recovery_budget(0), Duration::from_secs(2));
-        assert_eq!(routing_recovery_budget(1), Duration::from_secs(4));
-        assert_eq!(
-            routing_recovery_budget(MAX_ROUTE_CHANGES),
-            Duration::from_secs(66)
-        );
+        assert!(admit_routing_plan(deadline, now, Duration::from_millis(100), 32).is_err());
+        let cap = admit_routing_plan(deadline, now, Duration::from_millis(10), 4).unwrap();
+        assert_eq!(cap, Duration::from_millis(500));
+        assert!(admit_routing_write(deadline, deadline - Duration::from_secs(1), cap).is_ok());
+        assert!(admit_routing_write(deadline, deadline - Duration::from_millis(999), cap).is_err());
+        assert_eq!(routing_recovery_budget(0), Duration::from_secs(4));
+        assert_eq!(routing_recovery_budget(1024), Duration::from_secs(4));
+        assert!(admit_routing_plan(deadline, now, Duration::ZERO, 1024).is_err());
     }
 
     #[test]
@@ -4135,6 +4213,7 @@ mod tests {
         let RoutingSessionError::PowerRestore {
             operation: Some(operation),
             detail,
+            ..
         } = error
         else {
             panic!("expected both routing and power failures");
@@ -4152,6 +4231,29 @@ mod tests {
     }
 
     #[test]
+    fn successful_apply_report_survives_power_restore_failure() {
+        let key = ControlKey::Selector(Entity {
+            interface: 3,
+            id: 8,
+        });
+        let report = RouteReport {
+            changed: vec![key],
+            unchanged: vec![],
+        };
+        let failure = finish_routing_power(Ok(()), Err("power restore".into())).unwrap_err();
+        let result = attach_apply_report(Err(failure), Some(report));
+        let failure = result.unwrap_err();
+        assert!(matches!(
+            *failure.error,
+            RoutingSessionError::PowerRestore {
+                operation: None,
+                ..
+            }
+        ));
+        assert_eq!(failure.report.unwrap().changed, vec![key]);
+    }
+
+    #[test]
     fn routing_power_hand_back_keeps_single_failures_and_success_distinct() {
         assert_eq!(finish_routing_power(Ok(7), Ok(())).unwrap(), 7);
         assert!(matches!(finish_routing_power::<()>(
@@ -4159,7 +4261,7 @@ mod tests {
             Err(RoutingSessionError::Drift(detail)) if detail == "changed"));
         assert!(
             matches!(finish_routing_power(Ok(()), Err("power restore".into())),
-            Err(RoutingSessionError::PowerRestore { operation: None, detail })
+            Err(RoutingSessionError::PowerRestore { operation: None, detail, .. })
                 if detail == "power restore")
         );
     }
