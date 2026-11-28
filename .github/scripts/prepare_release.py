@@ -224,6 +224,9 @@ def registry_absent(repo, version, reference):
     auth = 'Basic ' + base64.b64encode(f'{actor}:{token}'.encode()).decode()
     if not reference or git('ls-remote', '--tags', 'origin', f'refs/tags/v{version}'):
         return False
+    # Cargo sparse index: a name of four or more characters lives at
+    # {first two}/{next two}/{name}, one JSON line per published version
+    # (yanked ones included), keyed by "vers".
     index = fetch('https://index.crates.io/us/bd/usbdac-core')
     if index is None:
         return False
@@ -277,12 +280,23 @@ def select_automatic(run_id, source):
         tags = stable_tags()
         newest = version_tuple(tags[-1][1:]) if tags else (0, 0, 0)
         reference = previous[-1][1:] if previous else None
-        try:
-            records = reservations(head, current) if numeric > newest else []
-            eligible = (can_adopt(head, current, reference) if records else
-                        registry_absent(os.environ['GITHUB_REPOSITORY'], current, reference)) if numeric > newest else False
-        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
-            eligible = False
+        records, eligible = None, False
+        if numeric > newest:
+            try:
+                records = reservations(head, current)
+                eligible = (can_adopt(head, current, reference) if records else
+                            registry_absent(os.environ['GITHUB_REPOSITORY'], current, reference))
+            except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+                eligible = False
+            if not eligible and records == []:
+                # Nothing reserved this version, so a maintainer declared it above every
+                # tag (SemVer 2.0.0 section 2 orders X.Y.Z numerically). Section 3 forbids
+                # reusing a released version, so it needs proof of absence, but bumping to
+                # its next patch would replace the declared version (a new minor X.Y.0
+                # would ship as X.Y.1). Stop and leave the choice to the maintainer.
+                raise SystemExit(f'Declared version {current} is newer than every tag but the registries '
+                                 'could not prove it unpublished; re-run when they are reachable, or '
+                                 'declare a different version')
         if eligible:
             version = current
         else:

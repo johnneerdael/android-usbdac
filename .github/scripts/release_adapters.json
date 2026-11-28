@@ -14,7 +14,7 @@
   },
   {
     "files": {
-      ".github/scripts/prepare_release.py": "9457758fe59d2d1c1394f801da0fea2ab283456eb554163a68f9f8ed89607092",
+      ".github/scripts/prepare_release.py": "56fc24cf144709c602ca1b28fae67b07b5d536e7279344153433121aa1168e7f",
       ".github/scripts/publish_release.py": "fc1cd2b6b6f5e6bc1a1482c665536e4108dfba96e8ff9d4bc68ee8cccc3ba8c0",
       ".github/scripts/recover_release.py": "690c3ace9b927bf66c2143fa67a7df2b6081b162d016364dc7302b695b595ede",
       ".github/scripts/release_artifact.py": "d901130bf7ed0898e59d535b6486e4ee9b5b5db58404d49c94dd05ce4fc57cc2",

@@ -82,7 +82,7 @@ class ReservationTests(unittest.TestCase):
             self.assertFalse(prepare.can_adopt('main', '0.1.12', '0.1.11'))
 
     def test_reserved_version_requires_adoption_after_ordinary_edit(self):
-        def exercise(records, adopted, absent):
+        def exercise(records, adopted, absent, declared='0.1.15'):
             calls = []
             def git(*args):
                 calls.append(args)
@@ -91,8 +91,9 @@ class ReservationTests(unittest.TestCase):
                 if args[:2] == ('diff', '--name-only'): return 'changed'
                 return ''
             with patch.object(prepare, 'git', side_effect=git), patch.object(prepare, 'stable_tags', return_value=['v0.1.14']), \
-                 patch.object(prepare, 'declared_version', return_value='0.1.15'), patch.object(prepare, 'reservations', return_value=records), \
-                 patch.object(prepare, 'can_adopt', return_value=adopted), patch.object(prepare, 'registry_absent', return_value=absent), \
+                 patch.object(prepare, 'declared_version', return_value=declared), patch.object(prepare, 'reservations', return_value=records), \
+                 patch.object(prepare, 'can_adopt', return_value=adopted), \
+                 patch.object(prepare, 'registry_absent', **({'side_effect': absent} if isinstance(absent, Exception) else {'return_value': absent})), \
                  patch.object(prepare, 'set_version'), patch.object(prepare.subprocess, 'run') as push, \
                  patch.dict(prepare.os.environ, {'GITHUB_REPOSITORY': 'x/y'}):
                 push.return_value.returncode = 0
@@ -100,7 +101,16 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(exercise([('reserved', 1)], False, True), '0.1.16')
         self.assertEqual(exercise([('reserved', 1)], True, False), '0.1.15')
         self.assertEqual(exercise([], False, True), '0.1.15')
-        self.assertEqual(exercise([], False, False), '0.1.16')
+        self.assertEqual(exercise([], False, True, declared='0.2.0'), '0.2.0')
+        # An unreserved declared version newer than every tag is the maintainer's
+        # choice. If the registries cannot prove it unpublished, stop rather than
+        # replace 0.2.0 with its first patch.
+        for declared in ('0.1.15', '0.2.0'):
+            for absent in (False, OSError('registry unreachable')):
+                with self.subTest(declared=declared, absent=absent), self.assertRaises(SystemExit):
+                    exercise([], False, absent, declared=declared)
+        # The tagged version itself is released, so main moves to the next patch.
+        self.assertEqual(exercise([], False, False, declared='0.1.14'), '0.1.15')
 
 
 class PinTests(unittest.TestCase):
