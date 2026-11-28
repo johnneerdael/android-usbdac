@@ -253,7 +253,7 @@ impl IsoPacketScheduler {
         self.feedback_remainder = 0.0;
     }
 
-    fn nominal_frames_per_packet(&self) -> f64 {
+    pub(crate) fn nominal_frames_per_packet(&self) -> f64 {
         self.sample_rate as f64 * self.service_interval_us as f64 / 1_000_000.0
     }
 

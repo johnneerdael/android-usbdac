@@ -1161,6 +1161,10 @@ pub(super) struct FeedbackCounters {
     selected_timebase: Option<FeedbackTimebase>,
     service_interval_confirmations: u8,
     redetecting: bool,
+    /// Locked power-of-two shift for four-byte bus-timebase reports, as ALSA's
+    /// `ep->freqshift`: `None` until the first report, then 0 (Q16.16) or
+    /// `PADDED_Q10_14_SHIFT`. Cleared by an out-of-window report.
+    feedback_shift: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1170,6 +1174,35 @@ enum FeedbackTimebase {
 }
 
 const SERVICE_INTERVAL_CONFIRMATIONS: u8 = 3;
+
+/// Q10.14 carried in a four-byte Q16.16 slot reads 4x low (USB 2.0 section
+/// 5.12.4.2 defines 10.14 in 3 bytes for full speed, 16.16 in 4 bytes for high
+/// speed; ALSA endpoint.c:1855-1863 notes devices that mix them up).
+const PADDED_Q10_14_SHIFT: i32 = 2;
+
+/// ALSA endpoint.c snd_usb_handle_sync_urb:1889-1905: shift the first report
+/// left or right until it lies within -25%..+50% of nominal, and return that
+/// shift. The caller still applies the admission window afterwards.
+fn alsa_feedback_shift(frames: f64, nominal: f64) -> Option<i32> {
+    if !(frames.is_finite() && frames > 0.0 && nominal.is_finite() && nominal > 0.0) {
+        return None;
+    }
+    let (mut f, mut shift) = (frames, 0i32);
+    while f < nominal - nominal / 4.0 {
+        f *= 2.0;
+        shift += 1;
+    }
+    while f > nominal + nominal / 2.0 {
+        f /= 2.0;
+        shift -= 1;
+    }
+    Some(shift)
+}
+
+fn shift_feedback((frames, rate): (f64, f64), shift: i32) -> (f64, f64) {
+    let scale = 2f64.powi(shift);
+    (frames * scale, rate * scale)
+}
 
 impl FeedbackCounters {
     pub(super) fn selected_service_interval(&self) -> bool {
@@ -1360,6 +1393,16 @@ fn inspect_feedback_packets_with_compatibility(
                 matches!(bytes.len(), 3 | 4)
             }
         }) {
+            // ALSA's feedback-format autodetection (endpoint.c:1889-1924) for
+            // four-byte bus-timebase reports at full and high speed. Tenor
+            // correction and the confirmed OUT-service timebase keep their own
+            // units and are never re-shifted.
+            let shift_eligible = bytes.len() == 4
+                && !per_service
+                && !inferred_service_interval
+                && compatibility.tenor_nominal_q16.is_none()
+                && matches!(speed, Speed::Full | Speed::High);
+            let locked_shift = counters.feedback_shift.filter(|_| shift_eligible);
             if !inferred_service_interval || matches!(bytes.len(), 4 | 8) {
                 decoded = match compatibility.tenor_nominal_q16 {
                     Some(nominal)
@@ -1383,7 +1426,8 @@ fn inspect_feedback_packets_with_compatibility(
                         service_us,
                         speed,
                         per_service || inferred_service_interval,
-                    ),
+                    )
+                    .map(|native| shift_feedback(native, locked_shift.unwrap_or(0))),
                 };
             }
             // Discard a selected timebase only when this report positively fits
@@ -1423,7 +1467,7 @@ fn inspect_feedback_packets_with_compatibility(
             }
             match decoded {
                 None => Outcome::InvalidEncoding,
-                Some((frames, _)) if !scheduler.feedback_rate_is_plausible(frames) => {
+                Some((frames, rate)) if !scheduler.feedback_rate_is_plausible(frames) => {
                     let compatible = ((detecting
                         || (counters.selected_timebase.is_none()
                             && counters.infer_service_interval
@@ -1438,19 +1482,50 @@ fn inspect_feedback_packets_with_compatibility(
                             scheduler.feedback_rate_is_plausible(*frames)
                                 && frames.ceil() <= max_frames as f64
                         });
+                    // First report: adopt the shift ALSA's search finds only
+                    // when it is the padded-Q10.14 one. A per-frame high-speed
+                    // scale (shift -3) belongs to the confirmed timebase
+                    // inference above; other shifts name no defined encoding,
+                    // so one corrupt report cannot rescale the clock.
+                    let padded = (shift_eligible && locked_shift.is_none())
+                        .then(|| alsa_feedback_shift(frames, scheduler.nominal_frames_per_packet()))
+                        .flatten()
+                        .filter(|&shift| shift == PADDED_Q10_14_SHIFT)
+                        .map(|shift| shift_feedback((frames, rate), shift))
+                        .filter(|(frames, _)| {
+                            scheduler.feedback_rate_is_plausible(*frames)
+                                && frames.ceil() <= max_frames as f64
+                        });
                     if let Some(rate) = compatible {
                         newest_service_interval = Some((rate, bytes));
                         decoded = Some(rate);
                         Outcome::TimebaseCandidate
+                    } else if let Some(shifted) = padded {
+                        counters.feedback_shift = Some(PADDED_Q10_14_SHIFT);
+                        decoded = Some(shifted);
+                        newest = decoded;
+                        counters.record_valid_bytes(bytes);
+                        Outcome::Valid
                     } else {
+                        if shift_eligible {
+                            // endpoint.c:1918-1923: out of range, maybe the
+                            // shift is wrong; detect again on the next report.
+                            counters.feedback_shift = None;
+                        }
                         conflicting_report = true;
                         Outcome::RateOutOfRange
                     }
                 }
                 Some((frames, _)) if frames.ceil() > max_frames as f64 => {
+                    if shift_eligible {
+                        counters.feedback_shift = None;
+                    }
                     Outcome::PacketCapacityExceeded
                 }
                 Some(_) => {
+                    if shift_eligible && locked_shift.is_none() {
+                        counters.feedback_shift = Some(0);
+                    }
                     newest = decoded;
                     counters.record_valid_bytes(bytes);
                     Outcome::Valid
@@ -2099,6 +2174,93 @@ mod explicit_feedback_tests {
                 }
             }
         }
+    }
+
+    fn padded_q10_14(frames: f64) -> [u8; 4] {
+        ((frames * 16_384.0).round() as u32).to_le_bytes()
+    }
+
+    #[test]
+    fn padded_q10_14_feedback_is_autodetected_once_and_locked() {
+        // USB 2.0 section 5.12.4.2: Q10.14 in 3 bytes at full speed, Q16.16 in
+        // 4 bytes at high speed. Some devices pad Q10.14 into 4 bytes; ALSA's
+        // snd_usb_handle_sync_urb finds the shift (+2) on the first report.
+        for (rate, service, speed, frames) in [
+            (44_100, 1000, Speed::Full, 44.1),
+            (48_000, 125, Speed::High, 6.0),
+        ] {
+            let scheduler = IsoPacketScheduler::new(rate, 8, service);
+            let mut counters = FeedbackCounters::default();
+            let report = |bytes: &[u8], counters: &mut FeedbackCounters| {
+                select_feedback_report(
+                    bytes,
+                    [(0, 4, 4)],
+                    &scheduler,
+                    service,
+                    speed,
+                    64,
+                    false,
+                    counters,
+                )
+            };
+            for _ in 0..3 {
+                let (decoded, estimated) = report(&padded_q10_14(frames), &mut counters).unwrap();
+                assert!((decoded - frames).abs() <= 0.5 / 16_384.0, "{decoded}");
+                assert!((estimated - f64::from(rate)).abs() < 0.5, "{estimated}");
+            }
+            assert_eq!(counters.feedback_shift, Some(PADDED_Q10_14_SHIFT));
+            assert_eq!(counters.rate_rejected, 0);
+            // A report the locked shift puts out of the window is rejected and
+            // clears the lock (endpoint.c:1918-1923); the next one redetects.
+            assert!(report(&q16(frames), &mut counters).is_none());
+            assert_eq!(counters.rate_rejected, 1);
+            assert_eq!(counters.feedback_shift, None);
+            let (native, _) = report(&q16(frames), &mut counters).unwrap();
+            assert!((native - frames).abs() <= 0.5 / 65_536.0, "{native}");
+            assert_eq!(counters.feedback_shift, Some(0));
+            // Locked native: a padded report is rejected first, as in ALSA.
+            assert!(report(&padded_q10_14(frames), &mut counters).is_none());
+            assert_eq!(counters.feedback_shift, None);
+            assert!(report(&padded_q10_14(frames), &mut counters).is_some());
+        }
+    }
+
+    #[test]
+    fn feedback_shift_detection_keeps_native_formats_and_rejects_unplaceable_values() {
+        let scheduler = scheduler(125);
+        let native = |bytes: &[u8]| {
+            let mut counters = FeedbackCounters::default();
+            let decoded = select_feedback_report(
+                bytes,
+                [(0, bytes.len(), bytes.len())],
+                &scheduler,
+                125,
+                Speed::High,
+                16,
+                false,
+                &mut counters,
+            );
+            (decoded, counters)
+        };
+        // Three-byte Q10.14 and four-byte Q16.16 keep their exact decode.
+        let (decoded, counters) = native(&[0, 0x80, 1]);
+        assert_eq!(decoded, Some((6.0, 48_000.0)));
+        assert_eq!(counters.feedback_shift, None);
+        let (decoded, counters) = native(&q16(6.0));
+        assert_eq!(decoded, Some((6.0, 48_000.0)));
+        assert_eq!(counters.feedback_shift, Some(0));
+        // 0.8 x nominal: every power-of-two shift lands outside 7/8..3/2, as
+        // does its padded form (1.2 frames shifted +2 is 4.8).
+        for bytes in [q16(4.8), q16(1.2), padded_q10_14(1.2)] {
+            let (decoded, counters) = native(&bytes);
+            assert!(decoded.is_none());
+            assert_eq!(counters.rate_rejected, 1);
+            assert_eq!(counters.feedback_shift, None);
+        }
+        assert_eq!(alsa_feedback_shift(1.5, 6.0), Some(2));
+        assert_eq!(alsa_feedback_shift(48.0, 6.0), Some(-3));
+        assert_eq!(alsa_feedback_shift(4.8, 6.0), Some(0));
+        assert_eq!(alsa_feedback_shift(0.0, 6.0), None);
     }
 
     #[test]
