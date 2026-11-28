@@ -465,6 +465,28 @@ impl Device {
                 self.rate = rate;
                 vec![]
             }
+            // RV_UAC3_RECORD=1 (full-uac3-nearest) records every SET_CUR on the
+            // full-UAC3 clock 9, whose RANGE lists only 48 kHz, and stalls any other rate.
+            (0x21, 1, 0x0100, 0x0900)
+                if self.config == 3
+                    && self.mode == Mode::FullUac3
+                    && env::var("RV_UAC3_RECORD").is_ok()
+                    && data.len() == 4 =>
+            {
+                let rate = u32::from_le_bytes(data.try_into().unwrap());
+                {
+                    let mut state = self.shared.lock().unwrap();
+                    if state.rate_sets.len() < 256 {
+                        state.rate_sets.push(rate);
+                    }
+                }
+                if rate != 48_000 {
+                    eprintln!("SET_CUR clock=9 rate={rate} STALL");
+                    return Err(());
+                }
+                eprintln!("SET_CUR clock=9 rate={rate}");
+                vec![]
+            }
             (0x21, 1, 0x0100, 0x0900) if self.config >= 2 && data == 48_000u32.to_le_bytes() => {
                 vec![]
             }

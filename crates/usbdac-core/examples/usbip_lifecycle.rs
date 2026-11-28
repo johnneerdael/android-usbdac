@@ -227,6 +227,71 @@ mod linux {
         Ok(())
     }
 
+    // Full UAC3 whose clock RANGE lists only 48 kHz behind a powered route that
+    // cannot certify a live refusal. The cached model excludes 44.1 kHz, so the
+    // ranked loop and the playback candidates must skip it without any USB request,
+    // as ALSA never offers a rate absent from its format table (pcm.c hw_rule_rate).
+    fn full_uac3_nearest(
+        dac: Dac,
+        fd: i32,
+        caps: &usbdac_core::Capabilities,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use usbdac_core::playback::PlaybackPolicy;
+        assert_eq!(caps.uac_version, UacVersion::V3);
+        assert_eq!(caps.link_speed, LinkSpeed::High);
+        let mut rates = caps.pcm_sample_rates.clone();
+        rates.sort_unstable();
+        rates.dedup();
+        assert_eq!(rates, [48_000], "unexpected full-UAC3 fixture rates");
+        let no_44k = |snapshot: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let sets = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+            if sets
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|v| v == "44100")
+            {
+                return Err(format!("model-excluded 44100 Hz was programmed: {snapshot}").into());
+            }
+            Ok(())
+        };
+        out_of_band("reset")?;
+        let format = dac.negotiate(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+        )?;
+        assert_eq!(
+            (format.sample_rate, format.channels, format.valid_bits),
+            (48_000, 2, 16)
+        );
+        let negotiated = out_of_band("snapshot")?;
+        no_44k(&negotiated)?;
+        out_of_band("reset")?;
+        let decision = dac.resolve_playback(
+            &StreamRequest::pcm(44_100, 2, 16),
+            &PlaybackPolicy::default(),
+        )?;
+        assert_eq!(decision.format.sample_rate, 48_000);
+        assert_eq!(decision.candidates[0], StreamRequest::pcm(44_100, 2, 16));
+        assert!(
+            matches!(decision.exact_refusal, Some(Error::Unsupported { .. })),
+            "the skipped exact source must report a typed refusal: {:?}",
+            decision.exact_refusal
+        );
+        let resolved = out_of_band("snapshot")?;
+        no_44k(&resolved)?;
+        println!(
+            "NEGOTIATE_CASE mode=full-uac3-nearest requested=44100 actual=48000 resolve=48000 attempted={} negotiate={negotiated} resolve_snapshot={resolved}",
+            decision.attempted_candidates
+        );
+        assert_eq!(alt(fd)?, 0);
+        dac.close()?;
+        assert!(Dac::await_usb_retirement(Duration::from_secs(3)));
+        assert_eq!(alt(fd)?, 0);
+        for interface in [1, 0] {
+            claim(fd, interface, false)?;
+        }
+        println!("USBIP_LIFECYCLE_PASS mode=full-uac3-nearest retired=true");
+        Ok(())
+    }
+
     fn vendor(fd: i32, value: u16) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(control(fd, 0x40, 0x5a, value, 0, &mut [])?, 0);
         Ok(())
@@ -589,6 +654,7 @@ mod linux {
                     | "selector"
                     | "refuse-set"
                     | "zero-res"
+                    | "full-uac3-nearest"
             )
         {
             return Err(
@@ -620,7 +686,8 @@ mod linux {
             | "full-uac3-volatile"
             | "full-uac3-clock"
             | "full-uac3-clock-bad"
-            | "full-uac3-clock-stale" => 3,
+            | "full-uac3-clock-stale"
+            | "full-uac3-nearest" => 3,
             _ => 1,
         };
         if configuration != 1 {
@@ -788,6 +855,9 @@ mod linux {
             }
             println!("USBIP_LIFECYCLE_PASS mode=badd alt=0 retired=true");
             return Ok(());
+        }
+        if args[2] == "full-uac3-nearest" {
+            return full_uac3_nearest(dac, fd, &caps);
         }
         if matches!(args[2].as_str(), "full-uac3" | "full-uac3-volatile") {
             return full_uac3(dac, fd, &caps, args[2] == "full-uac3-volatile");

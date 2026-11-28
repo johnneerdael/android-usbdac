@@ -139,16 +139,24 @@ Capture, duplex and routing have their own entry points; they are listed under
   multiples), then the highest other lower rate, then the lowest higher rate.
   An 88.2 kHz request on a DAC with {44.1, 176.4} kHz therefore runs at
   44.1 kHz, halving the bandwidth; a host that prefers 176.4 kHz asks for it
-  with `Exact`. Each candidate is tried as an exact request on the retained USB
-  handle, at most eight within 15 s. The next one is tried only after a
-  certified clean refusal: complete descriptors (standard UAC1 Type I, or UAC2
-  PCM) show that no alternate setting carries the candidate, or a UAC2 Valid
-  Alternate Settings control excluded it after an acknowledged SET and the
-  original clock was restored and read back. Since 0.1.11 a UAC1 refusal can be
-  clean in this way. Any other failure (a claim, a stalled clock write, a
-  disconnect, an uncertain restoration) ends the call with that error.
+  with `Exact`. A candidate that the DAC's cached capability model already
+  excludes is skipped without any USB request, the way ALSA never offers a rate
+  missing from its parsed format table. Only explicit rate evidence excludes: a
+  UAC2 or UAC3 clock RANGE, the fixed 48 kHz of a BADD function, or a UAC1
+  Type I rate list whose descriptor is complete. Each remaining candidate is
+  tried as an exact request on the retained USB handle, at most eight within
+  15 s. The next one is tried only after a clean refusal on the same handle:
+  complete descriptors or a read-only clock RANGE show that no alternate
+  setting carries the candidate, or a UAC2 Valid Alternate Settings control
+  excluded it after an acknowledged SET and the original clock was restored and
+  read back. Any other failure (a claim, a stalled clock write, a disconnect,
+  an uncertain restoration, a change of USB owner) ends the call with that
+  error.
 - `negotiate_candidates` takes one to eight distinct exact PCM requests with the
-  same channel count and tries them in order under the same clean-refusal rule.
+  same channel count and tries them in order under the same rules: candidates
+  the model excludes are skipped, and an attempted one advances only after a
+  clean refusal. `PlaybackDecision::attempted_candidates` counts the skipped
+  candidates too, and each has an `Unsupported` entry in `candidate_refusals`.
 - `reconfigure_stream` drains a playback-only stream (playing it if it was
   paused) and replaces it without releasing the USB handle or the host's claims.
   Stop the writer first. The replacement is paused with counters at zero; supply

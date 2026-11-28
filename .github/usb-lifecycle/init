@@ -57,9 +57,10 @@ run_mode() {
     daemon_mode=$mode
     [ "$mode" = jni-retire ] && daemon_mode=retire
     [ "$mode" = reconfigure ] && daemon_mode=normal
-    unset RV_SELECTOR RV_RANGE RV_RATES RV_CLOCK_FAULT RV_VOLATILE_SELECTOR RV_REFUSE_RATE
+    unset RV_SELECTOR RV_RANGE RV_RATES RV_CLOCK_FAULT RV_VOLATILE_SELECTOR RV_REFUSE_RATE RV_UAC3_RECORD
     if [ "$mode" = refuse-set ]; then daemon_mode=normal; RV_REFUSE_RATE=96000; export RV_REFUSE_RATE; fi
     if [ "$mode" = selector ]; then daemon_mode=normal; RV_SELECTOR=1; export RV_SELECTOR; fi
+    if [ "$mode" = full-uac3-nearest ]; then daemon_mode=full-uac3; RV_UAC3_RECORD=1; export RV_UAC3_RECORD; fi
     if [ "$mode" = full-uac3-volatile ]; then daemon_mode=full-uac3; RV_VOLATILE_SELECTOR=1; export RV_VOLATILE_SELECTOR; fi
     if [ "$mode" = zero-res ]; then daemon_mode=normal; RV_RANGE=44100:96000:0; export RV_RANGE; fi
     if [ "$mode" = full-uac3-clock-bad ]; then daemon_mode=full-uac3-clock; RV_CLOCK_FAULT=bad; export RV_CLOCK_FAULT; fi
@@ -125,12 +126,13 @@ run_mode() {
     return 0
 }
 
-entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex:3245 retire:3246 jni-retire:3247 full-uac3-clock:3248 reconfigure:3249 selector:3250 zero-res:3251 full-uac3-clock-bad:3252 full-uac3-clock-stale:3253 full-uac3-volatile:3254 refuse-set:3255'
+entries='normal:3240 bad-cur:3241 stale-cur:3242 badd:3243 full-uac3:3244 duplex:3245 retire:3246 jni-retire:3247 full-uac3-clock:3248 reconfigure:3249 selector:3250 zero-res:3251 full-uac3-clock-bad:3252 full-uac3-clock-stale:3253 full-uac3-volatile:3254 refuse-set:3255 full-uac3-nearest:3256'
 IFS= read -r cmdline < /proc/cmdline
 for arg in $cmdline; do
     case "$arg" in
         usbip.mode=clock-faults) entries=full-uac3-clock-bad:3252\ full-uac3-clock-stale:3253 ;;
         usbip.mode=refuse-set) entries=refuse-set:3255 ;;
+        usbip.mode=full-uac3-nearest) entries=full-uac3-nearest:3256 ;;
         usbip.mode=full-uac3-volatile) entries=full-uac3-volatile:3254 ;;
         usbip.mode=full-uac3-clock-bad) entries=full-uac3-clock-bad:3252 ;;
         usbip.mode=full-uac3-clock-stale) entries=full-uac3-clock-stale:3253 ;;
