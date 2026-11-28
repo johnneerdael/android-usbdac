@@ -79,13 +79,15 @@ For in-app support captures, see [collecting a USB playback support report](docs
 ## Validators
 
 Each release from 0.1.11 on includes an **Android validator APK** and an
-**Apple Silicon macOS validator ZIP**, built from the same commit as the
+**Apple Silicon macOS validator disk image**, built from the same commit as the
 library. Start a capture, connect one DAC, and the app runs the direct USB
 format tests and saves a report ZIP with device details, test outcomes and
 debug logs. The APK is signed with the project's pinned validator key, the
 same for every release after 0.1.20, so a new APK installs over the previous
-one (an APK from 0.1.20 or earlier must be uninstalled once); the macOS app is
-ad hoc signed and not notarized. Remove headphones and mute the amplifier first.
+one (an APK from 0.1.20 or earlier must be uninstalled once). From 0.1.22 the
+macOS app comes as a DMG, signed with a Developer ID and notarized by Apple, so
+it opens without a Gatekeeper override; earlier releases shipped an ad hoc
+signed ZIP. Remove headphones and mute the amplifier first.
 
 <table>
   <tr>
@@ -342,10 +344,13 @@ patch version, builds and tests a versioned commit, publishes the Rust crate
 and the `usbdac` and `usbdac-media3` AARs, and creates the GitHub Release with its downloads. A merge
 that declares a higher version can select the next minor or major release.
 For releases from sources containing the validator, the downloads also include
-a versioned Android validator APK and Apple Silicon macOS validator ZIP built
+a versioned Android validator APK and Apple Silicon macOS validator DMG built
 from that same commit. The APK is signed with the pinned validator key from the
-repository secrets, and the release checks its certificate digest; the macOS
-app is ad hoc signed and not notarized. Both are included in `SHA256SUMS.txt`.
+repository secrets, and the release checks its certificate digest. The macOS
+app and DMG are signed with the Developer ID identity and the DMG is notarized
+and stapled, using the certificate and App Store Connect API key from the
+repository secrets; the release checks the team identifier and Gatekeeper's
+assessment. Both are included in `SHA256SUMS.txt`.
 Documentation-only changes deploy through the Docs workflow.
 
 Use **Actions → Release → Run workflow** to build an explicit version, or

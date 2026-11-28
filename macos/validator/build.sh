@@ -39,5 +39,40 @@ else
   codesign --force --sign - "$app/Contents/MacOS/usbdac-validator-worker"
   codesign --force --sign - "$app"
 fi
-/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "build/USB-DAC-Validator-macOS.zip"
-printf 'Built %s and distribution ZIP\n' "$app"
+
+# Drag-to-install disk image: the app and a link to /Applications.
+dmg="build/USB-DAC-Validator-macOS.dmg"
+stage="build/dmg"
+rm -rf "$stage" "$dmg"
+mkdir -p "$stage"
+/usr/bin/ditto "$app" "$stage/$(basename "$app")"
+ln -s /Applications "$stage/Applications"
+# hdiutil on CI runners sometimes reports a busy resource; retry briefly.
+for attempt in 1 2 3; do
+  hdiutil create -volname "USB DAC Validator" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" && break
+  [[ $attempt -lt 3 ]] || exit 1
+  sleep 5
+done
+rm -rf "$stage"
+if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
+  codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$dmg"
+fi
+
+# Notarize and staple when App Store Connect API credentials are given.
+if [[ -n "${NOTARY_KEY_PATH:-}" ]]; then
+  [[ -n "${SIGNING_IDENTITY:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] || {
+    echo "Notarization needs SIGNING_IDENTITY, NOTARY_KEY_ID and NOTARY_ISSUER_ID"; exit 1; }
+  result="build/notarization.json"
+  xcrun notarytool submit "$dmg" --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" \
+    --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m --output-format json > "$result"
+  status=$(/usr/bin/plutil -extract status raw -o - "$result" 2>/dev/null || true)
+  if [[ "$status" != Accepted ]]; then
+    cat "$result"
+    id=$(/usr/bin/plutil -extract id raw -o - "$result" 2>/dev/null || true)
+    [[ -z "$id" ]] || xcrun notarytool log "$id" --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
+    exit 1
+  fi
+  xcrun stapler staple "$dmg"
+  xcrun stapler validate "$dmg"
+fi
+printf 'Built %s and %s\n' "$app" "$dmg"
