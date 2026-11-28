@@ -149,21 +149,26 @@ class PinTests(unittest.TestCase):
 
 class ReceiptTests(unittest.TestCase):
     def check_receipt(self, schema, historical=False, identity='usbdac-release-gates/v1',
-                      changed_digest=False, source_repo='x/y', source_repo_id=17):
+                      changed_digest=False, source_repo='x/y', source_repo_id=17,
+                      payload_attempt=1, receipt_attempt=1, sealed_attempt=None):
         candidate, workflow = 'b' * 40, 'a' * 40
         run = {'head_sha': workflow, 'repository': {'id': 17}}
         jobs = [{'name': name, 'status': 'completed', 'conclusion': 'success', 'id': i}
                 for i, name in enumerate((recover.PREPARE, 'Seal release gate evidence', *recover.GATES))]
         digest = 'sha256:' + 'c' * 64
-        items = [{'name': f'release-payload-42-1-{candidate}', 'id': 9, 'digest': digest,
+        items = [{'name': f'release-payload-42-{payload_attempt}-{candidate}', 'id': 9, 'digest': digest,
                   'workflow_run': {'id': 42}},
-                 {'name': 'release-gate-receipt-42-1', 'id': 10, 'workflow_run': {'id': 42}}]
+                 {'name': f'release-gate-receipt-42-{receipt_attempt}', 'id': 10, 'workflow_run': {'id': 42}}]
         receipt = dict(schema_version=schema, repository=source_repo, version='0.1.11',
-            source_sha=candidate, workflow_sha=workflow, run_id=42, run_attempt=1,
+            source_sha=candidate, workflow_sha=workflow, run_id=42, run_attempt=payload_attempt,
             artifact_id=9, artifact_digest=('sha256:' + 'e' * 64 if changed_digest else digest),
             reservation_run_id=42, manifest_sha256='d' * 64)
-        if schema == 2:
+        if schema in (2, 3):
             receipt['gate_identity'] = identity
+        if schema == 3:
+            receipt['repository_id'] = 17
+        if sealed_attempt is not None:
+            receipt['receipt_run_attempt'] = sealed_attempt
         def command(args, **kwargs):
             if args[0] == 'git':
                 return b'historical-layout' if historical else (REPO / args[-1].split(':', 1)[1]).read_bytes()
@@ -178,7 +183,9 @@ class ReceiptTests(unittest.TestCase):
             return f'[command] git log -1 --format=%H\n2026-11-01T00:00:00Z {candidate}\n'
         with patch.object(recover.subprocess, 'check_output', side_effect=command), \
              patch.object(recover, 'api', side_effect=api):
-            return recover.verify_staged(run, jobs, items, 'x/y', '0.1.11', candidate, 42, 1, 42)
+            with patch.object(recover, 'reviewed_adapters', return_value=[{'schema': 3, 'files': {}}]), \
+                 patch.object(recover, 'matches_adapter', return_value=not historical):
+                return recover.verify_staged(run, jobs, items, 'x/y', '0.1.11', candidate, 42, receipt_attempt, 42)
 
     def test_main_reuses_receipt_from_original_attempt(self):
         candidate, parent = 'b' * 40, 'a' * 40
@@ -208,11 +215,12 @@ class ReceiptTests(unittest.TestCase):
                  patch.object(recover, 'require_latest_reservation'), \
                  patch.object(recover, 'version_files', return_value={Path('Cargo.toml'): (prepare.WORKER_VERSION, 1)}), \
                  patch.object(recover.subprocess, 'run') as cat_file, \
-                 patch.object(recover, 'verify_staged', return_value=({'id': 9}, {'id': 10}, {'repository': 'x/y', 'schema_version': 2})) as staged:
+                 patch.object(recover, 'verify_staged', return_value=({'id': 9}, {'id': 10}, {'repository': 'x/y', 'schema_version': 2, 'run_attempt': 1})) as staged:
                 cat_file.return_value.returncode = 1
                 recover.main()
                 self.assertEqual(staged.call_args.args[7], 1)
                 self.assertIn('source_run_attempt=1', output.read_text())
+                self.assertIn('receipt_run_attempt=1', output.read_text())
 
     def test_main_recovers_earlier_receipt_with_mixed_validator_attempts(self):
         candidate, parent = 'b' * 40, 'a' * 40
@@ -229,7 +237,7 @@ class ReceiptTests(unittest.TestCase):
             subjects.append(dict(platform=platform, artifact_id=artifact_id, artifact_digest=digest, run_id=42,
                                  run_attempt=attempt, source_sha=candidate, version='0.1.11', repository_id=17))
         items.append({'name': 'release-gate-receipt-42-2'})
-        receipt = dict(repository='x/y', schema_version=3, validators=subjects)
+        receipt = dict(repository='x/y', schema_version=3, validators=subjects, run_attempt=2)
         def api(*args):
             path = args[-1]
             if path == 'repos/x/y': return json.dumps({'id': 17})
@@ -264,6 +272,54 @@ class ReceiptTests(unittest.TestCase):
                 subjects[0]['run_attempt'] = 4
                 with self.assertRaises(SystemExit):
                     recover.main()
+
+    def test_recovery_accepts_a_receipt_sealed_after_its_payload(self):
+        # gate-receipt failed in attempt 1 and was re-run alone in attempt 2.
+        payload, _, evidence = self.check_receipt(3, payload_attempt=1, receipt_attempt=2, sealed_attempt=2)
+        self.assertEqual((payload['id'], evidence['run_attempt']), (9, 1))
+        # Receipts sealed before receipt_run_attempt existed (0.1.17) use their payload's attempt.
+        self.assertEqual(self.check_receipt(3, payload_attempt=2, receipt_attempt=2)[0]['id'], 9)
+        for attempts in (dict(payload_attempt=1, receipt_attempt=2), dict(payload_attempt=3, receipt_attempt=2, sealed_attempt=2),
+                         dict(payload_attempt=1, receipt_attempt=2, sealed_attempt=1)):
+            with self.subTest(**attempts), self.assertRaises(SystemExit):
+                self.check_receipt(3, **attempts)
+
+    def test_main_reports_payload_and_receipt_attempts_separately(self):
+        candidate, parent = 'b' * 40, 'a' * 40
+        run = dict(id=42, run_attempt=2, path='.github/workflows/release.yml', event='push', head_branch='main',
+                   status='completed', conclusion='failure', head_sha=parent,
+                   repository={'id': 17}, head_repository={'id': 17})
+        prepare_job = dict(name=recover.PREPARE, status='completed', conclusion='success', id=100)
+        def api(*args):
+            path = args[-1]
+            if path == 'repos/x/y': return json.dumps({'id': 17})
+            if path == 'repos/x/y/actions/runs/42': return json.dumps(run)
+            if '/jobs?' in path: return json.dumps([{'jobs': [prepare_job]}])
+            if '/artifacts?' in path: return json.dumps([{'artifacts': [{'name': 'release-gate-receipt-42-2'}]}])
+            if '/actions/jobs/100/logs' in path: return f'Release 0.1.11 from {candidate}'
+            raise AssertionError(path)
+        def git(*args):
+            if args[:2] == ('log', 'origin/main'): return candidate
+            if args[:3] == ('show', '-s', '--format=%B'): return 'Release-Run: 42'
+            if args[:3] == ('show', '-s', '--format=%P'): return parent
+            if args[0] == 'show': return 'version = "0.1.11"'
+            return ''
+        evidence = {'repository': 'x/y', 'schema_version': 3, 'validators': [], 'run_attempt': 1, 'receipt_run_attempt': 2}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'out'
+            args = ['recover_release.py', '--failed-run-id', '42', '--version', '0.1.11', '--output', str(output)]
+            with patch.object(sys, 'argv', args), patch.dict(recover.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main', 'GITHUB_REPOSITORY': 'x/y'}), \
+                 patch.object(recover, 'api', side_effect=api), patch.object(recover, 'git', side_effect=git), \
+                 patch.object(recover, 'require_latest_reservation'), \
+                 patch.object(recover, 'version_files', return_value={Path('Cargo.toml'): (prepare.WORKER_VERSION, 1)}), \
+                 patch.object(recover.subprocess, 'run') as cat_file, \
+                 patch.object(recover, 'verify_staged', return_value=({'id': 9}, {'id': 10}, evidence)) as staged:
+                cat_file.return_value.returncode = 1
+                recover.main()
+                self.assertEqual(staged.call_args.args[7], 2)
+                result = output.read_text()
+                self.assertIn('source_run_attempt=1', result)
+                self.assertIn('receipt_run_attempt=2', result)
 
     def test_schema_two_identity_and_digest(self):
         self.assertEqual(self.check_receipt(2)[0]['id'], 9)
@@ -307,6 +363,79 @@ class PayloadAndPublicationTests(unittest.TestCase):
             (root / next(iter(entries))).write_bytes(b'modified')
             with self.assertRaises(SystemExit):
                 artifact.verify(root, {'version': '0.1.11'})
+
+    def sealed_payload(self, root, attempt):
+        entries = {}
+        for name in artifact.required(root, '0.1.11'):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'payload')
+            entries[name] = {'sha256': hashlib.sha256(b'payload').hexdigest(), 'size': 7}
+        (root / 'manifest.json').write_text(json.dumps(dict(schema_version=1, repository='x/y', repository_id=17,
+            version='0.1.11', source_sha='b' * 40, workflow_sha='a' * 40, run_id=42, run_attempt=attempt,
+            reservation_run_id=42, files=entries)))
+
+    def seal_env(self, **changes):
+        return dict(dict(GITHUB_REPOSITORY='x/y', GITHUB_REPOSITORY_ID='17', SOURCE_SHA='b' * 40, WORKFLOW_SHA='a' * 40,
+                         SOURCE_RUN_ID='42', PAYLOAD_RUN_ATTEMPT='1', RECEIPT_RUN_ATTEMPT='2', RESERVATION_RUN_ID='42',
+                         GATE_IDENTITY='usbdac-release-gates/v1', ARTIFACT_ID='9', ARTIFACT_DIGEST='c' * 64,
+                         VALIDATOR='false'), **changes)
+
+    def test_seal_binds_the_payload_attempt_after_the_receipt_is_rerun(self):
+        # Attempt 2 re-ran only gate-receipt; the gates kept attempt 1's payload and outputs.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'payload'
+            self.sealed_payload(root, 1)
+            info = {'name': f"release-payload-42-1-{'b' * 40}", 'workflow_run': {'id': 42}, 'digest': 'sha256:' + 'c' * 64}
+            api = lambda path: json.dumps(info).encode()
+            receipt = artifact.seal(root, Path(tmp) / 'receipt' / 'receipt.json', '0.1.11', self.seal_env(), api)
+            self.assertEqual((receipt['run_attempt'], receipt['receipt_run_attempt']), (1, 2))
+            self.assertEqual(json.loads((Path(tmp) / 'receipt' / 'receipt.json').read_text()), receipt)
+            self.assertEqual(receipt['manifest_sha256'], hashlib.sha256((root / 'manifest.json').read_bytes()).hexdigest())
+
+    def test_seal_rejects_a_payload_attempt_its_artifact_or_manifest_does_not_carry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'payload'
+            self.sealed_payload(root, 1)
+            for name_attempt, env in ((1, self.seal_env(PAYLOAD_RUN_ATTEMPT='2')),   # artifact name says 1
+                                      (2, self.seal_env(PAYLOAD_RUN_ATTEMPT='2')),   # manifest says 1
+                                      (3, self.seal_env(PAYLOAD_RUN_ATTEMPT='3')),   # later than the receipt
+                                      (1, self.seal_env(PAYLOAD_RUN_ATTEMPT=''))):
+                info = {'name': f"release-payload-42-{name_attempt}-{'b' * 40}", 'workflow_run': {'id': 42}, 'digest': 'sha256:' + 'c' * 64}
+                with self.subTest(name_attempt=name_attempt, env=env['PAYLOAD_RUN_ATTEMPT']), self.assertRaises(SystemExit):
+                    artifact.seal(root, Path(tmp) / 'receipt.json', '0.1.11', env, lambda path: json.dumps(info).encode())
+            self.assertFalse((Path(tmp) / 'receipt.json').exists())
+
+    def test_package_checks_receipt_attempt_separately_and_accepts_older_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.sealed_payload(root, 1)
+            manifest = root / 'manifest.json'
+            expected = dict(repository='x/y', version='0.1.11', source_sha='b' * 40, workflow_sha='a' * 40,
+                            run_id=42, run_attempt=1, reservation_run_id=42, artifact_id=9)
+            receipt = dict(expected, schema_version=3, gate_identity='usbdac-release-gates/v1', repository_id=17,
+                           receipt_run_attempt=2, manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+            artifact.check_receipt(receipt, manifest, expected, 2, 17)
+            with self.assertRaises(SystemExit):
+                artifact.check_receipt(receipt, manifest, expected, 1, 17)
+            # A 0.1.17 receipt has no receipt_run_attempt: it was sealed in its payload's attempt.
+            older = {k: v for k, v in receipt.items() if k != 'receipt_run_attempt'}
+            artifact.check_receipt(older, manifest, expected, 1, 17)
+            with self.assertRaises(SystemExit):
+                artifact.check_receipt(older, manifest, expected, 2, 17)
+            with self.assertRaises(SystemExit):
+                artifact.check_receipt(dict(receipt, repository_id=18), manifest, expected, 2, 17)
+
+    def test_workflows_take_the_payload_attempt_from_the_gates(self):
+        release = (SCRIPTS.parent / 'workflows' / 'release.yml').read_text()
+        ci = (SCRIPTS.parent / 'workflows' / 'ci.yml').read_text()
+        receipt_job = release.split('\n  gate-receipt:\n', 1)[1].split('\n  package:\n', 1)[0]
+        self.assertIn('PAYLOAD_RUN_ATTEMPT: ${{ needs.release-gates.outputs.artifact_attempt }}', receipt_job)
+        self.assertIn('RECEIPT_RUN_ATTEMPT: ${{ github.run_attempt }}', receipt_job)
+        self.assertNotIn('SOURCE_RUN_ATTEMPT', receipt_job)
+        self.assertIn('artifact_attempt:\n        value: ${{ jobs.android.outputs.artifact_attempt }}', ci)
+        android_job = ci.split('\n  android:\n', 1)[1].split('\n    steps:\n', 1)[0]
+        self.assertIn('artifact_attempt: ${{ github.run_attempt }}', android_job)
 
     def test_maven_matching_partial_and_conflicting(self):
         with tempfile.TemporaryDirectory() as tmp:

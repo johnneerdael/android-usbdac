@@ -10,6 +10,7 @@ import subprocess
 import io
 import zipfile
 
+from release_artifact import receipt_attempt
 from prepare_release import (HISTORICAL_WORKFLOWS, RELEASE_IMPLEMENTATION, STABLE_VERSION,
                              version_files, git, require_latest_reservation, matches_adapter, reviewed_adapters)
 
@@ -81,13 +82,13 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
         job = one([j for j in jobs if j.get('name') == name], name)
         if job.get('status') != 'completed' or job.get('conclusion') != 'success':
             fail(f'Required original job did not succeed: {name}')
-    payload_name = f'release-payload-{run_id}-{attempt}-{candidate}'
+    # `attempt` sealed the receipt. Its payload can come from an earlier attempt,
+    # because jobs that "Re-run failed jobs" does not re-run keep their outputs
+    # from the previous attempt (GitHub Docs, "Re-running workflows and jobs").
     receipt_name = f'release-gate-receipt-{run_id}-{attempt}'
-    payload = one([a for a in artifacts if a.get('name') == payload_name], 'gate payload')
     receipt = one([a for a in artifacts if a.get('name') == receipt_name], 'gate receipt')
-    for artifact in (payload, receipt):
-        if artifact.get('expired') or artifact.get('workflow_run', {}).get('id') != run_id:
-            fail('Gate artifact expired or belongs to another run')
+    if receipt.get('expired') or receipt.get('workflow_run', {}).get('id') != run_id:
+        fail('Gate artifact expired or belongs to another run')
     raw = subprocess.check_output(['gh', 'api', f"repos/{repo}/actions/artifacts/{receipt['id']}/zip"])
     if (not re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('digest') or '')
             or 'sha256:' + hashlib.sha256(raw).hexdigest() != receipt['digest']):
@@ -96,6 +97,14 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
         if archive.namelist() != ['receipt.json'] or archive.infolist()[0].external_attr >> 16 & 0o170000 == 0o120000:
             fail('Unexpected gate receipt archive')
         evidence = json.loads(archive.read('receipt.json'))
+    payload_attempt = evidence.get('run_attempt')
+    if (not isinstance(payload_attempt, int) or isinstance(payload_attempt, bool) or not 1 <= payload_attempt <= attempt
+            or receipt_attempt(evidence) != attempt):
+        fail('Gate receipt attempt mismatch')
+    payload_name = f'release-payload-{run_id}-{payload_attempt}-{candidate}'
+    payload = one([a for a in artifacts if a.get('name') == payload_name], 'gate payload')
+    if payload.get('expired') or payload.get('workflow_run', {}).get('id') != run_id:
+        fail('Gate artifact expired or belongs to another run')
     schema = evidence.get('schema_version')
     if schema == 3:
         if not schema_three or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
@@ -132,7 +141,7 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
                 or json.loads(api(f'repos/{source_repo}')).get('id') != repo_id):
             fail('Gate receipt belongs to another repository')
     expected = dict(version=version, source_sha=candidate,
-                    workflow_sha=run['head_sha'], run_id=run_id, run_attempt=attempt,
+                    workflow_sha=run['head_sha'], run_id=run_id, run_attempt=payload_attempt,
                     artifact_id=payload['id'], artifact_digest=payload.get('digest'),
                     reservation_run_id=reservation_run_id)
     if any(evidence.get(k) != v for k, v in expected.items()):
@@ -264,7 +273,8 @@ def main():
             validators = validator_artifacts(evidence_jobs, artifacts, run_id, evidence_attempt) if has_validator else {}
         with args.output.open('a') as output:
             print(f'version={declared}', f'commit={candidate}', 'recovered=true',
-                  f'source_run_id={run_id}', f'source_run_attempt={evidence_attempt}',
+                  f'source_run_id={run_id}', f'source_run_attempt={evidence["run_attempt"]}',
+                  f'receipt_run_attempt={evidence_attempt}',
                   f'source_repository={evidence["repository"]}',
                   f'workflow_sha={run["head_sha"]}', f'reservation_run_id={reservation_run_id}', f'artifact_id={payload["id"]}',
                   f'receipt_id={receipt["id"]}', sep='\n', file=output)

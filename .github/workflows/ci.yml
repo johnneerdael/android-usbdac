@@ -31,6 +31,10 @@ on:
         value: ${{ jobs.android.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.android.outputs.artifact_digest }}
+      # The attempt that uploaded the payload. "Re-run failed jobs" keeps this
+      # output, and the payload, from the earlier attempt when the job is not re-run.
+      artifact_attempt:
+        value: ${{ jobs.android.outputs.artifact_attempt }}
 
 permissions:
   contents: read
@@ -116,6 +120,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.release_payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.release_payload.outputs.artifact-digest }}
+      artifact_attempt: ${{ github.run_attempt }}
     name: AAR, unit tests and sample
     runs-on: ubuntu-24.04
     timeout-minutes: 60
