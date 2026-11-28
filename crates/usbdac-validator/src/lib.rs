@@ -25,6 +25,8 @@ use std::{
 use usbdac_core::{AltFormat, Capabilities, Dac, DacEvent, Encoding, StreamFormat, StreamRequest};
 
 const LOG_LIMIT: u64 = 8 * 1024 * 1024;
+const NATIVE_USB_LOG_RESERVE: u64 = 256 * 1024;
+const NATIVE_USB_QUEUE_CAPACITY: usize = 128;
 const TONE_HZ: f64 = 997.0;
 const AMPLITUDE: f64 = 0.01;
 
@@ -81,9 +83,8 @@ pub struct Report {
     pub fallback_results: Vec<Value>,
     pub termination_reason: Option<String>,
     pub legs: Vec<LegResult>,
-    /// Fallback cases that passed despite one transfer the host put on the
-    /// bus too late (see `host_timing`): each case's request and loss evidence.
-    /// More than one fails the run.
+    /// Fallback cases with accepted host-timing loss or a timing annotation
+    /// after all normal checks passed. Only accepted losses count toward the cap.
     pub host_timing_incidents: Vec<Value>,
     pub cancelled: bool,
     pub error: Option<String>,
@@ -94,13 +95,44 @@ pub struct Capture {
     started: Instant,
     file: Mutex<File>,
     debug: SyncSender<DebugMessage>,
+    native_usb_debug: SyncSender<Value>,
+    native_usb_dropped: AtomicU64,
     dropped: Arc<AtomicU64>,
     io_error: Arc<Mutex<Option<String>>>,
 }
 enum DebugMessage {
     Row(Value),
+    Wake,
     Flush(mpsc::Sender<()>),
 }
+
+struct DebugBudget {
+    written: u64,
+    limit: u64,
+    truncated: bool,
+    marker: &'static [u8],
+}
+
+impl DebugBudget {
+    fn write(&mut self, file: &mut File, row: &Value) -> io::Result<()> {
+        if self.truncated {
+            return Ok(());
+        }
+        let mut bytes = serde_json::to_vec(row)?;
+        bytes.push(b'\n');
+        let marker_len = self.marker.len() as u64;
+        if bytes.len() > 65536 || self.written + bytes.len() as u64 + marker_len > self.limit {
+            self.truncated = true;
+            if self.written + marker_len <= self.limit {
+                return file.write_all(self.marker);
+            }
+            return Ok(());
+        }
+        self.written += bytes.len() as u64;
+        file.write_all(&bytes)
+    }
+}
+
 impl Capture {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         fs::create_dir_all(path.as_ref())?;
@@ -113,6 +145,7 @@ impl Capture {
             .append(true)
             .open(path.as_ref().join("debug.jsonl"))?;
         let (debug, rx) = mpsc::sync_channel::<DebugMessage>(1024);
+        let (native_usb_debug, native_usb_rx) = mpsc::sync_channel(NATIVE_USB_QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let io_error = Arc::new(Mutex::new(None));
         let worker_error = io_error.clone();
@@ -120,25 +153,36 @@ impl Capture {
             .name("validator-debug-writer".into())
             .spawn(move || {
                 let mut file = debug_file;
-                let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let mut truncated = false;
+                let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let ordinary_limit = LOG_LIMIT - NATIVE_USB_LOG_RESERVE;
+                let mut ordinary = DebugBudget {
+                    written,
+                    limit: ordinary_limit,
+                    truncated: false,
+                    marker: b"{\"kind\":\"debug_truncated\"}\n",
+                };
+                let mut native = DebugBudget {
+                    written: written.saturating_sub(ordinary_limit),
+                    limit: NATIVE_USB_LOG_RESERVE,
+                    truncated: false,
+                    marker: b"{\"kind\":\"native_usb_debug_truncated\"}\n",
+                };
                 while let Ok(message) = rx.recv() {
+                    // Preserve backend errors and submit context even when
+                    // ordinary logging fills its queue or file allowance.
+                    for row in native_usb_rx.try_iter().take(NATIVE_USB_QUEUE_CAPACITY) {
+                        if let Err(e) = native.write(&mut file, &row) {
+                            *worker_error.lock().unwrap() =
+                                Some(format!("native USB debug log: {e}"));
+                        }
+                    }
                     match message {
                         DebugMessage::Row(value) => {
-                            if truncated {
-                                continue;
-                            }
-                            let mut bytes = serde_json::to_vec(&value).unwrap_or_default();
-                            bytes.push(b'\n');
-                            if bytes.len() > 65536 || size + bytes.len() as u64 > LOG_LIMIT {
-                                truncated = true;
-                                bytes = b"{\"kind\":\"debug_truncated\"}\n".to_vec();
-                            }
-                            if let Err(e) = file.write_all(&bytes) {
+                            if let Err(e) = ordinary.write(&mut file, &value) {
                                 *worker_error.lock().unwrap() = Some(format!("debug log: {e}"));
                             }
-                            size += bytes.len() as u64;
                         }
+                        DebugMessage::Wake => {}
                         DebugMessage::Flush(ack) => {
                             if let Err(e) = file.flush() {
                                 *worker_error.lock().unwrap() = Some(format!("debug flush: {e}"));
@@ -153,6 +197,8 @@ impl Capture {
             started: Instant::now(),
             file: Mutex::new(file),
             debug,
+            native_usb_debug,
+            native_usb_dropped: AtomicU64::new(0),
             dropped,
             io_error,
         };
@@ -165,6 +211,17 @@ impl Capture {
         let row =
             json!({"elapsed_ms": self.started.elapsed().as_millis(), "kind": kind, "value": value});
         if kind == "driver_log" || kind == "rust_log" {
+            if matches!(
+                row["value"]["target"].as_str(),
+                Some("usbdac_core::transport::libusb" | "usbdac_core::transport::iso_submit")
+            ) {
+                if self.native_usb_debug.try_send(row).is_ok() {
+                    let _ = self.debug.try_send(DebugMessage::Wake);
+                } else {
+                    self.native_usb_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
             if self.debug.try_send(DebugMessage::Row(row)).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -191,7 +248,10 @@ impl Capture {
             .map_err(|_| io::Error::other("debug writer stopped"))?;
         self.record(
             "debug_queue",
-            json!({"dropped": self.dropped.load(Ordering::Relaxed)}),
+            json!({
+                "dropped": self.dropped.load(Ordering::Relaxed),
+                "native_usb_dropped": self.native_usb_dropped.load(Ordering::Relaxed),
+            }),
         );
         if let Some(error) = self.io_error.lock().unwrap().clone() {
             return Err(io::Error::other(error));
@@ -862,6 +922,10 @@ impl Capture {
             }
         }
         result.evidence["cleanup"] = result.close_outcome["status"].clone();
+        if let Some(usb) = iso_submit_evidence(dac, timing_origin) {
+            result.evidence["iso_submit_evidence"] = usb;
+        }
+
         if event_lost.load(Ordering::Acquire) || device_lost.load(Ordering::Acquire) {
             mark_stop(&mut result, "device_lost", "stream");
         }
@@ -874,37 +938,65 @@ impl Capture {
         result
     }
 }
-/// Exact refusals remain independently recorded; overall success additionally
-/// requires every requested fallback to be present and independently verified.
+fn iso_submit_evidence(dac: &Dac, leg_origin: Instant) -> Option<Value> {
+    let trace = dac.feedback_trace()?;
+    // The retained trace can still be from the previous leg if open failed.
+    if trace.started_at < leg_origin
+        || (trace.iso_submit_incidents.is_empty() && trace.iso_submit_dropped == 0)
+    {
+        return None;
+    }
+    Some(json!({
+        "clock": "monotonic microseconds from this stream start",
+        "stream_start_offset_us": trace.started_at.duration_since(leg_origin).as_micros(),
+        "attempts": trace.iso_submit_incidents,
+        "dropped": trace.iso_submit_dropped,
+    }))
+}
+
 fn host_timing_incidents(fallbacks: &[Value]) -> Vec<Value> {
     fallbacks
         .iter()
         .filter_map(|fallback| {
-            let loss = fallback.get("host_timing_loss")?;
-            Some(json!({"source_request": fallback.get("source_request"), "target_request": fallback.get("target_request"), "host_timing_loss": loss}))
+            let (kind, timing) = ["host_timing_loss", "host_timing_stall"]
+                .into_iter()
+                .find_map(|kind| fallback.get(kind).map(|timing| (kind, timing)))?;
+            Some(json!({
+                "source_request": fallback.get("source_request"),
+                "target_request": fallback.get("target_request"),
+                (kind): timing,
+            }))
         })
         .collect()
 }
+
+fn fallback_verified(fallback: &Value) -> bool {
+    fallback.get("status").and_then(Value::as_str) == Some("passed_usb")
+        && fallback
+            .pointer("/selection_verification/passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && fallback
+            .pointer("/conversion_verification/passed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && fallback
+            .get("target_wire_integrity")
+            .and_then(Value::as_str)
+            == Some("verified")
+}
+
+/// Exact refusals remain independently recorded; overall success additionally
+/// requires every requested fallback to be present and independently verified.
 fn required_fallbacks_verified(report: &Report) -> bool {
-    if host_timing_incidents(&report.fallback_results).len() > host_timing::MAX_ACCEPTED_INCIDENTS {
-        return false;
-    }
-    let verified = |fallback: &Value| {
-        fallback.get("status").and_then(Value::as_str) == Some("passed_usb")
-            && fallback
-                .pointer("/selection_verification/passed")
-                .and_then(Value::as_bool)
-                == Some(true)
-            && fallback
-                .pointer("/conversion_verification/passed")
-                .and_then(Value::as_bool)
-                == Some(true)
-            && fallback
-                .get("target_wire_integrity")
-                .and_then(Value::as_str)
-                == Some("verified")
-    };
-    if !report.fallback_results.iter().all(verified) {
+    let losses = report
+        .fallback_results
+        .iter()
+        .filter(|fallback| fallback.get("host_timing_loss").is_some())
+        .count();
+    if losses > host_timing::MAX_ACCEPTED_INCIDENTS
+        || !report.fallback_results.iter().all(fallback_verified)
+    {
         return false;
     }
     let required = report
@@ -922,12 +1014,12 @@ fn required_fallbacks_verified(report: &Report) -> bool {
     required.into_iter().all(|leg| {
         report.fallback_results.iter().any(|fallback| {
             fallback.get("source_request").and_then(Value::as_str) == Some(leg.request.as_str())
-                && verified(fallback)
+                && fallback_verified(fallback)
         })
     })
 }
 fn fallback_summary(value: &Value) -> Value {
-    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_generation": value.get("source_generation"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "source_generation": value.get("source_generation"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "clock_feedback": value.get("clock_feedback"), "host_timing_loss": value.get("host_timing_loss"), "host_timing_stall": value.get("host_timing_stall"), "iso_submit_evidence": value.get("iso_submit_evidence"), "error": value.get("error"), "reason": value.get("reason")})
 }
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];
@@ -943,6 +1035,7 @@ fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value 
         "error_stage": leg.error_stage,
         "error_code": leg.error_code,
         "close_outcome": leg.close_outcome,
+        "iso_submit_evidence": leg.evidence.get("iso_submit_evidence"),
         "payload_bytes": leg.payload_bytes,
         "payload_sha256": leg.payload_sha256,
         "stats": {
@@ -1582,16 +1675,85 @@ mod tests {
         report.fallback_results[0]["conversion_verification"]["passed"] = json!(true);
         report.fallback_results[0]["target_wire_integrity"] = json!("unverified");
         assert!(!required_fallbacks_verified(&report));
-        // One lone host-timing loss passes and is reported; a second fails.
+        let timing = host_timing::LossCounters {
+            adaptive_queue_us: 16_000,
+            max_event_pump_elapsed_us: 45_000,
+            max_worker_loop_gap_us: 22_000,
+            ..Default::default()
+        };
+        host_timing::annotate_passing_stall(&mut report.fallback_results[0], &timing);
+        assert!(host_timing_incidents(&report.fallback_results).is_empty());
+        assert!(!required_fallbacks_verified(&report));
+
         report.fallback_results[0]["target_wire_integrity"] = json!("verified");
-        report.fallback_results[0]["host_timing_loss"] = json!({"lost_frames": 353});
+        let mut annotated = report.fallback_results[0].clone();
+        annotated["source_request"] = json!("annotated source");
+        host_timing::annotate_passing_stall(&mut annotated, &timing);
+        assert_eq!(
+            annotated["host_timing_stall"]["max_event_pump_elapsed_us"],
+            45_000
+        );
+        report.fallback_results.push(annotated.clone());
         assert!(required_fallbacks_verified(&report));
         assert_eq!(host_timing_incidents(&report.fallback_results).len(), 1);
+        annotated["status"] = json!("failed");
+        annotated
+            .as_object_mut()
+            .unwrap()
+            .remove("host_timing_stall");
+        host_timing::annotate_passing_stall(&mut annotated, &timing);
+        assert!(annotated.get("host_timing_stall").is_none());
+        assert_eq!(annotated["status"], "failed");
+
+        // One lone host-timing loss passes even with the annotation; a second fails.
+        report.fallback_results[0]["host_timing_loss"] = json!({"lost_frames": 353});
+        assert!(required_fallbacks_verified(&report));
+        assert_eq!(host_timing_incidents(&report.fallback_results).len(), 2);
         let mut second = report.fallback_results[0].clone();
         second["source_request"] = json!("second");
         report.fallback_results.push(second);
         assert!(!required_fallbacks_verified(&report));
     }
+    #[test]
+    fn native_usb_error_survives_ordinary_debug_truncation() {
+        let dir = std::env::temp_dir().join(format!(
+            "usbdac-native-debug-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let capture = Capture::new(&dir).unwrap();
+        capture.record("rust_log", json!({"message":"x".repeat(65536)}));
+        capture.flush_debug().unwrap();
+        capture.record("rust_log", json!({
+            "target":"usbdac_core::transport::libusb",
+            "level":"WARN",
+            "message":"libusb: error [submit_iso_transfer] isochronous transfer failed (dir: Out): unknown error (0xe000404f)",
+        }));
+        capture.record(
+            "rust_log",
+            json!({
+                "target":"usbdac_core::transport::iso_submit",
+                "level":"WARN",
+                "message":"OUT submit attempt=1 code=Some(-99) interface=1 alt=2 endpoint=0x01",
+            }),
+        );
+        let path = dir.join("diagnostics.zip");
+        capture.export_zip(&path).unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut debug = String::new();
+        archive
+            .by_name("debug.jsonl")
+            .unwrap()
+            .read_to_string(&mut debug)
+            .unwrap();
+        assert!(debug.contains("debug_truncated"));
+        assert!(debug.contains("0xe000404f"));
+        assert!(debug.contains("endpoint=0x01"));
+        drop(archive);
+        drop(capture);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn mode_coverage_reports_admission_and_decoder_boundary() {
         let plans = vec![Plan {

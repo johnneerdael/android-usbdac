@@ -509,9 +509,49 @@ pub(super) fn cancel_stale_transfers_for_flush(
     Ok(targets.len())
 }
 
+// LIBUSB_ERROR_OTHER hides several IOKit errors. A fresh submit lets Darwin
+// pick a new bus frame after a scheduling refusal. Keep this policy macOS-only
+// and provisional until the native evidence identifies the actual failure.
+fn retry_darwin_iso_submit(status: Option<i32>, attempt: u8) -> bool {
+    attempt == 1 && status == Some(libusb1_sys::constants::LIBUSB_ERROR_OTHER)
+}
+
+fn record_iso_submit(
+    stats: &RuntimeStats,
+    slot: &IsoTransferSlot,
+    candidate: &IsoStreamCandidate,
+    generation: u64,
+    attempt: u8,
+    packets: usize,
+    outcome: &'static str,
+    lost_frames: u64,
+) {
+    if let Some(trace) = &stats.feedback_trace {
+        trace.record_iso_submit(crate::IsoSubmitIncident {
+            elapsed_us: 0,
+            interface_number: candidate.interface_number,
+            alt_setting: candidate.alt_setting,
+            endpoint_address: candidate.endpoint_address,
+            slot: slot.slot_index,
+            generation,
+            attempt,
+            libusb_status: slot.last_submit_status,
+            native_error: slot.last_native_submit_error.clone(),
+            outcome,
+            packets,
+            service_interval_us: candidate.service_interval_us,
+            queued_slots: stats.transfer_queue_depth.load(Ordering::Relaxed),
+            adaptive_queue_us: stats.adaptive_queue_us.load(Ordering::Relaxed),
+            max_event_pump_elapsed_us: stats.max_event_pump_elapsed_us.load(Ordering::Relaxed),
+            max_worker_loop_gap_us: stats.max_worker_loop_gap_us.load(Ordering::Relaxed),
+            lost_frames,
+        });
+    }
+}
+
 /// Fills `slot` from the ring and submits it, as the output loop does for every
 /// completed slot. `Ok(false)`: the scheduler had nothing to send.
-pub(super) fn submit_next_transfer(
+fn submit_next_transfer(
     slot: &mut IsoTransferSlot,
     handle: &DeviceHandle<Context>,
     scheduler: &mut IsoPacketScheduler,
@@ -530,46 +570,186 @@ pub(super) fn submit_next_transfer(
     underrun_count: &mut u64,
     shared: &StreamShared,
     was_underrun: &mut bool,
+    loss_tracker: &mut LossTracker,
+    stream_started_at: Instant,
+    stop: &AtomicBool,
 ) -> Result<bool, String> {
-    let payload = match prepare_iso_transfer_payload_held(
-        scheduler,
-        pcm_buffer,
-        runtime_stats,
-        candidate,
-        slot_bytes,
-        channels,
-        bytes_per_frame,
-        playback_format.dsd_transport,
-        dsd_big_endian,
-        dsd_bit_reverse,
-        force_held,
-    ) {
-        Ok(Some(payload)) => payload,
-        Ok(None) => return Ok(false),
-        Err(error) => {
-            return Err(format!("USB direct transfer preparation failed: {}", error));
+    let mut attempt = 1;
+    loop {
+        let payload = match prepare_iso_transfer_payload_held(
+            scheduler,
+            pcm_buffer,
+            runtime_stats,
+            candidate,
+            slot_bytes,
+            channels,
+            bytes_per_frame,
+            playback_format.dsd_transport,
+            dsd_big_endian,
+            dsd_bit_reverse,
+            force_held,
+        ) {
+            Ok(Some(payload)) => payload,
+            Ok(None) if attempt == 1 => return Ok(false),
+            Ok(None) => return Err("USB direct transfer retry has no packet schedule".into()),
+            Err(error) => {
+                return Err(format!("USB direct transfer preparation failed: {}", error));
+            }
+        };
+        record_prepared_iso_transfer(
+            &payload,
+            playback_format,
+            candidate,
+            runtime_stats,
+            bytes_per_frame,
+            logged_transfer_preview,
+            logged_usb_encode_format,
+            underrun_count,
+        );
+        note_underrun_edge(shared, was_underrun, payload.underrun);
+        let scheduled = payload.transfer_buffer.len() / bytes_per_frame;
+        let packets = payload.packet_sizes.len();
+        let held = payload.held;
+        let frames = payload.frame_count as u64;
+        let music = payload.music_frames as u64;
+        let epoch = payload.epoch;
+        let generation = slot.generation.saturating_add(1);
+        let Err(error) = slot.submit(handle, candidate.endpoint_address, payload) else {
+            if candidate.implicit_feedback.is_some() {
+                runtime_stats
+                    .implicit_scheduled_frames
+                    .fetch_add(scheduled as u64, Ordering::Relaxed);
+            }
+            if attempt == 2 {
+                record_iso_submit(
+                    runtime_stats,
+                    slot,
+                    candidate,
+                    generation,
+                    attempt,
+                    packets,
+                    "recovered",
+                    0,
+                );
+                log_warn!(
+                    target: "usbdac_core::transport::iso_submit",
+                    "[USB] OUT submit recovered endpoint=0x{:02x} slot={} generation={}",
+                    candidate.endpoint_address,
+                    slot.slot_index,
+                    generation,
+                );
+            }
+            return Ok(true);
+        };
+        let retry = cfg!(target_os = "macos")
+            && retry_darwin_iso_submit(slot.last_submit_status, attempt)
+            && !usb_stop_requested(stop);
+        log_warn!(
+            target: "usbdac_core::transport::iso_submit",
+            "[USB] OUT submit attempt={} retry={} code={:?} error={} rateHz={} interface={} alt={} \
+             endpoint=0x{:02x} slot={} generation={} packets={} serviceUs={} queuedSlots={} adaptiveQueueUs={} \
+             maxEventPumpUs={} maxWorkerLoopGapUs={}",
+            attempt,
+            retry,
+            slot.last_submit_status,
+            error,
+            playback_format.sample_rate,
+            candidate.interface_number,
+            candidate.alt_setting,
+            candidate.endpoint_address,
+            slot.slot_index,
+            generation,
+            packets,
+            candidate.service_interval_us,
+            runtime_stats.transfer_queue_depth.load(Ordering::Relaxed),
+            runtime_stats.adaptive_queue_us.load(Ordering::Relaxed),
+            runtime_stats.max_event_pump_elapsed_us.load(Ordering::Relaxed),
+            runtime_stats.max_worker_loop_gap_us.load(Ordering::Relaxed),
+        );
+        if !retry {
+            record_iso_submit(
+                runtime_stats,
+                slot,
+                candidate,
+                generation,
+                attempt,
+                packets,
+                "failed",
+                0,
+            );
+            return Err(format!("USB direct transfer failed: {}", error));
         }
-    };
-    record_prepared_iso_transfer(
-        &payload,
-        playback_format,
-        candidate,
-        runtime_stats,
-        bytes_per_frame,
-        logged_transfer_preview,
-        logged_usb_encode_format,
-        underrun_count,
-    );
-    note_underrun_edge(shared, was_underrun, payload.underrun);
-    let scheduled = payload.transfer_buffer.len() / bytes_per_frame;
-    slot.submit(handle, candidate.endpoint_address, payload)
-        .map_err(|error| format!("USB direct transfer failed: {}", error))?;
-    if candidate.implicit_feedback.is_some() {
-        runtime_stats
-            .implicit_scheduled_frames
-            .fetch_add(scheduled as u64, Ordering::Relaxed);
+
+        // IOKit refused this slot before it reached the bus. Drop that payload
+        // and fill the same slot with the next samples, so no lost sample is
+        // also credited as played or replayed after already queued audio.
+        let music = if epoch == runtime_stats.flush_epoch.load(Ordering::Acquire) {
+            // Only this worker increases the count. A concurrent flush can
+            // reduce it to zero, which a saturating decrement must preserve.
+            let inflight = runtime_stats.inflight_music_frames.load(Ordering::Relaxed);
+            runtime_stats
+                .inflight_music_frames
+                .fetch_min(inflight.saturating_sub(music), Ordering::Release);
+            music
+        } else {
+            0
+        };
+        let verdict = loss_tracker.record_at(
+            frames,
+            UrbLoss {
+                transport_failed: true,
+                lost_frames: if held { frames } else { music },
+                held,
+                ..UrbLoss::default()
+            },
+            stream_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        publish_transport_loss(runtime_stats, loss_tracker);
+        if music > 0 {
+            shared
+                .events
+                .emit_stream(crate::events::DacEvent::LostFrames { frames: music });
+            shared.note_bit_perfect();
+        }
+        log_warn!(
+            target: "usbdac_core::transport::iso_submit",
+            "[USB] OUT submit gap code={:?} slot={} lostFrames={} heldLostFrames={} consecutiveLossyUrbs={}",
+            slot.last_submit_status,
+            slot.slot_index,
+            music,
+            if held { frames } else { 0 },
+            loss_tracker.consecutive_lossy_urbs(),
+        );
+        let outcome = if verdict.fatal.is_some() {
+            "loss_limit"
+        } else {
+            "retrying"
+        };
+        record_iso_submit(
+            runtime_stats,
+            slot,
+            candidate,
+            generation,
+            attempt,
+            packets,
+            outcome,
+            music,
+        );
+        if let Some(limit) = verdict.fatal {
+            return Err(format!("USB direct transfer failed: {error}; {limit}"));
+        }
+        if candidate.implicit_feedback.is_some() {
+            let pattern = slot
+                .rejected_packet_sizes
+                .take()
+                .ok_or("USB direct transfer retry lost the implicit packet schedule")?;
+            scheduler.set_packet_pattern(pattern);
+        }
+        attempt += 1;
     }
-    Ok(true)
 }
 
 pub(super) fn record_prepared_iso_transfer(
@@ -1479,7 +1659,9 @@ pub(super) fn run_usb_output_loop(
                 };
                 scheduler.set_packet_pattern(pattern);
             }
-            let payload = match prepare_iso_transfer_payload_held(
+            match submit_next_transfer(
+                slot,
+                handle,
                 &mut scheduler,
                 &pcm_buffer,
                 &runtime_stats,
@@ -1487,44 +1669,28 @@ pub(super) fn run_usb_output_loop(
                 slot_bytes,
                 channels,
                 bytes_per_frame,
-                playback_format.dsd_transport,
+                playback_format,
                 dsd_big_endian,
                 dsd_bit_reverse,
                 lock_gate.pending()
                     || implicit
                         .as_ref()
                         .is_some_and(|engine| engine.pattern_is_silence()),
-            ) {
-                Ok(Some(payload)) => payload,
-                Ok(None) => continue,
-                Err(error) => {
-                    fatal_error =
-                        Some(format!("USB direct transfer preparation failed: {}", error));
-                    break;
-                }
-            };
-
-            record_prepared_iso_transfer(
-                &payload,
-                playback_format,
-                &candidate,
-                &runtime_stats,
-                bytes_per_frame,
                 &mut logged_transfer_preview,
                 &mut logged_usb_encode_format,
                 &mut underrun_count,
-            );
-            note_underrun_edge(&shared, &mut was_underrun, payload.underrun);
-
-            let scheduled = payload.transfer_buffer.len() / bytes_per_frame;
-            if let Err(error) = slot.submit(handle, candidate.endpoint_address, payload) {
-                fatal_error = Some(format!("USB direct transfer failed: {}", error));
-                break;
-            }
-            if candidate.implicit_feedback.is_some() {
-                runtime_stats
-                    .implicit_scheduled_frames
-                    .fetch_add(scheduled as u64, Ordering::Relaxed);
+                &shared,
+                &mut was_underrun,
+                &mut loss_tracker,
+                stream_started_at,
+                &stop,
+            ) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    fatal_error = Some(error);
+                    break;
+                }
             }
             if active_slots == 0 {
                 if let Some(pool) = capture_pool.as_mut() {
@@ -1937,6 +2103,9 @@ pub(super) fn run_usb_output_loop(
                         &mut underrun_count,
                         &shared,
                         &mut was_underrun,
+                        &mut loss_tracker,
+                        stream_started_at,
+                        &stop,
                     ) {
                         Ok(true) => active_slots = active_slots.saturating_add(1),
                         Ok(false) => {}
@@ -2233,6 +2402,9 @@ pub(super) fn run_usb_output_loop(
                     &mut underrun_count,
                     &shared,
                     &mut was_underrun,
+                    &mut loss_tracker,
+                    stream_started_at,
+                    &stop,
                 ) {
                     Ok(true) => {
                         submit_gap_us =
@@ -2381,6 +2553,9 @@ pub(super) fn run_usb_output_loop(
                     &mut underrun_count,
                     &shared,
                     &mut was_underrun,
+                    &mut loss_tracker,
+                    stream_started_at,
+                    &stop,
                 ) {
                     Ok(true) => active_slots += 1,
                     Ok(false) => (),
@@ -2460,6 +2635,9 @@ pub(super) fn run_usb_output_loop(
                         &mut underrun_count,
                         &shared,
                         &mut was_underrun,
+                        &mut loss_tracker,
+                        stream_started_at,
+                        &stop,
                     ) {
                         Ok(true) => {
                             active_slots += 1;
@@ -2720,6 +2898,16 @@ fn classify_stream_failure(
 #[cfg(test)]
 mod duplex_failure_tests {
     use super::*;
+    #[test]
+    fn darwin_submit_retries_other_once_and_never_retries_disconnect() {
+        use libusb1_sys::constants::{LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_OTHER};
+
+        assert!(retry_darwin_iso_submit(Some(LIBUSB_ERROR_OTHER), 1));
+        assert!(!retry_darwin_iso_submit(Some(LIBUSB_ERROR_OTHER), 2));
+        assert!(!retry_darwin_iso_submit(Some(LIBUSB_ERROR_NO_DEVICE), 1));
+        assert!(!retry_darwin_iso_submit(None, 1));
+    }
+
     #[test]
     fn classify_disconnect_before_notifying_playback_and_capture() {
         let failure = classify_stream_failure(

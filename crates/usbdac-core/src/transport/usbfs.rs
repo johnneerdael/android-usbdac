@@ -21,6 +21,127 @@ impl DeviceKey {
     }
 }
 
+// Connect the log at the context that owns the asynchronous transfers. Never
+// use a process-wide callback: another USB client may own another context.
+fn forward_libusb_warnings(context: &Context) {
+    use libusb1_sys::{
+        constants::{LIBUSB_LOG_CB_CONTEXT, LIBUSB_LOG_LEVEL_WARNING},
+        libusb_set_debug, libusb_set_log_cb,
+    };
+
+    // SAFETY: Context keeps the pointer live. The callback is static and owns
+    // no resources that could outlive the context.
+    unsafe {
+        libusb_set_log_cb(
+            context.as_raw(),
+            Some(libusb_warning),
+            LIBUSB_LOG_CB_CONTEXT,
+        );
+        libusb_set_debug(context.as_raw(), LIBUSB_LOG_LEVEL_WARNING);
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct NativeSubmitDiagnostic {
+    context: *mut libusb1_sys::libusb_context,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static NATIVE_SUBMIT: std::cell::RefCell<Option<NativeSubmitDiagnostic>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Darwin logs the original error synchronously, immediately before mapping
+/// it to a libusb code. Associate it only with this call and USB context.
+#[cfg(target_os = "macos")]
+pub(super) fn darwin_iso_submit(
+    context: &Context,
+    submit: impl FnOnce() -> i32,
+) -> (i32, Option<String>) {
+    let previous = NATIVE_SUBMIT.with(|capture| {
+        capture.replace(Some(NativeSubmitDiagnostic {
+            context: context.as_raw(),
+            error: None,
+        }))
+    });
+    let result = submit();
+    let error = NATIVE_SUBMIT.with(|capture| capture.replace(previous).and_then(|row| row.error));
+    (result, error)
+}
+
+extern "system" fn libusb_warning(
+    context: *mut libusb1_sys::libusb_context,
+    level: libc::c_int,
+    message: *mut c_void,
+) {
+    use libusb1_sys::constants::{LIBUSB_LOG_LEVEL_ERROR, LIBUSB_LOG_LEVEL_WARNING};
+    use std::{cell::Cell, ffi::CStr};
+
+    if message.is_null() || !matches!(level, LIBUSB_LOG_LEVEL_ERROR | LIBUSB_LOG_LEVEL_WARNING) {
+        return;
+    }
+    thread_local! { static LOGGING: Cell<bool> = const { Cell::new(false) }; }
+    let _ = LOGGING.try_with(|logging| {
+        if logging.replace(true) {
+            return;
+        }
+        // A consumer's logger must not unwind through libusb's C stack, or
+        // recursively forward a message if logging itself calls into libusb.
+        let _ = std::panic::catch_unwind(|| {
+            // SAFETY: libusb supplies a NUL-terminated message for this call.
+            let message = unsafe { CStr::from_ptr(message.cast()) }.to_string_lossy();
+            let message = message.trim_end();
+            #[cfg(target_os = "macos")]
+            if level == LIBUSB_LOG_LEVEL_ERROR {
+                let _ = NATIVE_SUBMIT.try_with(|capture| {
+                    if let Some(row) = capture
+                        .borrow_mut()
+                        .as_mut()
+                        .filter(|r| r.context == context)
+                    {
+                        row.error = Some(message.to_owned());
+                    }
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = context;
+            log_warn!(target: "usbdac_core::transport::libusb", "{}", message);
+        });
+        logging.set(false);
+    });
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn darwin_submit_diagnostic_is_scoped_to_the_call_and_context() {
+    use libusb1_sys::constants::{LIBUSB_ERROR_OTHER, LIBUSB_LOG_LEVEL_ERROR};
+
+    let context = Context::new().unwrap();
+    let emit = |raw, message: &'static [u8]| {
+        libusb_warning(
+            raw,
+            LIBUSB_LOG_LEVEL_ERROR,
+            message.as_ptr().cast_mut().cast(),
+        );
+    };
+    let (status, native) = darwin_iso_submit(&context, || {
+        emit(
+            context.as_raw(),
+            b"[submit_iso_transfer] native result 0xe000404f\n\0",
+        );
+        emit(std::ptr::null_mut(), b"unrelated context\0");
+        LIBUSB_ERROR_OTHER
+    });
+    assert_eq!(status, LIBUSB_ERROR_OTHER);
+    assert_eq!(
+        native.as_deref(),
+        Some("[submit_iso_transfer] native result 0xe000404f")
+    );
+    assert_eq!(darwin_iso_submit(&context, || 0), (0, None));
+}
+
 pub(super) fn badd_snapshot_matches(
     active_id: u8,
     header: &[u8; 9],
@@ -782,6 +903,7 @@ pub(super) fn wrap_android_usb_handle(device: &UsbDevice) -> Result<ClaimedHandl
 
     let context =
         Context::new().map_err(|error| format!("Failed to create libusb context: {}", error))?;
+    forward_libusb_warnings(&context);
     let handle = unsafe { context.open_device_with_fd(device.fd.usbfs().expect("usbfs source")) }
         .map_err(|error| format!("Failed to wrap USB file descriptor: {}", error))?;
 
@@ -889,6 +1011,7 @@ pub(crate) fn open_darwin_device(
     probe_capture_inputs: bool,
 ) -> Result<(UsbDevice, crate::DeviceInfo), crate::Error> {
     let usb = attachment.device();
+    forward_libusb_warnings(usb.context());
     let before = usb.active_config_descriptor().map_err(|error| {
         crate::Error::Claim(format!("active configuration before claim: {error}"))
     })?;

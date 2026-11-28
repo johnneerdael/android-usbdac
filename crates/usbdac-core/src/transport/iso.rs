@@ -88,6 +88,9 @@ pub(super) struct IsoTransferSlot {
     pub(super) generation: u64,
     pub(super) submitted_endpoint: u8,
     pub(super) submitted_bytes: usize,
+    pub(super) last_submit_status: Option<i32>,
+    pub(super) last_native_submit_error: Option<String>,
+    pub(super) rejected_packet_sizes: Option<Vec<usize>>,
     pub(super) packet_sizes: Vec<usize>,
     pub(super) queued_frame_count: usize,
     pub(super) queued_underrun: bool,
@@ -232,6 +235,9 @@ impl IsoTransferSlot {
             generation: 0,
             submitted_endpoint: 0,
             submitted_bytes: 0,
+            last_submit_status: None,
+            last_native_submit_error: None,
+            rejected_packet_sizes: None,
             packet_sizes: vec![0; packet_count],
             queued_frame_count: 0,
             queued_underrun: false,
@@ -263,6 +269,9 @@ impl IsoTransferSlot {
         mut payload: IsoTransferPayload,
         timeout_ms: u32,
     ) -> Result<(), String> {
+        self.last_submit_status = None;
+        self.last_native_submit_error = None;
+        self.rejected_packet_sizes = None;
         if self.in_flight || self.retirement_pending {
             return Err("isochronous transfer slot is not retired".to_string());
         }
@@ -277,7 +286,12 @@ impl IsoTransferSlot {
 
         // Payload verification ran before framing. The extra bytes carry no
         // samples and never enter queued frame/music counts.
-        if endpoint & 0x80 == 0 && settings().source_has(crate::Quirk::TxLengthPrefix) {
+        let prefix_bytes = if endpoint & 0x80 == 0 {
+            data_packet_prefix_bytes()
+        } else {
+            0
+        };
+        if prefix_bytes != 0 {
             add_tx_length_prefix(&mut payload)?;
         }
         validate_submission_geometry(&payload.packet_sizes, payload.transfer_buffer.len())?;
@@ -320,18 +334,38 @@ impl IsoTransferSlot {
                 .length = *packet_size as u32;
             }
 
+            #[cfg(target_os = "macos")]
+            let submit_result = {
+                let (status, native) = super::usbfs::darwin_iso_submit(handle.context(), || {
+                    libusb_submit_transfer(self.transfer.as_ptr())
+                });
+                self.last_native_submit_error = native;
+                status
+            };
+            #[cfg(not(target_os = "macos"))]
             let submit_result = libusb_submit_transfer(self.transfer.as_ptr());
-            if submit_result == 0 {
-                self.in_flight = true;
-            }
+            self.last_submit_status = Some(submit_result);
             if submit_result != 0 {
-                if submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
-                    return Err("USB DAC disconnected (isochronous submit)".into());
+                if cfg!(target_os = "macos")
+                    && submit_result == libusb1_sys::constants::LIBUSB_ERROR_OTHER
+                {
+                    // Implicit feedback consumes its measured packet vector on
+                    // first use. Keep the unframed schedule available for retry.
+                    for size in &mut payload.packet_sizes {
+                        *size -= prefix_bytes;
+                    }
+                    self.rejected_packet_sizes = Some(payload.packet_sizes);
                 }
-                return Err(format!(
-                    "libusb_submit_transfer failed with code {}",
-                    submit_result
-                ));
+                let mut error = if submit_result == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
+                    "USB DAC disconnected (isochronous submit)".to_owned()
+                } else {
+                    format!("libusb_submit_transfer failed with code {submit_result}")
+                };
+                if let Some(native) = &self.last_native_submit_error {
+                    error.push_str(": ");
+                    error.push_str(native);
+                }
+                return Err(error);
             }
         }
 
@@ -927,10 +961,17 @@ impl FeedbackTransferSlot {
             return Err("invalid feedback request geometry".into());
         }
 
-        let poll_window_ms =
-            ((packet_count as u64).saturating_mul(endpoint.service_interval_us as u64) / 1_000)
-                .max(1) as u32;
-        let timeout_ms = USB_FEEDBACK_TIMEOUT_MS.max(poll_window_ms.saturating_add(20));
+        // An isochronous poll has no per-transfer timeout. On Darwin a
+        // libusb timeout aborts every transfer on the pipe, including the
+        // sibling still polling. ExplicitFeedbackHealth owns the deadline.
+        let timeout_ms = if endpoint.transfer_type == TransferType::Isochronous {
+            0
+        } else {
+            let poll_window_ms =
+                ((packet_count as u64).saturating_mul(endpoint.service_interval_us as u64) / 1_000)
+                    .max(1) as u32;
+            USB_FEEDBACK_TIMEOUT_MS.max(poll_window_ms.saturating_add(20))
+        };
 
         let completion = Arc::new(IsoTransferCompletion::new());
         let user_data = Box::new(IsoTransferUserData {
@@ -965,6 +1006,16 @@ impl FeedbackTransferSlot {
             last_submit_status: None,
             retry_at: Instant::now(),
         })
+    }
+
+    fn defer_transient_completion(&mut self, status: i32, now: Instant) {
+        if status != LIBUSB_TRANSFER_COMPLETED {
+            self.retry_at = now + Duration::from_millis(5);
+        }
+    }
+
+    fn ready_to_submit(&self, now: Instant) -> bool {
+        !self.in_flight && now >= self.retry_at
     }
 
     pub(super) fn submit(&mut self, handle: &DeviceHandle<Context>) -> Result<(), String> {
@@ -1703,12 +1754,9 @@ pub(super) fn feedback_submit_failure(
     }
 }
 
-fn feedback_completion_fault(status: i32, stopping: bool, endpoint: u8) -> Option<FeedbackFault> {
+fn feedback_completion_fault(status: i32, endpoint: u8) -> Option<FeedbackFault> {
     match status {
         LIBUSB_TRANSFER_NO_DEVICE => Some(FeedbackFault::DeviceLost),
-        LIBUSB_TRANSFER_CANCELLED if !stopping => Some(FeedbackFault::Transfer(
-            "explicit feedback unexpectedly cancelled".into(),
-        )),
         LIBUSB_TRANSFER_STALL => Some(FeedbackFault::Transfer(format!(
             "explicit feedback endpoint 0x{:02x} stalled",
             endpoint
@@ -1765,9 +1813,7 @@ pub(super) fn pump_feedback_transfers(
             status,
             &mut transfers.compatibility,
         );
-        if let Some(fault) =
-            feedback_completion_fault(status, usb_stop_requested(stop), slot.endpoint.address)
-        {
+        if let Some(fault) = feedback_completion_fault(status, slot.endpoint.address) {
             return Err(fault);
         }
         match status {
@@ -1817,17 +1863,14 @@ pub(super) fn pump_feedback_transfers(
                 counters.errors = counters.errors.saturating_add(1);
             }
         }
-        // Retry transient completions with a small bounded delay, not a busy resubmit loop.
-        if status != LIBUSB_TRANSFER_COMPLETED {
-            slot.retry_at = Instant::now() + Duration::from_millis(5);
-        }
-        if !usb_stop_requested(stop) && Instant::now() >= slot.retry_at {
+        slot.defer_transient_completion(status, Instant::now());
+        if !usb_stop_requested(stop) && slot.ready_to_submit(Instant::now()) {
             transfers.submit(index, handle, counters, false)?;
         }
     }
     for index in 0..transfers.slots.len() {
         let slot = &transfers.slots[index];
-        if !usb_stop_requested(stop) && !slot.in_flight && Instant::now() >= slot.retry_at {
+        if !usb_stop_requested(stop) && slot.ready_to_submit(Instant::now()) {
             transfers.submit(index, handle, counters, false)?;
         }
     }
@@ -2710,7 +2753,7 @@ mod explicit_feedback_tests {
             &mut compatibility
         )
         .is_none());
-        assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, false, 0x81).is_none());
+        assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, 0x81).is_none());
         assert_eq!(compatibility.startup_packets_remaining, 2);
         assert!(counters.selected_timebase.is_none());
         assert!(select_feedback_report_with_compatibility(
@@ -2947,6 +2990,47 @@ mod explicit_feedback_tests {
         assert_eq!(feedback_poll_geometry(endpoint, 16), (1, 1));
         endpoint.transfer_type = TransferType::Interrupt;
         assert_eq!(feedback_poll_geometry(endpoint, 16), (1, 1));
+    }
+
+    #[test]
+    fn iso_feedback_has_no_transfer_timeout_but_interrupt_feedback_does() {
+        let iso = FeedbackTransferSlot::new(feedback_pipe(), 8).unwrap();
+        let interrupt = FeedbackTransferSlot::new(
+            FeedbackEndpoint {
+                transfer_type: TransferType::Interrupt,
+                ..feedback_pipe()
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(iso.timeout_ms, 0);
+        assert_eq!(interrupt.timeout_ms, USB_FEEDBACK_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn timeout_and_cancelled_sibling_become_eligible_for_feedback_resubmit() {
+        let mut transfers =
+            FeedbackTransfers::new(feedback_pipe(), 4, FeedbackCompatibility::default()).unwrap();
+        let completed = Instant::now();
+        let retry = completed + Duration::from_millis(5);
+        let mut counters = FeedbackCounters::default();
+
+        for (index, status) in [LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_CANCELLED]
+            .into_iter()
+            .enumerate()
+        {
+            let slot = &mut transfers.slots[index];
+            assert!(feedback_completion_fault(status, slot.endpoint.address).is_none());
+            slot.defer_transient_completion(status, completed);
+            assert!(!slot.ready_to_submit(retry - Duration::from_micros(1)));
+            assert!(slot.ready_to_submit(retry));
+            slot.last_submit_status = Some(0);
+            transfers
+                .record_submission(index, Ok(()), &mut counters, false)
+                .unwrap();
+        }
+        assert_eq!(transfers.pending, [0, 1]);
+        assert!(counters.last_report_at.is_none());
     }
 
     #[test]
@@ -3696,16 +3780,12 @@ mod explicit_feedback_tests {
             Some(FeedbackFault::DeviceLost)
         ));
         assert!(matches!(
-            feedback_completion_fault(LIBUSB_TRANSFER_NO_DEVICE, false, 0x81),
+            feedback_completion_fault(LIBUSB_TRANSFER_NO_DEVICE, 0x81),
             Some(FeedbackFault::DeviceLost)
         ));
-        assert!(feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, true, 0x81).is_none());
-        assert!(matches!(
-            feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, false, 0x81),
-            Some(FeedbackFault::Transfer(_))
-        ));
-        assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, false, 0x81).is_none());
-        assert!(feedback_completion_fault(LIBUSB_TRANSFER_OVERFLOW, false, 0x81).is_none());
+        assert!(feedback_completion_fault(LIBUSB_TRANSFER_CANCELLED, 0x81).is_none());
+        assert!(feedback_completion_fault(LIBUSB_TRANSFER_TIMED_OUT, 0x81).is_none());
+        assert!(feedback_completion_fault(LIBUSB_TRANSFER_OVERFLOW, 0x81).is_none());
     }
 
     #[test]

@@ -306,6 +306,33 @@ pub struct UnderrunEdge {
     pub transfer_queue_depth: usize,
 }
 
+/// Evidence of an isochronous OUT submit failure or its one retry. The slot
+/// and generation pair joins both attempts within the same stream.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct IsoSubmitIncident {
+    pub elapsed_us: u64,
+    pub interface_number: u8,
+    pub alt_setting: u8,
+    pub endpoint_address: u8,
+    pub slot: usize,
+    pub generation: u64,
+    pub attempt: u8,
+    pub libusb_status: Option<i32>,
+    /// Unmodified backend diagnostic, if emitted for this exact submit.
+    pub native_error: Option<String>,
+    pub outcome: &'static str,
+    pub packets: usize,
+    pub service_interval_us: u32,
+    pub queued_slots: usize,
+    pub adaptive_queue_us: u64,
+    pub max_event_pump_elapsed_us: u64,
+    pub max_worker_loop_gap_us: u64,
+    pub lost_frames: u64,
+}
+
+const ISO_SUBMIT_INCIDENTS: usize = 32;
+
 /// A shareable support capture for the most recent stream of a DAC session.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -322,6 +349,8 @@ pub struct FeedbackTrace {
     pub underrun_edges: Vec<UnderrunEdge>,
     /// Underrun edges overwritten or missed due to a concurrent snapshot.
     pub underrun_dropped: u64,
+    pub iso_submit_incidents: Vec<IsoSubmitIncident>,
+    pub iso_submit_dropped: u64,
     pub failure: Option<String>,
 }
 
@@ -332,6 +361,8 @@ pub(crate) struct FeedbackRecorder {
     history: Mutex<History>,
     underrun_dropped: AtomicU64,
     underruns: Mutex<UnderrunHistory>,
+    iso_submit_dropped: AtomicU64,
+    iso_submits: Mutex<VecDeque<IsoSubmitIncident>>,
 }
 
 #[derive(Debug)]
@@ -353,6 +384,8 @@ impl FeedbackRecorder {
             started_at,
             dropped: AtomicU64::new(0),
             underrun_dropped: AtomicU64::new(0),
+            iso_submit_dropped: AtomicU64::new(0),
+            iso_submits: Mutex::new(VecDeque::with_capacity(ISO_SUBMIT_INCIDENTS)),
             underruns: Mutex::new(UnderrunHistory {
                 startup: Vec::with_capacity(UNDERRUN_STARTUP_ENTRIES),
                 recent: VecDeque::with_capacity(UNDERRUN_RECENT_ENTRIES),
@@ -446,6 +479,22 @@ impl FeedbackRecorder {
         )
     }
 
+    pub(crate) fn record_iso_submit(&self, mut incident: IsoSubmitIncident) {
+        incident.elapsed_us = Instant::now()
+            .saturating_duration_since(self.started_at)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let Some(mut entries) = self.iso_submits.try_lock() else {
+            self.iso_submit_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if entries.len() == ISO_SUBMIT_INCIDENTS {
+            entries.pop_front();
+            self.iso_submit_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        entries.push_back(incident);
+    }
+
     pub(crate) fn fail(&self, reason: &str) {
         self.history.lock().failure = Some(reason.to_owned());
     }
@@ -470,6 +519,8 @@ impl FeedbackRecorder {
             dropped_entries: self.dropped.load(Ordering::Relaxed),
             underrun_edges,
             underrun_dropped,
+            iso_submit_incidents: self.iso_submits.lock().iter().cloned().collect(),
+            iso_submit_dropped: self.iso_submit_dropped.load(Ordering::Relaxed),
             failure: history.failure.clone(),
         }
     }
