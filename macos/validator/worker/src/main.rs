@@ -209,7 +209,12 @@ fn main() {
         QuirkPolicy::SourceBacked => "source_backed",
     };
     capture.record("compatibility_policy", json!({"quirk_policy":policy_label}));
-    capture.record("host", json!({"os":"macos", "arch":env::consts::ARCH, "app_version":env!("CARGO_PKG_VERSION"), "driver_version":driver_version(), "driver_version_source":"workspace package version", "os_version":Command::new("/usr/bin/sw_vers").output().ok().map(|v| String::from_utf8_lossy(&v.stdout).into_owned()), "effective_uid":unsafe { libc::geteuid() }, "allow_device_capture":allow_capture}));
+    let libusb = rusb::version();
+    let libusb_version = json!({
+        "major": libusb.major(), "minor": libusb.minor(), "micro": libusb.micro(),
+        "nano": libusb.nano(), "rc": libusb.rc(),
+    });
+    capture.record("host", json!({"libusb_version":libusb_version, "os":"macos", "arch":env::consts::ARCH, "app_version":env!("CARGO_PKG_VERSION"), "driver_version":driver_version(), "driver_version_source":"workspace package version", "os_version":Command::new("/usr/bin/sw_vers").output().ok().map(|v| String::from_utf8_lossy(&v.stdout).into_owned()), "effective_uid":unsafe { libc::geteuid() }, "allow_device_capture":allow_capture}));
     let device_lost = AtomicBool::new(false);
     let result = run(&capture, &cancel, allow_capture, policy, &device_lost);
     capture.record("terminal", json!({"scope": if result.is_ok() {"run"} else {"host_or_driver"}, "result":match &result { Ok(()) => "completed".to_string(), Err(e) => e.clone() }, "cancelled":cancel.load(Ordering::Relaxed), "termination_reason":if device_lost.load(Ordering::Acquire) { Some("device_lost") } else if cancel.load(Ordering::Relaxed) { Some("cancelled") } else { None }}));

@@ -663,6 +663,15 @@
           ? "PASS"
           : "FAIL";
       }
+      function submitSummary(value) {
+        const submit = obj(value.iso_submit_evidence ?? obj(value.evidence).iso_submit_evidence);
+        const attempt = arr(submit.attempts).map(obj).find((x) => x.native_error || (x.libusb_status != null && x.libusb_status !== 0));
+        if (attempt?.native_error) return " · " + attempt.native_error;
+        if (attempt) return " · libusb submit " + attempt.libusb_status + " (native reason unavailable)";
+        if (submit.dropped > 0) return " · USB submit evidence incomplete";
+        if (value.host_timing_stall) return " · host timing exceeded queue coverage";
+        return "";
+      }
       const exact = arr(report.legs).map(obj),
         probes = arr(report.admission_results).map(obj),
         fallback = arr(report.fallback_results).map(obj),
@@ -677,7 +686,8 @@
             (v.error ||
               (exactVerdict(v) === "PASS"
                 ? "USB transport verified"
-                : "exact format, clock or delivery proof missing")),
+                : "exact format, clock or delivery proof missing")) +
+            submitSummary(v),
           v,
           verdict: exactVerdict(v),
           id: "exact-" + i,
@@ -691,7 +701,7 @@
           sub:
             admitVerdict(v) === "PASS"
               ? "Admission · expected typed refusal"
-              : "Admission · " + (v.error || "incomplete evidence"),
+              : "Admission · " + (v.error || "incomplete evidence") + submitSummary(v),
           v,
           verdict: admitVerdict(v),
           id: "admission-" + i,
@@ -722,7 +732,7 @@
             " · " +
             (selection(v)
               ? "selection evidenced"
-              : "selection evidence incomplete") + qualitySummary(v),
+              : "selection evidence incomplete") + qualitySummary(v) + submitSummary(v),
           v,
           verdict: fallbackVerdict(v),
           id: "fallback-" + i,
@@ -840,9 +850,16 @@
         data.warnings.push("Successful session close is not evidenced.");
       if (!terminal)
         data.warnings.push("A terminal capture event is not evidenced.");
+      if (report.status === "failed") {
+        const losses = fallback.filter((v) => v.host_timing_loss).length;
+        data.warnings.push(losses > 1
+          ? "The validator recorded more than one accepted host-timing loss."
+          : "The validator recorded a failed run.");
+      }
       const complete =
         closed &&
         terminal &&
+        report.status !== "failed" &&
         matrixConsistent &&
         items.some(
           (x) =>

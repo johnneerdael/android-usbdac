@@ -371,6 +371,8 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
             "flush_epoch": edge.flush_epoch, "transfer_queue_depth": edge.transfer_queue_depth,
         })).collect::<Vec<_>>(),
         "underrun_dropped": trace.underrun_dropped,
+        "iso_submit_incidents": trace.iso_submit_incidents,
+        "iso_submit_dropped": trace.iso_submit_dropped,
         "failure": trace.failure,
     })
 }

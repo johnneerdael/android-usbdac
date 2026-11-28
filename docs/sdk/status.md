@@ -44,7 +44,7 @@ These are annotations in current sources, not counts of passing tests. CI and ar
 
 | Source | Test annotations |
 |---|---|
-| Rust core | 1027 |
+| Rust core | 1031 |
 | Rust JNI | 105 |
 | Kotlin SDK | 376 |
 | Media3 library | 33 |

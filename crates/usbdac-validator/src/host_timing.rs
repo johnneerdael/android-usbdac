@@ -29,6 +29,8 @@ pub(crate) struct LossCounters {
     pub adaptive_queue_changes: u64,
     pub max_turnaround_us: u64,
     pub max_worker_gap_us: u64,
+    pub max_worker_loop_gap_us: u64,
+    pub max_event_pump_elapsed_us: u64,
     pub worker_gap_over_10ms: u64,
 }
 
@@ -47,6 +49,8 @@ impl From<&StreamStats> for LossCounters {
             adaptive_queue_changes: stats.adaptive_queue_changes,
             max_turnaround_us: stats.max_turnaround_us,
             max_worker_gap_us: stats.max_worker_gap_us,
+            max_worker_loop_gap_us: stats.max_worker_loop_gap_us,
+            max_event_pump_elapsed_us: stats.max_event_pump_elapsed_us,
             worker_gap_over_10ms: stats.worker_gap_over_10ms,
         }
     }
@@ -54,6 +58,27 @@ impl From<&StreamStats> for LossCounters {
 
 /// Most incidents a run may accept and still pass.
 pub(crate) const MAX_ACCEPTED_INCIDENTS: usize = 1;
+
+/// Annotate a queue-length stall only after every normal fallback check
+/// passed. The existing one-loss allowance is a separate verdict.
+pub(crate) fn annotate_passing_stall(fallback: &mut Value, stats: &LossCounters) {
+    if !crate::fallback_verified(fallback)
+        || fallback.get("host_timing_loss").is_some()
+        || stats.adaptive_queue_us == 0
+        || stats
+            .max_event_pump_elapsed_us
+            .max(stats.max_worker_loop_gap_us)
+            <= stats.adaptive_queue_us
+    {
+        return;
+    }
+    fallback["host_timing_stall"] = json!({
+        "classification": "host_timing_stall",
+        "adaptive_queue_us": stats.adaptive_queue_us,
+        "max_event_pump_elapsed_us": stats.max_event_pump_elapsed_us,
+        "max_worker_loop_gap_us": stats.max_worker_loop_gap_us,
+    });
+}
 
 /// Evidence for a lone host-timing loss in `stats`, or `None` when the loss
 /// has any other shape. `sample_rate_hz` is the wire frame rate;

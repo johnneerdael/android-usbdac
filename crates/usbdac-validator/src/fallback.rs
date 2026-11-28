@@ -633,6 +633,7 @@ pub(super) fn run_fallback(
             dropped_timing.load(Ordering::Relaxed),
         );
     }
+    let transport = (&stats).into();
     let conversion = stream.conversion_stats();
     let drained = stream.is_drained();
     let target_frame_bytes = if matches!(format.encoding, Encoding::DsdNative { .. }) {
@@ -679,7 +680,7 @@ pub(super) fn run_fallback(
         && pacing_ok
     {
         crate::host_timing::lone_host_timing_loss(
-            &(&stats).into(),
+            &transport,
             format.encoding,
             format.counter_rate_hz(),
             format.service_interval_us,
@@ -716,7 +717,11 @@ pub(super) fn run_fallback(
         "underruns":stats.underruns, "short_packets":stats.short_packets,
         "zero_packets":stats.zero_packets, "urb_timeouts":stats.urb_timeouts,
         "max_turnaround_us":stats.max_turnaround_us, "max_submit_gap_us":stats.max_submit_gap_us,
-        "max_worker_gap_us":stats.max_worker_gap_us
+        "max_worker_gap_us":stats.max_worker_gap_us,
+        "adaptive_queue_us":stats.adaptive_queue_us,
+        "max_event_pump_elapsed_us":stats.max_event_pump_elapsed_us,
+        "max_event_pump_timeout_overrun_us":stats.max_event_pump_timeout_overrun_us,
+        "max_worker_loop_gap_us":stats.max_worker_loop_gap_us
     });
     evidence["conversion_verification"] = verification;
     evidence["conversion_verification"]["clipped_samples"] = json!(conversion.clipped_samples);
@@ -751,6 +756,11 @@ pub(super) fn run_fallback(
             evidence["status"] = json!("failed");
             evidence["termination_reason"] = json!("retirement_failed");
         }
+    } else {
+        crate::host_timing::annotate_passing_stall(&mut evidence, &transport);
+    }
+    if let Some(usb) = iso_submit_evidence(dac, timing_origin) {
+        evidence["iso_submit_evidence"] = usb;
     }
     evidence
 }
