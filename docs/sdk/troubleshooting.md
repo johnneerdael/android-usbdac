@@ -24,6 +24,9 @@ Most SDK failures are `DacException`s. An opt-in checked playback open may inste
 | `PERMISSION_DENIED` | `UsbDac.open` | The app has no USB permission for the device. See [permission](#permission) |
 | `OPEN_FAILED` | `UsbDac.open`, `AndroidManagedOutput.open` | Android refused to open the device or gave no file descriptor, or the `AudioTrack` could not be created |
 | `CONFIGURATION_UNAVAILABLE`, `CONFIGURATION_SELECTION_FAILED`, `CONFIGURATION_RESTORE_FAILED` | `UsbDac.open`, `openPlaybackForRequest`, `openCapture`, `openDuplex` with a `configurationId`; `close` or pending hand-back | The configuration ID is absent or advertised twice; Android rejected the selection or `GET_CONFIGURATION` did not confirm it; or the original configuration could not be confirmed again on hand-back (a configuration changed by someone else is not overwritten) |
+| `RECONFIGURE_DRAIN_TIMEOUT` | `reconfigure`, `reconfigureCandidates` | The current stream did not drain before the deadline. It is still open and draining and its token is still valid: wait longer, flush, or close it. Nothing was discarded |
+| `RECONFIGURE_UNUSABLE` | `reconfigure`, `reconfigureCandidates`, later session calls | Retirement, the retained USB owner or the rollback could not be proved. Do not play through the old stream; close the session before using the DAC again |
+| `HOST_USB` | macOS host only | A host USB stack refused the device (the libusb open, an interface claim or the whole-device capture). The Android usbfs path does not raise it |
 | `UNKNOWN` | any | A code this version of the SDK does not know, from a newer native library |
 
 ## Asynchronous endpoints without feedback

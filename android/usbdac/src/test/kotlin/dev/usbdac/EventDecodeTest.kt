@@ -48,8 +48,30 @@ class EventDecodeTest {
 
     @Test
     fun anErrorEventWithAnUnparsableMessageStillDecodes() {
-        val event = decodeEvent(6, 3, 0.0, null) as DacEvent.StreamFailed
+        val event = decodeEvent(6, 0, 0.0, "not ours") as DacEvent.StreamFailed
         assertEquals(DacErrorCode.UNKNOWN, event.error.code)
+        assertEquals("not ours", event.error.detail)
+    }
+
+    @Test
+    fun anErrorEventWithoutAMessageUsesTheStableNumericCode() {
+        // usbdac-jni json.rs error_code: 1 busy .. 12 volume_unavailable, 13 host_usb,
+        // 14 reconfigure_drain_timeout, 15 reconfigure_unusable; 0 is a code it does not number.
+        val expected = listOf(
+            DacErrorCode.BUSY, DacErrorCode.PLATFORM_UNSUPPORTED, DacErrorCode.CLAIM, DacErrorCode.UNSUPPORTED,
+            DacErrorCode.CLOCK_UNVERIFIED, DacErrorCode.DEVICE_LOST, DacErrorCode.TRANSFER, DacErrorCode.CONTROL,
+            DacErrorCode.INVALID_STATE, DacErrorCode.INVALID_ARGUMENT, DacErrorCode.IMPLICIT_FEEDBACK_UNSUPPORTED,
+            DacErrorCode.VOLUME_UNAVAILABLE, DacErrorCode.HOST_USB, DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT,
+            DacErrorCode.RECONFIGURE_UNUSABLE,
+        )
+        expected.forEachIndexed { index, code ->
+            val event = decodeEvent(6, index + 1L, 0.0, null) as DacEvent.StreamFailed
+            assertEquals("code ${index + 1}", code, event.error.code)
+        }
+        assertEquals(DacErrorCode.UNKNOWN, (decodeEvent(6, 0, 0.0, null) as DacEvent.StreamFailed).error.code)
+        assertEquals(DacErrorCode.UNKNOWN, (decodeEvent(6, 16, 0.0, null) as DacEvent.StreamFailed).error.code)
+        val parsed = decodeEvent(6, 15, 0.0, "usbdac:reconfigure_unusable: close the DAC") as DacEvent.StreamFailed
+        assertEquals("close the DAC", parsed.error.detail)
     }
 
     @Test
