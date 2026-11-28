@@ -113,7 +113,7 @@ pub fn offers(capabilities: &Capabilities, track: TrackFormat) -> bool {
     capabilities.alt_settings.iter().any(|alt| {
         alt.format == AltFormat::Pcm
             && alt.channels == track.channels
-            && alt.valid_bits >= track.bits
+            && alt.valid_bits == track.bits
             && alt.sample_rates.contains(&track.sample_rate)
     })
 }

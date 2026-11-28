@@ -296,7 +296,9 @@ public data class DacConfig @JvmOverloads constructor(
 
     /**
      * Add two transfers to the USB queue after a completion that lost frames, up to 16 transfers
-     * (at most 64 ms and 255 packets in flight), and remove one after 30 s without loss. Applies only
+     * (at most 64 ms and 255 packets in flight), and remove one after 30 s without loss. With the
+     * default geometry, the queue starts at about 16 ms and grows to at most 30 ms for a 125 µs
+     * service interval or 32 ms otherwise. Applies only
      * with the default [busQueueMs], [transfersInFlight] and [transferPeriodUs], and not with
      * implicit feedback. Default `true`.
      */

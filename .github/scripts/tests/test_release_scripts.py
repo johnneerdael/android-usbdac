@@ -353,6 +353,36 @@ class PayloadAndPublicationTests(unittest.TestCase):
             crate_upload.assert_not_called()
             maven_upload.assert_not_called()
 
+    def test_docs_push_selects_only_published_build_inputs_and_coordinates(self):
+        workflow = (SCRIPTS.parent / 'workflows' / 'docs.yml').read_text()
+        program = textwrap.dedent(workflow.split("          python3 - <<'PYSELECT'\n", 1)[1].split('          PYSELECT\n', 1)[0])
+        source, main = 'a' * 40, 'b' * 40
+        state = {'diff': 0, 'guide': 'dev.usbdac:usbdac:0.1.16 dev.usbdac:usbdac-media3:0.1.16'}
+        def command(args, **kwargs):
+            if args[:2] == ['gh', 'api']: return json.dumps({'tag_name': 'v0.1.16'}).encode()
+            if args[:2] == ['git', 'rev-parse']: return source + '\n'
+            if args[:2] == ['git', 'show']: return state['guide']
+            raise AssertionError(args)
+        def compare(args, **kwargs):
+            self.assertIn(source, args)
+            self.assertIn(main, args)
+            return type('Result', (), {'returncode': state['diff']})()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'output'
+            env = {'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push', 'GITHUB_REPOSITORY': 'x/y',
+                   'GITHUB_SHA': main, 'GITHUB_OUTPUT': str(output), 'VERSION': '', 'SOURCE_SHA': ''}
+            with patch.dict(os.environ, env), patch('subprocess.check_output', side_effect=command), patch('subprocess.run', side_effect=compare):
+                exec(compile(program, 'docs.yml:PYSELECT', 'exec'), {})
+                self.assertIn('deploy=true', output.read_text())
+                self.assertIn(f'source={source}', output.read_text())
+                for diff, guide in ((1, state['guide']), (0, 'unpublished coordinates')):
+                    state.update(diff=diff, guide=guide)
+                    output.write_text('')
+                    with self.assertRaises(SystemExit) as skipped:
+                        exec(compile(program, 'docs.yml:PYSELECT', 'exec'), {})
+                    self.assertEqual(skipped.exception.code, 0)
+                    self.assertEqual(output.read_text().strip(), 'deploy=false')
+
     def test_docs_embedded_gate_requires_published_matching_source(self):
         workflow = (SCRIPTS.parent / 'workflows' / 'docs.yml').read_text()
         program = textwrap.dedent(workflow.split("          python3 - <<'PYDOCS'\n", 1)[1].split('          PYDOCS\n', 1)[0])
@@ -378,7 +408,7 @@ class PayloadAndPublicationTests(unittest.TestCase):
             target = Path(args[args.index('--dir') + 1])
             (target / 'manifest.json').write_bytes(manifest_bytes)
             (target / 'receipt.json').write_bytes(receipt_bytes)
-        env = {'VERSION': version, 'SOURCE_SHA': source, 'GITHUB_REPOSITORY': 'x/y', 'GITHUB_REPOSITORY_ID': '17', 'GITHUB_REF': 'refs/heads/main'}
+        env = {'VERSION': version, 'SOURCE_SHA': source, 'GITHUB_REPOSITORY': 'x/y', 'GITHUB_REPOSITORY_ID': '17', 'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}
         with patch.dict(os.environ, env), patch('subprocess.check_output', side_effect=command), patch('subprocess.run', side_effect=download):
             exec(compile(program, 'docs.yml:PYDOCS', 'exec'), {})
             state['tag'] = 'b' * 40

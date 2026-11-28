@@ -4,7 +4,7 @@ Automatic releases reserve a version on main before gating. A package-only recov
 
 A partial Maven publication is an abandoned coordinate, not an ordinary retry. Save the `maven-publication-incident` artifact and sealed evidence, then reserve a new patch and run all gates for its new source. Do not create the release page for the partial coordinate. Cross-service publication is not atomic: external writes can race preflight checks.
 
-The Pages workflow deploys only verified published release source. Documentation-only changes on main are not deployed automatically; include them in a release before publishing them. After an externally created release, or to retry a failed documentation deployment, dispatch the workflow on main with its exact published version and peeled source commit:
+The Pages workflow deploys only verified published release source. Documentation-only changes on main deploy when the library build inputs still match the latest published tag and the guide names its published coordinates. A push with unpublished library inputs or coordinates skips deployment until publication. After an externally created release, or to retry a failed documentation deployment, dispatch the workflow on main with its exact published version and peeled source commit:
 
 ```sh
 gh workflow run docs.yml --repo johnneerdael/usbdac --ref main -f published_version=VERSION -f source_sha=COMMIT_SHA
