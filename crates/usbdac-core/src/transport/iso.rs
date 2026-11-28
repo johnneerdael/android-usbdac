@@ -217,6 +217,8 @@ impl IsoTransferSlot {
         let transfer = unsafe { libusb_alloc_transfer(packet_count as i32) };
 
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
+            // SAFETY: user_data_ptr came from Box::into_raw above and was never
+            // shared; no transfer exists to reference it.
             unsafe {
                 drop(Box::from_raw(user_data_ptr));
             }
@@ -438,6 +440,9 @@ impl IsoTransferSlot {
     }
 
     pub(super) fn take_completion(&mut self) -> Option<(i32, Option<Instant>, usize)> {
+        // SAFETY: user_data came from Box::into_raw in new() and is freed only in
+        // Drop. The completion holds only atomics and mutexes, and the callback
+        // takes it by shared reference too, so this read is sound mid-flight.
         let completion = unsafe { &(*self.user_data).completion };
         if !completion.is_published() {
             return None;
@@ -464,6 +469,9 @@ impl IsoTransferSlot {
         &self,
         acceptance: PacketAcceptance,
     ) -> Result<CompletionStats, String> {
+        // SAFETY: the transfer is a live libusb_alloc_transfer allocation freed
+        // only in Drop, and callers run this after its completion was taken, so
+        // libusb no longer writes it.
         let transfer = unsafe { self.transfer.as_ref() };
         validate_iso_packet_results(transfer, &self.packet_sizes, acceptance).map_err(|error| {
             format!(
@@ -482,10 +490,15 @@ impl IsoTransferSlot {
 
     /// Validate descriptor geometry before any recovery accounting.
     fn failed_transfer_geometry(&self) -> Result<(), String> {
+        // SAFETY: the transfer is a live libusb_alloc_transfer allocation freed
+        // only in Drop, and callers run this after its completion was taken, so
+        // libusb no longer writes it.
         let transfer = unsafe { self.transfer.as_ref() };
         if transfer.num_iso_packets != self.packet_sizes.len() as i32 {
             return Err("failed transfer packet count changed".into());
         }
+        // SAFETY: the transfer was allocated with packet_sizes.len() descriptors
+        // (new()), num_iso_packets matches that count, and it is retired.
         let descriptors = unsafe {
             std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), self.packet_sizes.len())
         };
@@ -513,6 +526,9 @@ impl IsoTransferSlot {
         acceptance: PacketAcceptance,
     ) -> Result<CompletionStats, String> {
         self.failed_transfer_geometry()?;
+        // SAFETY: the transfer is a live libusb_alloc_transfer allocation freed
+        // only in Drop, and callers run this after its completion was taken, so
+        // libusb no longer writes it.
         let transfer = unsafe { self.transfer.as_ref() };
         Ok(timed_out_packet_results(
             transfer,
@@ -553,6 +569,9 @@ impl IsoTransferSlot {
             return;
         }
 
+        // SAFETY: the transfer stays allocated until Drop and was submitted
+        // (in_flight). libusb_cancel_transfer only requests cancellation; one
+        // that already completed returns LIBUSB_ERROR_NOT_FOUND, ignored here.
         let _ = unsafe { libusb_cancel_transfer(self.transfer.as_ptr()) };
     }
 
@@ -570,6 +589,9 @@ impl IsoTransferSlot {
 
     /// libusb has handed this transfer back: its result is waiting to be taken.
     pub(super) fn completion_ready(&self) -> bool {
+        // SAFETY: user_data came from Box::into_raw in new() and is freed only in
+        // Drop. The completion holds only atomics and mutexes, and the callback
+        // takes it by shared reference too, so this read is sound mid-flight.
         let completion = unsafe { &(*self.user_data).completion };
         completion.is_published() && !completion.consumed.load(Ordering::Acquire)
     }
@@ -604,6 +626,10 @@ impl Drop for IsoTransferSlot {
             }
         }
 
+        // SAFETY: reached only once libusb has returned the transfer (an
+        // in-flight slot without a retirement context returns early above and
+        // leaks both). Each pointer is freed exactly once: the transfer came
+        // from libusb_alloc_transfer and user_data from Box::into_raw in new().
         unsafe {
             libusb_free_transfer(self.transfer.as_ptr());
             drop(Box::from_raw(self.user_data));
@@ -651,6 +677,9 @@ impl InterruptTransferSlot {
             ));
         }
 
+        // SAFETY: the idle slot (checked above) exclusively owns its transfer and
+        // buffer, the length is bounded by the buffer, and the matching owner
+        // (require_owner) keeps the handle alive until the callback returns it.
         unsafe {
             let data = &mut *self.slot.user_data;
             if self.packet_bytes == 0
@@ -699,6 +728,9 @@ impl InterruptTransferSlot {
         }
         let (mut status, _, actual_length) = self.slot.take_completion()?;
         self.slot.mark_completed();
+        // SAFETY: take_completion returned the transfer, so libusb no longer
+        // writes the buffer; user_data lives until the slot is dropped, and the
+        // returned slice borrows self.
         let buffer = unsafe { &(*self.slot.user_data).buffer };
         let length = if status == LIBUSB_TRANSFER_COMPLETED {
             if actual_length > self.packet_bytes || actual_length > buffer.len() {
@@ -910,6 +942,8 @@ impl FeedbackTransferSlot {
         let transfer = unsafe { libusb_alloc_transfer(packet_count as i32) };
 
         let Some(transfer) = std::ptr::NonNull::new(transfer) else {
+            // SAFETY: user_data_ptr came from Box::into_raw above and was never
+            // shared; no transfer exists to reference it.
             unsafe {
                 drop(Box::from_raw(user_data_ptr));
             }
@@ -1019,6 +1053,9 @@ impl FeedbackTransferSlot {
     }
 
     pub(super) fn take_completion(&mut self) -> Option<(i32, Option<Instant>, usize)> {
+        // SAFETY: user_data came from Box::into_raw in new() and is freed only in
+        // Drop. The completion holds only atomics and mutexes, and the callback
+        // takes it by shared reference too, so this read is sound mid-flight.
         let completion = unsafe { &(*self.user_data).completion };
         if !completion.is_published() {
             return None;
@@ -1043,8 +1080,12 @@ impl FeedbackTransferSlot {
         transfer_status: i32,
         compatibility: &mut FeedbackCompatibility,
     ) -> Option<(f64, f64)> {
+        // SAFETY: called for a completion already taken from this slot, so libusb
+        // has returned the transfer and no longer writes the buffer or the
+        // descriptors; both live until Drop.
         let buffer = unsafe { &(*self.user_data).buffer };
         if self.endpoint.transfer_type == TransferType::Isochronous {
+            // SAFETY: as above, the transfer is allocated and retired.
             let transfer = unsafe { self.transfer.as_ref() };
             if transfer.num_iso_packets < 0
                 || transfer.num_iso_packets as usize != self.packet_count
@@ -1057,6 +1098,8 @@ impl FeedbackTransferSlot {
             inspect_feedback_packets_with_compatibility(
                 buffer,
                 (0..self.packet_count).map(|index| {
+                    // SAFETY: index < packet_count == num_iso_packets (checked
+                    // above), the descriptor count the transfer was allocated with.
                     let packet = unsafe { &*transfer.iso_packet_desc.as_ptr().add(index) };
                     (
                         packet.status,
@@ -1099,6 +1142,9 @@ impl FeedbackTransferSlot {
 
     pub(super) fn cancel(&mut self) {
         if self.in_flight {
+            // SAFETY: the transfer stays allocated until Drop and was submitted
+            // (in_flight). libusb_cancel_transfer only requests cancellation; one
+            // that already completed returns LIBUSB_ERROR_NOT_FOUND, ignored here.
             let _ = unsafe { libusb_cancel_transfer(self.transfer.as_ptr()) };
         }
     }
@@ -1132,6 +1178,10 @@ impl Drop for FeedbackTransferSlot {
             }
         }
 
+        // SAFETY: reached only once libusb has returned the transfer (an
+        // in-flight slot without a retirement context returns early above and
+        // leaks both). Each pointer is freed exactly once: the transfer came
+        // from libusb_alloc_transfer and user_data from Box::into_raw in new().
         unsafe {
             libusb_free_transfer(self.transfer.as_ptr());
             drop(Box::from_raw(self.user_data));
@@ -1965,6 +2015,8 @@ pub(super) extern "system" fn iso_transfer_callback(transfer: *mut libusb_transf
         let Some(user_data) = std::ptr::NonNull::new(user_data_ptr) else {
             return;
         };
+        // SAFETY: as above, both stay live until the publication below; these
+        // are plain reads of fields libusb finished writing before the callback.
         let status = unsafe { transfer.as_ref().status };
         let actual_length = unsafe { transfer.as_ref().actual_length }.max(0) as usize;
         let completion = unsafe { user_data.as_ref() }.completion.clone();
@@ -2003,8 +2055,9 @@ pub(super) fn validate_iso_packet_results(
         ));
     }
 
-    // Both callers allocated exactly packet_sizes.len() descriptors and call
-    // this only after completion, before resubmitting or freeing the transfer.
+    // SAFETY: both callers allocated exactly packet_sizes.len() descriptors
+    // (num_iso_packets is checked above) and call this only after completion,
+    // before resubmitting or freeing the transfer.
     let descriptors = unsafe {
         std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), packet_sizes.len())
     };
@@ -2021,9 +2074,9 @@ pub(super) fn timed_out_packet_results(
         return account_timed_out_transfer(packet_sizes, &[], acceptance);
     }
 
-    // Same contract as validate_iso_packet_results: the slot allocated exactly
-    // packet_sizes.len() descriptors and this runs after completion, before the
-    // slot is resubmitted.
+    // SAFETY: same contract as validate_iso_packet_results: the slot allocated
+    // exactly packet_sizes.len() descriptors and this runs after completion,
+    // before the slot is resubmitted.
     let descriptors = unsafe {
         std::slice::from_raw_parts(transfer.iso_packet_desc.as_ptr(), packet_sizes.len())
     };
@@ -3056,6 +3109,8 @@ mod explicit_feedback_tests {
         // The later poll may publish first, but cannot consume startup skips first.
         for index in [1, 0] {
             let slot = &mut transfers.slots[index];
+            // SAFETY: test slot, never submitted: it exclusively owns its
+            // transfer, its two descriptors and its buffer.
             unsafe {
                 let data = &mut *slot.user_data;
                 data.buffer.copy_from_slice(&q16(6.0).repeat(2));
@@ -3107,6 +3162,7 @@ mod explicit_feedback_tests {
         assert_eq!(transfers.compatibility.startup_packets_remaining, 0);
         assert!(counters.selected_timebase.is_none());
         // The next poll accepts the newest plausible report and rejects its later bad packet.
+        // SAFETY: test slot, never submitted; the range lies inside its 8-byte buffer.
         unsafe {
             (&mut *transfers.slots[0].user_data).buffer[4..8].copy_from_slice(&q16(48.0));
         }
@@ -3140,6 +3196,8 @@ mod explicit_feedback_tests {
         let mut counters = FeedbackCounters::default();
         let report = (6u64 << 32).to_le_bytes();
         let slot = &mut transfers.slots[1];
+        // SAFETY: test slot, never submitted: it exclusively owns its transfer,
+        // its two descriptors and its buffer.
         unsafe {
             (&mut *slot.user_data)
                 .buffer
