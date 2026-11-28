@@ -20,6 +20,7 @@ if [ "${1:-}" = build ]; then
     fetch "$base/main/aarch64/linux-lts-6.12.119-r0.apk" 60374bc0d9b125bc710f952d4508fd3ad4c78523c75ab1be1ec54fc3267cd54f "$out/downloads/kernel.apk"
     fetch "$base/community/aarch64/openjdk17-jre-headless-17.0.19_p10-r0.apk" 3d70540059df8771a6329e1d9a0af665df0c3deee670cf32a049de713d8e289f "$out/downloads/jre.apk"
     fetch "$base/main/aarch64/zlib-1.4-r0.apk" 279972bab4f817182d9617984880bc29471f1d3016f92265be10d71e6f95ca74 "$out/downloads/zlib.apk"
+    fetch "$base/main/aarch64/libgcc-14.2.0-r6.apk" ba1835eec3ad8a120efd3d5020e561d53553a0513763a08f509e3ce6d4baa9ca "$out/downloads/libgcc.apk"
     fetch https://github.com/JetBrains/kotlin/releases/download/v2.4.0/kotlin-compiler-2.4.0.zip ba1b9e6eb6ddc3275079224f2e9ea4a2b02eef7d59ce2d38404f04b22613c20a "$out/downloads/kotlin.zip"
     # Recreate only job-owned outputs; preserve verified downloads and any local baseline.
     rm -rf "$out/root" "$out/compiled"
@@ -27,7 +28,7 @@ if [ "${1:-}" = build ]; then
     "$tar_cmd" -xzf "$out/downloads/rootfs.tar.gz" -C "$out/root"
     mkdir -p "$out/compiled/kernel"
     "$tar_cmd" -xzf "$out/downloads/kernel.apk" --ignore-zeros -C "$out/compiled/kernel"
-    for apk in jre zlib; do "$tar_cmd" -xzf "$out/downloads/$apk.apk" --ignore-zeros -C "$out/root"; done
+    for apk in jre zlib libgcc; do "$tar_cmd" -xzf "$out/downloads/$apk.apk" --ignore-zeros -C "$out/root"; done
     unzip -q "$out/downloads/kotlin.zip" -d "$out/compiled"
     cp "$out/compiled/kernel/boot/vmlinuz-lts" "$out/vmlinuz-lts"
     for module in usbcore usbip-core vhci-hcd; do
@@ -59,7 +60,12 @@ if [ "${1:-}" = build ]; then
         export CC_aarch64_unknown_linux_musl="$out/compiled/musl-cc"
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$out/compiled/musl-cc"
         rustup run "$RUSTUP_TOOLCHAIN" cargo build --locked --release -p usbdac-core --example usbip_lifecycle --target "$target" --features libusb1-sys/vendored
-        RUSTFLAGS='-C target-feature=-crt-static' rustup run "$RUSTUP_TOOLCHAIN" cargo build --locked --release -p usbdac-jni -p usbdac-core --target "$target" --features libusb1-sys/vendored
+        # musl-gcc's host GCC linker script can otherwise resolve glibc libgcc_s or fail.
+        # Supply the digest-verified Alpine musl library for the JNI shared object.
+        mkdir -p "$out/compiled/musl-libgcc"
+        test -f "$out/root/usr/lib/libgcc_s.so.1"
+        ln -s "$out/root/usr/lib/libgcc_s.so.1" "$out/compiled/musl-libgcc/libgcc_s.so"
+        RUSTFLAGS="-C target-feature=-crt-static -L native=$out/compiled/musl-libgcc" rustup run "$RUSTUP_TOOLCHAIN" cargo build --locked --release -p usbdac-jni -p usbdac-core --target "$target" --features libusb1-sys/vendored
         "$out/compiled/musl-cc" -static -O2 "$fixture/usbfs_jni_launcher.c" -o "$out/root/fixture/usbfs_jni_launcher"
         rustup run "$RUSTUP_TOOLCHAIN" rustc --edition 2021 --target "$target" -C linker=rust-lld -C linker-flavor=ld.lld "$fixture/usbip_uac.rs" -o "$out/root/fixture/usbip_uac"
     fi
@@ -85,7 +91,7 @@ if [ "${1:-}" = build ]; then
         if command -v musl-gcc >/dev/null; then musl-gcc --version | sed -n '1p'; else zig version; fi
         sha256sum "$fixture/run.sh" "$fixture/usbip_uac.rs" "$fixture/init" "$fixture/JniRetirementProbe.java" "$fixture/usbfs_jni_launcher.c" "$root/crates/usbdac-core/examples/usbip_lifecycle.rs" "$root/android/usbdac/src/main/kotlin/dev/usbdac/internal/Native.kt"
         sha256sum "$out/downloads/"*
-        sha256sum "$root/Cargo.lock" "$out/vmlinuz-lts" "$out/initramfs.gz" "$out/root/fixture/usbip_uac" "$out/root/fixture/usbip_lifecycle" "$out/root/fixture/libusbdac.so" "$out/root/fixture/classes.jar" "$out/root/fixture/kotlin-stdlib.jar" "$out/root/fixture/usbfs_jni_launcher" "$out/root/fixture/"*.ko
+        sha256sum "$out/root/usr/lib/libgcc_s.so.1" "$root/Cargo.lock" "$out/vmlinuz-lts" "$out/initramfs.gz" "$out/root/fixture/usbip_uac" "$out/root/fixture/usbip_lifecycle" "$out/root/fixture/libusbdac.so" "$out/root/fixture/classes.jar" "$out/root/fixture/kotlin-stdlib.jar" "$out/root/fixture/usbfs_jni_launcher" "$out/root/fixture/"*.ko
     } > "$out/manifest.txt"
     sha256sum "$out/vmlinuz-lts" "$out/initramfs.gz" > "$out/runtime.SHA256"
     echo "USBIP_BUILD_READY $out"
