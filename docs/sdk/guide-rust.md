@@ -10,6 +10,16 @@ The code is compiled. It is in `crates/usbdac-core/examples` (`guide_open.rs` an
 
 **Status.** The examples compile on the host and for `aarch64-linux-android`, and the writer thread and transport have 5 tests that run against a fake ring, with no DAC. No code on this page has been run with a DAC in front of it, and the Linux part has not been run on a Linux desktop. The driver underneath has played on hardware ([hardware status](evidence.md#hardware-status)). Run the checks of [step 13](#13-test-it) on your own devices before you ship.
 
+## Automatic direct USB playback
+
+The examples below use `Dac::negotiate` and `Dac::open_stream` for strict direct playback. That path remains available when the application needs an exact format and manages its own conversion.
+
+For a source-domain stream, call `Dac::resolve_playback` with the source `StreamRequest` and a `playback::PlaybackPolicy`, inspect the returned `PlaybackDecision`, then pass it and a listener to `Dac::open_playback`. The decision identifies the negotiated USB format, planned candidates, any exact refusal, the transform and its source-fidelity classification. Policy controls permitted lossless and lossy conversion, widening, native DSD, DoP handling and PCM limits. In particular, an unconfirmed DoP decoder is not proof that a carrier will be decoded; the policy also controls whether that input may be converted to PCM.
+
+Write the original source layout to `PlaybackStream::write`, not the negotiated USB layout. It accepts whole source frames and returns source bytes accepted; retry a short write. Native DSD input is chronological bytes per channel, and DoP input uses validated 24- or 32-bit carrier slots. Call `drain` until it accepts the request, wait for `is_drained`, and close the stream. The stream reports conversion counters separately from USB transport statistics.
+
+`Exact` means no source transform; `BitExact` or `Lossless` describes sample-preserving changes such as layout or channel expansion. `Lossy` includes resampling, narrowing and DSD-to-PCM conversion. A verified target USB stream does not make a lossy conversion source-bit-perfect and does not establish analog output or DoP decoder lock. These automatic paths require their own hardware acceptance; earlier exact-stream results do not establish parity.
+
 ## Words used on this page
 
 - **DAC.** The box that turns digital audio into sound. Here it is a USB one.

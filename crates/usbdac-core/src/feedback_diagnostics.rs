@@ -8,6 +8,8 @@ use std::time::Instant;
 
 const STARTUP_ENTRIES: usize = 128;
 const RECENT_ENTRIES: usize = 2_048;
+const UNDERRUN_STARTUP_ENTRIES: usize = 16;
+const UNDERRUN_RECENT_ENTRIES: usize = 64;
 
 /// What happened to a packet while it was examined for explicit feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,15 +270,58 @@ pub struct FeedbackTraceEntry {
     pub event: FeedbackTraceEvent,
 }
 
+/// A worker-observed transition into or out of an underrun episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnderrunEdgeKind {
+    /// A prepared transfer first required underrun padding.
+    Started,
+    /// A later prepared transfer no longer required underrun padding.
+    Recovered,
+}
+impl UnderrunEdgeKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+/// Relaxed atomic snapshots taken at the observed worker edge, after preparing the transfer.
+/// `elapsed_us` shares the exact origin of the enclosing feedback trace. Sample counts
+/// are interleaved ring samples; frame counters use the stream's native counter rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnderrunEdge {
+    pub elapsed_us: u64,
+    pub kind: UnderrunEdgeKind,
+    pub underrun_transfers: u64,
+    pub buffered_samples: usize,
+    pub capacity_samples: usize,
+    pub channels: usize,
+    pub producer_frames: u64,
+    pub played_frames: u64,
+    pub inflight_frames: u64,
+    pub flush_epoch: u64,
+    pub transfer_queue_depth: usize,
+}
+
 /// A shareable support capture for the most recent stream of a DAC session.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct FeedbackTrace {
+    /// In-process monotonic origin shared by feedback entries and underrun edges.
+    /// This instant has no portable UTC representation; compute offsets in-process.
+    pub started_at: Instant,
     pub format: crate::StreamFormat,
     pub explicit: Option<ExplicitFeedbackDiagnostics>,
     pub entries: Vec<FeedbackTraceEntry>,
     /// Observations overwritten at the retention limit or missed during an export.
     pub dropped_entries: u64,
+    /// First and recent underrun edges, independently retained from feedback events.
+    pub underrun_edges: Vec<UnderrunEdge>,
+    /// Underrun edges overwritten or missed due to a concurrent snapshot.
+    pub underrun_dropped: u64,
     pub failure: Option<String>,
 }
 
@@ -285,6 +330,8 @@ pub(crate) struct FeedbackRecorder {
     started_at: Instant,
     dropped: AtomicU64,
     history: Mutex<History>,
+    underrun_dropped: AtomicU64,
+    underruns: Mutex<UnderrunHistory>,
 }
 
 #[derive(Debug)]
@@ -294,11 +341,22 @@ struct History {
     failure: Option<String>,
 }
 
+#[derive(Debug)]
+struct UnderrunHistory {
+    startup: Vec<UnderrunEdge>,
+    recent: VecDeque<UnderrunEdge>,
+}
+
 impl FeedbackRecorder {
     pub(crate) fn new(started_at: Instant) -> Self {
         Self {
             started_at,
             dropped: AtomicU64::new(0),
+            underrun_dropped: AtomicU64::new(0),
+            underruns: Mutex::new(UnderrunHistory {
+                startup: Vec::with_capacity(UNDERRUN_STARTUP_ENTRIES),
+                recent: VecDeque::with_capacity(UNDERRUN_RECENT_ENTRIES),
+            }),
             history: Mutex::new(History {
                 startup: Vec::with_capacity(STARTUP_ENTRIES),
                 recent: VecDeque::with_capacity(RECENT_ENTRIES),
@@ -354,6 +412,40 @@ impl FeedbackRecorder {
         }
     }
 
+    /// Try to retain an edge without blocking or allocating on the USB worker.
+    pub(crate) fn record_underrun_at(&self, timestamp: Instant, mut edge: UnderrunEdge) {
+        edge.elapsed_us = timestamp
+            .saturating_duration_since(self.started_at)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let Some(mut history) = self.underruns.try_lock() else {
+            self.underrun_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if history.startup.len() < UNDERRUN_STARTUP_ENTRIES {
+            history.startup.push(edge);
+        } else {
+            if history.recent.len() == UNDERRUN_RECENT_ENTRIES {
+                history.recent.pop_front();
+                self.underrun_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            history.recent.push_back(edge);
+        }
+    }
+
+    pub(crate) fn underrun_snapshot(&self) -> (Vec<UnderrunEdge>, u64) {
+        let history = self.underruns.lock();
+        (
+            history
+                .startup
+                .iter()
+                .chain(&history.recent)
+                .copied()
+                .collect(),
+            self.underrun_dropped.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn fail(&self, reason: &str) {
         self.history.lock().failure = Some(reason.to_owned());
     }
@@ -364,7 +456,9 @@ impl FeedbackRecorder {
         explicit: Option<ExplicitFeedbackDiagnostics>,
     ) -> FeedbackTrace {
         let history = self.history.lock();
+        let (underrun_edges, underrun_dropped) = self.underrun_snapshot();
         FeedbackTrace {
+            started_at: self.started_at,
             format,
             explicit,
             entries: history
@@ -374,6 +468,8 @@ impl FeedbackRecorder {
                 .copied()
                 .collect(),
             dropped_entries: self.dropped.load(Ordering::Relaxed),
+            underrun_edges,
+            underrun_dropped,
             failure: history.failure.clone(),
         }
     }
@@ -444,6 +540,57 @@ impl fmt::Display for ExplicitFeedbackDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn edge() -> UnderrunEdge {
+        UnderrunEdge {
+            elapsed_us: 0,
+            kind: UnderrunEdgeKind::Started,
+            underrun_transfers: 1,
+            buffered_samples: 4,
+            capacity_samples: 100,
+            channels: 2,
+            producer_frames: 8,
+            played_frames: 4,
+            inflight_frames: 2,
+            flush_epoch: 0,
+            transfer_queue_depth: 3,
+        }
+    }
+    #[test]
+    fn underrun_history_has_independent_bounded_first_and_recent_edges() {
+        let start = Instant::now();
+        let recorder = FeedbackRecorder::new(start);
+        for n in 0..(STARTUP_ENTRIES + RECENT_ENTRIES + 5) {
+            recorder.record_at(
+                start + std::time::Duration::from_micros(n as u64),
+                FeedbackTraceEvent::Submit {
+                    slot: None,
+                    status: 0,
+                },
+            );
+        }
+        let count = UNDERRUN_STARTUP_ENTRIES + UNDERRUN_RECENT_ENTRIES + 3;
+        for n in 0..count {
+            recorder.record_underrun_at(start + std::time::Duration::from_micros(n as u64), edge());
+        }
+        let (events, dropped) = recorder.underrun_snapshot();
+        assert_eq!(
+            events.len(),
+            UNDERRUN_STARTUP_ENTRIES + UNDERRUN_RECENT_ENTRIES
+        );
+        assert_eq!(events[0].elapsed_us, 0);
+        assert_eq!(
+            events[UNDERRUN_STARTUP_ENTRIES].elapsed_us,
+            (UNDERRUN_STARTUP_ENTRIES + 3) as u64
+        );
+        assert_eq!(events.last().unwrap().elapsed_us, (count - 1) as u64);
+        assert_eq!(dropped, 3);
+        assert_eq!(recorder.dropped.load(Ordering::Relaxed), 5);
+        let held = recorder.underruns.lock();
+        recorder.record_underrun_at(start, edge());
+        drop(held);
+        assert_eq!(recorder.underrun_snapshot().1, 4);
+    }
 
     #[test]
     fn preserves_startup_and_latest_observations_with_bounded_storage() {

@@ -127,8 +127,8 @@ public data class OutputPolicy @JvmOverloads constructor(
     val dopSupport: DopSupport = DopSupport.UNCONFIRMED,
     /** Resampling, dither and source-layout options. Headroom is applied only when resampling. */
     val conversionOptions: ConversionOptions = ConversionOptions(headroomDb = -3.5),
-    /** Permit unpacking explicit DoP input for lossy PCM conversion, when allowConversion is also true. */
-    val allowDopPcmConversion: Boolean = false,
+    /** Permit validated DoP input to be converted to PCM, when allowConversion is also true. */
+    val allowDopPcmConversion: Boolean = true,
     /** Explicit, process-local decoder association; close it when no longer needed. */
     val downstreamBinding: DownstreamBinding? = null,
 ) {

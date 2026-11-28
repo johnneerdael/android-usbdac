@@ -438,6 +438,18 @@ impl Dac {
         config: DacConfig,
         allow_capture: bool,
     ) -> Result<Dac> {
+        Self::open_darwin_with_capture_probe(attachment, config, allow_capture, false)
+    }
+
+    /// Optionally claim and release descriptor-proven input interfaces while
+    /// playback claims are held. This does not open capture or prove duplex audio.
+    #[cfg(target_os = "macos")]
+    pub fn open_darwin_with_capture_probe(
+        attachment: crate::darwin_discovery::Attachment,
+        config: DacConfig,
+        allow_capture: bool,
+        probe_capture_inputs: bool,
+    ) -> Result<Dac> {
         config.validate()?;
         let _guard = OPEN_GUARD.lock();
         let context = transport::context::SessionContext::reserve_darwin(attachment.device())?;
@@ -445,8 +457,18 @@ impl Dac {
         if transport::session::session_registered() {
             return Err(Error::Busy);
         }
-        let (device, info) = transport::usbfs::open_darwin_device(&attachment, allow_capture)?;
-        settings::install(Settings::for_device(config.clone(), &info));
+        let (device, info) = match transport::usbfs::open_darwin_device(
+            &attachment,
+            &config,
+            allow_capture,
+            probe_capture_inputs,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                settings::reset();
+                return Err(error);
+            }
+        };
         if let Err(error) = transport::api::register_darwin_device(device, &info) {
             settings::reset();
             return Err(error);
@@ -569,6 +591,16 @@ impl Dac {
         self.shared.reject_reconfigure()?;
         let _scope = self.shared.enter()?;
         transport::api::negotiate_candidates(requests)
+    }
+
+    pub(crate) fn negotiate_playback_candidates(
+        &self,
+        requests: &[StreamRequest],
+    ) -> Result<(StreamFormat, usize, Option<Error>, Vec<Error>)> {
+        let _control = self.shared.control_guard.lock();
+        self.shared.reject_reconfigure()?;
+        let _scope = self.shared.enter()?;
+        transport::api::negotiate_playback_candidates(requests)
     }
 
     fn negotiate_locked(&self, request: &StreamRequest) -> Result<StreamFormat> {

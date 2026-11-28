@@ -95,3 +95,18 @@ pub fn validator_flush<'l>(mut env: EnvUnowned<'l>, _class: JObject<'l>) {
         Ok(())
     })
 }
+
+/// Render from files alone, including a recovered capture with no live Capture object.
+#[jni_mangle("dev.usbdac.internal.Native")]
+pub fn validator_write_html<'l>(
+    mut env: EnvUnowned<'l>,
+    _class: JObject<'l>,
+    directory: JString<'l>,
+) {
+    run(&mut env, |env| {
+        let dir = string_of(env, &directory)?;
+        usbdac_validator::write_html_report(std::path::Path::new(&dir))
+            .map_err(|error| Failure::Bad(format!("HTML report: {error}")))?;
+        Ok(())
+    })
+}

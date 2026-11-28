@@ -39,6 +39,7 @@ pub mod capture;
 pub mod convert;
 pub mod descriptors;
 pub mod pioneer;
+pub mod playback;
 pub mod routing;
 pub mod scarlett;
 
@@ -106,7 +107,7 @@ pub use events::{CompatibilityFallbackTier, DacEvent, DacListener, StreamState};
 pub use fake::{PlaybackDevice, PlaybackStream};
 pub use feedback_diagnostics::{
     ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket, FeedbackTrace,
-    FeedbackTraceEntry, FeedbackTraceEvent,
+    FeedbackTraceEntry, FeedbackTraceEvent, UnderrunEdge, UnderrunEdgeKind,
 };
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use hotplug::{

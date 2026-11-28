@@ -174,6 +174,24 @@ fn uac1_type_i_excludes(extra: &[u8], request: PlaybackFormat) -> Option<bool> {
     )
 }
 
+/// Reuse the strict exclusion parser as a completeness witness; unlike the
+/// general parser it rejects truncated, zero, duplicate and private descriptors.
+pub(super) fn complete_uac1_type_i(extra: &[u8]) -> bool {
+    uac1_type_i_excludes(
+        extra,
+        PlaybackFormat {
+            pcm_encoding: PcmEncoding::Signed,
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0,
+        },
+    )
+    .is_some()
+}
+
 // A successful, read-only RANGE exclusion on a single direct UAC2 path.
 // Selectors and multipliers remain terminal because another reachable path
 // may admit the requested rate, or the route could change while probing.
@@ -1524,6 +1542,22 @@ mod evidence_tests {
         assert_eq!(uac1_type_i_excludes(&unknown_tag, request), None);
     }
 
+    #[test]
+    fn uac1_rate_witness_rejects_truncated_and_unknown_lists() {
+        let complete = [
+            7, 0x24, 1, 1, 0, 1, 0, 14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xac, 0, 0x80, 0xbb, 0,
+        ];
+        assert!(super::complete_uac1_type_i(&complete));
+        assert!(!super::complete_uac1_type_i(
+            &complete[..complete.len() - 1]
+        ));
+        let mut zero = complete;
+        zero[15..18].fill(0);
+        assert!(!super::complete_uac1_type_i(&zero));
+        let mut private = complete;
+        private[5] = 0xff;
+        assert!(!super::complete_uac1_type_i(&private));
+    }
     #[test]
     fn uac2_exclusion_requires_complete_standard_type_i() {
         let descriptor = [

@@ -28,6 +28,7 @@ internal object Native {
     @JvmStatic external fun validatorCancel()
     @JvmStatic external fun validatorDeviceLost()
     @JvmStatic external fun validatorFlush()
+    @JvmStatic external fun validatorWriteHtml(directory: String)
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 
@@ -75,6 +76,9 @@ internal object Native {
     @JvmStatic external fun routingApply(dac: Long, snapshot: Long, editsJson: String): String
     @JvmStatic external fun dacCapabilities(dac: Long): String
     @JvmStatic external fun dacFeedbackTrace(dac: Long): String
+    @JvmStatic external fun playbackDsdMonoToStereo(input: ByteBuffer, output: ByteBuffer, count: Int): Int
+    @JvmStatic external fun playbackU8ToI16(input: ByteBuffer, output: ByteBuffer, count: Int): Int
+    @JvmStatic external fun playbackResolve(dac: Long, requestJson: String, policyJson: String): String
     @JvmStatic external fun dacNegotiate(dac: Long, requestJson: String): String
     @JvmStatic external fun dacNegotiateCandidates(dac: Long, requestsJson: String): String
     @JvmStatic external fun dacSetListener(dac: Long, listener: Any?)

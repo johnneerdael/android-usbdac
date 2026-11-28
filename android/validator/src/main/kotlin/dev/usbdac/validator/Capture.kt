@@ -1,6 +1,7 @@
 package dev.usbdac.validator
 
 import android.content.*
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.Uri
@@ -314,6 +315,43 @@ internal object Capture {
     }
 
     private fun identity(info: DacDeviceInfo): JSONObject = JSONObject().put("vendor_id", info.vendorId).put("product_id", info.productId).put("product", info.productName).put("manufacturer", info.manufacturerName).put("configurations", org.json.JSONArray(info.configurations.map { JSONObject().put("id", it.id).put("name", it.name).put("playback", it.hasPlayback).put("capture", it.hasCapture) }))
+    /** A CLAIM refusal is optional only when the rejected interface is capture-only. */
+    private fun optionalCaptureRefusal(info: DacDeviceInfo, error: DacException): Boolean {
+        if (error.suppressed.isNotEmpty()) return false
+        if (error.code == DacErrorCode.UNSUPPORTED) return true
+        if (error.code != DacErrorCode.CLAIM) return false
+        if (error.detail == "duplex capture proof does not match active interfaces") return true
+        val id = Regex("^Could not claim USB audio interface ([0-9]+) on ").find(error.detail)
+            ?.groupValues?.get(1)?.toIntOrNull() ?: return false
+        var input = false
+        var output = false
+        var controlOrOther = false
+        val device = info.device
+        for (ci in 0 until device.configurationCount) {
+            val configuration = device.getConfiguration(ci)
+            for (ii in 0 until configuration.interfaceCount) {
+                val usbInterface = configuration.getInterface(ii)
+                if (usbInterface.id != id) continue
+                if (usbInterface.interfaceClass != UsbConstants.USB_CLASS_AUDIO || usbInterface.interfaceSubclass != 2) {
+                    controlOrOther = true; continue
+                }
+                for (ei in 0 until usbInterface.endpointCount) {
+                    val endpoint = usbInterface.getEndpoint(ei)
+                    if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_ISOC) continue
+                    if (endpoint.direction == UsbConstants.USB_DIR_IN) input = true else output = true
+                }
+            }
+        }
+        return input && !output && !controlOrOther
+    }
+
+    private fun stillSelectedAndPermitted(manager: UsbManager, info: DacDeviceInfo, runId: Long): Boolean {
+        if (runId != generation || !active || finishing || cancelled || deviceLost) return false
+        val current = manager.deviceList[info.deviceName] ?: return false
+        return current.deviceId == info.device.deviceId && current.vendorId == info.vendorId &&
+            current.productId == info.productId && manager.hasPermission(current)
+    }
+
     private fun run(info: DacDeviceInfo) {
         status = "USB permission granted for ${info.productName}. Reading USB descriptors…"
         val runId = generation
@@ -332,7 +370,25 @@ internal object Capture {
                 if (cancelled) error("Cancelled")
                 status = "Claiming exclusive USB audio interfaces for ${info.productName}…"
                 record("claim_started", identity(info))
-                session = UsbDac.open(app, info, DacConfig(requireHardwareVolume = false, captureFeedbackTrace = true, startupVolume = StartupVolume.Keep, quirkPolicy = runPolicy))
+                val config = DacConfig(requireHardwareVolume = false, captureFeedbackTrace = true, startupVolume = StartupVolume.Keep, quirkPolicy = runPolicy)
+                val duplexConfigs = info.configurations.filter { it.hasPlayback && it.hasCapture }
+                var duplexClaimed = false
+                session = if (duplexConfigs.isNotEmpty()) {
+                    record("duplex_claim_attempt", JSONObject().put("advertised_configuration_ids", org.json.JSONArray(duplexConfigs.map { it.id }))
+                        .put("configuration_selection", "keep_active").put("capture_samples_recorded", false))
+                    status = "Claiming playback and optional microphone interfaces for ${info.productName}…"
+                    try {
+                        UsbDac.openDuplex(app, info, config).also { duplexClaimed = true }
+                    } catch (error: DacException) {
+                        if (!optionalCaptureRefusal(info, error) || !stillSelectedAndPermitted(manager, info, runId)) throw error
+                        record("duplex_claim_fallback", JSONObject().put("code", error.code.name).put("detail", error.detail)
+                            .put("fallback", "playback_only").put("capture_samples_recorded", false))
+                        status = "Optional microphone claim unavailable; claiming playback only…"
+                        try { UsbDac.open(app, info, config) } catch (playbackError: Throwable) {
+                            playbackError.addSuppressed(error); throw playbackError
+                        }
+                    }
+                } else UsbDac.open(app, info, config)
                 val capabilities = session.capabilities
                 record("recognized_capabilities", JSONObject().put("quirk_policy", runPolicy.name)
                     .put("supports_pcm", capabilities.supportsPcm).put("pcm_sample_rates", org.json.JSONArray(capabilities.pcmSampleRates))
@@ -341,6 +397,7 @@ internal object Capture {
                     .put("supports_native_dsd", capabilities.supportsNativeDsd).put("native_dsd_bit_rates", org.json.JSONArray(capabilities.nativeDsdBitRates)))
                 val claim = JSONObject(session.validatorClaimEvidenceJson())
                 record("claim_confirmed", claim)
+                if (duplexClaimed) record("duplex_claim_confirmed", JSONObject(claim.toString()).put("capture_samples_recorded", false))
                 status = "Exclusive USB audio claim confirmed for ${info.productName} (configuration ${claim.optInt("configuration_id")}, interfaces ${claim.optJSONArray("claimed_interface_ids")}). Preparing tests…"
                 record("sdk_opened", JSONObject().put("capabilities", session.capabilities.toString()).put("startup_volume", "keep").put("fixed_output_allowed", true))
                 if (deviceLost) error("Selected DAC disconnected")
@@ -352,7 +409,7 @@ internal object Capture {
                 val legs = result.optJSONArray("legs")
                 val passed = (0 until (legs?.length() ?: 0)).count { legs?.optJSONObject(it)?.optString("status") == "passed_usb" }
                 val count = legs?.length() ?: 0
-                outcome = if (result.optString("termination_reason") == "retirement_failed") "USB retirement failed during validation. Inspect diagnostics." else when (result.optString("status")) { "passed_usb" -> "USB validation passed ($passed of $count cases)"; "cancelled" -> "Cancelled"; "device_lost" -> "Selected DAC lost during validation"; "no_cases" -> "No admitted exact playback cases. Inspect fallback results in the archive."; "failed" -> "Validation failed: ${result.optString("error", "unknown error")}"; else -> "Validation completed with findings ($passed of $count cases passed); see archive" }
+                outcome = if (result.optString("termination_reason") == "retirement_failed") "USB retirement failed during validation. Inspect diagnostics." else when (result.optString("status")) { "passed_usb" -> "USB validation passed ($passed of $count cases)"; "cancelled" -> "Cancelled"; "device_lost" -> "Selected DAC lost during validation"; "no_cases" -> "No admitted exact playback cases. Inspect fallback results in the archive."; "failed" -> result.optString("error").takeUnless { it.isBlank() || it == "null" }?.let { "Validation failed: $it" } ?: "Validation failed. Inspect case and fallback details in the archive."; else -> "Validation completed with findings ($passed of $count cases passed); see archive" }
                 result.optJSONArray("admission_results")?.let { probes ->
                     val unexpected = (0 until probes.length()).count { probes.optJSONObject(it)?.optString("admission") == "unexpected_admitted" }
                     val inconclusive = (0 until probes.length()).count { probes.optJSONObject(it)?.optString("admission") == "inconclusive" }
@@ -404,10 +461,10 @@ internal object Capture {
         record("error", JSONObject().put("stage", stage).put("type", e.javaClass.simpleName).put("code", (e as? DacException)?.code?.toString()).put("message", e.message))
     }
     fun observation(text: String, done: () -> Unit) {
-        if (text.isBlank() || !::directory.isInitialized || !archiveBelongsToDirectory) { done(); return }
-        active = true; status = "Adding observation and preparing archive…"
+        if (!::directory.isInitialized || !archiveBelongsToDirectory) { done(); return }
+        active = true; status = "Preparing archive…"
         worker.execute {
-            record("physical_observation", JSONObject().put("text", text))
+            if (text.isNotBlank()) record("physical_observation", JSONObject().put("text", text))
             val result = runCatching { archive() }
             main.post { active = false; result.onSuccess { status = "Archive ready.${warningSuffix()}"; done() }.onFailure { status = "Archive creation failed: ${it.message}. ${previousArchiveMessage()}" } }
         }
@@ -435,27 +492,45 @@ internal object Capture {
     }
     private fun archive() {
         archiveWarning = null
+        var nativeWarning: String? = null
         if (nativeStarted) runCatching { ValidatorBridge.flush() }.onFailure { error ->
-            val warning = "Native debug flush failed: ${error.message}; available evidence may be incomplete."
-            archiveWarning = warning
-            record("capture_warning", JSONObject().put("stage", "native_debug_flush").put("message", warning))
-            runCatching { File(directory, "capture-warning.json").writeText(JSONObject().put("stage", "native_debug_flush").put("message", warning).toString()) }
+            nativeWarning = "Native debug flush failed: ${error.message}; available evidence may be incomplete."
+            record("capture_warning", JSONObject().put("stage", "native_debug_flush").put("message", nativeWarning))
+            runCatching { File(directory, "capture-warning.json").writeText(JSONObject().put("stage", "native_debug_flush").put("message", nativeWarning).toString()) }
         }
         val priorWarning = File(directory, "capture-warning.json")
-        if (archiveWarning == null && priorWarning.isFile) archiveWarning = runCatching { JSONObject(priorWarning.readText()).optString("message").takeIf { it.isNotBlank() } }.getOrNull()
+        if (nativeWarning == null && priorWarning.isFile) nativeWarning = runCatching { JSONObject(priorWarning.readText()).optString("message").takeIf { it.isNotBlank() } }.getOrNull()
+        // Render from disk, so this also works before native start and after process recovery.
+        // Do not include a previous report if regeneration failed.
+        val htmlResult = runCatching {
+            ValidatorBridge.writeHtml(directory.absolutePath)
+            check(File(directory, "report.html").isFile) { "renderer did not produce report.html" }
+        }
+        val htmlWarning = htmlResult.exceptionOrNull()?.let { error ->
+            val warning = "HTML report generation failed: ${error.message}. Raw capture files are included; retry Save or Share to regenerate the report."
+            record("capture_warning", JSONObject().put("stage", "html_report").put("message", warning))
+            warning
+        }
+        archiveWarning = listOfNotNull(nativeWarning, htmlWarning).takeIf { it.isNotEmpty() }?.joinToString(" ")
         val target = File(app.filesDir, "archive-${System.currentTimeMillis()}-${System.nanoTime()}.zip")
         val temporary = File(app.filesDir, target.name + ".tmp")
         val marker = markerFile()
         if (marker.exists()) writeMarker(JSONObject().put("state", "pending").put("published_archive", target.name))
         try {
             ZipOutputStream(temporary.outputStream().buffered()).use { zip ->
-                directory.walkTopDown().filter { it.isFile && it.name != "pending.json" && it.name != "pending.json.tmp" && it.name != "capture-warning.json" }.forEach { file ->
+                directory.walkTopDown().filter { file ->
+                    file.isFile && file.name !in setOf("pending.json", "pending.json.tmp", "capture-warning.json", "report.html.tmp", "HTML_REPORT_UNAVAILABLE.txt") &&
+                        (file.name != "report.html" || htmlResult.isSuccess)
+                }.forEach { file ->
                     zip.putNextEntry(ZipEntry(file.relativeTo(directory).invariantSeparatorsPath)); file.inputStream().use { it.copyTo(zip) }; zip.closeEntry()
                 }
-                val warningFile = File(directory, "capture-warning.json")
-                val warning = archiveWarning?.let { JSONObject().put("stage", "native_debug_flush").put("message", it).toString() }
-                    ?: warningFile.takeIf { it.isFile }?.readText()
-                if (warning != null) { zip.putNextEntry(ZipEntry("capture-warning.json")); zip.write(warning.toByteArray(Charsets.UTF_8)); zip.closeEntry() }
+                if (nativeWarning != null) {
+                    val warning = JSONObject().put("stage", "native_debug_flush").put("message", nativeWarning).toString()
+                    zip.putNextEntry(ZipEntry("capture-warning.json")); zip.write(warning.toByteArray(Charsets.UTF_8)); zip.closeEntry()
+                }
+                if (htmlWarning != null) {
+                    zip.putNextEntry(ZipEntry("HTML_REPORT_UNAVAILABLE.txt")); zip.write(htmlWarning.toByteArray(Charsets.UTF_8)); zip.closeEntry()
+                }
             }
             check(temporary.renameTo(target)) { "Cannot publish archive" }
             archive = target; archiveBelongsToDirectory = true

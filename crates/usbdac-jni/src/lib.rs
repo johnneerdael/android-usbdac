@@ -20,6 +20,7 @@ mod dsd_pcm;
 mod json;
 mod listener;
 mod pioneer;
+mod playback;
 mod registry;
 mod routing;
 mod scarlett;
