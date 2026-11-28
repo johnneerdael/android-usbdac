@@ -3,7 +3,9 @@
 //! crate never changes hardware volume. USB delivery does not prove audibility.
 mod conversion_check;
 mod fallback;
+mod report_html;
 use fallback::run_fallback;
+pub use report_html::write_html_report;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -387,8 +389,12 @@ impl Capture {
             report.status = "device_lost".into();
         } else if report.cancelled {
             report.status = "cancelled".into();
-        } else if report.termination_reason.as_deref() == Some("retirement_failed") {
-            report.status = "completed_with_findings".into();
+        } else if report.termination_reason.as_deref() == Some("retirement_failed")
+            || !required_fallbacks_verified(&report)
+            || report.legs.len() != plans.len()
+            || report.admission_results.len() != probes.len()
+        {
+            report.status = "failed".into();
         } else if plans.is_empty()
             && report
                 .admission_results
@@ -445,6 +451,14 @@ impl Capture {
         let mut warnings = Vec::new();
         if let Err(error) = self.flush_debug() {
             warnings.push(format!("capture flush: {error}"));
+            self.record(
+                "capture_warning",
+                json!({"message":format!("capture flush: {error}")}),
+            );
+        }
+        if let Err(error) = write_html_report(&self.dir) {
+            let _ = fs::remove_file(self.dir.join("report.html"));
+            warnings.push(format!("HTML report unavailable: {error}"));
         }
         let destination = path.as_ref();
         let parent = destination
@@ -467,11 +481,17 @@ impl Capture {
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             let mut buffer = [0u8; 32 * 1024];
-            for name in ["timeline.jsonl", "debug.jsonl", "report.json"] {
+            for name in [
+                "timeline.jsonl",
+                "debug.jsonl",
+                "report.json",
+                "report.html",
+            ] {
                 let mut source = match File::open(self.dir.join(name)) {
                     Ok(file) => file,
                     Err(error)
-                        if name == "report.json" && error.kind() == io::ErrorKind::NotFound =>
+                        if (name == "report.json" || name == "report.html")
+                            && error.kind() == io::ErrorKind::NotFound =>
                     {
                         continue
                     }
@@ -769,8 +789,48 @@ impl Capture {
         result
     }
 }
+/// Exact refusals remain independently recorded; overall success additionally
+/// requires every requested fallback to be present and independently verified.
+fn required_fallbacks_verified(report: &Report) -> bool {
+    let verified = |fallback: &Value| {
+        fallback.get("status").and_then(Value::as_str) == Some("passed_usb")
+            && fallback
+                .pointer("/selection_verification/passed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && fallback
+                .pointer("/conversion_verification/passed")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && fallback
+                .get("target_wire_integrity")
+                .and_then(Value::as_str)
+                == Some("verified")
+    };
+    if !report.fallback_results.iter().all(verified) {
+        return false;
+    }
+    let required = report
+        .legs
+        .iter()
+        .filter(|leg| {
+            leg.status == "unsupported" && leg.error_stage.as_deref() == Some("negotiate")
+        })
+        .chain(
+            report
+                .admission_results
+                .iter()
+                .filter(|leg| leg.admission.as_deref() == Some("expected_rejected")),
+        );
+    required.into_iter().all(|leg| {
+        report.fallback_results.iter().any(|fallback| {
+            fallback.get("source_request").and_then(Value::as_str) == Some(leg.request.as_str())
+                && verified(fallback)
+        })
+    })
+}
 fn fallback_summary(value: &Value) -> Value {
-    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "conversion_verification": value.get("conversion_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
+    json!({"trigger": value.get("trigger"), "source_request": value.get("source_request"), "target_request": value.get("target_request"), "wire_format": value.get("wire_format"), "status": value.get("status"), "termination_reason": value.get("termination_reason"), "conversion": value.get("conversion"), "conversion_verification": value.get("conversion_verification"), "selection_verification": value.get("selection_verification"), "source_fidelity": value.get("source_fidelity"), "target_wire_integrity": value.get("target_wire_integrity"), "error": value.get("error"), "reason": value.get("reason")})
 }
 fn leg_summary(leg: &LegResult, advertised_identity: (u8, u8, u8, u8)) -> Value {
     let stats = &leg.evidence["stats"];
@@ -848,7 +908,7 @@ fn mark_stop(result: &mut LegResult, reason: &str, stage: &str) {
     );
 }
 fn format_json(f: &StreamFormat) -> Value {
-    json!({"encoding": format!("{:?}", f.encoding), "sample_rate": f.sample_rate, "counter_rate_hz": f.counter_rate_hz(), "channels": f.channels, "valid_bits": f.valid_bits, "subslot_bytes": f.subslot_bytes, "interface_number": f.interface_number, "alt_setting": f.alt_setting, "endpoint_address": f.endpoint_address, "service_interval_us": f.service_interval_us, "explicit_feedback": f.explicit_feedback, "pacing": format!("{:?}", f.pacing)})
+    json!({"encoding": format!("{:?}", f.encoding), "sample_rate": f.sample_rate, "counter_rate_hz": f.counter_rate_hz(), "channels": f.channels, "valid_bits": f.valid_bits, "subslot_bytes": f.subslot_bytes, "interface_number": f.interface_number, "alt_setting": f.alt_setting, "endpoint_address": f.endpoint_address, "service_interval_us": f.service_interval_us, "explicit_feedback": f.explicit_feedback, "pacing": format!("{:?}", f.pacing), "clock": f.clock.as_ref().map(|clock| json!({"control_interface":clock.control_interface, "source_id":clock.source_id, "resolution":clock.resolution.code(), "path":clock.path.iter().map(|hop| json!({"id":hop.id, "kind":hop.kind.code(), "detail":format!("{:?}",hop.kind)})).collect::<Vec<_>>() }))})
 }
 
 fn unix_ms() -> u128 {
@@ -1372,6 +1432,58 @@ mod tests {
         assert_eq!(native_dsd_rate(705_600, 4), Some(22_579_200));
         assert_eq!(native_dsd_rate(u32::MAX, 4), None);
         assert_eq!(native_dsd_rate(88_200, 0), None);
+    }
+    #[test]
+    fn required_fallback_requires_selection_conversion_and_usb_proof() {
+        let rejected = LegResult {
+            request: "source".into(),
+            advertised_alt: String::new(),
+            negotiated: None,
+            status: "expected_rejected".into(),
+            admission: Some("expected_rejected".into()),
+            error: None,
+            termination_reason: None,
+            error_stage: Some("negotiate".into()),
+            error_code: Some("unsupported".into()),
+            close_outcome: json!({"status":"not_opened"}),
+            payload_sha256: None,
+            payload_bytes: 0,
+            evidence: json!({}),
+        };
+        let mut report = Report {
+            schema_version: 1,
+            started_unix_ms: 0,
+            coverage: String::new(),
+            signal: Value::Null,
+            capabilities: Value::Null,
+            mode_coverage: Value::Null,
+            status: "running".into(),
+            plan: vec![],
+            unattempted_plan: vec![],
+            admission_plan: vec![],
+            unattempted_admission_plan: vec![],
+            admission_results: vec![rejected],
+            fallback_results: vec![],
+            termination_reason: None,
+            legs: vec![],
+            cancelled: false,
+            error: None,
+        };
+        assert!(!required_fallbacks_verified(&report));
+        report
+            .fallback_results
+            .push(json!({"source_request":"source", "status":"no_fallback"}));
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0] = json!({"source_request":"source", "status":"passed_usb", "selection_verification":{"passed":true}, "conversion_verification":{"passed":true}, "target_wire_integrity":"verified"});
+        assert!(required_fallbacks_verified(&report));
+        report.fallback_results[0]["selection_verification"]["passed"] = json!(false);
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0]["selection_verification"]["passed"] = json!(true);
+        report.fallback_results[0]["conversion_verification"]["passed"] = json!(false);
+        assert!(!required_fallbacks_verified(&report));
+        report.fallback_results[0]["conversion_verification"]["passed"] = json!(true);
+        report.fallback_results[0]["target_wire_integrity"] = json!("unverified");
+        assert!(!required_fallbacks_verified(&report));
     }
     #[test]
     fn mode_coverage_reports_admission_and_decoder_boundary() {

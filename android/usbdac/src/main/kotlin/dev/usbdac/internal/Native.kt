@@ -28,6 +28,7 @@ internal object Native {
     @JvmStatic external fun validatorCancel()
     @JvmStatic external fun validatorDeviceLost()
     @JvmStatic external fun validatorFlush()
+    @JvmStatic external fun validatorWriteHtml(directory: String)
     @JvmStatic external fun version(): String
     @JvmStatic external fun setLogLevel(level: Int)
 

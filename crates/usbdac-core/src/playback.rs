@@ -76,7 +76,11 @@ pub struct PlaybackDecision {
     /// Ordered planned requests; a success may stop before all were attempted.
     pub candidates: Vec<StreamRequest>,
     pub attempted_candidates: usize,
+    /// Typed, clean refusals for the attempted prefix before the selected request.
+    pub candidate_refusals: Vec<Error>,
     pub exact_refusal: Option<Error>,
+    /// Descriptor-backed source exclusion before any candidate USB mutation.
+    pub source_preflight_refusal: Option<String>,
     pub transform: PlaybackTransform,
     pub fidelity: PlaybackFidelity,
     /// Input framing at `PlaybackStream::write`. Native DSD is one byte/channel.
@@ -462,6 +466,85 @@ fn candidates(
 fn sort_candidates(candidates: &mut [Candidate]) {
     candidates.sort_by_key(|v| (v.fidelity, v.rate_rank, v.channels_rank, v.depth_rank));
 }
+/// Returns a conservative source exclusion only for a complete claimed descriptor scan.
+/// Unknown/opaque alternatives and unknown rates remain eligible for real negotiation.
+fn descriptor_exclusion(
+    complete: bool,
+    alts: &[crate::AltSetting],
+    native_only_aliases: &[(u8, u8, u8)],
+    source: &StreamRequest,
+) -> Option<String> {
+    if !complete || alts.is_empty() || matches!(source.encoding, Encoding::DoP) {
+        return None;
+    }
+    let desired = match source.encoding {
+        Encoding::Pcm => AltFormat::Pcm,
+        Encoding::PcmU8 => AltFormat::PcmU8,
+        Encoding::PcmFloat32 => AltFormat::PcmFloat32,
+        Encoding::DsdNative { .. } => AltFormat::Dsd,
+        Encoding::DoP => unreachable!(),
+    };
+    if alts.iter().any(|a| {
+        a.channels == source.channels
+            && a.format == AltFormat::Other
+            && !native_only_aliases.contains(&(
+                a.interface_number,
+                a.alt_setting,
+                a.endpoint_address,
+            ))
+    }) {
+        return None;
+    }
+    let matching: Vec<_> = alts
+        .iter()
+        .filter(|a| {
+            a.channels == source.channels
+                && a.format == desired
+                && (desired == AltFormat::Dsd || a.valid_bits == source.bit_depth)
+        })
+        .collect();
+    if matching.is_empty() {
+        return Some(
+            "complete descriptor snapshot has no matching encoding/channel/depth shape".into(),
+        );
+    }
+    let possibly_supported = matching.iter().any(|alt| {
+        // UAC1 descriptor rate lists can be incomplete; missing range evidence is unknown.
+        if alt.uac_version != crate::UacVersion::V2
+            || alt.rate_ranges.is_empty()
+            || alt
+                .rate_ranges
+                .iter()
+                .any(|r| r.min_hz == 0 || r.min_hz > r.max_hz)
+        {
+            return true;
+        }
+        let rate = match source.encoding {
+            Encoding::DsdNative { bit_rate } => {
+                let divisor = u32::from(alt.subslot_bytes) * 8;
+                if divisor == 0 || bit_rate.checked_rem(divisor) != Some(0) {
+                    return true;
+                }
+                bit_rate / divisor
+            }
+            _ => source.sample_rate,
+        };
+        alt.sample_rates.contains(&rate)
+            || alt.rate_ranges.iter().any(|r| {
+                rate >= r.min_hz
+                    && rate <= r.max_hz
+                    && (r.step_hz == 0 || (rate - r.min_hz).checked_rem(r.step_hz) == Some(0))
+            })
+    });
+    if possibly_supported {
+        None
+    } else {
+        Some(
+            "complete UAC2 descriptor snapshot and clock ranges exclude the exact source rate"
+                .into(),
+        )
+    }
+}
 fn exact_policy_allows(source: &StreamRequest, policy: &PlaybackPolicy) -> bool {
     let pcm_limit_ok = !matches!(
         source.encoding,
@@ -495,9 +578,11 @@ impl Dac {
                 "source channels must be between one and 32".into(),
             ));
         }
+        // Validate the source independently of descriptor or policy filtering.
+        crate::transport::api::playback_format_from_request(source)?;
         let frame = input_frame(source, &policy.conversion_options)?;
-        let allow_exact = exact_policy_allows(source, policy);
-        let policy_refusal = (!allow_exact).then(|| Error::Unsupported {
+        let policy_allows_exact = exact_policy_allows(source, policy);
+        let policy_refusal = (!policy_allows_exact).then(|| Error::Unsupported {
             reason: if matches!(source.encoding, Encoding::DoP) && !policy.dop_confirmed {
                 "DoP decoder has not been confirmed"
             } else {
@@ -507,47 +592,26 @@ impl Dac {
             offered: vec![],
         });
         let caps = self.capabilities()?;
+        let source_preflight_refusal = if policy_allows_exact {
+            descriptor_exclusion(
+                caps.exclusion_snapshot_complete,
+                &caps.alt_settings,
+                &caps.native_only_aliases,
+                source,
+            )
+        } else {
+            None
+        };
+        let allow_exact = policy_allows_exact && source_preflight_refusal.is_none();
         let all = candidates(&caps, source, policy)?;
-        let mut chosen = Vec::new();
-        for tier in [
-            PlaybackFidelity::Exact,
-            PlaybackFidelity::BitExact,
-            PlaybackFidelity::Lossless,
-            PlaybackFidelity::Lossy,
-        ] {
-            for channels in [
-                source.channels,
-                if source.channels == 1 {
-                    2
-                } else {
-                    source.channels
-                },
-            ] {
-                if let Some(candidate) = all
-                    .iter()
-                    .find(|c| c.fidelity == tier && c.request.channels == channels)
-                {
-                    if !chosen.contains(&candidate.request) {
-                        chosen.push(candidate.request);
-                    }
-                }
-            }
-        }
+        // A strict prefix preserves the global fidelity/rate/channel/depth ranking.
+        // The transport may attempt only a bounded prefix under one owner reservation.
         let capacity = if allow_exact { 7 } else { 8 };
-        chosen.truncate(capacity);
-        for candidate in &all {
-            if chosen.len() >= capacity {
-                break;
-            }
-            if !chosen.contains(&candidate.request) {
-                chosen.push(candidate.request);
-            }
-        }
-        chosen.sort_by_key(|r| {
-            all.iter()
-                .position(|c| c.request == *r)
-                .unwrap_or(usize::MAX)
-        });
+        let chosen: Vec<_> = all
+            .iter()
+            .take(capacity)
+            .map(|candidate| candidate.request)
+            .collect();
         let mut selected = Vec::new();
         if allow_exact {
             selected.push(*source);
@@ -555,11 +619,13 @@ impl Dac {
         selected.extend(chosen);
         if selected.is_empty() {
             return Err(policy_refusal.unwrap_or(Error::Unsupported {
-                reason: "no permitted playback format".into(),
+                reason: source_preflight_refusal
+                    .clone()
+                    .unwrap_or_else(|| "no permitted playback format".into()),
                 offered: vec![],
             }));
         }
-        let (format, attempted_candidates, first_refusal) =
+        let (format, attempted_candidates, first_refusal, candidate_refusals) =
             self.negotiate_playback_candidates(&selected)?;
         if !selected.iter().any(|r| exact_matches(r, &format)) || !permitted(policy, &format) {
             return Err(Error::InvalidState(
@@ -570,7 +636,7 @@ impl Dac {
         let refusal = if exact_selected {
             None
         } else {
-            policy_refusal.or(first_refusal)
+            policy_refusal.or_else(|| source_preflight_refusal.as_ref().map(|reason| Error::Unsupported { reason: format!("source descriptor preflight: {reason}; no source USB negotiation was attempted"), offered: vec![] })).or(first_refusal)
         };
         if exact_selected {
             if source.encoding == Encoding::Pcm {
@@ -583,7 +649,9 @@ impl Dac {
                         format,
                         candidates: selected,
                         attempted_candidates,
+                        candidate_refusals,
                         exact_refusal: None,
+                        source_preflight_refusal: None,
                         transform: PlaybackTransform::Direct,
                         fidelity: PlaybackFidelity::Exact,
                         source_frame_bytes: frame,
@@ -617,7 +685,9 @@ impl Dac {
                     format,
                     candidates: selected,
                     attempted_candidates,
+                    candidate_refusals,
                     exact_refusal: None,
+                    source_preflight_refusal: None,
                     transform,
                     fidelity: f,
                     source_frame_bytes: frame,
@@ -637,7 +707,9 @@ impl Dac {
                 format,
                 candidates: selected,
                 attempted_candidates,
+                candidate_refusals,
                 exact_refusal: None,
+                source_preflight_refusal: None,
                 transform: if repack {
                     PlaybackTransform::DopRepack {
                         target_channels: channels,
@@ -728,7 +800,9 @@ impl Dac {
             format,
             candidates: selected,
             attempted_candidates,
+            candidate_refusals,
             exact_refusal: refusal,
+            source_preflight_refusal,
             transform,
             fidelity,
             source_frame_bytes: frame,
@@ -1221,6 +1295,84 @@ fn unpack_dop_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn descriptor_alt(format: AltFormat, channels: u16, bits: u8) -> crate::AltSetting {
+        crate::AltSetting {
+            interface_number: 1,
+            alt_setting: 1,
+            endpoint_address: 1,
+            format,
+            channels,
+            subslot_bytes: 4,
+            valid_bits: bits,
+            rate_ranges: vec![crate::RateRange {
+                min_hz: 44_100,
+                max_hz: 48_000,
+                step_hz: 3_900,
+            }],
+            sample_rates: vec![44_100, 48_000],
+            sync_type: crate::SyncKind::Asynchronous,
+            feedback_endpoint: Some(0x81),
+            max_packet_bytes: 776,
+            service_interval_us: 125,
+            uac_version: crate::UacVersion::V2,
+            endpoint_interval: 1,
+            usage: crate::EndpointUsage::Data,
+            refresh: 0,
+            synch_address: 0,
+            pacing: Some(crate::Pacing::ExplicitFeedback { endpoint: 0x81 }),
+        }
+    }
+    #[test]
+    fn descriptor_preflight_only_excludes_proven_shapes_and_rates() {
+        let pcm = descriptor_alt(AltFormat::Pcm, 2, 32);
+        let native = descriptor_alt(AltFormat::Dsd, 2, 1);
+        let alts = vec![pcm.clone(), native.clone()];
+        assert!(
+            descriptor_exclusion(false, &alts, &[], &StreamRequest::pcm(8_000, 1, 16)).is_none()
+        );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(8_000, 1, 16)).is_some()
+        );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(8_000, 2, 32)).is_some()
+        );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &StreamRequest::pcm(44_100, 2, 32)).is_none()
+        );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &StreamRequest::dsd_native(2_822_400, 1))
+                .is_some()
+        );
+        assert!(
+            descriptor_exclusion(true, &alts, &[], &StreamRequest::dsd_native(2_822_400, 2))
+                .is_some()
+        );
+        let mut unknown = native.clone();
+        unknown.rate_ranges.clear();
+        assert!(descriptor_exclusion(
+            true,
+            &[pcm.clone(), unknown],
+            &[],
+            &StreamRequest::dsd_native(2_822_400, 2)
+        )
+        .is_none());
+        let mut opaque = pcm.clone();
+        opaque.format = AltFormat::Other;
+        assert!(descriptor_exclusion(
+            true,
+            &[pcm.clone(), opaque.clone()],
+            &[],
+            &StreamRequest::pcm_u8(44_100, 2)
+        )
+        .is_none());
+        assert!(descriptor_exclusion(
+            true,
+            &[pcm, opaque],
+            &[(1, 1, 1)],
+            &StreamRequest::pcm_u8(44_100, 2)
+        )
+        .is_some());
+    }
     #[test]
     fn policy_blocks_exact_before_negotiation() {
         let policy = PlaybackPolicy {

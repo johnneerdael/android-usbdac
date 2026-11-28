@@ -45,7 +45,7 @@ pub(super) fn preflight_implicit_feedback_interfaces(
     ))
 }
 
-fn structural_feedback_interfaces(
+pub(super) fn structural_feedback_interfaces(
     config: &ConfigDescriptor,
     handle: &DeviceHandle<Context>,
     speed: Speed,
@@ -1015,6 +1015,8 @@ pub(super) fn build_usb_capability_model(
         }
         let sample_rates = profile.sample_rates();
         return Ok(CapabilityModel {
+            exclusion_snapshot_complete: false,
+            native_only_aliases: Vec::new(),
             supported_sample_rates: sample_rates.clone(),
             link_speed: Some(link_speed_of(profile.speed)),
             alt_settings: vec![AltSetting {
@@ -1058,6 +1060,9 @@ pub(super) fn build_usb_capability_model(
         implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces))
     };
     let mut alt_settings = Vec::new();
+    let mut exclusion_snapshot_complete = true;
+    let mut playback_endpoints = Vec::new();
+    let mut native_only_aliases = Vec::new();
     let mut supported_sample_rates = Vec::new();
     let mut stream_rate_cache =
         std::collections::HashMap::<(u8, Option<u8>), Vec<SamplingFrequencySubrange>>::new();
@@ -1079,8 +1084,31 @@ pub(super) fn build_usb_capability_model(
                 continue;
             }
 
+            let endpoints: Vec<_> = descriptor
+                .endpoint_descriptors()
+                .filter(|ep| {
+                    ep.direction() == Direction::Out
+                        && ep.transfer_type() == TransferType::Isochronous
+                })
+                .map(|ep| {
+                    (
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        ep.address(),
+                    )
+                })
+                .collect();
+            let has_playback_endpoint = !endpoints.is_empty();
+            playback_endpoints.extend(endpoints);
+            if has_playback_endpoint && !claimed_interfaces.contains(&descriptor.interface_number())
+            {
+                exclusion_snapshot_complete = false;
+            }
             let Some(mut stream_format) = parse_android_streaming_interface_format(&descriptor)
             else {
+                if has_playback_endpoint {
+                    exclusion_snapshot_complete = false;
+                }
                 continue;
             };
             let ap80_dsd = matches_ap80_raw_dsd(
@@ -1351,6 +1379,18 @@ pub(super) fn build_usb_capability_model(
                         ),
                     )
                 };
+                if stream_format.format_tag == FORMAT_TAG_DSD
+                    && stream_format.native_dsd.is_some()
+                    && stream_format
+                        .uac2_formats
+                        .map_or(true, |bits| bits & 0b111 == 0)
+                {
+                    native_only_aliases.push((
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        endpoint.address(),
+                    ));
+                }
                 let base_alt = AltSetting {
                     interface_number: descriptor.interface_number(),
                     alt_setting: descriptor.setting_number(),
@@ -1646,7 +1686,19 @@ pub(super) fn build_usb_capability_model(
         )
     });
 
+    exclusion_snapshot_complete &= !playback_endpoints.is_empty()
+        && playback_endpoints
+            .iter()
+            .all(|(interface, alternate, endpoint)| {
+                alt_settings.iter().any(|alt| {
+                    alt.interface_number == *interface
+                        && alt.alt_setting == *alternate
+                        && alt.endpoint_address == *endpoint
+                })
+            });
     Ok(CapabilityModel {
+        exclusion_snapshot_complete,
+        native_only_aliases,
         supported_sample_rates,
         alt_settings,
         link_speed: Some(link_speed_of(effective_speed)),
@@ -2485,6 +2537,62 @@ pub(super) fn validate_android_usb_claims(
     validate_android_usb_claims_with_capture(claimed_handle, config_descriptor, &[])
 }
 
+/// Derive only the AudioControl and isochronous playback claims shared by
+/// Darwin acquisition and strict registration. Input-only AS is not playback.
+pub(super) fn required_playback_claims(config: &ConfigDescriptor) -> Result<Vec<u8>, String> {
+    let roles = config
+        .interfaces()
+        .flat_map(|interface| interface.descriptors())
+        .map(|descriptor| {
+            let audio = descriptor.class_code() == USB_CLASS_AUDIO;
+            let control = audio && descriptor.sub_class_code() == USB_SUBCLASS_AUDIOCONTROL;
+            let playback = audio
+                && descriptor.sub_class_code() == USB_SUBCLASS_AUDIOSTREAMING
+                && descriptor.endpoint_descriptors().any(|endpoint| {
+                    endpoint.direction() == Direction::Out
+                        && endpoint.transfer_type() == TransferType::Isochronous
+                });
+            (descriptor.interface_number(), control, playback)
+        });
+    required_claims_from_roles(roles)
+}
+fn required_claims_from_roles(
+    roles: impl IntoIterator<Item = (u8, bool, bool)>,
+) -> Result<Vec<u8>, String> {
+    let mut required = Vec::new();
+    let mut has_control = false;
+    let mut has_playback = false;
+    for (id, control, playback) in roles {
+        has_control |= control;
+        has_playback |= playback;
+        if (control || playback) && !required.contains(&id) {
+            required.push(id);
+        }
+    }
+    if !has_control || !has_playback {
+        return Err("USB configuration is missing audio control or playback interfaces".into());
+    }
+    required.sort_unstable();
+    Ok(required)
+}
+/// Limit optional acquisition to descriptor/topology-proven feedback and routing.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn optional_playback_claims(
+    required: &[u8],
+    feedback: &[u8],
+    routing: Option<u8>,
+) -> Vec<u8> {
+    let mut optional: Vec<_> = feedback
+        .iter()
+        .copied()
+        .chain(routing)
+        .filter(|id| !required.contains(id))
+        .collect();
+    optional.sort_unstable();
+    optional.dedup();
+    optional
+}
+
 fn validate_android_usb_claims_with_capture(
     claimed_handle: &ClaimedHandle,
     config_descriptor: &ConfigDescriptor,
@@ -2502,37 +2610,9 @@ fn validate_android_usb_claims_with_capture(
         }
         return Ok(());
     }
-    let mut required = HashSet::new();
-    let mut has_control = false;
-    let mut has_playback = false;
-    for interface in config_descriptor.interfaces() {
-        for descriptor in interface.descriptors() {
-            if descriptor.class_code() != USB_CLASS_AUDIO {
-                continue;
-            }
-            match descriptor.sub_class_code() {
-                USB_SUBCLASS_AUDIOCONTROL => {
-                    required.insert(descriptor.interface_number());
-                    has_control = true;
-                }
-                USB_SUBCLASS_AUDIOSTREAMING
-                    if descriptor.endpoint_descriptors().any(|endpoint| {
-                        endpoint.direction() == Direction::Out
-                            && endpoint.transfer_type() == TransferType::Isochronous
-                    }) =>
-                {
-                    required.insert(descriptor.interface_number());
-                    has_playback = true;
-                }
-                _ => {}
-            }
-        }
-    }
-    if !has_control || !has_playback {
-        return Err(
-            "USB configuration is missing audio control or playback interfaces".to_string(),
-        );
-    }
+    let required: HashSet<_> = required_playback_claims(config_descriptor)?
+        .into_iter()
+        .collect();
     let claimed: HashSet<_> = claimed_handle.claimed_interfaces.iter().copied().collect();
     // Refuse an incomplete base handoff before any topology GET_CUR/GET_RANGE
     // request can make libusb implicitly claim a control interface.
@@ -3702,5 +3782,25 @@ mod ap80_raw_data_tests {
             rates.iter().map(|r| r.min).collect::<Vec<_>>(),
             [88_200, 176_400, 352_800]
         );
+    }
+}
+
+#[cfg(test)]
+mod darwin_claim_regression {
+    use super::{optional_playback_claims, required_claims_from_roles};
+    #[test]
+    fn playback_excludes_unrelated_microphone_and_retains_proved_feedback() {
+        // AC 0; stereo OUT 1; unrelated microphone 2; HID 3.
+        let base = required_claims_from_roles([
+            (0, true, false),
+            (1, false, true),
+            (2, false, false),
+            (3, false, false),
+        ])
+        .unwrap();
+        assert_eq!(base, [0, 1]);
+        assert!(optional_playback_claims(&base, &[], None).is_empty());
+        assert_eq!(optional_playback_claims(&base, &[2, 2, 1], Some(3)), [2, 3]);
+        assert!(required_claims_from_roles([(0, true, false), (2, false, false)]).is_err());
     }
 }

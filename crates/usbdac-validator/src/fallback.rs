@@ -3,6 +3,44 @@ use super::*;
 use crate::conversion_check::ConversionCheck;
 use usbdac_core::playback::{PlaybackFidelity, PlaybackPolicy, PlaybackTransform};
 
+fn selection_proof(
+    source: &StreamRequest,
+    candidates: &[StreamRequest],
+    selected: &StreamRequest,
+    attempted: usize,
+    refusals: &[usbdac_core::Error],
+    exact_refusal: Option<&usbdac_core::Error>,
+    preflight: Option<&str>,
+) -> Value {
+    let selected_index = candidates
+        .iter()
+        .position(|candidate| candidate == selected);
+    let source_was_planned = candidates.first() == Some(source);
+    let source_refusal_kind = if preflight.is_some() {
+        "descriptor_preflight"
+    } else if exact_refusal.is_some() && !source_was_planned {
+        "policy"
+    } else if exact_refusal.is_some() {
+        "certified_clean_unsupported"
+    } else {
+        "none"
+    };
+    let source_evidence_ok = if source_was_planned {
+        selected_index == Some(0) || exact_refusal.is_some()
+    } else {
+        exact_refusal.is_some()
+    };
+    let passed = selected_index.is_some_and(|index| {
+        index + 1 == attempted
+            && refusals.len() == index
+            && refusals
+                .iter()
+                .all(|error| matches!(error, usbdac_core::Error::Unsupported { .. }))
+    }) && source_evidence_ok;
+    let higher_ranks = candidates.iter().zip(refusals).map(|(request, error)| json!({"request":format!("{request:?}"), "outcome":"certified_clean_unsupported", "code":error.code(), "message":error.to_string()})).collect::<Vec<_>>();
+    json!({"passed":passed, "selected_request":format!("{selected:?}"), "selected_index":selected_index, "index_base":0, "attempted_candidates":attempted, "higher_ranked_refusals":higher_ranks, "source_refusal_kind":source_refusal_kind, "source_preflight_refusal":preflight, "basis":"strict ranked prefix; driver advances only after same-owner clean Unsupported"})
+}
+
 fn emit_dop_markers(data: &mut [u8], channels: usize, slot: usize, phase: &mut bool) {
     for frame in data.chunks_exact_mut(channels * slot) {
         for word in frame.chunks_exact_mut(slot) {
@@ -27,7 +65,7 @@ pub(super) fn run_fallback(
         allow_dop_pcm: true,
         ..PlaybackPolicy::default()
     };
-    let mut evidence = json!({"source_request":format!("{source:?}"), "resolver":"production Dac::resolve_playback", "policy":format!("{policy:?}"), "status":"no_fallback", "source_fidelity":"not_tested", "target_wire_integrity":"not_tested", "conversion_verification":{"status":"not_tested"}, "dop_decoder":"not_observed"});
+    let mut evidence = json!({"source_request":format!("{source:?}"), "resolver":"production Dac::resolve_playback", "policy":format!("{policy:?}"), "status":"no_fallback", "source_fidelity":"not_tested", "target_wire_integrity":"not_tested", "conversion_verification":{"status":"not_tested", "passed":false}, "selection_verification":{"status":"not_verified", "passed":false}, "clock_feedback":{"clock":null, "clock_verified":null, "feedback_kind":null, "feedback_locked":null, "feedback_reports":null, "feedback_rate_hz":null, "payload_verified":null}, "dop_decoder":"not_observed"});
     if let Some(reason) = stop_reason(cancel, device_lost) {
         evidence["termination_reason"] = json!(reason);
         evidence["status"] = json!(reason);
@@ -62,6 +100,7 @@ pub(super) fn run_fallback(
     }
     evidence["target_request"] = json!(format!("{:?}", format.request));
     evidence["wire_format"] = format_json(&format);
+    evidence["clock_feedback"] = json!({"clock": evidence["wire_format"]["clock"], "feedback_kind": format.pacing.code(), "clock_verified":null, "feedback_locked":null, "feedback_reports":null, "feedback_rate_hz":null, "payload_verified":null});
     evidence["planned_candidates"] = json!(decision
         .candidates
         .iter()
@@ -74,6 +113,17 @@ pub(super) fn run_fallback(
         .exact_refusal
         .as_ref()
         .map(|e| json!({"code":e.code(), "message":e.to_string()})));
+    let verification = selection_proof(
+        source,
+        &decision.candidates,
+        &format.request,
+        decision.attempted_candidates,
+        &decision.candidate_refusals,
+        decision.exact_refusal.as_ref(),
+        decision.source_preflight_refusal.as_deref(),
+    );
+    let selection_pass = verification.get("passed").and_then(Value::as_bool) == Some(true);
+    evidence["selection_verification"] = verification;
     evidence["conversion"] = json!({"kind":format!("{fidelity:?}"), "description":format!("{:?}", decision.transform), "policy":format!("{:?}", policy.conversion_options)});
     evidence["source_fidelity"] = json!(format!("{fidelity:?}"));
     if let Some(reason) = stop_reason(cancel, device_lost) {
@@ -328,13 +378,26 @@ pub(super) fn run_fallback(
             .get("source_bytes")
             .and_then(Value::as_u64)
             .is_some_and(|n| n > 0);
+    evidence["clock_feedback"] = json!({
+        "clock": evidence["wire_format"]["clock"], "clock_verified":stats.clock_verified,
+        "feedback_kind":format.pacing.code(), "feedback_locked":stats.feedback_locked,
+        "feedback_reports":stats.feedback_reports, "feedback_rate_hz":stats.feedback_rate_hz,
+        "feedback_stale":stats.feedback_stale, "feedback_errors":stats.feedback_errors,
+        "feedback_timeouts":stats.feedback_timeouts, "feedback_rejected":stats.feedback_rejected,
+        "payload_verified":stats.payload_verified, "effective_rate_hz":stats.effective_rate_hz,
+        "completed_transfers":stats.completed_transfers, "lost_frames":stats.lost_frames,
+        "underruns":stats.underruns, "short_packets":stats.short_packets,
+        "zero_packets":stats.zero_packets, "urb_timeouts":stats.urb_timeouts,
+        "max_turnaround_us":stats.max_turnaround_us, "max_submit_gap_us":stats.max_submit_gap_us,
+        "max_worker_gap_us":stats.max_worker_gap_us
+    });
     evidence["conversion_verification"] = verification;
     evidence["conversion_verification"]["clipped_samples"] = json!(conversion.clipped_samples);
     evidence["conversion_verification"]["passed"] = json!(conversion_pass);
     evidence["target_wire_integrity"] = json!(if usb_pass { "verified" } else { "unverified" });
-    evidence["status"] = json!(if usb_pass && conversion_pass {
+    evidence["status"] = json!(if usb_pass && conversion_pass && selection_pass {
         "passed_usb"
-    } else if usb_pass && !conversion_pass && enough_samples {
+    } else if usb_pass && ((!conversion_pass && enough_samples) || !selection_pass) {
         "failed"
     } else if failure.is_none() {
         "inconclusive"
@@ -363,4 +426,58 @@ pub(super) fn run_fallback(
         }
     }
     evidence
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn only_exact_attempted_prefix_proves_selection() {
+        let source = StreamRequest::pcm(8_000, 1, 16);
+        let a = StreamRequest::pcm(44_100, 2, 24);
+        let b = StreamRequest::pcm(48_000, 2, 24);
+        let refusal = usbdac_core::Error::Unsupported {
+            reason: "descriptor preflight".into(),
+            offered: vec![],
+        };
+        let passed = selection_proof(
+            &source,
+            &[a, b],
+            &b,
+            2,
+            std::slice::from_ref(&refusal),
+            Some(&refusal),
+            Some("no source shape"),
+        );
+        assert_eq!(passed["passed"], true);
+        assert_eq!(
+            passed["higher_ranked_refusals"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(passed["source_refusal_kind"], "descriptor_preflight");
+        assert_eq!(
+            selection_proof(
+                &source,
+                &[a, b],
+                &b,
+                1,
+                std::slice::from_ref(&refusal),
+                Some(&refusal),
+                None
+            )["passed"],
+            false
+        );
+        assert_eq!(
+            selection_proof(
+                &source,
+                &[a, b],
+                &b,
+                2,
+                std::slice::from_ref(&refusal),
+                None,
+                None
+            )["passed"],
+            false
+        );
+    }
 }

@@ -229,6 +229,11 @@ pub struct AltSetting {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Capabilities {
+    /// All claimed playback OUT alternates in the cached descriptor snapshot parsed.
+    /// False means an absent shape cannot be inferred from the snapshot.
+    pub exclusion_snapshot_complete: bool,
+    /// Other alternatives whose descriptor proves a native-only DSD alias.
+    pub native_only_aliases: Vec<(u8, u8, u8)>,
     pub uac_version: UacVersion,
     pub link_speed: LinkSpeed,
     pub alt_settings: Vec<AltSetting>,
