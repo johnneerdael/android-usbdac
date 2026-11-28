@@ -121,6 +121,13 @@ internal object Capture {
         if (!::directory.isInitialized) return
         runCatching { File(directory, "android-events.jsonl").appendText(JSONObject().put("time_ms", System.currentTimeMillis()).put("kind", kind).put("data", data).toString() + "\n") }
     }
+    // Same shape as the macOS worker's host record, which the HTML report reads for host identity.
+    private fun recordHost() {
+        record("host", JSONObject().put("os", "android").put("arch", Build.SUPPORTED_ABIS.firstOrNull() ?: System.getProperty("os.arch"))
+            .put("os_version", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("manufacturer", Build.MANUFACTURER).put("model", Build.MODEL)
+            .put("app_version", runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName }.getOrNull())
+            .put("driver_version", UsbDac.nativeVersion).put("driver_version_source", "native library"))
+    }
     fun start(includeCompatibility: Boolean) {
         if (active) return
         runPolicy = if (includeCompatibility) QuirkPolicy.SOURCE_BACKED else QuirkPolicy.VERIFIED_ONLY
@@ -135,6 +142,7 @@ internal object Capture {
         archiveBelongsToDirectory = false; archiveWarning = null
         record("capture_started", JSONObject().put("sdk", Build.VERSION.SDK_INT).put("manufacturer", Build.MANUFACTURER).put("model", Build.MODEL).put("app_version", runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName }.getOrNull()).put("quirk_policy", runPolicy.name).put("require_hardware_volume", false).put("capture_feedback_trace", true).put("startup_volume", "KEEP"))
         try { ValidatorBridge.begin(directory.absolutePath); nativeStarted = true; record("driver_version", JSONObject().put("version", UsbDac.nativeVersion)) } catch (e: Throwable) { failure("native_begin", e); finish("Cannot start native capture"); return }
+        runCatching { recordHost() }
         receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (runId != generation || !active) return
@@ -405,7 +413,8 @@ internal object Capture {
                 status = "$permissionNote\nExclusive USB audio claim confirmed for ${info.productName} (configuration ${claim.optInt("configuration_id")}, interfaces ${claim.optJSONArray("claimed_interface_ids")}). Running tests…"
                 val report = session.runValidator(directory.absolutePath)
                 val result = JSONObject(report)
-                record("suite_result", result)
+                // report.json already holds the full result; the event log keeps a bounded summary.
+                record("suite_result", SuiteResultEvidence.summary(result))
                 val legs = result.optJSONArray("legs")
                 val passed = (0 until (legs?.length() ?: 0)).count { legs?.optJSONObject(it)?.optString("status") == "passed_usb" }
                 val count = legs?.length() ?: 0

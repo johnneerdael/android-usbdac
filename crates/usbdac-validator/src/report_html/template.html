@@ -872,6 +872,9 @@
         ["attachment", "selected", "attached"].includes(x.v.kind),
       );
       let host = timeline.find((x) => x.v.kind === "host");
+      // Android learns the active configuration only when it claims the interfaces.
+      const claim = timeline.find((x) => x.v.kind === "claim_confirmed");
+      const claimedConfiguration = obj(claim && claim.v.value).configuration_id;
       const started = timeline.find((x) => x.v.kind === "run_started");
       const runInfo = obj(started && started.v.value).info;
       let runProduct = obj(runInfo).product_name;
@@ -904,7 +907,7 @@
         ["Host", hostInfo.os || "Unavailable"],
         ["Architecture", hostInfo.arch || "Unavailable"],
         ["Driver", hostInfo.driver_version || "Unavailable"],
-        ["USB configuration", ev.active_configuration ?? "Unavailable"],
+        ["USB configuration", ev.active_configuration ?? claimedConfiguration ?? "Unavailable"],
         ["Overall result", complete ? "PASS" : "FAIL"],
       ]) {
         let wrap = el("div");
