@@ -102,4 +102,27 @@ class DopInputOutputTest {
         output.close()
         assertTrue(target.recorded.closed)
     }
+
+    // The unpacker holds whole DSD pairs only, so drain reaches the native-DSD adapter below it,
+    // which completes the final wire word with ALSA's DSD silence byte 0x69 (sound/core/pcm_misc.c).
+    @Test fun drainThroughNativeDsdPadsTheFinalWireWordWithDsdIdle() {
+        val recording = RecordingOutput()
+        val wire = object : PcmOutput by recording {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                val complete = buffer.remaining() / 8 * 8
+                if (complete == 0) return 0
+                val view = buffer.duplicate().apply { limit(position() + complete) }
+                val count = recording.write(view)
+                buffer.position(buffer.position() + count)
+                return count
+            }
+        }
+        val output = DopInputOutput(NativeDsdInputOutput(wire, channels = 2, wordBytes = 4), 2, 3)
+        val input = heapOf(3,1,5,4,2,5, 7,5,0xfa,8,6,0xfa, 11,9,5,12,10,5)
+        assertEquals(18, output.write(input))
+        assertEquals(listOf(1,2,3,4,5,6,7,8), recording.received.map { it.toInt() and 255 })
+        output.drain()
+        assertTrue(recording.calls.contains("drain"))
+        assertEquals(listOf(1,2,3,4,5,6,7,8, 9,10,11,12,0x69,0x69,0x69,0x69), recording.received.map { it.toInt() and 255 })
+    }
 }

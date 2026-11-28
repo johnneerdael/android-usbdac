@@ -44,6 +44,40 @@ class RealCoreRankingTest {
         output.close()
     }
 
+    // The mono expander holds no partial group, so drain reaches the stereo adapter below it, which
+    // completes the tail with ALSA's DSD silence byte 0x69 (sound/core/pcm_misc.c); the DoP framer
+    // frames that pad under the next DoP v1.1 marker.
+    @Test fun monoDsdExpansionDrainsAnIncompleteFinalGroupWithDsdIdle() {
+        assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
+        val native = RecordingOutput()
+        val nativeWire = object : PcmOutput by native {
+            override fun write(buffer: ByteBuffer): Int {
+                val complete = buffer.remaining() / 8 * 8
+                if (complete == 0) return 0
+                val view = buffer.duplicate().apply { limit(position() + complete) }
+                val count = native.write(view)
+                buffer.position(buffer.position() + count)
+                return count
+            }
+        }
+        val toNative = DsdMonoExpansionOutput(NativeDsdInputOutput(nativeWire, channels = 2, wordBytes = 4))
+        assertEquals(3, toNative.write(ByteBuffer.wrap(byteArrayOf(0x12, 0x34, 0x56))))
+        assertTrue(native.received.isEmpty())
+        toNative.drain()
+        assertTrue(native.calls.contains("drain"))
+        assertArrayEquals(byteArrayOf(0x12, 0x12, 0x34, 0x34, 0x56, 0x56, 0x69, 0x69), native.received.toByteArray())
+        toNative.close()
+
+        val dop = RecordingOutput()
+        val toDop = DsdMonoExpansionOutput(DsdDopOutput(dop, 2, 3, true))
+        assertEquals(3, toDop.write(ByteBuffer.wrap(byteArrayOf(0x12, 0x34, 0x56))))
+        toDop.drain()
+        assertTrue(dop.calls.contains("drain"))
+        assertEquals(listOf(0x34, 0x12, 0x05, 0x34, 0x12, 0x05, 0x69, 0x56, 0xfa, 0x69, 0x56, 0xfa),
+            dop.received.map { it.toInt() and 255 })
+        toDop.close()
+    }
+
     @Test fun expandedOutputsReturnAcceptedFramesBeforeTargetFailure() {
         assumeTrue("host conversion gate requires library loading", System.getenv("USBDAC_TEST_DSD_PCM") == "1")
         for (unsigned in listOf(true, false)) {

@@ -118,6 +118,60 @@ class DriverPlaybackSelectorTest {
         assertEquals(64 * 1024, output.writableBytes)
         output.close()
     }
+    // ALSA fills DSD silence with 0x69 (sound/core/pcm_misc.c pcm_formats[DSD_*].silence), so a
+    // DSF/DFF tail that is not a whole wire word drains with idle bytes instead of being refused.
+    @Test fun nativeDsdDrainPadsAnIncompleteFinalWireWordWithDsdIdle() {
+        for (wordBytes in listOf(2, 4, 8)) {
+            val wireFrame = 2 * wordBytes
+            val recording = RecordingOutput()
+            val wire = object : PcmOutput by recording {
+                override fun write(buffer: java.nio.ByteBuffer): Int {
+                    val complete = buffer.remaining() / wireFrame * wireFrame
+                    if (complete == 0) return 0
+                    val view = buffer.duplicate().apply { limit(position() + complete) }
+                    val count = recording.write(view)
+                    buffer.position(buffer.position() + count)
+                    return count
+                }
+            }
+            val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = wordBytes)
+            // One whole wire word, then one byte-frame short of the next.
+            val source = ByteArray(2 * wireFrame - 2) { (it + 1).toByte() }
+            assertEquals(source.size, output.write(java.nio.ByteBuffer.wrap(source)))
+            assertEquals(wireFrame, recording.received.size)
+            output.drain()
+            assertTrue(recording.calls.contains("drain"))
+            assertArrayEquals(source + byteArrayOf(0x69, 0x69), recording.received.toByteArray())
+            recording.drained = true
+            assertTrue(output.isDrained)
+            assertThrows(DacException::class.java) { output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2))) }
+            output.flush()
+            assertEquals(2, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(7, 8))))
+            output.drain()
+            assertArrayEquals(byteArrayOf(7, 8) + ByteArray(wireFrame - 2) { 0x69 },
+                recording.received.drop(source.size + 2).toByteArray())
+            output.close()
+        }
+    }
+    @Test fun nativeDsdDrainAfterTargetFailureRethrowsTheLatchedFailure() {
+        val recorded = RecordingOutput()
+        val failure = DacException(DacErrorCode.DEVICE_LOST, "target failed")
+        var attempts = 0
+        val wire = object : PcmOutput by recorded {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                if (!buffer.hasRemaining()) return 0
+                attempts++
+                throw failure
+            }
+        }
+        val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = 4)
+        assertEquals(6, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2, 3, 4, 5, 6))))
+        assertSame(failure, assertThrows(DacException::class.java) { output.drain() })
+        assertSame(failure, assertThrows(DacException::class.java) { output.drain() })
+        assertEquals(1, attempts)
+        assertFalse(recorded.calls.contains("drain"))
+        output.close()
+    }
     // DoP v1.1: a DoP wire carries DSD under marker bytes, and a native DSD wire carries DSD
     // words, so a PCM conversion must never be framed onto either. The core refuses DsdToPcm on a
     // DSD wire; the Kotlin selector holds the same invariant before it opens a stream.
