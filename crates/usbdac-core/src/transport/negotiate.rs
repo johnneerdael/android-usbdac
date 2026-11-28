@@ -102,16 +102,8 @@ fn uac1_type_i_excludes(extra: &[u8], request: PlaybackFormat) -> Option<bool> {
                 return None;
             }
             match d[2] {
-                1 => {
-                    if general.replace(d).is_some() {
-                        return None;
-                    }
-                }
-                2 => {
-                    if type_i.replace(d).is_some() {
-                        return None;
-                    }
-                }
+                1 if general.replace(d).is_some() => return None,
+                2 if type_i.replace(d).is_some() => return None,
                 _ => {}
             }
         }
@@ -241,8 +233,93 @@ fn direct_uac2_rate_exclusion(
     if choice.resolution != crate::clock_resolution::ClockResolution::Resolved {
         return None;
     }
-    let ranges = get_sampling_frequency_ranges(&claimed.handle, control, choice.source_id).ok()?;
+    let ranges =
+        get_uac2_sampling_frequency_ranges(&claimed.handle, control, choice.source_id).ok()?;
     if !complete_live_range_excludes(&ranges, rate) {
+        return None;
+    }
+    Some(LiveRateExclusion)
+}
+
+// A narrow, complete selector topology: a terminal feeds one selector whose
+// every input is an explicitly described source. Unrecognized or duplicate
+// entities are unknown, never evidence that a rate is absent.
+fn uac2_selector_sources(bytes: &[u8], terminal: u8) -> Option<(u8, Vec<u8>)> {
+    let mut entities = std::collections::HashMap::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let len = usize::from(*bytes.get(at)?);
+        if len < 3 || len > bytes.len() - at {
+            return None;
+        }
+        let d = &bytes[at..at + len];
+        at += len;
+        if d[1] != USB_DT_CS_INTERFACE || d[2] == 1 {
+            continue;
+        }
+        // A private or unknown entity may hide a conflicting clock route.
+        if !matches!(d[2], 2..=12) {
+            return None;
+        }
+        if len < 4 || d[3] == 0 || entities.insert(d[3], d).is_some() {
+            return None;
+        }
+    }
+    let t = *entities.get(&terminal)?;
+    let selector = match (t[2], t.len()) {
+        (2, 17) => t[7],
+        (3, 12) => t[8],
+        _ => return None,
+    };
+    let sel = *entities.get(&selector)?;
+    if sel[2] != 11 || sel.len() < 8 {
+        return None;
+    }
+    let count = usize::from(sel[4]);
+    if count == 0 || sel.len() != 7 + count || !matches!(sel[5 + count] & 3, 1 | 3) {
+        return None;
+    }
+    let sources = sel[5..5 + count].to_vec();
+    for source in &sources {
+        let d = *entities.get(source)?;
+        if d[2] != 10 || d.len() != 8 || !matches!(d[5] & 3, 1 | 3) {
+            return None;
+        }
+    }
+    Some((selector, sources))
+}
+
+fn selector_uac2_rate_exclusion(
+    claimed: &ClaimedHandle,
+    interface: u8,
+    terminal: Option<u8>,
+    rate: u32,
+) -> Option<LiveRateExclusion> {
+    let device = claimed.handle.device();
+    let (control, _) = owning_clock_graph(&device, &claimed.handle, interface)?;
+    if !claimed.claimed_interfaces.contains(&control) {
+        return None;
+    }
+    let config = device.active_config_descriptor().ok()?;
+    let raw = read_active_configuration_bytes_checked(&claimed.handle, &config).ok()?;
+    let ac = audio_control_descriptors_from_config(&raw, control);
+    let (selector, sources) = uac2_selector_sources(&ac, terminal?)?;
+    let pin = get_clock_selector_pin(&claimed.handle, control, selector).ok()?;
+    if pin == 0 || usize::from(pin) > sources.len() {
+        return None;
+    }
+    for source in sources {
+        // UAC2 deliberately exposes MIN only for ambiguous zero-resolution
+        // ranges; use the same policy as the production selector.
+        let ranges = get_uac2_sampling_frequency_ranges(&claimed.handle, control, source).ok()?;
+        if !complete_live_range_excludes(&ranges, rate) {
+            return None;
+        }
+    }
+    if get_clock_selector_pin(&claimed.handle, control, selector).ok()? != pin
+        || claimed.handle.active_configuration().ok()? != config.number()
+        || read_active_configuration_bytes_checked(&claimed.handle, &config).ok()? != raw
+    {
         return None;
     }
     Some(LiveRateExclusion)
@@ -340,7 +417,7 @@ fn complete_uac2_type_i(extra: &[u8]) -> bool {
     general && format
 }
 
-// Only immutable, fully described output incompatibility mints a clean refusal;
+// Only complete descriptor or fresh read-only clock incompatibility mints a clean refusal;
 // generic SelectError::NoMatch can also represent failed I/O or power changes.
 fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
     if format.is_dop || format.dsd_transport != DsdTransportMode::None {
@@ -392,12 +469,27 @@ fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, spee
                         format.sample_rate,
                     )
                     .is_none()
+                    && selector_uac2_rate_exclusion(
+                        claimed,
+                        alt.interface_number(),
+                        parsed.terminal_link,
+                        format.sample_rate,
+                    )
+                    .is_none()
                 {
                     return false;
                 }
             }
             0x30 if format.pcm_encoding == PcmEncoding::Signed => {
-                if !adc3::adc3_direct_rate_excludes(claimed, &config, &alt, speed, format) {
+                let badd_excludes = format.sample_rate != 48_000
+                    && read_active_configuration_bytes_checked(&claimed.handle, &config)
+                        .ok()
+                        .is_some_and(|raw| {
+                            adc3::badd_only_fixed_rate_witness(&config, &raw, speed) == 1
+                        });
+                if !badd_excludes
+                    && !adc3::adc3_direct_rate_excludes(claimed, &config, &alt, speed, format)
+                {
                     return false;
                 }
             }
@@ -1603,6 +1695,28 @@ mod evidence_tests {
         let mut bad_link = control;
         bad_link[7] = 6;
         assert!(!super::complete_uac2_direct_clock(&bad_link, 1, 5));
+    }
+
+    #[test]
+    fn selector_exclusion_requires_complete_sources_and_unambiguous_entities() {
+        let descriptors = [
+            17, 0x24, 2, 1, 1, 1, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0x24, 11, 40, 2, 16, 17, 3,
+            0, 8, 0x24, 10, 16, 0, 1, 0, 0, 8, 0x24, 10, 17, 0, 1, 0, 0,
+        ];
+        assert_eq!(
+            super::uac2_selector_sources(&descriptors, 1),
+            Some((40, vec![16, 17]))
+        );
+        assert_eq!(
+            super::uac2_selector_sources(&descriptors[..descriptors.len() - 8], 1),
+            None
+        );
+        let mut duplicate = descriptors.to_vec();
+        duplicate.extend_from_slice(&descriptors[26..34]);
+        assert_eq!(super::uac2_selector_sources(&duplicate, 1), None);
+        let mut unknown = descriptors;
+        unknown[23] = 18;
+        assert_eq!(super::uac2_selector_sources(&unknown, 1), None);
     }
 
     #[test]

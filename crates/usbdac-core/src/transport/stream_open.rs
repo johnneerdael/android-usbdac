@@ -931,16 +931,33 @@ fn start_stream_inner_with_capture(
     let mut adc3_status_clock_proven = false;
     let mut uac1_status_rate = None;
     if let Some(route) = adc3_route.as_ref() {
-        if let Err(error) =
-            configure_adc3(&claimed_handle.handle, route, playback_format.sample_rate)
-        {
-            duplex::cleanup_claimed(
+        if let Err(error) = adc3::configure_adc3_post_activation(
+            &claimed_handle.handle,
+            route,
+            playback_format.sample_rate,
+        ) {
+            set_clock_verification(
+                clock_control_attempted,
+                clock_control_succeeded,
+                false,
+                match &error {
+                    Error::ClockUnverified { reported_hz, .. } => *reported_hz,
+                    _ => None,
+                },
+            );
+            let restored = duplex::cleanup_claimed(
                 claimed_handle,
                 attachment.as_ref(),
                 Some(candidate.interface_number),
                 lock_requested,
             );
-            return Err(Error::Transfer(error));
+            return Err(if restored || matches!(error, Error::DeviceLost) {
+                error
+            } else {
+                Error::Transfer(
+                    "ADC3 clock verification failed and cleanup was not verified".into(),
+                )
+            });
         }
         // Both OUT and any embedded implicit IN alternate are active now.
         // Prove their advertised live PCM format before publishing the stream.

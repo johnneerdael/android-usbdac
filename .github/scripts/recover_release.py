@@ -1,6 +1,7 @@
 """Verify a failed automatic release before retrying its packaging only."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ import io
 import zipfile
 
 from prepare_release import (HISTORICAL_WORKFLOWS, RELEASE_IMPLEMENTATION, STABLE_VERSION,
-                             version_files, git, require_latest_reservation)
+                             version_files, git, require_latest_reservation, matches_adapter, reviewed_adapters)
 
 GATES = {
     "release-gates / Guide code samples",
@@ -20,21 +21,6 @@ GATES = {
     "release-gates / AAR, unit tests and sample",
 }
 PREPARE = "Select the release version and source"
-PACKAGE = "Build, test and publish the package"
-# Historical workflow layouts before and after the host-JNI input fix.  These
-# are legacy source-only recoveries, not evidence of identical binaries.
-LEGACY_BUILD_STEPS = {
-    "Build the AAR (all four ABIs), run the unit tests, build the sample",
-    "Build the AAR (all four ABIs) and sample",
-}
-NOT_REACHED = {
-    "Check whether the Rust crate version is published",
-    "Publish the Rust crate to crates.io",
-    "Check each Maven package before uploading",
-    "Publish the core to GitHub Packages",
-    "Publish the Media3 integration to GitHub Packages",
-    "Collect the release assets",
-}
 
 
 def fail(message):
@@ -47,50 +33,18 @@ def one(items, label):
     return items[0]
 
 
-def verify(run, jobs, log, gate_logs, run_id, version, repo, candidate, parent, declared):
-    if not STABLE_VERSION.fullmatch(version):
-        fail("Recovery requires a stable version")
-    if (run.get("id") != run_id or run.get("path") != ".github/workflows/release.yml"
-            or run.get("event") != "push" or run.get("head_branch") != "main"
-            or run.get("status") != "completed" or run.get("conclusion") != "failure"
-            or run.get("repository", {}).get("full_name") != repo
-            or run.get("head_repository", {}).get("full_name") != repo):
-        fail("Failed run is not a completed main push release in this repository")
-    observed_gates = [job.get("name") for job in jobs if job.get("name", "").startswith("release-gates / ")]
-    if len(observed_gates) != len(GATES) or set(observed_gates) != GATES:
-        fail("Prior release does not contain exactly the required gates")
-    for name in GATES | {PREPARE}:
-        job = one([j for j in jobs if j.get("name") == name], name)
-        if job.get("status") != "completed" or job.get("conclusion") != "success":
-            fail(f"Prior gate did not succeed: {name}")
-    for name in GATES:
-        checkout = re.findall(r"\[command\][^\n]*git log -1 --format=%H\r?\n[^\n]*Z ([0-9a-f]{40})(?:\r?\n|$)", gate_logs.get(name, ""))
-        if checkout != [candidate]:
-            fail(f"Prior gate did not check out the reserved commit: {name}")
-    package = one([j for j in jobs if j.get("name") == PACKAGE], PACKAGE)
-    if package.get("status") != "completed" or package.get("conclusion") != "failure":
-        fail("Prior package job did not fail")
-    steps = package.get("steps", [])
-    build = one([s for s in steps if s.get("name") in LEGACY_BUILD_STEPS], "known legacy AAR build step")
-    if build.get("conclusion") != "failure":
-        fail("Prior failure was not at the known AAR build step")
-    for name in NOT_REACHED:
-        if one([s for s in steps if s.get("name") == name], name).get("conclusion") != "skipped":
-            fail(f"Prior package may have published: {name}")
-    uploads = [s for s in steps if s.get("name", "").startswith("Run actions/upload-artifact@")]
-    if not uploads or any(s.get("conclusion") != "skipped" for s in uploads):
-        fail("Prior package artifact upload was not skipped")
-    if parent != run.get("head_sha") or declared != version:
-        fail("Reserved commit parent or declared version does not match")
-    matches = re.findall(r"\bRelease ([0-9]+\.[0-9]+\.[0-9]+) from ([0-9a-f]{40})\b", log)
-    if matches != [(version, candidate)]:
-        fail("Prior prepare log does not uniquely identify this version and commit")
-
-
 def api(*args):
     return subprocess.check_output(["gh", "api", *args], text=True)
 
 
+
+
+def same_repository(run, repo):
+    current = json.loads(api(f'repos/{repo}'))
+    repo_id = current.get('id')
+    if not isinstance(repo_id, int) or isinstance(repo_id, bool):
+        return False
+    return all(run.get(key, {}).get('id') == repo_id for key in ('repository', 'head_repository'))
 
 
 def verify_reservation(run, prepare, log, run_id, version, repo, candidate, parent, declared):
@@ -99,8 +53,7 @@ def verify_reservation(run, prepare, log, run_id, version, repo, candidate, pare
     if (run.get('id') != run_id or run.get('path') != '.github/workflows/release.yml'
             or run.get('event') != 'push' or run.get('head_branch') != 'main'
             or run.get('status') != 'completed' or run.get('conclusion') != 'failure'
-            or run.get('repository', {}).get('full_name') != repo
-            or run.get('head_repository', {}).get('full_name') != repo
+            or not same_repository(run, repo)
             or parent != run.get('head_sha') or declared != version
             or prepare.get('status') != 'completed' or prepare.get('conclusion') != 'success'):
         fail('Original release reservation or run identity mismatch')
@@ -119,11 +72,12 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
                        for path in RELEASE_IMPLEMENTATION)
         except subprocess.CalledProcessError:
             return False
-    schema_two = matches(None) or matches('16e5dc4d2d16304a8feab8ad54f774eda3f04a54')
+    schema_two = any(matches(ref) for ref in ('16e5dc4d2d16304a8feab8ad54f774eda3f04a54', '6255d00b83408d81dacfa3faff615dd99cd08ecd'))
+    schema_three = any(a['schema'] == 3 and matches_adapter(run['head_sha'], a['files']) for a in reviewed_adapters())
     historical = any(matches(ref) for ref in HISTORICAL_WORKFLOWS)
-    if not schema_two and not historical:
+    if not schema_two and not schema_three and not historical:
         fail('Unknown release workflow layout')
-    for name in (PREPARE, 'Seal release gate evidence'):
+    for name in ('Seal release gate evidence',):
         job = one([j for j in jobs if j.get('name') == name], name)
         if job.get('status') != 'completed' or job.get('conclusion') != 'success':
             fail(f'Required original job did not succeed: {name}')
@@ -135,12 +89,20 @@ def verify_staged(run, jobs, artifacts, repo, version, candidate, run_id, attemp
         if artifact.get('expired') or artifact.get('workflow_run', {}).get('id') != run_id:
             fail('Gate artifact expired or belongs to another run')
     raw = subprocess.check_output(['gh', 'api', f"repos/{repo}/actions/artifacts/{receipt['id']}/zip"])
+    if (not re.fullmatch(r'sha256:[0-9a-f]{64}', receipt.get('digest') or '')
+            or 'sha256:' + hashlib.sha256(raw).hexdigest() != receipt['digest']):
+        fail('Gate receipt archive digest mismatch')
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        if archive.namelist() != ['receipt.json']:
+        if archive.namelist() != ['receipt.json'] or archive.infolist()[0].external_attr >> 16 & 0o170000 == 0o120000:
             fail('Unexpected gate receipt archive')
         evidence = json.loads(archive.read('receipt.json'))
     schema = evidence.get('schema_version')
-    if schema == 2:
+    if schema == 3:
+        if not schema_three or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
+            fail('Unsupported gate identity or workflow')
+        if evidence.get('repository_id') != run.get('repository', {}).get('id'):
+            fail('Gate receipt repository ID mismatch')
+    elif schema == 2:
         if not schema_two or evidence.get('gate_identity') != 'usbdac-release-gates/v1':
             fail('Unsupported gate identity or workflow')
     elif schema == 1:
@@ -213,9 +175,9 @@ def main():
     repo = os.environ["GITHUB_REPOSITORY"]
     run = json.loads(api(f"repos/{repo}/actions/runs/{run_id}"))
     attempt = run.get("run_attempt")
-    if not isinstance(attempt, int) or attempt < 1:
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
         fail("Prior run has no valid attempt")
-    pages = json.loads(api("--paginate", "--slurp", f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"))
+    pages = json.loads(api("--paginate", "--slurp", f"repos/{repo}/actions/runs/{run_id}/attempts/1/jobs?per_page=100"))
     jobs = [job for page in pages for job in page["jobs"]]
     prepare = one([j for j in jobs if j.get("name") == PREPARE], PREPARE)
     log = api("--allow-escape-sequences", f"repos/{repo}/actions/jobs/{prepare['id']}/logs")
@@ -251,11 +213,10 @@ def main():
         if (run.get('id') != run_id or run.get('path') != '.github/workflows/release.yml'
                 or run.get('event') != 'workflow_dispatch' or run.get('head_branch') != 'main'
                 or run.get('status') != 'completed' or run.get('conclusion') != 'failure'
-                or run.get('repository', {}).get('full_name') != repo
-                or run.get('head_repository', {}).get('full_name') != repo
-                or not isinstance(attempt, int) or attempt < 1):
+                or not same_repository(run, repo)
+                or not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1):
             fail('Re-gating run identity mismatch')
-        pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100'))
+        pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/attempts/1/jobs?per_page=100'))
         jobs = [job for page in pages for job in page['jobs']]
         gate_prepare = one([j for j in jobs if j.get('name') == PREPARE], PREPARE)
         gate_prepare_log = api('--allow-escape-sequences', f"repos/{repo}/actions/jobs/{gate_prepare['id']}/logs")
@@ -264,23 +225,53 @@ def main():
             fail('Re-gating run did not verify the requested reservation')
     artifact_pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100'))
     artifacts = [item for page in artifact_pages for item in page['artifacts']]
-    if any(a.get('name', '').startswith(f'release-gate-receipt-{run_id}-{attempt}') for a in artifacts):
-        payload, receipt, evidence = verify_staged(run, jobs, artifacts, repo, args.version, candidate, run_id, attempt, reservation_run_id)
-        validators = validator_artifacts(jobs, artifacts, run_id, attempt) if has_validator else {}
+    for evidence_attempt in range(attempt, 0, -1):
+        receipt_name = f'release-gate-receipt-{run_id}-{evidence_attempt}'
+        if not any(a.get('name') == receipt_name for a in artifacts):
+            continue
+        pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/attempts/{evidence_attempt}/jobs?per_page=100'))
+        evidence_jobs = [job for page in pages for job in page['jobs']]
+        payload, receipt, evidence = verify_staged(run, evidence_jobs, artifacts, repo, args.version, candidate, run_id, evidence_attempt, reservation_run_id)
+        if evidence.get('schema_version') == 3:
+            subjects = evidence.get('validators')
+            if not isinstance(subjects, list) or len(subjects) != (2 if has_validator else 0):
+                fail('Invalid validator subject list')
+            validators = {}
+            if has_validator:
+                if {s.get('platform') for s in subjects} != {'android', 'mac'}:
+                    fail('Duplicate or unknown validator subject')
+                for subject in subjects:
+                    platform = subject['platform']
+                    producing_attempt = subject.get('run_attempt')
+                    if not isinstance(producing_attempt, int) or isinstance(producing_attempt, bool) or not 1 <= producing_attempt <= evidence_attempt:
+                        fail('Invalid validator producing attempt')
+                    obj = one([a for a in artifacts if a.get('id') == subject.get('artifact_id')], 'validator artifact')
+                    name = f'{platform}-validator-{run_id}-{producing_attempt}'
+                    if (obj.get('name') != name or obj.get('expired') or obj.get('workflow_run', {}).get('id') != run_id
+                            or subject.get('artifact_digest') != obj.get('digest')
+                            or not re.fullmatch(r'sha256:[0-9a-f]{64}', obj.get('digest') or '')
+                            or subject.get('run_id') != run_id or subject.get('source_sha') != candidate
+                            or subject.get('version') != declared or subject.get('repository_id') != run.get('repository', {}).get('id')):
+                        fail('Validator subject provenance mismatch')
+                    pages = json.loads(api('--paginate', '--slurp', f'repos/{repo}/actions/runs/{run_id}/attempts/{producing_attempt}/jobs?per_page=100'))
+                    producing_jobs = [job for page in pages for job in page['jobs']]
+                    label = 'Android' if platform == 'android' else 'macOS'
+                    job = one([j for j in producing_jobs if j.get('name') == f'Build the {label} validator'], f'{label} validator job')
+                    if job.get('status') != 'completed' or job.get('conclusion') != 'success':
+                        fail('Validator producing job did not succeed')
+                    validators[platform] = obj['id']
+        else:
+            validators = validator_artifacts(evidence_jobs, artifacts, run_id, evidence_attempt) if has_validator else {}
         with args.output.open('a') as output:
             print(f'version={declared}', f'commit={candidate}', 'recovered=true',
-                  f'source_run_id={run_id}', f'source_run_attempt={attempt}',
+                  f'source_run_id={run_id}', f'source_run_attempt={evidence_attempt}',
                   f'source_repository={evidence["repository"]}',
                   f'workflow_sha={run["head_sha"]}', f'reservation_run_id={reservation_run_id}', f'artifact_id={payload["id"]}',
                   f'receipt_id={receipt["id"]}', sep='\n', file=output)
             for kind, artifact_id in validators.items():
                 print(f'{kind}_validator_id={artifact_id}', file=output)
         return
-    # Legacy adapter is limited to the historical source-only release.  It does
-    # not turn a rebuild into digest-bound provenance.
-    if args.gate_run_id is not None or args.version != '0.1.10':
-        fail('No complete retained gate receipt; rerun all gates on reserved source')
-    fail('Historical source-only recovery cannot use the staged-artifact publisher')
+    fail('No complete retained gate receipt; rerun all gates on reserved source')
 
 
 if __name__ == "__main__":

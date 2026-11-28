@@ -8,6 +8,8 @@ import dev.usbdac.DacEvent
 import dev.usbdac.DacException
 import dev.usbdac.DacVolume
 import dev.usbdac.OutputChange
+import dev.usbdac.OutputKind
+import dev.usbdac.OutputPolicy
 import dev.usbdac.OutputSelector
 import dev.usbdac.PcmOutput
 import dev.usbdac.SelectedOutput
@@ -31,13 +33,20 @@ import kotlin.math.log10
  * Owns the selector and the output in use for the whole process, and tells the rest of the app what
  * happened. The service creates it once; the settings screen reads [selected] and [notice].
  */
-class DirectOutputController(
-    private val context: Context,
+class DirectOutputController internal constructor(
     settings: DirectOutputSettings,
     private val scope: CoroutineScope,
+    private val selectorFactory: (OutputPolicy) -> OutputSelector,
 ) : OutputSource {
+    constructor(context: Context, settings: DirectOutputSettings, scope: CoroutineScope) :
+        this(settings, scope, { policy -> OutputSelector(context, policy) })
     private val lock = Any()
-    private val selectors = MutableStateFlow(OutputSelector(context, settings.toPolicy()))
+    private var settings = settings
+    private var directRouteRequired = false
+    private fun selector() = selectorFactory(settings.toPolicy().let {
+        if (directRouteRequired) it.copy(force = OutputKind.DIRECT_USB) else it
+    })
+    private val selectors = MutableStateFlow(selector())
     @Volatile
     private var supportSnapshot = selectors.value.pcmSupportSnapshot()
     private var current: OpenedOutput? = null
@@ -70,8 +79,10 @@ class DirectOutputController(
     val changes: Flow<OutputChange> = selectors.flatMapLatest { it.changes }
 
     /** Takes effect at the next flush or format change, never in the middle of a track. */
-    fun apply(settings: DirectOutputSettings) {
-        val selector = OutputSelector(context, settings.toPolicy())
+    fun apply(settings: DirectOutputSettings) = synchronized(lock) {
+        this.settings = settings
+        if (!settings.takeOverDac) directRouteRequired = false
+        val selector = selector()
         selectors.value = selector
         supportSnapshot = selector.pcmSupportSnapshot()
         lookAgain = true
@@ -100,6 +111,11 @@ class DirectOutputController(
         lookAgain = false
         val selected = selectors.value.open(request)
         supportSnapshot = selectors.value.pcmSupportSnapshot()
+        if (selected.decision.kind == OutputKind.DIRECT_USB && !directRouteRequired) {
+            directRouteRequired = true
+            selectors.value = selector()
+            supportSnapshot = selectors.value.pcmSupportSnapshot()
+        }
         val opened = OpenedOutput(selected, selected.format, request, selected)
         current = opened
         mutableSelected.value = selected
@@ -121,7 +137,7 @@ class DirectOutputController(
     }
 
     override fun canRecover(error: DacException): Boolean =
-        error.code == DacErrorCode.DEVICE_LOST || error.code == DacErrorCode.TRANSFER
+        error.code == DacErrorCode.TRANSFER
 
     override fun close(output: OpenedOutput) = synchronized(lock) {
         watching?.cancel()

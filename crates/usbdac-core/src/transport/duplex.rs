@@ -1646,6 +1646,10 @@ impl InputPool {
             };
             self.order.pop_front();
             self.reordered[index] = false;
+            let Some(completed) = completed else {
+                self.slots[index].mark_completed();
+                return Err(Error::Transfer("duplex callback timestamp missing".into()));
+            };
             self.local_transfer_failure = false;
             if status != LIBUSB_TRANSFER_COMPLETED && status != LIBUSB_TRANSFER_NO_DEVICE {
                 if let Ok((_, false)) = capture_stream::inspect_slot(

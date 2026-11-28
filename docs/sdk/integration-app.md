@@ -149,6 +149,8 @@ Two rules behind the table.
 - **Do not fall back to the speaker silently.** A listener who chose a DAC and hears the phone speaker will not forgive it. Mornye's README: "A failure after direct-USB preparation never redirects to the speaker." Fall back to another output only when the listener's settings say it is acceptable, and when you do, show the reason.
 - **Decide fallback at a track boundary, not in the middle.** The selector cannot move a playing stream. A failure that ends the stream is a pause in which you may choose again.
 
+A successful write accepts the returned number of source bytes, equal to the buffer position change; a converter may still hold these bytes pending, so acceptance is not proof of audible playback. Use played frames for position. Keep the remainder after an error; correct invalid PCM padding for `INVALID_ARGUMENT` rather than masking, truncating or silently changing output.
+
 Failed packets and transfers are charged conservatively: bytes reported by a failed packet are not credited as delivered. The decaying loss budget and consecutive-failure limit bound recovery; malformed geometry or unsupported statuses remain terminal. `LOST_FRAMES` stays latched after music loss. See [loss handling](decisions-stream.md#loss-handling); these rules are software evidence, not a new phone measurement.
 
 ## Diagnostics and bug reports
@@ -191,3 +193,5 @@ Send what you find, with the log, to [the issue tracker](https://github.com/john
 - The manifest merges `android.hardware.usb.host` with `required="false"`, so your app is still offered on phones without host mode (the managed output works there).
 - Say in your own release notes which phones, DACs, formats and output paths you verified.
 - Credit: usbdac is MIT licensed. The `NOTICE` file records that it began from Flick's USB driver. Include both notices as the licence asks.
+
+The checked `isReadOnly` JNI lookup is intentionally retained for correctness; caching it is a performance follow-up requiring a live class reference. DSD tail synthesis retains a bounded scratch copy to handle small and unaligned output buffers.

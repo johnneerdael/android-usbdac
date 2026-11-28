@@ -58,4 +58,33 @@ class DriverPlaybackSelectorTest {
         assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8), recording.received.toByteArray())
         output.close()
     }
+    @Test fun nativeDsdFailureKeepsStagedBytesAndReturnsSourceProgress() {
+        val recorded = RecordingOutput()
+        val failure = DacException(DacErrorCode.DEVICE_LOST, "target failed")
+        var attempts = 0
+        val wire = object : PcmOutput by recorded {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                if (!buffer.hasRemaining()) return 0
+                attempts++
+                val limit = buffer.limit()
+                buffer.limit(buffer.position() + 8)
+                try { recorded.write(buffer) } finally { buffer.limit(limit) }
+                throw failure
+            }
+        }
+        val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = 4)
+        val input = java.nio.ByteBuffer.wrap(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+        assertEquals(10, output.write(input))
+        assertEquals(10, input.position())
+        assertEquals(1, input.remaining())
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8), recorded.received.toByteArray())
+        assertEquals(1L, output.latencyFrames)
+        assertEquals(0L, output.playedFrames)
+        assertSame(failure, assertThrows(DacException::class.java) { output.write(input) })
+        assertSame(failure, assertThrows(DacException::class.java) { output.flush() })
+        assertEquals(1, attempts)
+        output.close()
+        assertTrue(recorded.closed)
+    }
+
 }

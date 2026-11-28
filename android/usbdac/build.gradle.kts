@@ -69,6 +69,7 @@ dependencies {
 // The named host-JNI test must rerun when its native ranking implementation changes.
 tasks.withType<Test>().configureEach {
     val hostJni = providers.environmentVariable("USBDAC_TEST_HOST_JNI")
+    hostJni.orNull?.let { systemProperty("java.library.path", file(it).parentFile.absolutePath) }
     inputs.property("usbdacHostJniPath", hostJni.orElse(""))
     inputs.files(hostJni.map { listOf(file(it)) }.orElse(emptyList())).withPropertyName("usbdacHostJniLibrary")
 }
@@ -202,7 +203,7 @@ publishing {
         }
         maven {
             name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/${githubRepository ?: "johnneerdael/android-usbdac"}")
+            url = uri("https://maven.pkg.github.com/${githubRepository ?: "johnneerdael/usbdac"}")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")

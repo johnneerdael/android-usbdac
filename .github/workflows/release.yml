@@ -72,6 +72,15 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Require the reviewed release implementation
+        run: |
+          python3 - <<'PYPIN'
+          import os, sys
+          sys.path.insert(0, '.github/scripts')
+          from prepare_release import matches_adapter, reviewed_adapters
+          if not any(a.get('schema') == 3 and matches_adapter(os.environ['GITHUB_SHA'], a['files']) for a in reviewed_adapters()):
+              raise SystemExit('Release implementation differs from reviewed adapter; review and pin the complete layout')
+          PYPIN
       - name: Select and verify the release source
         id: source
         env:
@@ -140,6 +149,8 @@ jobs:
     timeout-minutes: 30
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -177,6 +188,8 @@ jobs:
     timeout-minutes: 60
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -238,14 +251,18 @@ jobs:
 
   gate-receipt:
     name: Seal release gate evidence
-    needs: [prepare, release-gates]
-    if: needs.release-gates.result == 'success'
+    needs: [prepare, release-gates, mac-validator, android-validator]
+    if: >-
+      ${{ always() && !cancelled() && needs.release-gates.result == 'success'
+      && ((needs.prepare.outputs.validator == 'true' && needs.mac-validator.result == 'success' && needs.android-validator.result == 'success')
+      || (needs.prepare.outputs.validator == 'false' && needs.mac-validator.result == 'skipped' && needs.android-validator.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
     outputs:
       receipt_id: ${{ steps.upload.outputs.artifact-id }}
+      evidence_run_attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -265,19 +282,41 @@ jobs:
           GATE_IDENTITY: usbdac-release-gates/v1
           ARTIFACT_ID: ${{ needs.release-gates.outputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ needs.release-gates.outputs.artifact_digest }}
+          ANDROID_VALIDATOR_ID: ${{ needs.android-validator.outputs.artifact_id }}
+          ANDROID_VALIDATOR_DIGEST: ${{ needs.android-validator.outputs.artifact_digest }}
+          ANDROID_VALIDATOR_ATTEMPT: ${{ needs.android-validator.outputs.artifact_attempt }}
+          MAC_VALIDATOR_ID: ${{ needs.mac-validator.outputs.artifact_id }}
+          MAC_VALIDATOR_DIGEST: ${{ needs.mac-validator.outputs.artifact_digest }}
+          MAC_VALIDATOR_ATTEMPT: ${{ needs.mac-validator.outputs.artifact_attempt }}
+          VALIDATOR: ${{ needs.prepare.outputs.validator }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 -I .github/scripts/release_artifact.py verify release-payload --version "$VERSION"
           mkdir gate-receipt
           python3 - <<'PYRECEIPT'
-          import hashlib, json, os
+          import hashlib, json, os, subprocess, sys
           from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from release_artifact import validator_subject
           e = os.environ
           if not e['ARTIFACT_ID'] or not e['ARTIFACT_DIGEST']:
               raise SystemExit('Missing gate payload identity')
           if e['GATE_IDENTITY'] != 'usbdac-release-gates/v1':
               raise SystemExit('Unsupported or missing gate identity')
-          receipt = dict(schema_version=2, gate_identity=e['GATE_IDENTITY'], repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
+          validators = []
+          if e['VALIDATOR'] == 'true':
+              for platform in ('android', 'mac'):
+                  prefix = platform.upper() + '_VALIDATOR_'
+                  artifact_id = e[prefix + 'ID']
+                  info = json.loads(subprocess.check_output(['gh', 'api', f"repos/{e['GITHUB_REPOSITORY']}/actions/artifacts/{artifact_id}"]))
+                  expected_name = f"{platform}-validator-{e['SOURCE_RUN_ID']}-{e[prefix + 'ATTEMPT']}"
+                  digest = 'sha256:' + e[prefix + 'DIGEST'].removeprefix('sha256:')
+                  if info.get('name') != expected_name or info.get('expired') or info.get('workflow_run', {}).get('id') != int(e['SOURCE_RUN_ID']) or info.get('digest') != digest:
+                      raise SystemExit('Validator artifact API identity mismatch')
+                  raw = subprocess.check_output(['gh', 'api', f"repos/{e['GITHUB_REPOSITORY']}/actions/artifacts/{artifact_id}/zip"])
+                  validators.append(validator_subject(raw, platform, artifact_id, digest, e['SOURCE_RUN_ID'], e[prefix + 'ATTEMPT'], e['VERSION'], e['SOURCE_SHA'], e['GITHUB_REPOSITORY_ID']))
+          receipt = dict(schema_version=3, validators=validators, repository_id=int(e['GITHUB_REPOSITORY_ID']), gate_identity=e['GATE_IDENTITY'], repository=e['GITHUB_REPOSITORY'], version=e['VERSION'],
               source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
               run_attempt=int(e['SOURCE_RUN_ATTEMPT']), reservation_run_id=int(e['RESERVATION_RUN_ID']), artifact_id=int(e['ARTIFACT_ID']),
               artifact_digest='sha256:' + e['ARTIFACT_DIGEST'].removeprefix('sha256:'), manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
@@ -314,7 +353,7 @@ jobs:
       SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
       WORKFLOW_SHA: ${{ needs.prepare.outputs.workflow_sha || github.sha }}
       SOURCE_RUN_ID: ${{ needs.prepare.outputs.source_run_id || github.run_id }}
-      SOURCE_RUN_ATTEMPT: ${{ needs.prepare.outputs.source_run_attempt || github.run_attempt }}
+      SOURCE_RUN_ATTEMPT: ${{ needs.prepare.outputs.source_run_attempt || needs.gate-receipt.outputs.evidence_run_attempt }}
       SOURCE_REPOSITORY: ${{ needs.prepare.outputs.source_repository || github.repository }}
       PAYLOAD_ID: ${{ needs.prepare.outputs.artifact_id || needs.release-gates.outputs.artifact_id }}
       RECEIPT_ID: ${{ needs.prepare.outputs.receipt_id || needs.gate-receipt.outputs.receipt_id }}
@@ -361,9 +400,9 @@ jobs:
           from pathlib import Path
           e = os.environ
           r = json.loads(Path('gate-receipt/receipt.json').read_text())
-          if r.get('schema_version') == 2 and r.get('gate_identity') != 'usbdac-release-gates/v1':
+          if r.get('schema_version') in (2, 3) and r.get('gate_identity') != 'usbdac-release-gates/v1':
               raise SystemExit('Unsupported gate identity')
-          if r.get('schema_version') not in (1, 2):
+          if r.get('schema_version') not in (1, 2, 3):
               raise SystemExit('Unsupported receipt schema')
           expected = dict(repository=e['SOURCE_REPOSITORY'], version=e['VERSION'],
               source_sha=e['SOURCE_SHA'], workflow_sha=e['WORKFLOW_SHA'], run_id=int(e['SOURCE_RUN_ID']),
@@ -371,6 +410,10 @@ jobs:
               manifest_sha256=hashlib.sha256(Path('release-payload/manifest.json').read_bytes()).hexdigest())
           if any(r.get(k) != v for k, v in expected.items()):
               raise SystemExit('Gate receipt or manifest mismatch')
+          if r.get('schema_version') == 3:
+              manifest = json.loads(Path('release-payload/manifest.json').read_text())
+              if r.get('repository_id') != int(e['GITHUB_REPOSITORY_ID']) or manifest.get('repository_id') != int(e['GITHUB_REPOSITORY_ID']):
+                  raise SystemExit('Gate evidence repository ID mismatch')
           PYCHECK
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
@@ -411,13 +454,18 @@ jobs:
           set -euo pipefail
           test -s "validator-assets/usbdac-validator-$VERSION-android.apk"
           test -s "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip"
+          python3 - <<'PYVALIDATOR'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from release_artifact import verify_validator_subjects
+          e = os.environ
+          receipt = json.loads(Path('gate-receipt/receipt.json').read_text())
+          if receipt.get('schema_version') == 3:
+              verify_validator_subjects(receipt, Path('validator-assets'), e['VERSION'], e['SOURCE_SHA'], e['GITHUB_REPOSITORY_ID'], e['SOURCE_RUN_ID'], e['SOURCE_RUN_ATTEMPT'], {'android': e['ANDROID_VALIDATOR_ID'], 'mac': e['MAC_VALIDATOR_ID']})
+          PYVALIDATOR
           unzip -tq "validator-assets/usbdac-validator-$VERSION-android.apk" >/dev/null
           unzip -tq "validator-assets/usbdac-validator-$VERSION-macos-arm64.zip" >/dev/null
-      - name: Publish and verify exact staged files
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
-        run: python3 .github/scripts/publish_release.py
       - name: Assemble release assets from the verified payload
         run: |
           set -euo pipefail
@@ -431,6 +479,18 @@ jobs:
           fi
           (cd release-assets && sha256sum -- * > SHA256SUMS.txt)
           python3 .github/scripts/release_notes.py --output release-notes.md
+      - name: Publish and verify exact staged files
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        run: python3 .github/scripts/publish_release.py
+      - name: Retain Maven publication incident
+        if: failure() && hashFiles('maven-publication-incident.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: maven-publication-incident-${{ github.run_id }}-${{ github.run_attempt }}
+          path: maven-publication-incident.json
+          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: release_assets
         with:
@@ -500,7 +560,7 @@ jobs:
               expected = {p.name: 'sha256:' + hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('dist/release-assets').iterdir() if p.is_file()}
               actual = {a['name']: a.get('digest') for a in release['assets']}
               notes = Path('dist/release-notes.md').read_text()
-              if release.get('draft') or tag_ref is None or expected != actual or (release.get('body') or '').strip() != notes.strip():
+              if release.get('draft') or release.get('prerelease') or len(actual) != len(release['assets']) or tag_ref is None or expected != actual or (release.get('body') or '').strip() != notes.strip():
                   raise SystemExit('Existing release, tag or asset digest differs; refusing replacement')
               print('Existing release and every asset match the verified payload')
           else:
@@ -508,8 +568,9 @@ jobs:
                   '--repo', repo, '--target', commit, '--title', f'usbdac {version}',
                   '--notes-file', 'dist/release-notes.md'], check=True)
           PYRELEASE
-      - name: Refresh the documentation after an automatic release
-        if: github.event_name == 'push'
+      - name: Refresh the documentation after publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run docs.yml --repo "$PUBLISH_REPOSITORY" --ref main
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.commit }}
+        run: gh workflow run docs.yml --repo "$PUBLISH_REPOSITORY" --ref main -f "published_version=$VERSION" -f "source_sha=$SOURCE_SHA"

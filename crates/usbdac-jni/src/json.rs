@@ -493,6 +493,9 @@ pub mod event_type {
 }
 
 /// Numeric code of an error, for `onEvent(ERROR, code, ...)`.
+/// Stable codes: busy 1, platform 2, claim 3, unsupported 4, clock 5, device lost 6,
+/// transfer 7, control 8, state 9, argument 10, implicit feedback 11, volume 12,
+/// host USB 13, reconfigure drain timeout 14, reconfigure unusable 15. String codes remain authoritative.
 pub fn error_code(error: &Error) -> i64 {
     match error {
         Error::Busy => 1,
@@ -507,6 +510,9 @@ pub fn error_code(error: &Error) -> i64 {
         Error::InvalidArgument(_) => 10,
         Error::ImplicitFeedbackUnsupported => 11,
         Error::VolumeUnavailable => 12,
+        Error::HostUsb { .. } => 13,
+        Error::ReconfigureDrainTimeout => 14,
+        Error::ReconfigureUnusable(_) => 15,
         _ => 0,
     }
 }
@@ -1160,6 +1166,55 @@ mod tests {
         assert_eq!((kind, code), (6, 12));
         assert!(message.unwrap().starts_with("usbdac:volume_unavailable: "));
         assert_eq!(error_code(&Error::VolumeUnavailable), 12);
+    }
+
+    #[test]
+    fn all_error_event_codes_and_messages_are_stable() {
+        use usbdac_core::HostUsbFailureKind;
+        let cases = vec![
+            (Error::Busy, 1),
+            (Error::PlatformUnsupported, 2),
+            (Error::Claim("x".into()), 3),
+            (
+                Error::Unsupported {
+                    reason: "x".into(),
+                    offered: vec![],
+                },
+                4,
+            ),
+            (
+                Error::ClockUnverified {
+                    requested_hz: 48000,
+                    reported_hz: None,
+                },
+                5,
+            ),
+            (Error::DeviceLost, 6),
+            (Error::Transfer("x".into()), 7),
+            (Error::Control("x".into()), 8),
+            (Error::InvalidState("x".into()), 9),
+            (Error::InvalidArgument("x".into()), 10),
+            (Error::ImplicitFeedbackUnsupported, 11),
+            (Error::VolumeUnavailable, 12),
+            (
+                Error::HostUsb {
+                    operation: "open".into(),
+                    kind: HostUsbFailureKind::Other,
+                    detail: "x".into(),
+                },
+                13,
+            ),
+            (Error::ReconfigureDrainTimeout, 14),
+            (Error::ReconfigureUnusable("x".into()), 15),
+        ];
+        for (error, expected) in cases {
+            let (kind, code, _, message) = event(&DacEvent::Error(error.clone()));
+            assert_eq!((kind, code), (event_type::ERROR, expected));
+            assert_eq!(
+                message,
+                Some(format!("usbdac:{}: {}", error.code(), error.message()))
+            );
+        }
     }
 
     #[test]

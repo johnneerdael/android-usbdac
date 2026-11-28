@@ -1,0 +1,15 @@
+[
+  {
+    "files": {
+      ".github/scripts/prepare_release.py": "9457758fe59d2d1c1394f801da0fea2ab283456eb554163a68f9f8ed89607092",
+      ".github/scripts/publish_release.py": "fc1cd2b6b6f5e6bc1a1482c665536e4108dfba96e8ff9d4bc68ee8cccc3ba8c0",
+      ".github/scripts/recover_release.py": "b1f9ecf797ec4b57c1dced0ff7baf73624a7359191c4e37176e3824893c6da20",
+      ".github/scripts/release_artifact.py": "64cd1bcc7d19b63db791e2d3dd8a147f52befcb5812cfb921c093f1540ce80ae",
+      ".github/scripts/release_notes.py": "f6967c60eacfd24e2cf9c0cf0941c96058be8892ef3d765add01a1e9f75cb1f4",
+      ".github/workflows/ci.yml": "7673bb0f282905579fddde0f9766b483a752315834f59c856cc2101c3a1df670",
+      ".github/workflows/release.yml": "906f6c980807817a1ff838002118233fbd2e09465f3845ff0f53cb4a5e826f76"
+    },
+    "gate_identity": "usbdac-release-gates/v1",
+    "schema": 3
+  }
+]

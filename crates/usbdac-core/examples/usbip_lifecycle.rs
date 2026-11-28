@@ -88,7 +88,9 @@ mod linux {
             dac.negotiate(&StreamRequest::pcm(96_000, 2, 16)),
             Err(Error::Unsupported { .. })
         ));
-        let format = dac.negotiate(&StreamRequest::pcm(48_000, 2, 16))?;
+        let format = dac.negotiate(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+        )?;
         assert_eq!(
             (
                 format.sample_rate,
@@ -123,7 +125,9 @@ mod linux {
         stream.play()?;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(3)
-            && (stream.played_frames() == 0 || stream.stats().completed_transfers == 0)
+            && (stream.played_frames() == 0
+                || stream.stats().completed_transfers == 0
+                || stream.stats().feedback_reports == 0)
         {
             let n = stream.writable_bytes().min(pcm.len());
             if n >= 4 {
@@ -134,8 +138,8 @@ mod linux {
         let stats = stream.stats();
         println!("BADD_PCM_STATS {stats:?}");
         assert!(
-            stats.played_frames > 0 && stats.completed_transfers > 0,
-            "BADD playback has no real completions"
+            stats.played_frames > 0 && stats.completed_transfers > 0 && stats.feedback_reports > 0,
+            "BADD playback or feedback has no real completions"
         );
         stream.close()?;
         Ok(())
@@ -145,6 +149,7 @@ mod linux {
         dac: Dac,
         fd: i32,
         caps: &usbdac_core::Capabilities,
+        volatile: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use usbdac_core::routing::{
             ControlKey, Entity, RouteEdit, RouteValue, RoutingHandBackOutcome,
@@ -174,12 +179,25 @@ mod linux {
             }],
         )?;
         assert_eq!(report.changed, vec![key]);
+        let applied = out_of_band("snapshot")?;
+        assert!(
+            applied.contains("selector=[2]"),
+            "fixture selector was not written: {applied}"
+        );
+        assert!(
+            applied.contains(if volatile {
+                "selector_state=1"
+            } else {
+                "selector_state=2"
+            }),
+            "unexpected fixture selector after D2: {applied}"
+        );
         assert_eq!(power(fd)?, 2, "apply must restore D2");
         let updated = dac.routing_discover_powered()?;
         assert_eq!(
             dac.routing_read_powered(&updated, key)?,
-            RouteValue::SelectorPin(2),
-            "selector must survive power cycling"
+            RouteValue::SelectorPin(if volatile { 1 } else { 2 }),
+            "selector readback must reflect the fixture's D2 behavior"
         );
         assert_eq!(power(fd)?, 2);
         dac.close()?;
@@ -188,13 +206,19 @@ mod linux {
             .hand_back_report()
             .ok_or("missing routing hand-back report")?;
         println!("UAC3_HAND_BACK {hand_back:?}");
-        assert!(
-            hand_back
-                .controls
-                .contains(&(key, RoutingHandBackOutcome::Restored)),
-            "selector hand-back was not verified"
-        );
+        if !volatile {
+            assert!(
+                hand_back
+                    .controls
+                    .contains(&(key, RoutingHandBackOutcome::Restored)),
+                "selector hand-back was not verified"
+            );
+        }
         assert_eq!(power(fd)?, 2, "final power must be D2");
+        assert!(
+            out_of_band("snapshot")?.contains("selector_state=1"),
+            "fixture selector was not restored"
+        );
         assert_eq!(alt(fd)?, 0);
         for interface in [1, 0] {
             claim(fd, interface, false)?;
@@ -301,6 +325,31 @@ mod linux {
         }
         assert!(marker_frames > 0, "no actual capture marker");
         println!("DUPLEX_CAPTURE_MARKER frames={marker_frames}");
+        out_of_band("mixed")?;
+        let mixed_start = Instant::now();
+        while mixed_start.elapsed() < Duration::from_secs(5) {
+            feed(&playback, &pcm)?;
+            let frames = capture.read(&mut received)?;
+            assert!(
+                received[..frames * 4]
+                    .chunks_exact(4)
+                    .all(|frame| frame == [0x34, 0x12, 0xcc, 0xed]),
+                "invalid packet leaked into capture"
+            );
+            let stats = capture.stats();
+            if stats.short_packets > 0 && stats.failed_packets > 0 && stats.malformed_packets > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mixed_stats = capture.stats();
+        assert!(
+            mixed_stats.short_packets > 0
+                && mixed_stats.failed_packets > 0
+                && mixed_stats.malformed_packets > 0,
+            "mixed packet statuses not observed: {mixed_stats:?}"
+        );
+        println!("DUPLEX_MIXED_PACKETS {mixed_stats:?}");
         vendor(fd, 1)?;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) && capture.state() == CaptureState::Active {
@@ -430,6 +479,7 @@ mod linux {
             previous.played_frames() > 0,
             "original playback never completed"
         );
+        out_of_band("reset")?;
         println!("RECONFIGURE_PHASE_BEGIN from=96000 to=48000");
         let request = StreamRequest::pcm(48_000, 2, 16);
         let replacement = dac.reconfigure_stream_candidates(
@@ -449,6 +499,33 @@ mod linux {
         assert_eq!(replacement.stream.format().sample_rate, 48_000);
         assert_eq!(replacement.stream.played_frames(), 0);
         assert_eq!(alt(fd)?, 1);
+        let transitions = out_of_band("snapshot")?;
+        let alt_history = transitions
+            .split("alts=[")
+            .nth(1)
+            .ok_or("missing alternate history")?
+            .split(']')
+            .next()
+            .ok_or("missing alternate terminator")?;
+        let unlink_count: u64 = transitions
+            .split("unlinks=")
+            .nth(1)
+            .ok_or("missing unlink count")?
+            .parse()?;
+        assert!(
+            unlink_count <= 16,
+            "more than one bounded transfer set cancelled: {transitions}"
+        );
+        let mut alts: Vec<_> = alt_history.split(", ").collect();
+        alts.dedup();
+        assert_eq!(
+            alts,
+            ["0", "1"],
+            "unexpected alternate transitions: {transitions}"
+        );
+        let mut current = [0u8; 4];
+        assert_eq!(control(fd, 0xa1, 1, 0x0100, 0x1000, &mut current)?, 4);
+        assert_eq!(u32::from_le_bytes(current), 48_000);
         let stream = replacement.stream;
         for _ in 0..3 {
             stream.write(&pcm)?;
@@ -465,7 +542,21 @@ mod linux {
             stream.played_frames() > 0 && stream.stats().completed_transfers > 0,
             "replacement playback never completed"
         );
-        println!("RECONFIGURE_PLAYBACK_PASS stats={:?}", stream.stats());
+        let stats = stream.stats();
+        assert!(stats.played_frames <= stats.frames_written);
+        assert!(stats.queued_frames <= stats.frames_written);
+        assert!(
+            stats.underruns <= 50,
+            "USB/IP replacement exceeded 50 underruns: {stats:?}"
+        );
+        let fixture_stats = out_of_band("snapshot")?;
+        assert!(
+            !fixture_stats.contains("out_completions=0"),
+            "replacement has no completed OUT URB: {fixture_stats}"
+        );
+        println!(
+            "RECONFIGURE_PLAYBACK_PASS stats={stats:?} underrun_limit=50 fixture={fixture_stats}"
+        );
         stream.close()?;
         let retirement = dac.retirement();
         dac.close()?;
@@ -488,10 +579,16 @@ mod linux {
                     | "stale-cur"
                     | "badd"
                     | "full-uac3"
+                    | "full-uac3-volatile"
                     | "full-uac3-clock"
+                    | "full-uac3-clock-bad"
+                    | "full-uac3-clock-stale"
                     | "duplex"
                     | "retire"
                     | "reconfigure"
+                    | "selector"
+                    | "refuse-set"
+                    | "zero-res"
             )
         {
             return Err(
@@ -519,7 +616,11 @@ mod linux {
         // Select the explicitly advertised fixture configuration before interface claims.
         let configuration = match args[2].as_str() {
             "badd" => 2u32,
-            "full-uac3" | "full-uac3-clock" => 3,
+            "full-uac3"
+            | "full-uac3-volatile"
+            | "full-uac3-clock"
+            | "full-uac3-clock-bad"
+            | "full-uac3-clock-stale" => 3,
             _ => 1,
         };
         if configuration != 1 {
@@ -556,7 +657,10 @@ mod linux {
             claim(fd, u32::from(interface), true)?;
         }
         assert_eq!(alt(fd)?, 0);
-        if matches!(args[2].as_str(), "badd" | "full-uac3") {
+        if matches!(
+            args[2].as_str(),
+            "badd" | "full-uac3" | "full-uac3-volatile"
+        ) {
             assert_eq!(power(fd)?, 0, "power domain must initially be D0");
             let mut state = [2u8];
             assert_eq!(control(fd, 0x21, 1, 0x0200, 0x0a00, &mut state)?, 1);
@@ -586,24 +690,111 @@ mod linux {
             return reconfigure(dac, fd);
         }
         let caps = dac.capabilities()?;
+        if args[2] == "refuse-set" {
+            out_of_band("reset")?;
+            let requests = [
+                StreamRequest::pcm(96_000, 2, 16),
+                StreamRequest::pcm(48_000, 2, 16),
+            ];
+            let failure = dac.negotiate_candidates(&requests);
+            assert!(
+                matches!(
+                    failure,
+                    Err(Error::ClockUnverified {
+                        requested_hz: 96_000,
+                        ..
+                    })
+                ),
+                "refused SET must be terminal: {failure:?}"
+            );
+            let snapshot = out_of_band("snapshot")?;
+            let rates = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+            assert!(rates.contains("96000"));
+            assert!(
+                !rates.contains("48000"),
+                "second candidate was tried after uncertain SET: {snapshot}"
+            );
+            let retirement = dac.retirement();
+            dac.close()?;
+            assert!(retirement.wait(Duration::from_secs(3)));
+            assert_eq!(alt(fd)?, 0);
+            for interface in [1, 0] {
+                claim(fd, interface, false)?;
+            }
+            println!("USBIP_LIFECYCLE_PASS mode=refuse-set snapshot={snapshot}");
+            return Ok(());
+        }
+        if matches!(args[2].as_str(), "selector" | "zero-res") {
+            let (requested, expected) = if args[2] == "selector" {
+                (192_000, 96_000)
+            } else {
+                (96_000, 44_100)
+            };
+            out_of_band("reset")?;
+            let request =
+                StreamRequest::pcm(requested, 2, 16).with_rate_policy(RatePolicy::NearestSupported);
+            let format = dac.negotiate(&request)?;
+            assert_eq!(format.sample_rate, expected);
+            let stream = dac.open_stream(&format, Arc::new(|_| {}))?;
+            let snapshot = out_of_band("snapshot")?;
+            let rates = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+            let rejected = requested.to_string();
+            assert!(
+                !rates
+                    .split(|c: char| !c.is_ascii_digit())
+                    .any(|v| v == rejected),
+                "requested unsupported rate was sent: {snapshot}"
+            );
+            println!(
+                "NEGOTIATE_CASE mode={} requested={requested} actual={expected} {snapshot}",
+                args[2]
+            );
+            stream.close()?;
+            let retirement = dac.retirement();
+            dac.close()?;
+            assert!(retirement.wait(Duration::from_secs(3)));
+            assert_eq!(alt(fd)?, 0);
+            for interface in [1, 0] {
+                claim(fd, interface, false)?;
+            }
+            println!("USBIP_LIFECYCLE_PASS mode={} retired=true", args[2]);
+            return Ok(());
+        }
         if args[2] == "badd" {
             badd(&dac, fd, &caps)?;
             assert_eq!(alt(fd)?, 0);
             dac.close()?;
             assert!(Dac::await_usb_retirement(Duration::from_secs(3)));
             assert_eq!(alt(fd)?, 0);
+            assert_eq!(power(fd)?, 2, "BADD must restore D2");
+            let power_log = out_of_band("snapshot")?;
+            let powers = power_log
+                .split("power=[")
+                .nth(1)
+                .ok_or("missing power history")?
+                .split(']')
+                .next()
+                .ok_or("missing power terminator")?;
+            assert!(
+                powers
+                    .split(", ")
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair == ["0", "2"]),
+                "expected D0 to D2 transition: {power_log}"
+            );
             for interface in [1, 0] {
                 claim(fd, interface, false)?;
             }
             println!("USBIP_LIFECYCLE_PASS mode=badd alt=0 retired=true");
             return Ok(());
         }
-        if args[2] == "full-uac3" {
-            return full_uac3(dac, fd, &caps);
+        if matches!(args[2].as_str(), "full-uac3" | "full-uac3-volatile") {
+            return full_uac3(dac, fd, &caps, args[2] == "full-uac3-volatile");
         }
         assert_eq!(
             caps.uac_version,
-            if args[2] == "full-uac3-clock" {
+            if args[2].starts_with("full-uac3-clock") {
                 UacVersion::V3
             } else {
                 UacVersion::V2
@@ -639,7 +830,7 @@ mod linux {
         assert_eq!(format.endpoint_address, 0x01);
         assert_eq!(format.link_speed, LinkSpeed::High);
         assert_eq!(format.bytes_per_frame(), 4);
-        if args[2] == "full-uac3-clock" {
+        if args[2].starts_with("full-uac3-clock") {
             assert_eq!(format.service_interval_us, 125);
             assert!(!format.explicit_feedback);
         }
@@ -652,7 +843,7 @@ mod linux {
             (clock.control_interface, clock.source_id),
             (
                 0,
-                if args[2] == "full-uac3-clock" {
+                if args[2].starts_with("full-uac3-clock") {
                     9
                 } else {
                     0x10
@@ -711,10 +902,20 @@ mod linux {
                 stream.close()?;
             }
             mode => match dac.open_stream(&format, listener) {
-                Err(error @ Error::ClockUnverified { .. }) => println!(
-                    "EXPECTED_FAILURE mode={mode} code={} error={error:?}",
-                    error.code()
-                ),
+                Err(error @ Error::ClockUnverified { .. }) => {
+                    let expected_reported = if mode == "bad-cur" || mode == "full-uac3-clock-bad" {
+                        None
+                    } else {
+                        Some(48_000)
+                    };
+                    assert!(
+                        matches!(error, Error::ClockUnverified { requested_hz: 96_000, reported_hz } if reported_hz == expected_reported)
+                    );
+                    println!(
+                        "EXPECTED_FAILURE mode={mode} code={} error={error:?}",
+                        error.code()
+                    );
+                }
                 Err(error) => {
                     return Err(format!("unexpected failure for {mode}: {error:?}").into())
                 }

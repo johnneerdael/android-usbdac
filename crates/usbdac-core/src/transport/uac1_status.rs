@@ -260,26 +260,7 @@ impl Uac1Status {
             }
             if let Some(expected) = stream.rate {
                 let endpoint = u16::from(stream.endpoint);
-                let result = read(0xa2, 0x81, 0x0100, endpoint, 3);
-                let data = match result {
-                    Err(Error::DeviceLost) => return Err(Error::DeviceLost),
-                    Ok(data)
-                        if data.len() == 3
-                            && (1..=0x7f_ffff)
-                                .contains(&u32::from_le_bytes([data[0], data[1], data[2], 0])) =>
-                    {
-                        data
-                    }
-                    _ if stream.interface != 0 => read(
-                        0xa2,
-                        0x81,
-                        0x0100,
-                        endpoint | u16::from(stream.interface) << 8,
-                        3,
-                    )?,
-                    Err(error) => return Err(error),
-                    Ok(data) => data,
-                };
+                let data = read(0xa2, 0x81, 0x0100, endpoint, 3)?;
                 if data.len() != 3 || u32::from_le_bytes([data[0], data[1], data[2], 0]) != expected
                 {
                     return Err(Error::Control(
@@ -472,47 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn rate_compatibility_fallback_never_hides_detach_or_a_valid_changed_rate() {
-        let mut indexes = Vec::new();
-        target()
-            .poll(&[0x81, 2], |_, request, _, index, _| {
+    fn rate_read_failure_does_not_retry_with_interface_in_endpoint_index() {
+        for reply in [
+            Err(Error::Control("stall".into())),
+            Err(Error::DeviceLost),
+            Ok(vec![]),
+            Ok(vec![0, 0, 0]),
+        ] {
+            let mut indexes = Vec::new();
+            let result = target().poll(&[0x81, 2], |_, request, _, index, _| {
                 indexes.push(index);
                 match request {
                     0xff => Ok(vec![]),
                     0x0a => Ok(vec![1]),
-                    _ if index == 1 => Err(Error::Control("stall".into())),
-                    _ => Ok(vec![0x80, 0xbb, 0]),
+                    _ => reply.clone(),
                 }
-            })
-            .unwrap();
-        assert_eq!(indexes, vec![2, 2, 1, 0x201]);
-        for invalid in [vec![], vec![0, 0, 0], vec![0, 0, 0x80]] {
-            target()
-                .poll(&[0x81, 2], |_, request, _, index, _| {
-                    Ok(match request {
-                        0xff => vec![],
-                        0x0a => vec![1],
-                        _ if index == 1 => invalid.clone(),
-                        _ => vec![0x80, 0xbb, 0],
-                    })
-                })
-                .unwrap();
+            });
+            assert!(result.is_err());
+            assert_eq!(indexes, vec![2, 2, 1]);
         }
-        let mut rate_reads = 0;
-        assert_eq!(
-            target().poll(&[0x81, 2], |_, request, _, _, _| {
-                match request {
-                    0xff => Ok(vec![]),
-                    0x0a => Ok(vec![1]),
-                    _ => {
-                        rate_reads += 1;
-                        Err(Error::DeviceLost)
-                    }
-                }
-            }),
-            Err(Error::DeviceLost)
-        );
-        assert_eq!(rate_reads, 1);
     }
 
     #[test]

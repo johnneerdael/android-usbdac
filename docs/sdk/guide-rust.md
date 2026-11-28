@@ -623,7 +623,7 @@ pub fn offers(capabilities: &Capabilities, track: TrackFormat) -> bool {
     capabilities.alt_settings.iter().any(|alt| {
         alt.format == AltFormat::Pcm
             && alt.channels == track.channels
-            && alt.valid_bits >= track.bits
+            && alt.valid_bits == track.bits
             && alt.sample_rates.contains(&track.sample_rate)
     })
 }
@@ -1303,7 +1303,7 @@ impl Ring for FakeRing {
 |---|---|
 | Cold start: plug in, open, play a tone | Plays; `is_bit_perfect()` becomes true after real audio; the level is at or below -40 dB |
 | 44.1, 48, 96 kHz and the DAC's highest rate; 16 and 24 bit | No `ClockUnverified`; the DAC shows each rate |
-| Gapless in one format | No gap, no click, `played_frames` continuous |
+| Gapless in one format | Same-format stream and `played_frames` remain continuous; audibility depends on buffering, source delivery and hardware. Reconfiguration drains and replaces the stream and may introduce a short gap; click-free hardware behavior is not guaranteed |
 | A rate change between tracks | A gap of 100 ms or more; the right rate on the DAC |
 | Pause, resume, seek while playing and while paused | Observe acoustic response and old submitted audio; compare the counters |
 | Slow the decoder | `Underrun` events and `underruns` rise, then recover |

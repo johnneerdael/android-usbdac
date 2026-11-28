@@ -10,13 +10,18 @@ on:
     paths:
       - "docs/**"
       - "branding/**"
-      - "android/usbdac/**"
-      - "android/usbdac-media3/**"
-      - ".github/workflows/docs.yml"
       - ".github/scripts/build_site.py"
-  release:
-    types: [published]
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
+    inputs:
+      published_version:
+        description: Published stable version to deploy
+        required: true
+        type: string
+      source_sha:
+        description: Exact published source commit
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -30,27 +35,135 @@ jobs:
     name: Build the site
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      deploy: ${{ steps.select.outputs.deploy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Select published documentation source
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.published_version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python3 - <<'PYSELECT'
+          import json, os, re, subprocess
+          from pathlib import Path
+          e = os.environ
+          if e['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Documentation must run on main')
+          version, source = e['VERSION'], e['SOURCE_SHA']
+          if e['GITHUB_EVENT_NAME'] == 'push':
+              release = json.loads(subprocess.check_output(['gh', 'api', f"repos/{e['GITHUB_REPOSITORY']}/releases/latest"]))
+              tag = release.get('tag_name', '')
+              if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+                  raise SystemExit('Latest published release has an invalid stable tag')
+              version = tag[1:]
+              source = subprocess.check_output(['git', 'rev-parse', f'refs/tags/{tag}^{{commit}}'], text=True).strip()
+              diff = subprocess.run(['git', 'diff', '--quiet', source, e['GITHUB_SHA'], '--', 'Cargo.toml', 'Cargo.lock', 'crates', 'android'], check=False)
+              if diff.returncode not in (0, 1):
+                  raise SystemExit('Cannot compare published and main build inputs')
+              guide = subprocess.check_output(['git', 'show', f"{e['GITHUB_SHA']}:docs/sdk/getting-started.md"], text=True)
+              coordinates = re.findall(r'dev\.usbdac:usbdac(?:-media3)?:([0-9]+\.[0-9]+\.[0-9]+)', guide)
+              downloads = re.findall(r'usbdac-([0-9]+\.[0-9]+\.[0-9]+)\.aar', guide)
+              if (diff.returncode == 1 or any(f'dev.usbdac:{name}:{version}' not in guide for name in ('usbdac', 'usbdac-media3'))
+                      or any(found != version for found in coordinates + downloads)):
+                  print('Main contains unpublished build inputs or download coordinates; skip Pages deployment')
+                  with Path(e['GITHUB_OUTPUT']).open('a') as output:
+                      print('deploy=false', file=output)
+                  raise SystemExit(0)
+          elif e['GITHUB_EVENT_NAME'] != 'workflow_dispatch':
+              raise SystemExit('Unsupported documentation event')
+          with Path(e['GITHUB_OUTPUT']).open('a') as output:
+              print('deploy=true', f'version={version}', f'source={source}', sep='\n', file=output)
+          PYSELECT
+      - name: Verify published source and release evidence
+        if: steps.select.outputs.deploy == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.select.outputs.version }}
+          SOURCE_SHA: ${{ steps.select.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYDOCS'
+          import hashlib, json, os, re, subprocess, tempfile
+          from pathlib import Path
+          e = os.environ
+          version, source, repo = e['VERSION'], e['SOURCE_SHA'], e['GITHUB_REPOSITORY']
+          if e['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Documentation must be dispatched on main')
+          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version) or not re.fullmatch(r'[0-9a-f]{40}', source):
+              raise SystemExit('Invalid published version or source')
+          release = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/releases/tags/v{version}']))
+          if release.get('draft') or release.get('prerelease') or not release.get('published_at'):
+              raise SystemExit('Release is not published and stable')
+          tag = subprocess.check_output(['git', 'rev-parse', f'refs/tags/v{version}^{{commit}}'], text=True).strip()
+          if tag != source:
+              raise SystemExit('Published tag does not resolve to requested source')
+          assets = release.get('assets', [])
+          by_name = {asset['name']: asset for asset in assets}
+          if len(by_name) != len(assets):
+              raise SystemExit('Duplicate release assets')
+          with tempfile.TemporaryDirectory() as tmp:
+              subprocess.run(['gh', 'release', 'download', f'v{version}', '--repo', repo, '--pattern', 'manifest.json', '--pattern', 'receipt.json', '--dir', tmp], check=True)
+              for name in ('manifest.json', 'receipt.json'):
+                  data = (Path(tmp) / name).read_bytes()
+                  if by_name.get(name, {}).get('digest') != 'sha256:' + hashlib.sha256(data).hexdigest():
+                      raise SystemExit('Published evidence digest mismatch')
+              manifest = json.loads((Path(tmp) / 'manifest.json').read_text())
+              receipt = json.loads((Path(tmp) / 'receipt.json').read_text())
+              if any(item.get('version') != version or item.get('source_sha') != source for item in (manifest, receipt)) or receipt.get('manifest_sha256') != hashlib.sha256((Path(tmp) / 'manifest.json').read_bytes()).hexdigest():
+                  raise SystemExit('Published evidence source mismatch')
+              for evidence in (manifest, receipt):
+                  repo_id = evidence.get('repository_id')
+                  if repo_id is None:
+                      name = evidence.get('repository', '')
+                      if not re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', name):
+                          raise SystemExit('Legacy evidence has no valid repository name')
+                      repo_id = json.loads(subprocess.check_output(['gh', 'api', f'repos/{name}'])).get('id')
+                  if repo_id != int(e['GITHUB_REPOSITORY_ID']):
+                      raise SystemExit('Published evidence repository identity mismatch')
+              for name in ('usbdac', 'usbdac-media3'):
+                  key = f'maven/dev/usbdac/{name}/{version}/{name}-{version}.aar'
+                  entry = manifest.get('files', {}).get(key, {})
+                  asset = by_name.get(f'{name}-{version}.aar', {})
+                  if asset.get('digest') != 'sha256:' + entry.get('sha256', ''):
+                      raise SystemExit('Published Maven coordinate does not match manifest')
+          guide_source = e['GITHUB_SHA'] if e['GITHUB_EVENT_NAME'] == 'push' else source
+          guide = subprocess.check_output(['git', 'show', f'{guide_source}:docs/sdk/getting-started.md'], text=True)
+          coordinates = re.findall(r'dev\.usbdac:usbdac(?:-media3)?:([0-9]+\.[0-9]+\.[0-9]+)', guide)
+          downloads = re.findall(r'usbdac-([0-9]+\.[0-9]+\.[0-9]+)\.aar', guide)
+          if (any(f'dev.usbdac:{name}:{version}' not in guide for name in ('usbdac', 'usbdac-media3'))
+                  or any(found != version for found in coordinates + downloads)):
+              raise SystemExit('Source documentation does not describe published coordinates')
+          PYDOCS
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            git checkout --detach "$SOURCE_SHA"
+          fi
 
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        if: steps.select.outputs.deploy == 'true'
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Install the Android SDK platform
+        if: steps.select.outputs.deploy == 'true'
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0"
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: steps.select.outputs.deploy == 'true'
 
       # Plugin downloads from the Gradle and Maven repositories fail intermittently on
       # hosted runners. Resolve them first, with retries, so a transient outage does not
       # fail the build.
       - name: Resolve Gradle plugins (with retries)
+        if: steps.select.outputs.deploy == 'true'
         working-directory: android
         run: |
           for attempt in 1 2 3 4 5; do
@@ -62,14 +175,17 @@ jobs:
 
       # Dokka reads the Kotlin sources; the Rust build is not needed for that.
       - name: Generate the API reference
+        if: steps.select.outputs.deploy == 'true'
         working-directory: android
         run: ./gradlew :usbdac:dokkaGeneratePublicationHtml :usbdac-media3:dokkaGeneratePublicationHtml -Pusbdac.skipNative=true --console=plain
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.select.outputs.deploy == 'true'
         with:
           python-version: "3.13"
 
       - name: Assemble the site
+        if: steps.select.outputs.deploy == 'true'
         run: |
           python -m pip install "markdown==3.8.2" "pygments==2.19.2"
           python .github/scripts/build_site.py \
@@ -80,12 +196,14 @@ jobs:
             --output _site
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.select.outputs.deploy == 'true'
         with:
           path: _site
 
   deploy:
     name: Deploy to GitHub Pages
     needs: build
+    if: needs.build.outputs.deploy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

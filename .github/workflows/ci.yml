@@ -13,6 +13,7 @@ on:
         options:
           - rust-lint
           - qemu-uac1
+          - qemu-usb-lifecycle
           - rust-lint-and-qemu-uac1
   workflow_call:
     inputs:
@@ -47,7 +48,7 @@ env:
 
 jobs:
   rust:
-    if: inputs.recheck != 'qemu-uac1'
+    if: inputs.recheck != 'qemu-uac1' && inputs.recheck != 'qemu-usb-lifecycle'
     name: Rust tests and Android check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -182,7 +183,8 @@ jobs:
         working-directory: android
         env:
           USBDAC_TEST_HOST_JNI: ${{ github.workspace }}/target/debug/libusbdac.so
-        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :media3-example:assembleDebug --console=plain
+          USBDAC_TEST_DSD_PCM: "1"
+        run: ./gradlew :usbdac:assembleRelease :usbdac:testDebugUnitTest :sample:assembleDebug :usbdac-media3:testDebugUnitTest :usbdac-media3:assembleRelease :media3-example:assembleDebug :media3-example:testDebugUnitTest --console=plain
 
       - name: Check that the AAR carries every ABI
         run: |
@@ -270,7 +272,7 @@ jobs:
           retention-days: 7
 
   qemu-usb:
-    if: inputs.recheck != 'rust-lint'
+    if: inputs.recheck != 'rust-lint' && inputs.recheck != 'qemu-usb-lifecycle'
     name: QEMU UAC1 playback, reconfigure and two owners
     # Noble ships QEMU8.2.2 whose UAC1 AC descriptors incorrectly advertise
     # protocol0x04; Resolute ships fixed QEMU10.2.1. Keep strict driver/probe gates.
@@ -300,4 +302,44 @@ jobs:
             target/qemu-usb-smoke/acceptance-window.txt
             target/qemu-usb-smoke/qemu-version.txt
             target/qemu-usb-smoke/SHA256SUMS
+          retention-days: 7
+
+  qemu-usb-lifecycle:
+    if: inputs.recheck == '' || inputs.recheck == 'qemu-usb-lifecycle'
+    name: QEMU USB/IP lifecycle and JNI retirement
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+      - name: Install guest build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-arm musl-tools linux-libc-dev cpio unzip
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add aarch64-unknown-linux-musl
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21.0.8+9"
+      - name: Build pinned guest and production probes
+        run: .github/usb-lifecycle/run.sh build
+      - name: Run bounded USB/IP acceptance
+        run: .github/usb-lifecycle/run.sh run
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: usb-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/usb-lifecycle/manifest.txt
+            target/usb-lifecycle/runtime.SHA256
+            target/usb-lifecycle/acceptance-window.txt
+            target/usb-lifecycle/serial.log
+            target/usb-lifecycle/modes/
+            target/usb-lifecycle/initramfs.gz
+            target/usb-lifecycle/vmlinuz-lts
+          if-no-files-found: error
           retention-days: 7
