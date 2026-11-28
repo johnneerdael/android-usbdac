@@ -620,8 +620,34 @@ pub(super) fn record_prepared_iso_transfer(
 
 /// One `Underrun` event per run of underrun transfers.
 pub(super) fn note_underrun_edge(shared: &StreamShared, was_underrun: &mut bool, underrun: bool) {
-    if underrun && !*was_underrun {
-        shared.events.emit_stream(crate::events::DacEvent::Underrun);
+    if underrun != *was_underrun {
+        if let Some(trace) = &shared.stats.feedback_trace {
+            let observed_at = Instant::now();
+            let stats = &shared.stats;
+            trace.record_underrun_at(
+                observed_at,
+                crate::UnderrunEdge {
+                    elapsed_us: 0,
+                    kind: if underrun {
+                        crate::UnderrunEdgeKind::Started
+                    } else {
+                        crate::UnderrunEdgeKind::Recovered
+                    },
+                    underrun_transfers: stats.underrun_count.load(Ordering::Relaxed),
+                    buffered_samples: stats.buffered_samples.load(Ordering::Relaxed),
+                    capacity_samples: stats.buffer_capacity_samples,
+                    channels: stats.channels,
+                    producer_frames: stats.producer_frames.load(Ordering::Relaxed),
+                    played_frames: stats.played_frames(),
+                    inflight_frames: stats.inflight_music_frames.load(Ordering::Relaxed),
+                    flush_epoch: stats.flush_epoch.load(Ordering::Relaxed),
+                    transfer_queue_depth: stats.transfer_queue_depth.load(Ordering::Relaxed),
+                },
+            );
+        }
+        if underrun {
+            shared.events.emit_stream(crate::events::DacEvent::Underrun);
+        }
     }
     *was_underrun = underrun;
 }

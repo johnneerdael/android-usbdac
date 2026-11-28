@@ -3,6 +3,7 @@
 //! crate never changes hardware volume. USB delivery does not prove audibility.
 mod conversion_check;
 mod fallback;
+mod producer_timing;
 mod report_html;
 use fallback::run_fallback;
 pub use report_html::write_html_report;
@@ -538,6 +539,8 @@ impl Capture {
         cancel: &AtomicBool,
         device_lost: &AtomicBool,
     ) -> LegResult {
+        let timing_origin = Instant::now();
+        let mut timing = producer_timing::ProducerTimingCapture::new(timing_origin);
         let mut result = LegResult {
             request: format!("{:?}", plan.request),
             advertised_alt: plan.alt.clone(),
@@ -553,7 +556,17 @@ impl Capture {
             payload_bytes: 0,
             evidence: json!({}),
         };
-        let format = match dac.negotiate(&plan.request) {
+        let negotiation_started = Instant::now();
+        let negotiation = dac.negotiate(&plan.request);
+        timing.record(
+            "negotiation",
+            negotiation_started,
+            negotiation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+        let format = match negotiation {
             Ok(f) => f,
             Err(e) => {
                 if is_device_lost(&e) {
@@ -665,7 +678,22 @@ impl Capture {
         let mut pending = Vec::new();
         let mut offset = 0;
         let mut prefix = Vec::new();
+        let mut next_sample = Instant::now();
         while remaining > 0 || offset < pending.len() {
+            if Instant::now() >= next_sample {
+                let started = Instant::now();
+                let sample = stream.stats();
+                timing.sample(&sample, false);
+                timing.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+                next_sample = Instant::now() + Duration::from_millis(20);
+            }
             if event_lost.load(Ordering::Acquire) {
                 mark_stop(&mut result, "device_lost", "stream");
                 break;
@@ -682,13 +710,37 @@ impl Capture {
             }
             if offset == pending.len() {
                 let count = remaining.min(256) as usize;
+                let started = Instant::now();
                 pending = generator.frames(count);
+                timing.record(
+                    "generation_on_demand",
+                    started,
+                    started.elapsed(),
+                    0,
+                    pending.len(),
+                    false,
+                );
                 offset = 0;
                 remaining -= count as u64;
             }
-            match stream.write(&pending[offset..]) {
-                Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+            let started = Instant::now();
+            let write = stream.write(&pending[offset..]);
+            timing.record(
+                "ring_enqueue",
+                started,
+                started.elapsed(),
+                pending.len() - offset,
+                write.as_ref().copied().unwrap_or(0),
+                matches!(&write, Ok(0)),
+            );
+            match write {
+                Ok(0) => {
+                    let started = Instant::now();
+                    std::thread::sleep(Duration::from_millis(2));
+                    timing.record("backpressure_wait", started, started.elapsed(), 0, 0, true);
+                }
                 Ok(n) => {
+                    let started = Instant::now();
                     if prefix.len() < 64 {
                         let count = n.min(64 - prefix.len());
                         prefix.extend_from_slice(&pending[offset..offset + count]);
@@ -696,6 +748,14 @@ impl Capture {
                     hash.update(&pending[offset..offset + n]);
                     result.payload_bytes += n as u64;
                     offset += n;
+                    timing.record(
+                        "source_verification_hash",
+                        started,
+                        started.elapsed(),
+                        n,
+                        n,
+                        false,
+                    );
                 }
                 Err(e) => {
                     if is_device_lost(&e) {
@@ -721,6 +781,20 @@ impl Capture {
             }
         }
         while result.error.is_none() && !stream.is_drained() {
+            if Instant::now() >= next_sample {
+                let started = Instant::now();
+                let sample = stream.stats();
+                timing.sample(&sample, false);
+                timing.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+                next_sample = Instant::now() + Duration::from_millis(20);
+            }
             if event_lost.load(Ordering::Acquire) {
                 mark_stop(&mut result, "device_lost", "stream");
                 break;
@@ -735,13 +809,18 @@ impl Capture {
                 result.error = Some("drain deadline exceeded".into());
                 break;
             }
+            let started = Instant::now();
             std::thread::sleep(Duration::from_millis(5));
+            timing.record("drain_wait", started, started.elapsed(), 0, 0, false);
         }
         let stats = stream.stats();
+        timing.sample(&stats, true);
+        let (edges, edge_dropped) = producer_timing::worker_edges(dac, timing_origin);
+        let producer_timing = timing.finish(stats.underruns, &edges, edge_dropped, 0);
         let feedback = stream.explicit_feedback_diagnostics();
         result.payload_sha256 = Some(format!("{:x}", hash.finalize()));
         let prefix_hex: String = prefix.iter().map(|b| format!("{b:02x}")).collect();
-        result.evidence = json!({"format": format_json(&format), "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed"});
+        result.evidence = json!({"format": format_json(&format), "producer_timing":producer_timing, "payload_prefix_hex": prefix_hex, "stats": {"bit_perfect": stats.bit_perfect, "payload_verified": stats.payload_verified, "clock_verified": stats.clock_verified, "underruns": stats.underruns, "lost_frames": stats.lost_frames, "short_packets": stats.short_packets, "zero_packets": stats.zero_packets, "urb_timeouts": stats.urb_timeouts, "frames_written": stats.frames_written, "played_frames": stats.played_frames, "completed_transfers": stats.completed_transfers, "feedback_reports": stats.feedback_reports, "feedback_rate_hz": stats.feedback_rate_hz, "feedback_locked": stats.feedback_locked, "debug": format!("{stats:#?}")}, "feedback": format!("{feedback:#?}"), "dac_feedback_trace": format!("{:?}", dac.feedback_trace()), "events": events.lock().map(|v| v.clone()).unwrap_or_default(), "drained": stream.is_drained(), "counter_units": "PCM and DoP: wire frames; native DSD: one byte per channel", "host_enqueue_is_delivery": false, "usb_transport_only": true, "dop_decoder_lock": "not_observed"});
         if result.error.is_none()
             && stats.bit_perfect
             && stats.payload_verified

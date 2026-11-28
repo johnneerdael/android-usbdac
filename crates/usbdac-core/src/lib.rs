@@ -107,7 +107,7 @@ pub use events::{CompatibilityFallbackTier, DacEvent, DacListener, StreamState};
 pub use fake::{PlaybackDevice, PlaybackStream};
 pub use feedback_diagnostics::{
     ExplicitFeedbackDiagnostics, ExplicitFeedbackOutcome, ExplicitFeedbackPacket, FeedbackTrace,
-    FeedbackTraceEntry, FeedbackTraceEvent,
+    FeedbackTraceEntry, FeedbackTraceEvent, UnderrunEdge, UnderrunEdgeKind,
 };
 pub use format::{Encoding, RatePolicy, StreamFormat, StreamRequest};
 pub use hotplug::{

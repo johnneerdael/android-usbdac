@@ -2403,6 +2403,45 @@ mod push_stream_tests {
     }
 
     #[test]
+    fn worker_records_underrun_and_recovery_edges_when_trace_enabled() {
+        let stats =
+            Arc::new(RuntimeStats::new(48_000, 2, 200, 100, 10, 50).with_feedback_trace(true));
+        let ring = Arc::new(Mutex::new(PcmRing::new(stats.buffer_capacity_samples, 2)));
+        let hub = EventHub::start();
+        let format = PlaybackFormat {
+            pcm_encoding: crate::transport::PcmEncoding::Signed,
+            sample_rate: 48_000,
+            bit_depth: 16,
+            channels: 2,
+            is_dop: false,
+            dsd_transport: DsdTransportMode::None,
+            dsd_bit_rate: 0,
+        };
+        let shared = StreamShared::new(ring, stats.clone(), hub.clone(), format, 2);
+        stats.buffered_samples.store(12, Ordering::Relaxed);
+        stats.underrun_count.store(3, Ordering::Relaxed);
+        stats.producer_frames.store(200, Ordering::Relaxed);
+        stats.played_music_frames.store(100, Ordering::Relaxed);
+        let mut was_underrun = false;
+        note_underrun_edge(&shared, &mut was_underrun, true);
+        note_underrun_edge(&shared, &mut was_underrun, true);
+        stats.buffered_samples.store(40, Ordering::Relaxed);
+        note_underrun_edge(&shared, &mut was_underrun, false);
+        let (edges, dropped) = stats.feedback_trace.as_ref().unwrap().underrun_snapshot();
+        assert_eq!(dropped, 0);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].kind, crate::UnderrunEdgeKind::Started);
+        assert_eq!(edges[0].underrun_transfers, 3);
+        assert_eq!(edges[0].buffered_samples, 12);
+        assert_eq!(edges[0].producer_frames, 200);
+        assert_eq!(edges[0].played_frames, 100);
+        assert_eq!(edges[1].kind, crate::UnderrunEdgeKind::Recovered);
+        assert_eq!(edges[1].buffered_samples, 40);
+        assert!(edges[1].elapsed_us >= edges[0].elapsed_us);
+        hub.shutdown();
+    }
+
+    #[test]
     fn a_run_of_underruns_is_one_event() {
         let _globals = lock_globals();
         let rig = Rig::pcm(2, 16);

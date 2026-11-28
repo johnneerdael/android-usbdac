@@ -697,6 +697,15 @@
           id: "admission-" + i,
         }),
       );
+      function qualitySummary(value) {
+        const quality = obj(value.selected_quality);
+        if (!Object.keys(quality).length) return "";
+        const parts = [];
+        if (typeof quality.retained_bandwidth_hz === "number") parts.push("retained " + (quality.retained_bandwidth_hz / 1000).toFixed(1) + " kHz");
+        if (quality.meaningful_depth_bits != null) parts.push(quality.meaningful_depth_bits + "-bit meaningful depth");
+        if (quality.resampling === true) parts.push("resampling");
+        return parts.length ? " · " + parts.join(" · ") : "";
+      }
       fallback.forEach((v, i) =>
         items.push({
           kind: "fallback",
@@ -713,7 +722,7 @@
             " · " +
             (selection(v)
               ? "selection evidenced"
-              : "selection evidence incomplete"),
+              : "selection evidence incomplete") + qualitySummary(v),
           v,
           verdict: fallbackVerdict(v),
           id: "fallback-" + i,
@@ -1101,6 +1110,26 @@
           },
           null,
         );
+      }
+      function showProducerIncidents(request, timing, underruns) {
+        const evidence = obj(timing);
+        if (Number(underruns) > 0 && !arr(evidence.incident_details).length) {
+          row($("clock-rows"), "Underrun · " + requestLabel(request), "Stage unresolved · worker edge or producer timing was not captured", {underruns, producer_timing:timing}, null);
+        }
+        for (const incident of arr(evidence.incident_details)) {
+          const worker = obj(incident.worker);
+          const knownStage = incident.classification === "observed_producer_stage_at_empty_edge" && incident.observed_stage;
+          const label = knownStage ? "Observed stage: " + String(incident.observed_stage).replaceAll("_", " ") : "Stage unresolved";
+          const buffered = worker.buffered_samples == null ? "queue unavailable" : "queue " + worker.buffered_samples + "/" + String(worker.capacity_samples ?? "?") + " interleaved samples";
+          const age = incident.last_accepted_enqueue_age_us == null ? "last enqueue unavailable" : "last accepted enqueue " + (incident.last_accepted_enqueue_age_us / 1000).toFixed(1) + " ms earlier";
+          row($("clock-rows"), "Underrun · " + requestLabel(request), label + " · " + buffered + " · " + age, {incident, retention:evidence.retention, stage_totals:evidence.stages, timeline:evidence.detail}, null);
+        }
+      }
+      for (const value of exact) showProducerIncidents(value.request, obj(value.evidence).producer_timing, obj(obj(value.evidence).stats).underruns);
+      for (const value of fallback) {
+        const raw = String(obj(value.counts).stats || "");
+        const match = raw.match(/\bunderruns:\s*(\d+)/);
+        showProducerIncidents(value.source_request, value.producer_timing, obj(value.clock_feedback).underruns ?? (match ? Number(match[1]) : null));
       }
       const clockMessages = debug.filter((r) => {
         const message = String(obj(r.v.value).message || "");

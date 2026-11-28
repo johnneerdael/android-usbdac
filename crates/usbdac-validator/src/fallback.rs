@@ -1,7 +1,20 @@
 //! Exercise the production playback resolver and source-domain stream.
 use super::*;
 use crate::conversion_check::ConversionCheck;
-use usbdac_core::playback::{PlaybackFidelity, PlaybackPolicy, PlaybackTransform};
+use crate::producer_timing::{callback_dropped, worker_edges, ProducerTimingCapture};
+use usbdac_core::playback::{
+    PlaybackCandidateQuality, PlaybackFidelity, PlaybackPolicy, PlaybackTransform,
+    ProducerTimingPhase,
+};
+
+fn quality_evidence(value: &PlaybackCandidateQuality) -> Value {
+    json!({"request":format!("{:?}",value.request), "fidelity":format!("{:?}",value.fidelity),
+        "retained_bandwidth_hz":value.retained_bandwidth_hz, "meaningful_depth_bits":value.meaningful_depth_bits,
+        "resampling":value.resampling, "resampler_passband_hz":value.resampler_passband_hz,
+        "resampler_attenuation_db":value.resampler_attenuation_db,
+        "dsd_first_stage_passband_hz":value.dsd_first_stage_passband_hz,
+        "dsd_first_stage_attenuation_db":value.dsd_first_stage_attenuation_db, "reason":value.reason})
+}
 
 fn selection_proof(
     source: &StreamRequest,
@@ -131,6 +144,9 @@ pub(super) fn run_fallback(
     cancel: &AtomicBool,
     device_lost: &AtomicBool,
 ) -> Value {
+    let timing_origin = Instant::now();
+    let timing = Arc::new(Mutex::new(ProducerTimingCapture::new(timing_origin)));
+    let dropped_timing = callback_dropped();
     let policy = PlaybackPolicy {
         allow_lossless: true,
         allow_lossy: true,
@@ -144,7 +160,19 @@ pub(super) fn run_fallback(
         evidence["status"] = json!(reason);
         return evidence;
     }
-    let decision = match dac.resolve_playback(source, &policy) {
+    let negotiation_started = Instant::now();
+    let decision_result = dac.resolve_playback(source, &policy);
+    if let Ok(mut capture) = timing.lock() {
+        capture.record(
+            "negotiation",
+            negotiation_started,
+            negotiation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+    }
+    let decision = match decision_result {
         Ok(decision) => decision,
         Err(error) => {
             let lost = is_device_lost(&error);
@@ -180,6 +208,12 @@ pub(super) fn run_fallback(
         .map(|c| format!("{c:?}"))
         .collect::<Vec<_>>());
     evidence["attempted_candidate_count"] = json!(decision.attempted_candidates);
+    evidence["planned_candidate_quality"] = json!(decision
+        .candidate_quality
+        .iter()
+        .map(quality_evidence)
+        .collect::<Vec<_>>());
+    evidence["selected_quality"] = quality_evidence(&decision.selected_quality);
     evidence["candidate_order_note"] =
         json!("ordered planned candidates; only the reported prefix was attempted");
     evidence["exact_refusal"] = json!(decision
@@ -227,7 +261,7 @@ pub(super) fn run_fallback(
     let generation_started = Instant::now();
     let generation_deadline =
         generation_started + Duration::from_millis(options.leg_timeout_ms.max(100));
-    let prepared = match prepare_high_rate_source(
+    let prepared_result = prepare_high_rate_source(
         source,
         frames,
         decision.source_frame_bytes,
@@ -235,7 +269,22 @@ pub(super) fn run_fallback(
         &mut marker,
         || stop_reason(cancel, device_lost),
         generation_deadline,
-    ) {
+    );
+    if let Ok(mut capture) = timing.lock() {
+        capture.record(
+            if matches!(&prepared_result, Ok(PreparedSource::Ready(_))) {
+                "generation_preopen"
+            } else {
+                "generation_planning_preopen"
+            },
+            generation_started,
+            generation_started.elapsed(),
+            0,
+            0,
+            false,
+        );
+    }
+    let prepared = match prepared_result {
         Ok(value) => value,
         Err(reason) => {
             evidence["source_generation"] = json!({"mode":"pre_generation_interrupted", "phase":"before_stream_open", "reason":reason, "limit_bytes":PREGENERATED_SOURCE_LIMIT, "elapsed_ms":generation_started.elapsed().as_millis()});
@@ -309,6 +358,38 @@ pub(super) fn run_fallback(
             return evidence;
         }
     };
+    let timing_observer = timing.clone();
+    let callback_drops = dropped_timing.clone();
+    stream.set_timing_observer(Some(Arc::new(move |event| {
+        let phase = match event.phase {
+            ProducerTimingPhase::SourceFormat => "source_format",
+            ProducerTimingPhase::ConverterProcess => "converter_process",
+            ProducerTimingPhase::ConverterFinish => "converter_finish",
+            ProducerTimingPhase::RingEnqueue => "ring_enqueue",
+            ProducerTimingPhase::Observer => "observer_verification",
+        };
+        let diagnostic_started = Instant::now();
+        if let Ok(mut capture) = timing_observer.try_lock() {
+            capture.record(
+                phase,
+                event.started,
+                event.elapsed,
+                event.input_bytes,
+                event.output_bytes,
+                event.blocked,
+            );
+            capture.record(
+                "diagnostic_callback",
+                diagnostic_started,
+                diagnostic_started.elapsed(),
+                0,
+                0,
+                false,
+            );
+        } else {
+            callback_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    })));
     let applied_headroom_db = match &decision.transform {
         PlaybackTransform::Pcm { plan, .. } if plan.resamples() => plan.options().headroom_db,
         PlaybackTransform::DsdToPcm { options, .. } => options.headroom_db,
@@ -340,7 +421,24 @@ pub(super) fn run_fallback(
     let mut source_hash = Sha256::new();
     let deadline = Instant::now() + Duration::from_millis(options.leg_timeout_ms.max(100));
     let mut failure: Option<(String, String, String)> = None;
+    let mut next_sample = Instant::now();
     while remaining > 0 || offset < buffer.len() {
+        if Instant::now() >= next_sample {
+            let started = Instant::now();
+            let sample = stream.target_stats();
+            if let Ok(mut capture) = timing.lock() {
+                capture.sample(&sample, false);
+                capture.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            next_sample = Instant::now() + Duration::from_millis(20);
+        }
         if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
             failure = Some(("usb_event".into(), error.0, error.1));
             break;
@@ -368,6 +466,7 @@ pub(super) fn run_fallback(
         if offset == buffer.len() {
             let count = remaining.min(256) as usize;
             remaining -= count as u64;
+            let started = Instant::now();
             buffer = signal.frames(count);
             offset = 0;
             if source.encoding == Encoding::DoP {
@@ -378,16 +477,55 @@ pub(super) fn run_fallback(
                     &mut marker,
                 );
             }
+            if let Ok(mut capture) = timing.lock() {
+                capture.record(
+                    "generation_on_demand",
+                    started,
+                    started.elapsed(),
+                    0,
+                    buffer.len(),
+                    false,
+                );
+            }
         }
-        match stream.write(&buffer[offset..]) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+        let write_started = Instant::now();
+        let write_result = stream.write(&buffer[offset..]);
+        if let Ok(mut capture) = timing.lock() {
+            capture.record(
+                "producer_call_inclusive",
+                write_started,
+                write_started.elapsed(),
+                buffer.len() - offset,
+                write_result.as_ref().copied().unwrap_or(0),
+                matches!(&write_result, Ok(0)),
+            );
+        }
+        match write_result {
+            Ok(0) => {
+                let started = Instant::now();
+                std::thread::sleep(Duration::from_millis(2));
+                if let Ok(mut capture) = timing.lock() {
+                    capture.record("backpressure_wait", started, started.elapsed(), 0, 0, true);
+                }
+            }
             Ok(n) => {
+                let started = Instant::now();
                 source_hash.update(&buffer[offset..offset + n]);
                 if let Ok(mut check) = check.lock() {
                     check.source(&buffer[offset..offset + n]);
                 }
                 offset += n;
                 accepted += n as u64;
+                if let Ok(mut capture) = timing.lock() {
+                    capture.record(
+                        "source_verification_hash",
+                        started,
+                        started.elapsed(),
+                        n,
+                        n,
+                        false,
+                    );
+                }
             }
             Err(error) => {
                 failure = Some((
@@ -405,6 +543,22 @@ pub(super) fn run_fallback(
     }
     let mut drain_started = false;
     while failure.is_none() && !stream.is_drained() {
+        if Instant::now() >= next_sample {
+            let started = Instant::now();
+            let sample = stream.target_stats();
+            if let Ok(mut capture) = timing.lock() {
+                capture.sample(&sample, false);
+                capture.record(
+                    "diagnostic_sampling",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            next_sample = Instant::now() + Duration::from_millis(20);
+        }
         if let Some(error) = async_error.lock().ok().and_then(|slot| slot.clone()) {
             failure = Some(("usb_event".into(), error.0, error.1));
             break;
@@ -430,7 +584,19 @@ pub(super) fn run_fallback(
             break;
         }
         if !drain_started {
-            match stream.drain() {
+            let started = Instant::now();
+            let drain_result = stream.drain();
+            if let Ok(mut capture) = timing.lock() {
+                capture.record(
+                    "producer_call_inclusive",
+                    started,
+                    started.elapsed(),
+                    0,
+                    0,
+                    false,
+                );
+            }
+            match drain_result {
                 Ok(started) => drain_started = started,
                 Err(error) => {
                     failure = Some((
@@ -446,9 +612,23 @@ pub(super) fn run_fallback(
                 }
             }
         }
+        let started = Instant::now();
         std::thread::sleep(Duration::from_millis(2));
+        if let Ok(mut capture) = timing.lock() {
+            capture.record("drain_wait", started, started.elapsed(), 0, 0, false);
+        }
     }
     let stats = stream.target_stats();
+    let (edges, worker_dropped) = worker_edges(dac, timing_origin);
+    if let Ok(mut capture) = timing.lock() {
+        capture.sample(&stats, true);
+        evidence["producer_timing"] = capture.finish(
+            stats.underruns,
+            &edges,
+            worker_dropped,
+            dropped_timing.load(Ordering::Relaxed),
+        );
+    }
     let conversion = stream.conversion_stats();
     let drained = stream.is_drained();
     let target_frame_bytes = if matches!(format.encoding, Encoding::DsdNative { .. }) {

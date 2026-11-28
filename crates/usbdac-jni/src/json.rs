@@ -363,6 +363,14 @@ pub fn feedback_trace(trace: &FeedbackTrace, info: &DeviceInfo) -> Value {
         "explicit": explicit,
         "entries": entries,
         "dropped_entries": trace.dropped_entries,
+        "time_origin": "stream_runtime_started_monotonic",
+        "underrun_edges": trace.underrun_edges.iter().map(|edge| json!({
+            "elapsed_us": edge.elapsed_us, "kind": edge.kind.code(), "underrun_transfers": edge.underrun_transfers,
+            "buffered_samples": edge.buffered_samples, "capacity_samples": edge.capacity_samples, "channels": edge.channels,
+            "producer_frames": edge.producer_frames, "played_frames": edge.played_frames, "inflight_frames": edge.inflight_frames,
+            "flush_epoch": edge.flush_epoch, "transfer_queue_depth": edge.transfer_queue_depth,
+        })).collect::<Vec<_>>(),
+        "underrun_dropped": trace.underrun_dropped,
         "failure": trace.failure,
     })
 }

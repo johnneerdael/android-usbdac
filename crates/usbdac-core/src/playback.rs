@@ -9,6 +9,7 @@ use crate::{
     StreamRequest, StreamStats,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaybackPolicy {
@@ -69,12 +70,30 @@ pub enum PlaybackTransform {
         target_channels: u16,
     },
 }
+/// Auditable ranking inputs for an individual planned request. Bandwidth is
+/// the conservative passband edge of the production conversion path.
+#[derive(Debug, Clone)]
+pub struct PlaybackCandidateQuality {
+    pub request: StreamRequest,
+    pub fidelity: PlaybackFidelity,
+    pub retained_bandwidth_hz: Option<f64>,
+    pub meaningful_depth_bits: Option<u8>,
+    pub resampling: bool,
+    pub resampler_passband_hz: Option<f64>,
+    pub resampler_attenuation_db: Option<f64>,
+    pub dsd_first_stage_passband_hz: Option<f64>,
+    pub dsd_first_stage_attenuation_db: Option<f64>,
+    pub reason: String,
+}
 #[derive(Debug, Clone)]
 pub struct PlaybackDecision {
     pub source: StreamRequest,
     pub format: StreamFormat,
     /// Ordered planned requests; a success may stop before all were attempted.
     pub candidates: Vec<StreamRequest>,
+    /// Quality records aligned to `candidates`; planned, not necessarily attempted.
+    pub candidate_quality: Vec<PlaybackCandidateQuality>,
+    pub selected_quality: PlaybackCandidateQuality,
     pub attempted_candidates: usize,
     /// Typed, clean refusals for the attempted prefix before the selected request.
     pub candidate_refusals: Vec<Error>,
@@ -210,6 +229,8 @@ struct Candidate {
     rate_rank: usize,
     channels_rank: u8,
     depth_rank: (u8, u8),
+    quality: PlaybackCandidateQuality,
+    upsample_excess: u32,
 }
 fn supported_rate(alt: &crate::AltSetting, rate: u32) -> bool {
     alt.sample_rates.contains(&rate)
@@ -443,6 +464,8 @@ fn candidates(
     let mut out: Vec<_> = found
         .into_iter()
         .map(|(request, fidelity)| Candidate {
+            quality: candidate_quality(source, &request, fidelity, &policy.conversion_options),
+            upsample_excess: request.sample_rate.saturating_sub(source_rate),
             rate_rank: if matches!(request.encoding, Encoding::DsdNative { .. }) {
                 0
             } else {
@@ -464,7 +487,103 @@ fn candidates(
     Ok(out)
 }
 fn sort_candidates(candidates: &mut [Candidate]) {
-    candidates.sort_by_key(|v| (v.fidelity, v.rate_rank, v.channels_rank, v.depth_rank));
+    candidates.sort_by(|a, b| {
+        a.fidelity
+            .cmp(&b.fidelity)
+            .then_with(|| {
+                if a.fidelity == PlaybackFidelity::Lossy {
+                    b.quality
+                        .retained_bandwidth_hz
+                        .unwrap_or(0.0)
+                        .total_cmp(&a.quality.retained_bandwidth_hz.unwrap_or(0.0))
+                        .then_with(|| {
+                            b.quality
+                                .meaningful_depth_bits
+                                .cmp(&a.quality.meaningful_depth_bits)
+                        })
+                        .then_with(|| a.upsample_excess.cmp(&b.upsample_excess))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| {
+                (a.rate_rank, a.channels_rank, a.depth_rank).cmp(&(
+                    b.rate_rank,
+                    b.channels_rank,
+                    b.depth_rank,
+                ))
+            })
+    });
+}
+fn candidate_quality(
+    source: &StreamRequest,
+    target: &StreamRequest,
+    fidelity: PlaybackFidelity,
+    options: &ConvertOptions,
+) -> PlaybackCandidateQuality {
+    let dsd = dsd_rate(source);
+    let source_rate = dsd.map_or(source.sample_rate, |rate| rate / 16);
+    let target_pcm = matches!(
+        target.encoding,
+        Encoding::Pcm | Encoding::PcmU8 | Encoding::PcmFloat32
+    );
+    let resampling = target_pcm && target.sample_rate != source_rate;
+    let filter = if resampling {
+        crate::convert::filter_info(source_rate, target.sample_rate, options.quality).ok()
+    } else {
+        None
+    };
+    let first_stage = if target_pcm {
+        dsd.map(|rate| f64::from(rate) * 0.020)
+    } else {
+        None
+    };
+    let retained_bandwidth_hz = if target_pcm {
+        let bandwidth = if resampling {
+            filter.as_ref().map(|f| f.passband_hz)
+        } else {
+            Some(f64::from(source_rate) / 2.0)
+        };
+        bandwidth.map(|bandwidth| first_stage.map_or(bandwidth, |first| first.min(bandwidth)))
+    } else {
+        None
+    };
+    let source_bits = match source.encoding {
+        Encoding::PcmU8 => 8,
+        Encoding::PcmFloat32 | Encoding::DoP | Encoding::DsdNative { .. } => 24,
+        Encoding::Pcm => match options.source_sample {
+            Some(SampleFormat::Float32) => 24,
+            Some(SampleFormat::Int { bits, .. }) => bits,
+            None => source.bit_depth,
+        },
+    };
+    let target_bits = match target.encoding {
+        Encoding::PcmFloat32 => 24,
+        Encoding::PcmU8 => 8,
+        Encoding::Pcm => target.bit_depth,
+        _ => 0,
+    };
+    let meaningful_depth_bits = target_pcm.then_some(if resampling {
+        target_bits
+    } else {
+        source_bits.min(target_bits)
+    });
+    PlaybackCandidateQuality {
+        request: *target,
+        fidelity,
+        retained_bandwidth_hz,
+        meaningful_depth_bits,
+        resampling,
+        resampler_passband_hz: filter.as_ref().map(|f| f.passband_hz),
+        resampler_attenuation_db: filter.as_ref().map(|f| f.design_attenuation_db),
+        dsd_first_stage_passband_hz: first_stage,
+        dsd_first_stage_attenuation_db: first_stage.map(|_| 120.0),
+        reason: if target_pcm {
+            "Ranked by fidelity, retained conversion passband, meaningful depth, and excess upsampling; rate-family preference breaks ties".into()
+        } else {
+            "Bitstream-preserving transport; no PCM conversion passband applies".into()
+        },
+    }
 }
 /// Returns a conservative source exclusion only for a complete claimed descriptor scan.
 /// Unknown/opaque alternatives and unknown rates remain eligible for real negotiation.
@@ -644,6 +763,29 @@ impl Dac {
                 "candidate negotiation returned an unplanned format".into(),
             ));
         }
+        let mut candidate_quality: Vec<_> = selected
+            .iter()
+            .map(|request| {
+                all.iter()
+                    .find(|candidate| candidate.request == *request)
+                    .map(|candidate| candidate.quality.clone())
+                    .unwrap_or_else(|| {
+                        candidate_quality(
+                            source,
+                            request,
+                            PlaybackFidelity::Exact,
+                            &policy.conversion_options,
+                        )
+                    })
+            })
+            .collect();
+        let mut selected_quality = candidate_quality
+            .iter()
+            .find(|quality| quality.request == format.request)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidState("selected candidate has no quality record".into())
+            })?;
         let exact_selected = allow_exact && exact_matches(source, &format);
         let refusal = if exact_selected {
             None
@@ -660,6 +802,8 @@ impl Dac {
                         source: *source,
                         format,
                         candidates: selected,
+                        candidate_quality,
+                        selected_quality,
                         attempted_candidates,
                         candidate_refusals,
                         exact_refusal: None,
@@ -672,6 +816,13 @@ impl Dac {
                 let plan = ConversionPlan::between(source, &format, &policy.conversion_options)
                     .map_err(conversion_error)?;
                 let f = fidelity(plan.kind(), false);
+                selected_quality.fidelity = f;
+                if let Some(q) = candidate_quality
+                    .iter_mut()
+                    .find(|q| q.request == format.request)
+                {
+                    q.fidelity = f;
+                }
                 if !enabled(policy, f)
                     || (!policy.allow_widening
                         && plan
@@ -696,6 +847,8 @@ impl Dac {
                     source: *source,
                     format,
                     candidates: selected,
+                    candidate_quality,
+                    selected_quality,
                     attempted_candidates,
                     candidate_refusals,
                     exact_refusal: None,
@@ -714,10 +867,21 @@ impl Dac {
                 });
             }
             let channels = format.channels;
+            if repack {
+                selected_quality.fidelity = PlaybackFidelity::BitExact;
+                if let Some(q) = candidate_quality
+                    .iter_mut()
+                    .find(|q| q.request == format.request)
+                {
+                    q.fidelity = PlaybackFidelity::BitExact;
+                }
+            }
             return Ok(PlaybackDecision {
                 source: *source,
                 format,
                 candidates: selected,
+                candidate_quality,
+                selected_quality,
                 attempted_candidates,
                 candidate_refusals,
                 exact_refusal: None,
@@ -811,6 +975,8 @@ impl Dac {
             source: *source,
             format,
             candidates: selected,
+            candidate_quality,
+            selected_quality,
             attempted_candidates,
             candidate_refusals,
             exact_refusal: refusal,
@@ -886,6 +1052,7 @@ impl Dac {
             source_bytes: 0,
             target_bytes: 0,
             observer: None,
+            timing_observer: None,
         })
     }
 }
@@ -902,7 +1069,47 @@ enum Engine {
         dop: bool,
     },
 }
+fn emit_producer_timing(
+    observer: Option<&ProducerTimingObserver>,
+    started: Option<Instant>,
+    phase: ProducerTimingPhase,
+    input_bytes: usize,
+    output_bytes: usize,
+    blocked: bool,
+) {
+    if let (Some(started), Some(observer)) = (started, observer) {
+        observer(ProducerTiming {
+            phase,
+            started,
+            elapsed: started.elapsed(),
+            input_bytes,
+            output_bytes,
+            blocked,
+        });
+    }
+}
 type Observer = Arc<dyn Fn(&[u8]) + Send + Sync>;
+/// Independently timed source-side operation. No wall-clock time is inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerTimingPhase {
+    SourceFormat,
+    ConverterProcess,
+    ConverterFinish,
+    RingEnqueue,
+    Observer,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ProducerTiming {
+    pub phase: ProducerTimingPhase,
+    pub started: Instant,
+    pub elapsed: Duration,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    /// True when an enqueue accepts fewer bytes than requested.
+    pub blocked: bool,
+}
+pub type ProducerTimingObserver = Arc<dyn Fn(ProducerTiming) + Send + Sync>;
+
 /// One source-domain stream. Conversion and USB writes are nonblocking; a short
 /// input count means the caller must retry the remainder. Observers see bytes
 /// accepted by the core stream, before any native DSD wire packing/DoP marker rewrite.
@@ -920,6 +1127,7 @@ pub struct PlaybackStream {
     source_bytes: u64,
     target_bytes: u64,
     observer: Option<Observer>,
+    timing_observer: Option<ProducerTimingObserver>,
 }
 impl PlaybackStream {
     pub fn decision(&self) -> &PlaybackDecision {
@@ -931,15 +1139,62 @@ impl PlaybackStream {
     pub fn set_observer(&mut self, observer: Option<Observer>) {
         self.observer = observer;
     }
+    /// Install an optional synchronous, nonblocking instrumentation callback.
+    /// `started` uses the process monotonic clock and can be aligned with the
+    /// transport feedback trace's `started_at`. Callbacks must not block.
+    pub fn set_timing_observer(&mut self, observer: Option<ProducerTimingObserver>) {
+        self.timing_observer = observer;
+    }
+    fn timing_start(&self) -> Option<Instant> {
+        self.timing_observer.as_ref().map(|_| Instant::now())
+    }
+    fn timing_end(
+        &self,
+        started: Option<Instant>,
+        phase: ProducerTimingPhase,
+        input_bytes: usize,
+        output_bytes: usize,
+        blocked: bool,
+    ) {
+        emit_producer_timing(
+            self.timing_observer.as_ref(),
+            started,
+            phase,
+            input_bytes,
+            output_bytes,
+            blocked,
+        );
+    }
+    fn notify_observer(&self, bytes: &[u8]) {
+        if let Some(observer) = &self.observer {
+            let start = self.timing_start();
+            observer(bytes);
+            self.timing_end(
+                start,
+                ProducerTimingPhase::Observer,
+                bytes.len(),
+                bytes.len(),
+                false,
+            );
+        }
+    }
     fn flush_output(&mut self) -> Result<bool> {
         while self.output_offset < self.output.len() {
-            let n = self.stream.write(&self.output[self.output_offset..])?;
+            let wanted = self.output.len() - self.output_offset;
+            let start = self.timing_start();
+            let write = self.stream.write(&self.output[self.output_offset..]);
+            self.timing_end(
+                start,
+                ProducerTimingPhase::RingEnqueue,
+                wanted,
+                write.as_ref().copied().unwrap_or(0),
+                write.as_ref().is_ok_and(|n| *n < wanted),
+            );
+            let n = write?;
             if n == 0 {
                 return Ok(false);
             }
-            if let Some(observer) = &self.observer {
-                observer(&self.output[self.output_offset..self.output_offset + n]);
-            }
+            self.notify_observer(&self.output[self.output_offset..self.output_offset + n]);
             self.output_offset += n;
             self.target_bytes += n as u64;
         }
@@ -953,7 +1208,8 @@ impl PlaybackStream {
         }
         while self.input_offset < self.input.len() {
             self.output.resize(65536, 0);
-            let p = match &mut self.engine {
+            let start = self.timing_start();
+            let processed = match &mut self.engine {
                 Engine::Pcm { converter, .. } => {
                     converter.process(&self.input[self.input_offset..], &mut self.output)
                 }
@@ -963,8 +1219,15 @@ impl PlaybackStream {
                 Engine::Direct | Engine::DsdRepack => {
                     return Err(Error::InvalidState("direct stream has staged input".into()))
                 }
-            }
-            .map_err(conversion_error)?;
+            };
+            self.timing_end(
+                start,
+                ProducerTimingPhase::ConverterProcess,
+                processed.as_ref().map_or(0, |p| p.consumed),
+                processed.as_ref().map_or(0, |p| p.produced),
+                false,
+            );
+            let p = processed.map_err(conversion_error)?;
             self.input_offset += p.consumed;
             self.output.truncate(p.produced);
             if p.consumed == 0 && p.produced == 0 {
@@ -994,28 +1257,47 @@ impl PlaybackStream {
         if matches!(self.engine, Engine::Direct) {
             let mut phase = self.marker;
             if self.decision.source.encoding == Encoding::DoP {
-                validate_dop(
+                let start = self.timing_start();
+                let checked = validate_dop(
                     &data[..n],
                     usize::from(self.decision.source.channels),
                     frame / usize::from(self.decision.source.channels),
                     &mut phase,
-                )?;
+                );
+                self.timing_end(start, ProducerTimingPhase::SourceFormat, n, n, false);
+                checked?;
             }
-            let taken = self.stream.write(&data[..n])?;
+            let start = self.timing_start();
+            let write = self.stream.write(&data[..n]);
+            self.timing_end(
+                start,
+                ProducerTimingPhase::RingEnqueue,
+                n,
+                write.as_ref().copied().unwrap_or(0),
+                write.as_ref().is_ok_and(|taken| *taken < n),
+            );
+            let taken = write?;
             if self.decision.source.encoding == Encoding::DoP {
                 let mut accepted = self.marker;
-                validate_dop(
+                let start = self.timing_start();
+                let checked = validate_dop(
                     &data[..taken],
                     usize::from(self.decision.source.channels),
                     frame / usize::from(self.decision.source.channels),
                     &mut accepted,
-                )?;
+                );
+                self.timing_end(
+                    start,
+                    ProducerTimingPhase::SourceFormat,
+                    taken,
+                    taken,
+                    false,
+                );
+                checked?;
                 self.marker = accepted;
             }
-            if let Some(observer) = &self.observer {
-                if taken > 0 {
-                    observer(&data[..taken]);
-                }
+            if taken > 0 {
+                self.notify_observer(&data[..taken]);
             }
             self.source_bytes += taken as u64;
             self.target_bytes += taken as u64;
@@ -1030,24 +1312,36 @@ impl PlaybackStream {
         if !self.pump()? {
             return Ok(0);
         }
+        let start = self.timing_start();
         self.input.clear();
-        match &self.engine {
-            Engine::Pcm { unsigned: true, .. } => {
-                self.input.resize(n * 2, 0);
-                pcm_u8_to_i16(&data[..n], &mut self.input);
-            }
-            Engine::Pcm { .. } | Engine::Dsd { dop: false, .. } => {
-                self.input.extend_from_slice(&data[..n])
-            }
-            Engine::Dsd { dop: true, .. } => unpack_dop_into(
-                &data[..n],
-                usize::from(self.decision.source.channels),
-                frame / usize::from(self.decision.source.channels),
-                &mut self.marker,
-                &mut self.input,
-            )?,
-            Engine::Direct | Engine::DsdRepack => unreachable!(),
-        }
+        let formatted: Result<()> = (|| {
+            match &self.engine {
+                Engine::Pcm { unsigned: true, .. } => {
+                    self.input.resize(n * 2, 0);
+                    pcm_u8_to_i16(&data[..n], &mut self.input);
+                }
+                Engine::Pcm { .. } | Engine::Dsd { dop: false, .. } => {
+                    self.input.extend_from_slice(&data[..n])
+                }
+                Engine::Dsd { dop: true, .. } => unpack_dop_into(
+                    &data[..n],
+                    usize::from(self.decision.source.channels),
+                    frame / usize::from(self.decision.source.channels),
+                    &mut self.marker,
+                    &mut self.input,
+                )?,
+                Engine::Direct | Engine::DsdRepack => unreachable!(),
+            };
+            Ok(())
+        })();
+        self.timing_end(
+            start,
+            ProducerTimingPhase::SourceFormat,
+            n,
+            self.input.len(),
+            false,
+        );
+        formatted?;
         self.input_offset = 0;
         self.source_bytes += n as u64;
         let _ = self.pump()?;
@@ -1076,6 +1370,7 @@ impl PlaybackStream {
         if taken == 0 {
             return Ok(0);
         }
+        let start = self.timing_start();
         self.input.clear();
         if source_dop {
             unpack_dop_into(
@@ -1108,6 +1403,13 @@ impl PlaybackStream {
         } else {
             self.output.extend_from_slice(&self.input);
         }
+        self.timing_end(
+            start,
+            ProducerTimingPhase::SourceFormat,
+            taken,
+            self.output.len(),
+            false,
+        );
         self.input.clear();
         self.input_offset = 0;
         self.source_bytes += taken as u64;
@@ -1127,12 +1429,20 @@ impl PlaybackStream {
         if !matches!(self.engine, Engine::Direct | Engine::DsdRepack) {
             loop {
                 self.output.resize(65536, 0);
-                let n = match &mut self.engine {
+                let start = self.timing_start();
+                let finished = match &mut self.engine {
                     Engine::Pcm { converter, .. } => converter.finish(&mut self.output),
                     Engine::Dsd { converter, .. } => converter.finish(&mut self.output),
                     Engine::Direct | Engine::DsdRepack => unreachable!(),
-                }
-                .map_err(conversion_error)?;
+                };
+                self.timing_end(
+                    start,
+                    ProducerTimingPhase::ConverterFinish,
+                    0,
+                    finished.as_ref().copied().unwrap_or(0),
+                    false,
+                );
+                let n = finished.map_err(conversion_error)?;
                 if n == 0 {
                     break;
                 }
@@ -1473,6 +1783,13 @@ mod tests {
             rate_rank,
             channels_rank: 0,
             depth_rank: (0, 0),
+            quality: candidate_quality(
+                &StreamRequest::pcm(48_000, 2, 16),
+                &StreamRequest::pcm(48_000, 2, 16),
+                fidelity,
+                &ConvertOptions::default(),
+            ),
+            upsample_excess: 0,
         };
         let mut items = vec![
             candidate(PlaybackFidelity::Lossy, 0),
@@ -1488,6 +1805,120 @@ mod tests {
                 PlaybackFidelity::Lossy
             ]
         );
+    }
+    #[test]
+    fn lossy_rank_maximizes_bandwidth_before_rate_family_and_avoids_extra_upsampling() {
+        for source_rate in [88_200, 176_400, 352_800, 705_600] {
+            let source = StreamRequest::pcm(source_rate, 2, 16);
+            let candidate = |rate, rank| {
+                let request = StreamRequest::pcm(rate, 2, 16);
+                Candidate {
+                    request,
+                    fidelity: PlaybackFidelity::Lossy,
+                    rate_rank: rank,
+                    channels_rank: 0,
+                    depth_rank: (0, 0),
+                    quality: candidate_quality(
+                        &source,
+                        &request,
+                        PlaybackFidelity::Lossy,
+                        &ConvertOptions::default(),
+                    ),
+                    upsample_excess: rate.saturating_sub(source.sample_rate),
+                }
+            };
+            let mut list = vec![candidate(44_100, 0), candidate(48_000, 1)];
+            sort_candidates(&mut list);
+            assert_eq!(list[0].request.sample_rate, 48_000);
+        }
+        let dsd = StreamRequest::dsd_native(2_822_400, 2);
+        let a = candidate_quality(
+            &dsd,
+            &StreamRequest::pcm(44_100, 2, 16),
+            PlaybackFidelity::Lossy,
+            &ConvertOptions::default(),
+        );
+        let b = candidate_quality(
+            &dsd,
+            &StreamRequest::pcm(48_000, 2, 16),
+            PlaybackFidelity::Lossy,
+            &ConvertOptions::default(),
+        );
+        assert!(b.retained_bandwidth_hz.unwrap() > a.retained_bandwidth_hz.unwrap());
+        let small = StreamRequest::pcm(8_000, 2, 16);
+        let q1 = candidate_quality(
+            &small,
+            &StreamRequest::pcm(44_100, 2, 16),
+            PlaybackFidelity::Lossy,
+            &ConvertOptions::default(),
+        );
+        let q2 = candidate_quality(
+            &small,
+            &StreamRequest::pcm(48_000, 2, 16),
+            PlaybackFidelity::Lossy,
+            &ConvertOptions::default(),
+        );
+        assert_eq!(q1.retained_bandwidth_hz, q2.retained_bandwidth_hz);
+        let make = |request, quality, rate_rank| Candidate {
+            request,
+            fidelity: PlaybackFidelity::Lossy,
+            rate_rank,
+            channels_rank: 0,
+            depth_rank: (0, 0),
+            upsample_excess: request.sample_rate - small.sample_rate,
+            quality,
+        };
+        let mut same = vec![
+            make(StreamRequest::pcm(48_000, 2, 16), q2, 0),
+            make(StreamRequest::pcm(44_100, 2, 16), q1, 1),
+        ];
+        sort_candidates(&mut same);
+        assert_eq!(same[0].request.sample_rate, 44_100);
+    }
+    #[test]
+    fn producer_timing_records_observer_and_conversion_separately() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = records.clone();
+        let callback: ProducerTimingObserver =
+            Arc::new(move |event| sink.lock().unwrap().push(event));
+        let t = Instant::now();
+        emit_producer_timing(
+            Some(&callback),
+            Some(t),
+            ProducerTimingPhase::ConverterProcess,
+            16,
+            32,
+            false,
+        );
+        let t = Instant::now();
+        emit_producer_timing(
+            Some(&callback),
+            Some(t),
+            ProducerTimingPhase::Observer,
+            32,
+            32,
+            false,
+        );
+        let t = Instant::now();
+        emit_producer_timing(
+            Some(&callback),
+            Some(t),
+            ProducerTimingPhase::RingEnqueue,
+            32,
+            0,
+            true,
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.iter().map(|v| v.phase).collect::<Vec<_>>(),
+            [
+                ProducerTimingPhase::ConverterProcess,
+                ProducerTimingPhase::Observer,
+                ProducerTimingPhase::RingEnqueue
+            ]
+        );
+        assert!(records[2].blocked);
+        assert_eq!(records[0].output_bytes, 32);
     }
     #[test]
     fn converter_supports_high_rate_and_dsd_512_families() {
