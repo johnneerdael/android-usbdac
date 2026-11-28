@@ -2,6 +2,8 @@
 
 import hashlib
 import os
+import re
+import subprocess
 import textwrap
 import io
 import json
@@ -111,6 +113,44 @@ class ReservationTests(unittest.TestCase):
                     exercise([], False, absent, declared=declared)
         # The tagged version itself is released, so main moves to the next patch.
         self.assertEqual(exercise([], False, False, declared='0.1.14'), '0.1.15')
+
+
+# A crate, Maven or AAR coordinate that names a release version.
+COORDINATE = re.compile(r'usbdac-core(?:@|\s*=\s*"|\s*=\s*\{[^}\n]*version\s*=\s*"|-(?=[0-9.]+\.crate))([0-9]+\.[0-9]+\.[0-9]+)'
+                        r'|dev\.usbdac:usbdac(?:-media3)?:([0-9]+\.[0-9]+\.[0-9]+)'
+                        r'|usbdac(?:-media3)?-([0-9]+\.[0-9]+\.[0-9]+)\.aar')
+
+
+class VersionedDocsTests(unittest.TestCase):
+    def test_every_document_naming_a_coordinate_is_rewritten_at_release(self):
+        tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', '*.md', '*.html'], cwd=REPO).decode().split('\0')
+        naming = {name for name in tracked if name and COORDINATE.search((REPO / name).read_text(errors='replace'))}
+        self.assertTrue(naming)
+        self.assertEqual(naming - set(prepare.VERSIONED_DOCS), set(),
+                         'add these documents and their coordinates to VERSIONED_DOCS in prepare_release.py')
+
+    def test_set_version_rewrites_every_coordinate_and_literal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, templates in prepare.VERSIONED_DOCS.items():
+                content = (REPO / name).read_text()
+                for template in templates:
+                    pattern = re.escape(template).replace(re.escape('{version}'), prepare.STABLE_VERSION.pattern)
+                    self.assertRegex(content, pattern, f'{name} no longer contains {template!r}')
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(content)
+            previous = os.getcwd()
+            os.chdir(root)
+            try:
+                with patch.object(prepare, 'version_files', return_value={}):
+                    prepare.set_version('0.1.17', '9.8.7', '0.1.17')
+            finally:
+                os.chdir(previous)
+            for name, templates in prepare.VERSIONED_DOCS.items():
+                content = (root / name).read_text()
+                self.assertEqual({v for match in COORDINATE.findall(content) for v in match if v} - {'9.8.7'}, set(), name)
+                for template in templates:
+                    self.assertIn(template.format(version='9.8.7'), content)
 
 
 class PinTests(unittest.TestCase):

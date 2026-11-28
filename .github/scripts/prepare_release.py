@@ -70,23 +70,26 @@ def stable_tags(*options):
     )
 
 
+# The sealed package and its source examples must carry the selected version.
+# Every tracked document naming a crate, Maven or AAR coordinate belongs here.
+VERSIONED_DOCS = {
+    "README.md": ["usbdac-core@{version}"],
+    "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
+    "docs/API.md": ["usbdac-core@{version}"],
+    "docs/sdk/guide-rust.md": ["usbdac-core@{version}"],
+    "docs/sdk/index.md": ["This guide covers usbdac {version}."],
+    "docs/sdk/getting-started.md": [
+        "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",
+        "[{version} release]",
+    ],
+}
+
+
 def set_version(old, new, last_release):
     for path, (pattern, _) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         path.write_text(pattern.sub(lambda match: match[1] + new + match[3], path.read_text()))
 
-    # The sealed package and its source examples must carry the selected version.
-    examples = {
-        "README.md": ["usbdac-core@{version}"],
-        "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
-        "docs/API.md": ["usbdac-core@{version}"],
-        "docs/sdk/guide-rust.md": ["usbdac-core@{version}"],
-        "docs/sdk/index.md": ["This guide covers usbdac {version}."],
-        "docs/sdk/getting-started.md": [
-            "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",
-            "[{version} release]",
-        ],
-    }
-    for name, literals in examples.items():
+    for name, literals in VERSIONED_DOCS.items():
         path = Path(name)
         content = path.read_text()
         updated = content
