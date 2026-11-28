@@ -82,8 +82,10 @@ Each release from 0.1.11 on includes an **Android validator APK** and an
 **Apple Silicon macOS validator ZIP**, built from the same commit as the
 library. Start a capture, connect one DAC, and the app runs the direct USB
 format tests and saves a report ZIP with device details, test outcomes and
-debug logs. The APK is signed with the CI debug key; the macOS app is ad hoc
-signed and not notarized. Remove headphones and mute the amplifier first.
+debug logs. The APK is signed with the project's pinned validator key, the
+same for every release after 0.1.20, so a new APK installs over the previous
+one (an APK from 0.1.20 or earlier must be uninstalled once); the macOS app is
+ad hoc signed and not notarized. Remove headphones and mute the amplifier first.
 
 <table>
   <tr>
@@ -341,8 +343,9 @@ and the `usbdac` and `usbdac-media3` AARs, and creates the GitHub Release with i
 that declares a higher version can select the next minor or major release.
 For releases from sources containing the validator, the downloads also include
 a versioned Android validator APK and Apple Silicon macOS validator ZIP built
-from that same commit. The APK uses the CI debug signing key; the macOS app is
-ad hoc signed and not notarized. Both are included in `SHA256SUMS.txt`.
+from that same commit. The APK is signed with the pinned validator key from the
+repository secrets, and the release checks its certificate digest; the macOS
+app is ad hoc signed and not notarized. Both are included in `SHA256SUMS.txt`.
 Documentation-only changes deploy through the Docs workflow.
 
 Use **Actions → Release → Run workflow** to build an explicit version, or

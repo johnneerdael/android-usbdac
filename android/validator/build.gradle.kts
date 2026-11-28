@@ -4,11 +4,29 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+val validatorVersionName = providers.gradleProperty("VERSION_NAME").get()
+// 0.1.21 -> 1021: every release installs over the previous one.
+val validatorVersionCode = validatorVersionName.substringBefore('-').split('.').map(String::toInt)
+    .let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch }
+// Release builds sign with one pinned key, supplied by CI from repository
+// secrets, so an installed validator upgrades in place. Without it, the
+// machine's own debug key is used.
+val pinnedKeystore = providers.environmentVariable("VALIDATOR_KEYSTORE").orNull
 android {
     namespace = "dev.usbdac.validator"
     compileSdk = 36
     buildFeatures { aidl = true; compose = true; buildConfig = true }
-    defaultConfig { applicationId = "dev.usbdac.validator"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = providers.gradleProperty("VERSION_NAME").get() }
+    defaultConfig { applicationId = "dev.usbdac.validator"; minSdk = 26; targetSdk = 34; versionCode = validatorVersionCode; versionName = validatorVersionName }
+    if (pinnedKeystore != null) {
+        val password = providers.environmentVariable("VALIDATOR_KEYSTORE_PASSWORD").get()
+        val pinned = signingConfigs.create("pinned") {
+            storeFile = file(pinnedKeystore)
+            storePassword = password
+            keyAlias = "usbdac-validator"
+            keyPassword = password
+        }
+        buildTypes.getByName("debug").signingConfig = pinned
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
 }
 kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
