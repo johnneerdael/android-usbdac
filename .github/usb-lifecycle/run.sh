@@ -46,9 +46,7 @@ if [ "${1:-}" = build ]; then
         rustup run "$RUSTUP_TOOLCHAIN" cargo zigbuild --locked --release -p usbdac-core --example usbip_lifecycle --target "$target" --features libusb1-sys/vendored
         RUSTFLAGS='-C target-feature=-crt-static' rustup run "$RUSTUP_TOOLCHAIN" cargo zigbuild --locked --release -p usbdac-jni -p usbdac-core --target "$target" --features libusb1-sys/vendored
         zig cc -target aarch64-linux-musl -static -O2 "$fixture/usbfs_jni_launcher.c" -o "$out/root/fixture/usbfs_jni_launcher"
-        printf '#!/bin/sh\nexec zig cc -target aarch64-linux-musl "$@"\n' > "$out/compiled/zig-cc"
-        chmod +x "$out/compiled/zig-cc"
-        rustup run "$RUSTUP_TOOLCHAIN" rustc --edition 2021 --target "$target" -C linker="$out/compiled/zig-cc" "$fixture/usbip_uac.rs" -o "$out/root/fixture/usbip_uac"
+        rustup run "$RUSTUP_TOOLCHAIN" rustc --edition 2021 --target "$target" -C linker=rust-lld -C linker-flavor=ld.lld "$fixture/usbip_uac.rs" -o "$out/root/fixture/usbip_uac"
     else
         uapi="$out/compiled/uapi"
         mkdir -p "$uapi"
@@ -63,7 +61,7 @@ if [ "${1:-}" = build ]; then
         rustup run "$RUSTUP_TOOLCHAIN" cargo build --locked --release -p usbdac-core --example usbip_lifecycle --target "$target" --features libusb1-sys/vendored
         RUSTFLAGS='-C target-feature=-crt-static' rustup run "$RUSTUP_TOOLCHAIN" cargo build --locked --release -p usbdac-jni -p usbdac-core --target "$target" --features libusb1-sys/vendored
         "$out/compiled/musl-cc" -static -O2 "$fixture/usbfs_jni_launcher.c" -o "$out/root/fixture/usbfs_jni_launcher"
-        rustup run "$RUSTUP_TOOLCHAIN" rustc --edition 2021 --target "$target" -C linker="$out/compiled/musl-cc" "$fixture/usbip_uac.rs" -o "$out/root/fixture/usbip_uac"
+        rustup run "$RUSTUP_TOOLCHAIN" rustc --edition 2021 --target "$target" -C linker=rust-lld -C linker-flavor=ld.lld "$fixture/usbip_uac.rs" -o "$out/root/fixture/usbip_uac"
     fi
     cp "$root/target/$target/release/examples/usbip_lifecycle" "$out/root/fixture/usbip_lifecycle"
     cp "$root/target/$target/release/libusbdac.so" "$out/root/fixture/libusbdac.so"

@@ -373,9 +373,9 @@ class UsbDacAudioSinkTest {
         val positions = mutableListOf<Long>()
         val source = object : OutputSource by fake {
             override fun canRecover(error: DacException) = error.code == DacErrorCode.TRANSFER
-            override fun onRecoveryPosition(output: OpenedOutput, positionUs: Long) {
+            override fun onRecoveryPosition(output: OpenedOutput?, positionUs: Long?) {
                 assertFalse(fake.opened.single().closed)
-                positions += positionUs
+                if (positionUs != null) positions += positionUs
             }
         }
         val sink = UsbDacAudioSink(source)
