@@ -55,6 +55,8 @@ class ReservationTests(unittest.TestCase):
             path = args[-1]
             if 'workflow_dispatch' in path:
                 return [{'workflow_runs': []}]
+            if path.startswith('repositories/'):
+                return {'id': int(path.split('/')[1]), 'full_name': 'x/y'}
             number = int(path.split('/runs/')[1].split('/')[0])
             run = {'id': number, 'run_attempt': 2, 'status': 'completed', 'conclusion': 'failure'}
             if '/jobs?' in path:
@@ -66,16 +68,25 @@ class ReservationTests(unittest.TestCase):
                 run['run_attempt'] = int(path.split('/attempts/')[1])
                 return run
             return dict(run, head_sha='c' * 40, path='.github/workflows/release.yml',
-                        event='push', head_branch='main', repository={'full_name': 'x/y'},
-                        head_repository={'full_name': 'x/y'}, created_at='2026-11-01T00:00:00Z')
-        with patch.object(prepare, 'api_json', side_effect=api), \
-             patch.object(prepare, 'git', return_value='c' * 40), \
-             patch.object(prepare, 'trusted_workflow', return_value=True):
-            records = [('a' * 40, 1), ('b' * 40, 2)]
-            self.assertTrue(prepare.never_published('x/y', '0.1.12', records))
-            for outcome in ('missing', 'active', 'failure', 'success'):
-                state['result'] = outcome
-                self.assertFalse(prepare.never_published('x/y', '0.1.12', records))
+                        event='push', head_branch='main', repository={'full_name': 'x/y', 'id': 17},
+                        head_repository={'full_name': 'x/y', 'id': 17}, created_at='2026-11-01T00:00:00Z')
+        records = [('a' * 40, 1), ('b' * 40, 2)]
+        # Hosted runners set GITHUB_REPOSITORY_ID, which switches never_published to the
+        # numeric repository check; exercise both the name and the ID path explicitly.
+        for repo_id in (None, '17'):
+            state['result'] = 'skipped'
+            env = {k: v for k, v in prepare.os.environ.items() if k != 'GITHUB_REPOSITORY_ID'}
+            if repo_id is not None:
+                env['GITHUB_REPOSITORY_ID'] = repo_id
+            with self.subTest(repository_id=repo_id), \
+                 patch.dict(prepare.os.environ, env, clear=True), \
+                 patch.object(prepare, 'api_json', side_effect=api), \
+                 patch.object(prepare, 'git', return_value='c' * 40), \
+                 patch.object(prepare, 'trusted_workflow', return_value=True):
+                self.assertTrue(prepare.never_published('x/y', '0.1.12', records))
+                for outcome in ('missing', 'active', 'failure', 'success'):
+                    state['result'] = outcome
+                    self.assertFalse(prepare.never_published('x/y', '0.1.12', records))
 
     def test_uncertain_evidence_does_not_authorize_adoption(self):
         with patch.object(prepare, 'reservations', return_value=[('a', 1)]), \
