@@ -91,6 +91,9 @@ enum Mode {
     FullUac3Clock,
     Duplex,
     Retire,
+    // DoP carrier DACs for resolve_playback: one stereo PCM alternate at 176.4 kHz.
+    DopCarrier32,
+    DopStereo24,
 }
 
 fn duplex_configuration() -> Vec<u8> {
@@ -111,6 +114,35 @@ impl Mode {
     fn has_uac3(self) -> bool {
         matches!(self, Self::Badd | Self::FullUac3 | Self::FullUac3Clock)
     }
+    /// (subslot bytes, bit resolution, wMaxPacketSize) of a DoP carrier mode.
+    fn dop_carrier(self) -> Option<(u8, u8, u16)> {
+        // 176.4 kHz at 125 us is up to 23 stereo frames per service interval.
+        match self {
+            Self::DopCarrier32 => Some((4, 32, 23 * 8)),
+            Self::DopStereo24 => Some((3, 24, 23 * 6)),
+            _ => None,
+        }
+    }
+}
+
+// The UAC2 configuration with its one stereo alternate re-described as a 32- or
+// 24-bit Type I PCM carrier (Frmts20 §2.3.1.6) whose endpoint fits 176.4 kHz.
+fn dop_carrier_configuration(subslot: u8, bits: u8, max_packet: u16) -> Vec<u8> {
+    let mut c = rv_config0();
+    let format = c
+        .windows(6)
+        .position(|w| w == [6, 0x24, 2, 1, 2, 16])
+        .expect("format type descriptor");
+    c[format + 4] = subslot;
+    c[format + 5] = bits;
+    let endpoint = c
+        .windows(6)
+        .position(|w| w == [7, 5, 1, 0x0d, 48, 0])
+        .expect("data endpoint");
+    c[endpoint + 4..endpoint + 6].copy_from_slice(&max_packet.to_le_bytes());
+    let len = c.len() as u16;
+    c[2..4].copy_from_slice(&len.to_le_bytes());
+    c
 }
 
 // ADC3 AC header, programmable internal clock, USB input and speaker output.
@@ -257,6 +289,10 @@ impl Device {
                     full_uac3_clock_configuration()
                 } else if v == 0x0200 && self.mode == Mode::Duplex {
                     duplex_configuration()
+                } else if let (0x0200, Some((subslot, bits, max_packet))) =
+                    (v, self.mode.dop_carrier())
+                {
+                    dop_carrier_configuration(subslot, bits, max_packet)
                 } else {
                     configuration(v as u8).ok_or(())?
                 }
@@ -510,6 +546,7 @@ impl Device {
                         | Mode::FullUac3Clock
                         | Mode::Duplex
                         | Mode::Retire => self.rate,
+                        Mode::DopCarrier32 | Mode::DopStereo24 => self.rate,
                     }
                 } else {
                     self.rate
@@ -712,6 +749,9 @@ fn urb_loop(mut s: TcpStream, mut dev: Device) -> io::Result<()> {
             dev.shared.lock().unwrap().out_submits += 1;
             let mut total = 0usize;
             let max_packet = match (dev.config, dev.alt) {
+                (1, 1) if dev.mode.dop_carrier().is_some() => {
+                    usize::from(dev.mode.dop_carrier().unwrap().2)
+                }
                 (1, 1) => 48,
                 (3, 1) if dev.mode == Mode::FullUac3Clock => 48,
                 (2, 1) | (3, 1) => 196,
@@ -958,6 +998,19 @@ fn main() -> io::Result<()> {
                     Some("full-uac3-clock") => Mode::FullUac3Clock,
                     Some("duplex") => Mode::Duplex,
                     Some("retire") => Mode::Retire,
+                    // DoP resolution modes; the carrier DACs clock only 176.4 kHz,
+                    // and dop-no-carrier is the stock 48/96 kHz S16 DAC.
+                    Some(name @ ("dop-carrier32" | "dop-stereo24")) => {
+                        if env::var_os("RV_RATES").is_none() {
+                            env::set_var("RV_RATES", "176400");
+                        }
+                        if name == "dop-carrier32" {
+                            Mode::DopCarrier32
+                        } else {
+                            Mode::DopStereo24
+                        }
+                    }
+                    Some("dop-no-carrier") => Mode::Normal,
                     _ => return Err(invalid("unknown mode")),
                 }
             }
@@ -970,7 +1023,7 @@ fn main() -> io::Result<()> {
             }
             _ => {
                 return Err(invalid(
-                    "usage: usbip_uac [--attach | --control status|release] [--mode normal|bad-cur|stale-cur|badd|full-uac3|full-uac3-clock|duplex|retire] [--port PORT]",
+                    "usage: usbip_uac [--attach | --control status|release] [--mode normal|bad-cur|stale-cur|badd|full-uac3|full-uac3-clock|duplex|retire|dop-carrier32|dop-stereo24|dop-no-carrier] [--port PORT]",
                 ))
             }
         }
@@ -1027,6 +1080,21 @@ mod tests {
         s
     }
     #[test]
+    fn dop_carrier_configurations_describe_one_wide_alternate() {
+        for (mode, subslot, bits, max_packet) in [
+            (Mode::DopCarrier32, 4u8, 32u8, 184u16),
+            (Mode::DopStereo24, 3, 24, 138),
+        ] {
+            let mut d = Device::new(mode);
+            let c = d.control(req(0x80, 6, 0x0200, 0, 512), &[]).unwrap();
+            assert_eq!(u16::from_le_bytes([c[2], c[3]]) as usize, c.len());
+            assert!(c.windows(6).any(|w| w == [6, 0x24, 2, 1, subslot, bits]));
+            let mp = max_packet.to_le_bytes();
+            assert!(c.windows(6).any(|w| w == [7, 5, 1, 0x0d, mp[0], mp[1]]));
+            assert!(!c.windows(6).any(|w| w == [6, 0x24, 2, 1, 2, 16]));
+        }
+    }
+    #[test]
     fn descriptors_are_well_formed() {
         let mut d = Device::new(Mode::Normal);
         let c = d.control(req(0x80, 6, 0x0200, 0, 255), &[]).unwrap();
@@ -1059,6 +1127,7 @@ mod tests {
                 Mode::Badd | Mode::FullUac3 | Mode::FullUac3Clock | Mode::Duplex | Mode::Retire => {
                     unreachable!()
                 }
+                Mode::DopCarrier32 | Mode::DopStereo24 => unreachable!(),
             }
             let range = d.control(req(0xa1, 2, 0x100, 0x1000, 255), &[]).unwrap();
             assert_eq!(range.len(), 26);

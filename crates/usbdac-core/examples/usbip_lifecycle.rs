@@ -687,6 +687,145 @@ mod linux {
         Ok(())
     }
 
+    /// DoP resolution through the production resolve_playback, transport and
+    /// PlaybackStream. DoP v1.1 carries 16 DSD bits per channel per carrier frame,
+    /// so a DoP carrier of another depth or channel count is a repack (H1), and an
+    /// exact DoP shape absent from the descriptors is never attempted (H2).
+    fn dop_resolution(dac: Dac, fd: i32, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use usbdac_core::playback::{PlaybackFidelity, PlaybackPolicy, PlaybackTransform};
+        use usbdac_core::Encoding;
+        let confirmed = PlaybackPolicy {
+            dop_confirmed: true,
+            ..PlaybackPolicy::default()
+        };
+        let caps = dac.capabilities()?;
+        assert!(
+            caps.exclusion_snapshot_complete,
+            "the fixture descriptor snapshot must be complete"
+        );
+        let source = StreamRequest::dop(2_822_400, if mode == "dop-stereo24" { 1 } else { 2 });
+        if mode == "dop-carrier32" {
+            // H2: 24-bit DoP on a 32-bit-only DAC reaches the 32-bit carrier.
+            let widened = dac.resolve_playback(&source, &confirmed)?;
+            println!(
+                "DOP_DECISION mode={mode} case=widen transform={:?} fidelity={:?} bits={} preflight={:?}",
+                widened.transform, widened.fidelity, widened.format.valid_bits, widened.source_preflight_refusal
+            );
+            assert!(widened.source_preflight_refusal.is_some());
+            assert_eq!(widened.format.encoding, Encoding::DoP);
+            assert_eq!(widened.format.valid_bits, 32);
+            assert_eq!(
+                widened.transform,
+                PlaybackTransform::DopRepack { target_channels: 2 }
+            );
+        }
+        let policy = if mode == "dop-carrier32" {
+            // H1: the review's smallest case.
+            PlaybackPolicy {
+                allowed_pcm_depths: Some(vec![32]),
+                ..confirmed.clone()
+            }
+        } else {
+            confirmed.clone()
+        };
+        out_of_band("reset")?;
+        let decision = dac.resolve_playback(&source, &policy)?;
+        println!(
+            "DOP_DECISION mode={mode} transform={:?} fidelity={:?} format={:?}/{}ch/{}bit preflight={:?} attempted={}",
+            decision.transform,
+            decision.fidelity,
+            decision.format.encoding,
+            decision.format.channels,
+            decision.format.valid_bits,
+            decision.source_preflight_refusal,
+            decision.attempted_candidates
+        );
+        if mode == "dop-no-carrier" {
+            // H2: confirmed DoP on a DAC that cannot carry it falls back like unconfirmed.
+            assert!(decision.source_preflight_refusal.is_some());
+            assert_eq!(decision.format.encoding, Encoding::Pcm);
+            assert!(matches!(
+                decision.transform,
+                PlaybackTransform::DsdToPcm {
+                    dop_input: true,
+                    ..
+                }
+            ));
+            let unconfirmed = dac.resolve_playback(&source, &PlaybackPolicy::default())?;
+            assert_eq!(unconfirmed.format, decision.format);
+        } else {
+            assert_eq!(decision.format.encoding, Encoding::DoP);
+            assert_eq!(decision.format.channels, 2);
+            assert_eq!(
+                decision.transform,
+                PlaybackTransform::DopRepack { target_channels: 2 }
+            );
+            assert_eq!(
+                decision.fidelity,
+                if source.channels == 2 {
+                    PlaybackFidelity::BitExact
+                } else {
+                    PlaybackFidelity::Lossless
+                }
+            );
+            assert_eq!(decision.attempted_candidates, 1);
+        }
+        let mut stream = dac.open_playback(&decision, Arc::new(|_| {}))?;
+        let channels = usize::from(source.channels);
+        let frame = decision.source_frame_bytes;
+        let mut next = 0usize;
+        let mut chunk = Vec::new();
+        let start = Instant::now();
+        let mut started = false;
+        while start.elapsed() < Duration::from_secs(3)
+            && (stream.played_frames() == 0 || stream.stats().completed_transfers == 0)
+        {
+            let frames = stream.writable_bytes() / frame;
+            if frames > 0 {
+                chunk.clear();
+                for i in next..next + frames {
+                    let marker = if i % 2 == 0 { 0x05 } else { 0xfa };
+                    for _ in 0..channels {
+                        chunk.extend_from_slice(&[0x69, 0x69, marker]);
+                    }
+                }
+                next += stream.write(&chunk)? / frame;
+            }
+            if !started && next > 0 {
+                stream.play()?;
+                started = true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let stats = stream.target_stats();
+        let snapshot = out_of_band("snapshot")?;
+        println!("DOP_STATS mode={mode} source_frames={next} {stats:?} {snapshot}");
+        assert!(
+            stats.played_frames > 0 && stats.completed_transfers > 0,
+            "no DoP-resolved completions"
+        );
+        let rates = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+        let carrier_set = rates
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|v| v == "176400");
+        // The carrier DACs clock 176.4 kHz; the exact carrier is never set on a DAC without one.
+        assert_eq!(carrier_set, mode != "dop-no-carrier", "{snapshot}");
+        if mode != "dop-no-carrier" {
+            assert!(stats.payload_verified, "the DoP payload must audit clean");
+        }
+        stream.close()?;
+        assert_eq!(alt(fd)?, 0, "stream teardown must restore alternate zero");
+        let retirement = dac.retirement();
+        dac.close()?;
+        assert!(retirement.wait(Duration::from_secs(3)));
+        assert_eq!(alt(fd)?, 0);
+        for interface in [1, 0] {
+            claim(fd, interface, false)?;
+        }
+        println!("USBIP_LIFECYCLE_PASS mode={mode} alt=0 retired=true");
+        Ok(())
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = std::env::args().collect();
         if args.len() != 3
@@ -708,6 +847,9 @@ mod linux {
                     | "refuse-set"
                     | "zero-res"
                     | "full-uac3-nearest"
+                    | "dop-carrier32"
+                    | "dop-stereo24"
+                    | "dop-no-carrier"
             )
         {
             return Err(
@@ -808,6 +950,9 @@ mod linux {
         }
         if args[2] == "reconfigure" {
             return reconfigure(dac, fd);
+        }
+        if args[2].starts_with("dop-") {
+            return dop_resolution(dac, fd, &args[2]);
         }
         let caps = dac.capabilities()?;
         if args[2] == "refuse-set" {
