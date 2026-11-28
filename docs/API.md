@@ -1195,9 +1195,9 @@ The exported symbols are `Java_dev_usbdac_internal_Native_<name>`.
 Every failure is a `java.lang.IllegalStateException` whose message is
 `usbdac:<code>: <message>`, with `<code>` one of `busy`, `platform_unsupported`,
 `claim`, `unsupported`, `implicit_feedback_unsupported`, `clock_unverified`, `device_lost`, `transfer`,
-`control`, `invalid_state`, `invalid_argument`, `volume_unavailable`, `reconfigure_drain_timeout`,
-`reconfigure_unusable` (section 3). In an `Error` event the two reconfiguration codes, like any
-code without a number in the table below, arrive as `a` = 0. Malformed JSON and
+`control`, `invalid_state`, `invalid_argument`, `volume_unavailable`, `host_usb`,
+`reconfigure_drain_timeout`, `reconfigure_unusable` (section 3). In an `Error` event a code
+without a number in the table below arrives as `a` = 0. Malformed JSON and
 bad handles are `invalid_argument`. A Rust panic is converted to a
 `RuntimeException`.
 
@@ -1213,7 +1213,7 @@ bad handles are `invalid_argument`. A Rust panic is converted to a
 | 3 | BitPerfectChanged | 1 or 0 | 0 | null |
 | 4 | VolumeChanged | muted: 1, 0, or -1 unknown | level in dB | the volume state JSON |
 | 5 | FeedbackStale | 0 | 0 | null |
-| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported, 12 volume_unavailable | 0 | `usbdac:<code>: <message>` |
+| 6 | Error | error code: 1 busy, 2 platform_unsupported, 3 claim, 4 unsupported, 5 clock_unverified, 6 device_lost, 7 transfer, 8 control, 9 invalid_state, 10 invalid_argument, 11 implicit_feedback_unsupported, 12 volume_unavailable, 13 host_usb, 14 reconfigure_drain_timeout, 15 reconfigure_unusable | 0 | `usbdac:<code>: <message>` |
 | 7 | DeviceLost | 0 | 0 | null |
 | 8 | CompatibilityFallback | tier code | 0 | reason |
 | 9 | NominalAsyncHostStarvation | host ring empty duration in ms | 0 | null |
