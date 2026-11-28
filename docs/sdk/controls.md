@@ -209,7 +209,7 @@ For a DAC whose Clock Selector has the second of two inputs active, that prints 
 | Control | Type | Effect | Bit-perfect impact |
 |---|---|---|---|
 | `range` | `VolumeRange` | The DAC's minimum, maximum and resolution in dB | None |
-| `state` | `StateFlow<VolumeState>` | Level in dB, position on the 0..1 curve, mute (`null` when the DAC has no readable mute). Follows this library's writes and `refresh()`; a physical knob is noticed only by `refresh()` | None |
+| `state` | `StateFlow<VolumeState>` | Level in dB, position on the 0..1 curve, mute (`null` when the DAC has no readable mute). Follows this library's writes and `refresh()`; a physical knob is noticed only by `refresh()`. A level of `Double.NEGATIVE_INFINITY` is silence (see below) | None |
 | `setDb(db)` | `Double` | Clamped to the range and snapped to the nearest step the DAC supports (a tie goes to the quieter step). Returns at once | None: the DAC scales the audio, the stream stays bit-perfect |
 | `setFraction(f)` | `Double` (0..1) | Position on the curve. 0 is the DAC's minimum; above 0 the curve spans the larger of the minimum and -80 dB to the maximum, linearly in dB, so a DAC whose minimum is -127 dB does not waste most of a slider on inaudible levels. Returns at once | None |
 | `step(direction, steps)` | `Int, Int = 16` | Moves by 1/`steps` of the curve and by at least one DAC step; at either end the level stays. `steps` of 0 or less means 16. Returns at once | None |
@@ -219,6 +219,8 @@ For a DAC whose Clock Selector has the second of two inputs active, that prints 
 | `startup` | `StartupVolumeReport` | What the library did to the level when the session opened: `originalDb` and `appliedDb` per channel, `limitDb`, `attenuated`, `clampedToMinimum`, `maxDb`. See [start-up volume protection](#start-up-volume-protection) | None |
 | `originalDb` | `Double?` | The level the DAC had before the library first changed it, if every channel agreed | None |
 | `handBack()` | `Boolean` | Writes the original level back (blocking) and forgets it. Pending writes are dropped first | None |
+
+A Feature Unit volume CUR of 0x8000 is the UAC silence code ([UAC1 §5.2.2.4.3.2](references.md#ref-uac1), [UAC2 §5.2.5.7.2](references.md#ref-uac2)): `state.db` reads it as negative infinity, with `fraction` 0, and a read-back accepts it even though it lies below the DAC's minimum. Format a level before showing it: `"%.1f dB"` prints `-Infinity dB`. The range stays numeric: the specifications forbid a MIN of 0x8000, and a DAC that reports one anyway gets a `range.minDb` of -128 dB.
 
 The setters queue their writes on a library thread, one at a time. A burst of absolute values (`setDb`, `setFraction`) collapses to the last one, which is always applied; identical `step` calls merge into a count (at most 32 wait); a mute request replaces a pending one. A write that fails is reported as `DacEvent.VolumeWriteFailed` on `session.events`, because the call that asked has already returned. Writes are verified by reading the level back.
 
