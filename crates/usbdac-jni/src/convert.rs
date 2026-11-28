@@ -8,13 +8,15 @@
 //! section 14.
 
 use jni::errors::ThrowRuntimeExAndDefault;
+use jni::ids::JMethodID;
 use jni::objects::{JByteBuffer, JObject, JString};
+use jni::signature::{Primitive, ReturnType};
 use jni::{jni_mangle, jni_sig, jni_str, Env, EnvUnowned};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use usbdac_core::convert::{
     filter_info, ConversionPlan, ConvertError, ConvertOptions, Converter, Narrowing, PcmFormat,
     Quality, SampleFormat,
@@ -251,11 +253,51 @@ fn direct_range(
     Ok((unsafe { base.add(offset) }, count))
 }
 
+/// `java.nio.ByteBuffer.isReadOnly()Z`, resolved on first use.
+static IS_READ_ONLY: OnceLock<JMethodID> = OnceLock::new();
+
+/// `buffer.isReadOnly()`, with the method ID cached instead of looked up on
+/// every call. The same virtual call as `call_method`, which resolves the name
+/// on the receiver's class each time; a null receiver fails as it does there.
+pub(crate) fn is_read_only(
+    env: &mut Env<'_>,
+    buffer: &JByteBuffer<'_>,
+) -> jni::errors::Result<bool> {
+    if buffer.is_null() {
+        return Err(jni::errors::Error::NullPtr("call_method obj argument"));
+    }
+    let method = match IS_READ_ONLY.get() {
+        Some(&method) => method,
+        None => {
+            let method = env.get_method_id(
+                jni_str!("java/nio/ByteBuffer"),
+                jni_str!("isReadOnly"),
+                jni_sig!("()Z"),
+            )?;
+            // A racing thread resolves the same ID; keep whichever won.
+            *IS_READ_ONLY.get_or_init(|| method)
+        }
+    };
+    // SAFETY: `method` is ByteBuffer's `isReadOnly()Z`: no arguments, boolean
+    // return, matching the empty args and `Primitive::Boolean`. The receiver is
+    // a non-null `java.nio.ByteBuffer` (checked above; the JVM enforces the
+    // declared parameter type), and Call<Type>MethodA dispatches virtually, so
+    // every ByteBuffer subclass runs its own override. java.nio.ByteBuffer is a
+    // bootstrap class: a class unloads only with its defining loader, and the
+    // bootstrap loader never goes away, so the cached ID stays valid.
+    unsafe {
+        env.call_method_unchecked(
+            buffer,
+            method,
+            ReturnType::Primitive(Primitive::Boolean),
+            &[],
+        )
+    }?
+    .z()
+}
+
 pub(crate) fn require_writable(env: &mut Env<'_>, buffer: &JByteBuffer<'_>) -> Outcome<()> {
-    if env
-        .call_method(buffer, jni_str!("isReadOnly"), jni_sig!("()Z"), &[])?
-        .z()?
-    {
+    if is_read_only(env, buffer)? {
         return Err(bad("the output buffer is read-only").into());
     }
     Ok(())

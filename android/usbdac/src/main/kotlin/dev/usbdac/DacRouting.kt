@@ -52,7 +52,21 @@ public class RoutingException @JvmOverloads constructor(public val kind: Routing
     public val sessionCode: DacErrorCode?, public val failedChange: Int?,
     public val controlFailure: RoutingControlFailure?, public val rollbackFailures: List<RoutingRollbackFailure>,
     /** Scoped ADC3 power hand-back also failed; the primary error fields remain intact. */
-    public val powerRestoreFailure: String? = null) : Exception(message)
+    public val powerRestoreFailure: String? = null) : Exception(message) {
+    /**
+     * The routes the transaction committed when only the ADC3 power hand-back failed afterwards:
+     * those controls now hold their new values. `null` when the transaction itself did not commit.
+     */
+    public var routeReport: RoutingReport? = null
+        private set
+
+    public constructor(kind: RoutingErrorKind, message: String, sessionCode: DacErrorCode?, failedChange: Int?,
+        controlFailure: RoutingControlFailure?, rollbackFailures: List<RoutingRollbackFailure>,
+        powerRestoreFailure: String?, routeReport: RoutingReport?) :
+        this(kind, message, sessionCode, failedChange, controlFailure, rollbackFailures, powerRestoreFailure) {
+        this.routeReport = routeReport
+    }
+}
 
 /**
  * Typed routing through this session's checked native controls while idle.
@@ -100,7 +114,7 @@ public class DacRouting internal constructor(private val dac: Long, private val 
         require(edits.size <= 32) { "at most 32 route edits" }
         val json = JSONArray(edits.map { JSONObject().put("key", it.key.json()).put("expected", it.expected.json()).put("value", it.value.json()) })
         val result = routingResponse { if (powered) Native.routingApplyPowered(dac, snapshot.handle, json.toString()) else Native.routingApply(dac, snapshot.handle, json.toString()) }
-        return RoutingReport(result.getJSONArray("changed").objects().map(::parseKey), result.getJSONArray("unchanged").objects().map(::parseKey))
+        return parseRoutingReport(result)
     }
     private fun check(snapshot: RoutingSnapshot) {
         checkOpen()
@@ -150,6 +164,8 @@ private fun parseValue(value: JSONObject): RouteValue = when (value.getString("k
     "mixer_gain" -> RouteValue.MixerGain(value.getInt("value"))
     else -> throw org.json.JSONException("unknown route value")
 }
+private fun parseRoutingReport(value: JSONObject): RoutingReport =
+    RoutingReport(value.getJSONArray("changed").objects().map(::parseKey), value.getJSONArray("unchanged").objects().map(::parseKey))
 private fun JSONObject.optionalInt(key: String): Int? = if (isNull(key)) null else getInt(key)
 private fun controlFailure(value: JSONObject): RoutingControlFailure = RoutingControlFailure(
     RoutingControlErrorKind.valueOf(value.getString("kind").uppercase()), value.optString("detail").takeIf { it.isNotEmpty() },
@@ -162,7 +178,8 @@ internal fun routingResponse(call: () -> String): JSONObject = nativeCall {
             error.optString("session_code").takeIf { it.isNotEmpty() }?.let { DacErrorCode.fromWireName(it) }, error.optionalInt("failed_change"),
             error.optJSONObject("cause")?.let(::controlFailure), error.optJSONArray("rollback_failures")?.objects()?.map {
                 RoutingRollbackFailure(parseKey(it.getJSONObject("key")), controlFailure(it.getJSONObject("cause")))
-            } ?: emptyList(), error.optString("power_restore_failure").takeIf { it.isNotEmpty() })
+            } ?: emptyList(), error.optString("power_restore_failure").takeIf { it.isNotEmpty() },
+            error.optJSONObject("route_report")?.let(::parseRoutingReport))
     }
     result.getJSONObject("value")
 }

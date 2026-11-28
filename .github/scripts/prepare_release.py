@@ -70,23 +70,26 @@ def stable_tags(*options):
     )
 
 
+# The sealed package and its source examples must carry the selected version.
+# Every tracked document naming a crate, Maven or AAR coordinate belongs here.
+VERSIONED_DOCS = {
+    "README.md": ["usbdac-core@{version}"],
+    "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
+    "docs/API.md": ["usbdac-core@{version}"],
+    "docs/sdk/guide-rust.md": ["usbdac-core@{version}"],
+    "docs/sdk/index.md": ["This guide covers usbdac {version}."],
+    "docs/sdk/getting-started.md": [
+        "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",
+        "[{version} release]",
+    ],
+}
+
+
 def set_version(old, new, last_release):
     for path, (pattern, _) in version_files(Path("crates/usbdac-validator/Cargo.toml").exists()).items():
         path.write_text(pattern.sub(lambda match: match[1] + new + match[3], path.read_text()))
 
-    # The sealed package and its source examples must carry the selected version.
-    examples = {
-        "README.md": ["usbdac-core@{version}"],
-        "crates/usbdac-core/README.md": ["usbdac-core@{version}"],
-        "docs/API.md": ["usbdac-core@{version}"],
-        "docs/sdk/guide-rust.md": ["usbdac-core@{version}"],
-        "docs/sdk/index.md": ["This guide covers usbdac {version}."],
-        "docs/sdk/getting-started.md": [
-            "dev.usbdac:usbdac:{version}", "dev.usbdac:usbdac-media3:{version}", "usbdac-{version}.aar", "v{version})",
-            "[{version} release]",
-        ],
-    }
-    for name, literals in examples.items():
+    for name, literals in VERSIONED_DOCS.items():
         path = Path(name)
         content = path.read_text()
         updated = content
@@ -224,6 +227,9 @@ def registry_absent(repo, version, reference):
     auth = 'Basic ' + base64.b64encode(f'{actor}:{token}'.encode()).decode()
     if not reference or git('ls-remote', '--tags', 'origin', f'refs/tags/v{version}'):
         return False
+    # Cargo sparse index: a name of four or more characters lives at
+    # {first two}/{next two}/{name}, one JSON line per published version
+    # (yanked ones included), keyed by "vers".
     index = fetch('https://index.crates.io/us/bd/usbdac-core')
     if index is None:
         return False
@@ -277,12 +283,23 @@ def select_automatic(run_id, source):
         tags = stable_tags()
         newest = version_tuple(tags[-1][1:]) if tags else (0, 0, 0)
         reference = previous[-1][1:] if previous else None
-        try:
-            records = reservations(head, current) if numeric > newest else []
-            eligible = (can_adopt(head, current, reference) if records else
-                        registry_absent(os.environ['GITHUB_REPOSITORY'], current, reference)) if numeric > newest else False
-        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
-            eligible = False
+        records, eligible = None, False
+        if numeric > newest:
+            try:
+                records = reservations(head, current)
+                eligible = (can_adopt(head, current, reference) if records else
+                            registry_absent(os.environ['GITHUB_REPOSITORY'], current, reference))
+            except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+                eligible = False
+            if not eligible and records == []:
+                # Nothing reserved this version, so a maintainer declared it above every
+                # tag (SemVer 2.0.0 section 2 orders X.Y.Z numerically). Section 3 forbids
+                # reusing a released version, so it needs proof of absence, but bumping to
+                # its next patch would replace the declared version (a new minor X.Y.0
+                # would ship as X.Y.1). Stop and leave the choice to the maintainer.
+                raise SystemExit(f'Declared version {current} is newer than every tag but the registries '
+                                 'could not prove it unpublished; re-run when they are reachable, or '
+                                 'declare a different version')
         if eligible:
             version = current
         else:

@@ -10,7 +10,9 @@ import java.util.concurrent.Executor
 /**
  * The DAC's volume as read back from the device.
  *
- * @property db The level in dB.
+ * @property db The level in dB. [Double.NEGATIVE_INFINITY] when the DAC reports the UAC silence code
+ *   (a CUR of 0x8000, UAC1 §5.2.2.4.3.2 and UAC2 §5.2.5.7.2), and for the silent minimum of a
+ *   min-mute or linear-amplitude quirk. [VolumeRange] bounds stay finite.
  * @property fraction Position on the 0..1 curve. 0 is the DAC's minimum; anything above 0 spans
  *   `max(minimum, -80 dB)` to the maximum, linearly in dB, so a DAC whose minimum is -127 dB does
  *   not spend most of a slider on inaudible levels. A level below -80 dB reads as 0.0 but keeps its exact [db].

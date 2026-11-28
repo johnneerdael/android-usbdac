@@ -998,6 +998,13 @@ public class OutputSelector internal constructor(
             "dop_repack" -> "DoP validated and reframed for a confirmed decoder"
             else -> throw DacException(DacErrorCode.UNSUPPORTED, "unknown driver playback transform ${choice.transform}")
         }
+        // DoP v1.1: a DoP wire carries DSD under marker bytes and a native DSD wire carries DSD
+        // words, so converted PCM must never be framed onto either. The core refuses this too;
+        // refuse it here before a stream opens, whatever the decision says.
+        if (choice.transform in listOf("pcm", "pcm_u8", "dsd_to_pcm", "dop_to_pcm") &&
+            format.encoding != StreamEncoding.PCM && format.encoding != StreamEncoding.PCM_FLOAT32) {
+            throw DacException(DacErrorCode.UNSUPPORTED, "driver chose ${choice.transform} onto a ${format.encoding} wire; PCM can only go to a PCM wire")
+        }
         val plan = when (choice.transform) {
             "pcm", "pcm_u8" -> {
                 val pcmSource = if (choice.transform == "pcm_u8") StreamRequest.pcm(request.sampleRate, request.channels, 16) else request

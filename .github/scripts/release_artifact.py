@@ -1,4 +1,4 @@
-"""Create and verify the immutable release-gate payload (schema 1)."""
+"""Create and verify the immutable release-gate payload (schema 1) and seal its receipt (schema 3)."""
 
 import argparse
 import hashlib
@@ -170,16 +170,123 @@ def verify_validator_subjects(receipt, root, version, source_sha, repository_id,
         raise SystemExit('Unexpected validator release files')
 
 
+GATE_IDENTITY = 'usbdac-release-gates/v1'
+
+
+def attempt_number(value, label):
+    try:
+        attempt = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(f'Missing or invalid {label} attempt') from None
+    if attempt < 1:
+        raise SystemExit(f'Missing or invalid {label} attempt')
+    return attempt
+
+
+def receipt_attempt(receipt):
+    """Return the attempt that sealed a receipt.
+
+    The gate payload and its receipt can come from different attempts: after
+    "Re-run failed jobs", jobs that are not re-run keep their outputs from the
+    previous attempt (GitHub Docs, "Re-running workflows and jobs"), so a
+    re-run receipt seals a payload uploaded by an earlier attempt. Receipts
+    sealed before receipt_run_attempt existed (0.1.17 and older) were always
+    sealed in the payload's own attempt.
+    """
+    value = receipt.get('receipt_run_attempt', receipt.get('run_attempt'))
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise SystemExit('Invalid gate receipt attempt')
+    return value
+
+
+def gh_api(path):
+    return subprocess.check_output(['gh', 'api', path])
+
+
+def seal(root, receipt_path, version, env, api=gh_api):
+    payload_attempt = attempt_number(env.get('PAYLOAD_RUN_ATTEMPT'), 'gate payload')
+    sealing_attempt = attempt_number(env.get('RECEIPT_RUN_ATTEMPT'), 'gate receipt')
+    if payload_attempt > sealing_attempt:
+        raise SystemExit('Gate payload attempt is later than the sealing attempt')
+    if not env.get('ARTIFACT_ID') or not env.get('ARTIFACT_DIGEST'):
+        raise SystemExit('Missing gate payload identity')
+    if env.get('GATE_IDENTITY') != GATE_IDENTITY:
+        raise SystemExit('Unsupported or missing gate identity')
+    repo, run_id, source_sha = env['GITHUB_REPOSITORY'], int(env['SOURCE_RUN_ID']), env['SOURCE_SHA']
+    payload_digest = 'sha256:' + env['ARTIFACT_DIGEST'].removeprefix('sha256:')
+    info = json.loads(api(f"repos/{repo}/actions/artifacts/{env['ARTIFACT_ID']}"))
+    if (info.get('name') != f'release-payload-{run_id}-{payload_attempt}-{source_sha}' or info.get('expired')
+            or info.get('workflow_run', {}).get('id') != run_id or info.get('digest') != payload_digest):
+        raise SystemExit('Gate payload artifact API identity mismatch')
+    verify(root, dict(repository=env.get('SOURCE_REPOSITORY', repo), version=version, source_sha=source_sha,
+                      workflow_sha=env['WORKFLOW_SHA'], run_id=run_id, run_attempt=payload_attempt,
+                      reservation_run_id=int(env['RESERVATION_RUN_ID'])))
+    validators = []
+    if env.get('VALIDATOR') == 'true':
+        for platform in ('android', 'mac'):
+            prefix = platform.upper() + '_VALIDATOR_'
+            artifact_id, attempt = env[prefix + 'ID'], attempt_number(env.get(prefix + 'ATTEMPT'), f'{platform} validator')
+            if attempt > sealing_attempt:
+                raise SystemExit('Validator attempt is later than the sealing attempt')
+            info = json.loads(api(f'repos/{repo}/actions/artifacts/{artifact_id}'))
+            validator_digest = 'sha256:' + env[prefix + 'DIGEST'].removeprefix('sha256:')
+            if (info.get('name') != f'{platform}-validator-{run_id}-{attempt}' or info.get('expired')
+                    or info.get('workflow_run', {}).get('id') != run_id or info.get('digest') != validator_digest):
+                raise SystemExit('Validator artifact API identity mismatch')
+            raw = api(f'repos/{repo}/actions/artifacts/{artifact_id}/zip')
+            validators.append(validator_subject(raw, platform, artifact_id, validator_digest, run_id, attempt, version, source_sha, env['GITHUB_REPOSITORY_ID']))
+    receipt = dict(schema_version=3, validators=validators, repository_id=int(env['GITHUB_REPOSITORY_ID']), gate_identity=GATE_IDENTITY,
+                   repository=repo, version=version, source_sha=source_sha, workflow_sha=env['WORKFLOW_SHA'], run_id=run_id,
+                   run_attempt=payload_attempt, receipt_run_attempt=sealing_attempt,
+                   reservation_run_id=int(env['RESERVATION_RUN_ID']), artifact_id=int(env['ARTIFACT_ID']),
+                   artifact_digest=payload_digest, manifest_sha256=digest(root / 'manifest.json'))
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+    return receipt
+
+
+def check_receipt(receipt, manifest_path, expected, sealing_attempt, repository_id):
+    """Bind a gate receipt to the verified payload and the attempt that sealed it."""
+    schema = receipt.get('schema_version')
+    if schema in (2, 3) and receipt.get('gate_identity') != GATE_IDENTITY:
+        raise SystemExit('Unsupported gate identity')
+    if schema not in (1, 2, 3):
+        raise SystemExit('Unsupported receipt schema')
+    if any(receipt.get(k) != v for k, v in expected.items()) or receipt.get('manifest_sha256') != digest(manifest_path):
+        raise SystemExit('Gate receipt or manifest mismatch')
+    if receipt_attempt(receipt) != sealing_attempt or receipt['run_attempt'] > sealing_attempt:
+        raise SystemExit('Gate receipt attempt mismatch')
+    if schema == 3:
+        manifest = json.loads(manifest_path.read_text())
+        if receipt.get('repository_id') != repository_id or manifest.get('repository_id') != repository_id:
+            raise SystemExit('Gate evidence repository ID mismatch')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=('stage', 'verify'))
+    parser.add_argument('action', choices=('stage', 'verify', 'seal', 'check-receipt'))
     parser.add_argument('root', type=Path)
     parser.add_argument('--version', required=True)
+    parser.add_argument('--receipt', type=Path, help='gate receipt to write (seal) or check (check-receipt)')
     args = parser.parse_args()
+    env = os.environ
+    if args.action in ('seal', 'check-receipt') and args.receipt is None:
+        parser.error(f'--receipt is required with {args.action}')
     if args.action == 'stage':
         stage(args.root, args.version)
+    elif args.action == 'seal':
+        seal(args.root, args.receipt, args.version, env)
+    elif args.action == 'check-receipt':
+        # SOURCE_RUN_ATTEMPT is the payload's attempt; RECEIPT_RUN_ATTEMPT sealed the receipt.
+        expected = dict(repository=env['SOURCE_REPOSITORY'], version=args.version,
+                        source_sha=env['SOURCE_SHA'], workflow_sha=env['WORKFLOW_SHA'],
+                        run_id=int(env['SOURCE_RUN_ID']), run_attempt=int(env['SOURCE_RUN_ATTEMPT']),
+                        reservation_run_id=int(env['RESERVATION_RUN_ID']))
+        verify(args.root, expected)
+        check_receipt(json.loads(args.receipt.read_text()), args.root / 'manifest.json',
+                      dict(expected, artifact_id=int(env['PAYLOAD_ID'])),
+                      attempt_number(env.get('RECEIPT_RUN_ATTEMPT'), 'gate receipt'), int(env['GITHUB_REPOSITORY_ID']))
     else:
-        env = os.environ
         verify(args.root, dict(repository=env.get('SOURCE_REPOSITORY', env['GITHUB_REPOSITORY']), version=args.version,
                source_sha=env['SOURCE_SHA'], workflow_sha=env['WORKFLOW_SHA'],
                run_id=int(env['SOURCE_RUN_ID']), run_attempt=int(env['SOURCE_RUN_ATTEMPT']),

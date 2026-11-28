@@ -11,12 +11,18 @@ import dev.usbdac.*
  * depth and zero-padded slots; the sink preserves every input bit. No resampling or narrowing occurs.
  * DAC ducking is deliberately host-owned via [volumeMultiplier], so the host can restore its level.
  */
-class DacSessionOutputSource(
-    private val session: DacSession,
-    private val allowWidening: Boolean = true,
-    private val volumeMultiplier: (Float) -> Unit = {},
+class DacSessionOutputSource internal constructor(
+    private val session: DirectSession,
+    private val allowWidening: Boolean,
+    private val volumeMultiplier: (Float) -> Unit,
 ) : OutputSource {
-    private val supportSnapshot = session.capabilities.altSettings.map { alt ->
+    constructor(
+        session: DacSession,
+        allowWidening: Boolean = true,
+        volumeMultiplier: (Float) -> Unit = {},
+    ) : this(SessionDirect(session), allowWidening, volumeMultiplier)
+
+    private val supportSnapshot = session.altSettings.map { alt ->
         alt.copy(sampleRates = alt.sampleRates.toList(), rateRanges = alt.rateRanges.toList())
     }
 
@@ -28,40 +34,71 @@ class DacSessionOutputSource(
         val exact = request.copy(ratePolicy = RatePolicy.EXACT)
         var original: DacException? = null
         val depths = listOf(request.bitDepth) + if (allowWidening && request.encoding == StreamEncoding.PCM) {
-            session.capabilities.pcmBitDepths.filter { it > request.bitDepth }.distinct().sorted()
+            session.pcmBitDepths.filter { it > request.bitDepth }.distinct().sorted()
         } else emptyList()
         for (depth in depths) {
-            val wire = try {
+            val negotiated = try {
                 session.negotiate(exact.copy(bitDepth = depth))
             } catch (error: DacException) {
                 if (error.code != DacErrorCode.UNSUPPORTED) throw error
                 if (original == null) original = error
                 continue
             }
+            val wire = negotiated.format
             check(wire.encoding == request.encoding && wire.sampleRate == request.sampleRate && wire.counterRateHz == request.sampleRate &&
                 wire.channels == request.channels && wire.validBits >= request.bitDepth &&
                 wire.subslotBytes >= request.bitDepth / 8) { "negotiation is not lossless integer widening" }
-            val stream = session.openStream(wire)
-            return OpenedOutput(stream, WriteFormat(wire.sampleRate, wire.channels, wire.subslotBytes,
-                wire.validBits, wire.counterRateHz, wire.encoding), request)
+            return OpenedOutput(negotiated.open(), wire, request)
         }
         throw checkNotNull(original)
     }
 
     override fun reconfigure(output: OpenedOutput, request: StreamRequest): OutputReconfiguration? {
-        val current = output.output as? DacStream ?: return null
+        if (!session.reconfigurable(output.output)) return null
         val candidates = reconfigurationCandidates(supportSnapshot, request, allowWidening)
         if (candidates.isEmpty()) throw DacException(DacErrorCode.UNSUPPORTED, "no cached same-rate output alternate")
-        val report = session.reconfigureCandidates(current, candidates)
-        val wire = report.stream.format
+        // One native transaction for every candidate: the old stream is drained and retired once,
+        // and exactly one replacement (or the restored old format) comes back.
+        val report = session.reconfigureCandidates(output.output, candidates)
         val actualRequest = if (report.rollbackCause == null) request else output.request
-        return OutputReconfiguration(OpenedOutput(report.stream, WriteFormat(wire.sampleRate, wire.channels,
-            wire.subslotBytes, wire.validBits, wire.counterRateHz, wire.encoding), actualRequest), report.rollbackCause)
+        return OutputReconfiguration(OpenedOutput(report.output, report.format, actualRequest), report.rollbackCause)
     }
 
     override fun close(output: OpenedOutput) = output.output.close()
     override fun takeLookAgain(): Boolean = false
     override fun setVolumeMultiplier(multiplier: Float) = volumeMultiplier(multiplier)
+}
+
+/** A negotiated wire format and the call that opens a stream in it. */
+internal class DirectWire(val format: WriteFormat, val open: () -> PcmOutput)
+
+/** The stream a reconfiguration left in place: the requested format, or the old one restored. */
+internal class DirectReplacement(val output: PcmOutput, val format: WriteFormat, val rollbackCause: DacException?)
+
+/** The session calls [DacSessionOutputSource] makes, so a test can count them without a DAC. */
+internal interface DirectSession {
+    val altSettings: List<AltSetting>
+    val pcmBitDepths: List<Int>
+    fun negotiate(request: StreamRequest): DirectWire
+    /** Whether [current] is this session's stream, which [reconfigureCandidates] can replace. */
+    fun reconfigurable(current: PcmOutput): Boolean
+    /** One transaction over [requests], for a [current] that is [reconfigurable]. */
+    fun reconfigureCandidates(current: PcmOutput, requests: List<StreamRequest>): DirectReplacement
+}
+
+private class SessionDirect(private val session: DacSession) : DirectSession {
+    override val altSettings: List<AltSetting> get() = session.capabilities.altSettings
+    override val pcmBitDepths: List<Int> get() = session.capabilities.pcmBitDepths
+    override fun negotiate(request: StreamRequest): DirectWire {
+        val wire = session.negotiate(request)
+        return DirectWire(wire.writeFormat()) { session.openStream(wire) }
+    }
+    override fun reconfigurable(current: PcmOutput): Boolean = current is DacStream
+    override fun reconfigureCandidates(current: PcmOutput, requests: List<StreamRequest>): DirectReplacement {
+        val report = session.reconfigureCandidates(current as DacStream, requests)
+        return DirectReplacement(report.stream, report.stream.format.writeFormat(), report.rollbackCause)
+    }
+    private fun StreamFormat.writeFormat() = WriteFormat(sampleRate, channels, subslotBytes, validBits, counterRateHz, encoding)
 }
 
 internal fun reconfigurationCandidates(alts: List<AltSetting>, request: StreamRequest, allowWidening: Boolean): List<StreamRequest> {

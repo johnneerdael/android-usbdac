@@ -177,7 +177,7 @@ Direct USB, an Android-managed output (which asks Android 14 and later for its o
 
 If a DAC cannot play a file's sample rate or bit depth, an app may ask usbdac to convert: mono to stereo, a different bit depth, or a different sample rate using a high-quality resampler (measured at about 110 dB of rejection). Every conversion is classified as exact, lossless or lossy, and anything other than exact turns the bit-perfect flag off.
 
-**In plain terms:** the file still plays on a limited DAC, and the app is told plainly that it is no longer bit-perfect. A direct stream never converts on its own. `OutputSelector` permits PCM conversion and lossless widening by default (`OutputPolicy.allowConversion`, `allowWidening`); an app that never wants converted output turns them off. DoP-to-PCM additionally requires `allowDopPcmConversion = true`.
+**In plain terms:** the file still plays on a limited DAC, and the app is told plainly that it is no longer bit-perfect. A direct stream never converts on its own. `OutputSelector` permits PCM conversion and lossless widening by default (`OutputPolicy.allowConversion`, `allowWidening`); an app that never wants converted output turns them off. DoP-to-PCM additionally requires `allowDopPcmConversion`, which is on by default since 0.1.16.
 
 ### Around the driver
 

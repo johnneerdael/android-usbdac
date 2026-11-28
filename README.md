@@ -198,7 +198,8 @@ a feasible PCM carrier; marker decoding still needs device evidence.
   calls them by itself (`docs/API.md` section 14). On Android, `OutputPolicy` enables
   them by default (`allowConversion` and `allowWidening`). Resampling applies −3.5 dB of
   headroom, which reduces clipping but does not prevent it, so clipped samples are counted.
-  Unpacking DoP to PCM needs `allowDopPcmConversion`, which is off by default.
+  Unpacking DoP to PCM also needs `allowDopPcmConversion`, which is on by default
+  since 0.1.16; set it to `false` to refuse it.
 - Events through one library thread: state changes, underruns, lost frames,
   bit-perfect changes, volume changes, stale feedback, errors, device loss.
 

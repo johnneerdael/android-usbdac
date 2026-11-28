@@ -99,10 +99,11 @@ elif [ "${1:-}" = run ] || [ "${1:-}" = check ]; then
     action=$1
     selection=${2:-full}
     if [ "$#" -gt 2 ]; then echo "select at most one mode" >&2; exit 2; fi
-    full_modes='normal bad-cur stale-cur badd full-uac3 duplex retire jni-retire full-uac3-clock reconfigure selector zero-res full-uac3-clock-bad full-uac3-clock-stale full-uac3-volatile refuse-set'
+    full_modes='normal bad-cur stale-cur badd full-uac3 duplex retire jni-retire full-uac3-clock reconfigure selector zero-res full-uac3-clock-bad full-uac3-clock-stale full-uac3-volatile refuse-set full-uac3-nearest dop-carrier32 dop-stereo24 dop-no-carrier'
     case "$selection" in
         full) expected=$full_modes ;;
         clock-faults) expected='full-uac3-clock-bad full-uac3-clock-stale' ;;
+        dop) expected='dop-carrier32 dop-stereo24 dop-no-carrier' ;;
         *)
             case " $full_modes " in
                 *" $selection "*) expected=$selection ;;

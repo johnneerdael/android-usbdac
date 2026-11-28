@@ -31,6 +31,10 @@ on:
         value: ${{ jobs.android.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.android.outputs.artifact_digest }}
+      # The attempt that uploaded the payload. "Re-run failed jobs" keeps this
+      # output, and the payload, from the earlier attempt when the job is not re-run.
+      artifact_attempt:
+        value: ${{ jobs.android.outputs.artifact_attempt }}
 
 permissions:
   contents: read
@@ -111,11 +115,34 @@ jobs:
       - name: Check that the guide's code comes from the sample
         run: python3 -I .github/scripts/check_docs_snippets.py
 
+  # Not a release gate: Release checks the pin itself and runs these gates on reserved source.
+  release-scripts:
+    if: inputs.source_sha == '' && inputs.recheck == ''
+    name: Release scripts and pinned implementation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Release refuses an unpinned implementation; catch that before merge (.github/release-recovery.md).
+      - name: Check the pinned release implementation
+        run: python3 -I .github/scripts/pin_release_adapter.py --check
+
+      - name: Run the release script tests from the repository root
+        run: python3 -B -m unittest discover -s .github/scripts/tests
+
+      - name: Run the release script tests from their directory
+        working-directory: .github/scripts/tests
+        run: python3 -B -m unittest discover -s .
+
   android:
     if: inputs.recheck == ''
     outputs:
       artifact_id: ${{ steps.release_payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.release_payload.outputs.artifact-digest }}
+      artifact_attempt: ${{ github.run_attempt }}
     name: AAR, unit tests and sample
     runs-on: ubuntu-24.04
     timeout-minutes: 60

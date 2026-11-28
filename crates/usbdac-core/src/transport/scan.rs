@@ -1061,8 +1061,6 @@ pub(super) fn build_usb_capability_model(
         implicit_source_inventory(&config_descriptor, handle, speed, Some(claimed_interfaces))
     };
     let mut alt_settings = Vec::new();
-    let mut exclusion_snapshot_complete = true;
-    let mut playback_endpoints = Vec::new();
     let mut native_only_aliases = Vec::new();
     let mut complete_uac1_rate_alternates = Vec::new();
     let mut supported_sample_rates = Vec::new();
@@ -1086,31 +1084,8 @@ pub(super) fn build_usb_capability_model(
                 continue;
             }
 
-            let endpoints: Vec<_> = descriptor
-                .endpoint_descriptors()
-                .filter(|ep| {
-                    ep.direction() == Direction::Out
-                        && ep.transfer_type() == TransferType::Isochronous
-                })
-                .map(|ep| {
-                    (
-                        descriptor.interface_number(),
-                        descriptor.setting_number(),
-                        ep.address(),
-                    )
-                })
-                .collect();
-            let has_playback_endpoint = !endpoints.is_empty();
-            playback_endpoints.extend(endpoints);
-            if has_playback_endpoint && !claimed_interfaces.contains(&descriptor.interface_number())
-            {
-                exclusion_snapshot_complete = false;
-            }
             let Some(mut stream_format) = parse_android_streaming_interface_format(&descriptor)
             else {
-                if has_playback_endpoint {
-                    exclusion_snapshot_complete = false;
-                }
                 continue;
             };
             let ap80_dsd = matches_ap80_raw_dsd(
@@ -1697,16 +1672,30 @@ pub(super) fn build_usb_capability_model(
         )
     });
 
-    exclusion_snapshot_complete &= !playback_endpoints.is_empty()
-        && playback_endpoints
-            .iter()
-            .all(|(interface, alternate, endpoint)| {
-                alt_settings.iter().any(|alt| {
-                    alt.interface_number == *interface
-                        && alt.alt_setting == *alternate
-                        && alt.endpoint_address == *endpoint
+    let alternates: Vec<_> = config_descriptor
+        .interfaces()
+        .flat_map(|interface| interface.descriptors())
+        .collect();
+    let exclusion_snapshot_complete = exclusion_snapshot_complete(
+        alternates.iter().map(|descriptor| SnapshotAlternate {
+            interface: descriptor.interface_number(),
+            alt_setting: descriptor.setting_number(),
+            class: descriptor.class_code(),
+            subclass: descriptor.sub_class_code(),
+            protocol: descriptor.protocol_code(),
+            extra: descriptor.extra(),
+            out_iso_endpoints: descriptor
+                .endpoint_descriptors()
+                .filter(|ep| {
+                    ep.direction() == Direction::Out
+                        && ep.transfer_type() == TransferType::Isochronous
                 })
-            });
+                .map(|ep| ep.address())
+                .collect(),
+        }),
+        claimed_interfaces,
+        &alt_settings,
+    );
     Ok(CapabilityModel {
         exclusion_snapshot_complete,
         native_only_aliases,
@@ -1715,6 +1704,68 @@ pub(super) fn build_usb_capability_model(
         alt_settings,
         link_speed: Some(link_speed_of(effective_speed)),
     })
+}
+
+/// One alternate setting as the exclusion snapshot sees it: the standard
+/// interface fields (UAC2 §4.9.1), the class-specific descriptors that follow
+/// it (`extra`: AS_GENERAL §4.9.2 and the Format Type descriptor §4.9.3) and
+/// the addresses of its isochronous OUT endpoints. It holds no libusb state, so
+/// a test can build it from raw configuration bytes.
+pub(super) struct SnapshotAlternate<'a> {
+    pub(super) interface: u8,
+    pub(super) alt_setting: u8,
+    pub(super) class: u8,
+    pub(super) subclass: u8,
+    pub(super) protocol: u8,
+    pub(super) extra: &'a [u8],
+    pub(super) out_iso_endpoints: Vec<u8>,
+}
+
+/// Whether the capability model covers every standard playback alternate, so
+/// that a PCM shape missing from it is missing from the device.
+///
+/// UAC2 §4.9 describes an AS alternate completely by its standard interface
+/// descriptor, AS_GENERAL and Format Type descriptor. ALSA builds its format
+/// table from exactly those, and silently skips an alternate it cannot parse
+/// (stream.c `snd_usb_get_audioformat_uac12`:734-748 returns NULL without a
+/// valid AS_GENERAL; `__snd_usb_parse_audio_interface`:1214-1216 continues).
+/// Such a skipped alternate may carry any shape, so one unparsed audio-class
+/// OUT alternate makes the snapshot incomplete. Unlike ALSA (stream.c:1170-1176),
+/// an unknown protocol is never assumed to be UAC1. So does an OUT alternate on
+/// an interface this owner has not claimed, or one whose endpoint the model did
+/// not publish. A vendor-class alternate is not counted: the selector never
+/// admits one (`select_stream_candidates` takes only AUDIO/AUDIOSTREAMING), so
+/// it cannot hide a candidate, and a vendor PCM profile has its own model
+/// without a complete snapshot. A configuration with no standard playback
+/// alternate proves nothing.
+pub(super) fn exclusion_snapshot_complete<'a>(
+    alternates: impl IntoIterator<Item = SnapshotAlternate<'a>>,
+    claimed_interfaces: &[u8],
+    published: &[AltSetting],
+) -> bool {
+    let mut playback = false;
+    for alternate in alternates {
+        if alternate.class != USB_CLASS_AUDIO
+            || alternate.subclass != USB_SUBCLASS_AUDIOSTREAMING
+            || alternate.out_iso_endpoints.is_empty()
+        {
+            continue;
+        }
+        playback = true;
+        if !claimed_interfaces.contains(&alternate.interface)
+            || parse_streaming_extra(alternate.protocol, alternate.extra).is_none()
+            || !alternate.out_iso_endpoints.iter().all(|endpoint| {
+                published.iter().any(|alt| {
+                    alt.interface_number == alternate.interface
+                        && alt.alt_setting == alternate.alt_setting
+                        && alt.endpoint_address == *endpoint
+                })
+            })
+        {
+            return false;
+        }
+    }
+    playback
 }
 
 pub(super) fn select_stream_candidate(
@@ -3814,5 +3865,171 @@ mod darwin_claim_regression {
         assert!(optional_playback_claims(&base, &[], None).is_empty());
         assert_eq!(optional_playback_claims(&base, &[2, 2, 1], Some(3)), [2, 3]);
         assert!(required_claims_from_roles([(0, true, false), (2, false, false)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exclusion_snapshot_tests {
+    use super::*;
+
+    // Splits a configuration the way libusb's parse_configuration does: an
+    // interface descriptor owns the descriptors after it up to the next
+    // interface or endpoint descriptor (`extra`), then its endpoints.
+    fn alternates(raw: &[u8]) -> Vec<SnapshotAlternate<'_>> {
+        let mut alternates: Vec<SnapshotAlternate<'_>> = Vec::new();
+        let mut extra_from = None;
+        let mut at = 0;
+        while at < raw.len() {
+            let len = usize::from(raw[at]);
+            assert!(len >= 2 && at + len <= raw.len(), "malformed fixture");
+            let d = &raw[at..at + len];
+            if matches!(d[1], 4 | 5) {
+                if let Some(from) = extra_from.take() {
+                    alternates.last_mut().unwrap().extra = &raw[from..at];
+                }
+            }
+            match d[1] {
+                4 => {
+                    alternates.push(SnapshotAlternate {
+                        interface: d[2],
+                        alt_setting: d[3],
+                        class: d[5],
+                        subclass: d[6],
+                        protocol: d[7],
+                        extra: &[],
+                        out_iso_endpoints: Vec::new(),
+                    });
+                    extra_from = Some(at + len);
+                }
+                5 if d[2] & 0x80 == 0 && d[3] & 3 == 1 => {
+                    alternates.last_mut().unwrap().out_iso_endpoints.push(d[2]);
+                }
+                _ => {}
+            }
+            at += len;
+        }
+        if let Some(from) = extra_from {
+            alternates.last_mut().unwrap().extra = &raw[from..];
+        }
+        alternates
+    }
+
+    fn interface(number: u8, alt: u8, endpoints: u8, class: [u8; 3]) -> Vec<u8> {
+        vec![
+            9, 4, number, alt, endpoints, class[0], class[1], class[2], 0,
+        ]
+    }
+
+    // UAC2 §4.9.2 AS_GENERAL with `format_type`, then a Frmts20 §2.3.1.6 Type I
+    // descriptor, an asynchronous OUT data endpoint and its explicit feedback.
+    fn uac2_playback(number: u8, alt: u8, format_type: u8, bits: u8) -> Vec<u8> {
+        let mut bytes = interface(number, alt, 2, [1, 2, 0x20]);
+        bytes.extend([16, 0x24, 1, 3, 0, format_type, 1, 0, 0, 0, 2, 3, 0, 0, 0, 0]);
+        bytes.extend([6, 0x24, 2, 1, 4, bits]);
+        bytes.extend([7, 5, number, 0x05, 0x00, 0x02, 1]);
+        bytes.extend([8, 0x25, 1, 0, 0, 0, 0, 0]);
+        bytes.extend([7, 5, 0x80 | number, 0x11, 4, 0, 4]);
+        bytes
+    }
+
+    // A UAC2 configuration: AudioControl 0, then AudioStreaming 1 with an idle
+    // zero-bandwidth alt 0 and 24- and 32-bit playback alternates.
+    fn uac2_config(tail: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = interface(0, 0, 0, [1, 1, 0x20]);
+        body.extend([9, 0x24, 1, 0, 2, 0x0a, 9, 0, 0]);
+        body.extend(interface(1, 0, 0, [1, 2, 0x20]));
+        body.extend(uac2_playback(1, 1, 1, 24));
+        body.extend(uac2_playback(1, 2, 1, 32));
+        for bytes in tail {
+            body.extend(bytes);
+        }
+        let total = (9 + body.len()) as u16;
+        let mut raw = vec![9, 2, total as u8, (total >> 8) as u8, 2, 1, 0, 0x80, 50];
+        raw.extend(body);
+        raw
+    }
+
+    // What the builder publishes for each standard OUT endpoint it can parse.
+    fn published(alternates: &[SnapshotAlternate<'_>]) -> Vec<AltSetting> {
+        alternates
+            .iter()
+            .filter(|alt| (alt.class, alt.subclass) == (1, 2))
+            .flat_map(|alt| {
+                alt.out_iso_endpoints.iter().map(|endpoint| {
+                    let mut model = super::super::negotiate::test_model_alt(UacVersion::V2, &[]);
+                    model.interface_number = alt.interface;
+                    model.alt_setting = alt.alt_setting;
+                    model.endpoint_address = *endpoint;
+                    model
+                })
+            })
+            .collect()
+    }
+
+    fn complete(raw: &[u8], claimed: &[u8], published: &[AltSetting]) -> bool {
+        exclusion_snapshot_complete(alternates(raw), claimed, published)
+    }
+
+    #[test]
+    fn complete_uac2_configuration_gives_a_complete_snapshot() {
+        let raw = uac2_config(&[]);
+        let parsed = alternates(&raw);
+        assert_eq!(parsed.len(), 4);
+        // The class-specific AS pair stays with its alternate, as in libusb.
+        assert_eq!(parsed[2].extra.len(), 22);
+        assert_eq!(parsed[2].out_iso_endpoints, [0x01]);
+        assert!(parse_streaming_extra(parsed[3].protocol, parsed[3].extra)
+            .is_some_and(|f| f.bit_resolution == 32 && f.channels == 2));
+        let model = published(&parsed);
+        assert_eq!(model.len(), 2);
+        assert!(complete(&raw, &[0, 1], &model));
+        // An unclaimed streaming interface or an endpoint the model did not
+        // publish leaves a shape the model cannot speak for.
+        assert!(!complete(&raw, &[0], &model));
+        assert!(!complete(&raw, &[0, 1], &model[..1]));
+        // No standard playback alternate proves nothing.
+        let control_only = [9, 2, 18, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 0, 1, 1, 0x20, 0];
+        assert!(!complete(&control_only, &[0], &[]));
+    }
+
+    #[test]
+    fn unparsed_or_unknown_out_alternate_makes_the_snapshot_incomplete() {
+        // A Type II AS_GENERAL (UAC2 §4.9.2 bFormatType) is not a Type I PCM
+        // table; ALSA would skip it, so its shapes are unknown.
+        for tail in [
+            uac2_playback(1, 3, 2, 24),
+            // An unknown interface protocol on an AS OUT alternate.
+            {
+                let mut bytes = uac2_playback(1, 3, 1, 24);
+                bytes[7] = 0x10;
+                bytes
+            },
+            // An AS OUT alternate without its class-specific descriptors.
+            {
+                let mut bytes = interface(1, 3, 1, [1, 2, 0x20]);
+                bytes.extend([7, 5, 0x01, 0x05, 0x00, 0x02, 1]);
+                bytes
+            },
+        ] {
+            let raw = uac2_config(&[tail]);
+            let parsed = alternates(&raw);
+            // Even a model that lists every endpoint cannot vouch for it.
+            assert!(!complete(&raw, &[0, 1], &published(&parsed)));
+        }
+    }
+
+    #[test]
+    fn vendor_class_out_alternate_is_not_counted() {
+        let mut vendor = interface(2, 0, 0, [0xff, 0xff, 0]);
+        vendor.extend(interface(2, 1, 1, [0xff, 0xff, 0]));
+        vendor.extend([7, 5, 0x02, 0x05, 0x00, 0x02, 1]);
+        let raw = uac2_config(&[vendor]);
+        let parsed = alternates(&raw);
+        assert_eq!(parsed[5].out_iso_endpoints, [0x02]);
+        // The model never publishes it and the snapshot stays complete, also
+        // with the vendor interface unclaimed.
+        let model = published(&parsed);
+        assert_eq!(model.len(), 2);
+        assert!(complete(&raw, &[0, 1], &model));
     }
 }

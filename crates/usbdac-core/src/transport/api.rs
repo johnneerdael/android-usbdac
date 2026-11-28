@@ -175,6 +175,7 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
         rates,
         owner,
         retained_usb_handle_identity,
+        model_refusal,
         |candidate| negotiate_attempt(candidate, &mut batch, owner),
     )?;
     format.request = *request;
@@ -184,20 +185,55 @@ pub(crate) fn negotiate(request: &StreamRequest) -> Result<StreamFormat, Error> 
     Ok(format)
 }
 
+/// The refusal for a candidate the cached capability model already excludes.
+///
+/// ALSA never offers or tries a rate absent from its parsed format table
+/// (sound/usb/pcm.c `hw_rule_rate`:844-862; format.c
+/// `parse_audio_format_rates_v1` and `parse_audio_format_rates_v2v3`; BADD is
+/// fixed-rate, stream.c:1076-1077). Skipping such a candidate is read-only: no
+/// USB request is made, so it needs no clean certificate, and a refusal after a
+/// possible mutation keeps its own terminal rule.
+fn model_refusal(request: &StreamRequest) -> Option<Error> {
+    let format = playback_format_from_request(request).ok()?;
+    let excluded = SESSION_STATE
+        .lock()
+        .as_ref()
+        .and_then(|state| state.capability_model.as_ref())
+        .is_some_and(|model| negotiate::model_excludes(model, format));
+    excluded.then(|| Error::Unsupported {
+        reason: format!(
+            "the DAC's capability model excludes {} Hz {}-bit {}-channel PCM; no USB request was made",
+            request.sample_rate, request.bit_depth, request.channels
+        ),
+        offered: offered_alt_settings(),
+    })
+}
+
 // Shared by the real retained-owner entry and its serialized callback probe.
 // Each callback represents a complete attempt including mandatory restoration.
+// `excluded` is the read-only model check; a candidate it refuses is skipped
+// without an attempt and does not count against the attempt budget.
 fn negotiate_ranked<T>(
     request: &StreamRequest,
     mut rates: Vec<u32>,
     owner: usize,
     mut current_owner: impl FnMut() -> Option<usize>,
+    mut excluded: impl FnMut(&StreamRequest) -> Option<Error>,
     mut attempt: impl FnMut(&StreamRequest) -> Result<T, AttemptFailure>,
 ) -> Result<T, Error> {
     rates.push(request.sample_rate);
     negotiate::rank_sample_rates(&mut rates, request.sample_rate);
     let mut initial_error = None;
     let started = Instant::now();
-    for (attempts, rate) in rates.into_iter().enumerate() {
+    let mut attempts = 0;
+    for rate in rates {
+        let mut candidate = *request;
+        candidate.sample_rate = rate;
+        candidate.rate_policy = RatePolicy::Exact;
+        if let Some(error) = excluded(&candidate) {
+            initial_error.get_or_insert(error);
+            continue;
+        }
         if !ranked_attempt_available(attempts, started.elapsed()) {
             return Err(Error::Unsupported {
                 reason: format!("ranked rate attempt limit reached after {attempts} candidates; first refusal: {}",
@@ -210,9 +246,7 @@ fn negotiate_ranked<T>(
                 "retained USB owner changed between candidates".into(),
             ));
         }
-        let mut candidate = *request;
-        candidate.sample_rate = rate;
-        candidate.rate_policy = RatePolicy::Exact;
+        attempts += 1;
         match attempt(&candidate) {
             Ok(result) => {
                 if current_owner() != Some(owner) {
@@ -292,8 +326,19 @@ fn negotiate_candidate_batch(
         seen.push(*request);
     }
     let Some(owner) = retained_usb_handle_identity() else {
-        // Without a retained owner there can be no clean certificate for another attempt.
-        return negotiate_impl(&first, None, false).map(|format| (format, 1, None, Vec::new()));
+        // Without a retained owner there can be no clean certificate for another
+        // attempt, so only one candidate is attempted; the read-only model check
+        // may still skip an excluded prefix without any USB request.
+        let skipped: Vec<_> = requests.iter().map_while(model_refusal).collect();
+        let Some(request) = requests.get(skipped.len()) else {
+            return Err(candidates_exhausted(
+                allow_mono_stereo,
+                skipped.len(),
+                skipped.first().cloned(),
+            ));
+        };
+        return negotiate_impl(request, None, false)
+            .map(|format| (format, skipped.len() + 1, skipped.first().cloned(), skipped));
     };
     let _reservation = reserve_candidates()?;
     if retained_usb_handle_identity() != Some(owner) {
@@ -302,21 +347,72 @@ fn negotiate_candidate_batch(
         ));
     }
     let mut batch = negotiate::RetryBaseline::new(owner);
+    negotiate_batch_ranked(
+        requests,
+        owner,
+        allow_mono_stereo,
+        retained_usb_handle_identity,
+        model_refusal,
+        |request| negotiate_attempt(request, &mut batch, owner),
+    )
+}
+
+fn candidates_exhausted(
+    allow_mono_stereo: bool,
+    attempted: usize,
+    initial_error: Option<Error>,
+) -> Error {
+    if allow_mono_stereo {
+        if let Some(error) = initial_error.clone() {
+            return error;
+        }
+    }
+    Error::Unsupported {
+        reason: format!(
+            "ranked PCM candidates exhausted after {attempted} attempts; first refusal: {}",
+            initial_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "none".into())
+        ),
+        offered: offered_alt_settings(),
+    }
+}
+
+// The candidate loop shared by `negotiate_candidates`, source playback and the
+// serialized callback probe. `attempted` counts the consumed ranked prefix,
+// including candidates the model skipped, so `refusals` stays aligned with it.
+fn negotiate_batch_ranked<T>(
+    requests: &[StreamRequest],
+    owner: usize,
+    allow_mono_stereo: bool,
+    mut current_owner: impl FnMut() -> Option<usize>,
+    mut excluded: impl FnMut(&StreamRequest) -> Option<Error>,
+    mut attempt: impl FnMut(&StreamRequest) -> Result<T, AttemptFailure>,
+) -> Result<(T, usize, Option<Error>, Vec<Error>), Error> {
     let mut initial_error = None;
     let mut refusals = Vec::new();
     let started = Instant::now();
     let mut attempted = 0;
-    for (attempts, request) in requests.iter().enumerate() {
-        if !ranked_attempt_available(attempts, started.elapsed()) {
+    let mut usb_attempts = 0;
+    for request in requests {
+        if let Some(error) = excluded(request) {
+            attempted += 1;
+            refusals.push(error.clone());
+            initial_error.get_or_insert(error);
+            continue;
+        }
+        if !ranked_attempt_available(usb_attempts, started.elapsed()) {
             break;
         }
-        if retained_usb_handle_identity() != Some(owner) {
+        if current_owner() != Some(owner) {
             return Err(Error::InvalidState(
                 "retained USB owner changed between candidates".into(),
             ));
         }
         attempted += 1;
-        match negotiate_attempt(request, &mut batch, owner) {
+        usb_attempts += 1;
+        match attempt(request) {
             Ok(format) => return Ok((format, attempted, initial_error, refusals)),
             Err(failure) => {
                 if (allow_mono_stereo && !matches!(&failure.error, Error::Unsupported { .. }))
@@ -331,21 +427,11 @@ fn negotiate_candidate_batch(
             }
         }
     }
-    if allow_mono_stereo {
-        if let Some(error) = initial_error.clone() {
-            return Err(error);
-        }
-    }
-    Err(Error::Unsupported {
-        reason: format!(
-            "ranked PCM candidates exhausted after {attempted} attempts; first refusal: {}",
-            initial_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "none".into())
-        ),
-        offered: offered_alt_settings(),
-    })
+    Err(candidates_exhausted(
+        allow_mono_stereo,
+        attempted,
+        initial_error,
+    ))
 }
 
 pub(crate) fn negotiate_attempt(
@@ -965,6 +1051,7 @@ mod dsd_summary_tests {
                 supported.clone(),
                 owner,
                 || Some(owner),
+                |_| None,
                 |candidate| {
                     assert_eq!(candidate.rate_policy, RatePolicy::Exact);
                     calls.borrow_mut().push(candidate.sample_rate);
@@ -991,6 +1078,7 @@ mod dsd_summary_tests {
             vec![96_000],
             owner,
             || Some(owner),
+            |_| None,
             |_| {
                 calls.set(calls.get() + 1);
                 Err(AttemptFailure {
@@ -1016,6 +1104,7 @@ mod dsd_summary_tests {
                 vec![96_000],
                 owner,
                 || Some(owner),
+                |_| None,
                 |_| {
                     calls.set(calls.get() + 1);
                     Err(AttemptFailure {
@@ -1043,6 +1132,7 @@ mod dsd_summary_tests {
                     Some(owner + 1)
                 }
             },
+            |_| None,
             |_| {
                 calls.set(calls.get() + 1);
                 Err(AttemptFailure {
@@ -1059,6 +1149,7 @@ mod dsd_summary_tests {
             vec![96_000],
             owner,
             || Some(owner + 1),
+            |_| None,
             |_| unreachable!(),
         );
         assert!(matches!(result, Err(Error::InvalidState(_))));
@@ -1076,9 +1167,388 @@ mod dsd_summary_tests {
                     None
                 }
             },
+            |_| None,
             |_| Ok((96_000, owner)),
         );
         assert!(matches!(result, Err(Error::InvalidState(_))));
+    }
+
+    // M3 / N1 root cause: ALSA never offers or tries a rate absent from the
+    // parsed format table (pcm.c hw_rule_rate:844-862; BADD fixed at 48 kHz,
+    // stream.c:1076-1077), so a model-excluded candidate is skipped without an
+    // attempt and needs no clean certificate.
+    #[test]
+    fn model_excluded_candidates_are_skipped_without_an_attempt() {
+        use crate::transport::negotiate::{model_excludes, test_model_alt};
+        use crate::transport::types::CapabilityModel;
+        use crate::UacVersion;
+        use std::cell::{Cell, RefCell};
+        let owner = 0x1234;
+        // The real predicate over a cached Full UAC3 model without a certifiable
+        // clock route (clock RANGE {48 kHz}); BADD's fixed-rate model is the same.
+        let model = CapabilityModel {
+            alt_settings: vec![test_model_alt(UacVersion::V3, &[(48_000, 48_000, 0)])],
+            ..Default::default()
+        };
+        let excluded = |candidate: &StreamRequest| {
+            let format = playback_format_from_request(candidate).unwrap();
+            model_excludes(&model, format).then(|| Error::Unsupported {
+                reason: "model excludes".into(),
+                offered: vec![],
+            })
+        };
+        // A live refusal of this route carries no certificate.
+        let uncertified = |rate: u32| AttemptFailure {
+            error: Error::Unsupported {
+                reason: format!("no isochronous OUT endpoint can carry {rate} Hz"),
+                offered: vec![],
+            },
+            clean: None,
+        };
+        let request =
+            StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported);
+        let calls = RefCell::new(Vec::new());
+        let result = negotiate_ranked(
+            &request,
+            vec![48_000],
+            owner,
+            || Some(owner),
+            excluded,
+            |candidate| {
+                assert_eq!(candidate.rate_policy, RatePolicy::Exact);
+                calls.borrow_mut().push(candidate.sample_rate);
+                if candidate.sample_rate == 48_000 {
+                    Ok(candidate.sample_rate)
+                } else {
+                    Err(uncertified(candidate.sample_rate))
+                }
+            },
+        );
+        assert_eq!(result, Ok(48_000));
+        assert_eq!(*calls.borrow(), vec![48_000]);
+
+        // The playback batch (resolve_playback -> negotiate_candidates) skips the
+        // exact 44.1 kHz source the same way and reports an aligned refusal.
+        let exact = StreamRequest::pcm(44_100, 2, 16);
+        let fallback = StreamRequest::pcm(48_000, 2, 16);
+        for allow_mono_stereo in [false, true] {
+            calls.borrow_mut().clear();
+            let (rate, attempted, first, refusals) = negotiate_batch_ranked(
+                &[exact, fallback],
+                owner,
+                allow_mono_stereo,
+                || Some(owner),
+                excluded,
+                |candidate| {
+                    calls.borrow_mut().push(candidate.sample_rate);
+                    if candidate.sample_rate == 48_000 {
+                        Ok(candidate.sample_rate)
+                    } else {
+                        Err(uncertified(candidate.sample_rate))
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(rate, 48_000);
+            assert_eq!(*calls.borrow(), vec![48_000]);
+            assert_eq!((attempted, refusals.len()), (2, 1));
+            assert!(matches!(first, Some(Error::Unsupported { .. })));
+        }
+
+        // Every candidate excluded: no attempt and an Unsupported refusal.
+        let none = Cell::new(0);
+        let result = negotiate_ranked::<()>(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+            vec![],
+            owner,
+            || Some(owner),
+            excluded,
+            |_| {
+                none.set(none.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        let batch = negotiate_batch_ranked::<()>(
+            &[exact],
+            owner,
+            false,
+            || Some(owner),
+            excluded,
+            |_| {
+                none.set(none.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(matches!(batch, Err(Error::Unsupported { .. })));
+        assert_eq!(none.get(), 0);
+
+        // The skip changes nothing after a possible mutation: an uncertain
+        // restoration on the first attempted candidate stays terminal, and an
+        // owner change stays InvalidState.
+        let calls = Cell::new(0);
+        let result = negotiate_ranked::<u32>(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+            vec![48_000, 96_000],
+            owner,
+            || Some(owner),
+            |candidate| (candidate.sample_rate == 44_100).then_some(Error::DeviceLost),
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(AttemptFailure {
+                    error: Error::Transfer("restore uncertain".into()),
+                    clean: None,
+                })
+            },
+        );
+        assert_eq!(result, Err(Error::Transfer("restore uncertain".into())));
+        assert_eq!(calls.get(), 1);
+        let calls = Cell::new(0);
+        let batch = negotiate_batch_ranked::<u32>(
+            &[exact, fallback, StreamRequest::pcm(96_000, 2, 16)],
+            owner,
+            false,
+            || Some(owner),
+            excluded,
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(AttemptFailure {
+                    error: Error::Transfer("restore uncertain".into()),
+                    clean: None,
+                })
+            },
+        );
+        assert_eq!(batch, Err(Error::Transfer("restore uncertain".into())));
+        assert_eq!(calls.get(), 1);
+        let reads = Cell::new(0);
+        let owner_read = || {
+            reads.set(reads.get() + 1);
+            Some(owner + 1)
+        };
+        let result = negotiate_ranked::<u32>(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+            vec![48_000],
+            owner,
+            owner_read,
+            excluded,
+            |_| unreachable!(),
+        );
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+        let batch = negotiate_batch_ranked::<u32>(
+            &[exact, fallback],
+            owner,
+            true,
+            owner_read,
+            excluded,
+            |_| unreachable!(),
+        );
+        assert!(matches!(batch, Err(Error::InvalidState(_))));
+        assert_eq!(reads.get(), 2);
+    }
+
+    // The batch keeps its certificate rule for attempted candidates.
+    #[test]
+    fn batch_advances_only_after_a_same_owner_clean_refusal() {
+        use std::cell::Cell;
+        let owner = 0x1234;
+        let requests = [
+            StreamRequest::pcm(96_000, 2, 16),
+            StreamRequest::pcm(48_000, 2, 16),
+        ];
+        let unavailable = || Error::Unsupported {
+            reason: "rate excluded".into(),
+            offered: vec![],
+        };
+        let (rate, attempted, first, refusals) = negotiate_batch_ranked(
+            &requests,
+            owner,
+            false,
+            || Some(owner),
+            |_| None,
+            |candidate| {
+                if candidate.sample_rate == 48_000 {
+                    Ok(candidate.sample_rate)
+                } else {
+                    Err(AttemptFailure {
+                        error: unavailable(),
+                        clean: Some(CleanIdle { owner }),
+                    })
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!((rate, attempted, refusals.len()), (48_000, 2, 1));
+        assert_eq!(first, Some(unavailable()));
+        for clean in [None, Some(CleanIdle { owner: owner + 1 })] {
+            let calls = Cell::new(0);
+            let mut clean = Some(clean);
+            let result = negotiate_batch_ranked::<()>(
+                &requests,
+                owner,
+                false,
+                || Some(owner),
+                |_| None,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Err(AttemptFailure {
+                        error: unavailable(),
+                        clean: clean.take().flatten(),
+                    })
+                },
+            );
+            assert_eq!(result, Err(unavailable()));
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    // H2: a DoP request is carried on a PCM alternate at its carrier rate and
+    // depth (DoP v1.1 §3; ALSA keeps a DoP alternate's PCM format table,
+    // format.c:158-160, and fills it as 3-byte PCM slots, pcm.c:1399-1450).
+    // The certificate therefore treats it as that PCM request: a refusal the
+    // descriptors prove before any mutation is clean and the batch advances.
+    #[test]
+    fn dop_refusal_is_certified_like_its_pcm_carrier() {
+        use crate::transport::negotiate::{shape_absent, AltShapeEvidence};
+        use std::cell::{Cell, RefCell};
+        let owner = 0x1234;
+        // UAC2 §4.9.2 AS_GENERAL (PCM, `channels`) and Frmts20 §2.3.1.6 Type I.
+        let uac2 = |channels: u8, subslot: u8, bits: u8| {
+            let mut extra = vec![16, 0x24, 1, 3, 0, 1, 1, 0, 0, 0, channels, 3, 0, 0, 0, 0];
+            extra.extend([6, 0x24, 2, 1, subslot, bits]);
+            extra
+        };
+        // UAC1 AS_GENERAL (PCM) and a discrete Type I list of 44.1/48/96 kHz.
+        let uac1_stereo_24 = {
+            let mut extra = vec![7, 0x24, 1, 1, 1, 1, 0];
+            extra.extend([17, 0x24, 2, 1, 2, 3, 24, 3]);
+            for rate in [44_100u32, 48_000, 96_000] {
+                extra.extend(&rate.to_le_bytes()[..3]);
+            }
+            extra
+        };
+        // The descriptor certificate plus the attempt's fate when it does not
+        // hold: `Ok` for the candidate the DAC runs, otherwise a refusal after
+        // a possible mutation, which carries no certificate.
+        let batch = |alternates: Vec<(u8, Vec<u8>)>,
+                     requests: &[StreamRequest],
+                     runs: StreamRequest,
+                     live: bool| {
+            let calls = RefCell::new(Vec::new());
+            let result = negotiate_batch_ranked(
+                requests,
+                owner,
+                true,
+                || Some(owner),
+                |_| None,
+                |request| {
+                    calls.borrow_mut().push(*request);
+                    let format = playback_format_from_request(request).unwrap();
+                    let certified = shape_absent(
+                        alternates
+                            .iter()
+                            .map(|(protocol, extra)| (&(), 1, 2, *protocol, extra.as_slice())),
+                        format,
+                        |_, evidence, _| {
+                            assert!(matches!(
+                                evidence,
+                                AltShapeEvidence::Uac2Rate { .. } | AltShapeEvidence::Uac3
+                            ));
+                            live
+                        },
+                    );
+                    if certified {
+                        Err(AttemptFailure {
+                            error: Error::Unsupported {
+                                reason: "no standard output descriptor carries it".into(),
+                                offered: vec![],
+                            },
+                            clean: Some(CleanIdle { owner }),
+                        })
+                    } else if *request == runs {
+                        Ok(request.bit_depth)
+                    } else {
+                        Err(AttemptFailure {
+                            error: Error::Transfer("restore uncertain".into()),
+                            clean: None,
+                        })
+                    }
+                },
+            );
+            (result, calls.into_inner())
+        };
+        let dop64 = |channels| StreamRequest::dop(2_822_400, channels);
+        let dop64_32 = StreamRequest {
+            bit_depth: 32,
+            ..dop64(2)
+        };
+
+        // Mono DoP on a 24-bit stereo-only DAC advances to the stereo carrier.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(1), dop64(2)],
+            dop64(2),
+            false,
+        );
+        let (depth, attempted, first, refusals) = result.unwrap();
+        assert_eq!((depth, attempted, refusals.len()), (24, 2, 1));
+        assert!(matches!(first, Some(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(1), dop64(2)]);
+
+        // 24-bit DoP on a 32-bit-only DAC advances to the 32-bit carrier.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 4, 32))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert_eq!(result.unwrap().0, 32);
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // A complete UAC1 rate list without the 176.4 kHz carrier rate
+        // excludes it without a clock read.
+        let (result, calls) = batch(
+            vec![(0, uac1_stereo_24)],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // The advertised shape is present, so only live clock evidence could
+        // certify the refusal. Without it the attempt may have mutated the DAC
+        // and its refusal stays terminal, as for PCM.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert_eq!(result, Err(Error::Transfer("restore uncertain".into())));
+        assert_eq!(calls, vec![dop64(2)]);
+        // A read-only RANGE exclusion certifies it exactly as for PCM.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            true,
+        );
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // Native DSD has no descriptor-complete rule and is never certified.
+        let native =
+            playback_format_from_request(&StreamRequest::dsd_native(2_822_400, 1)).unwrap();
+        let reads = Cell::new(0);
+        assert!(!shape_absent(
+            [(&(), 1, 2, 0x20, uac2(2, 3, 24).as_slice())],
+            native,
+            |_, _, _| {
+                reads.set(reads.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(reads.get(), 0);
     }
 
     #[test]

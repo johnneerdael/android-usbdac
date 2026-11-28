@@ -436,9 +436,12 @@ pub(crate) fn read_hardware_volume_snapshot(
             return Err("USB volume readback channels disagree".to_string());
         }
     }
-    if !ranges
-        .iter()
-        .any(|range| raw >= range.min && raw <= range.max)
+    // CUR 0x8000 is silence even though MIN never is (UAC2 5.2.5.7.2); ALSA
+    // reads a CUR below MIN as the bottom step (mixer.c get_relative_value).
+    if raw != crate::volume::RAW_SILENCE
+        && !ranges
+            .iter()
+            .any(|range| raw >= range.min && raw <= range.max)
     {
         return Err("USB volume readback is out of range".to_string());
     }
@@ -449,7 +452,7 @@ pub(crate) fn read_hardware_volume_snapshot(
     };
     Ok(HardwareVolumeSnapshot {
         raw,
-        db: crate::volume::raw_to_db(raw),
+        db: crate::volume::cur_raw_to_db(raw),
         volume: normalize_volume(raw, ranges),
         muted,
         mute_error,
@@ -1248,7 +1251,7 @@ impl VolumeCurve {
                 if minimum_is_mute && raw == min {
                     f64::NEG_INFINITY
                 } else {
-                    crate::volume::raw_to_db(raw)
+                    crate::volume::cur_raw_to_db(raw)
                 }
             }
             Self::LinearAmplitude => {
@@ -1260,6 +1263,16 @@ impl VolumeCurve {
                         .log10()
                 }
             }
+        }
+    }
+    /// dB for a RANGE bound: as [`Self::db`], except that a MIN of 0x8000 is
+    /// the numeric -128 dB rather than the CUR silence code.
+    pub(crate) fn range_db(self, raw: i16, ranges: &[RawRange]) -> f64 {
+        match self {
+            Self::Decibels {
+                minimum_is_mute: false,
+            } => crate::volume::raw_to_db(raw),
+            _ => self.db(raw, ranges),
         }
     }
     pub(crate) fn fraction(self, raw: i16, ranges: &[RawRange]) -> f64 {
@@ -1339,6 +1352,45 @@ mod curve_tests {
         assert_eq!(curve.db(-39 * 256, &ranges), -39.0);
         assert_eq!(curve.target_db(f64::NEG_INFINITY, &ranges), -40 * 256);
         assert_eq!(curve.target_fraction(0.0, &ranges), -40 * 256);
+    }
+    #[test]
+    fn silence_code_reads_as_negative_infinity_and_keeps_the_range_finite() {
+        // UAC2 5.2.5.7.2: CUR may be 0x8000 (silence) though MIN never is.
+        let conforming = [RawRange {
+            min: -127 * 256,
+            max: 0,
+            resolution: 256,
+        }];
+        let curve = VolumeCurve::Decibels {
+            minimum_is_mute: false,
+        };
+        assert_eq!(curve.db(i16::MIN, &conforming), f64::NEG_INFINITY);
+        assert_eq!(curve.fraction(i16::MIN, &conforming), 0.0);
+        assert_eq!(curve.range_db(-127 * 256, &conforming), -127.0);
+        let snapshot =
+            read_hardware_volume_snapshot(&[1, 2], &conforming, |_| Ok(i16::MIN), || Ok(None))
+                .unwrap();
+        assert_eq!(snapshot.db, f64::NEG_INFINITY);
+        assert_eq!(snapshot.volume, 0.0);
+        // Still refuses a real out-of-range level.
+        assert!(
+            read_hardware_volume_snapshot(&[1], &conforming, |_| Ok(256), || Ok(None)).is_err()
+        );
+        // A (non-conforming) MIN of 0x8000 keeps a finite range bottom; a
+        // MixerPlaybackMinMute minimum is still muted.
+        let full = [RawRange {
+            min: i16::MIN,
+            max: 0,
+            resolution: 1,
+        }];
+        assert_eq!(curve.range_db(i16::MIN, &full), -128.0);
+        assert_eq!(
+            VolumeCurve::Decibels {
+                minimum_is_mute: true
+            }
+            .range_db(i16::MIN, &full),
+            f64::NEG_INFINITY
+        );
     }
 }
 

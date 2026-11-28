@@ -87,4 +87,124 @@ class DriverPlaybackSelectorTest {
         assertTrue(recorded.closed)
     }
 
+    // PcmOutput.writableBytes is "the room up to the target depth"; the staged partial wire word
+    // already uses part of the target's room, as in the other driver adapters.
+    @Test fun nativeDsdWritableBytesFollowsTargetRoom() {
+        val recording = RecordingOutput()
+        val wire = object : PcmOutput by recording {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                val complete = minOf(buffer.remaining(), recording.writable) / 8 * 8
+                if (complete == 0) return 0
+                val view = buffer.duplicate().apply { limit(position() + complete) }
+                val count = recording.write(view)
+                buffer.position(buffer.position() + count)
+                recording.writable -= count
+                return count
+            }
+        }
+        val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = 4)
+        recording.writable = 16
+        assertEquals(16, output.writableBytes)
+        assertEquals(2, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2))))
+        assertEquals(14, output.writableBytes)
+        recording.writable = 0
+        assertEquals(0, output.writableBytes)
+        assertEquals(6, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(3, 4, 5, 6, 7, 8))))
+        assertEquals(0, output.writableBytes)
+        recording.writable = 8
+        assertEquals(0, output.writableBytes)
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8), recording.received.toByteArray())
+        recording.writable = 100_000
+        assertEquals(64 * 1024, output.writableBytes)
+        output.close()
+    }
+    // ALSA fills DSD silence with 0x69 (sound/core/pcm_misc.c pcm_formats[DSD_*].silence), so a
+    // DSF/DFF tail that is not a whole wire word drains with idle bytes instead of being refused.
+    @Test fun nativeDsdDrainPadsAnIncompleteFinalWireWordWithDsdIdle() {
+        for (wordBytes in listOf(2, 4, 8)) {
+            val wireFrame = 2 * wordBytes
+            val recording = RecordingOutput()
+            val wire = object : PcmOutput by recording {
+                override fun write(buffer: java.nio.ByteBuffer): Int {
+                    val complete = buffer.remaining() / wireFrame * wireFrame
+                    if (complete == 0) return 0
+                    val view = buffer.duplicate().apply { limit(position() + complete) }
+                    val count = recording.write(view)
+                    buffer.position(buffer.position() + count)
+                    return count
+                }
+            }
+            val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = wordBytes)
+            // One whole wire word, then one byte-frame short of the next.
+            val source = ByteArray(2 * wireFrame - 2) { (it + 1).toByte() }
+            assertEquals(source.size, output.write(java.nio.ByteBuffer.wrap(source)))
+            assertEquals(wireFrame, recording.received.size)
+            output.drain()
+            assertTrue(recording.calls.contains("drain"))
+            assertArrayEquals(source + byteArrayOf(0x69, 0x69), recording.received.toByteArray())
+            recording.drained = true
+            assertTrue(output.isDrained)
+            assertThrows(DacException::class.java) { output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2))) }
+            output.flush()
+            assertEquals(2, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(7, 8))))
+            output.drain()
+            assertArrayEquals(byteArrayOf(7, 8) + ByteArray(wireFrame - 2) { 0x69 },
+                recording.received.drop(source.size + 2).toByteArray())
+            output.close()
+        }
+    }
+    @Test fun nativeDsdDrainAfterTargetFailureRethrowsTheLatchedFailure() {
+        val recorded = RecordingOutput()
+        val failure = DacException(DacErrorCode.DEVICE_LOST, "target failed")
+        var attempts = 0
+        val wire = object : PcmOutput by recorded {
+            override fun write(buffer: java.nio.ByteBuffer): Int {
+                if (!buffer.hasRemaining()) return 0
+                attempts++
+                throw failure
+            }
+        }
+        val output = NativeDsdInputOutput(wire, channels = 2, wordBytes = 4)
+        assertEquals(6, output.write(java.nio.ByteBuffer.wrap(byteArrayOf(1, 2, 3, 4, 5, 6))))
+        assertSame(failure, assertThrows(DacException::class.java) { output.drain() })
+        assertSame(failure, assertThrows(DacException::class.java) { output.drain() })
+        assertEquals(1, attempts)
+        assertFalse(recorded.calls.contains("drain"))
+        output.close()
+    }
+    // DoP v1.1: a DoP wire carries DSD under marker bytes, and a native DSD wire carries DSD
+    // words, so a PCM conversion must never be framed onto either. The core refuses DsdToPcm on a
+    // DSD wire; the Kotlin selector holds the same invariant before it opens a stream.
+    @Test fun pcmConversionOntoADsdWireIsRefusedBeforeAnyStreamOpens() {
+        data class Case(val request: StreamRequest, val transform: String, val wire: StreamEncoding, val sourceFrameBytes: Int)
+        val cases = listOf(
+            Case(StreamRequest.dop(2_822_400, 2), "dop_to_pcm", StreamEncoding.DOP, 6),
+            Case(StreamRequest.dsdNative(2_822_400, 2), "dsd_to_pcm", StreamEncoding.DSD_NATIVE, 2),
+            Case(StreamRequest.dop(2_822_400, 2), "dop_to_pcm", StreamEncoding.DSD_NATIVE, 6),
+            Case(StreamRequest.pcm(44_100, 2, 16), "pcm", StreamEncoding.DOP, 4),
+        )
+        for (case in cases) {
+            val fake = FakePlatform()
+            val link = fake.attach(fakeDac())
+            val dsdWire = if (case.wire == StreamEncoding.DOP) {
+                StreamFormat(1, StreamEncoding.DOP, 2_822_400, 176_400, 2, 24, 3, 6, 176_400, 1, 1, 1,
+                    SyncType.ASYNCHRONOUS, true, LinkSpeed.HIGH, 125, false, Pacing.ExplicitFeedback(0x81))
+            } else {
+                StreamFormat(1, StreamEncoding.DSD_NATIVE, 2_822_400, 88_200, 2, 32, 4, 8, 352_800, 1, 1, 1,
+                    SyncType.ASYNCHRONOUS, true, LinkSpeed.HIGH, 125, false, Pacing.ExplicitFeedback(0x81))
+            }
+            val platform = object : OutputPlatform by fake {
+                override fun openDac(dac: DacDeviceInfo, config: DacConfig): DirectLink = object : DirectLink by link {
+                    override val supportsDriverPlayback = true
+                    override fun resolvePlayback(request: StreamRequest, policy: OutputPolicy, bypassLimits: Boolean) =
+                        DriverPlaybackDecision(dsdWire, case.transform, "lossy", case.sourceFrameBytes, null)
+                }
+            }
+            val error = assertThrows(DacException::class.java) {
+                OutputSelector(platform, OutputPolicy(force = OutputKind.DIRECT_USB)).open(case.request)
+            }
+            assertEquals(case.toString(), DacErrorCode.UNSUPPORTED, error.code)
+            assertTrue(case.toString(), link.streams.isEmpty())
+        }
+    }
 }

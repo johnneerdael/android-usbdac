@@ -83,12 +83,42 @@ public enum class DacErrorCode(internal val wireName: String?) {
     /** Hand-back could not confirm restoration of the original USB configuration. */
     CONFIGURATION_RESTORE_FAILED(null),
 
+    /**
+     * A host USB stack refused the device: the macOS libusb open, an interface claim or the
+     * whole-device capture failed. It does not by itself mean a DAC fault. The Android usbfs path
+     * does not raise it; it is listed so every native code has a value.
+     */
+    HOST_USB("host_usb"),
+
     /** A code this version of the library does not know. */
     UNKNOWN(null);
 
     internal companion object {
         fun fromWireName(name: String): DacErrorCode =
             entries.firstOrNull { it.wireName == name } ?: UNKNOWN
+
+        /**
+         * The stable number of an `onEvent(ERROR, code, ...)` call (usbdac-jni `json::error_code`).
+         * The string code in the message stays authoritative; this reads an event without one.
+         */
+        fun fromNativeNumber(code: Long): DacErrorCode = when (code) {
+            1L -> BUSY
+            2L -> PLATFORM_UNSUPPORTED
+            3L -> CLAIM
+            4L -> UNSUPPORTED
+            5L -> CLOCK_UNVERIFIED
+            6L -> DEVICE_LOST
+            7L -> TRANSFER
+            8L -> CONTROL
+            9L -> INVALID_STATE
+            10L -> INVALID_ARGUMENT
+            11L -> IMPLICIT_FEEDBACK_UNSUPPORTED
+            12L -> VOLUME_UNAVAILABLE
+            13L -> HOST_USB
+            14L -> RECONFIGURE_DRAIN_TIMEOUT
+            15L -> RECONFIGURE_UNUSABLE
+            else -> UNKNOWN
+        }
     }
 }
 

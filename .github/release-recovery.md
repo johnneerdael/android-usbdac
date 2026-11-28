@@ -10,4 +10,22 @@ The Pages workflow deploys only verified published release source. Documentation
 gh workflow run docs.yml --repo johnneerdael/usbdac --ref main -f published_version=VERSION -f source_sha=COMMIT_SHA
 ```
 
-The workflow checks the stable tag, published release, evidence and download coordinates before building. Legacy releases whose receipts do not contain a repository ID cannot use this deployment path; deploy a newer release with current evidence instead.
+The workflow checks the stable tag, published release, evidence and download coordinates before building. It requires the manifest and receipt to identify this repository by ID. 0.1.17 is the first release whose evidence records `repository_id`; for older releases the workflow resolves the recorded repository name to an ID instead, so that name must still resolve to this repository.
+
+## What the release evidence binds
+
+The release gates seal `manifest.json` for the library payload: the crate, both AARs with their POMs, Gradle module files and source jars, the JNI libraries zip and the device compatibility list. They seal it before the validator apps are built, so the manifest does not list the validators. The gate receipt (schema 3) binds them separately: each validator entry records the release file name, SHA-256 and size, the workflow artifact ID and digest, and the run attempt that produced it. Before anything is published, `verify_validator_subjects` in `release_artifact.py` checks the downloaded validator bytes against those entries. To audit a release, check the library assets against `manifest.json` and the validator assets against `receipt.json`. `SHA256SUMS.txt` lists every published asset, but nothing seals it, so treat it as a convenience index.
+
+## Re-pinning the release implementation
+
+The Release workflow refuses to run unless the release implementation at its commit matches a reviewed pin in `.github/scripts/release_adapters.json`. The pinned files are listed in `RELEASE_IMPLEMENTATION` in `.github/scripts/prepare_release.py`: `release.yml`, `ci.yml` and the release scripts. Any edit to one of them, including an unrelated CI change, needs a new pin in the same pull request. CI checks this before merge.
+
+After reviewing the change, pin it and check the result from the repository root:
+
+```sh
+python3 -I .github/scripts/pin_release_adapter.py          # add a pin for the working tree
+python3 -I .github/scripts/pin_release_adapter.py --check  # what CI runs
+python3 -B -m unittest discover -s .github/scripts/tests
+```
+
+While a branch is still changing, `--amend` replaces the newest pin instead of adding another. It refuses when the newest pin is the implementation of a released tag, because package-only recovery of runs on that implementation verifies them against the pin. Fetch tags first. Never remove a released pin.

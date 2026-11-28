@@ -79,6 +79,33 @@ class DacExceptionTest {
     }
 
     @Test
+    fun committedRoutesSurviveAPowerHandBackFailure() {
+        // usbdac-jni detailed_apply_failure adds route_report when the transaction committed and only
+        // the ADC3 power hand-back failed: the app must see which controls now hold the new value.
+        val response = """{"error":{"kind":"session","detail":"power restore","session_code":"control",
+            "power_restore_failure":"power restore","route_report":{
+                "changed":[{"kind":"selector","interface":3,"entity":8}],
+                "unchanged":[{"kind":"crosspoint","interface":3,"entity":9,"input_pin":1,"input_channel":2,"output_channel":1}]}}}"""
+        try {
+            routingResponse { response }
+            fail("expected routing failure")
+        } catch (error: RoutingException) {
+            assertEquals("power restore", error.powerRestoreFailure)
+            assertEquals(RoutingReport(listOf(RouteKey.Selector(3, 8)), listOf(RouteKey.Crosspoint(3, 9, 1, 2, 1))), error.routeReport)
+        }
+        try {
+            routingResponse { """{"error":{"kind":"session","detail":"power restore","session_code":"control","power_restore_failure":"power restore"}}""" }
+            fail("expected routing failure")
+        } catch (error: RoutingException) {
+            assertNull(error.routeReport)
+        }
+        assertNull(RoutingException(RoutingErrorKind.INVALID, "invalid", null, null, null, emptyList()).routeReport)
+        val report = RoutingReport(listOf(RouteKey.Selector(3, 8)), emptyList())
+        assertEquals(report, RoutingException(RoutingErrorKind.SESSION, "power restore", DacErrorCode.CONTROL, null, null,
+            emptyList(), "power restore", report).routeReport)
+    }
+
+    @Test
     fun everyDocumentedNativeCodeParses() {
         val expected = mapOf(
             "busy" to DacErrorCode.BUSY,
@@ -93,6 +120,9 @@ class DacExceptionTest {
             "invalid_state" to DacErrorCode.INVALID_STATE,
             "invalid_argument" to DacErrorCode.INVALID_ARGUMENT,
             "volume_unavailable" to DacErrorCode.VOLUME_UNAVAILABLE,
+            "host_usb" to DacErrorCode.HOST_USB,
+            "reconfigure_drain_timeout" to DacErrorCode.RECONFIGURE_DRAIN_TIMEOUT,
+            "reconfigure_unusable" to DacErrorCode.RECONFIGURE_UNUSABLE,
         )
         for ((wire, code) in expected) {
             val error = parseNativeError("usbdac:$wire: something went wrong")!!

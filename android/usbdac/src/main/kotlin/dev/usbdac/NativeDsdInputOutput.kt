@@ -3,7 +3,8 @@ package dev.usbdac
 import kotlinx.coroutines.flow.StateFlow
 import java.nio.ByteBuffer
 
-/** Accumulate chronological DSD byte-frames until the native wire word is complete. */
+/** Accumulate chronological DSD byte-frames until the native wire word is complete.
+ * [drain] completes a final partial wire word with the DSD idle byte `0x69` in every channel. */
 internal class NativeDsdInputOutput(private val target: PcmOutput, private val channels: Int, wordBytes: Int) : PcmOutput {
     private val lock = Any()
     private val wireFrame = channels * wordBytes
@@ -37,7 +38,10 @@ internal class NativeDsdInputOutput(private val target: PcmOutput, private val c
         if (closed) return 0
         targetFailure?.let { throw it }
         if (draining) return 0
-        pump(); pending.remaining().let { it - it % channels }
+        // PcmOutput.writableBytes is the room up to the target depth: the staged bytes of an
+        // incomplete wire word already use part of the target's room, as in the other adapters.
+        pump()
+        minOf(pending.remaining(), (targetCall { target.writableBytes } - pending.position()).coerceAtLeast(0)).let { it - it % channels }
     }
     override fun play() = synchronized(lock) { if (closed) throw DacException(DacErrorCode.INVALID_STATE, "output closed"); targetCall { target.play() } }
     override fun pause() = synchronized(lock) { if (closed) throw DacException(DacErrorCode.INVALID_STATE, "output closed"); targetCall { target.pause() } }
@@ -45,7 +49,12 @@ internal class NativeDsdInputOutput(private val target: PcmOutput, private val c
     private fun pumpDrain() { pump(); if (pending.position() == 0 && !targetDrained) { targetCall { target.drain() }; targetDrained = true } }
     override fun drain() = synchronized(lock) {
         if (closed) throw DacException(DacErrorCode.INVALID_STATE, "output closed")
-        if (pending.position() % wireFrame != 0) throw DacException(DacErrorCode.INVALID_ARGUMENT, "incomplete native DSD wire word")
+        // A final partial wire word is completed with DSD idle, ALSA's silence byte for every DSD
+        // format (sound/core/pcm_misc.c pcm_formats[DSD_U8..DSD_U32_BE].silence = 0x69; also
+        // sound/usb/endpoint.c data_ep_set_params silence_value), so every accepted byte plays.
+        // Staged input is whole byte-frames and the capacity whole wire words, so the pad fits and
+        // gives each channel the same number of idle bytes.
+        while (pending.position() % wireFrame != 0) pending.put(DSD_IDLE)
         draining = true; pumpDrain()
     }
     override val isDrained: Boolean get() = synchronized(lock) { if (closed) false else { targetFailure?.let { throw it }; if (!draining) false else { pumpDrain(); targetDrained && targetCall { target.isDrained } } } }
@@ -53,3 +62,6 @@ internal class NativeDsdInputOutput(private val target: PcmOutput, private val c
     override val latencyFrames: Long get() = synchronized(lock) { if (closed) 0 else target.latencyFrames + pending.position() / channels }
     override fun close() = synchronized(lock) { if (!closed) { closed = true; target.close() } }
 }
+
+/** DSD idle pattern: ALSA's silence byte for DSD (sound/core/pcm_misc.c), which pads a drained tail. */
+internal const val DSD_IDLE: Byte = 0x69

@@ -227,6 +227,71 @@ mod linux {
         Ok(())
     }
 
+    // Full UAC3 whose clock RANGE lists only 48 kHz behind a powered route that
+    // cannot certify a live refusal. The cached model excludes 44.1 kHz, so the
+    // ranked loop and the playback candidates must skip it without any USB request,
+    // as ALSA never offers a rate absent from its format table (pcm.c hw_rule_rate).
+    fn full_uac3_nearest(
+        dac: Dac,
+        fd: i32,
+        caps: &usbdac_core::Capabilities,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use usbdac_core::playback::PlaybackPolicy;
+        assert_eq!(caps.uac_version, UacVersion::V3);
+        assert_eq!(caps.link_speed, LinkSpeed::High);
+        let mut rates = caps.pcm_sample_rates.clone();
+        rates.sort_unstable();
+        rates.dedup();
+        assert_eq!(rates, [48_000], "unexpected full-UAC3 fixture rates");
+        let no_44k = |snapshot: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let sets = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+            if sets
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|v| v == "44100")
+            {
+                return Err(format!("model-excluded 44100 Hz was programmed: {snapshot}").into());
+            }
+            Ok(())
+        };
+        out_of_band("reset")?;
+        let format = dac.negotiate(
+            &StreamRequest::pcm(44_100, 2, 16).with_rate_policy(RatePolicy::NearestSupported),
+        )?;
+        assert_eq!(
+            (format.sample_rate, format.channels, format.valid_bits),
+            (48_000, 2, 16)
+        );
+        let negotiated = out_of_band("snapshot")?;
+        no_44k(&negotiated)?;
+        out_of_band("reset")?;
+        let decision = dac.resolve_playback(
+            &StreamRequest::pcm(44_100, 2, 16),
+            &PlaybackPolicy::default(),
+        )?;
+        assert_eq!(decision.format.sample_rate, 48_000);
+        assert_eq!(decision.candidates[0], StreamRequest::pcm(44_100, 2, 16));
+        assert!(
+            matches!(decision.exact_refusal, Some(Error::Unsupported { .. })),
+            "the skipped exact source must report a typed refusal: {:?}",
+            decision.exact_refusal
+        );
+        let resolved = out_of_band("snapshot")?;
+        no_44k(&resolved)?;
+        println!(
+            "NEGOTIATE_CASE mode=full-uac3-nearest requested=44100 actual=48000 resolve=48000 attempted={} negotiate={negotiated} resolve_snapshot={resolved}",
+            decision.attempted_candidates
+        );
+        assert_eq!(alt(fd)?, 0);
+        dac.close()?;
+        assert!(Dac::await_usb_retirement(Duration::from_secs(3)));
+        assert_eq!(alt(fd)?, 0);
+        for interface in [1, 0] {
+            claim(fd, interface, false)?;
+        }
+        println!("USBIP_LIFECYCLE_PASS mode=full-uac3-nearest retired=true");
+        Ok(())
+    }
+
     fn vendor(fd: i32, value: u16) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(control(fd, 0x40, 0x5a, value, 0, &mut [])?, 0);
         Ok(())
@@ -523,9 +588,55 @@ mod linux {
             ["0", "1"],
             "unexpected alternate transitions: {transitions}"
         );
+        // USB-level count of the live 96 -> 48 kHz replacement on interface 1 and
+        // clock 16. ALSA's UAC2 prepare deselects the alternate first, writes the
+        // rate, and enables the alternate last (sound/usb/endpoint.c
+        // snd_usb_endpoint_prepare:1498-1530, endpoint_set_interface:917-951).
+        // ALSA elides a SET_INTERFACE to the alternate it already holds
+        // (endpoint.c:926-927); usbdac re-asserts alt 0 at stop, before and after
+        // the read-only negotiation and before activation, which is idempotent.
+        let sequence = out_of_band("sequence")?;
+        let writes: Vec<_> = sequence
+            .strip_prefix("seq=[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .ok_or("missing write sequence")?
+            .split(", ")
+            .collect();
+        let count = |w: &str| writes.iter().filter(|x| **x == w).count();
+        assert_eq!(
+            (
+                count("alt0"),
+                count("alt1"),
+                count("rate48000"),
+                writes.len()
+            ),
+            (4, 1, 2, 7),
+            "unexpected replacement write counts: {sequence}"
+        );
+        assert_eq!(
+            writes.first(),
+            Some(&"alt0"),
+            "old alternate not deselected first: {sequence}"
+        );
+        assert_eq!(
+            writes.last(),
+            Some(&"alt1"),
+            "alternate not enabled last: {sequence}"
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|w| w.starts_with("rate") && *w != "rate48000"),
+            "a rate other than 48 kHz was written: {sequence}"
+        );
+        // Fresh post-replacement evidence: the DAC's clock reads back 48 kHz at alt 1.
         let mut current = [0u8; 4];
         assert_eq!(control(fd, 0xa1, 1, 0x0100, 0x1000, &mut current)?, 4);
         assert_eq!(u32::from_le_bytes(current), 48_000);
+        println!(
+            "RECONFIGURE_USB_WRITES {sequence} clock_readback=48000 alt={}",
+            alt(fd)?
+        );
         let stream = replacement.stream;
         for _ in 0..3 {
             stream.write(&pcm)?;
@@ -549,6 +660,13 @@ mod linux {
             stats.underruns <= 50,
             "USB/IP replacement exceeded 50 underruns: {stats:?}"
         );
+        let mut current = [0u8; 4];
+        assert_eq!(control(fd, 0xa1, 1, 0x0100, 0x1000, &mut current)?, 4);
+        assert_eq!(
+            u32::from_le_bytes(current),
+            48_000,
+            "clock drifted during replacement playback"
+        );
         let fixture_stats = out_of_band("snapshot")?;
         assert!(
             !fixture_stats.contains("out_completions=0"),
@@ -566,6 +684,145 @@ mod linux {
             claim(fd, interface, false)?;
         }
         println!("USBIP_LIFECYCLE_PASS mode=reconfigure retired=true alt=0");
+        Ok(())
+    }
+
+    /// DoP resolution through the production resolve_playback, transport and
+    /// PlaybackStream. DoP v1.1 carries 16 DSD bits per channel per carrier frame,
+    /// so a DoP carrier of another depth or channel count is a repack (H1), and an
+    /// exact DoP shape absent from the descriptors is never attempted (H2).
+    fn dop_resolution(dac: Dac, fd: i32, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use usbdac_core::playback::{PlaybackFidelity, PlaybackPolicy, PlaybackTransform};
+        use usbdac_core::Encoding;
+        let confirmed = PlaybackPolicy {
+            dop_confirmed: true,
+            ..PlaybackPolicy::default()
+        };
+        let caps = dac.capabilities()?;
+        assert!(
+            caps.exclusion_snapshot_complete,
+            "the fixture descriptor snapshot must be complete"
+        );
+        let source = StreamRequest::dop(2_822_400, if mode == "dop-stereo24" { 1 } else { 2 });
+        if mode == "dop-carrier32" {
+            // H2: 24-bit DoP on a 32-bit-only DAC reaches the 32-bit carrier.
+            let widened = dac.resolve_playback(&source, &confirmed)?;
+            println!(
+                "DOP_DECISION mode={mode} case=widen transform={:?} fidelity={:?} bits={} preflight={:?}",
+                widened.transform, widened.fidelity, widened.format.valid_bits, widened.source_preflight_refusal
+            );
+            assert!(widened.source_preflight_refusal.is_some());
+            assert_eq!(widened.format.encoding, Encoding::DoP);
+            assert_eq!(widened.format.valid_bits, 32);
+            assert_eq!(
+                widened.transform,
+                PlaybackTransform::DopRepack { target_channels: 2 }
+            );
+        }
+        let policy = if mode == "dop-carrier32" {
+            // H1: the review's smallest case.
+            PlaybackPolicy {
+                allowed_pcm_depths: Some(vec![32]),
+                ..confirmed.clone()
+            }
+        } else {
+            confirmed.clone()
+        };
+        out_of_band("reset")?;
+        let decision = dac.resolve_playback(&source, &policy)?;
+        println!(
+            "DOP_DECISION mode={mode} transform={:?} fidelity={:?} format={:?}/{}ch/{}bit preflight={:?} attempted={}",
+            decision.transform,
+            decision.fidelity,
+            decision.format.encoding,
+            decision.format.channels,
+            decision.format.valid_bits,
+            decision.source_preflight_refusal,
+            decision.attempted_candidates
+        );
+        if mode == "dop-no-carrier" {
+            // H2: confirmed DoP on a DAC that cannot carry it falls back like unconfirmed.
+            assert!(decision.source_preflight_refusal.is_some());
+            assert_eq!(decision.format.encoding, Encoding::Pcm);
+            assert!(matches!(
+                decision.transform,
+                PlaybackTransform::DsdToPcm {
+                    dop_input: true,
+                    ..
+                }
+            ));
+            let unconfirmed = dac.resolve_playback(&source, &PlaybackPolicy::default())?;
+            assert_eq!(unconfirmed.format, decision.format);
+        } else {
+            assert_eq!(decision.format.encoding, Encoding::DoP);
+            assert_eq!(decision.format.channels, 2);
+            assert_eq!(
+                decision.transform,
+                PlaybackTransform::DopRepack { target_channels: 2 }
+            );
+            assert_eq!(
+                decision.fidelity,
+                if source.channels == 2 {
+                    PlaybackFidelity::BitExact
+                } else {
+                    PlaybackFidelity::Lossless
+                }
+            );
+            assert_eq!(decision.attempted_candidates, 1);
+        }
+        let mut stream = dac.open_playback(&decision, Arc::new(|_| {}))?;
+        let channels = usize::from(source.channels);
+        let frame = decision.source_frame_bytes;
+        let mut next = 0usize;
+        let mut chunk = Vec::new();
+        let start = Instant::now();
+        let mut started = false;
+        while start.elapsed() < Duration::from_secs(3)
+            && (stream.played_frames() == 0 || stream.stats().completed_transfers == 0)
+        {
+            let frames = stream.writable_bytes() / frame;
+            if frames > 0 {
+                chunk.clear();
+                for i in next..next + frames {
+                    let marker = if i % 2 == 0 { 0x05 } else { 0xfa };
+                    for _ in 0..channels {
+                        chunk.extend_from_slice(&[0x69, 0x69, marker]);
+                    }
+                }
+                next += stream.write(&chunk)? / frame;
+            }
+            if !started && next > 0 {
+                stream.play()?;
+                started = true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let stats = stream.target_stats();
+        let snapshot = out_of_band("snapshot")?;
+        println!("DOP_STATS mode={mode} source_frames={next} {stats:?} {snapshot}");
+        assert!(
+            stats.played_frames > 0 && stats.completed_transfers > 0,
+            "no DoP-resolved completions"
+        );
+        let rates = snapshot.split(';').next().ok_or("missing rate snapshot")?;
+        let carrier_set = rates
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|v| v == "176400");
+        // The carrier DACs clock 176.4 kHz; the exact carrier is never set on a DAC without one.
+        assert_eq!(carrier_set, mode != "dop-no-carrier", "{snapshot}");
+        if mode != "dop-no-carrier" {
+            assert!(stats.payload_verified, "the DoP payload must audit clean");
+        }
+        stream.close()?;
+        assert_eq!(alt(fd)?, 0, "stream teardown must restore alternate zero");
+        let retirement = dac.retirement();
+        dac.close()?;
+        assert!(retirement.wait(Duration::from_secs(3)));
+        assert_eq!(alt(fd)?, 0);
+        for interface in [1, 0] {
+            claim(fd, interface, false)?;
+        }
+        println!("USBIP_LIFECYCLE_PASS mode={mode} alt=0 retired=true");
         Ok(())
     }
 
@@ -589,6 +846,10 @@ mod linux {
                     | "selector"
                     | "refuse-set"
                     | "zero-res"
+                    | "full-uac3-nearest"
+                    | "dop-carrier32"
+                    | "dop-stereo24"
+                    | "dop-no-carrier"
             )
         {
             return Err(
@@ -620,7 +881,8 @@ mod linux {
             | "full-uac3-volatile"
             | "full-uac3-clock"
             | "full-uac3-clock-bad"
-            | "full-uac3-clock-stale" => 3,
+            | "full-uac3-clock-stale"
+            | "full-uac3-nearest" => 3,
             _ => 1,
         };
         if configuration != 1 {
@@ -688,6 +950,9 @@ mod linux {
         }
         if args[2] == "reconfigure" {
             return reconfigure(dac, fd);
+        }
+        if args[2].starts_with("dop-") {
+            return dop_resolution(dac, fd, &args[2]);
         }
         let caps = dac.capabilities()?;
         if args[2] == "refuse-set" {
@@ -788,6 +1053,9 @@ mod linux {
             }
             println!("USBIP_LIFECYCLE_PASS mode=badd alt=0 retired=true");
             return Ok(());
+        }
+        if args[2] == "full-uac3-nearest" {
+            return full_uac3_nearest(dac, fd, &caps);
         }
         if matches!(args[2].as_str(), "full-uac3" | "full-uac3-volatile") {
             return full_uac3(dac, fd, &caps, args[2] == "full-uac3-volatile");

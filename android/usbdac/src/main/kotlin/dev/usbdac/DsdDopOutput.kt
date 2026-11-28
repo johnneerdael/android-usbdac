@@ -5,7 +5,8 @@ import kotlinx.coroutines.flow.StateFlow
 
 /** Exact native DSD to DoP framing for an independently confirmed DoP route.
  * Input is chronological interleaved bytes with the oldest bit in bit 7. One
- * byte-frame can be held across writes; drain rejects an incomplete final pair.
+ * byte-frame can be held across writes; drain completes an incomplete final pair
+ * with the DSD idle byte `0x69` as its later byte, under the next marker.
  * Position and latency use DSD byte-frames at the bit rate divided by eight.
  */
 public class DsdDopOutput(
@@ -29,14 +30,37 @@ public class DsdDopOutput(
     private var draining = false
     private var targetDrained = false
     private var closed = false
+    // PcmOutput.write returns the position delta, and Media3's AudioSink.handleBuffer must report
+    // what it consumed: a target failure after this call accepted input is returned as that count
+    // and rethrown, unchanged, by the next call.
+    private var targetFailure: DacException? = null
+
+    private inline fun <T> targetCall(block: () -> T): T {
+        targetFailure?.let { throw it }
+        return try { block() } catch (error: DacException) { targetFailure = error; throw error }
+    }
     override val bitPerfect: StateFlow<BitPerfectState> get() = target.bitPerfect
 
     private fun pump() {
-        if (pending.hasRemaining()) target.write(pending)
+        if (pending.hasRemaining()) targetCall { target.write(pending) }
+    }
+
+    /** Frames the held older byte-frame and [later] per channel under the current marker. */
+    private inline fun putCarrierFrame(later: (Int) -> Byte) {
+        for (ch in 0 until channels) {
+            if (slotBytes == 4) pending.put(0)
+            pending.put(later(ch))
+            pending.put(first[ch])
+            pending.put(marker.toByte())
+        }
+        haveFirst = false
+        marker = marker xor 0xff
     }
 
     override fun write(buffer: ByteBuffer): Int = synchronized(lock) {
-        check(!closed && !draining)
+        check(!closed)
+        targetFailure?.let { throw it }
+        check(!draining)
         pump()
         if (pending.hasRemaining()) return 0
         val start = buffer.position()
@@ -48,23 +72,18 @@ public class DsdDopOutput(
                 continue
             }
             val p = buffer.position()
-            for (ch in 0 until channels) {
-                if (slotBytes == 4) pending.put(0)
-                pending.put(buffer.get(p + ch))
-                pending.put(first[ch])
-                pending.put(marker.toByte())
-            }
+            putCarrierFrame { ch -> buffer.get(p + ch) }
             buffer.position(p + channels)
-            haveFirst = false
-            marker = marker xor 0xff
         }
         pending.flip()
-        pump()
+        try { pump() } catch (_: DacException) { return@synchronized buffer.position() - start }
         buffer.position() - start
     }
 
     override val writableBytes: Int get() = synchronized(lock) {
-        if (closed || draining) return 0
+        if (closed) return 0
+        targetFailure?.let { throw it }
+        if (draining) return 0
         pump()
         if (pending.hasRemaining()) return 0
         val frames = target.writableBytes / carrierFrame
@@ -74,17 +93,17 @@ public class DsdDopOutput(
 
     override fun play(): Unit = synchronized(lock) {
         check(!closed)
-        target.play()
+        targetCall { target.play() }
     }
 
     override fun pause(): Unit = synchronized(lock) {
         check(!closed)
-        target.pause()
+        targetCall { target.pause() }
     }
 
     override fun flush(): Unit = synchronized(lock) {
         check(!closed)
-        target.flush()
+        targetCall { target.flush() }
         pending.clear()
         pending.limit(0)
         marker = 0x05
@@ -96,22 +115,34 @@ public class DsdDopOutput(
     private fun pumpDrain() {
         pump()
         if (!pending.hasRemaining() && !targetDrained) {
-            target.drain()
+            targetCall { target.drain() }
             targetDrained = true
         }
     }
 
     override fun drain(): Unit = synchronized(lock) {
         check(!closed)
-        check(!haveFirst) { "incomplete final native DSD byte-frame pair" }
+        if (haveFirst) {
+            // DoP v1.1 section 2 carries 16 DSD bits per channel under a marker that alternates
+            // 0x05/0xFA per sample frame, the same in every channel (ALSA sound/usb/pcm.c
+            // fill_playback_urb_dsd_dop). A held older byte-frame is completed in the source
+            // domain, before framing, with DSD idle, ALSA's DSD silence byte (sound/core/pcm_misc.c
+            // pcm_formats[DSD_U8].silence = 0x69), so the frame takes the next marker in sequence.
+            // write() reserved this frame's room when it held the byte-frame.
+            pending.compact()
+            putCarrierFrame { DSD_IDLE }
+            pending.flip()
+        }
         draining = true
         pumpDrain()
     }
 
     override val isDrained: Boolean get() = synchronized(lock) {
-        if (closed || !draining) return false
+        if (closed) return false
+        targetFailure?.let { throw it }
+        if (!draining) return false
         pumpDrain()
-        targetDrained && target.isDrained
+        targetDrained && targetCall { target.isDrained }
     }
 
     override val playedFrames: Long get() = synchronized(lock) {

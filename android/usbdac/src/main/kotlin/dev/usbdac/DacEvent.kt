@@ -103,7 +103,7 @@ internal fun decodeEvent(type: Int, a: Long, b: Double, message: String?): DacEv
         EventType.FEEDBACK_STALE -> DacEvent.FeedbackStale
         EventType.NOMINAL_ASYNC_HOST_STARVATION -> DacEvent.NominalAsyncHostStarvation(a)
         EventType.ERROR -> DacEvent.StreamFailed(
-            parseNativeError(message) ?: DacException(DacErrorCode.UNKNOWN, message ?: "error code $a"),
+            parseNativeError(message) ?: DacException(DacErrorCode.fromNativeNumber(a), message ?: "error code $a"),
         )
         EventType.DEVICE_LOST -> DacEvent.DeviceLost
         EventType.COMPATIBILITY_FALLBACK -> CompatibilityFallbackTier.fromCode(a)?.let { tier ->
