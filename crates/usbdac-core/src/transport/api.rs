@@ -1401,6 +1401,156 @@ mod dsd_summary_tests {
         }
     }
 
+    // H2: a DoP request is carried on a PCM alternate at its carrier rate and
+    // depth (DoP v1.1 §3; ALSA keeps a DoP alternate's PCM format table,
+    // format.c:158-160, and fills it as 3-byte PCM slots, pcm.c:1399-1450).
+    // The certificate therefore treats it as that PCM request: a refusal the
+    // descriptors prove before any mutation is clean and the batch advances.
+    #[test]
+    fn dop_refusal_is_certified_like_its_pcm_carrier() {
+        use crate::transport::negotiate::{shape_absent, AltShapeEvidence};
+        use std::cell::{Cell, RefCell};
+        let owner = 0x1234;
+        // UAC2 §4.9.2 AS_GENERAL (PCM, `channels`) and Frmts20 §2.3.1.6 Type I.
+        let uac2 = |channels: u8, subslot: u8, bits: u8| {
+            let mut extra = vec![16, 0x24, 1, 3, 0, 1, 1, 0, 0, 0, channels, 3, 0, 0, 0, 0];
+            extra.extend([6, 0x24, 2, 1, subslot, bits]);
+            extra
+        };
+        // UAC1 AS_GENERAL (PCM) and a discrete Type I list of 44.1/48/96 kHz.
+        let uac1_stereo_24 = {
+            let mut extra = vec![7, 0x24, 1, 1, 1, 1, 0];
+            extra.extend([17, 0x24, 2, 1, 2, 3, 24, 3]);
+            for rate in [44_100u32, 48_000, 96_000] {
+                extra.extend(&rate.to_le_bytes()[..3]);
+            }
+            extra
+        };
+        // The descriptor certificate plus the attempt's fate when it does not
+        // hold: `Ok` for the candidate the DAC runs, otherwise a refusal after
+        // a possible mutation, which carries no certificate.
+        let batch = |alternates: Vec<(u8, Vec<u8>)>,
+                     requests: &[StreamRequest],
+                     runs: StreamRequest,
+                     live: bool| {
+            let calls = RefCell::new(Vec::new());
+            let result = negotiate_batch_ranked(
+                requests,
+                owner,
+                true,
+                || Some(owner),
+                |_| None,
+                |request| {
+                    calls.borrow_mut().push(*request);
+                    let format = playback_format_from_request(request).unwrap();
+                    let certified = shape_absent(
+                        alternates
+                            .iter()
+                            .map(|(protocol, extra)| (&(), 1, 2, *protocol, extra.as_slice())),
+                        format,
+                        |_, evidence, _| {
+                            assert!(matches!(
+                                evidence,
+                                AltShapeEvidence::Uac2Rate { .. } | AltShapeEvidence::Uac3
+                            ));
+                            live
+                        },
+                    );
+                    if certified {
+                        Err(AttemptFailure {
+                            error: Error::Unsupported {
+                                reason: "no standard output descriptor carries it".into(),
+                                offered: vec![],
+                            },
+                            clean: Some(CleanIdle { owner }),
+                        })
+                    } else if *request == runs {
+                        Ok(request.bit_depth)
+                    } else {
+                        Err(AttemptFailure {
+                            error: Error::Transfer("restore uncertain".into()),
+                            clean: None,
+                        })
+                    }
+                },
+            );
+            (result, calls.into_inner())
+        };
+        let dop64 = |channels| StreamRequest::dop(2_822_400, channels);
+        let dop64_32 = StreamRequest {
+            bit_depth: 32,
+            ..dop64(2)
+        };
+
+        // Mono DoP on a 24-bit stereo-only DAC advances to the stereo carrier.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(1), dop64(2)],
+            dop64(2),
+            false,
+        );
+        let (depth, attempted, first, refusals) = result.unwrap();
+        assert_eq!((depth, attempted, refusals.len()), (24, 2, 1));
+        assert!(matches!(first, Some(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(1), dop64(2)]);
+
+        // 24-bit DoP on a 32-bit-only DAC advances to the 32-bit carrier.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 4, 32))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert_eq!(result.unwrap().0, 32);
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // A complete UAC1 rate list without the 176.4 kHz carrier rate
+        // excludes it without a clock read.
+        let (result, calls) = batch(
+            vec![(0, uac1_stereo_24)],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // The advertised shape is present, so only live clock evidence could
+        // certify the refusal. Without it the attempt may have mutated the DAC
+        // and its refusal stays terminal, as for PCM.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            false,
+        );
+        assert_eq!(result, Err(Error::Transfer("restore uncertain".into())));
+        assert_eq!(calls, vec![dop64(2)]);
+        // A read-only RANGE exclusion certifies it exactly as for PCM.
+        let (result, calls) = batch(
+            vec![(0x20, uac2(2, 3, 24))],
+            &[dop64(2), dop64_32],
+            dop64_32,
+            true,
+        );
+        assert!(matches!(result, Err(Error::Unsupported { .. })));
+        assert_eq!(calls, vec![dop64(2), dop64_32]);
+
+        // Native DSD has no descriptor-complete rule and is never certified.
+        let native =
+            playback_format_from_request(&StreamRequest::dsd_native(2_822_400, 1)).unwrap();
+        let reads = Cell::new(0);
+        assert!(!shape_absent(
+            [(&(), 1, 2, 0x20, uac2(2, 3, 24).as_slice())],
+            native,
+            |_, _, _| {
+                reads.set(reads.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(reads.get(), 0);
+    }
+
     #[test]
     fn ranked_pcm_entry_rejects_unbounded_duplicate_and_non_exact_requests() {
         let exact = crate::StreamRequest::pcm(48_000, 2, 16);

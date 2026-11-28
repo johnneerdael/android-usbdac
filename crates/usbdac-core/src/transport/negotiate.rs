@@ -421,10 +421,119 @@ fn complete_uac2_type_i(extra: &[u8]) -> bool {
     general && format
 }
 
+/// The PCM request a clean-refusal certificate is checked against.
+///
+/// DoP is PCM on the wire: DoP v1.1 §3 packs 16 DSD bits and an 8-bit marker
+/// into each 24-bit PCM sample at bit_rate/16 Hz, and ALSA carries it on the
+/// alternate's ordinary PCM format table (format.c:158-160 keeps `pcm_formats`
+/// for a `dsd_dop` alternate; pcm.c:1399-1450 fills plain 3-byte PCM slots).
+/// The selector likewise admits DoP only on a PCM alternate with the same
+/// channel count and valid bits at the carrier rate (`transport_compatibility_penalty`,
+/// `adc3_candidate_matches_ranges`), so a DoP request is certified as that
+/// carrier. Native DSD stays uncertified: no standard descriptor field
+/// declares it. UAC2 RAW_DATA is only a "special" format to ALSA (format.c:60-65)
+/// and DSD layouts come from per-device quirks (quirks.c
+/// `snd_usb_interface_dsd_format_quirks`), so absence is never descriptor-complete.
+pub(super) fn certificate_format(format: PlaybackFormat) -> Option<PlaybackFormat> {
+    match (format.is_dop, format.dsd_transport) {
+        (false, DsdTransportMode::None) => Some(format),
+        (true, DsdTransportMode::DoP)
+            if format.pcm_encoding == PcmEncoding::Signed
+                && matches!(format.bit_depth, 24 | 32) =>
+        {
+            Some(PlaybackFormat {
+                is_dop: false,
+                dsd_transport: DsdTransportMode::None,
+                dsd_bit_rate: 0,
+                ..format
+            })
+        }
+        _ => None,
+    }
+}
+
+/// What the standard descriptors of one OUT alternate say about a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AltShapeEvidence {
+    /// Complete standard descriptors rule the request out on their own.
+    Absent,
+    /// A complete UAC2 Type I alternate with the requested shape; only a
+    /// read-only clock RANGE can still rule the rate out.
+    Uac2Rate { terminal: Option<u8> },
+    /// A UAC3 alternate; only BADD's fixed rate or a direct live route can.
+    Uac3,
+    /// Private, unknown, incomplete or matching: never evidence of absence.
+    Uncertified,
+}
+
+/// The descriptor-only part of `descriptor_shape_absent` for one OUT alternate,
+/// with `format` already mapped by `certificate_format`. It reads no device.
+pub(super) fn alt_shape_evidence(
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    extra: &[u8],
+    format: PlaybackFormat,
+) -> AltShapeEvidence {
+    if class != 1 || subclass != 2 {
+        return AltShapeEvidence::Uncertified;
+    }
+    match protocol {
+        0 if uac1_type_i_excludes(extra, format) == Some(true) => AltShapeEvidence::Absent,
+        0x20 if format.pcm_encoding == PcmEncoding::Signed => {
+            if !complete_uac2_type_i(extra) {
+                return AltShapeEvidence::Uncertified;
+            }
+            let Some(parsed) = scan::parse_streaming_extra(protocol, extra) else {
+                return AltShapeEvidence::Uncertified;
+            };
+            if parsed.channels == format.channels
+                && parsed.bit_resolution == format.bit_depth
+                && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
+            {
+                AltShapeEvidence::Uac2Rate {
+                    terminal: parsed.terminal_link,
+                }
+            } else {
+                AltShapeEvidence::Absent
+            }
+        }
+        0x30 if format.pcm_encoding == PcmEncoding::Signed => AltShapeEvidence::Uac3,
+        _ => AltShapeEvidence::Uncertified,
+    }
+}
+
+/// Folds per-alternate evidence: absent only when at least one OUT alternate
+/// exists and each is ruled out, by its descriptors or by `live` (the read-only
+/// clock evidence that `Uac2Rate` and `Uac3` still need).
+pub(super) fn shape_absent<'a, A: 'a>(
+    alternates: impl IntoIterator<Item = (&'a A, u8, u8, u8, &'a [u8])>,
+    format: PlaybackFormat,
+    mut live: impl FnMut(&A, AltShapeEvidence, PlaybackFormat) -> bool,
+) -> bool {
+    let Some(format) = certificate_format(format) else {
+        return false;
+    };
+    let mut seen = false;
+    for (alt, class, subclass, protocol, extra) in alternates {
+        seen = true;
+        match alt_shape_evidence(class, subclass, protocol, extra, format) {
+            AltShapeEvidence::Absent => {}
+            AltShapeEvidence::Uncertified => return false,
+            evidence => {
+                if !live(alt, evidence, format) {
+                    return false;
+                }
+            }
+        }
+    }
+    seen
+}
+
 // Only complete descriptor or fresh read-only clock incompatibility mints a clean refusal;
 // generic SelectError::NoMatch can also represent failed I/O or power changes.
 fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, speed: Speed) -> bool {
-    if format.is_dop || format.dsd_transport != DsdTransportMode::None {
+    if certificate_format(format).is_none() {
         return false;
     }
     let Ok(config) = claimed.handle.device().active_config_descriptor() else {
@@ -436,8 +545,7 @@ fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, spee
     ) {
         return false;
     }
-    let mut seen = false;
-    for alt in config
+    let alternates: Vec<_> = config
         .interfaces()
         .flat_map(|i| i.descriptors())
         .filter(|d| {
@@ -445,62 +553,48 @@ fn descriptor_shape_absent(claimed: &ClaimedHandle, format: PlaybackFormat, spee
                 && d.endpoint_descriptors()
                     .any(|ep| ep.direction() == Direction::Out)
         })
-    {
-        seen = true;
-        if alt.class_code() != 1 || alt.sub_class_code() != 2 {
-            return false;
-        }
-        match alt.protocol_code() {
-            0 => {
-                if uac1_type_i_excludes(alt.extra(), format) != Some(true) {
-                    return false;
-                }
-            }
-            0x20 if format.pcm_encoding == PcmEncoding::Signed => {
-                if !complete_uac2_type_i(alt.extra()) {
-                    return false;
-                }
-                let Some(parsed) = scan::parse_android_streaming_interface_format(&alt) else {
-                    return false;
-                };
-                if parsed.channels == format.channels
-                    && parsed.bit_resolution == format.bit_depth
-                    && parsed.uac2_formats.is_some_and(|bits| bits & 1 != 0)
-                    && direct_uac2_rate_exclusion(
+        .collect();
+    shape_absent(
+        alternates.iter().map(|alt| {
+            (
+                alt,
+                alt.class_code(),
+                alt.sub_class_code(),
+                alt.protocol_code(),
+                alt.extra(),
+            )
+        }),
+        format,
+        |alt, evidence, format| match evidence {
+            AltShapeEvidence::Uac2Rate { terminal } => {
+                direct_uac2_rate_exclusion(
+                    claimed,
+                    alt.interface_number(),
+                    terminal,
+                    format.sample_rate,
+                )
+                .is_some()
+                    || selector_uac2_rate_exclusion(
                         claimed,
                         alt.interface_number(),
-                        parsed.terminal_link,
+                        terminal,
                         format.sample_rate,
                     )
-                    .is_none()
-                    && selector_uac2_rate_exclusion(
-                        claimed,
-                        alt.interface_number(),
-                        parsed.terminal_link,
-                        format.sample_rate,
-                    )
-                    .is_none()
-                {
-                    return false;
-                }
+                    .is_some()
             }
-            0x30 if format.pcm_encoding == PcmEncoding::Signed => {
+            AltShapeEvidence::Uac3 => {
                 let badd_excludes = format.sample_rate != 48_000
                     && read_active_configuration_bytes_checked(&claimed.handle, &config)
                         .ok()
                         .is_some_and(|raw| {
                             adc3::badd_only_fixed_rate_witness(&config, &raw, speed) == 1
                         });
-                if !badd_excludes
-                    && !adc3::adc3_direct_rate_excludes(claimed, &config, &alt, speed, format)
-                {
-                    return false;
-                }
+                badd_excludes
+                    || adc3::adc3_direct_rate_excludes(claimed, &config, alt, speed, format)
             }
-            _ => return false,
-        }
-    }
-    seen
+            AltShapeEvidence::Absent | AltShapeEvidence::Uncertified => false,
+        },
+    )
 }
 
 /// Programs and verifies the DAC clock for `requested_format` and settles on the
@@ -561,7 +655,12 @@ pub(super) fn negotiate_playback_format(
         {
             clean_descriptor = true;
             return Err(Error::Unsupported {
-                reason: "no standard output descriptor carries the requested PCM format".into(),
+                reason: if requested_format.is_dop {
+                    "no standard output descriptor carries the requested DoP PCM carrier"
+                } else {
+                    "no standard output descriptor carries the requested PCM format"
+                }
+                .into(),
                 offered: offered_alt_settings(),
             });
         }
