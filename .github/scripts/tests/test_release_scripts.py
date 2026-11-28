@@ -22,11 +22,14 @@ import recover_release as recover
 import release_artifact as artifact
 import publish_release as publish
 import release_notes as notes
+import pin_release_adapter as pin
 
 
 class ReservationTests(unittest.TestCase):
     def test_reviewed_adapter_matches_current_files_and_rejects_changes(self):
-        adapter = next(item for item in prepare.reviewed_adapters() if item['schema'] == 3)
+        # Re-pinning appends or amends the newest entry, so it must be the current implementation.
+        adapter = prepare.reviewed_adapters()[-1]
+        self.assertEqual(adapter['schema'], 3)
         repo = REPO
         def git_show(args, **kwargs):
             path = args[-1].split(':', 1)[1]
@@ -98,6 +101,50 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(exercise([('reserved', 1)], True, False), '0.1.15')
         self.assertEqual(exercise([], False, True), '0.1.15')
         self.assertEqual(exercise([], False, False), '0.1.16')
+
+
+class PinTests(unittest.TestCase):
+    def layout(self, root, content):
+        for path in prepare.RELEASE_IMPLEMENTATION:
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(content + path.encode())
+        return {path: hashlib.sha256(content + path.encode()).hexdigest() for path in prepare.RELEASE_IMPLEMENTATION}
+
+    def run_pin(self, root, *args, tags=('v0.1.17',), released=()):
+        with patch.object(pin, 'REPO', root), patch.object(pin, 'ADAPTERS', root / 'adapters.json'), \
+             patch.object(pin, 'stable_tags', return_value=list(tags)), \
+             patch.object(pin, 'matches_adapter', side_effect=lambda tag, files: files in released):
+            pin.main(list(args))
+        return json.loads((root / 'adapters.json').read_text())
+
+    def test_check_fails_until_a_changed_implementation_is_pinned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.layout(root, b'reviewed ')
+            (root / 'adapters.json').write_text(json.dumps([{'files': first, 'gate_identity': 'usbdac-release-gates/v1', 'schema': 3}]))
+            self.run_pin(root, '--check')
+            second = self.layout(root, b'changed ')
+            with self.assertRaises(SystemExit):
+                self.run_pin(root, '--check')
+            adapters = self.run_pin(root)
+            self.assertEqual([a['files'] for a in adapters], [first, second])
+            self.run_pin(root, '--check')
+
+    def test_amend_replaces_only_an_unreleased_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            released = self.layout(root, b'released ')
+            unreleased = self.layout(root, b'unreleased ')
+            entry = lambda files: {'files': files, 'gate_identity': 'usbdac-release-gates/v1', 'schema': 3}
+            (root / 'adapters.json').write_text(json.dumps([entry(released), entry(unreleased)]))
+            current = self.layout(root, b'integrated ')
+            adapters = self.run_pin(root, '--amend', released=(released,))
+            self.assertEqual([a['files'] for a in adapters], [released, current])
+            (root / 'adapters.json').write_text(json.dumps([entry(released)]))
+            for options in (dict(released=(released,)), dict(tags=())):
+                with self.assertRaises(SystemExit):
+                    self.run_pin(root, '--amend', **options)
+                self.assertEqual(json.loads((root / 'adapters.json').read_text()), [entry(released)])
 
 
 class ReceiptTests(unittest.TestCase):
