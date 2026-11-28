@@ -728,8 +728,8 @@ pub(crate) fn hardware_volume_range() -> Option<PublicVolumeRange> {
     let guard = SESSION_STATE.lock();
     let control = guard.as_ref()?.hardware_volume_control.as_ref()?;
     Some(PublicVolumeRange {
-        min_db: playback_volume_curve().db(control.min_volume_raw, &control.ranges),
-        max_db: playback_volume_curve().db(control.max_volume_raw, &control.ranges),
+        min_db: playback_volume_curve().range_db(control.min_volume_raw, &control.ranges),
+        max_db: playback_volume_curve().range_db(control.max_volume_raw, &control.ranges),
         res_db: if playback_volume_curve() == VolumeCurve::LinearAmplitude {
             0.0
         } else {

@@ -28,7 +28,9 @@ pub struct VolumeRange {
 /// The DAC's volume as read back from the device.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VolumeState {
-    /// Level in dB.
+    /// Level in dB. `f64::NEG_INFINITY` when the DAC reports silence: the
+    /// UAC CUR code 0x8000 (UAC1 section 5.2.2.4.3.2, UAC2 section
+    /// 5.2.5.7.2), or its minimum on a DAC whose minimum is a mute.
     pub db: f64,
     /// Position on the 0..1 curve: 0 is the DAC's minimum; anything above 0
     /// spans `max(min, -80 dB)` to the maximum linearly in dB. A level below
@@ -253,7 +255,27 @@ impl<T> OrElseControl<T> for std::result::Result<T, String> {
     }
 }
 
-/// dB for a raw UAC volume value.
+/// The UAC volume CUR code for silence. UAC1 section 5.2.2.4.3.2 ("The range
+/// for the CUR attribute is extended by code 0x8000, representing silence,
+/// i.e., -inf dB") and UAC2 section 5.2.5.7.2 ("code 0x8000, representing
+/// silence (i.e., -inf dB), must always be implemented. However, it must never
+/// be reported as the MIN attribute value").
+pub(crate) const RAW_SILENCE: i16 = i16::MIN;
+
+/// dB for a raw UAC volume CUR value. [`RAW_SILENCE`] is
+/// `f64::NEG_INFINITY`, the value the public API already uses for silence.
+pub(crate) fn cur_raw_to_db(raw: i16) -> f64 {
+    if raw == RAW_SILENCE {
+        f64::NEG_INFINITY
+    } else {
+        raw_to_db(raw)
+    }
+}
+
+/// dB for a raw UAC volume RANGE attribute (MIN, MAX, RES). 0x8000 is only a
+/// CUR code; a MIN that a non-conforming DAC reports as 0x8000 stays -128 dB,
+/// as ALSA computes `dBmin` from the raw minimum with no special case (mixer.c
+/// get_min_max_with_quirks:1412-1413).
 pub(crate) fn raw_to_db(raw: i16) -> f64 {
     f64::from(raw) / RAW_PER_DB
 }
@@ -266,6 +288,11 @@ mod tests {
     fn raw_units_are_256ths_of_a_db() {
         assert_eq!(raw_to_db(-256), -1.0);
         assert_eq!(raw_to_db(-12800), -50.0);
+        // UAC1 5.2.2.4.3.2 / UAC2 5.2.5.7.2: CUR 0x8000 is silence, not -128 dB.
+        assert_eq!(cur_raw_to_db(i16::MIN), f64::NEG_INFINITY);
+        assert_eq!(cur_raw_to_db(i16::MIN + 1), -32767.0 / 256.0);
+        assert_eq!(cur_raw_to_db(-256), -1.0);
+        // As a RANGE attribute it stays the numeric bottom (ALSA dBmin).
         assert_eq!(raw_to_db(i16::MIN), -128.0);
     }
 }
