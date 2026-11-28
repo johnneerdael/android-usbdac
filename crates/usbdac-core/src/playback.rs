@@ -8,6 +8,7 @@ use crate::{
     AltFormat, Dac, DacListener, DacStream, Encoding, Error, RatePolicy, Result, StreamFormat,
     StreamRequest, StreamStats,
 };
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1087,78 +1088,70 @@ impl Dac {
         decision: &PlaybackDecision,
         listener: Arc<dyn DacListener>,
     ) -> Result<PlaybackStream> {
-        let engine = match &decision.transform {
-            PlaybackTransform::Direct
-                if matches!(decision.source.encoding, Encoding::DsdNative { .. })
-                    && decision.source_frame_bytes < decision.format.bytes_per_frame() =>
-            {
-                Engine::DsdRepack
-            }
-            PlaybackTransform::Direct => Engine::Direct,
-            PlaybackTransform::Pcm {
-                plan,
-                unsigned_input,
-            } => Engine::Pcm {
-                converter: Converter::new(plan).map_err(conversion_error)?,
-                unsigned: *unsigned_input,
-            },
-            PlaybackTransform::DopToNative { .. }
-            | PlaybackTransform::DopRepack { .. }
-            | PlaybackTransform::NativeToDop { .. }
-            | PlaybackTransform::DsdChannelExpansion { .. } => Engine::DsdRepack,
-            PlaybackTransform::DsdToPcm {
-                bit_rate,
-                dop_input,
-                options,
-            } => {
-                let sample = if decision.format.encoding == Encoding::PcmFloat32 {
-                    SampleFormat::Float32
-                } else {
-                    SampleFormat::int(decision.format.valid_bits, decision.format.subslot_bytes)
-                        .map_err(conversion_error)?
-                };
-                let target = PcmFormat::new(
-                    decision.format.sample_rate,
-                    decision.format.channels,
-                    sample,
-                );
-                let mut opts = *options;
-                opts.source_sample = None;
-                Engine::Dsd {
-                    converter: Box::new(
-                        DsdPcmConverter::with_options(
-                            *bit_rate,
-                            decision.source.channels,
-                            target,
-                            &opts,
-                        )
-                        .map_err(conversion_error)?,
-                    ),
-                    dop: *dop_input,
-                }
-            }
-        };
+        let engine = engine_for(decision)?;
         let stream = self.open_stream(&decision.format, listener)?;
         if !matches!(&decision.transform, PlaybackTransform::Direct) {
             stream.set_host_processing(true);
         }
-        Ok(PlaybackStream {
-            stream,
-            decision: decision.clone(),
+        Ok(PlaybackStream::with_sink(
+            Sink::Usb(stream),
+            decision,
             engine,
-            input: Vec::with_capacity(65536),
-            input_offset: 0,
-            output: Vec::with_capacity(65536),
-            output_offset: 0,
-            marker: None,
-            finishing: false,
-            drain_called: false,
-            source_bytes: 0,
-            target_bytes: 0,
-            observer: None,
-            timing_observer: None,
-        })
+        ))
     }
+}
+fn engine_for(decision: &PlaybackDecision) -> Result<Engine> {
+    Ok(match &decision.transform {
+        PlaybackTransform::Direct
+            if matches!(decision.source.encoding, Encoding::DsdNative { .. })
+                && decision.source_frame_bytes < decision.format.bytes_per_frame() =>
+        {
+            Engine::DsdRepack
+        }
+        PlaybackTransform::Direct => Engine::Direct,
+        PlaybackTransform::Pcm {
+            plan,
+            unsigned_input,
+        } => Engine::Pcm {
+            converter: Converter::new(plan).map_err(conversion_error)?,
+            unsigned: *unsigned_input,
+        },
+        PlaybackTransform::DopToNative { .. }
+        | PlaybackTransform::DopRepack { .. }
+        | PlaybackTransform::NativeToDop { .. }
+        | PlaybackTransform::DsdChannelExpansion { .. } => Engine::DsdRepack,
+        PlaybackTransform::DsdToPcm {
+            bit_rate,
+            dop_input,
+            options,
+        } => {
+            let sample = if decision.format.encoding == Encoding::PcmFloat32 {
+                SampleFormat::Float32
+            } else {
+                SampleFormat::int(decision.format.valid_bits, decision.format.subslot_bytes)
+                    .map_err(conversion_error)?
+            };
+            let target = PcmFormat::new(
+                decision.format.sample_rate,
+                decision.format.channels,
+                sample,
+            );
+            let mut opts = *options;
+            opts.source_sample = None;
+            Engine::Dsd {
+                converter: Box::new(
+                    DsdPcmConverter::with_options(
+                        *bit_rate,
+                        decision.source.channels,
+                        target,
+                        &opts,
+                    )
+                    .map_err(conversion_error)?,
+                ),
+                dop: *dop_input,
+            }
+        }
+    })
 }
 
 enum Engine {
@@ -1214,26 +1207,139 @@ pub struct ProducerTiming {
 }
 pub type ProducerTimingObserver = Arc<dyn Fn(ProducerTiming) + Send + Sync>;
 
+/// Source frames one converter or repack step takes. `write` loops over steps,
+/// so this bounds only the staging buffers, never what one call accepts.
+const WRITE_CHUNK_FRAMES: usize = 256;
+/// DSD idle pattern: ALSA's silence byte for DSD_U8/U16/U32 (sound/core/pcm_misc.c
+/// pcm_formats[].silence = 0x69), and what the ring sends for DSD while paused.
+const DSD_IDLE: u8 = 0x69;
+
+/// The ring a playback stream feeds: the USB stream, or a model of its ring in tests.
+enum Sink {
+    Usb(DacStream),
+    #[cfg(test)]
+    Model(tests::RingModel),
+}
+macro_rules! on_sink {
+    ($sink:expr, $stream:ident => $body:expr) => {
+        match $sink {
+            Sink::Usb($stream) => $body,
+            #[cfg(test)]
+            Sink::Model($stream) => $body,
+        }
+    };
+}
+impl Sink {
+    fn write(&self, data: &[u8]) -> Result<usize> {
+        on_sink!(self, s => s.write(data))
+    }
+    fn writable_bytes(&self) -> usize {
+        on_sink!(self, s => s.writable_bytes())
+    }
+    fn play(&self) -> Result<()> {
+        on_sink!(self, s => s.play())
+    }
+    fn pause(&self) -> Result<()> {
+        on_sink!(self, s => s.pause())
+    }
+    fn flush(&self) -> Result<()> {
+        on_sink!(self, s => s.flush())
+    }
+    fn drain(&self) -> Result<()> {
+        on_sink!(self, s => s.drain())
+    }
+    fn is_drained(&self) -> bool {
+        on_sink!(self, s => s.is_drained())
+    }
+    fn played_frames(&self) -> u64 {
+        on_sink!(self, s => s.played_frames())
+    }
+    fn close(self) -> Result<()> {
+        on_sink!(self, s => s.close())
+    }
+    fn stats(&self) -> StreamStats {
+        match self {
+            Sink::Usb(stream) => stream.stats(),
+            #[cfg(test)]
+            Sink::Model(_) => unreachable!("the ring model keeps no transport statistics"),
+        }
+    }
+}
+/// Wire bytes made but not yet taken by the ring. Kept behind a lock so
+/// `writable_bytes(&self)` can move them into the ring before it reports room.
+#[derive(Default)]
+struct Staged {
+    bytes: Vec<u8>,
+    offset: usize,
+    target_bytes: u64,
+    /// An error met after input was accepted, returned by the next call.
+    error: Option<Error>,
+}
+/// Rate of one `PlaybackStream::write` source frame. Native DSD is one byte per channel.
+fn source_frame_rate(source: &StreamRequest) -> u32 {
+    match source.encoding {
+        Encoding::DsdNative { bit_rate } => bit_rate / 8,
+        _ => source.sample_rate,
+    }
+}
+/// Wire bytes per second the ring drains at the format's nominal rate.
+fn wire_bytes_per_second(format: &StreamFormat) -> u64 {
+    let per_tick = if matches!(format.encoding, Encoding::DsdNative { .. }) {
+        usize::from(format.channels)
+    } else {
+        format.bytes_per_frame()
+    };
+    u64::from(format.counter_rate_hz()) * per_tick as u64
+}
+/// Source frames whose output fills `room` wire bytes, rounded up so any room
+/// of a whole wire frame admits at least one source frame (the ring can then
+/// always reach its start threshold, which never exceeds its target).
+fn source_frames_for_room(room: usize, source_rate: u32, wire_bytes_per_second: u64) -> usize {
+    if room == 0 || source_rate == 0 || wire_bytes_per_second == 0 {
+        return 0;
+    }
+    (room as u128 * u128::from(source_rate))
+        .div_ceil(u128::from(wire_bytes_per_second))
+        .min(usize::MAX as u128) as usize
+}
+
 /// One source-domain stream. Conversion and USB writes are nonblocking; a short
 /// input count means the caller must retry the remainder. Observers see bytes
 /// accepted by the core stream, before any native DSD wire packing/DoP marker rewrite.
 pub struct PlaybackStream {
-    stream: DacStream,
+    stream: Sink,
     decision: PlaybackDecision,
     engine: Engine,
     input: Vec<u8>,
     input_offset: usize,
-    output: Vec<u8>,
-    output_offset: usize,
+    staged: Mutex<Staged>,
     marker: Option<bool>,
     finishing: bool,
     drain_called: bool,
     source_bytes: u64,
-    target_bytes: u64,
     observer: Option<Observer>,
     timing_observer: Option<ProducerTimingObserver>,
 }
 impl PlaybackStream {
+    fn with_sink(stream: Sink, decision: &PlaybackDecision, engine: Engine) -> Self {
+        Self {
+            stream,
+            decision: decision.clone(),
+            engine,
+            input: Vec::with_capacity(65536),
+            input_offset: 0,
+            staged: Mutex::new(Staged {
+                bytes: Vec::with_capacity(65536),
+                ..Staged::default()
+            }),
+            marker: None,
+            finishing: false,
+            drain_called: false,
+            source_bytes: 0,
+            observer: None,
+            timing_observer: None,
+        }
+    }
     pub fn decision(&self) -> &PlaybackDecision {
         &self.decision
     }
@@ -1282,11 +1388,27 @@ impl PlaybackStream {
             );
         }
     }
-    fn flush_output(&mut self) -> Result<bool> {
-        while self.output_offset < self.output.len() {
-            let wanted = self.output.len() - self.output_offset;
+    fn latch(&mut self, error: Error) {
+        self.staged.get_mut().error = Some(error);
+    }
+    fn take_latched(&mut self) -> Result<()> {
+        match self.staged.get_mut().error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    /// Moves at most `limit` staged wire bytes into the ring. True once nothing is staged.
+    fn flush_staged(&self, limit: usize) -> Result<bool> {
+        let mut staged = self.staged.lock();
+        let mut budget = limit;
+        while staged.offset < staged.bytes.len() {
+            let at = staged.offset;
+            let wanted = (staged.bytes.len() - at).min(budget);
+            if wanted == 0 {
+                return Ok(false);
+            }
             let start = self.timing_start();
-            let write = self.stream.write(&self.output[self.output_offset..]);
+            let write = self.stream.write(&staged.bytes[at..at + wanted]);
             self.timing_end(
                 start,
                 ProducerTimingPhase::RingEnqueue,
@@ -1298,27 +1420,32 @@ impl PlaybackStream {
             if n == 0 {
                 return Ok(false);
             }
-            self.notify_observer(&self.output[self.output_offset..self.output_offset + n]);
-            self.output_offset += n;
-            self.target_bytes += n as u64;
+            self.notify_observer(&staged.bytes[at..at + n]);
+            staged.offset += n;
+            staged.target_bytes += n as u64;
+            budget -= n;
         }
-        self.output.clear();
-        self.output_offset = 0;
+        staged.bytes.clear();
+        staged.offset = 0;
         Ok(true)
+    }
+    fn flush_output(&self) -> Result<bool> {
+        self.flush_staged(usize::MAX)
     }
     fn pump(&mut self) -> Result<bool> {
         if !self.flush_output()? {
             return Ok(false);
         }
         while self.input_offset < self.input.len() {
-            self.output.resize(65536, 0);
             let start = self.timing_start();
+            let output = &mut self.staged.get_mut().bytes;
+            output.resize(65536, 0);
             let processed = match &mut self.engine {
                 Engine::Pcm { converter, .. } => {
-                    converter.process(&self.input[self.input_offset..], &mut self.output)
+                    converter.process(&self.input[self.input_offset..], output)
                 }
                 Engine::Dsd { converter, .. } => {
-                    converter.process(&self.input[self.input_offset..], &mut self.output)
+                    converter.process(&self.input[self.input_offset..], output)
                 }
                 Engine::Direct | Engine::DsdRepack => {
                     return Err(Error::InvalidState("direct stream has staged input".into()))
@@ -1333,7 +1460,7 @@ impl PlaybackStream {
             );
             let p = processed.map_err(conversion_error)?;
             self.input_offset += p.consumed;
-            self.output.truncate(p.produced);
+            self.staged.get_mut().bytes.truncate(p.produced);
             if p.consumed == 0 && p.produced == 0 {
                 return Err(Error::InvalidState("converter made no progress".into()));
             }
@@ -1346,7 +1473,13 @@ impl PlaybackStream {
         Ok(true)
     }
     /// Accepts whole source frames and returns bytes accepted, never target bytes.
+    /// Takes as much as the ring can hold (up to its capacity, like
+    /// `DacStream::write`); converted streams work through it in internal steps
+    /// of `WRITE_CHUNK_FRAMES` source frames. An error met after input was
+    /// accepted is returned by the next `write` or `drain`, so an accepted
+    /// count is never lost.
     pub fn write(&mut self, data: &[u8]) -> Result<usize> {
+        self.take_latched()?;
         if self.finishing {
             return Err(Error::InvalidState("write after drain".into()));
         }
@@ -1354,81 +1487,107 @@ impl PlaybackStream {
         if frame == 0 {
             return Err(Error::InvalidState("zero source frame".into()));
         }
-        let n = (data.len() / frame).min(256) * frame;
-        if n == 0 {
+        let whole = data.len() / frame * frame;
+        if whole == 0 {
             return Ok(0);
         }
         if matches!(self.engine, Engine::Direct) {
-            let mut phase = self.marker;
-            if self.decision.source.encoding == Encoding::DoP {
-                let start = self.timing_start();
-                let checked = validate_dop(
-                    &data[..n],
-                    usize::from(self.decision.source.channels),
-                    frame / usize::from(self.decision.source.channels),
-                    &mut phase,
-                );
-                self.timing_end(start, ProducerTimingPhase::SourceFormat, n, n, false);
-                checked?;
+            return self.write_direct(&data[..whole]);
+        }
+        let mut accepted = 0;
+        while accepted < whole {
+            let end = whole.min(accepted + WRITE_CHUNK_FRAMES * frame);
+            let step = if matches!(self.engine, Engine::DsdRepack) {
+                self.write_dsd_repack(&data[accepted..end])
+            } else {
+                self.write_converted(&data[accepted..end])
+            };
+            match step {
+                Ok(0) => break,
+                Ok(n) => accepted += n,
+                Err(error) if accepted == 0 => return Err(error),
+                Err(error) => {
+                    self.latch(error);
+                    break;
+                }
             }
+            if self.staged.get_mut().error.is_some() {
+                break;
+            }
+        }
+        Ok(accepted)
+    }
+    fn write_direct(&mut self, data: &[u8]) -> Result<usize> {
+        let frame = self.decision.source_frame_bytes;
+        let n = data.len();
+        let mut phase = self.marker;
+        if self.decision.source.encoding == Encoding::DoP {
             let start = self.timing_start();
-            let write = self.stream.write(&data[..n]);
+            let checked = validate_dop(
+                data,
+                usize::from(self.decision.source.channels),
+                frame / usize::from(self.decision.source.channels),
+                &mut phase,
+            );
+            self.timing_end(start, ProducerTimingPhase::SourceFormat, n, n, false);
+            checked?;
+        }
+        let start = self.timing_start();
+        let write = self.stream.write(data);
+        self.timing_end(
+            start,
+            ProducerTimingPhase::RingEnqueue,
+            n,
+            write.as_ref().copied().unwrap_or(0),
+            write.as_ref().is_ok_and(|taken| *taken < n),
+        );
+        let taken = write?;
+        if self.decision.source.encoding == Encoding::DoP {
+            let mut accepted = self.marker;
+            let start = self.timing_start();
+            let checked = validate_dop(
+                &data[..taken],
+                usize::from(self.decision.source.channels),
+                frame / usize::from(self.decision.source.channels),
+                &mut accepted,
+            );
             self.timing_end(
                 start,
-                ProducerTimingPhase::RingEnqueue,
-                n,
-                write.as_ref().copied().unwrap_or(0),
-                write.as_ref().is_ok_and(|taken| *taken < n),
+                ProducerTimingPhase::SourceFormat,
+                taken,
+                taken,
+                false,
             );
-            let taken = write?;
-            if self.decision.source.encoding == Encoding::DoP {
-                let mut accepted = self.marker;
-                let start = self.timing_start();
-                let checked = validate_dop(
-                    &data[..taken],
-                    usize::from(self.decision.source.channels),
-                    frame / usize::from(self.decision.source.channels),
-                    &mut accepted,
-                );
-                self.timing_end(
-                    start,
-                    ProducerTimingPhase::SourceFormat,
-                    taken,
-                    taken,
-                    false,
-                );
-                checked?;
-                self.marker = accepted;
-            }
-            if taken > 0 {
-                self.notify_observer(&data[..taken]);
-            }
-            self.source_bytes += taken as u64;
-            self.target_bytes += taken as u64;
-            return Ok(taken);
+            checked?;
+            self.marker = accepted;
         }
-        if matches!(self.engine, Engine::DsdRepack) {
-            if !self.flush_output()? {
-                return Ok(0);
-            }
-            return self.write_dsd_repack(data);
+        if taken > 0 {
+            self.notify_observer(&data[..taken]);
         }
+        self.source_bytes += taken as u64;
+        self.staged.get_mut().target_bytes += taken as u64;
+        Ok(taken)
+    }
+    /// One converter step of at most `WRITE_CHUNK_FRAMES` whole source frames.
+    fn write_converted(&mut self, data: &[u8]) -> Result<usize> {
         if !self.pump()? {
             return Ok(0);
         }
+        let frame = self.decision.source_frame_bytes;
+        let n = data.len();
         let start = self.timing_start();
         self.input.clear();
         let formatted: Result<()> = (|| {
             match &self.engine {
                 Engine::Pcm { unsigned: true, .. } => {
                     self.input.resize(n * 2, 0);
-                    pcm_u8_to_i16(&data[..n], &mut self.input);
+                    pcm_u8_to_i16(data, &mut self.input);
                 }
                 Engine::Pcm { .. } | Engine::Dsd { dop: false, .. } => {
-                    self.input.extend_from_slice(&data[..n])
+                    self.input.extend_from_slice(data)
                 }
                 Engine::Dsd { dop: true, .. } => unpack_dop_into(
-                    &data[..n],
+                    data,
                     usize::from(self.decision.source.channels),
                     frame / usize::from(self.decision.source.channels),
                     &mut self.marker,
@@ -1448,11 +1607,19 @@ impl PlaybackStream {
         formatted?;
         self.input_offset = 0;
         self.source_bytes += n as u64;
-        let _ = self.pump()?;
+        if let Err(error) = self.pump() {
+            self.latch(error);
+        }
         Ok(n)
     }
+    /// One repack step of at most `WRITE_CHUNK_FRAMES` whole source frames.
     fn write_dsd_repack(&mut self, data: &[u8]) -> Result<usize> {
+        if !self.flush_output()? {
+            return Ok(0);
+        }
         let start = self.timing_start();
+        let staged = self.staged.get_mut();
+        staged.offset = 0;
         let taken = repack_dsd_input(
             &self.decision.source,
             &self.decision.format,
@@ -1460,26 +1627,28 @@ impl PlaybackStream {
             data,
             &mut self.marker,
             &mut self.input,
-            &mut self.output,
+            &mut staged.bytes,
         )?;
-        self.output_offset = 0;
+        let produced = staged.bytes.len();
         self.timing_end(
             start,
             ProducerTimingPhase::SourceFormat,
             taken,
-            self.output.len(),
+            produced,
             false,
         );
         self.source_bytes += taken as u64;
-        let _ = self.flush_output()?;
+        if let Err(error) = self.flush_output() {
+            self.latch(error);
+        }
         Ok(taken)
     }
     /// Begin or progress drain. Returns false when the caller must retry after
     /// the USB ring makes space; `is_drained` reports actual USB completion.
+    /// A final partial native DSD word or DoP pair is completed with DSD idle
+    /// (0x69), so every accepted DSD byte is played.
     pub fn drain(&mut self) -> Result<bool> {
-        if matches!(self.engine, Engine::DsdRepack) {
-            ensure_repack_complete(&self.input)?;
-        }
+        self.take_latched()?;
         self.finishing = true;
         if self.drain_called {
             return Ok(true);
@@ -1488,16 +1657,30 @@ impl PlaybackStream {
             if !self.flush_output()? {
                 return Ok(false);
             }
+            if !self.input.is_empty() {
+                let staged = self.staged.get_mut();
+                staged.offset = 0;
+                pad_dsd_tail(
+                    &self.decision.source,
+                    &self.decision.format,
+                    &mut self.input,
+                    &mut staged.bytes,
+                )?;
+                if !self.flush_output()? {
+                    return Ok(false);
+                }
+            }
         } else if !self.pump()? {
             return Ok(false);
         }
         if !matches!(self.engine, Engine::Direct | Engine::DsdRepack) {
             loop {
-                self.output.resize(65536, 0);
                 let start = self.timing_start();
+                let output = &mut self.staged.get_mut().bytes;
+                output.resize(65536, 0);
                 let finished = match &mut self.engine {
-                    Engine::Pcm { converter, .. } => converter.finish(&mut self.output),
-                    Engine::Dsd { converter, .. } => converter.finish(&mut self.output),
+                    Engine::Pcm { converter, .. } => converter.finish(output),
+                    Engine::Dsd { converter, .. } => converter.finish(output),
                     Engine::Direct | Engine::DsdRepack => unreachable!(),
                 };
                 self.timing_end(
@@ -1508,10 +1691,10 @@ impl PlaybackStream {
                     false,
                 );
                 let n = finished.map_err(conversion_error)?;
+                self.staged.get_mut().bytes.truncate(n);
                 if n == 0 {
                     break;
                 }
-                self.output.truncate(n);
                 if !self.flush_output()? {
                     return Ok(false);
                 }
@@ -1535,36 +1718,67 @@ impl PlaybackStream {
             Engine::Direct | Engine::DsdRepack => {}
         }
         self.input.clear();
-        self.output.clear();
+        let staged = self.staged.get_mut();
+        staged.bytes.clear();
+        staged.offset = 0;
+        staged.target_bytes = 0;
+        staged.error = None;
         self.input_offset = 0;
-        self.output_offset = 0;
         self.marker = None;
         self.finishing = false;
         self.drain_called = false;
         self.source_bytes = 0;
-        self.target_bytes = 0;
         Ok(())
     }
+    /// Source bytes to write now to bring the ring to its active target, in
+    /// whole source frames, mirroring `DacStream::writable_bytes`: the ring's
+    /// room converted to source frames through the source/wire rate ratio,
+    /// minus source frames still waiting in the converter. Staged wire output
+    /// is first moved into that room (observers see it here), so it never pins
+    /// the capacity. 0 after `drain` or once the stream has failed; while an
+    /// error is pending it is one source frame, so the next `write` reports it.
+    /// `write` still accepts more, up to the ring's capacity.
     pub fn writable_bytes(&self) -> usize {
         if self.finishing {
-            0
-        } else if self.output_offset < self.output.len()
-            || (!matches!(self.engine, Engine::DsdRepack) && self.input_offset < self.input.len())
-        {
-            // A writer that polls writable_bytes must get a chance to call write(), which pumps
-            // retained data. The target's capacity remains the backpressure authority.
-            staged_retry_capacity(
-                self.stream.writable_bytes(),
-                self.decision.format.bytes_per_frame(),
-                self.decision.source_frame_bytes,
-            )
-        } else if matches!(self.engine, Engine::Direct) {
-            self.stream
-                .writable_bytes()
-                .min(256 * self.decision.source_frame_bytes)
-        } else {
-            256 * self.decision.source_frame_bytes
+            return 0;
         }
+        let frame = self.decision.source_frame_bytes;
+        if self.staged.lock().error.is_some() {
+            return frame;
+        }
+        match self.flush_staged(self.stream.writable_bytes()) {
+            Ok(true) => {}
+            Ok(false) => return 0,
+            Err(error) => {
+                self.staged.lock().error = Some(error);
+                return frame;
+            }
+        }
+        source_frames_for_room(
+            self.stream.writable_bytes(),
+            source_frame_rate(&self.decision.source),
+            wire_bytes_per_second(&self.decision.format),
+        )
+        .saturating_sub(self.pending_source_frames())
+            * frame
+    }
+    /// Accepted source frames still held as converter or repack input.
+    fn pending_source_frames(&self) -> usize {
+        let channels = usize::from(self.decision.source.channels);
+        let per_frame = match &self.engine {
+            Engine::Direct => return 0,
+            Engine::Pcm { unsigned: true, .. } => 2 * channels,
+            Engine::Pcm { .. } => self.decision.source_frame_bytes,
+            // DoP unpacks to two DSD bytes per channel; native DSD is one.
+            Engine::Dsd { .. } | Engine::DsdRepack => {
+                if self.decision.source.encoding == Encoding::DoP {
+                    2 * channels
+                } else {
+                    channels
+                }
+            }
+        };
+        (self.input.len() - self.input_offset).div_ceil(per_frame.max(1))
     }
     pub fn is_drained(&self) -> bool {
         self.drain_called && self.stream.is_drained()
@@ -1596,17 +1810,13 @@ impl PlaybackStream {
         };
         PlaybackConversionStats {
             source_bytes: self.source_bytes,
-            target_bytes: self.target_bytes,
+            target_bytes: self.staged.lock().target_bytes,
             clipped_samples,
         }
     }
     pub fn played_frames(&self) -> u64 {
         let wire = self.stream.played_frames();
-        let source_rate = match self.decision.source.encoding {
-            Encoding::DsdNative { bit_rate } => bit_rate / 8,
-            Encoding::DoP => self.decision.source.sample_rate,
-            _ => self.decision.source.sample_rate,
-        };
+        let source_rate = source_frame_rate(&self.decision.source);
         let target_rate = self.decision.format.counter_rate_hz();
         if target_rate == 0 {
             return 0;
@@ -1622,21 +1832,28 @@ impl PlaybackStream {
         self.stream.close()
     }
 }
-fn staged_retry_capacity(wire_room: usize, wire_frame: usize, source_frame: usize) -> usize {
-    if wire_frame > 0 && wire_room >= wire_frame {
-        source_frame
-    } else {
-        0
+/// Bytes of one complete target group per source channel: a DoP pair or one
+/// native DSD subslot word.
+fn dsd_group_bytes(format: &StreamFormat) -> Result<usize> {
+    let slot = usize::from(format.subslot_bytes);
+    let target_dop = format.encoding == Encoding::DoP;
+    if slot == 0 || (target_dop && !matches!(slot, 3 | 4)) {
+        return Err(Error::InvalidArgument(
+            "invalid target DSD word layout".into(),
+        ));
     }
+    Ok(if target_dop { 2 } else { slot })
 }
-fn ensure_repack_complete(pending: &[u8]) -> Result<()> {
-    if pending.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::InvalidArgument(
-            "incomplete final native DSD word or DoP pair".into(),
-        ))
-    }
+/// Completes a final partial group with DSD idle and packs it.
+fn pad_dsd_tail(
+    source: &StreamRequest,
+    format: &StreamFormat,
+    pending: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let unit = usize::from(source.channels) * dsd_group_bytes(format)?;
+    pending.resize(pending.len().div_ceil(unit) * unit, DSD_IDLE);
+    pack_dsd_groups(source, format, pending, output)
 }
 
 /// Accept complete source frames, buffering incomplete target groups for the next write.
@@ -1654,19 +1871,12 @@ fn repack_dsd_input(
     if src_ch == 0 || (src_ch != dst_ch && !(src_ch == 1 && dst_ch == 2)) || source_frame == 0 {
         return Err(Error::InvalidArgument("invalid DSD channel layout".into()));
     }
-    let source_dop = source.encoding == Encoding::DoP;
-    let target_dop = format.encoding == Encoding::DoP;
-    let slot = usize::from(format.subslot_bytes);
-    if slot == 0 || (target_dop && !matches!(slot, 3 | 4)) {
-        return Err(Error::InvalidArgument(
-            "invalid target DSD word layout".into(),
-        ));
-    }
-    let taken = (data.len() / source_frame).min(256) * source_frame;
+    dsd_group_bytes(format)?;
+    let taken = (data.len() / source_frame).min(WRITE_CHUNK_FRAMES) * source_frame;
     if taken == 0 {
         return Ok(0);
     }
-    if source_dop {
+    if source.encoding == Encoding::DoP {
         unpack_dop_into(
             &data[..taken],
             src_ch,
@@ -1677,7 +1887,21 @@ fn repack_dsd_input(
     } else {
         pending.extend_from_slice(&data[..taken]);
     }
-    let group = if target_dop { 2 } else { slot };
+    pack_dsd_groups(source, format, pending, output)?;
+    Ok(taken)
+}
+/// Packs the complete target groups of chronological DSD bytes into `output`.
+fn pack_dsd_groups(
+    source: &StreamRequest,
+    format: &StreamFormat,
+    pending: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let src_ch = usize::from(source.channels);
+    let dst_ch = usize::from(format.channels);
+    let target_dop = format.encoding == Encoding::DoP;
+    let slot = usize::from(format.subslot_bytes);
+    let group = dsd_group_bytes(format)?;
     let complete = pending.len() / (src_ch * group) * src_ch * group;
     output.clear();
     if target_dop {
@@ -1699,7 +1923,7 @@ fn repack_dsd_input(
         output.extend_from_slice(&pending[..complete]);
     }
     pending.drain(..complete);
-    Ok(taken)
+    Ok(())
 }
 /// Duplicate chronological mono DSD bytes into stereo channel-interleaved bytes.
 /// Returns the source bytes consumed, bounded by output capacity.
@@ -1904,12 +2128,6 @@ mod tests {
             .all(|candidate| candidate.request.encoding != Encoding::DoP));
     }
     #[test]
-    fn staged_output_advertises_retry_after_wire_capacity_returns() {
-        assert_eq!(staged_retry_capacity(0, 8, 2), 0);
-        assert_eq!(staged_retry_capacity(7, 8, 2), 0);
-        assert_eq!(staged_retry_capacity(8, 8, 2), 2);
-    }
-    #[test]
     fn partial_dsd_byte_frames_are_retained_until_complete_wire_word() {
         let source = StreamRequest::dsd_native(2_822_400, 1);
         let format = wire_format(StreamRequest::dsd_native(2_822_400, 2), 4);
@@ -1930,7 +2148,7 @@ mod tests {
             );
             assert!(output.is_empty());
         }
-        assert!(ensure_repack_complete(&pending).is_err());
+        assert_eq!(pending.len(), 3);
         assert_eq!(
             repack_dsd_input(
                 &source,
@@ -1945,7 +2163,7 @@ mod tests {
             1
         );
         assert_eq!(output, [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44]);
-        assert!(ensure_repack_complete(&pending).is_ok());
+        assert!(pending.is_empty());
     }
     #[test]
     fn dop_start_phase_is_inferred_and_failed_batch_does_not_advance() {
@@ -2555,5 +2773,303 @@ mod tests {
         assert!(supported_rate(&alt, 44_100));
         assert!(!supported_rate(&alt, 48_000));
         assert!(!supported_rate(&alt, 96_000));
+    }
+
+    #[derive(Default)]
+    struct RingState {
+        frame: usize,
+        capacity: usize,
+        target: usize,
+        queued: usize,
+        played: u64,
+        paused: bool,
+        draining: bool,
+        fail_writes: bool,
+        written: Vec<u8>,
+    }
+    /// The transport ring in miniature (transport/shared.rs): `writable_bytes`
+    /// is the room up to the active target in whole wire frames and `write`
+    /// takes whole wire frames up to the capacity.
+    #[derive(Clone, Default)]
+    pub(super) struct RingModel(Arc<parking_lot::Mutex<RingState>>);
+    impl RingModel {
+        fn new(format: &StreamFormat, target: usize, capacity: usize) -> Self {
+            Self(Arc::new(parking_lot::Mutex::new(RingState {
+                frame: format.bytes_per_frame(),
+                capacity,
+                target,
+                ..RingState::default()
+            })))
+        }
+        pub(super) fn write(&self, data: &[u8]) -> Result<usize> {
+            let mut ring = self.0.lock();
+            if ring.fail_writes {
+                return Err(Error::InvalidState("model ring failed".into()));
+            }
+            if ring.draining {
+                return Err(Error::InvalidState("model ring is draining".into()));
+            }
+            let frames = (data.len() / ring.frame).min(ring.capacity - ring.queued);
+            ring.queued += frames;
+            let bytes = frames * ring.frame;
+            ring.written.extend_from_slice(&data[..bytes]);
+            Ok(bytes)
+        }
+        pub(super) fn writable_bytes(&self) -> usize {
+            let ring = self.0.lock();
+            if ring.draining || ring.fail_writes {
+                0
+            } else {
+                ring.target.saturating_sub(ring.queued) * ring.frame
+            }
+        }
+        pub(super) fn play(&self) -> Result<()> {
+            self.0.lock().paused = false;
+            Ok(())
+        }
+        pub(super) fn pause(&self) -> Result<()> {
+            self.0.lock().paused = true;
+            Ok(())
+        }
+        pub(super) fn flush(&self) -> Result<()> {
+            self.0.lock().queued = 0;
+            Ok(())
+        }
+        pub(super) fn drain(&self) -> Result<()> {
+            self.0.lock().draining = true;
+            Ok(())
+        }
+        pub(super) fn is_drained(&self) -> bool {
+            let ring = self.0.lock();
+            ring.draining && ring.queued == 0
+        }
+        pub(super) fn played_frames(&self) -> u64 {
+            self.0.lock().played
+        }
+        pub(super) fn close(self) -> Result<()> {
+            Ok(())
+        }
+        /// Plays up to `frames` wire frames unless paused.
+        fn consume(&self, frames: usize) {
+            let mut ring = self.0.lock();
+            if !ring.paused {
+                let n = frames.min(ring.queued);
+                ring.queued -= n;
+                ring.played += n as u64;
+            }
+        }
+        fn queued(&self) -> usize {
+            self.0.lock().queued
+        }
+    }
+    /// Resolves `source` against one alternate and opens it on a ring model with
+    /// the given target and capacity in wire frames.
+    fn model_stream(
+        alt: crate::AltSetting,
+        source: StreamRequest,
+        policy: &PlaybackPolicy,
+        target: usize,
+        capacity: usize,
+    ) -> (PlaybackStream, RingModel) {
+        let (decision, _) = resolve_model(&capabilities_for(vec![alt]), &source, policy);
+        let decision = decision.unwrap();
+        let ring = RingModel::new(&decision.format, target, capacity);
+        let engine = engine_for(&decision).unwrap();
+        (
+            PlaybackStream::with_sink(Sink::Model(ring.clone()), &decision, engine),
+            ring,
+        )
+    }
+    /// 44.1 kHz source on a 48 kHz-only DAC: a resampling stream.
+    fn converted_stream(target: usize, capacity: usize) -> (PlaybackStream, RingModel) {
+        let (stream, ring) = model_stream(
+            fixed_alt(AltFormat::Pcm, 2, 2, 16, &[48_000]),
+            StreamRequest::pcm(44_100, 2, 16),
+            &PlaybackPolicy::default(),
+            target,
+            capacity,
+        );
+        assert!(matches!(
+            stream.decision().transform,
+            PlaybackTransform::Pcm { .. }
+        ));
+        (stream, ring)
+    }
+    fn direct_stream(target: usize, capacity: usize) -> (PlaybackStream, RingModel) {
+        let (stream, ring) = model_stream(
+            fixed_alt(AltFormat::Pcm, 2, 2, 16, &[48_000]),
+            StreamRequest::pcm(48_000, 2, 16),
+            &PlaybackPolicy::default(),
+            target,
+            capacity,
+        );
+        assert_eq!(stream.decision().transform, PlaybackTransform::Direct);
+        (stream, ring)
+    }
+    /// Mono DoP64 onto a stereo 24-bit DoP carrier: a repacking stream.
+    fn repack_stream(target: usize, capacity: usize) -> (PlaybackStream, RingModel) {
+        let (stream, ring) = model_stream(
+            fixed_alt(AltFormat::Pcm, 2, 3, 24, &[176_400]),
+            StreamRequest::dop(2_822_400, 1),
+            &PlaybackPolicy {
+                dop_confirmed: true,
+                ..PlaybackPolicy::default()
+            },
+            target,
+            capacity,
+        );
+        assert_eq!(
+            stream.decision().transform,
+            PlaybackTransform::DopRepack { target_channels: 2 }
+        );
+        (stream, ring)
+    }
+    /// Mono DoP source frames with alternating markers, starting at `first`.
+    fn dop_frames(count: usize, first: usize) -> Vec<u8> {
+        (first..first + count)
+            .flat_map(|i| [0x11, 0x22, if i % 2 == 0 { 0x05 } else { 0xfa }])
+            .collect()
+    }
+    #[test]
+    fn a_writer_that_waits_for_whole_chunks_progresses() {
+        // M1: the guide's render gate with a 1,024-frame buffer.
+        const CHUNK: usize = 1024;
+        for (name, (mut stream, ring)) in [
+            ("direct", direct_stream(12_000, 24_000)),
+            ("converted", converted_stream(12_000, 24_000)),
+            ("repack", repack_stream(44_100, 88_200)),
+        ] {
+            let frame = stream.decision().source_frame_bytes;
+            assert!(
+                stream.writable_bytes() >= CHUNK * frame,
+                "{name}: an empty ring reports {} bytes",
+                stream.writable_bytes()
+            );
+            let mut chunks = 0;
+            for round in 0..400 {
+                if stream.writable_bytes() >= CHUNK * frame {
+                    let data = if stream.decision().source.encoding == Encoding::DoP {
+                        dop_frames(CHUNK, chunks * CHUNK)
+                    } else {
+                        vec![0; CHUNK * frame]
+                    };
+                    assert_eq!(stream.write(&data).unwrap(), data.len(), "{name}");
+                    chunks += 1;
+                } else {
+                    ring.consume(1 + round % 700);
+                }
+            }
+            assert!(chunks >= 20, "{name}: only {chunks} chunks were written");
+        }
+    }
+    #[test]
+    fn paused_streams_stop_near_the_active_target() {
+        // M2: a paused stream fed by writable_bytes stops at its target, not its capacity.
+        for (name, (mut stream, ring), target) in [
+            ("direct", direct_stream(4_800, 24_000), 4_800),
+            ("converted", converted_stream(4_800, 24_000), 4_800),
+            ("repack", repack_stream(17_640, 88_200), 17_640),
+        ] {
+            stream.pause().unwrap();
+            let frame = stream.decision().source_frame_bytes;
+            let mut written = 0;
+            for _ in 0..1_000 {
+                let n = stream.writable_bytes();
+                if n == 0 {
+                    break;
+                }
+                let data = if stream.decision().source.encoding == Encoding::DoP {
+                    dop_frames(n / frame, written)
+                } else {
+                    vec![0; n]
+                };
+                written += stream.write(&data).unwrap() / frame;
+            }
+            assert_eq!(stream.writable_bytes(), 0, "{name}");
+            let queued = ring.queued();
+            assert!(
+                queued >= target && queued <= target + 32,
+                "{name}: paused ring holds {queued} frames for a target of {target}"
+            );
+        }
+    }
+    #[test]
+    fn staged_output_does_not_pin_the_reported_capacity() {
+        let (mut stream, ring) = converted_stream(4_800, 4_800);
+        // Overfill past capacity so converted output is left staged.
+        let data = vec![0; 8_000 * 4];
+        let accepted = stream.write(&data).unwrap();
+        assert!(accepted > 0 && accepted < data.len());
+        {
+            let staged = stream.staged.lock();
+            assert!(staged.offset < staged.bytes.len());
+        }
+        assert_eq!(stream.writable_bytes(), 0);
+        // Once the ring plays out, the report covers the room, not one frame.
+        ring.consume(4_800);
+        assert!(stream.writable_bytes() >= 1024 * 4);
+        assert!(stream.staged.lock().bytes.is_empty());
+    }
+    #[test]
+    fn an_error_after_acceptance_keeps_the_count_and_reports_next() {
+        for (name, (mut stream, ring)) in [
+            ("converted", converted_stream(4_800, 4_800)),
+            ("repack", repack_stream(4_800, 4_800)),
+        ] {
+            let frame = stream.decision().source_frame_bytes;
+            let data = if stream.decision().source.encoding == Encoding::DoP {
+                dop_frames(1024, 0)
+            } else {
+                vec![0; 1024 * frame]
+            };
+            ring.0.lock().fail_writes = true;
+            // The ring fails once output reaches it; the accepted step still counts.
+            let accepted = stream.write(&data).unwrap();
+            assert!(accepted > 0 && accepted % frame == 0, "{name}");
+            assert_eq!(stream.conversion_stats().source_bytes, accepted as u64);
+            assert!(stream.writable_bytes() > 0, "{name}");
+            assert!(stream.write(&data).is_err(), "{name}");
+        }
+    }
+    #[test]
+    fn drain_pads_a_final_partial_dsd_group_with_idle() {
+        // Native mono DSD on a 4-byte native stereo wire: three bytes are short of a word.
+        let (mut stream, ring) = model_stream(
+            fixed_alt(AltFormat::Dsd, 2, 4, 1, &[88_200]),
+            StreamRequest::dsd_native(2_822_400, 1),
+            &PlaybackPolicy::default(),
+            8_820,
+            17_640,
+        );
+        assert!(matches!(
+            stream.decision().transform,
+            PlaybackTransform::DsdChannelExpansion { .. }
+        ));
+        assert_eq!(stream.write(&[0x11, 0x22, 0x33]).unwrap(), 3);
+        assert!(stream.drain().unwrap());
+        assert_eq!(
+            ring.0.lock().written,
+            [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, DSD_IDLE, DSD_IDLE]
+        );
+        // Native mono onto a stereo DoP wire: one byte is short of a DoP pair.
+        let format = wire_format(StreamRequest::dop(2_822_400, 2), 3);
+        let source = StreamRequest::dsd_native(2_822_400, 1);
+        let (mut pending, mut output) = (vec![0xab], Vec::new());
+        pad_dsd_tail(&source, &format, &mut pending, &mut output).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(output, [DSD_IDLE, 0xab, 0, DSD_IDLE, 0xab, 0]);
+    }
+    #[test]
+    fn room_converts_to_source_frames_through_the_rate_ratio() {
+        // 48 kHz wire, 4-byte frames: 4,800 bytes is 1,200 wire frames, 1,103 source frames at 44.1 kHz.
+        assert_eq!(source_frames_for_room(4_800, 44_100, 48_000 * 4), 1_103);
+        assert_eq!(source_frames_for_room(4, 44_100, 48_000 * 4), 1);
+        assert_eq!(source_frames_for_room(0, 44_100, 48_000 * 4), 0);
+        let native = wire_format(StreamRequest::dsd_native(2_822_400, 2), 4);
+        // One 8-byte native stereo word is four mono DSD bytes.
+        assert_eq!(
+            source_frames_for_room(8, 352_800, wire_bytes_per_second(&native)),
+            4
+        );
     }
 }
