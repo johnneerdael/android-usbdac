@@ -118,4 +118,39 @@ class DriverPlaybackSelectorTest {
         assertEquals(64 * 1024, output.writableBytes)
         output.close()
     }
+    // DoP v1.1: a DoP wire carries DSD under marker bytes, and a native DSD wire carries DSD
+    // words, so a PCM conversion must never be framed onto either. The core refuses DsdToPcm on a
+    // DSD wire; the Kotlin selector holds the same invariant before it opens a stream.
+    @Test fun pcmConversionOntoADsdWireIsRefusedBeforeAnyStreamOpens() {
+        data class Case(val request: StreamRequest, val transform: String, val wire: StreamEncoding, val sourceFrameBytes: Int)
+        val cases = listOf(
+            Case(StreamRequest.dop(2_822_400, 2), "dop_to_pcm", StreamEncoding.DOP, 6),
+            Case(StreamRequest.dsdNative(2_822_400, 2), "dsd_to_pcm", StreamEncoding.DSD_NATIVE, 2),
+            Case(StreamRequest.dop(2_822_400, 2), "dop_to_pcm", StreamEncoding.DSD_NATIVE, 6),
+            Case(StreamRequest.pcm(44_100, 2, 16), "pcm", StreamEncoding.DOP, 4),
+        )
+        for (case in cases) {
+            val fake = FakePlatform()
+            val link = fake.attach(fakeDac())
+            val dsdWire = if (case.wire == StreamEncoding.DOP) {
+                StreamFormat(1, StreamEncoding.DOP, 2_822_400, 176_400, 2, 24, 3, 6, 176_400, 1, 1, 1,
+                    SyncType.ASYNCHRONOUS, true, LinkSpeed.HIGH, 125, false, Pacing.ExplicitFeedback(0x81))
+            } else {
+                StreamFormat(1, StreamEncoding.DSD_NATIVE, 2_822_400, 88_200, 2, 32, 4, 8, 352_800, 1, 1, 1,
+                    SyncType.ASYNCHRONOUS, true, LinkSpeed.HIGH, 125, false, Pacing.ExplicitFeedback(0x81))
+            }
+            val platform = object : OutputPlatform by fake {
+                override fun openDac(dac: DacDeviceInfo, config: DacConfig): DirectLink = object : DirectLink by link {
+                    override val supportsDriverPlayback = true
+                    override fun resolvePlayback(request: StreamRequest, policy: OutputPolicy, bypassLimits: Boolean) =
+                        DriverPlaybackDecision(dsdWire, case.transform, "lossy", case.sourceFrameBytes, null)
+                }
+            }
+            val error = assertThrows(DacException::class.java) {
+                OutputSelector(platform, OutputPolicy(force = OutputKind.DIRECT_USB)).open(case.request)
+            }
+            assertEquals(case.toString(), DacErrorCode.UNSUPPORTED, error.code)
+            assertTrue(case.toString(), link.streams.isEmpty())
+        }
+    }
 }
